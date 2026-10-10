@@ -153,7 +153,7 @@ fn normal_bytes_keep_alias_suppression_literals_and_default_value_names() {
             name,
         );
         assert_eq!(
-            render_completed_plan_tree(&plan, ExplainLevel::Normal).unwrap(),
+            render_completed_plan_tree(&plan, ExplainLevel::Normal, &crate::compiler::SqlCompileControl::unbounded()).unwrap(),
             [expected, "  1:VALUES (1 rows)"]
         );
     }
@@ -171,7 +171,7 @@ fn normal_bytes_keep_alias_suppression_literals_and_default_value_names() {
         Some("'名🦀'"),
     );
     assert_eq!(
-        render_completed_plan_tree(&plan, ExplainLevel::Normal).unwrap()[0],
+        render_completed_plan_tree(&plan, ExplainLevel::Normal, &crate::compiler::SqlCompileControl::unbounded()).unwrap()[0],
         "0:PROJECT ['名🦀']"
     );
 }
@@ -252,7 +252,7 @@ fn wide_boolean_arguments_remain_shallow_and_streamed() {
     assert_budget(
         render_tree_with_budget(&plan, ExplainLevel::Normal, small_budget()).unwrap_err(),
     );
-    let lines = render_completed_plan_tree(&plan, ExplainLevel::Normal).unwrap();
+    let lines = render_completed_plan_tree(&plan, ExplainLevel::Normal, &crate::compiler::SqlCompileControl::unbounded()).unwrap();
     assert_eq!(lines[0].matches("true").count(), 4096);
     assert!(!lines[0].contains("..."));
 }
@@ -289,7 +289,7 @@ fn valid_but_deep_node_and_expression_inputs_are_refused_without_elision() {
     }
     let plan = finish(builder, root, value, ty, Vec::new());
     assert!(
-        matches!(render_completed_plan_tree(&plan, ExplainLevel::Normal), Err(SqlCompileError::InvalidRequest(message)) if message.contains("depth bound"))
+        matches!(render_completed_plan_tree(&plan, ExplainLevel::Normal, &crate::compiler::SqlCompileControl::unbounded()), Err(SqlCompileError::InvalidRequest(message)) if message.contains("depth bound"))
     );
     let plan = project(
         |builder, node, ty| {
@@ -317,7 +317,7 @@ fn valid_but_deep_node_and_expression_inputs_are_refused_without_elision() {
         ValueType::new(DataType::Boolean, false),
         Some("deep"),
     );
-    assert_budget(render_completed_plan_tree(&plan, ExplainLevel::Normal).unwrap_err());
+    assert_budget(render_completed_plan_tree(&plan, ExplainLevel::Normal, &crate::compiler::SqlCompileControl::unbounded()).unwrap_err());
 }
 
 #[test]
@@ -420,7 +420,7 @@ fn borrowed_stats_and_name_indexes_keep_first_node_and_last_value_semantics() {
         "final"
     );
     assert_eq!(
-        render_completed_plan_tree(&plan, ExplainLevel::Costs)
+        render_completed_plan_tree(&plan, ExplainLevel::Costs, &crate::compiler::SqlCompileControl::unbounded())
             .unwrap()
             .last()
             .unwrap(),

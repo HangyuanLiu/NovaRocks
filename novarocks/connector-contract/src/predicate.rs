@@ -561,7 +561,7 @@ impl<C: Ord + Clone + Debug> TupleDomain<C> {
         Self { domains: None }
     }
 
-    pub fn with_column_domains(domains: BTreeMap<C, Domain>) -> Result<Self, ConnectorError> {
+    pub fn with_column_domains(mut domains: BTreeMap<C, Domain>) -> Result<Self, ConnectorError> {
         if domains.len() > MAX_TUPLE_DOMAIN_COLUMNS {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
@@ -571,13 +571,10 @@ impl<C: Ord + Clone + Debug> TupleDomain<C> {
         if domains.values().any(Domain::is_none) {
             return Ok(Self::none());
         }
+        // Normalize the already owned map without reconstructing its tree.
+        domains.retain(|_, domain| !domain.is_all());
         Ok(Self {
-            domains: Some(
-                domains
-                    .into_iter()
-                    .filter(|(_, domain)| !domain.is_all())
-                    .collect(),
-            ),
+            domains: Some(domains),
         })
     }
 
@@ -713,45 +710,65 @@ impl ConnectorExpression {
 
     /// Validate node count and depth before an expression crosses the SPI.
     pub fn validate(&self) -> Result<(), ConnectorError> {
-        let mut nodes = 0_usize;
-        self.walk(1, &mut nodes)
+        self.validate_observed(|_| Ok(()))
     }
 
-    fn walk(&self, depth: usize, nodes: &mut usize) -> Result<(), ConnectorError> {
+    /// Borrow the original expression law and one callback per actual node.
+    /// The caller owns numerical admission and its checkpoint scope.
+    pub fn validate_observed<E: From<ConnectorError>>(
+        &self,
+        mut observe: impl FnMut(&Self) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut nodes = 0_usize;
+        self.walk(1, &mut nodes, &mut observe)
+    }
+
+    fn walk<E: From<ConnectorError>>(
+        &self,
+        depth: usize,
+        nodes: &mut usize,
+        observe: &mut impl FnMut(&Self) -> Result<(), E>,
+    ) -> Result<(), E> {
         if depth > MAX_CONNECTOR_EXPRESSION_DEPTH {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
                 "connector expression depth exceeds the hard limit",
-            ));
+            )
+            .into());
         }
         *nodes += 1;
         if *nodes > MAX_CONNECTOR_EXPRESSION_NODES {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
                 "connector expression node count exceeds the hard limit",
-            ));
+            )
+            .into());
         }
         match self {
             Self::Constant { value, value_type } => {
                 if let Some(value) = value
                     && value.value_type() != *value_type
                 {
-                    return Err(invalid("connector constant type differs from its value"));
+                    return Err(invalid("connector constant type differs from its value").into());
                 }
-                Ok(())
+                observe(self)
             }
             Self::Variable { name, .. } => {
                 if name.is_empty() {
-                    return Err(invalid(
-                        "connector expression variable name must not be empty",
-                    ));
+                    return Err(
+                        invalid("connector expression variable name must not be empty").into(),
+                    );
                 }
-                Ok(())
+                observe(self)
             }
-            Self::FieldDereference { target, .. } => target.walk(depth + 1, nodes),
+            Self::FieldDereference { target, .. } => {
+                observe(self)?;
+                target.walk(depth + 1, nodes, observe)
+            }
             Self::Call { arguments, .. } => {
+                observe(self)?;
                 for argument in arguments {
-                    argument.walk(depth + 1, nodes)?;
+                    argument.walk(depth + 1, nodes, observe)?;
                 }
                 Ok(())
             }
@@ -760,18 +777,32 @@ impl ConnectorExpression {
 
     /// Every free variable name referenced by this expression.
     pub fn variable_names(&self, out: &mut Vec<Arc<str>>) {
-        match self {
-            Self::Constant { .. } => {}
-            Self::Variable { name, .. } => out.push(name.clone()),
-            Self::FieldDereference { target, .. } => target.variable_names(out),
-            Self::Call { arguments, .. } => {
-                for argument in arguments {
-                    argument.variable_names(out);
-                }
-            }
+        let result = self.visit_variable_names_observed(&mut |name| {
+            out.push(name.clone());
+            Ok::<_, std::convert::Infallible>(())
+        });
+        match result {
+            Ok(()) => {}
+            Err(never) => match never {},
         }
     }
 
+    pub(crate) fn visit_variable_names_observed<E>(
+        &self,
+        observe: &mut impl FnMut(&Arc<str>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match self {
+            Self::Constant { .. } => Ok(()),
+            Self::Variable { name, .. } => observe(name),
+            Self::FieldDereference { target, .. } => target.visit_variable_names_observed(observe),
+            Self::Call { arguments, .. } => {
+                for argument in arguments {
+                    argument.visit_variable_names_observed(observe)?;
+                }
+                Ok(())
+            }
+        }
+    }
     /// The always-true expression.
     pub fn constant_true() -> Self {
         Self::Constant {
@@ -975,6 +1006,37 @@ mod tests {
                 .intersect(&TupleDomain::none())
                 .expect("typed")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn tuple_domain_normalizes_mixed_constraints_and_keeps_limit_precedence() {
+        let constrained = Domain::single_value(big_int(7)).unwrap();
+        let tuple = TupleDomain::with_column_domains(BTreeMap::from([
+            (0_u32, Domain::all(ConnectorValueType::BigInt)),
+            (u32::MAX, constrained.clone()),
+        ]))
+        .unwrap();
+        assert_eq!(
+            tuple.domains().unwrap(),
+            &BTreeMap::from([(u32::MAX, constrained)])
+        );
+        assert!(
+            TupleDomain::with_column_domains(BTreeMap::from([(
+                0_u32,
+                Domain::all(ConnectorValueType::BigInt)
+            ),]))
+            .unwrap()
+            .is_all()
+        );
+        let oversized = (0..=MAX_TUPLE_DOMAIN_COLUMNS as u32)
+            .map(|id| (id, Domain::none(ConnectorValueType::BigInt)))
+            .collect();
+        assert_eq!(
+            TupleDomain::with_column_domains(oversized)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::ResourceExhausted
         );
     }
 

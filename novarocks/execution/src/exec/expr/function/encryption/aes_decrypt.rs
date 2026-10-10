@@ -18,55 +18,8 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::function::FunctionKind;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
 use arrow::array::ArrayRef;
-
-fn should_prefer_latin1_bytes(arena: &ExprArena, arg: ExprId) -> bool {
-    matches!(
-        arena.node(arg),
-        Some(ExprNode::FunctionCall {
-            kind: FunctionKind::Encryption(name),
-            ..
-        }) if matches!(*name, "from_base64" | "aes_encrypt" | "to_binary")
-    )
-}
-
-fn decrypt_with_utf8_fallback(
-    mode: super::common::AesMode,
-    src: &super::common::OwnedBytesArray,
-    row: usize,
-    key: &[u8],
-    iv: Option<&[u8]>,
-    aad: Option<&[u8]>,
-    prefer_latin1: bool,
-) -> Option<Vec<u8>> {
-    let utf8_bytes = src.bytes(row);
-    let latin1 = src
-        .utf8(row)
-        .and_then(super::common::latin1_string_to_bytes);
-    let primary = if prefer_latin1 {
-        latin1.as_deref().unwrap_or(utf8_bytes)
-    } else {
-        utf8_bytes
-    };
-
-    let mut result = super::common::aes_decrypt_raw(mode, primary, key, iv, aad);
-    if result.is_some() {
-        return result;
-    }
-
-    let fallback = if prefer_latin1 {
-        Some(utf8_bytes)
-    } else {
-        latin1.as_deref()
-    };
-    if let Some(fallback) = fallback
-        && fallback != primary
-    {
-        result = super::common::aes_decrypt_raw(mode, fallback, key, iv, aad);
-    }
-
-    result
-}
-
+use novarocks_functions::builtin::aes_rows::{self, Operation, Row};
+use novarocks_type_contract::ToBase64ByteSource;
 pub fn eval_aes_decrypt(
     arena: &ExprArena,
     expr: ExprId,
@@ -77,7 +30,13 @@ pub fn eval_aes_decrypt(
         return Err("aes_decrypt expects 2, 4, or 5 arguments".to_string());
     }
 
-    let prefer_latin1 = should_prefer_latin1_bytes(arena, args[0]);
+    let source = match arena.node(args[0]) {
+        Some(ExprNode::FunctionCall {
+            kind: FunctionKind::Encryption(name),
+            ..
+        }) => ToBase64ByteSource::from_immediate_encryption_identity(Some(*name)),
+        _ => ToBase64ByteSource::from_immediate_encryption_identity(None),
+    };
     let src = super::common::to_owned_bytes_array(arena.eval(args[0], chunk)?, "aes_decrypt", 0)?;
     let key = super::common::to_owned_bytes_array(arena.eval(args[1], chunk)?, "aes_decrypt", 1)?;
 
@@ -111,69 +70,28 @@ pub fn eval_aes_decrypt(
         None
     };
 
+    let two;
+    let four;
+    let five;
+    let inputs = if args.len() == 2 {
+        two = [src, key];
+        &two[..]
+    } else if args.len() == 4 {
+        four = [src, key, iv.unwrap(), mode.unwrap()];
+        &four[..]
+    } else {
+        five = [src, key, iv.unwrap(), mode.unwrap(), aad.unwrap()];
+        &five[..]
+    };
     let mut out = Vec::with_capacity(chunk.len());
     for row in 0..chunk.len() {
-        if src.is_null(row) || key.is_null(row) {
-            out.push(None);
-            continue;
+        let rows = [row; 5];
+        match aes_rows::evaluate_row(Operation::Decrypt, inputs, &rows[..inputs.len()], source) {
+            Row::Value(value) => out.push(value),
+            Row::Data(_) => {
+                return Err("aes_decrypt: requires GCM mode to use AAD parameter".to_string());
+            }
         }
-
-        let src_bytes = src.bytes(row);
-        let key_bytes = key.bytes(row);
-        if src_bytes.is_empty() || key_bytes.is_empty() {
-            out.push(None);
-            continue;
-        }
-
-        if args.len() == 2 {
-            out.push(decrypt_with_utf8_fallback(
-                super::common::AesMode::Aes128Ecb,
-                &src,
-                row,
-                key_bytes,
-                None,
-                None,
-                prefer_latin1,
-            ));
-            continue;
-        }
-
-        let mode_arr = mode.as_ref().unwrap();
-        if mode_arr.is_null(row) {
-            out.push(None);
-            continue;
-        }
-
-        let mode = super::common::AesMode::parse(mode_arr.bytes(row));
-        let iv_arr = iv.as_ref().unwrap();
-
-        if !mode.is_ecb() && iv_arr.is_null(row) {
-            out.push(None);
-            continue;
-        }
-
-        let iv_bytes = if iv_arr.is_null(row) {
-            None
-        } else {
-            Some(iv_arr.bytes(row))
-        };
-        let aad_bytes = aad
-            .as_ref()
-            .and_then(|arr| (!arr.is_null(row)).then_some(arr.bytes(row)));
-        if aad_bytes.is_some() && !mode.is_gcm() {
-            return Err("aes_decrypt: requires GCM mode to use AAD parameter".to_string());
-        }
-
-        out.push(decrypt_with_utf8_fallback(
-            mode,
-            &src,
-            row,
-            key_bytes,
-            iv_bytes,
-            aad_bytes,
-            prefer_latin1,
-        ));
     }
-
     super::common::build_bytes_output_lossy(out, arena.data_type(expr))
 }

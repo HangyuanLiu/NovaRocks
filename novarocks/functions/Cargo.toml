@@ -27,8 +27,39 @@ workspace = true
 [lib]
 doctest = false
 
+[features]
+test-support = []
+
 [dependencies]
+datasketches = { workspace = true, features = ["hll"] }
+openssl = "0.10"
+url.workspace = true
+arrow-arith = "58.2.0"
+arrow-ord = "58.2.0"
+regex.workspace = true
+roaring.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+allocator-api2 = "0.2"
+hashbrown = { version = "0.14.5", features = ["raw", "allocator-api2"] }
+hex.workspace = true
+base64.workspace = true
 arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-cast.workspace = true
+arrow-data.workspace = true
 arrow-schema.workspace = true
+arrow-select = "58.2.0"
+chrono.workspace = true
+chrono-tz = "0.10"
+md-5.workspace = true
 novarocks-type-contract.workspace = true
+novarocks-function-contract.workspace = true
+novarocks-constant-contract.workspace = true
+num-traits.workspace = true
+rand.workspace = true
+ryu.workspace = true
 sha2.workspace = true
+sm3 = "0.4"
+
+twox-hash = "2.1"

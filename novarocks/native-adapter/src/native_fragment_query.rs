@@ -31,13 +31,15 @@ use novarocks_execution::runtime::fragment::io::{
 };
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime::profile::Profiler;
+use novarocks_execution::runtime::query_memory::{QueryMemoryBinding, QueryMemoryBindingError};
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_memory::{LimitDimension, MemoryAuthority};
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 use novarocks_worker::query_context::{
-    QueryContextManager, QueryExecutionKey, query_context_manager,
+    QueryContextManager, QueryExecutionKey, QueryMemoryAccount, QueryMemoryAccountError,
+    query_context_manager,
 };
 use novarocks_worker::sink_commit::WorkerSinkCommitPort;
 
@@ -127,6 +129,7 @@ impl NativeFragmentQueryRuntime {
         self
     }
 
+    /// Compatibility boundary retaining the original full admission diagnostic.
     pub fn prepare_admission_execution(
         &self,
         execution_id: QueryExecutionId,
@@ -136,19 +139,42 @@ impl NativeFragmentQueryRuntime {
         exec_mem_limit: Option<i64>,
         runtime_filter: Option<RuntimeFilterSessionRef>,
     ) -> Result<NativeFragmentAdmissionResources, String> {
-        let execution = execution_key(execution_id);
-        self.manager.ensure_native_context_execution(
-            execution,
-            false,
+        self.prepare_admission_execution_typed(
+            execution_id,
+            fragment_instance_id,
             delivery_expire,
             query_expire,
-        )?;
+            exec_mem_limit,
+            runtime_filter,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn prepare_admission_execution_typed(
+        &self,
+        execution_id: QueryExecutionId,
+        fragment_instance_id: UniqueId,
+        delivery_expire: Duration,
+        query_expire: Duration,
+        exec_mem_limit: Option<i64>,
+        runtime_filter: Option<RuntimeFilterSessionRef>,
+    ) -> Result<NativeFragmentAdmissionResources, NativeFragmentAdmissionError> {
+        let execution = execution_key(execution_id);
+        self.manager
+            .ensure_native_context_execution(execution, false, delivery_expire, query_expire)
+            .map_err(NativeFragmentAdmissionError::Existing)?;
         let query_mem_tracker = self
             .manager
             .query_mem_tracker_execution(execution)
-            .ok_or_else(|| "QueryContext missing mem_tracker".to_string())?;
-        if let Some(limit) = exec_mem_limit {
-            query_mem_tracker.install_limit_once(limit)?;
+            .ok_or_else(|| {
+                NativeFragmentAdmissionError::Existing(
+                    "QueryContext missing mem_tracker".to_string(),
+                )
+            })?;
+        let query_memory_account = if let Some(limit) = exec_mem_limit {
+            query_mem_tracker
+                .install_limit_once(limit)
+                .map_err(NativeFragmentAdmissionError::Existing)?;
             // The same number, stated on both mechanisms. Charges still live
             // on the tracker, so the account's own `L` is near zero and this
             // policy refuses nothing yet; that is deliberate. As later slices
@@ -156,11 +182,32 @@ impl NativeFragmentQueryRuntime {
             // account side grows, and their sum stays this one limit.
             let account = self
                 .manager
-                .ensure_query_account(execution, &self.memory_authority)?;
-            let limit_bytes = u64::try_from(limit)
-                .map_err(|_| format!("query memory limit must not be negative: {limit}"))?;
-            account.install_policy(limit_bytes, LimitDimension::Work);
-        }
+                .ensure_query_memory_account(execution, &self.memory_authority)
+                .map_err(NativeFragmentAdmissionError::MemoryAccount)?;
+            let limit_bytes = u64::try_from(limit).map_err(|_| {
+                NativeFragmentAdmissionError::Existing(format!(
+                    "query memory limit must not be negative: {limit}"
+                ))
+            })?;
+            account
+                .account()
+                .install_policy(limit_bytes, LimitDimension::Work);
+            account
+        } else {
+            // Query-owned work always has its real account. None installs no
+            // local policy and never clears an existing context's policy.
+            self.manager
+                .ensure_query_memory_account(execution, &self.memory_authority)
+                .map_err(NativeFragmentAdmissionError::MemoryAccount)?
+        };
+        let query_memory = Some(
+            bind_query_memory(
+                execution_id,
+                Arc::clone(&self.memory_authority),
+                query_memory_account,
+            )
+            .map_err(NativeFragmentAdmissionError::Binding)?,
+        );
         let fragment_label = format!(
             "fragment_{:x}_{:x}",
             fragment_instance_id.high(),
@@ -168,6 +215,7 @@ impl NativeFragmentQueryRuntime {
         );
         let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
         let resources = NativeFragmentAdmissionResources {
+            query_memory,
             query_mem_tracker,
             fragment_mem_tracker,
             runtime_filter,
@@ -260,13 +308,35 @@ fn execution_key(execution_id: QueryExecutionId) -> QueryExecutionKey {
     )
 }
 
+/// Exact host admission causes; memory refusals stay typed until task projection.
+#[derive(Debug)]
+pub(crate) enum NativeFragmentAdmissionError {
+    Existing(String),
+    MemoryAccount(QueryMemoryAccountError),
+    Binding(QueryMemoryBindingError),
+}
+impl std::fmt::Display for NativeFragmentAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Existing(error) => f.write_str(error),
+            Self::MemoryAccount(error) => error.fmt(f),
+            Self::Binding(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for NativeFragmentAdmissionError {}
+
 pub struct NativeFragmentAdmissionResources {
+    query_memory: Option<QueryMemoryBinding>,
     query_mem_tracker: Arc<MemTracker>,
     fragment_mem_tracker: Arc<MemTracker>,
     runtime_filter: Option<RuntimeFilterSessionRef>,
 }
 
 impl NativeFragmentAdmissionResources {
+    pub fn query_memory(&self) -> Option<&QueryMemoryBinding> {
+        self.query_memory.as_ref()
+    }
     pub fn query_mem_tracker(&self) -> Arc<MemTracker> {
         Arc::clone(&self.query_mem_tracker)
     }
@@ -290,7 +360,24 @@ impl NativeFragmentAdmissionResources {
             result_writer,
             event_sink,
         )
+        .with_query_memory(self.query_memory)
         .with_fragment_commit_port(Arc::new(WorkerSinkCommitPort))
         .with_debug_exec_node_output(crate::debug_environment::debug_exec_node_output())
     }
 }
+
+// The witness is issued while the Worker holds the exact context lock. This
+// check precedes capability construction; ExternalRef/CV/type do not author attempt.
+fn bind_query_memory(
+    execution: QueryExecutionId,
+    authority: Arc<MemoryAuthority>,
+    owner: QueryMemoryAccount,
+) -> Result<QueryMemoryBinding, QueryMemoryBindingError> {
+    if owner.execution() != execution_key(execution) {
+        return Err(QueryMemoryBindingError::OwnerAttemptMismatch);
+    }
+    QueryMemoryBinding::try_new(execution, authority, owner.into_account())
+}
+#[cfg(test)]
+#[path = "native_query_memory_transport_tests.rs"]
+mod memory_transport_tests;

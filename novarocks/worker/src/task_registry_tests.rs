@@ -186,8 +186,19 @@ impl RunnableTask for TestRunnable {
 /// handed to `install_receiver`, in call order. It is how these cases prove
 /// that the host was reached exactly once per winning round, never for a
 /// replay, and always with the winner's own body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparationFailureStage {
+    Receiver,
+    Capability,
+    Domain,
+    Submit,
+}
+
 #[derive(Default)]
 struct TestTaskHost {
+    preparation_rejection: Option<(PreparationFailureStage, TaskFailureCategory)>,
+    preparation_stages: Mutex<Vec<PreparationFailureStage>>,
+    capabilities_removed: AtomicUsize,
     retain_normal_close: bool,
     inbound_capabilities: Option<Arc<TaskInboundCapabilities>>,
     install_gate: Option<Arc<InstallGate>>,
@@ -210,6 +221,22 @@ struct TestTaskHost {
 }
 
 impl TestTaskHost {
+    fn enter_preparation_stage(&self, stage: PreparationFailureStage) -> Result<(), HostRejection> {
+        self.preparation_stages
+            .lock()
+            .expect("preparation stage log")
+            .push(stage);
+        if let Some((refused, category)) = self.preparation_rejection
+            && stage == refused
+        {
+            return Err(HostRejection::new(
+                category,
+                "ResourceExhausted: identical typed host diagnostic",
+            ));
+        }
+        Ok(())
+    }
+
     fn prepared_bodies(&self) -> Vec<Bytes> {
         self.prepared_bodies
             .lock()
@@ -255,6 +282,7 @@ impl TaskExecutionHost for TestTaskHost {
             .lock()
             .expect("test prepared bodies")
             .push(plan.to_bytes());
+        self.enter_preparation_stage(PreparationFailureStage::Receiver)?;
         if plan.bytes().as_ref() == REFUSED_PLAN {
             // A real host undoes its own local preparation before it refuses;
             // this one prepared nothing, so it has nothing to undo.
@@ -282,6 +310,7 @@ impl TaskExecutionHost for TestTaskHost {
     }
 
     fn install_inbound_capability(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
+        self.enter_preparation_stage(PreparationFailureStage::Capability)?;
         if let Some(capabilities) = &self.inbound_capabilities {
             capabilities.install(Arc::new(descriptor.clone()))?;
         }
@@ -300,6 +329,7 @@ impl TaskExecutionHost for TestTaskHost {
     }
 
     fn remove_inbound_capability(&self, descriptor: &TaskDescriptor) {
+        self.capabilities_removed.fetch_add(1, Ordering::SeqCst);
         if let Some((task, gate)) = &self.rollback_gate
             && descriptor.identity().task_id() == *task
         {
@@ -315,6 +345,7 @@ impl TaskExecutionHost for TestTaskHost {
         _descriptor: &TaskDescriptor,
         reporter: TaskStatusReporter,
     ) -> Result<Arc<dyn RunnableTask>, HostRejection> {
+        self.enter_preparation_stage(PreparationFailureStage::Submit)?;
         self.submitted.fetch_add(1, Ordering::SeqCst);
         self.reporters
             .lock()
@@ -330,6 +361,7 @@ impl TaskExecutionHost for TestTaskHost {
         _descriptor: &TaskDescriptor,
         domain: &TaskDomainUpdate,
     ) -> Result<Option<u64>, HostRejection> {
+        self.enter_preparation_stage(PreparationFailureStage::Domain)?;
         self.domains_applied.fetch_add(1, Ordering::SeqCst);
         Ok(match domain {
             TaskDomainUpdate::SplitAssignment(_) => Some(0),
@@ -2718,6 +2750,187 @@ fn accepted_preparation_preserves_context_fifo() {
             Bytes::from_static(STREAM_PLAN)
         ]
     );
+}
+
+#[test]
+fn accepted_preparation_preserves_host_category_phase_and_same_identity_across_all_stages() {
+    use PreparationFailureStage::{Capability, Domain, Receiver, Submit};
+    for (category_index, category) in [
+        TaskFailureCategory::Protocol,
+        TaskFailureCategory::Exchange,
+        TaskFailureCategory::Execution,
+        TaskFailureCategory::Internal,
+        TaskFailureCategory::ResourceExhausted,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (stage_index, stage) in [Receiver, Capability, Domain, Submit]
+            .into_iter()
+            .enumerate()
+        {
+            let fixture = Fixture::new(TestTaskHost {
+                preparation_rejection: Some((stage, category)),
+                ..TestTaskHost::default()
+            });
+            let execution = execution(90_000 + category_index as i64 * 4 + stage_index as i64);
+            establish(&fixture.registry, fixture.context(execution));
+            let identity = task(execution, fixture.backend);
+            let request = fixture.create(descriptor(identity), vec![split_batch(1, 1, 1)]);
+            assert_eq!(
+                fixture
+                    .registry
+                    .accept_create_task(&request, body(RESULT_PLAN))
+                    .outcome(),
+                OperationOutcome::Accepted
+            );
+            wait_for_accepted_state(&fixture.registry, &request, TaskState::Failed);
+            let replay = fixture
+                .registry
+                .accept_create_task(&request, body(STREAM_PLAN));
+            assert_eq!(replay.outcome(), OperationOutcome::Idempotent);
+            let status = replay
+                .acknowledgement()
+                .expect("same accepted terminal identity");
+            assert!(!status.installed());
+            let Some(TerminationDetail::Failed(failure)) = status.termination() else {
+                panic!("host refusal remains a failure");
+            };
+            assert_eq!(failure.category(), category);
+            assert_eq!(failure.phase(), TaskFailurePhase::Preparation);
+            assert_eq!(
+                failure.detail().as_str(),
+                "ResourceExhausted: identical typed host diagnostic"
+            );
+            assert_eq!(
+                fixture.task_host.prepared_bodies(),
+                vec![Bytes::from_static(RESULT_PLAN)]
+            );
+            assert_eq!(
+                *fixture.task_host.preparation_stages.lock().unwrap(),
+                [Receiver, Capability, Domain, Submit][..=stage_index]
+            );
+            assert_eq!(
+                fixture.task_host.receivers_removed.load(Ordering::SeqCst),
+                usize::from(stage != Receiver)
+            );
+            assert_eq!(
+                fixture
+                    .task_host
+                    .capabilities_removed
+                    .load(Ordering::SeqCst),
+                1
+            );
+            assert_eq!(fixture.task_host.submitted.load(Ordering::SeqCst), 0);
+            let cancel = CancelTask::new(
+                TaskOperationId::new_v7(),
+                identity,
+                CancelReason::UpstreamNoLongerNeeded,
+            );
+            fixture.registry.cancel_task(&cancel);
+            let after = fixture
+                .registry
+                .accept_create_task(&request, body(REFUSED_PLAN));
+            assert_eq!(after.acknowledgement(), replay.acknowledgement());
+            for _ in 0..1000 {
+                if fixture.registry.preparation_snapshot().workers == 0 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let charges = fixture.registry.preparation_snapshot();
+            assert_eq!(charges.workers, 0);
+            assert_eq!(charges.positions, 0);
+            assert_eq!(charges.context_positions, 0);
+            assert_eq!(charges.bytes, 0);
+        }
+    }
+}
+
+#[test]
+fn accepted_preparation_category_retention_keeps_original_synchronous_operation_verdicts() {
+    use PreparationFailureStage::{Capability, Domain, Receiver, Submit};
+    for category in [
+        TaskFailureCategory::Protocol,
+        TaskFailureCategory::Exchange,
+        TaskFailureCategory::Execution,
+        TaskFailureCategory::Internal,
+        TaskFailureCategory::ResourceExhausted,
+    ] {
+        for stage in [Receiver, Capability, Domain, Submit] {
+            let fixture = Fixture::new(TestTaskHost {
+                preparation_rejection: Some((stage, category)),
+                ..TestTaskHost::default()
+            });
+            let execution = execution(90_100);
+            establish(&fixture.registry, fixture.context(execution));
+            let request = fixture.create(
+                descriptor(task(execution, fixture.backend)),
+                vec![split_batch(1, 1, 1)],
+            );
+            let refused = fixture.registry.create_task(&request, body(RESULT_PLAN));
+            let expected = if matches!(stage, Domain | Submit)
+                && category == TaskFailureCategory::ResourceExhausted
+            {
+                OperationOutcome::ResourceExhausted
+            } else {
+                OperationOutcome::InvalidStateOrRequest
+            };
+            assert_eq!(refused.outcome(), expected, "{stage:?} {category:?}");
+            assert_eq!(fixture.task_host.submitted.load(Ordering::SeqCst), 0);
+            // A synchronous refusal never consumed this task identity.
+            assert_eq!(fixture.registry.preparation_snapshot().positions, 0);
+        }
+    }
+}
+
+#[test]
+fn accepted_preparation_stop_before_host_refusal_keeps_original_cancel_winner() {
+    let gate = Arc::new(InstallGate::held());
+    let fixture = Fixture::new(TestTaskHost {
+        install_gate: Some(Arc::clone(&gate)),
+        preparation_rejection: Some((
+            PreparationFailureStage::Receiver,
+            TaskFailureCategory::Internal,
+        )),
+        ..TestTaskHost::default()
+    });
+    let execution = execution(90_101);
+    establish(&fixture.registry, fixture.context(execution));
+    let identity = task(execution, fixture.backend);
+    let request = fixture.create(descriptor(identity), Vec::new());
+    assert_eq!(
+        fixture
+            .registry
+            .accept_create_task(&request, body(RESULT_PLAN))
+            .outcome(),
+        OperationOutcome::Accepted
+    );
+    gate.wait_until_entered();
+    assert_eq!(
+        fixture
+            .registry
+            .cancel_task(&CancelTask::new(
+                TaskOperationId::new_v7(),
+                identity,
+                CancelReason::UpstreamNoLongerNeeded
+            ))
+            .outcome(),
+        OperationOutcome::Accepted
+    );
+    gate.release();
+    wait_for_accepted_state(&fixture.registry, &request, TaskState::Canceled);
+    let replay = fixture
+        .registry
+        .accept_create_task(&request, body(STREAM_PLAN));
+    assert_eq!(replay.outcome(), OperationOutcome::Idempotent);
+    assert_eq!(
+        replay.acknowledgement().unwrap().termination(),
+        Some(&TerminationDetail::Canceled(
+            CancelReason::UpstreamNoLongerNeeded
+        ))
+    );
+    assert_eq!(fixture.task_host.submitted.load(Ordering::SeqCst), 0);
 }
 
 #[test]

@@ -31,11 +31,12 @@ use arrow::compute::{cast, take};
 use arrow::datatypes::{DataType, Field, Fields, TimeUnit};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, NaiveTime, Offset, Timelike};
+use novarocks_functions::calendar_numeric::numeric_datetime_literal_to_naive as datetime_literal_to_naive_datetime;
 use novarocks_type_contract::{
     DecimalOverflowPolicy, decimal_error_policy_cast_supported, is_checked_decimal_numeric_cast,
 };
 use novarocks_types::largeint;
-use num_traits::ToPrimitive;
+
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
@@ -45,81 +46,8 @@ use novarocks_types::value::variant::{
     variant_to_time_micros,
 };
 const UNIX_EPOCH_DAY_OFFSET: i32 = 719163;
-fn date32_to_date_literal(days: i32) -> Result<i32, String> {
-    let date = NaiveDate::from_num_days_from_ce_opt(UNIX_EPOCH_DAY_OFFSET + days)
-        .ok_or_else(|| format!("invalid Date32 value {days}"))?;
-    Ok(date.year() * 10000 + date.month() as i32 * 100 + date.day() as i32)
-}
-
-fn standardize_date_literal(value: i64) -> Option<i64> {
-    const YY_PART_YEAR: i64 = 70;
-    if value <= 0 {
-        return None;
-    }
-    if value >= 10000101000000 {
-        if value > 99999999999999 {
-            return None;
-        }
-        return Some(value);
-    }
-    if value < 101 {
-        return None;
-    }
-    if value <= (YY_PART_YEAR - 1) * 10000 + 1231 {
-        return Some((value + 20000000) * 1000000);
-    }
-    if value < YY_PART_YEAR * 10000 + 101 {
-        return None;
-    }
-    if value <= 991231 {
-        return Some((value + 19000000) * 1000000);
-    }
-    if value < 10000101 {
-        return None;
-    }
-    if value <= 99991231 {
-        return Some(value * 1000000);
-    }
-    if value < 101000000 {
-        return None;
-    }
-    if value <= (YY_PART_YEAR - 1) * 10000000000 + 1231235959 {
-        return Some(value + 20000000000000);
-    }
-    if value < YY_PART_YEAR * 10000000000 + 101000000 {
-        return None;
-    }
-    if value <= 991231235959 {
-        return Some(value + 19000000000000);
-    }
-    Some(value)
-}
-
-fn date_literal_to_date32(value: i64) -> Result<i32, String> {
-    let standardized =
-        standardize_date_literal(value).ok_or_else(|| format!("invalid date literal {value}"))?;
-    let date_part = standardized / 1_000_000;
-    let time_part = standardized % 1_000_000;
-    let year = (date_part / 10000) as i32;
-    let month = ((date_part / 100) % 100) as u32;
-    let day = (date_part % 100) as u32;
-    let hour = (time_part / 10000) as i32;
-    let minute = ((time_part / 100) % 100) as i32;
-    let second = (time_part % 100) as i32;
-    if hour > 23 || minute > 59 || second > 59 {
-        return Err(format!("invalid date literal {value}"));
-    }
-    let date = NaiveDate::from_ymd_opt(year, month, day)
-        .ok_or_else(|| format!("invalid date literal {value}"))?;
-    Ok(date.num_days_from_ce() - UNIX_EPOCH_DAY_OFFSET)
-}
-
 fn pow10_i128(scale: u32) -> Option<i128> {
-    let mut out: i128 = 1;
-    for _ in 0..scale {
-        out = out.checked_mul(10)?;
-    }
-    Some(out)
+    novarocks_functions::legacy_decimal::checked_pow10_i128(scale as usize)
 }
 
 fn decimal128_to_i64_literal(value: i128, scale: i8) -> Option<i64> {
@@ -155,59 +83,11 @@ fn decimal256_to_i128_literal(value: i256, scale: i8) -> Option<i128> {
 }
 
 fn format_decimal_with_scale(unscaled: i128, scale: i8) -> String {
-    if scale <= 0 {
-        return unscaled.to_string();
-    }
-    let scale = scale as usize;
-    let abs = unscaled.abs().to_string();
-    if abs.len() <= scale {
-        let frac = format!("{:0>width$}", abs, width = scale);
-        if unscaled < 0 {
-            format!("-0.{}", frac)
-        } else {
-            format!("0.{}", frac)
-        }
-    } else {
-        let split = abs.len() - scale;
-        let int_part = &abs[..split];
-        let frac_part = &abs[split..];
-        if unscaled < 0 {
-            format!("-{}.{}", int_part, frac_part)
-        } else {
-            format!("{}.{}", int_part, frac_part)
-        }
-    }
+    novarocks_functions::builtin::string_extended::format_decimal_with_scale(unscaled, scale)
 }
 
 fn format_decimal256_with_scale(unscaled: i256, scale: i8) -> String {
-    if scale <= 0 {
-        return unscaled.to_string();
-    }
-    let scale = scale as usize;
-    let negative = unscaled.is_negative();
-    let abs = if negative {
-        unscaled.checked_neg().unwrap_or(unscaled)
-    } else {
-        unscaled
-    };
-    let abs_str = abs.to_string();
-    if abs_str.len() <= scale {
-        let frac = format!("{:0>width$}", abs_str, width = scale);
-        if negative {
-            format!("-0.{}", frac)
-        } else {
-            format!("0.{}", frac)
-        }
-    } else {
-        let split = abs_str.len() - scale;
-        let int_part = &abs_str[..split];
-        let frac_part = &abs_str[split..];
-        if negative {
-            format!("-{}.{}", int_part, frac_part)
-        } else {
-            format!("{}.{}", int_part, frac_part)
-        }
-    }
+    novarocks_functions::builtin::string_extended::format_decimal256_with_scale(unscaled, scale)
 }
 
 fn numeric_largeint_literal_at(array: &ArrayRef, row: usize) -> Result<Option<i128>, String> {
@@ -322,23 +202,6 @@ fn cast_numeric_to_largeint_binary_array(array: &ArrayRef) -> Result<ArrayRef, S
         values.push(numeric_largeint_literal_at(array, row)?);
     }
     largeint::array_from_i128(&values)
-}
-
-fn datetime_literal_to_naive_datetime(value: i64) -> Option<NaiveDateTime> {
-    let standardized = standardize_date_literal(value)?;
-    let date_part = standardized / 1_000_000;
-    let time_part = standardized % 1_000_000;
-
-    let year = (date_part / 10_000) as i32;
-    let month = ((date_part / 100) % 100) as u32;
-    let day = (date_part % 100) as u32;
-    let hour = (time_part / 10_000) as u32;
-    let minute = ((time_part / 100) % 100) as u32;
-    let second = (time_part % 100) as u32;
-
-    let date = NaiveDate::from_ymd_opt(year, month, day)?;
-    let time = NaiveTime::from_hms_opt(hour, minute, second)?;
-    Some(date.and_time(time))
 }
 
 fn is_numeric_datetime_source(ty: &DataType) -> bool {
@@ -541,8 +404,9 @@ fn cast_date32_to_float64(arr: &Date32Array) -> Result<ArrayRef, String> {
             builder.append_null();
             continue;
         }
-        let literal = date32_to_date_literal(arr.value(i))?;
-        builder.append_value(literal as f64);
+        builder.append_value(novarocks_functions::date_float_cast::value_f64(
+            arr.value(i),
+        )?);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -554,8 +418,9 @@ fn cast_date32_to_float32(arr: &Date32Array) -> Result<ArrayRef, String> {
             builder.append_null();
             continue;
         }
-        let literal = date32_to_date_literal(arr.value(i))?;
-        builder.append_value(literal as f32);
+        builder.append_value(novarocks_functions::date_float_cast::value_f32(
+            arr.value(i),
+        )?);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -567,13 +432,9 @@ fn cast_float64_to_date32(arr: &Float64Array) -> Result<ArrayRef, String> {
             builder.append_null();
             continue;
         }
-        let value = arr.value(i);
-        if !value.is_finite() {
-            return Err(format!("invalid date literal {value}"));
-        }
-        let literal = value as i64;
-        let days = date_literal_to_date32(literal)?;
-        builder.append_value(days);
+        builder.append_value(novarocks_functions::float_date_cast::value_f64(
+            arr.value(i),
+        )?);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -585,13 +446,9 @@ fn cast_float32_to_date32(arr: &Float32Array) -> Result<ArrayRef, String> {
             builder.append_null();
             continue;
         }
-        let value = arr.value(i) as f64;
-        if !value.is_finite() {
-            return Err(format!("invalid date literal {value}"));
-        }
-        let literal = value as i64;
-        let days = date_literal_to_date32(literal)?;
-        builder.append_value(days);
+        builder.append_value(novarocks_functions::float_date_cast::value_f32(
+            arr.value(i),
+        )?);
     }
     Ok(Arc::new(builder.finish()) as ArrayRef)
 }
@@ -621,10 +478,9 @@ fn sanitize_non_finite_float32(arr: &Float32Array) -> ArrayRef {
             continue;
         }
         let value = arr.value(i);
-        if !value.is_finite() {
-            builder.append_null();
-        } else {
-            builder.append_value(value);
+        match novarocks_functions::decimal_float_cast::finite_f32_value(value) {
+            None => builder.append_null(),
+            Some(value) => builder.append_value(value),
         }
     }
     Arc::new(builder.finish()) as ArrayRef
@@ -767,36 +623,11 @@ fn has_decimal_to_decimal_overflow(source: &ArrayRef, casted: &ArrayRef) -> bool
 }
 
 fn parse_time_string_to_seconds(raw: &str) -> Option<i64> {
-    let raw = raw.trim();
-    if raw.is_empty() || raw.contains('+') || raw.starts_with('-') {
-        return None;
-    }
-    let mut parts = raw.split(':');
-    let hour = parts.next()?.trim().parse::<i64>().ok()?;
-    let minute = parts.next()?.trim().parse::<i64>().ok()?;
-    let second = parts.next()?.trim().parse::<i64>().ok()?;
-    if parts.next().is_some()
-        || hour < 0
-        || minute < 0
-        || second < 0
-        || minute >= 60
-        || second >= 60
-    {
-        return None;
-    }
-    hour.checked_mul(3600)?
-        .checked_add(minute.checked_mul(60)?)?
-        .checked_add(second)
+    novarocks_functions::time_text_cast::parse_time_string_to_seconds(raw)
 }
 
 fn parse_datetime_string_to_seconds(raw: &str) -> Option<i64> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let dt = chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S").ok()?;
-    let t = dt.time();
-    Some((t.hour() as i64) * 3600 + (t.minute() as i64) * 60 + t.second() as i64)
+    novarocks_functions::time_text_cast::parse_datetime_string_to_seconds(raw)
 }
 
 fn parse_string_to_naive_datetime(raw: &str) -> Option<NaiveDateTime> {
@@ -900,26 +731,8 @@ fn parse_time_float_to_seconds(value: f64) -> Option<i64> {
     parse_time_integer_to_seconds(value.trunc() as i64)
 }
 
-fn seconds_from_timestamp(unit: &TimeUnit, value: i64) -> Option<i64> {
-    let micros = match unit {
-        TimeUnit::Second => value.checked_mul(1_000_000)?,
-        TimeUnit::Millisecond => value.checked_mul(1_000)?,
-        TimeUnit::Microsecond => value,
-        TimeUnit::Nanosecond => value / 1_000,
-    };
-    let seconds = micros.div_euclid(1_000_000);
-    let sub_micros = micros.rem_euclid(1_000_000) as u32;
-    let dt = DateTime::from_timestamp(seconds, sub_micros * 1000)?;
-    let t = dt.naive_utc().time();
-    Some((t.hour() as i64) * 3600 + (t.minute() as i64) * 60 + t.second() as i64)
-}
-
 fn seconds_to_time64_micro_array(seconds: Vec<Option<i64>>) -> Result<ArrayRef, String> {
-    let micros: Vec<Option<i64>> = seconds
-        .into_iter()
-        .map(|v| v.and_then(|s| s.checked_mul(1_000_000)))
-        .collect();
-    Ok(Arc::new(Time64MicrosecondArray::from(micros)) as ArrayRef)
+    novarocks_functions::time_text_cast::seconds_to_time64_micro_array(seconds)
 }
 
 fn parse_varchar_to_boolean_starrocks(value: &str) -> Option<bool> {
@@ -957,60 +770,11 @@ fn cast_utf8_to_boolean_array(arr: &StringArray) -> ArrayRef {
 }
 
 fn format_float64_for_varchar(value: f64) -> String {
-    if value == 0.0 {
-        return "0".to_string();
-    }
-    if value.is_nan() {
-        return "nan".to_string();
-    }
-    if value.is_infinite() {
-        return if value.is_sign_negative() {
-            "-inf".to_string()
-        } else {
-            "inf".to_string()
-        };
-    }
-    let mut buf = ryu::Buffer::new();
-    let formatted = buf.format(value);
-    normalize_float_string_for_varchar(formatted)
+    novarocks_functions::builtin::string_extended::format_float64_for_varchar(value)
 }
 
 fn format_float32_for_varchar(value: f32) -> String {
-    if value == 0.0 {
-        return "0".to_string();
-    }
-    if value.is_nan() {
-        return "nan".to_string();
-    }
-    if value.is_infinite() {
-        return if value.is_sign_negative() {
-            "-inf".to_string()
-        } else {
-            "inf".to_string()
-        };
-    }
-    let mut buf = ryu::Buffer::new();
-    let formatted = buf.format(value);
-    normalize_float_string_for_varchar(formatted)
-}
-
-fn normalize_float_string_for_varchar(formatted: &str) -> String {
-    let stripped = formatted.strip_suffix(".0").unwrap_or(formatted);
-    if let Some(exp_pos) = stripped.find('e') {
-        let mut out = String::with_capacity(stripped.len() + 1);
-        out.push_str(&stripped[..=exp_pos]);
-        if let Some(sign_or_digit) = stripped.as_bytes().get(exp_pos + 1) {
-            if *sign_or_digit == b'+' || *sign_or_digit == b'-' {
-                out.push_str(&stripped[exp_pos + 1..]);
-            } else {
-                out.push('+');
-                out.push_str(&stripped[exp_pos + 1..]);
-            }
-        }
-        out
-    } else {
-        stripped.to_string()
-    }
+    novarocks_functions::builtin::string_extended::format_float32_for_varchar(value)
 }
 
 fn cast_float64_to_utf8_array(arr: &Float64Array) -> ArrayRef {
@@ -1070,119 +834,15 @@ fn decimal256_value_within_precision(value: i256, precision: u8) -> bool {
 
 fn cast_float_to_decimal_with_rounding(
     len: usize,
-    mut value_at: impl FnMut(usize) -> Option<f64>,
+    value_at: impl FnMut(usize) -> Option<f64>,
     precision: u8,
     scale: i8,
 ) -> Result<ArrayRef, String> {
-    let scale_factor_f64 = if scale >= 0 {
-        let factor = pow10_i128(scale as u32).ok_or_else(|| {
-            format!(
-                "decimal scale overflow while casting float to DECIMAL: scale={}",
-                scale
-            )
-        })?;
-        factor as f64
-    } else {
-        let factor = pow10_i128((-scale) as u32).ok_or_else(|| {
-            format!(
-                "decimal scale overflow while casting float to DECIMAL: scale={}",
-                scale
-            )
-        })?;
-        1.0 / (factor as f64)
-    };
-    let effective_precision = precision;
-    let abs_limit = decimal_precision_limit(effective_precision).ok_or_else(|| {
-        format!(
-            "decimal precision overflow while casting float to DECIMAL: precision={}",
-            effective_precision
-        )
-    })?;
-
-    let mut values: Vec<Option<i128>> = Vec::with_capacity(len);
-    for row in 0..len {
-        let Some(v) = value_at(row) else {
-            values.push(None);
-            continue;
-        };
-        if !v.is_finite() {
-            values.push(None);
-            continue;
-        }
-
-        // Match StarRocks DecimalV3Cast::from_float: nearest integer with half-up behavior.
-        let delta = if v >= 0.0 { 0.5 } else { -0.5 };
-        let scaled = v * scale_factor_f64 + delta;
-        if !scaled.is_finite() {
-            values.push(None);
-            continue;
-        }
-
-        let unscaled_f = scaled.trunc();
-        if unscaled_f > (i128::MAX as f64) || unscaled_f < (i128::MIN as f64) {
-            values.push(None);
-            continue;
-        }
-        let unscaled = unscaled_f as i128;
-        if unscaled.unsigned_abs() >= abs_limit as u128 {
-            values.push(None);
-            continue;
-        }
-        values.push(Some(unscaled));
-    }
-
-    let wide = Decimal128Array::from(values)
-        .with_precision_and_scale(38, scale)
-        .map_err(|e| e.to_string())?;
-    retag_decimal_array(&wide, precision, scale)
+    novarocks_functions::float_decimal128::evaluate_legacy(len, value_at, precision, scale)
 }
 
 pub fn format_timestamp_for_varchar(unit: &TimeUnit, value: i64, tz: Option<&str>) -> String {
-    let timestamp_str = match unit {
-        TimeUnit::Second => {
-            let dt = DateTime::from_timestamp(value, 0)
-                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-            dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
-        }
-        TimeUnit::Millisecond => {
-            let seconds = value.div_euclid(1_000);
-            let millis = value.rem_euclid(1_000) as u32;
-            let dt = DateTime::from_timestamp(seconds, millis * 1_000_000)
-                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-            if millis == 0 {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
-            } else {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.3f").to_string()
-            }
-        }
-        TimeUnit::Microsecond => {
-            let seconds = value.div_euclid(1_000_000);
-            let micros = value.rem_euclid(1_000_000) as u32;
-            let dt = DateTime::from_timestamp(seconds, micros * 1_000)
-                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-            if micros == 0 {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
-            } else {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string()
-            }
-        }
-        TimeUnit::Nanosecond => {
-            let seconds = value.div_euclid(1_000_000_000);
-            let nanos = value.rem_euclid(1_000_000_000) as u32;
-            let dt = DateTime::from_timestamp(seconds, nanos)
-                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap());
-            if nanos == 0 {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S").to_string()
-            } else {
-                dt.naive_utc().format("%Y-%m-%d %H:%M:%S%.9f").to_string()
-            }
-        }
-    };
-    if let Some(tz) = tz {
-        format!("{timestamp_str} {tz}")
-    } else {
-        timestamp_str
-    }
+    novarocks_functions::builtin::string_extended::format_timestamp_for_varchar(unit, value, tz)
 }
 
 fn cast_timestamp_to_utf8_array(
@@ -1815,7 +1475,10 @@ fn cast_with_special_rules_with_field_schema(
         return Ok(new_null_array(&DataType::Null, array.len()));
     }
     if array.data_type() == &DataType::Null {
-        return Ok(new_null_array(target_type, array.len()));
+        return Ok(novarocks_functions::list_cast_core::null_source(
+            array.len(),
+            target_type,
+        ));
     }
     if !matches!(
         array.data_type(),
@@ -1922,10 +1585,6 @@ fn cast_with_special_rules_with_field_schema(
                 .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
             Ok(cast_float32_to_utf8_array(arr))
         }
-        (
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
-            DataType::Decimal128(target_precision, target_scale),
-        ) => cast_integral_to_decimal128_relaxed(array, *target_precision, *target_scale),
         (DataType::FixedSizeBinary(width), DataType::Decimal128(precision, scale))
             if *width == largeint::LARGEINT_BYTE_WIDTH =>
         {
@@ -2054,41 +1713,13 @@ fn cast_with_special_rules_with_field_schema(
             cast_list_to_map(array, target_entries, *ordered)
         }
         (DataType::List(_), DataType::List(target_field)) => {
-            let list = array
-                .as_any()
-                .downcast_ref::<ListArray>()
-                .ok_or_else(|| "failed to downcast to ListArray".to_string())?;
-            // A nested-field metadata change reuses every value, offset, and
-            // validity buffer. It neither parses JSON nor reinterprets Utf8.
-            if list.values().data_type() == target_field.data_type() {
-                return Ok(Arc::new(ListArray::new(
-                    target_field.clone(),
-                    list.offsets().clone(),
-                    list.values().clone(),
-                    list.nulls().cloned(),
-                )) as ArrayRef);
-            }
-            // Empty list values can be safely retagged to any target item type.
-            // This matches StarRocks behavior for casts around empty array literals.
-            let cast_values = if list.values().is_empty() {
-                arrow::array::new_empty_array(target_field.data_type())
-            } else if list.values().null_count() == list.values().len() {
-                // Preserve all-null list literals while adapting the target item type.
-                arrow::array::new_null_array(target_field.data_type(), list.values().len())
-            } else {
+            novarocks_functions::list_cast_core::cast(array, target_field, &mut |child, target| {
                 cast_with_special_rules_with_field_schema(
-                    list.values(),
-                    target_field.data_type(),
+                    child,
+                    target,
                     target_field_schema.and_then(ChunkFieldSchema::list_item),
-                )?
-            };
-            let out = ListArray::new(
-                target_field.clone(),
-                OffsetBuffer::new(list.value_offsets().to_vec().into()),
-                cast_values,
-                list.nulls().cloned(),
-            );
-            Ok(Arc::new(out) as ArrayRef)
+                )
+            })
         }
         (DataType::Struct(_), DataType::Struct(target_fields)) => {
             cast_struct_to_struct(array, target_fields)
@@ -2351,13 +1982,7 @@ fn retag_decimal_array(
     precision: u8,
     scale: i8,
 ) -> Result<ArrayRef, String> {
-    let data = array
-        .to_data()
-        .into_builder()
-        .data_type(DataType::Decimal128(precision, scale))
-        .build()
-        .map_err(|e| e.to_string())?;
-    Ok(make_array(data))
+    novarocks_functions::decimal128_rescale::retag_legacy(array, precision, scale)
 }
 
 fn retag_decimal256_array(
@@ -2374,148 +1999,18 @@ fn retag_decimal256_array(
     Ok(make_array(data))
 }
 
-fn cast_integral_to_decimal128_relaxed(
-    child_array: &ArrayRef,
-    target_precision: u8,
-    target_scale: i8,
-) -> Result<ArrayRef, String> {
-    let upscale = if target_scale > 0 {
-        Some(
-            pow10_i128(target_scale as u32)
-                .ok_or_else(|| "decimal scale overflow while casting integral".to_string())?,
-        )
-    } else {
-        None
-    };
-    let downscale = if target_scale < 0 {
-        Some(
-            pow10_i128((-target_scale) as u32)
-                .ok_or_else(|| "decimal scale overflow while casting integral".to_string())?,
-        )
-    } else {
-        None
-    };
-
-    let precision_limit = 10_u128
-        .checked_pow(u32::from(target_precision))
-        .filter(|_| (1..=38).contains(&target_precision))
-        .ok_or_else(|| "invalid frozen Decimal128 CAST precision".to_string())?;
-    let mut values = Vec::with_capacity(child_array.len());
-    for row in 0..child_array.len() {
-        if child_array.is_null(row) {
-            values.push(None);
-            continue;
-        }
-        let mut value = match child_array.data_type() {
-            DataType::Int8 => child_array
-                .as_any()
-                .downcast_ref::<Int8Array>()
-                .ok_or_else(|| "failed to downcast to Int8Array".to_string())?
-                .value(row) as i128,
-            DataType::Int16 => child_array
-                .as_any()
-                .downcast_ref::<Int16Array>()
-                .ok_or_else(|| "failed to downcast to Int16Array".to_string())?
-                .value(row) as i128,
-            DataType::Int32 => child_array
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .ok_or_else(|| "failed to downcast to Int32Array".to_string())?
-                .value(row) as i128,
-            DataType::Int64 => child_array
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| "failed to downcast to Int64Array".to_string())?
-                .value(row) as i128,
-            other => {
-                return Err(format!(
-                    "integral to DECIMAL cast unsupported source type: {:?}",
-                    other
-                ));
-            }
-        };
-
-        if let Some(factor) = upscale {
-            let Some(scaled) = value.checked_mul(factor) else {
-                values.push(None);
-                continue;
-            };
-            value = scaled;
-        } else if let Some(factor) = downscale {
-            value /= factor;
-        }
-
-        if value.unsigned_abs() >= precision_limit {
-            values.push(None);
-            continue;
-        }
-        values.push(Some(value));
-    }
-
-    let wide = Decimal128Array::from(values)
-        .with_precision_and_scale(38, target_scale)
-        .map_err(|e| e.to_string())?;
-    retag_decimal_array(&wide, target_precision, target_scale)
-}
-
 fn cast_decimal_to_decimal_relaxed(
     child_array: &ArrayRef,
     source_scale: i8,
     target_precision: u8,
     target_scale: i8,
 ) -> Result<ArrayRef, String> {
-    let arr = child_array
-        .as_any()
-        .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| "failed to downcast to Decimal128Array".to_string())?;
-    let precision_limit = 10_u128
-        .checked_pow(u32::from(target_precision))
-        .filter(|_| (1..=38).contains(&target_precision))
-        .ok_or_else(|| "invalid frozen Decimal128 CAST precision".to_string())?;
-    let mut values = Vec::with_capacity(arr.len());
-    for row in 0..arr.len() {
-        if arr.is_null(row) {
-            values.push(None);
-            continue;
-        }
-        let mut value = arr.value(row);
-        if source_scale < target_scale {
-            let factor = pow10_i128((target_scale - source_scale) as u32)
-                .ok_or_else(|| "decimal scale overflow while casting DECIMAL".to_string())?;
-            let Some(scaled) = value.checked_mul(factor) else {
-                values.push(None);
-                continue;
-            };
-            value = scaled;
-        } else if source_scale > target_scale {
-            let factor = pow10_i128((source_scale - target_scale) as u32)
-                .ok_or_else(|| "decimal scale overflow while casting DECIMAL".to_string())?;
-            let quotient = value / factor;
-            let remainder = value % factor;
-            let needs_round = remainder.abs().saturating_mul(2) >= factor;
-            value = if needs_round {
-                let carry = if value < 0 { -1 } else { 1 };
-                let Some(rounded) = quotient.checked_add(carry) else {
-                    values.push(None);
-                    continue;
-                };
-                rounded
-            } else {
-                quotient
-            };
-        }
-        if value.unsigned_abs() >= precision_limit {
-            values.push(None);
-            continue;
-        }
-        values.push(Some(value));
-    }
-
-    // Build with max precision first, then retag to FE-declared precision/scale.
-    let wide = Decimal128Array::from(values)
-        .with_precision_and_scale(38, target_scale)
-        .map_err(|e| e.to_string())?;
-    retag_decimal_array(&wide, target_precision, target_scale)
+    novarocks_functions::decimal128_rescale::relaxed_legacy(
+        child_array,
+        source_scale,
+        target_precision,
+        target_scale,
+    )
 }
 
 fn cast_decimal256_to_decimal256_relaxed(
@@ -2730,18 +2225,7 @@ fn decimal256_integral_values(arr: &Decimal256Array, source_scale: i8) -> Vec<Op
 }
 
 fn decimal256_to_f64(value: i256, scale: i8) -> f64 {
-    // Convert i256 to f64 using the same arithmetic approach as StarRocks BE:
-    // (double)unscaled / (double)scale_factor.
-    // This matches StarRocks's to_float() implementation in decimalv3.h which does:
-    //   *to_value = static_cast<To>(static_cast<double>(value) / static_cast<double>(scale_factor));
-    let unscaled_f64 = value.to_f64().unwrap_or(f64::NAN);
-    if scale <= 0 {
-        let factor = 10f64.powi((-scale) as i32);
-        unscaled_f64 * factor
-    } else {
-        let factor = 10f64.powi(scale as i32);
-        unscaled_f64 / factor
-    }
+    novarocks_functions::decimal_float_cast::decimal256_to_f64(value, scale)
 }
 
 fn cast_decimal256_to_float64(child_array: &ArrayRef, scale: i8) -> Result<ArrayRef, String> {
@@ -2772,7 +2256,9 @@ fn cast_decimal256_to_float32(child_array: &ArrayRef, scale: i8) -> Result<Array
         } else {
             // Convert to f64 first for precision, then narrow to f32.
             // f64->f32 narrowing preserves +inf/-inf for out-of-range values.
-            values.push(Some(decimal256_to_f64(arr.value(row), scale) as f32));
+            values.push(Some(
+                novarocks_functions::decimal_float_cast::decimal256_to_f32(arr.value(row), scale),
+            ));
         }
     }
     Ok(Arc::new(Float32Array::from(values)) as ArrayRef)
@@ -3061,69 +2547,17 @@ fn is_decimal_type(data_type: &DataType) -> bool {
 }
 
 fn checked_numeric_cast_has_overflow(source: &ArrayRef, casted: &ArrayRef) -> Result<bool, String> {
-    if source.len() != casted.len() {
-        return Err("checked decimal CAST length mismatch".to_string());
-    }
-    for row in 0..source.len() {
-        if source.is_null(row) || !casted.is_null(row) {
-            continue;
-        }
-        // Non-finite input is invalid input, distinct from overflow of a finite number.
-        let finite = match source.data_type() {
-            DataType::Float32 => source
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "checked CAST Float32 downcast failed".to_string())?
-                .value(row)
-                .is_finite(),
-            DataType::Float64 => source
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "checked CAST Float64 downcast failed".to_string())?
-                .value(row)
-                .is_finite(),
-            _ => true,
-        };
-        if finite {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    novarocks_functions::decimal128_rescale::checked_numeric_cast_has_overflow_legacy(
+        source, casted,
+    )
 }
 
 /// Enforce a declared decimal target even on same-scale/retag conversion paths.
 /// Limits are frozen metadata and computed once, before iterating values.
 fn enforce_declared_decimal_precision(array: ArrayRef) -> Result<ArrayRef, String> {
     match array.data_type() {
-        DataType::Decimal128(precision, scale) => {
-            let (precision, scale) = (*precision, *scale);
-            let limit = 10_u128
-                .checked_pow(u32::from(precision))
-                .filter(|_| (1..=38).contains(&precision))
-                .ok_or_else(|| "invalid frozen Decimal128 CAST precision".to_string())?;
-            let source = array
-                .as_any()
-                .downcast_ref::<Decimal128Array>()
-                .ok_or_else(|| "checked CAST Decimal128 downcast failed".to_string())?;
-            if (0..source.len())
-                .all(|row| source.is_null(row) || source.value(row).unsigned_abs() < limit)
-            {
-                return Ok(array);
-            }
-            let values = (0..source.len())
-                .map(|row| {
-                    if source.is_null(row) || source.value(row).unsigned_abs() >= limit {
-                        None
-                    } else {
-                        Some(source.value(row))
-                    }
-                })
-                .collect::<Vec<_>>();
-            Ok(Arc::new(
-                Decimal128Array::from(values)
-                    .with_precision_and_scale(precision, scale)
-                    .map_err(|error| error.to_string())?,
-            ))
+        DataType::Decimal128(..) => {
+            novarocks_functions::decimal128_rescale::enforce_precision_legacy(array)
         }
         DataType::Decimal256(precision, scale) => {
             let (precision, scale) = (*precision, *scale);
@@ -3155,6 +2589,10 @@ fn enforce_declared_decimal_precision(array: ArrayRef) -> Result<ArrayRef, Strin
     }
 }
 
+#[cfg(test)]
+#[path = "cast_numeric_oracle_tests.rs"]
+mod cast_numeric_oracle_tests;
+
 pub fn eval(
     arena: &ExprArena,
     cast_expr: ExprId,
@@ -3175,6 +2613,30 @@ pub fn eval(
     }
 
     let child_array = arena.eval(child, chunk)?;
+    if let (DataType::Decimal128(..), DataType::Decimal128(precision, scale)) =
+        (child_array.data_type(), &target_type)
+    {
+        return novarocks_functions::decimal128_rescale::evaluate_legacy(
+            &child_array,
+            *precision,
+            *scale,
+            decimal_overflow_policy,
+            arena.allow_throw_exception(),
+        );
+    }
+    if matches!(
+        child_array.data_type(),
+        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
+    ) && let DataType::Decimal128(precision, scale) = target_type
+    {
+        return novarocks_functions::integral_decimal128::evaluate_legacy(
+            &child_array,
+            precision,
+            scale,
+            decimal_overflow_policy,
+            arena.allow_throw_exception(),
+        );
+    }
     if is_checked_decimal_numeric_cast(child_array.data_type(), &target_type) {
         let casted = if child_array.data_type() == &target_type {
             child_array.clone()
@@ -3535,27 +2997,32 @@ fn eval_time_internal(
         });
     }
 
+    if matches!(
+        child_array.data_type(),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    ) {
+        let mode = if source_is_datetime {
+            novarocks_functions::time_text_cast::TimeTextParseMode::Datetime
+        } else {
+            novarocks_functions::time_text_cast::TimeTextParseMode::Duration
+        };
+        return novarocks_functions::time_text_cast::evaluate_arrays(
+            &child_array,
+            &target_type,
+            mode,
+        );
+    }
+    if matches!(
+        child_array.data_type(),
+        DataType::Date32 | DataType::Timestamp(_, _)
+    ) {
+        return novarocks_functions::time_calendar_cast::evaluate_arrays(
+            &child_array,
+            &target_type,
+        );
+    }
     let mut seconds = Vec::with_capacity(child_array.len());
     match child_array.data_type() {
-        DataType::Utf8 => {
-            let arr = child_array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    seconds.push(None);
-                } else {
-                    let raw = arr.value(i);
-                    let parsed = if source_is_datetime {
-                        parse_datetime_string_to_seconds(raw)
-                    } else {
-                        parse_time_string_to_seconds(raw)
-                    };
-                    seconds.push(parsed);
-                }
-            }
-        }
         DataType::Boolean => {
             let arr = child_array
                 .as_any()
@@ -3669,73 +3136,6 @@ fn eval_time_internal(
                 seconds.push(parse_time_integer_to_seconds(value as i64));
             }
         }
-        DataType::Date32 => {
-            let arr = child_array
-                .as_any()
-                .downcast_ref::<Date32Array>()
-                .ok_or_else(|| "failed to downcast to Date32Array".to_string())?;
-            for i in 0..arr.len() {
-                if arr.is_null(i) {
-                    seconds.push(None);
-                } else {
-                    seconds.push(Some(0));
-                }
-            }
-        }
-        DataType::Timestamp(unit, _) => match unit {
-            TimeUnit::Second => {
-                let arr = child_array
-                    .as_any()
-                    .downcast_ref::<TimestampSecondArray>()
-                    .ok_or_else(|| "failed to downcast to TimestampSecondArray".to_string())?;
-                for i in 0..arr.len() {
-                    if arr.is_null(i) {
-                        seconds.push(None);
-                    } else {
-                        seconds.push(seconds_from_timestamp(unit, arr.value(i)));
-                    }
-                }
-            }
-            TimeUnit::Millisecond => {
-                let arr = child_array
-                    .as_any()
-                    .downcast_ref::<TimestampMillisecondArray>()
-                    .ok_or_else(|| "failed to downcast to TimestampMillisecondArray".to_string())?;
-                for i in 0..arr.len() {
-                    if arr.is_null(i) {
-                        seconds.push(None);
-                    } else {
-                        seconds.push(seconds_from_timestamp(unit, arr.value(i)));
-                    }
-                }
-            }
-            TimeUnit::Microsecond => {
-                let arr = child_array
-                    .as_any()
-                    .downcast_ref::<TimestampMicrosecondArray>()
-                    .ok_or_else(|| "failed to downcast to TimestampMicrosecondArray".to_string())?;
-                for i in 0..arr.len() {
-                    if arr.is_null(i) {
-                        seconds.push(None);
-                    } else {
-                        seconds.push(seconds_from_timestamp(unit, arr.value(i)));
-                    }
-                }
-            }
-            TimeUnit::Nanosecond => {
-                let arr = child_array
-                    .as_any()
-                    .downcast_ref::<TimestampNanosecondArray>()
-                    .ok_or_else(|| "failed to downcast to TimestampNanosecondArray".to_string())?;
-                for i in 0..arr.len() {
-                    if arr.is_null(i) {
-                        seconds.push(None);
-                    } else {
-                        seconds.push(seconds_from_timestamp(unit, arr.value(i)));
-                    }
-                }
-            }
-        },
         _ => {
             let casted = cast(child_array.as_ref(), &target_type).map_err(|e| {
                 format!(
@@ -4040,8 +3440,13 @@ mod tests {
     };
     use arrow::datatypes::{Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use novarocks_functions::calendar_numeric::{
+        numeric_datetime_literal_to_naive as datetime_literal_to_naive_datetime,
+        standardize_numeric_datetime_literal as standardize_date_literal,
+    };
     use novarocks_types::SlotId;
     use novarocks_types::largeint;
+
     use novarocks_types::logical::{LogicalType, field_with_logical_type};
     use std::sync::Arc;
 
@@ -4520,9 +3925,7 @@ mod tests {
 
     #[test]
     fn list_json_metadata_cast_preserves_sliced_values_offsets_and_validity_buffers() {
-        use novarocks_types::logical::{
-            LogicalType, field_with_logical_type, logical_type_of_field,
-        };
+        use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
         for values in [
             Arc::new(StringArray::from(vec![
                 Some("{\"a\":1}"),
@@ -4860,6 +4263,57 @@ mod tests {
     }
 
     // IV3-7 Task 12: nanosecond timestamp cast semantics
+
+    #[test]
+    fn cast_seconds_and_milliseconds_to_micros_keep_checked_overflow_nulls() {
+        for (source, factor) in [
+            (TimeUnit::Second, 1_000_000_i64),
+            (TimeUnit::Millisecond, 1_000),
+        ] {
+            for zone in [None, Some(Arc::<str>::from("UTC"))] {
+                let boundary = i64::MAX / factor;
+                let values = vec![
+                    Some(1),
+                    Some(-1),
+                    Some(boundary),
+                    Some(boundary + 1),
+                    Some(i64::MAX),
+                    Some(i64::MIN),
+                    None,
+                ];
+                let array: ArrayRef = match source {
+                    TimeUnit::Second => {
+                        Arc::new(TimestampSecondArray::from(values).with_timezone_opt(zone))
+                    }
+                    TimeUnit::Millisecond => {
+                        Arc::new(TimestampMillisecondArray::from(values).with_timezone_opt(zone))
+                    }
+                    _ => unreachable!(),
+                };
+                let out = cast_with_special_rules(
+                    &array,
+                    &DataType::Timestamp(TimeUnit::Microsecond, None),
+                )
+                .unwrap();
+                let out = out
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                    .unwrap();
+                assert_eq!(
+                    out.iter().collect::<Vec<_>>(),
+                    [
+                        Some(factor),
+                        Some(-factor),
+                        Some(boundary * factor),
+                        None,
+                        None,
+                        None,
+                        None
+                    ]
+                );
+            }
+        }
+    }
 
     #[test]
     fn cast_same_unit_timestamp_retags_timezone_metadata() {
@@ -5321,3 +4775,23 @@ mod intrinsic_cast_row_contract_tests {
         assert_eq!(result.null_count(), 2);
     }
 }
+
+#[cfg(test)]
+#[path = "cast_float_numeric_oracle_tests.rs"]
+mod cast_float_numeric_oracle_tests;
+
+#[cfg(test)]
+#[path = "cast_float_identity_oracle_tests.rs"]
+mod cast_float_identity_oracle_tests;
+
+#[cfg(test)]
+#[path = "cast_value_conversion_oracle_tests.rs"]
+mod cast_value_conversion_oracle_tests;
+
+#[cfg(test)]
+#[path = "cast_bool_oracle_tests.rs"]
+mod cast_bool_oracle_tests;
+
+#[cfg(test)]
+#[path = "cast_unsigned_oracle_tests.rs"]
+mod cast_unsigned_oracle_tests;

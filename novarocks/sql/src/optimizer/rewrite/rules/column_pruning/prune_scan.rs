@@ -23,6 +23,7 @@
 //! Also unions in any columns referenced by pushed-down predicates so that
 //! predicate evaluation is not broken by column pruning.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use crate::column_id::ColumnId;
@@ -48,7 +49,7 @@ fn collect_scalar_column_ids(
         ScalarNode::ColumnRef(column_id) => {
             out.insert(*column_id);
         }
-        ScalarNode::Literal(_) => {}
+        ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
         ScalarNode::BinaryOp { left, right, .. } => {
             collect_scalar_column_ids(arena, *left, out);
             collect_scalar_column_ids(arena, *right, out);
@@ -160,7 +161,11 @@ impl LogicalRewriteRule for PruneScanColumns {
         true
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             children,
@@ -200,21 +205,21 @@ impl LogicalRewriteRule for PruneScanColumns {
             .variant_columns
             .iter()
             .filter(|descriptor| {
-                needed.contains(&descriptor.synthetic_column_id)
-                    || pred_col_ids.contains(&descriptor.synthetic_column_id)
+                needed.contains(&descriptor.synthetic_column_id())
+                    || pred_col_ids.contains(&descriptor.synthetic_column_id())
             })
-            .map(|descriptor| descriptor.synthetic_column_id)
+            .map(|descriptor| descriptor.synthetic_column_id())
             .collect::<HashSet<_>>();
         let all_synthetic = node
             .variant_columns
             .iter()
-            .map(|descriptor| descriptor.synthetic_column_id)
+            .map(|descriptor| descriptor.synthetic_column_id())
             .collect::<HashSet<_>>();
         let variant_sources = node
             .variant_columns
             .iter()
-            .filter(|descriptor| retained_synthetic.contains(&descriptor.synthetic_column_id))
-            .map(|descriptor| descriptor.source_column_id)
+            .filter(|descriptor| retained_synthetic.contains(&descriptor.synthetic_column_id()))
+            .map(|descriptor| descriptor.source_column_id())
             .collect::<HashSet<_>>();
         let required_columns = node
             .columns
@@ -254,7 +259,7 @@ impl LogicalRewriteRule for PruneScanColumns {
         });
         let variant_count = node.variant_columns.len();
         node.variant_columns
-            .retain(|descriptor| retained_synthetic.contains(&descriptor.synthetic_column_id));
+            .retain(|descriptor| retained_synthetic.contains(&descriptor.synthetic_column_id()));
 
         let unchanged = node.required_columns.as_ref() == Some(&required_columns)
             && node.columns.len() == column_count
@@ -317,8 +322,11 @@ mod tests {
                 .map(|(name, id)| OutputColumn {
                     column_id: *id,
                     name: name.to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 })
                 .collect(),
@@ -337,10 +345,12 @@ mod tests {
         }
     }
 
-    fn ctx_with_arena() -> RewriteContext {
+    fn ctx_with_arena() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         );
         let arena = Rc::new(RefCell::new(ScalarArena::new()));
         ctx.set_scalar_arena(arena);
@@ -408,13 +418,15 @@ mod tests {
 
         // Build a scalar predicate: b > 0 (referencing id_b).
         let mut arena = ScalarArena::new();
-        let col_b = arena.intern(ScalarNode::ColumnRef(id_b), DataType::Int32, false);
+        let col_b = arena.intern(
+            ScalarNode::ColumnRef(id_b),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+        );
         let zero = arena.intern(
             ScalarNode::Literal(scalar::HashableLiteral(crate::analysis::LiteralValue::Int(
                 0,
             ))),
-            DataType::Int32,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         );
         let pred = arena.intern(
             ScalarNode::BinaryOp {
@@ -423,8 +435,7 @@ mod tests {
                 right: zero,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
         scan.predicates.push(pred);
 
@@ -437,6 +448,8 @@ mod tests {
         let mut ctx = RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         );
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         let result = rule.apply(expr, &mut ctx).unwrap();
@@ -513,52 +526,46 @@ mod tests {
         let mut scan = make_scan(&[("payload", source_id)]);
         scan.table.columns[0].data_type = DataType::LargeBinary;
         scan.table.columns[0].nullable = true;
-        scan.columns[0].data_type = DataType::LargeBinary;
-        scan.columns[0].nullable = true;
+        scan.columns[0].value_type.data_type = DataType::LargeBinary;
+        scan.columns[0].value_type.nullable = true;
         let source = TypedExpr {
             kind: ExprKind::ColumnRef {
                 column_id: source_id,
                 qualifier: None,
                 column: "payload".to_string(),
             },
-            data_type: DataType::LargeBinary,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::LargeBinary,
+                true,
+            ),
         };
         let path = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::String("$.id".to_string())),
-            data_type: DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         };
         let requested_type = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::String("bigint".to_string())),
-            data_type: DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         };
         let args = vec![source, path, requested_type];
         scan.columns.push(OutputColumn {
             column_id: synthetic_id,
             name: "__nr_var_payload_0".to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: true,
         });
-        scan.variant_columns.push(ScanVariantColumn {
-            source_column_id: source_id,
-            source_column: "payload".to_string(),
-            synthetic_column_id: synthetic_id,
-            synthetic_column: "__nr_var_payload_0".to_string(),
-            canonical_path: "$.id".to_string(),
-            requested_type: DataType::Int64,
-            requested_type_literal: "bigint".to_string(),
-            strict: true,
-            binding: crate::analysis::test_function_binding(
-                "variant_get",
-                &args,
-                DataType::Int64,
-                true,
-                novarocks_functions::FunctionVolatility::Immutable,
-            ),
-        });
+        scan.variant_columns.push(ScanVariantColumn::test_fixture(
+            source_id,
+            "payload".to_string(),
+            synthetic_id,
+            "__nr_var_payload_0".to_string(),
+            "$.id".to_string(),
+            DataType::Int64,
+            "bigint".to_string(),
+            true,
+            args[0].value_type.clone(),
+        ));
 
         let rule = PruneScanColumns;
         let mut ctx = ctx_with_arena();
@@ -588,27 +595,21 @@ mod tests {
         scan.columns.push(OutputColumn {
             column_id: synthetic_id,
             name: "__nr_var_payload_0".to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: true,
         });
-        scan.variant_columns.push(ScanVariantColumn {
-            source_column_id: source_id,
-            source_column: "payload".to_string(),
-            synthetic_column_id: synthetic_id,
-            synthetic_column: "__nr_var_payload_0".to_string(),
-            canonical_path: "$.id".to_string(),
-            requested_type: DataType::Int64,
-            requested_type_literal: "bigint".to_string(),
-            strict: true,
-            binding: crate::analysis::test_function_binding(
-                "variant_get",
-                &[],
-                DataType::Int64,
-                true,
-                novarocks_functions::FunctionVolatility::Immutable,
-            ),
-        });
+        scan.variant_columns.push(ScanVariantColumn::test_fixture(
+            source_id,
+            "payload".to_string(),
+            synthetic_id,
+            "__nr_var_payload_0".to_string(),
+            "$.id".to_string(),
+            DataType::Int64,
+            "bigint".to_string(),
+            true,
+            scan.columns[0].value_type.clone(),
+        ));
 
         let rule = PruneScanColumns;
         let mut ctx = ctx_with_arena();

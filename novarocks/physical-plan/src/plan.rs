@@ -17,16 +17,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use novarocks_type_contract::SemanticParameters;
+
 use novarocks_connector_contract::{
     ConnectorEncodedPayload, ConnectorRowMutationEffect, ConnectorWriteFieldToken,
     ConnectorWriteRouteId, WriteTargetOrdinal,
 };
 
 use crate::{
-    AggregateBinding, AggregateCallId, ArtifactRefId, EdgeId, ExprArena, ExprId, FragmentId,
-    NodeId, NullOrdering, PLAN_CONTRACT_REVISION, PlanVersionId, ProviderColumnReference, Relation,
-    RuntimeFilterId, SealedArtifactRef, SealedArtifactSinkSpec, SortDirection, SortExpr, ValueId,
-    ValueType,
+    AggregateBinding, AggregateCallId, EdgeId, ExprArena, ExprId, FragmentId, NodeId, NullOrdering,
+    PLAN_CONTRACT_REVISION, PlanVersionId, ProviderColumnReference, Relation, RuntimeFilterId,
+    SortDirection, SortExpr, ValueId, ValueType,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,7 +36,6 @@ pub enum WriterDerivedKind {
     AffectedRows,
     CommitFragment,
     ChangeEvent,
-    ArtifactReference,
     RelationAuxiliary,
     WriteTargetOrdinal,
     GroupingKey,
@@ -548,6 +548,9 @@ pub struct WriterTarget {
 #[derive(Clone, Debug, PartialEq)]
 pub struct WriterTargetField {
     pub token: ConnectorWriteFieldToken,
+    /// Exact provider name frozen alongside this token. It is validated
+    /// against the same private target before a runtime writer is created.
+    pub provider_name: Box<str>,
     pub input: ValueId,
     pub ty: ValueType,
     pub hidden: bool,
@@ -586,8 +589,10 @@ pub struct WriterAggregateCall {
 #[derive(Clone, Debug, PartialEq)]
 pub enum UnpivotConstant {
     Scalar(ExprId),
-    Int32List(Box<[i32]>),
-    Utf8Map(Box<[(Box<str>, Box<str>)]>),
+    /// Selected rows in the enclosing plan's original checked constant pools.
+    /// These addresses do not authorize a logical domain or reconstruct data.
+    Int32List(crate::ConstantReference),
+    Utf8Map(crate::ConstantReference),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -673,9 +678,12 @@ pub enum SortMode {
 /// Whether an aggregate's groups are complete when it emits them.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum AggregateGrouping {
-    /// Some later pass still combines these groups.
+    /// Later exact state consumers combine these groups. One key may be
+    /// emitted repeatedly within a lane, across drivers or across batches.
     Partial,
-    /// Each group is emitted once, finished.
+    /// The required grouping domain is complete and each full key is emitted
+    /// at most once by the entire task under its actual CompileProfile.
+    /// This covers every driver and does not imply SQL-value finalization.
     Complete,
 }
 
@@ -684,6 +692,21 @@ pub enum TopNPhase {
     Single,
     Partial { sequence: crate::TopNSequenceId },
     Final { sequence: crate::TopNSequenceId },
+}
+
+/// Exact unit counted and state responsibility of a TopN reduction.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TopNReduction {
+    Rows,
+    /// Limit counts distinct complete grouping keys. Every contribution for
+    /// each retained key is merged through these exact Intermediate calls.
+    /// Output states have new identities; no contribution is a passthrough.
+    /// This guarantees task-local uniqueness, not global group completion.
+    GroupedStates {
+        group_by: Box<[(ExprId, ValueId)]>,
+        calls: Box<[AggregateCall]>,
+        comparator: novarocks_type_contract::OrderedComparisonAlgorithm,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -758,8 +781,9 @@ pub enum NodeKind {
     /// that predicate count never becomes expression depth, and so that
     /// consumers that reason per conjunct - pushdown, residual responsibility,
     /// runtime-filter placement - read the conjuncts directly instead of
-    /// re-splitting a tree. Order is evaluation order and short-circuits at the
-    /// first `false`, exactly as [`crate::ExprKind::Conjunction`] does.
+    /// re-splitting a tree. Each predicate is a TruthOnly use; FALSE or NULL
+    /// decides rejection. Scheduling must preserve the exact effect and
+    /// conditional-domain responsibilities of each occurrence.
     Filter {
         predicates: Box<[ExprId]>,
     },
@@ -769,15 +793,10 @@ pub enum NodeKind {
     Aggregate {
         group_by: Box<[(ExprId, ValueId)]>,
         calls: Box<[AggregateCall]>,
-        /// Whether the groups this node emits are finished with.
-        ///
-        /// Every call already states its own phase and they agree, so this
-        /// repeats what they say -- except for an aggregate that has no call
-        /// at all. A `DISTINCT` is exactly that, and a local pass that only
-        /// drops duplicates ahead of a shuffle is as legitimate as the pass
-        /// that finishes the groups; without this the two are
-        /// indistinguishable and the local pass is asked to prove a
-        /// co-location it does not need.
+        /// Required grouping completion and task-wide output uniqueness.
+        /// Call finalization is independent: Complete may emit intermediate
+        /// states, while a finalizing call requires Complete. The compiler
+        /// must meet this requirement across the selected local DOP.
         grouping: AggregateGrouping,
     },
     HashJoin {
@@ -803,6 +822,7 @@ pub enum NodeKind {
         limit: u64,
         offset: u64,
         phase: TopNPhase,
+        reduction: TopNReduction,
     },
     Limit {
         limit: Option<u64>,
@@ -868,7 +888,27 @@ pub struct ScanReadBudget {
     pub max_batch_bytes: u64,
 }
 
+/// Borrow of the common grouping and exact aggregate-call contract.
+pub type AggregateContractRef<'a> = (&'a [(ExprId, ValueId)], &'a [AggregateCall]);
+
 impl NodeKind {
+    /// The one aggregate state contract, shared by ordinary aggregation and
+    /// key-budgeted reduction. No separate grouped-TopN binding vocabulary.
+    pub fn aggregate_contract(&self) -> Option<AggregateContractRef<'_>> {
+        match self {
+            Self::Aggregate {
+                group_by, calls, ..
+            }
+            | Self::TopN {
+                reduction:
+                    TopNReduction::GroupedStates {
+                        group_by, calls, ..
+                    },
+                ..
+            } => Some((group_by, calls)),
+            _ => None,
+        }
+    }
     pub(crate) fn expression_references(&self, output: &mut Vec<ExprId>) {
         match self {
             Self::Scan {
@@ -914,7 +954,23 @@ impl NodeKind {
                     }
                 }
             }
-            Self::TopN { order_by, .. } => output.extend(order_by.iter().map(|item| item.expr)),
+            Self::TopN {
+                order_by,
+                reduction,
+                ..
+            } => {
+                output.extend(order_by.iter().map(|item| item.expr));
+                if let TopNReduction::GroupedStates {
+                    group_by, calls, ..
+                } = reduction
+                {
+                    output.extend(group_by.iter().map(|(expr, _)| *expr));
+                    for call in calls {
+                        output.extend(call.arguments.iter().copied());
+                        output.extend(call.order_by.iter().map(|item| item.expr));
+                    }
+                }
+            }
             Self::Window(spec) => {
                 output.extend(spec.partition_by.iter().map(|item| item.expr));
                 output.extend(spec.order_by.iter().map(|item| item.expr));
@@ -997,7 +1053,6 @@ pub enum FragmentSink {
         effect: ValueId,
         routes: Box<[ChangeStreamRoute]>,
     },
-    SealedArtifact(Box<SealedArtifactSinkSpec>),
     Noop,
 }
 
@@ -1011,9 +1066,24 @@ pub struct Fragment {
     sink: FragmentSink,
     dop_domain: PipelineDopDomain,
     runtime_filters: Box<[RuntimeFilterId]>,
+    pub(crate) call_requests: crate::FragmentCallRequests,
 }
 
 impl Fragment {
+    pub(crate) fn into_parts(self) -> FragmentParts {
+        FragmentParts {
+            id: self.id,
+            root: self.root,
+            values: self.values,
+            expressions: self.expressions,
+            nodes: self.nodes,
+            sink: self.sink,
+            dop_domain: self.dop_domain,
+            runtime_filters: self.runtime_filters,
+            call_requests: self.call_requests,
+        }
+    }
+
     pub const fn id(&self) -> FragmentId {
         self.id
     }
@@ -1040,6 +1110,10 @@ impl Fragment {
 
     pub const fn dop_domain(&self) -> PipelineDopDomain {
         self.dop_domain
+    }
+
+    pub const fn call_requests(&self) -> &crate::FragmentCallRequests {
+        &self.call_requests
     }
 
     pub fn runtime_filters(&self) -> &[RuntimeFilterId] {
@@ -1146,10 +1220,6 @@ pub struct InboundFragmentCut {
     pub destination_node: NodeId,
     pub imports: Box<[CutImport]>,
     pub partitioning: EdgePartitioning,
-    /// Exact provider inputs proven upstream of this edge.
-    pub source_bindings: Box<[crate::ArtifactSourceBinding]>,
-    /// Whether the upstream row set can contain rows with no provider source.
-    pub has_source_free_rows: bool,
     pub change_stream_writer: Option<ChangeStreamWriterCut>,
     pub writer_result: Option<WriterResultCut>,
 }
@@ -1160,40 +1230,47 @@ pub struct OutboundFragmentCut {
     pub edge: EdgeId,
     pub kind: EdgeKind,
     pub destination_fragment: FragmentId,
+    /// The edge's destination ExchangeSource in the destination fragment: the
+    /// sender's routing address. FE derives it from the plan edge.
+    pub destination_node: NodeId,
     pub projection: Box<[CutValue]>,
     /// Exact source-to-destination value mapping at the peer boundary.
     pub destination_imports: Box<[CutImport]>,
     pub partitioning: EdgePartitioning,
-    /// Exact provider inputs proven upstream of this edge.
-    pub source_bindings: Box<[crate::ArtifactSourceBinding]>,
-    /// Whether the upstream row set can contain rows with no provider source.
-    pub has_source_free_rows: bool,
     pub change_stream_writer: Option<ChangeStreamWriterCut>,
     pub writer_result: Option<WriterResultCut>,
+}
+
+/// Which endpoint of one runtime filter a binding identity names.
+///
+/// The index is into that filter's own `producers` or `consumers`, so a
+/// binding identity resolves back to the exact endpoint it was minted for
+/// without a second lookup key.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RuntimeFilterBindingRole {
+    Producer(usize),
+    Consumer(usize),
+}
+
+/// One local runtime-filter endpoint and the plan-global binding identity
+/// [`crate::runtime_filter_bindings`] numbered it with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RuntimeFilterBindingCut {
+    pub binding_id: u32,
+    pub filter: RuntimeFilterId,
+    pub role: RuntimeFilterBindingRole,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FragmentCuts {
     pub inbound: Box<[InboundFragmentCut]>,
     pub outbound: Box<[OutboundFragmentCut]>,
-    /// Exact immutable artifacts consumed by this fragment.
-    pub artifact_refs: Box<[SealedArtifactRef]>,
     /// Complete static runtime-filter contracts with at least one local endpoint.
     pub runtime_filters: Box<[RuntimeFilter]>,
-    /// Exact immutable plan subgraph needed to recompute every attached
-    /// runtime-filter equality and scan-lineage proof without the rest of the
-    /// query plan.
-    pub runtime_filter_proof: RuntimeFilterProofGraph,
-}
-
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct RuntimeFilterProofGraph {
-    pub fragments: Box<[Fragment]>,
-    pub edges: Box<[Edge]>,
-    /// Complete filter contracts needed to prove blocking-wait closure. This
-    /// includes the locally attached filters and any filter attached to a
-    /// fragment on their transitive producer build dependency paths.
-    pub filters: Box<[RuntimeFilter]>,
+    /// Plan-global binding identities of every local runtime-filter endpoint,
+    /// in numbering order. One package cannot recompute them: the numbering
+    /// depends on every other fragment's attachments.
+    pub runtime_filter_bindings: Box<[RuntimeFilterBindingCut]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1516,19 +1593,29 @@ pub enum AnnotationSubject {
 }
 
 /// Complete immutable final physical plan.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct PhysicalPlan {
+    constants: crate::ConstantPools,
+    parameters: SemanticParameters,
     version: PlanVersionId,
     fragments: BTreeMap<FragmentId, Fragment>,
     edges: BTreeMap<EdgeId, Edge>,
     runtime_filters: BTreeMap<RuntimeFilterId, RuntimeFilter>,
     result_port: Option<ResultPort>,
-    artifact_refs: BTreeMap<ArtifactRefId, SealedArtifactRef>,
     required: RequiredContracts,
     annotations: Box<[PlanAnnotation]>,
 }
 
 impl PhysicalPlan {
+    pub fn constants(&self) -> &crate::ConstantPools {
+        &self.constants
+    }
+
+    /// The sole immutable parameter-value authority for this plan.
+    pub const fn parameters(&self) -> &SemanticParameters {
+        &self.parameters
+    }
+
     /// Freeze the final root purpose once the application has resolved the
     /// ordered render or domain facts. The complete plan is revalidated.
     pub fn with_root_output(
@@ -1576,10 +1663,6 @@ impl PhysicalPlan {
         self.result_port.as_ref()
     }
 
-    pub fn artifact_refs(&self) -> &BTreeMap<ArtifactRefId, SealedArtifactRef> {
-        &self.artifact_refs
-    }
-
     pub const fn required(&self) -> RequiredContracts {
         self.required
     }
@@ -1590,12 +1673,13 @@ impl PhysicalPlan {
 }
 
 pub(crate) struct PhysicalPlanParts {
+    pub constants: crate::ConstantPools,
+    pub parameters: SemanticParameters,
     pub version: PlanVersionId,
     pub fragments: BTreeMap<FragmentId, Fragment>,
     pub edges: BTreeMap<EdgeId, Edge>,
     pub runtime_filters: BTreeMap<RuntimeFilterId, RuntimeFilter>,
     pub result_port: Option<ResultPort>,
-    pub artifact_refs: BTreeMap<ArtifactRefId, SealedArtifactRef>,
     pub required: RequiredContracts,
     pub annotations: Box<[PlanAnnotation]>,
 }
@@ -1603,12 +1687,13 @@ pub(crate) struct PhysicalPlanParts {
 impl From<PhysicalPlanParts> for PhysicalPlan {
     fn from(parts: PhysicalPlanParts) -> Self {
         Self {
+            constants: parts.constants,
+            parameters: parts.parameters,
             version: parts.version,
             fragments: parts.fragments,
             edges: parts.edges,
             runtime_filters: parts.runtime_filters,
             result_port: parts.result_port,
-            artifact_refs: parts.artifact_refs,
             required: parts.required,
             annotations: parts.annotations,
         }
@@ -1624,6 +1709,7 @@ pub(crate) struct FragmentParts {
     pub sink: FragmentSink,
     pub dop_domain: PipelineDopDomain,
     pub runtime_filters: Box<[RuntimeFilterId]>,
+    pub call_requests: crate::FragmentCallRequests,
 }
 
 impl From<FragmentParts> for Fragment {
@@ -1637,6 +1723,7 @@ impl From<FragmentParts> for Fragment {
             sink: parts.sink,
             dop_domain: parts.dop_domain,
             runtime_filters: parts.runtime_filters,
+            call_requests: parts.call_requests,
         }
     }
 }

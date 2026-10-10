@@ -13,6 +13,7 @@ pub mod mem_tracker;
 pub mod observable;
 pub mod operator_statistics;
 pub mod profile;
+pub mod query_memory;
 pub mod query_options;
 pub mod runtime_state;
 pub mod scan_stream_metrics;
@@ -21,3 +22,6 @@ pub mod table_writer_metrics;
 pub use execution_runtime::{
     ExecutionRuntime, ExecutionRuntimeConfig, ExecutionRuntimeConfigError,
 };
+
+#[cfg(test)]
+mod kernel_memory_observation_tests;

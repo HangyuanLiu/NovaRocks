@@ -25,6 +25,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+novarocks-type-contract.workspace = true
 novarocks-query-application.workspace = true
 novarocks-workload-control.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

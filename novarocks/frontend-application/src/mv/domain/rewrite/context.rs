@@ -808,8 +808,7 @@ fn aggregate_execution_facts(
             .map(|column| {
                 SqlImvAggregateVisibleColumnFacts::try_new(
                     column.name().to_string(),
-                    column.data_type().clone(),
-                    column.nullable(),
+                    column.value_type().clone(),
                 )
             })
             .collect::<Result<_, _>>()?,
@@ -819,8 +818,7 @@ fn aggregate_execution_facts(
             .map(|column| {
                 SqlImvAggregateExecutionStateColumnFacts::try_new(
                     column.name().to_string(),
-                    column.data_type().clone(),
-                    column.nullable(),
+                    column.value_type().clone(),
                     column.visible_source_index(),
                     column.aggregate_index(),
                     aggregate_function_kind(column.aggregate_kind()),

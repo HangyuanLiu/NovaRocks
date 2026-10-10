@@ -151,6 +151,8 @@ pub enum SqlType {
     Int,
     BigInt,
     LargeInt,
+    /// An externally authored UUID value; this does not add a SQL type spelling.
+    Uuid,
     Float,
     Double,
     Decimal {

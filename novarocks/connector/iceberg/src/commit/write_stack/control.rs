@@ -2756,7 +2756,7 @@ fn write_statistics_contract(
     let mut requirements = Vec::new();
     for (ordinal, binding) in input.fields().into_iter().enumerate() {
         let field = binding.field();
-        let Some(field_id) = resolve_statistics_field(
+        let Some((field_id, value_type)) = resolve_statistics_field(
             iceberg_schema,
             &arrow_schema,
             field,
@@ -2771,8 +2771,7 @@ fn write_statistics_contract(
         let input = StatisticsScanColumn::try_new(
             ordinal,
             Arc::<str>::from(field.name().as_str()),
-            field.data_type().clone(),
-            field.is_nullable(),
+            value_type,
         )?;
         let artifact = StatisticsArtifactIdentity::try_new(
             vec![field_id],
@@ -2792,7 +2791,7 @@ fn resolve_statistics_field(
     arrow_schema: &arrow::datatypes::Schema,
     field: &arrow::datatypes::Field,
     row_lineage: bool,
-) -> Result<Option<i32>, ConnectorError> {
+) -> Result<Option<(i32, novarocks_type_contract::FunctionValueType)>, ConnectorError> {
     let candidates = iceberg_schema
         .as_struct()
         .fields()
@@ -2831,7 +2830,13 @@ fn resolve_statistics_field(
             field.name()
         )));
     }
-    Ok(Some(iceberg_field.id))
+    let value_type = crate::statistics_value_type::statistics_input_value_type(
+        iceberg_field,
+        arrow_schema.field(schema_ordinal),
+        field,
+    )
+    .map_err(invalid)?;
+    Ok(Some((iceberg_field.id, value_type)))
 }
 
 /// COW retains the already-loaded immutable generation. No capacity is minted.
@@ -2885,10 +2890,10 @@ impl std::ops::Deref for IcebergAdmissionStatisticsMetadata {
     }
 }
 
-#[path = "control/cow_begin_own.rs"]
-mod cow_begin_own;
 #[path = "control/cow_begin.rs"]
 pub(crate) mod cow_begin;
+#[path = "control/cow_begin_own.rs"]
+mod cow_begin_own;
 #[path = "control/cow_json.rs"]
 pub(crate) mod cow_json;
 
@@ -2979,7 +2984,7 @@ impl IcebergWriteSessionControl {
             ),
             _ => None,
         };
-        let (table, metadata) = match &staged {
+        let (table, metadata, cow_read_access) = match &staged {
             Some(staged) => {
                 if staged.namespace != namespace || staged.table != table_name {
                     return Err(invalid(
@@ -2989,6 +2994,7 @@ impl IcebergWriteSessionControl {
                 (
                     None,
                     IcebergAdmissionStatisticsMetadata::Owned(staged.metadata.clone()),
+                    None,
                 )
             }
             None => {
@@ -2996,6 +3002,16 @@ impl IcebergWriteSessionControl {
                     .runtime
                     .load_table_for_request(namespace, table_name, &request.context)
                     .map_err(|error| unavailable(error.to_string()))?;
+                let cow_read_access = if matches!(
+                    &request.flavor,
+                    ConnectorWriteSessionFlavor::CopyOnWrite { .. }
+                ) {
+                    Some(Arc::new(
+                        crate::loaded_table::IcebergAttemptTableAccess::freeze(physical.clone()),
+                    ))
+                } else {
+                    None
+                };
                 let table = physical.into_table();
                 let metadata = IcebergAdmissionStatisticsMetadata::from_loaded_table(
                     &table,
@@ -3004,7 +3020,7 @@ impl IcebergWriteSessionControl {
                         ConnectorWriteSessionFlavor::CopyOnWrite { .. }
                     ),
                 );
-                (Some(table), metadata)
+                (Some(table), metadata, cow_read_access)
             }
         };
         if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } =
@@ -3316,7 +3332,12 @@ impl IcebergWriteSessionControl {
                             table_name,
                             metadata: &metadata,
                             snapshot_id,
-                            base_files: self.frozen_base_data_files(table, snapshot_id)?,
+                            base_files: self.frozen_base_data_files(
+                                table, snapshot_id,
+                                cow_read_access.as_ref().ok_or_else(|| invalid(
+                                    "Iceberg copy-on-write source lost its original access recipe"
+                                ))?,
+                            )?,
                             input: &material.input,
                             base_version_digest,
                             max_handle_payload_bytes: request.context.max_handle_payload_bytes(),
@@ -3362,13 +3383,33 @@ impl IcebergWriteSessionControl {
         &self,
         table: &crate::iceberg::table::Table,
         snapshot_id: i64,
-    ) -> Result<Vec<crate::manifest::DataFileWithStats>, ConnectorError> {
+        access: &Arc<crate::loaded_table::IcebergAttemptTableAccess>,
+    ) -> Result<
+        Vec<crate::commit::write_stack::copy_on_write::IcebergCowFrozenBaseFile>,
+        ConnectorError,
+    > {
         let owned = table.clone();
+        let metadata = table.metadata_ref();
+        let access = access.clone();
         self.runtime
             .resources()
             .catalog_runtime()
             .block_on(async move {
-                crate::manifest::extract_cow_data_files_with_stats_at(&owned, snapshot_id).await
+                crate::manifest::extract_data_files_with_stats_at_projected(
+                    &owned,
+                    snapshot_id,
+                    None,
+                    |stats, manifest, deletes| {
+                        crate::commit::write_stack::copy_on_write::IcebergCowFrozenBaseFile::new(
+                            crate::manifest::FrozenReadFileWithStats::retain(
+                                stats, manifest, deletes,
+                            ),
+                            metadata.clone(),
+                            access.clone(),
+                        )
+                    },
+                )
+                .await
             })
             .map_err(|error| unavailable(error.to_string()))?
             .map_err(unavailable)
@@ -4005,8 +4046,10 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         request: ConnectorWriteBeginRequest,
         original: novarocks_spi::connector::ConnectorOriginalResultScope,
         existing_caller_upper: u64,
-    ) -> Result<novarocks_spi::connector::ConnectorCowBeginPlan,
-                novarocks_spi::connector::ConnectorCowBeginFailure> {
+    ) -> Result<
+        novarocks_spi::connector::ConnectorCowBeginPlan,
+        novarocks_spi::connector::ConnectorCowBeginFailure,
+    > {
         self.begin_cow_original(request, original, existing_caller_upper)
     }
 
@@ -4159,6 +4202,173 @@ mod statistics_contract_tests {
         ] {
             assert!(resolve_statistics_field(&iceberg, &arrow, &field, false).is_err());
         }
+    }
+
+    #[test]
+    fn write_statistics_uses_exact_uuid_field_id_and_keeps_fixed16_physical() {
+        let iceberg = schema(vec![
+            Arc::new(NestedField::optional(
+                7,
+                "u",
+                Type::Primitive(PrimitiveType::Uuid),
+            )),
+            Arc::new(NestedField::required(
+                8,
+                "fixed",
+                Type::Primitive(PrimitiveType::Fixed(16)),
+            )),
+        ]);
+        let arrow = crate::schema_mapping::sql_read_schema_from_iceberg(&iceberg)
+            .expect("SQL read carrier");
+        let (uuid_id, uuid) = resolve_statistics_field(
+            &iceberg,
+            &arrow,
+            &Field::new("U", DataType::FixedSizeBinary(16), true),
+            false,
+        )
+        .expect("UUID source")
+        .expect("UUID field");
+        assert_eq!(uuid_id, 7);
+        assert_eq!(
+            uuid.logical_type,
+            novarocks_type_contract::ValueLogicalType::Uuid
+        );
+        assert_eq!(uuid.data_type, DataType::FixedSizeBinary(16));
+        let (fixed_id, fixed) = resolve_statistics_field(
+            &iceberg,
+            &arrow,
+            &Field::new("fixed", DataType::FixedSizeBinary(16), false),
+            false,
+        )
+        .expect("fixed source")
+        .expect("fixed field");
+        assert_eq!(fixed_id, 8);
+        assert_eq!(
+            fixed.logical_type,
+            novarocks_type_contract::ValueLogicalType::Physical
+        );
+    }
+
+    #[test]
+    fn write_statistics_keeps_authoritative_property_domains_and_rejects_retagging() {
+        let iceberg = schema(vec![
+            Arc::new(NestedField::optional(
+                1,
+                "h",
+                Type::Primitive(PrimitiveType::Binary),
+            )),
+            Arc::new(NestedField::optional(
+                2,
+                "b",
+                Type::Primitive(PrimitiveType::Binary),
+            )),
+            Arc::new(NestedField::optional(
+                3,
+                "n",
+                Type::Primitive(PrimitiveType::Fixed(16)),
+            )),
+            Arc::new(NestedField::optional(
+                4,
+                "raw",
+                Type::Primitive(PrimitiveType::Binary),
+            )),
+        ]);
+        let properties = [
+            ("novarocks.logical_type.h".into(), "hll".into()),
+            ("novarocks.logical_type.b".into(), "bitmap".into()),
+            ("novarocks.logical_type.n".into(), "largeint".into()),
+        ]
+        .into();
+        let arrow = crate::scalar_integer_domain::sql_schema(&iceberg, &properties).unwrap();
+        use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+        for (ordinal, logical) in [
+            ValueLogicalType::Hll,
+            ValueLogicalType::Bitmap,
+            ValueLogicalType::LargeInt,
+            ValueLogicalType::Physical,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let field = arrow.field(ordinal);
+            let (field_id, actual) = resolve_statistics_field(&iceberg, &arrow, field, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(field_id, ordinal as i32 + 1);
+            assert_eq!(actual.logical_type, logical);
+            let wrong_tag = if logical == ValueLogicalType::Hll {
+                "bitmap"
+            } else {
+                "hll"
+            };
+            let forged = field
+                .clone()
+                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), wrong_tag.into())].into());
+            assert!(resolve_statistics_field(&iceberg, &arrow, &forged, false).is_err());
+        }
+    }
+
+    #[test]
+    fn write_statistics_rejects_uuid_input_identity_and_carrier_conflicts() {
+        let iceberg = schema(vec![Arc::new(NestedField::optional(
+            7,
+            "u",
+            Type::Primitive(PrimitiveType::Uuid),
+        ))]);
+        let arrow = crate::schema_mapping::sql_read_schema_from_iceberg(&iceberg)
+            .expect("SQL read carrier");
+        for field in [
+            Field::new("u", DataType::Utf8, true),
+            Field::new("u", DataType::FixedSizeBinary(15), true),
+            Field::new("u", DataType::FixedSizeBinary(16), false),
+            Field::new("u", DataType::FixedSizeBinary(16), true).with_metadata(
+                [(
+                    novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
+                    "largeint".into(),
+                )]
+                .into(),
+            ),
+        ] {
+            assert!(resolve_statistics_field(&iceberg, &arrow, &field, false).is_err());
+        }
+    }
+
+    #[test]
+    fn write_statistics_preserves_variant_storage_identity_and_rejects_opaque_conflict() {
+        let iceberg = schema(vec![Arc::new(NestedField::optional(
+            9,
+            "v",
+            Type::Primitive(PrimitiveType::Variant),
+        ))]);
+        let arrow = crate::schema_mapping::sql_read_schema_from_iceberg(&iceberg)
+            .expect("SQL read carrier");
+        let field = Field::new("v", DataType::LargeBinary, true);
+        let (id, value_type) = resolve_statistics_field(&iceberg, &arrow, &field, false)
+            .expect("VARIANT input")
+            .expect("VARIANT field");
+        assert_eq!(id, 9);
+        assert_eq!(
+            value_type.logical_type,
+            novarocks_type_contract::ValueLogicalType::Variant
+        );
+        assert_eq!(value_type.data_type, DataType::LargeBinary);
+        let conflicting = field.with_metadata(
+            [(
+                novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
+                "object".into(),
+            )]
+            .into(),
+        );
+        assert!(resolve_statistics_field(&iceberg, &arrow, &conflicting, false).is_err());
+        assert!(
+            resolve_statistics_field(
+                &iceberg,
+                &arrow,
+                &Field::new("v", DataType::Binary, true),
+                false,
+            )
+            .is_err()
+        );
     }
 
     #[test]

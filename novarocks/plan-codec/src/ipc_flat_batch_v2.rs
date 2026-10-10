@@ -1,0 +1,624 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Borrowed flat, non-dictionary constant RecordBatch geometry.
+//!
+//! This component allocates no arrays and invokes no Arrow reader. Its measured
+//! buffer and repeated-view extents are inputs to admission, not a complete
+//! first-allocation/resource model or a formal memory grant. The stream owner
+//! must separately check schema identity, framing/EOS, Field/FVT correspondence,
+//! and reader/schema/header/alignment/validation allocation and work bounds.
+
+use crate::ipc_flat_stream_v2::progress::Admission;
+use crate::{
+    ipc_schema_v2::verified_message_observed,
+    physical_type_v2::{TypeCodecError, validate_field, validate_type},
+};
+use arrow::datatypes::{DataType, Field};
+use novarocks_arrow_ipc_frame::{VerifierOptions, checked_range, nonnegative_length};
+use novarocks_type_contract::CompileControlError;
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
+
+/// Explicit geometric admission, with no application defaults.
+#[derive(Clone, Copy, Debug)]
+pub struct FlatBatchProjectionLimits {
+    pub max_metadata_bytes: usize,
+    pub max_body_bytes: usize,
+    pub max_rows: usize,
+    pub max_buffer_descriptors: usize,
+    /// Sum of every view's declared byte length, including NULL and repeated
+    /// references. This is inspection work, not unique retained backing.
+    pub max_view_validation_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlatBatchGeometry {
+    pub rows: usize,
+    pub null_count: usize,
+    pub buffer_descriptors: usize,
+    pub variadic_buffers: usize,
+    pub body_bytes: usize,
+    /// Sum of descriptor extents, counting overlap/repeated descriptions.
+    /// Unreferenced body padding remains in body_bytes.
+    pub described_buffer_bytes: usize,
+    pub view_validation_bytes: usize,
+}
+
+pub(crate) enum Layout {
+    Null,
+    Bits,
+    Fixed(usize),
+    Offsets(usize),
+    Views,
+}
+
+pub(crate) fn layout(ty: &DataType) -> Result<Layout, TypeCodecError> {
+    match ty {
+        DataType::Null => Ok(Layout::Null),
+        DataType::Boolean => Ok(Layout::Bits),
+        DataType::FixedSizeBinary(width) => usize::try_from(*width)
+            .map(Layout::Fixed)
+            .map_err(|_| TypeCodecError::InvalidShape("negative fixed binary width")),
+        DataType::Utf8 | DataType::Binary => Ok(Layout::Offsets(4)),
+        DataType::LargeUtf8 | DataType::LargeBinary => Ok(Layout::Offsets(8)),
+        DataType::Utf8View | DataType::BinaryView => Ok(Layout::Views),
+        _ => ty
+            .primitive_width()
+            .map(Layout::Fixed)
+            .ok_or(TypeCodecError::InvalidShape(
+                "constant RecordBatch is not a flat non-dictionary carrier",
+            )),
+    }
+}
+
+fn add(left: usize, right: usize) -> Result<usize, TypeCodecError> {
+    left.checked_add(right)
+        .ok_or(TypeCodecError::InvalidShape("IPC batch extent overflow"))
+}
+fn mul(left: usize, right: usize) -> Result<usize, TypeCodecError> {
+    left.checked_mul(right)
+        .ok_or(TypeCodecError::InvalidShape("IPC batch extent overflow"))
+}
+fn length(value: i64) -> Result<usize, TypeCodecError> {
+    nonnegative_length(value)
+        .map_err(|_| TypeCodecError::InvalidShape("negative or unrepresentable IPC batch extent"))
+}
+fn require(
+    condition: bool,
+    message: &'static str,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), TypeCodecError> {
+    work.step()?;
+    if condition {
+        Ok(())
+    } else {
+        Err(TypeCodecError::InvalidShape(message))
+    }
+}
+
+fn numeric_parent<T>(parent: bool, result: Result<T, TypeCodecError>) -> Result<T, TypeCodecError> {
+    if parent {
+        result.map_err(|_| CompileControlError::ResourceExhausted.into())
+    } else {
+        result
+    }
+}
+fn parent_step(
+    admission: &mut Option<&mut Admission<'_, '_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), TypeCodecError> {
+    if let Some(a) = admission.as_deref_mut() {
+        a.batch_step(work)?;
+    } else {
+        work.step()?;
+    }
+    Ok(())
+}
+fn require_parent(
+    condition: bool,
+    message: &'static str,
+    mut admission: Option<&mut Admission<'_, '_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), TypeCodecError> {
+    parent_step(&mut admission, work)?;
+    if condition {
+        Ok(())
+    } else {
+        Err(TypeCodecError::InvalidShape(message))
+    }
+}
+fn limit_parent(
+    condition: bool,
+    message: &'static str,
+    admission: Option<&mut Admission<'_, '_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), TypeCodecError> {
+    if admission.is_some() && !condition {
+        return Err(CompileControlError::ResourceExhausted.into());
+    }
+    require_parent(condition, message, admission, work)
+}
+pub(crate) fn buffer<'a>(
+    batch: arrow::ipc::RecordBatch<'_>,
+    body: &'a [u8],
+    index: usize,
+) -> Result<&'a [u8], TypeCodecError> {
+    let buffers = batch.buffers().ok_or(TypeCodecError::InvalidShape(
+        "IPC batch buffer descriptors are missing",
+    ))?;
+    if index >= buffers.len() {
+        return Err(TypeCodecError::InvalidShape(
+            "IPC batch buffer index is invalid",
+        ));
+    }
+    let descriptor = buffers.get(index);
+    let range = checked_range(
+        body.len(),
+        length(descriptor.offset())?,
+        length(descriptor.length())?,
+    )
+    .map_err(|_| TypeCodecError::InvalidShape("IPC batch buffer range exceeds body"))?;
+    Ok(&body[range])
+}
+
+/// Checks one V5 uncompressed metadata/body pair without copying body bytes.
+/// Overlapping, nonsequential and unaligned legal descriptors remain allowed;
+/// this is independent of the NRX1 result writer's alignment profile. Exact
+/// values, validity popcount, offsets and UTF8 are still Arrow's later verdict.
+pub fn preflight_flat_record_batch(
+    metadata: &[u8],
+    body: &[u8],
+    expected: &Field,
+    limits: FlatBatchProjectionLimits,
+    verifier: &VerifierOptions,
+    control: &dyn PureCompileControl,
+) -> Result<FlatBatchGeometry, TypeCodecError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
+    let result = preflight(metadata, body, expected, limits, verifier, &mut work);
+    if matches!(&result, Err(TypeCodecError::Control(_))) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
+fn preflight(
+    metadata: &[u8],
+    body: &[u8],
+    expected: &Field,
+    limits: FlatBatchProjectionLimits,
+    verifier: &VerifierOptions,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FlatBatchGeometry, TypeCodecError> {
+    require(
+        metadata.len() <= limits.max_metadata_bytes,
+        "IPC batch metadata envelope exceeded",
+        work,
+    )?;
+    require(
+        body.len() <= limits.max_body_bytes,
+        "IPC batch body envelope exceeded",
+        work,
+    )?;
+    let layout = source_layout(expected, work)?;
+    let message = verified_message_observed(metadata, verifier, work)?;
+    preflight_message(message, body, limits, layout, work)
+}
+
+fn source_layout(
+    expected: &Field,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Layout, TypeCodecError> {
+    source_layout_core(expected, None, work)
+}
+fn source_layout_core(
+    expected: &Field,
+    mut admission: Option<&mut Admission<'_, '_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Layout, TypeCodecError> {
+    if let Some(a) = admission.as_deref_mut() {
+        a.batch_work_add(
+            a.source()
+                .checked_add(1)
+                .ok_or(CompileControlError::ResourceExhausted)?,
+        )?;
+    }
+    validate_field(expected, work)?;
+    novarocks_type_contract::field_logical_type(expected)?;
+    if let Some(a) = admission.as_deref_mut() {
+        let shared = std::cell::RefCell::new(a);
+        let mut scratch =
+            |layout: std::alloc::Layout| shared.borrow_mut().batch_work_add(layout.size());
+        let mut capture = |visit| {
+            let mut a = shared.borrow_mut();
+            let upper = if matches!(visit, novarocks_type_contract::ValueTypeVisit::Field(_)) {
+                a.source()
+                    .checked_add(1)
+                    .ok_or(CompileControlError::ResourceExhausted)?
+            } else {
+                1
+            };
+            a.batch_work_add(upper)
+        };
+        crate::physical_type_v2::validate_type_with_scratch_observed(
+            expected.data_type(),
+            &mut scratch,
+            &mut capture,
+            work,
+        )?;
+    } else {
+        validate_type(expected.data_type(), work)?;
+    }
+    let layout = layout(expected.data_type())?;
+    parent_step(&mut admission, work)?;
+    Ok(layout)
+}
+
+/// The stream owner has already verified this borrowed Message and checked
+/// metadata admission. Reuse that exact parse, without a second opaque call.
+pub(crate) fn preflight_verified_flat_record_batch(
+    message: arrow::ipc::Message<'_>,
+    body: &[u8],
+    expected: &Field,
+    limits: FlatBatchProjectionLimits,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FlatBatchGeometry, TypeCodecError> {
+    preflight_verified_flat_record_batch_core(message, body, expected, limits, None, work)
+}
+pub(crate) fn preflight_verified_flat_record_batch_in(
+    message: arrow::ipc::Message<'_>,
+    body: &[u8],
+    expected: &Field,
+    limits: FlatBatchProjectionLimits,
+    admission: &mut Admission<'_, '_>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FlatBatchGeometry, TypeCodecError> {
+    preflight_verified_flat_record_batch_core(
+        message,
+        body,
+        expected,
+        limits,
+        Some(admission),
+        work,
+    )
+}
+fn preflight_verified_flat_record_batch_core(
+    message: arrow::ipc::Message<'_>,
+    body: &[u8],
+    expected: &Field,
+    limits: FlatBatchProjectionLimits,
+    mut admission: Option<&mut Admission<'_, '_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FlatBatchGeometry, TypeCodecError> {
+    limit_parent(
+        body.len() <= limits.max_body_bytes,
+        "IPC batch body envelope exceeded",
+        admission.as_deref_mut(),
+        work,
+    )?;
+    let layout = source_layout_core(expected, admission.as_deref_mut(), work)?;
+    preflight_message_core(message, body, limits, layout, admission, work)
+}
+
+fn preflight_message(
+    message: arrow::ipc::Message<'_>,
+    body: &[u8],
+    limits: FlatBatchProjectionLimits,
+    layout: Layout,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FlatBatchGeometry, TypeCodecError> {
+    preflight_message_core(message, body, limits, layout, None, work)
+}
+fn preflight_message_core(
+    message: arrow::ipc::Message<'_>,
+    body: &[u8],
+    limits: FlatBatchProjectionLimits,
+    layout: Layout,
+    mut admission: Option<&mut Admission<'_, '_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FlatBatchGeometry, TypeCodecError> {
+    let parent = admission.is_some();
+    require_parent(
+        message.version() == arrow::ipc::MetadataVersion::V5
+            && message.header_type() == arrow::ipc::MessageHeader::RecordBatch
+            && message
+                .custom_metadata()
+                .is_none_or(|entries| entries.is_empty()),
+        "unsupported constant IPC RecordBatch message profile",
+        admission.as_deref_mut(),
+        work,
+    )?;
+    require_parent(
+        length(message.bodyLength())? == body.len(),
+        "IPC batch body length mismatch",
+        admission.as_deref_mut(),
+        work,
+    )?;
+    let batch = message
+        .header_as_record_batch()
+        .ok_or(TypeCodecError::InvalidShape(
+            "IPC RecordBatch payload is missing",
+        ))?;
+    require_parent(
+        batch.compression().is_none(),
+        "compressed constant IPC batch is unsupported",
+        admission.as_deref_mut(),
+        work,
+    )?;
+    let rows = length(batch.length())?;
+    limit_parent(
+        rows <= limits.max_rows,
+        "IPC batch row envelope exceeded",
+        admission.as_deref_mut(),
+        work,
+    )?;
+    let nodes = batch
+        .nodes()
+        .ok_or(TypeCodecError::InvalidShape("IPC batch nodes are missing"))?;
+    require_parent(
+        nodes.len() == 1,
+        "flat constant IPC batch must have exactly one node",
+        admission.as_deref_mut(),
+        work,
+    )?;
+    let node = nodes.get(0);
+    require_parent(
+        length(node.length())? == rows,
+        "IPC batch node length differs from rows",
+        admission.as_deref_mut(),
+        work,
+    )?;
+    let null_count = length(node.null_count())?;
+    require_parent(
+        null_count <= rows,
+        "IPC batch null count exceeds rows",
+        admission.as_deref_mut(),
+        work,
+    )?;
+    let buffers = batch.buffers().ok_or(TypeCodecError::InvalidShape(
+        "IPC batch buffer descriptors are missing",
+    ))?;
+    limit_parent(
+        buffers.len() <= limits.max_buffer_descriptors,
+        "IPC batch buffer envelope exceeded",
+        admission.as_deref_mut(),
+        work,
+    )?;
+    let variadic = batch.variadicBufferCounts();
+    let variadic_buffers = if matches!(layout, Layout::Views) {
+        require_parent(
+            variadic.is_some_and(|counts| counts.len() == 1),
+            "IPC view batch requires exactly one variadic count",
+            admission.as_deref_mut(),
+            work,
+        )?;
+        let count = variadic
+            .ok_or(TypeCodecError::InvalidShape(
+                "IPC view variadic count is missing",
+            ))?
+            .get(0);
+        // The locked reader adds two in i64 before collecting Buffer headers.
+        numeric_parent(
+            parent,
+            count.checked_add(2).ok_or(TypeCodecError::InvalidShape(
+                "IPC view buffer count overflow",
+            )),
+        )?;
+        length(count)?
+    } else {
+        require_parent(
+            variadic.is_none_or(|counts| counts.is_empty()),
+            "non-view IPC batch has extra variadic counts",
+            admission.as_deref_mut(),
+            work,
+        )?;
+        0
+    };
+    let count = match layout {
+        Layout::Null => 0,
+        Layout::Bits | Layout::Fixed(_) => 2,
+        Layout::Offsets(_) => 3,
+        Layout::Views => numeric_parent(parent, add(2, variadic_buffers))?,
+    };
+    require_parent(
+        buffers.len() == count,
+        "IPC batch descriptor count differs from carrier",
+        admission.as_deref_mut(),
+        work,
+    )?;
+    inspect_leaf_at_core(
+        batch,
+        body,
+        layout,
+        rows,
+        null_count,
+        0,
+        variadic_buffers,
+        limits,
+        admission,
+        work,
+    )
+}
+
+/// Inspect one already paired leaf occurrence in a larger recursive batch.
+/// Shared layout and buffer rules remain the flat owner's sole author.
+pub(crate) fn inspect_leaf_at_core(
+    batch: arrow::ipc::RecordBatch<'_>,
+    body: &[u8],
+    layout: Layout,
+    rows: usize,
+    null_count: usize,
+    buffer_start: usize,
+    variadic_buffers: usize,
+    limits: FlatBatchProjectionLimits,
+    mut admission: Option<&mut Admission<'_, '_>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FlatBatchGeometry, TypeCodecError> {
+    let parent = admission.is_some();
+    let count = match layout {
+        Layout::Null => 0,
+        Layout::Bits | Layout::Fixed(_) => 2,
+        Layout::Offsets(_) => 3,
+        Layout::Views => numeric_parent(parent, add(2, variadic_buffers))?,
+    };
+    let buffers = batch.buffers().ok_or(TypeCodecError::InvalidShape(
+        "IPC batch buffer descriptors are missing",
+    ))?;
+    require_parent(
+        numeric_parent(parent, add(buffer_start, count))? <= buffers.len(),
+        "IPC leaf descriptor range exceeds batch",
+        admission.as_deref_mut(),
+        work,
+    )?;
+    let leaf_buffer = |index| {
+        buffer(
+            batch,
+            body,
+            numeric_parent(parent, add(buffer_start, index))?,
+        )
+    };
+    let mut described_buffer_bytes = 0;
+    for index in 0..count {
+        let bytes = leaf_buffer(index)?;
+        described_buffer_bytes = numeric_parent(parent, add(described_buffer_bytes, bytes.len()))?;
+        parent_step(&mut admission, work)?;
+    }
+    let bitmap_bytes = numeric_parent(parent, add(rows / 8, usize::from(!rows.is_multiple_of(8))))?;
+    if !matches!(layout, Layout::Null) && null_count != 0 {
+        require_parent(
+            leaf_buffer(0)?.len() >= bitmap_bytes,
+            "IPC batch validity bitmap is too short",
+            admission.as_deref_mut(),
+            work,
+        )?;
+    }
+    let mut view_validation_bytes = 0;
+    match layout {
+        Layout::Null => require_parent(
+            null_count == rows,
+            "IPC Null node must mark every row null",
+            admission.as_deref_mut(),
+            work,
+        )?,
+        Layout::Bits => require_parent(
+            leaf_buffer(1)?.len() >= bitmap_bytes,
+            "IPC Boolean values are too short",
+            admission.as_deref_mut(),
+            work,
+        )?,
+        Layout::Fixed(width) => require_parent(
+            leaf_buffer(1)?.len() >= numeric_parent(parent, mul(rows, width))?,
+            "IPC fixed-width values are too short",
+            admission.as_deref_mut(),
+            work,
+        )?,
+        Layout::Offsets(width) => {
+            let offsets = leaf_buffer(1)?;
+            // Arrow's typed_offsets converts the entire descriptor before
+            // selecting N+1 entries. A partial trailing element would panic
+            // in Buffer::typed_data even when the useful prefix is complete.
+            require_parent(
+                offsets.len() % width == 0,
+                "IPC byte offsets contain a partial element",
+                admission.as_deref_mut(),
+                work,
+            )?;
+            // Arrow accepts an empty offsets buffer for an empty array and
+            // constructs its empty OffsetBuffer later. Do not reject it here.
+            let minimum = if rows == 0 && offsets.is_empty() {
+                0
+            } else {
+                numeric_parent(parent, mul(numeric_parent(parent, add(rows, 1))?, width))?
+            };
+            require_parent(
+                offsets.len() >= minimum,
+                "IPC byte offsets are too short",
+                admission.as_deref_mut(),
+                work,
+            )?;
+        }
+        Layout::Views => {
+            let views = leaf_buffer(1)?;
+            // The same whole-buffer typed conversion is used for u128 views.
+            // Extra complete records are allowed; a partial one is unsafe.
+            require_parent(
+                views.len() % 16 == 0,
+                "IPC view records contain a partial element",
+                admission.as_deref_mut(),
+                work,
+            )?;
+            let extent = numeric_parent(parent, mul(rows, 16))?;
+            require_parent(
+                views.len() >= extent,
+                "IPC view records are too short",
+                admission.as_deref_mut(),
+                work,
+            )?;
+            for record in views[..extent].chunks_exact(16) {
+                let read = |start| {
+                    u32::from_le_bytes([
+                        record[start],
+                        record[start + 1],
+                        record[start + 2],
+                        record[start + 3],
+                    ])
+                };
+                let bytes = usize::try_from(read(0)).map_err(|_| {
+                    TypeCodecError::InvalidShape("IPC view length is unrepresentable")
+                })?;
+                view_validation_bytes = numeric_parent(parent, add(view_validation_bytes, bytes))?;
+                limit_parent(
+                    view_validation_bytes <= limits.max_view_validation_bytes,
+                    "IPC view validation byte envelope exceeded",
+                    admission.as_deref_mut(),
+                    work,
+                )?;
+                if bytes > 12 {
+                    let index = usize::try_from(read(8)).map_err(|_| {
+                        TypeCodecError::InvalidShape("IPC view index is unrepresentable")
+                    })?;
+                    require_parent(
+                        index < variadic_buffers,
+                        "IPC view references an invalid buffer",
+                        admission.as_deref_mut(),
+                        work,
+                    )?;
+                    let payload = leaf_buffer(numeric_parent(parent, add(index, 2))?)?;
+                    let start = usize::try_from(read(12)).map_err(|_| {
+                        TypeCodecError::InvalidShape("IPC view offset is unrepresentable")
+                    })?;
+                    checked_range(payload.len(), start, bytes).map_err(|_| {
+                        TypeCodecError::InvalidShape("IPC view range exceeds its buffer")
+                    })?;
+                    parent_step(&mut admission, work)?;
+                }
+            }
+        }
+    }
+    Ok(FlatBatchGeometry {
+        rows,
+        null_count,
+        buffer_descriptors: count,
+        variadic_buffers,
+        body_bytes: body.len(),
+        described_buffer_bytes,
+        view_validation_bytes,
+    })
+}
+
+#[cfg(test)]
+mod tests;

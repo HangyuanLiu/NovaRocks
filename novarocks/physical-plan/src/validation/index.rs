@@ -21,24 +21,85 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::resource::MAX_PLAN_DERIVED_CUT_ITEMS;
 use crate::{
-    AggregatePhase, ArtifactSourceBinding, Edge, EdgeId, ExprId, Fragment, FragmentCuts,
-    FragmentId, FragmentSink, NodeId, NodeKind, PhysicalNode, PhysicalPlan, ValueId,
+    AggregatePhase, EdgeId, ExprId, Fragment, FragmentId, NodeId, NodeKind, PhysicalNode, ValueId,
 };
+
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, ControlOwnedResourceFacts, ControlResourceCounter,
+    ControlResourceError, control_resource_add, control_resource_mul,
+    owned_resources::{
+        copy::reserve_exit,
+        layout::{LayoutResourceError, arc_layout},
+        vec::boxed_slice_in,
+    },
+};
+use std::alloc::Layout;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ValuePortIndex {
     pub(crate) occurrences: BTreeMap<ValueId, usize>,
 }
 
+struct IndexAdmission<'a, 'control> {
+    counter: &'a mut ControlResourceCounter,
+    admit: &'a mut dyn FnMut(&ControlOwnedResourceFacts) -> Result<(), CompileControlError>,
+    work: &'a mut CompileCheckpoints<'control>,
+}
+impl IndexAdmission<'_, '_> {
+    fn gate(&mut self) -> Result<(), ControlResourceError> {
+        (self.admit)(&self.counter.facts())?;
+        Ok(())
+    }
+    fn reserve<T>(
+        &mut self,
+        values: &mut Vec<T>,
+        count: usize,
+    ) -> Result<(), ControlResourceError> {
+        if count != 0 {
+            self.work.flush()?;
+            let reserved = values.try_reserve_exact(count);
+            if reserved.is_ok() {
+                self.work.step()?;
+            }
+            reserve_exit::<ControlResourceError>(reserved, self.work)?;
+        }
+        Ok(())
+    }
+}
+
 impl ValuePortIndex {
     pub(crate) fn new(values: &[ValueId]) -> Self {
+        Self::new_core(values, None).expect("plain value-port indexing is infallible")
+    }
+
+    fn new_core(
+        values: &[ValueId],
+        mut admission: Option<&mut IndexAdmission<'_, '_>>,
+    ) -> Result<Self, ControlResourceError> {
+        if let Some(owner) = admission.as_deref_mut() {
+            owner.counter.tree::<ValueId, usize>(values.len())?;
+            owner.gate()?;
+        }
+        Self::build_core(values, admission)
+    }
+
+    fn build_core(
+        values: &[ValueId],
+        mut admission: Option<&mut IndexAdmission<'_, '_>>,
+    ) -> Result<Self, ControlResourceError> {
         let mut occurrences = BTreeMap::new();
         for value in values {
+            if let Some(owner) = admission.as_deref_mut() {
+                owner.work.flush()?;
+            }
             *occurrences.entry(*value).or_default() += 1;
+            if let Some(owner) = admission.as_deref_mut() {
+                owner.work.step()?;
+                owner.work.flush()?;
+            }
         }
-        Self { occurrences }
+        Ok(Self { occurrences })
     }
 
     pub(crate) fn contains(&self, value: &ValueId) -> bool {
@@ -69,48 +130,202 @@ impl VisibleInputIndex {
 
 impl FragmentValidationIndexes {
     pub(crate) fn new(fragment: &Fragment) -> Self {
-        let output_ports = fragment
-            .nodes()
-            .values()
-            .map(|node| (node.id, Arc::new(ValuePortIndex::new(&node.output.columns))))
-            .collect::<BTreeMap<_, _>>();
+        Self::new_core(fragment, None).expect("plain fragment indexing is infallible")
+    }
+
+    /// Quantity capture on the caller's original scope. This does not prove
+    /// fragment structure, allocator admission or arbitrary element cleanup.
+    pub(crate) fn new_in(
+        fragment: &Fragment,
+        counter: &mut ControlResourceCounter,
+        admit: &mut dyn FnMut(&ControlOwnedResourceFacts) -> Result<(), CompileControlError>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, ControlResourceError> {
+        Self::new_core(
+            fragment,
+            Some(IndexAdmission {
+                counter,
+                admit,
+                work,
+            }),
+        )
+    }
+
+    fn new_core(
+        fragment: &Fragment,
+        mut admission: Option<IndexAdmission<'_, '_>>,
+    ) -> Result<Self, ControlResourceError> {
+        let output_ports = if let Some(owner) = admission.as_mut() {
+            let count = fragment.nodes().len();
+            owner.counter.tree::<NodeId, Arc<ValuePortIndex>>(count)?;
+            owner.counter.tree::<NodeId, VisibleInputIndex>(count)?;
+            let arc = arc_layout(Layout::new::<ValuePortIndex>()).map_err(|error| match error {
+                LayoutResourceError::SourceModel => {
+                    ControlResourceError::SourceModel("Index Arc source model drift")
+                }
+                _ => CompileControlError::ResourceExhausted.into(),
+            })?;
+            owner.counter.layout(arc, count)?;
+            // Two source traversals, including each terminal lookup, use the
+            // sole locked tree work bound. No source B or maximum ID is used.
+            owner.counter.work(control_resource_mul(
+                control_resource_mul(control_resource_add(count, 1)?, 2)?,
+                ControlResourceCounter::lookup_work(count)?,
+            )?)?;
+            owner.gate()?;
+            let mut ports = BTreeMap::new();
+            for node in fragment.nodes().values() {
+                let port = ValuePortIndex::new_core(&node.output.columns, Some(owner))?;
+                owner.work.flush()?;
+                let port = Arc::new(port);
+                owner.work.step()?;
+                owner.work.flush()?;
+                // Source map keys need not equal node.id in an invalid plan.
+                // Explicit insertion preserves the original last winner.
+                ports.insert(node.id, port);
+                owner.work.step()?;
+                owner.work.flush()?;
+            }
+            ports
+        } else {
+            // Preserve the original Plain bulk-build/sort strategy.
+            fragment
+                .nodes()
+                .values()
+                .map(|node| (node.id, Arc::new(ValuePortIndex::new(&node.output.columns))))
+                .collect::<BTreeMap<_, _>>()
+        };
         let mut visible_inputs = BTreeMap::new();
         for node in fragment.nodes().values() {
-            // A scan's own expressions read the provider's columns and the
-            // ones it derives from them while reading -- a residual over a
-            // variant path is evaluated against the path, not against the
-            // bytes it was read out of.
-            let visible = if let NodeKind::Scan {
-                provider_outputs,
-                derived_values,
-                ..
-            } = &node.kind
-            {
-                VisibleInputIndex::One(Arc::new(ValuePortIndex::new(
-                    &provider_outputs
-                        .iter()
-                        .map(|(_, value)| *value)
-                        .chain(derived_values.iter().copied())
-                        .collect::<Vec<_>>(),
-                )))
-            } else {
-                let ports = node
-                    .inputs
-                    .iter()
-                    .filter_map(|input| output_ports.get(input).cloned())
-                    .collect::<Vec<_>>();
-                match ports.as_slice() {
-                    [] => VisibleInputIndex::Empty,
-                    [port] => VisibleInputIndex::One(port.clone()),
-                    _ => VisibleInputIndex::Many(ports.into_boxed_slice()),
-                }
-            };
+            let visible = Self::visible_core(node, &output_ports, admission.as_mut())?;
+            if let Some(owner) = admission.as_mut() {
+                owner.work.flush()?;
+            }
             visible_inputs.insert(node.id, visible);
+            if let Some(owner) = admission.as_mut() {
+                owner.work.step()?;
+                owner.work.flush()?;
+            }
         }
-        Self {
+        Ok(Self {
             output_ports,
             visible_inputs,
-        }
+        })
+    }
+
+    fn visible_core(
+        node: &PhysicalNode,
+        output_ports: &BTreeMap<NodeId, Arc<ValuePortIndex>>,
+        mut admission: Option<&mut IndexAdmission<'_, '_>>,
+    ) -> Result<VisibleInputIndex, ControlResourceError> {
+        // A scan reads both provider columns and its original derived values.
+        let visible = if let NodeKind::Scan {
+            provider_outputs,
+            derived_values,
+            ..
+        } = &node.kind
+        {
+            let values = if let Some(owner) = admission.as_deref_mut() {
+                let count = control_resource_add(provider_outputs.len(), derived_values.len())?;
+                owner.counter.buffer::<ValueId>(count, 1)?;
+                owner.counter.tree::<ValueId, usize>(count)?;
+                owner.counter.arc::<ValuePortIndex>(1)?;
+                owner.counter.work(count)?;
+                owner.gate()?;
+                let mut values = Vec::new();
+                owner.reserve(&mut values, count)?;
+                for value in provider_outputs
+                    .iter()
+                    .map(|(_, value)| *value)
+                    .chain(derived_values.iter().copied())
+                {
+                    values.push(value);
+                    owner.work.step()?;
+                }
+                values
+            } else {
+                provider_outputs
+                    .iter()
+                    .map(|(_, value)| *value)
+                    .chain(derived_values.iter().copied())
+                    .collect::<Vec<_>>()
+            };
+            let port = if admission.is_some() {
+                ValuePortIndex::build_core(&values, admission.as_deref_mut())?
+            } else {
+                ValuePortIndex::new(&values)
+            };
+            if let Some(owner) = admission.as_deref_mut() {
+                owner.work.flush()?;
+            }
+            let port = Arc::new(port);
+            if let Some(owner) = admission.as_deref_mut() {
+                owner.work.step()?;
+                owner.work.flush()?;
+            }
+            VisibleInputIndex::One(port)
+        } else {
+            let ports = if let Some(owner) = admission.as_deref_mut() {
+                let count = node.inputs.len();
+                owner.counter.buffer::<Arc<ValuePortIndex>>(count, 1)?;
+                owner.counter.work(control_resource_mul(
+                    count,
+                    ControlResourceCounter::lookup_work(output_ports.len())?,
+                )?)?;
+                // Each possible matched handle clone/drop and the One branch's
+                // additional clone/drop are closed Arc operations, not backing.
+                owner
+                    .counter
+                    .work(control_resource_add(control_resource_mul(count, 8)?, 4)?)?;
+                owner.gate()?;
+                let mut ports = Vec::new();
+                owner.reserve(&mut ports, count)?;
+                for input in &node.inputs {
+                    owner.work.flush()?;
+                    let port = output_ports.get(input).cloned();
+                    owner.work.step()?;
+                    owner.work.flush()?;
+                    if let Some(port) = port {
+                        ports.push(port);
+                        owner.work.step()?;
+                    }
+                }
+                ports
+            } else {
+                node.inputs
+                    .iter()
+                    .filter_map(|input| output_ports.get(input).cloned())
+                    .collect::<Vec<_>>()
+            };
+            match ports.as_slice() {
+                [] => VisibleInputIndex::Empty,
+                [port] => {
+                    let port = port.clone();
+                    if let Some(owner) = admission.as_deref_mut() {
+                        owner.work.step()?;
+                    }
+                    VisibleInputIndex::One(port)
+                }
+                _ => {
+                    if let Some(owner) = admission {
+                        VisibleInputIndex::Many(boxed_slice_in::<_, ControlResourceError>(
+                            ports,
+                            &mut |facts| {
+                                if let Some(layout) = facts.requested_backing {
+                                    owner.counter.layout(layout, 1)?;
+                                }
+                                (owner.admit)(&owner.counter.facts())?;
+                                Ok(())
+                            },
+                            owner.work,
+                        )?)
+                    } else {
+                        VisibleInputIndex::Many(ports.into_boxed_slice())
+                    }
+                }
+            }
+        };
+        Ok(visible)
     }
 
     pub(crate) fn output(&self, node: NodeId) -> Option<&ValuePortIndex> {
@@ -121,6 +336,10 @@ impl FragmentValidationIndexes {
         self.visible_inputs.get(&node)
     }
 }
+
+#[cfg(test)]
+#[path = "index_borrowed_tests.rs"]
+mod index_borrowed_tests;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ValueMappingIndex {
@@ -486,452 +705,6 @@ impl SemanticTraceIndexes {
             })
             .collect()
     }
-
-    pub(crate) fn port_contains_all(
-        &mut self,
-        fragment: FragmentId,
-        node: &PhysicalNode,
-        values: impl IntoIterator<Item = ValueId>,
-        value_count: usize,
-        budget: &mut SemanticTraceWorkBudget,
-    ) -> bool {
-        let key = (fragment, node.id);
-        if !self.ensure_port(key, &node.output.columns, budget) || !budget.charge(value_count) {
-            return false;
-        }
-        let Some(port) = self.ports.get(&key) else {
-            return false;
-        };
-        values.into_iter().all(|value| port.contains(&value))
-    }
-}
-
-#[derive(Clone, Default, PartialEq)]
-pub(crate) struct SourceBindingIndex {
-    pub(crate) bindings: BTreeSet<ArtifactSourceBinding>,
-}
-
-impl SourceBindingIndex {
-    pub(crate) fn insert(&mut self, binding: ArtifactSourceBinding) {
-        self.bindings.insert(binding);
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.bindings.len()
-    }
-
-    pub(crate) fn values(&self) -> impl Iterator<Item = &ArtifactSourceBinding> {
-        self.bindings.iter()
-    }
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct SourceProvenance {
-    pub(crate) bindings: SourceBindingIndex,
-    pub(crate) has_source_free_rows: bool,
-}
-
-pub(crate) struct SourceBindingRegistry<'a> {
-    pub(crate) ids: Vec<(crate::SourceBindingRef<'a>, u32)>,
-    pub(crate) bindings: Vec<crate::SourceBindingRef<'a>>,
-}
-
-impl<'a> SourceBindingRegistry<'a> {
-    fn new(plan: &'a PhysicalPlan, scans: usize) -> Option<Self> {
-        let mut bindings = Vec::with_capacity(scans);
-        let mut ids = Vec::with_capacity(scans);
-        for fragment in plan.fragments().values() {
-            for node in fragment.nodes().values() {
-                if let NodeKind::Scan { relation, .. } = &node.kind {
-                    let binding = relation.source_binding_ref();
-                    let id = u32::try_from(bindings.len()).ok()?;
-                    bindings.push(binding);
-                    ids.push((binding, id));
-                }
-            }
-        }
-        // Keep the first occurrence as the canonical id, preserving the old
-        // registry's first-visit order even when equal scans are repeated.
-        ids.sort_unstable();
-        ids.dedup_by(|left, right| left.0 == right.0);
-        Some(Self { ids, bindings })
-    }
-
-    pub(crate) fn intern(&self, binding: crate::SourceBindingRef<'_>) -> Option<usize> {
-        let ordinal = self
-            .ids
-            .binary_search_by(|(key, _)| key.cmp(&binding))
-            .ok()?;
-        Some(self.ids[ordinal].1 as usize)
-    }
-}
-
-#[derive(Clone, Default)]
-pub(crate) struct CompactSourceBindingSet {
-    pub(crate) ids: Arc<[u32]>,
-}
-
-impl CompactSourceBindingSet {
-    pub(crate) fn from_ids(ids: &[usize]) -> Option<Self> {
-        let mut values = Vec::with_capacity(ids.len());
-        for id in ids {
-            values.push(u32::try_from(*id).ok()?);
-        }
-        Some(Self { ids: values.into() })
-    }
-
-    pub(crate) fn union<I>(local: &Self, parents: I) -> Self
-    where
-        I: IntoIterator<Item = Self>,
-        I::IntoIter: ExactSizeIterator,
-    {
-        let parents = parents.into_iter();
-        let mut sets = Vec::with_capacity(parents.len().saturating_add(1));
-        for parent in parents {
-            if !parent.ids.is_empty() {
-                sets.push(parent);
-            }
-        }
-        if !local.ids.is_empty() {
-            sets.push(local.clone());
-        }
-        if sets.is_empty() {
-            return Self::default();
-        }
-        while sets.len() > 1 {
-            let mut merged = Vec::with_capacity(sets.len().div_ceil(2));
-            let mut pairs = sets.chunks_exact(2);
-            for pair in &mut pairs {
-                merged.push(Self::merge_sorted(&pair[0], &pair[1]));
-            }
-            if let [remainder] = pairs.remainder() {
-                merged.push(remainder.clone());
-            }
-            sets = merged;
-        }
-        sets.pop()
-            .expect("one non-empty source binding set remains")
-    }
-
-    pub(crate) fn merge_sorted(left: &Self, right: &Self) -> Self {
-        if Arc::ptr_eq(&left.ids, &right.ids) {
-            return left.clone();
-        }
-        let mut ids = Vec::with_capacity(left.ids.len().saturating_add(right.ids.len()));
-        let (mut left_index, mut right_index) = (0, 0);
-        while left_index < left.ids.len() && right_index < right.ids.len() {
-            match left.ids[left_index].cmp(&right.ids[right_index]) {
-                std::cmp::Ordering::Less => {
-                    ids.push(left.ids[left_index]);
-                    left_index += 1;
-                }
-                std::cmp::Ordering::Greater => {
-                    ids.push(right.ids[right_index]);
-                    right_index += 1;
-                }
-                std::cmp::Ordering::Equal => {
-                    ids.push(left.ids[left_index]);
-                    left_index += 1;
-                    right_index += 1;
-                }
-            }
-        }
-        ids.extend_from_slice(&left.ids[left_index..]);
-        ids.extend_from_slice(&right.ids[right_index..]);
-        Self { ids: ids.into() }
-    }
-
-    pub(crate) fn ids(&self) -> impl Iterator<Item = usize> + '_ {
-        self.ids.iter().map(|id| *id as usize)
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.ids.len()
-    }
-}
-
-pub(crate) fn charge_provenance_cut_items(
-    current: &mut usize,
-    source_binding_count: usize,
-    outgoing_count: usize,
-) -> Option<()> {
-    *current = current.saturating_add(
-        source_binding_count
-            .saturating_mul(outgoing_count)
-            .saturating_mul(2),
-    );
-    (*current <= MAX_PLAN_DERIVED_CUT_ITEMS).then_some(())
-}
-
-pub(crate) struct PlanSourceProvenance<'a> {
-    pub(crate) registry: SourceBindingRegistry<'a>,
-    pub(crate) by_fragment: Vec<(FragmentId, CompactSourceBindingSet)>,
-    pub(crate) source_free_fragments: Vec<FragmentId>,
-}
-
-impl<'a> PlanSourceProvenance<'a> {
-    fn set(&self, fragment: FragmentId) -> Option<&CompactSourceBindingSet> {
-        let ordinal = self
-            .by_fragment
-            .binary_search_by_key(&fragment, |(id, _)| *id)
-            .ok()?;
-        Some(&self.by_fragment[ordinal].1)
-    }
-
-    pub(crate) fn binding_refs(
-        &self,
-        fragment: FragmentId,
-    ) -> Option<impl Iterator<Item = crate::SourceBindingRef<'a>> + '_> {
-        Some(self.set(fragment)?.ids().map(|id| {
-            *self
-                .registry
-                .bindings
-                .get(id)
-                .expect("compact provenance ids are interned")
-        }))
-    }
-
-    pub(crate) fn bindings(&self, fragment: FragmentId) -> Option<Vec<ArtifactSourceBinding>> {
-        Some(
-            self.binding_refs(fragment)?
-                .map(crate::SourceBindingRef::to_owned)
-                .collect(),
-        )
-    }
-
-    pub(crate) fn binding_count(&self, fragment: FragmentId) -> Option<usize> {
-        Some(self.set(fragment)?.len())
-    }
-
-    pub(crate) fn has_source_free_rows(&self, fragment: FragmentId) -> Option<bool> {
-        self.set(fragment)
-            .map(|_| self.source_free_fragments.binary_search(&fragment).is_ok())
-    }
-}
-
-/// A conservative bound on every allocation made by the provenance kernel,
-/// including live parent sets, merge buffers, Vec-to-Arc copies, topology
-/// indexes, ready work, and the temporary vectors used by pairwise unions.
-/// Counts are read from the borrowed plan before allocating any index.
-/// Unstable sorting needs no heap scratch. The intentionally conservative
-/// all-scans bound also covers distinct-source deduplication without first
-/// building an unbounded registry.
-pub(crate) fn source_provenance_index_bytes(plan: &PhysicalPlan) -> Option<usize> {
-    let fragments = plan.fragments().len();
-    let edges = plan.edges().len();
-    let scans = plan
-        .fragments()
-        .values()
-        .try_fold(0usize, |total, fragment| {
-            total.checked_add(
-                fragment
-                    .nodes()
-                    .values()
-                    .filter(|node| matches!(node.kind, NodeKind::Scan { .. }))
-                    .count(),
-            )
-        })?;
-    // Exact-capacity registry, fragment arrays, two adjacency arrays and local
-    // scan-id vectors. Include empty/default Arc headers and Vec minimum
-    // capacities in unions as well as every live old/new set at a merge.
-    let registry = scans.checked_mul(
-        size_of::<crate::SourceBindingRef<'_>>()
-            .checked_add(size_of::<(crate::SourceBindingRef<'_>, u32)>())?
-            .checked_add(size_of::<usize>())?,
-    )?;
-    let topology = fragments
-        .checked_mul(
-            size_of::<&Fragment>()
-                .checked_add(2 * size_of::<CompactSourceBindingSet>())?
-                .checked_add(size_of::<(FragmentId, CompactSourceBindingSet)>())?
-                .checked_add(2 * size_of::<usize>())?
-                .checked_add(3 * size_of::<FragmentId>())?
-                .checked_add(2 * size_of::<bool>())?,
-        )?
-        .checked_add(edges.checked_mul(2 * size_of::<(usize, usize)>())?)?;
-    let union_count = edges.checked_add(fragments)?;
-    // A pairwise union has at most one merge per parent/local set. Each merge
-    // requests <= 2*scans u32s in its Vec and <= 2*scans in its new Arc while
-    // the old sets remain live. Counting all requests (not just the final
-    // live bytes) safely covers intermediate generations and Arc headers.
-    let sets = union_count.checked_mul(scans.checked_mul(16)?.checked_add(64)?)?;
-    let union_vectors = edges
-        .checked_add(fragments.checked_mul(8)?)?
-        .checked_mul(8 * size_of::<CompactSourceBindingSet>())?;
-    registry
-        .checked_add(topology)?
-        .checked_add(sets)?
-        .checked_add(union_vectors)
-}
-
-pub(crate) fn source_provenance_index(plan: &PhysicalPlan) -> Option<PlanSourceProvenance<'_>> {
-    source_provenance_index_bounded(plan, usize::MAX)
-}
-
-pub(crate) fn source_provenance_index_bounded(
-    plan: &PhysicalPlan,
-    maximum_bytes: usize,
-) -> Option<PlanSourceProvenance<'_>> {
-    if source_provenance_index_bytes(plan)? > maximum_bytes {
-        return None;
-    }
-    let scans = plan
-        .fragments()
-        .values()
-        .map(|fragment| {
-            fragment
-                .nodes()
-                .values()
-                .filter(|node| matches!(node.kind, NodeKind::Scan { .. }))
-                .count()
-        })
-        .sum();
-    let registry = SourceBindingRegistry::new(plan, scans)?;
-    let fragments = plan.fragments().values().collect::<Vec<_>>();
-    let ordinal = |id: FragmentId| {
-        fragments
-            .binary_search_by_key(&id, |fragment| fragment.id())
-            .ok()
-    };
-    let mut indegree = vec![0usize; fragments.len()];
-    let mut outgoing = Vec::with_capacity(plan.edges().len());
-    let mut incoming = Vec::with_capacity(plan.edges().len());
-    for edge in plan.edges().values() {
-        let source = ordinal(edge.source.fragment)?;
-        let destination = ordinal(edge.destination.fragment)?;
-        indegree[destination] = indegree[destination].checked_add(1)?;
-        outgoing.push((source, destination));
-        incoming.push((destination, source));
-    }
-    outgoing.sort_unstable();
-    incoming.sort_unstable();
-    let adjacency = |index: &[(usize, usize)], fragment: usize| {
-        let begin = index.partition_point(|(id, _)| *id < fragment);
-        let end = index.partition_point(|(id, _)| *id <= fragment);
-        begin..end
-    };
-    let mut local_sets = Vec::with_capacity(fragments.len());
-    let mut local_source_free = vec![false; fragments.len()];
-    for (ordinal, fragment) in fragments.iter().enumerate() {
-        let scan_count = fragment
-            .nodes()
-            .values()
-            .filter(|node| matches!(node.kind, NodeKind::Scan { .. }))
-            .count();
-        let mut ids = Vec::with_capacity(scan_count);
-        for node in fragment.nodes().values() {
-            match &node.kind {
-                NodeKind::Scan { relation, .. } => {
-                    ids.push(registry.intern(relation.source_binding_ref())?);
-                }
-                NodeKind::Values { rows } if !rows.is_empty() => local_source_free[ordinal] = true,
-                NodeKind::GenerateSeries { .. } => local_source_free[ordinal] = true,
-                NodeKind::TableFunction { .. } if node.inputs.is_empty() => {
-                    local_source_free[ordinal] = true
-                }
-                _ => {}
-            }
-        }
-        ids.sort_unstable();
-        ids.dedup();
-        local_sets.push(CompactSourceBindingSet::from_ids(&ids)?);
-    }
-    let mut by_fragment = Vec::with_capacity(fragments.len());
-    for fragment in &fragments {
-        by_fragment.push((fragment.id(), CompactSourceBindingSet::default()));
-    }
-    let mut source_free = vec![false; fragments.len()];
-    let mut cut_binding_items = 0_usize;
-    let mut ready = Vec::with_capacity(fragments.len());
-    for (ordinal, degree) in indegree.iter().enumerate() {
-        if *degree == 0 {
-            ready.push(ordinal);
-        }
-    }
-    let mut visited = 0usize;
-    while !ready.is_empty() {
-        // Match the old BTreeSet's smallest-fragment-first traversal, with no
-        // sorting scratch or growable queue outside the preflighted capacity.
-        ready.sort_unstable_by(|left, right| right.cmp(left));
-        let source = ready.pop()?;
-        visited += 1;
-        let parents = incoming[adjacency(&incoming, source)]
-            .iter()
-            .map(|(_, parent)| by_fragment[*parent].1.clone());
-        by_fragment[source].1 = CompactSourceBindingSet::union(&local_sets[source], parents);
-        source_free[source] = local_source_free[source]
-            || incoming[adjacency(&incoming, source)]
-                .iter()
-                .any(|(_, parent)| source_free[*parent]);
-        let destinations = &outgoing[adjacency(&outgoing, source)];
-        charge_provenance_cut_items(
-            &mut cut_binding_items,
-            by_fragment[source].1.len(),
-            destinations.len(),
-        )?;
-        for (_, destination) in destinations {
-            indegree[*destination] = indegree[*destination].checked_sub(1)?;
-            if indegree[*destination] == 0 {
-                ready.push(*destination);
-            }
-        }
-    }
-    if visited != fragments.len() {
-        return None;
-    }
-    let mut source_free_fragments = Vec::with_capacity(fragments.len());
-    for (ordinal, fragment) in fragments.iter().enumerate() {
-        if source_free[ordinal] {
-            source_free_fragments.push(fragment.id());
-        }
-    }
-    Some(PlanSourceProvenance {
-        registry,
-        by_fragment,
-        source_free_fragments,
-    })
-}
-
-pub(crate) fn fragment_source_provenance(
-    fragment: &Fragment,
-    cuts: &FragmentCuts,
-) -> SourceProvenance {
-    let mut provenance = SourceProvenance::default();
-    for node in fragment.nodes().values() {
-        match &node.kind {
-            NodeKind::Scan { relation, .. } => {
-                provenance.bindings.insert(relation.source_binding());
-            }
-            NodeKind::Values { rows } if !rows.is_empty() => {
-                provenance.has_source_free_rows = true;
-            }
-            NodeKind::GenerateSeries { .. } => {
-                provenance.has_source_free_rows = true;
-            }
-            NodeKind::TableFunction { .. } if node.inputs.is_empty() => {
-                provenance.has_source_free_rows = true;
-            }
-            _ => {}
-        }
-    }
-    for cut in &cuts.inbound {
-        for binding in &cut.source_bindings {
-            provenance.bindings.insert(binding.clone());
-        }
-        provenance.has_source_free_rows |= cut.has_source_free_rows;
-    }
-    provenance
-}
-
-pub(crate) fn same_source_bindings(
-    left: &[ArtifactSourceBinding],
-    right: &SourceBindingIndex,
-) -> bool {
-    let mut left_index = SourceBindingIndex::default();
-    for binding in left {
-        left_index.insert(binding.clone());
-    }
-    &left_index == right
 }
 
 pub(crate) fn bounded_count(
@@ -945,70 +718,5 @@ pub(crate) fn bounded_count(
             path,
             format!("contains {actual} items, exceeding {maximum}"),
         ));
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct SourceSinkEdgeIndex {
-    pub(crate) owned: BTreeMap<EdgeId, bool>,
-}
-
-impl SourceSinkEdgeIndex {
-    pub(crate) fn new(plan: &PhysicalPlan) -> Self {
-        let mut index = Self::default();
-        for source in plan.fragments().values() {
-            match source.sink() {
-                FragmentSink::Stream { edge } => index.record(
-                    *edge,
-                    plan.edges().get(edge).is_some_and(|contract| {
-                        contract.source.fragment == source.id()
-                            && contract.kind == crate::EdgeKind::Stream
-                    }),
-                ),
-                FragmentSink::Multicast { edges } => {
-                    for edge in edges {
-                        index.record(
-                            *edge,
-                            plan.edges().get(edge).is_some_and(|contract| {
-                                contract.source.fragment == source.id()
-                                    && contract.kind == crate::EdgeKind::CteMulticast
-                            }),
-                        );
-                    }
-                }
-                FragmentSink::Router { routes, .. } => {
-                    for route in routes {
-                        index.record(
-                            route.edge,
-                            plan.edges().get(&route.edge).is_some_and(|contract| {
-                                contract.source.fragment == source.id()
-                                    && contract.kind == crate::EdgeKind::ChangeStreamRouter
-                                    && contract
-                                        .source
-                                        .projection
-                                        .iter()
-                                        .eq(route.input_mapping.iter().map(|(_, value)| value))
-                            }),
-                        );
-                    }
-                }
-                FragmentSink::Result
-                | FragmentSink::RootResult(_)
-                | FragmentSink::SealedArtifact(_)
-                | FragmentSink::Noop => {}
-            }
-        }
-        index
-    }
-
-    pub(crate) fn record(&mut self, edge: EdgeId, valid: bool) {
-        self.owned
-            .entry(edge)
-            .and_modify(|owned| *owned = false)
-            .or_insert(valid);
-    }
-
-    pub(crate) fn owns(&self, edge: &Edge) -> bool {
-        self.owned.get(&edge.id) == Some(&true)
     }
 }

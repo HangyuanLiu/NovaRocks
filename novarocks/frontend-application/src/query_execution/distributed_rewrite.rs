@@ -179,6 +179,7 @@ pub(crate) fn rewrite_cohort_provider_read_need(
             (
                 Box::<str>::from(field.name().as_str()),
                 novarocks_physical_plan::ValueType {
+                    logical_type: novarocks_type_contract::ValueLogicalType::Physical,
                     data_type: field.data_type().clone(),
                     nullable: field.is_nullable(),
                 },

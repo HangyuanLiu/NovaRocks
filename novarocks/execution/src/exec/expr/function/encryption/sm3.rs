@@ -16,21 +16,8 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{ArrayRef, StringArray};
-use sm3::{Digest, Sm3};
-use std::sync::Arc;
-
-fn format_sm3_with_spaces(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    for (idx, byte) in bytes.iter().enumerate() {
-        if idx >= 4 && idx % 4 == 0 {
-            out.push(' ');
-        }
-        out.push_str(&format!("{:02x}", byte));
-    }
-    out
-}
-
+use arrow::array::ArrayRef;
+use novarocks_functions::builtin::sm3_shared;
 pub fn eval_sm3(
     arena: &ExprArena,
     expr: ExprId,
@@ -39,25 +26,5 @@ pub fn eval_sm3(
 ) -> Result<ArrayRef, String> {
     let _ = expr;
     let input = super::common::to_owned_bytes_array(arena.eval(args[0], chunk)?, "sm3", 0)?;
-
-    let mut out = Vec::with_capacity(chunk.len());
-    for row in 0..chunk.len() {
-        if input.is_null(row) {
-            out.push(None);
-            continue;
-        }
-
-        let bytes = input.bytes(row);
-        if bytes.is_empty() {
-            out.push(Some(String::new()));
-            continue;
-        }
-
-        let mut hasher = Sm3::new();
-        hasher.update(bytes);
-        let digest = hasher.finalize();
-        out.push(Some(format_sm3_with_spaces(&digest)));
-    }
-
-    Ok(Arc::new(StringArray::from(out)) as ArrayRef)
+    Ok(sm3_shared::evaluate_legacy(&input, chunk.len()))
 }

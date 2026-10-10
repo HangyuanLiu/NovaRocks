@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_execution::runtime::mem_tracker::{self, MemTracker};
-use novarocks_memory::{AccountHandle, AccountKind, ExternalRef, MemoryAuthority};
+use novarocks_memory::{AccountHandle, AccountKind, CapacityError, ExternalRef, MemoryAuthority};
 use novarocks_types::{QueryId, UniqueId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -77,6 +77,38 @@ impl QueryExecutionKey {
         }
     }
 }
+
+/// The exact context key which owns an installed account. Identity is not a grant.
+#[derive(Clone, Debug)]
+pub struct QueryMemoryAccount {
+    execution: QueryExecutionKey,
+    account: AccountHandle,
+}
+impl QueryMemoryAccount {
+    pub const fn execution(&self) -> QueryExecutionKey {
+        self.execution
+    }
+    pub fn account(&self) -> &AccountHandle {
+        &self.account
+    }
+    pub fn into_account(self) -> AccountHandle {
+        self.account
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueryMemoryAccountError {
+    MissingContext,
+    Capacity(CapacityError),
+}
+impl std::fmt::Display for QueryMemoryAccountError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingContext => f.write_str("QueryContext missing for memory account"),
+            Self::Capacity(error) => write!(f, "create query memory account: {error}"),
+        }
+    }
+}
+impl std::error::Error for QueryMemoryAccountError {}
 
 #[allow(
     dead_code,
@@ -170,11 +202,11 @@ pub(crate) struct QueryContext {
     pub(crate) mem_tracker: Arc<MemTracker>,
     /// This query's memory account, created on first ask.
     ///
-    /// The account lives exactly as long as the context does, which is what
-    /// makes the query's capacity return on its own when the query ends. It
-    /// stays `None` until an owner that was *handed* a memory authority asks
-    /// for it: this registry is a process-global singleton and must not be a
-    /// place capacity can be reached from.
+    /// The context retains the initial owner. Task bindings and outstanding
+    /// domains may retain it beyond context removal; only actual final free
+    /// releases their payload, and funded retirement needs teardown evidence.
+    /// Native admission always asks its explicitly supplied authority for this
+    /// account, regardless of whether a local policy limit was supplied.
     mem_account: Option<AccountHandle>,
     cleanup_leases: Vec<QueryCleanupLease>,
 }
@@ -550,12 +582,26 @@ impl QueryContextManager {
         execution: QueryExecutionKey,
         authority: &Arc<MemoryAuthority>,
     ) -> Result<AccountHandle, String> {
+        self.ensure_query_memory_account(execution, authority)
+            .map(QueryMemoryAccount::into_account)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Preserves the existing account constructor and full typed capacity cause.
+    pub fn ensure_query_memory_account(
+        &self,
+        execution: QueryExecutionKey,
+        authority: &Arc<MemoryAuthority>,
+    ) -> Result<QueryMemoryAccount, QueryMemoryAccountError> {
         let mut inner = self.inner.lock().expect("query context manager lock");
         let context = inner
             .context_mut(execution)
-            .ok_or_else(|| "QueryContext missing for memory account".to_string())?;
+            .ok_or(QueryMemoryAccountError::MissingContext)?;
         if let Some(account) = context.mem_account.as_ref() {
-            return Ok(account.clone());
+            return Ok(QueryMemoryAccount {
+                execution,
+                account: account.clone(),
+            });
         }
         let query_id = execution.query_id();
         let account = authority
@@ -563,9 +609,26 @@ impl QueryContextManager {
                 AccountKind::Work,
                 ExternalRef::new(query_id.high() as u64, query_id.low() as u64),
             )
-            .map_err(|error| format!("create query memory account: {error}"))?;
+            .map_err(QueryMemoryAccountError::Capacity)?;
         context.mem_account = Some(account.clone());
-        Ok(account)
+        Ok(QueryMemoryAccount { execution, account })
+    }
+
+    /// Borrows only an already-installed exact context account. This never
+    /// creates a no-limit wallet or changes an existing policy.
+    pub fn query_memory_account_execution(
+        &self,
+        execution: QueryExecutionKey,
+    ) -> Option<QueryMemoryAccount> {
+        let mut inner = self.inner.lock().expect("query context manager lock");
+        let context = inner.context_mut(execution)?;
+        context
+            .mem_account
+            .as_ref()
+            .map(|account| QueryMemoryAccount {
+                execution,
+                account: account.clone(),
+            })
     }
 
     pub fn ensure_native_context_execution(

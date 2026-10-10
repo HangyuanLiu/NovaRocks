@@ -34,7 +34,7 @@ use arrow::datatypes::SchemaRef;
 use novarocks_query_application::api::ExactBindingReceiptStore;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorTableHandle,
-    ConnectorTableMetadata, ConnectorWritePreparation,
+    ConnectorTableMetadata,
 };
 use novarocks_sql::binding::{SqlTableBindingAllocator, SqlTableBindingId, SqlTableBindingScopeId};
 use novarocks_sql::planning::catalog::{
@@ -79,18 +79,12 @@ pub enum QueryFrozenReadInput {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum QueryTableBindingSelector {
     StrictBaseTable,
-    /// A terminal writer target. This remains separate from a read binding
-    /// for the same physical table because the writer's frozen physical
-    /// schema may include hidden lineage or MV state columns that a scan does
-    /// not expose.
-    /// One provider-signed terminal writer target. Multiple physical sink
-    /// shapes for the same table (for example MOR change streams) must retain
-    /// distinct bindings, rather than allowing one shape to stand in for
-    /// another during SQL sink projection.
-    WriteTarget([u8; 32]),
-    /// One logical write target of the query's write session. Within a session
-    /// the ordinal is dense and unique, so it -- not a preparation digest -- is
-    /// what tells two branches of the same physical table apart.
+    /// One logical write target of the query's write session. It remains
+    /// separate from a read binding for the same physical table because the
+    /// writer's frozen physical schema may include hidden lineage or MV state
+    /// columns that a scan does not expose. Within a session the ordinal is
+    /// dense and unique, so it is what tells two branches of the same physical
+    /// table apart.
     SessionWriteTarget(u32),
     Snapshot(i64),
     Metadata(SqlMetadataTableKind),
@@ -126,20 +120,6 @@ impl QueryTableBindingKey {
     /// Reserve an exact terminal writer target.  A write must never reuse a
     /// same-name read binding: those bindings carry different SQL facts while
     /// both remain valid for their independently frozen application roles.
-    pub fn write_target(
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        preparation_digest: [u8; 32],
-    ) -> Self {
-        Self::new(
-            catalog,
-            namespace,
-            table,
-            QueryTableBindingSelector::WriteTarget(preparation_digest),
-        )
-    }
-
     pub fn session_write_target(
         catalog: &str,
         namespace: &str,
@@ -337,12 +317,9 @@ pub struct QueryTableBinding {
 #[derive(Clone)]
 pub struct QueryWriteTargetAdmission {
     /// What SQL is allowed to see: the Arrow layout and field tokens of this
-    /// target's input rows. Both admission paths supply it.
+    /// target's input rows, as the write session sealed them for the handle
+    /// the plan's writer carries.
     pub input: novarocks_spi::connector::ConnectorWriteInputShape,
-    /// The provider-signed preparation. Present only on the legacy
-    /// write-operation path -- a write session admits a target from its sealed
-    /// input shape, and no longer mints a preparation per target.
-    pub preparation: Option<ConnectorWritePreparation>,
 }
 
 /// Exact provider scan facts retained after admission.  The concrete Iceberg
@@ -783,65 +760,6 @@ impl QueryTableBindingStore {
         Ok(catalog::table_binding_id(&binding.resolved))
     }
 
-    /// Return the unique Provider-signed preparation admitted for a terminal
-    /// write target.  Callers that need more than one shape must use their
-    /// explicit preparation instead of allowing target lookup to choose one.
-    pub fn admitted_iceberg_write_preparation(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Result<ConnectorWritePreparation, String> {
-        let matches = self
-            .captured_bindings()
-            .into_iter()
-            .filter(|(_, binding)| {
-                catalog::materialization_identity_facts(&binding.resolved)
-                    .matches(catalog, namespace, table)
-                    && binding.write_target_admission.is_some()
-            })
-            .collect::<Vec<_>>();
-        let [(_, binding)] = matches.as_slice() else {
-            return Err(format!(
-                "SQL write target {catalog}.{namespace}.{table} does not have exactly one admitted Iceberg provider preparation"
-            ));
-        };
-        binding
-            .write_target_admission
-            .as_ref()
-            .and_then(|admission| admission.preparation.clone())
-            .ok_or_else(|| {
-                format!(
-                    "SQL write target {catalog}.{namespace}.{table} is missing admitted Iceberg provider facts"
-                )
-            })
-    }
-
-    /// Return one explicitly admitted writer binding for its sealed
-    /// preparation. This is required when a single terminal operation has
-    /// multiple writer shapes for the same physical target.
-    pub fn admitted_iceberg_write_binding_id_for_preparation(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        preparation: &ConnectorWritePreparation,
-    ) -> Result<SqlTableBindingId, String> {
-        let key =
-            QueryTableBindingKey::write_target(catalog, namespace, table, preparation.digest());
-        let Some(binding) = self.binding_for_key(&key) else {
-            return Err(format!(
-                "SQL write target {catalog}.{namespace}.{table} was not admitted into this query binding store"
-            ));
-        };
-        match binding.write_target_admission.as_ref() {
-            Some(_) => Ok(catalog::table_binding_id(&binding.resolved)),
-            _ => Err(format!(
-                "SQL write target {catalog}.{namespace}.{table} is missing admitted Iceberg provider facts"
-            )),
-        }
-    }
-
     /// Return the one admission-frozen MV target binding.  The UUID and
     /// snapshot are part of the lookup key so a recreated target or a later
     /// refresh baseline can never reuse an earlier request's authority.
@@ -1134,7 +1052,12 @@ mod tests {
                 || Ok(local_binding()),
             )
             .expect("scan token");
-        let writer_key = QueryTableBindingKey::write_target("ice", "db", "orders", [1; 32]);
+        let writer_key = QueryTableBindingKey::session_write_target(
+            "ice",
+            "db",
+            "orders",
+            novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(0).expect("ordinal"),
+        );
         let writer = store
             .resolve_or_insert(writer_key.clone(), || Ok(local_binding()))
             .expect("writer token");

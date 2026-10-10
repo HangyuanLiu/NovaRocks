@@ -21,6 +21,16 @@
 //! Memo operators (`MExpr`) and reads child statistics from group logical
 //! properties instead of recursing the `LogicalPlanNode` tree.
 
+#[cfg(test)]
+#[path = "stats/selectivity_constant_tests.rs"]
+mod selectivity_constant_tests;
+
+#[cfg(test)]
+#[path = "stats/values_constant_tests.rs"]
+mod values_constant_tests;
+
+use crate::compiler::SqlCompileError;
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 use std::collections::HashMap;
 
 use super::estimate::ndv::{agg_group_rows, cap_ndv_at_rows};
@@ -76,490 +86,528 @@ pub(crate) fn derive_statistics(
     expr: &MExpr,
     memo: &Memo,
     stats_input: &OptimizerStatsInput,
-) -> Statistics {
-    match &expr.op {
-        // -- Leaf operators (no children) --
-        Operator::LogicalScan(scan) => derive_scan(scan, &memo.scalars, stats_input),
-        Operator::LogicalValues(vals) => Statistics {
-            output_row_count: vals.rows.len() as f64,
-            row_count_confidence: Confidence::Exact,
-            column_statistics: values_column_statistics_scalar(
-                &memo.scalars,
-                &vals.rows,
-                &vals.columns,
-            ),
-        },
-        Operator::LogicalGenerateSeries(gs) => Statistics {
-            output_row_count: generate_series_row_count_f64(gs.start, gs.end, gs.step),
-            row_count_confidence: Confidence::Exact,
-            column_statistics: generate_series_column_statistics(
-                gs.output_column_id,
-                gs.start,
-                gs.end,
-                gs.step,
-            ),
-        },
-        Operator::LogicalTableFunction(tf) => {
-            derive_table_function_stats(tf.is_left_join, expr, memo)
-        }
-        Operator::LogicalCTEConsume(cte) => {
-            // Look up the CTEProduce group's row count from the memo.
-            if let Some(&produce_group_id) = memo.cte_produce_groups.get(&cte.cte_id) {
-                if let Some(ref props) = memo.groups[produce_group_id].logical_props {
-                    Statistics {
-                        output_row_count: props.row_count,
-                        row_count_confidence: Confidence::Estimated,
-                        column_statistics: remap_cte_consume_column_statistics(
-                            props,
-                            &cte.output_columns,
-                        ),
+    work: &mut CompileCheckpoints<'_>,
+    control: &dyn PureCompileControl,
+) -> Result<Statistics, SqlCompileError> {
+    work.step()?;
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    // Non-VALUES operator helpers remain opaque. These surrounding observations
+    // do not establish their internal work, growth, or host authorization.
+    let result: Result<Statistics, SqlCompileError> = (|| {
+        Ok(match &expr.op {
+            // -- Leaf operators (no children) --
+            Operator::LogicalScan(scan) => derive_scan(scan, &memo.scalars, stats_input, work)?,
+            Operator::LogicalValues(vals) => Statistics {
+                output_row_count: vals.rows.len() as f64,
+                row_count_confidence: Confidence::Exact,
+                column_statistics: values_column_statistics_scalar(
+                    &memo.scalars,
+                    &vals.rows,
+                    &vals.columns,
+                    control,
+                    work,
+                )?,
+            },
+            Operator::LogicalGenerateSeries(gs) => Statistics {
+                output_row_count: generate_series_row_count_f64(gs.start, gs.end, gs.step),
+                row_count_confidence: Confidence::Exact,
+                column_statistics: generate_series_column_statistics(
+                    gs.output_column_id,
+                    gs.start,
+                    gs.end,
+                    gs.step,
+                ),
+            },
+            Operator::LogicalTableFunction(tf) => {
+                derive_table_function_stats(tf.is_left_join, expr, memo)
+            }
+            Operator::LogicalCTEConsume(cte) => {
+                // Look up the CTEProduce group's row count from the memo.
+                if let Some(&produce_group_id) = memo.cte_produce_groups.get(&cte.cte_id) {
+                    if let Some(ref props) = memo.groups[produce_group_id].logical_props {
+                        Statistics {
+                            output_row_count: props.row_count,
+                            row_count_confidence: Confidence::Estimated,
+                            column_statistics: remap_cte_consume_column_statistics(
+                                props,
+                                &cte.output_columns,
+                            ),
+                        }
+                    } else {
+                        // CTEProduce group not yet derived (should not happen in bottom-up order).
+                        Statistics {
+                            output_row_count: 10_000.0,
+                            row_count_confidence: Confidence::Fallback,
+                            column_statistics: HashMap::new(),
+                        }
                     }
                 } else {
-                    // CTEProduce group not yet derived (should not happen in bottom-up order).
+                    // No mapping found; conservative fallback.
                     Statistics {
                         output_row_count: 10_000.0,
                         row_count_confidence: Confidence::Fallback,
                         column_statistics: HashMap::new(),
                     }
                 }
-            } else {
-                // No mapping found; conservative fallback.
-                Statistics {
-                    output_row_count: 10_000.0,
-                    row_count_confidence: Confidence::Fallback,
-                    column_statistics: HashMap::new(),
-                }
             }
-        }
-        Operator::LogicalCTEAnchor(_) => child_statistics(memo, &expr.children, 1),
+            Operator::LogicalCTEAnchor(_) => child_statistics(memo, &expr.children, 1),
 
-        // -- Unary operators (single child) --
-        Operator::LogicalFilter(filter) => {
-            let child_stats = child_statistics(memo, &expr.children, 0);
-            let selectivity = estimate_selectivity_scalar(
-                &memo.scalars,
-                filter.predicate,
-                &child_stats.column_statistics,
-            );
-            let (output_rows, row_count_confidence) = apply_filter(
-                child_stats.output_row_count,
-                child_stats.row_count_confidence,
-                selectivity,
-            );
-            let mut column_statistics = child_stats.column_statistics;
-            for stat in column_statistics.values_mut() {
-                cap_stat_ndv_at_rows(stat, output_rows);
-            }
-            Statistics {
-                output_row_count: output_rows,
-                row_count_confidence,
-                column_statistics,
-            }
-        }
-
-        Operator::LogicalProject(proj) => {
-            let child_stats = child_statistics(memo, &expr.children, 0);
-            let projected: HashMap<ColumnId, ColumnStatistic> = proj
-                .items
-                .iter()
-                .filter_map(|item| {
-                    extract_column_id_scalar(&memo.scalars, item.expr)
-                        .and_then(|column_id| child_stats.column_statistics.get(&column_id))
-                        .cloned()
-                        .map(|cs| (item.output_column_id, cs))
-                })
-                .collect();
-            Statistics {
-                output_row_count: child_stats.output_row_count,
-                row_count_confidence: Confidence::Estimated,
-                column_statistics: projected,
-            }
-        }
-
-        Operator::LogicalAggregate(agg) => {
-            let child_stats = child_statistics(memo, &expr.children, 0);
-            if agg.group_by.is_empty() {
-                return Statistics {
-                    output_row_count: 1.0,
-                    row_count_confidence: Confidence::Estimated,
-                    column_statistics: HashMap::new(),
-                };
-            }
-            let group_key_ndvs: Vec<f64> = agg
-                .group_by
-                .iter()
-                .map(|gb_expr| {
-                    get_expr_ndv_scalar(&memo.scalars, *gb_expr, &child_stats.column_statistics)
-                })
-                .collect();
-            let output_rows = agg_group_rows(&group_key_ndvs, child_stats.output_row_count);
-            let column_statistics = aggregate_group_column_statistics_scalar(
-                &memo.scalars,
-                &agg.group_by,
-                &agg.output_columns,
-                &child_stats,
-                output_rows,
-            );
-            Statistics {
-                output_row_count: output_rows,
-                row_count_confidence: Confidence::derive(
-                    &[child_stats.row_count_confidence],
-                    false,
-                ),
-                column_statistics,
-            }
-        }
-
-        Operator::LogicalSort(_) => {
-            // Sort preserves row count.
-            child_statistics(memo, &expr.children, 0)
-        }
-
-        Operator::LogicalTopN(topn) => {
-            // TopN limits output rows to at most limit+offset.
-            let child_stats = child_statistics(memo, &expr.children, 0);
-            let limit_rows = match (topn.limit, topn.offset) {
-                (Some(l), Some(o)) => ((l as f64) + (o as f64)).min(child_stats.output_row_count),
-                (Some(l), None) => (l as f64).min(child_stats.output_row_count),
-                _ => child_stats.output_row_count,
-            };
-            Statistics {
-                output_row_count: limit_rows.max(0.0),
-                row_count_confidence: Confidence::Estimated,
-                column_statistics: child_stats.column_statistics,
-            }
-        }
-
-        Operator::LogicalLimit(limit) => {
-            let child_stats = child_statistics(memo, &expr.children, 0);
-            let output_rows = if let Some(lim) = limit.limit {
-                (lim as f64).min(child_stats.output_row_count)
-            } else {
-                child_stats.output_row_count
-            };
-            Statistics {
-                output_row_count: output_rows.max(0.0),
-                row_count_confidence: Confidence::Estimated,
-                column_statistics: child_stats.column_statistics,
-            }
-        }
-
-        Operator::LogicalWindow(window) => {
-            let child_stats = child_statistics(memo, &expr.children, 0);
-            derive_window_statistics_scalar(
-                child_stats,
-                window.window_exprs.len(),
-                &window.output_columns,
-            )
-        }
-
-        Operator::LogicalRepeat(repeat) => {
-            let child_stats = child_statistics(memo, &expr.children, 0);
-            let repeat_times = repeat.repeat_column_ref_list.len() as f64;
-            Statistics {
-                output_row_count: child_stats.output_row_count * repeat_times,
-                row_count_confidence: Confidence::Estimated,
-                column_statistics: child_stats.column_statistics,
-            }
-        }
-
-        Operator::LogicalChangeEventExpand(expand) => {
-            derive_change_event_expand_statistics(expand, expr, memo)
-        }
-
-        Operator::LogicalCTEProduce(_) => {
-            // Passthrough child stats.
-            child_statistics(memo, &expr.children, 0)
-        }
-
-        // -- Binary / multi-child operators --
-        Operator::LogicalJoin(join) => {
-            let left_stats = child_statistics(memo, &expr.children, 0);
-            let right_stats = child_statistics(memo, &expr.children, 1);
-            derive_join(join, &memo.scalars, &left_stats, &right_stats)
-        }
-
-        Operator::LogicalUnion(union_op) => derive_set_op_statistics(
-            memo,
-            &expr.children,
-            &union_op.output_columns,
-            SetOpKind::Union { all: union_op.all },
-        ),
-
-        Operator::LogicalIntersect(intersect_op) => derive_set_op_statistics(
-            memo,
-            &expr.children,
-            &intersect_op.output_columns,
-            SetOpKind::Intersect,
-        ),
-
-        Operator::LogicalExcept(except_op) => derive_set_op_statistics(
-            memo,
-            &expr.children,
-            &except_op.output_columns,
-            SetOpKind::Except,
-        ),
-
-        // -- Physical operators: derive the same way as their logical counterparts --
-        Operator::PhysicalScan(scan) => derive_scan(scan, &memo.scalars, stats_input),
-
-        Operator::PhysicalFilter(filter) => {
-            let child_stats = child_statistics(memo, &expr.children, 0);
-            let selectivity = estimate_selectivity_scalar(
-                &memo.scalars,
-                filter.predicate,
-                &child_stats.column_statistics,
-            );
-            let (output_rows, row_count_confidence) = apply_filter(
-                child_stats.output_row_count,
-                child_stats.row_count_confidence,
-                selectivity,
-            );
-            let mut column_statistics = child_stats.column_statistics;
-            for stat in column_statistics.values_mut() {
-                cap_stat_ndv_at_rows(stat, output_rows);
-            }
-            Statistics {
-                output_row_count: output_rows,
-                row_count_confidence,
-                column_statistics,
-            }
-        }
-
-        Operator::PhysicalProject(proj) => {
-            let child_stats = child_statistics(memo, &expr.children, 0);
-            let projected: HashMap<ColumnId, ColumnStatistic> = proj
-                .items
-                .iter()
-                .filter_map(|item| {
-                    extract_column_id_scalar(&memo.scalars, item.expr)
-                        .and_then(|column_id| child_stats.column_statistics.get(&column_id))
-                        .cloned()
-                        .map(|cs| (item.output_column_id, cs))
-                })
-                .collect();
-            Statistics {
-                output_row_count: child_stats.output_row_count,
-                row_count_confidence: Confidence::Estimated,
-                column_statistics: projected,
-            }
-        }
-
-        Operator::PhysicalHashAggregate(agg) => {
-            let child_stats = child_statistics(memo, &expr.children, 0);
-            if agg.group_by.is_empty() {
-                return Statistics {
-                    output_row_count: 1.0,
-                    row_count_confidence: Confidence::Estimated,
-                    column_statistics: HashMap::new(),
-                };
-            }
-            let group_key_ndvs: Vec<f64> = agg
-                .group_by
-                .iter()
-                .map(|gb_expr| {
-                    get_expr_ndv_scalar(&memo.scalars, *gb_expr, &child_stats.column_statistics)
-                })
-                .collect();
-            let output_rows = agg_group_rows(&group_key_ndvs, child_stats.output_row_count);
-            let column_statistics = aggregate_group_column_statistics_scalar(
-                &memo.scalars,
-                &agg.group_by,
-                &agg.output_columns,
-                &child_stats,
-                output_rows,
-            );
-            Statistics {
-                output_row_count: output_rows,
-                row_count_confidence: Confidence::derive(
-                    &[child_stats.row_count_confidence],
-                    false,
-                ),
-                column_statistics,
-            }
-        }
-
-        Operator::PhysicalHashJoin(join) => {
-            let left_stats = child_statistics(memo, &expr.children, 0);
-            let right_stats = child_statistics(memo, &expr.children, 1);
-            #[expect(
-                clippy::type_complexity,
-                reason = "The tuple mirrors the independent statistics facts returned to the estimator."
-            )]
-            let eq_key_ndvs: Vec<(f64, f64, Confidence, Option<(ColumnId, ColumnId)>)> = join
-                .eq_conditions
-                .iter()
-                .map(|eq| {
-                    let eq_key_pair = extract_column_id_scalar(&memo.scalars, eq.left)
-                        .zip(extract_column_id_scalar(&memo.scalars, eq.right));
-                    let (left_ndv, left_confidence) = best_join_key_ndv_scalar(
-                        &memo.scalars,
-                        eq.left,
-                        &left_stats.column_statistics,
-                        &right_stats.column_statistics,
-                    );
-                    let (right_ndv, right_confidence) = best_join_key_ndv_scalar(
-                        &memo.scalars,
-                        eq.right,
-                        &right_stats.column_statistics,
-                        &left_stats.column_statistics,
-                    );
-                    (
-                        left_ndv,
-                        right_ndv,
-                        left_confidence.combine(right_confidence),
-                        eq_key_pair,
-                    )
-                })
-                .collect();
-            let mut eq_key_ndvs_for_cardinality = Vec::new();
-            let mut eq_key_pairs = Vec::new();
-            for (left_ndv, right_ndv, confidence, pair) in eq_key_ndvs {
-                eq_key_ndvs_for_cardinality.push((left_ndv, right_ndv, confidence));
-                if let Some(pair) = pair {
-                    eq_key_pairs.push(pair);
-                }
-            }
-
-            let (output_rows, row_count_confidence) = estimate_join_cardinality(&JoinCardInput {
-                left: (left_stats.output_row_count, left_stats.row_count_confidence),
-                right: (
-                    right_stats.output_row_count,
-                    right_stats.row_count_confidence,
-                ),
-                kind: join.join_type,
-                eq_key_ndvs: eq_key_ndvs_for_cardinality,
-                non_equi_selectivity: None,
-            });
-
-            let column_statistics = merge_join_column_statistics(
-                &left_stats,
-                &right_stats,
-                output_rows,
-                row_count_confidence,
-                join.join_type,
-                &eq_key_pairs,
-            );
-            Statistics {
-                output_row_count: output_rows,
-                row_count_confidence,
-                column_statistics,
-            }
-        }
-
-        Operator::PhysicalNestLoopJoin(join) => {
-            let left_stats = child_statistics(memo, &expr.children, 0);
-            let right_stats = child_statistics(memo, &expr.children, 1);
-            let non_equi_selectivity = join.condition.map(|cond| {
-                (
-                    estimate_selectivity_scalar(&memo.scalars, cond, &left_stats.column_statistics),
-                    Confidence::Estimated,
-                )
-            });
-            let eq_key_pairs = collect_equi_join_column_pairs_scalar(&memo.scalars, join.condition);
-
-            let (output_rows, row_count_confidence) = estimate_join_cardinality(&JoinCardInput {
-                left: (left_stats.output_row_count, left_stats.row_count_confidence),
-                right: (
-                    right_stats.output_row_count,
-                    right_stats.row_count_confidence,
-                ),
-                kind: join.join_type,
-                eq_key_ndvs: Vec::new(),
-                non_equi_selectivity,
-            });
-
-            let column_statistics = merge_join_column_statistics(
-                &left_stats,
-                &right_stats,
-                output_rows,
-                row_count_confidence,
-                join.join_type,
-                &eq_key_pairs,
-            );
-            Statistics {
-                output_row_count: output_rows,
-                row_count_confidence,
-                column_statistics,
-            }
-        }
-
-        Operator::PhysicalSort(sort) => {
-            let child_stats = child_statistics(memo, &expr.children, 0);
-            if let Some(k) = sort.partition_limit {
-                let output_rows = sort_partition_limit_output_rows_scalar(
+            // -- Unary operators (single child) --
+            Operator::LogicalFilter(filter) => {
+                let child_stats = child_statistics(memo, &expr.children, 0);
+                let selectivity = estimate_selectivity_scalar(
                     &memo.scalars,
-                    child_stats.output_row_count,
-                    &sort.analytic_partition_exprs,
+                    filter.predicate,
                     &child_stats.column_statistics,
-                    k,
+                    work,
+                )?;
+                let (output_rows, row_count_confidence) = apply_filter(
+                    child_stats.output_row_count,
+                    child_stats.row_count_confidence,
+                    selectivity,
+                );
+                let mut column_statistics = child_stats.column_statistics;
+                for stat in column_statistics.values_mut() {
+                    cap_stat_ndv_at_rows(stat, output_rows);
+                }
+                Statistics {
+                    output_row_count: output_rows,
+                    row_count_confidence,
+                    column_statistics,
+                }
+            }
+
+            Operator::LogicalProject(proj) => {
+                let child_stats = child_statistics(memo, &expr.children, 0);
+                let projected: HashMap<ColumnId, ColumnStatistic> = proj
+                    .items
+                    .iter()
+                    .filter_map(|item| {
+                        extract_column_id_scalar(&memo.scalars, item.expr)
+                            .and_then(|column_id| child_stats.column_statistics.get(&column_id))
+                            .cloned()
+                            .map(|cs| (item.output_column_id, cs))
+                    })
+                    .collect();
+                Statistics {
+                    output_row_count: child_stats.output_row_count,
+                    row_count_confidence: Confidence::Estimated,
+                    column_statistics: projected,
+                }
+            }
+
+            Operator::LogicalAggregate(agg) => {
+                let child_stats = child_statistics(memo, &expr.children, 0);
+                if agg.group_by.is_empty() {
+                    return Ok(Statistics {
+                        output_row_count: 1.0,
+                        row_count_confidence: Confidence::Estimated,
+                        column_statistics: HashMap::new(),
+                    });
+                }
+                let group_key_ndvs: Vec<f64> = agg
+                    .group_by
+                    .iter()
+                    .map(|gb_expr| {
+                        get_expr_ndv_scalar(&memo.scalars, *gb_expr, &child_stats.column_statistics)
+                    })
+                    .collect();
+                let output_rows = agg_group_rows(&group_key_ndvs, child_stats.output_row_count);
+                let column_statistics = aggregate_group_column_statistics_scalar(
+                    &memo.scalars,
+                    &agg.group_by,
+                    &agg.output_columns,
+                    &child_stats,
+                    output_rows,
                 );
                 Statistics {
                     output_row_count: output_rows,
+                    row_count_confidence: Confidence::derive(
+                        &[child_stats.row_count_confidence],
+                        false,
+                    ),
+                    column_statistics,
+                }
+            }
+
+            Operator::LogicalSort(_) => {
+                // Sort preserves row count.
+                child_statistics(memo, &expr.children, 0)
+            }
+
+            Operator::LogicalTopN(topn) => {
+                // TopN limits output rows to at most limit+offset.
+                let child_stats = child_statistics(memo, &expr.children, 0);
+                let limit_rows = match (topn.limit, topn.offset) {
+                    (Some(l), Some(o)) => {
+                        ((l as f64) + (o as f64)).min(child_stats.output_row_count)
+                    }
+                    (Some(l), None) => (l as f64).min(child_stats.output_row_count),
+                    _ => child_stats.output_row_count,
+                };
+                Statistics {
+                    output_row_count: limit_rows.max(0.0),
                     row_count_confidence: Confidence::Estimated,
                     column_statistics: child_stats.column_statistics,
                 }
-            } else {
-                child_stats
             }
-        }
 
-        Operator::PhysicalTopN(topn) => {
-            // TopN limits output rows to at most limit+offset.
-            let child_stats = child_statistics(memo, &expr.children, 0);
-            let limit_rows = match (topn.limit, topn.offset) {
-                (Some(l), Some(o)) => ((l as f64) + (o as f64)).min(child_stats.output_row_count),
-                (Some(l), None) => (l as f64).min(child_stats.output_row_count),
-                _ => child_stats.output_row_count,
-            };
-            Statistics {
-                output_row_count: limit_rows.max(0.0),
-                row_count_confidence: Confidence::Estimated,
-                column_statistics: child_stats.column_statistics,
+            Operator::LogicalLimit(limit) => {
+                let child_stats = child_statistics(memo, &expr.children, 0);
+                let output_rows = if let Some(lim) = limit.limit {
+                    (lim as f64).min(child_stats.output_row_count)
+                } else {
+                    child_stats.output_row_count
+                };
+                Statistics {
+                    output_row_count: output_rows.max(0.0),
+                    row_count_confidence: Confidence::Estimated,
+                    column_statistics: child_stats.column_statistics,
+                }
             }
-        }
 
-        Operator::PhysicalLimit(limit) => {
-            let child_stats = child_statistics(memo, &expr.children, 0);
-            let output_rows = if let Some(lim) = limit.limit {
-                (lim as f64).min(child_stats.output_row_count)
-            } else {
-                child_stats.output_row_count
-            };
-            Statistics {
-                output_row_count: output_rows.max(0.0),
-                row_count_confidence: Confidence::Estimated,
-                column_statistics: child_stats.column_statistics,
+            Operator::LogicalWindow(window) => {
+                let child_stats = child_statistics(memo, &expr.children, 0);
+                derive_window_statistics_scalar(
+                    child_stats,
+                    window.window_exprs.len(),
+                    &window.output_columns,
+                )
             }
-        }
 
-        Operator::PhysicalWindow(window) => {
-            let child_stats = child_statistics(memo, &expr.children, 0);
-            derive_window_statistics_scalar(
-                child_stats,
-                window.window_exprs.len(),
-                &window.output_columns,
-            )
-        }
+            Operator::LogicalRepeat(repeat) => {
+                let child_stats = child_statistics(memo, &expr.children, 0);
+                let repeat_times = repeat.repeat_column_ref_list.len() as f64;
+                Statistics {
+                    output_row_count: child_stats.output_row_count * repeat_times,
+                    row_count_confidence: Confidence::Estimated,
+                    column_statistics: child_stats.column_statistics,
+                }
+            }
 
-        Operator::PhysicalDistribution(_) => {
-            // Distribution enforcer preserves row count.
-            child_statistics(memo, &expr.children, 0)
-        }
+            Operator::LogicalChangeEventExpand(expand) => {
+                derive_change_event_expand_statistics(expand, expr, memo)
+            }
 
-        Operator::PhysicalCTEProduce(_) => child_statistics(memo, &expr.children, 0),
+            Operator::LogicalCTEProduce(_) => {
+                // Passthrough child stats.
+                child_statistics(memo, &expr.children, 0)
+            }
 
-        Operator::PhysicalCTEConsume(cte) => {
-            // Look up the CTEProduce group's row count from the memo.
-            if let Some(&produce_group_id) = memo.cte_produce_groups.get(&cte.cte_id) {
-                if let Some(ref props) = memo.groups[produce_group_id].logical_props {
-                    Statistics {
-                        output_row_count: props.row_count,
+            // -- Binary / multi-child operators --
+            Operator::LogicalJoin(join) => {
+                let left_stats = child_statistics(memo, &expr.children, 0);
+                let right_stats = child_statistics(memo, &expr.children, 1);
+                derive_join(join, &memo.scalars, &left_stats, &right_stats, work)?
+            }
+
+            Operator::LogicalUnion(union_op) => derive_set_op_statistics(
+                memo,
+                &expr.children,
+                &union_op.output_columns,
+                SetOpKind::Union { all: union_op.all },
+            ),
+
+            Operator::LogicalIntersect(intersect_op) => derive_set_op_statistics(
+                memo,
+                &expr.children,
+                &intersect_op.output_columns,
+                SetOpKind::Intersect,
+            ),
+
+            Operator::LogicalExcept(except_op) => derive_set_op_statistics(
+                memo,
+                &expr.children,
+                &except_op.output_columns,
+                SetOpKind::Except,
+            ),
+
+            // -- Physical operators: derive the same way as their logical counterparts --
+            Operator::PhysicalScan(scan) => derive_scan(scan, &memo.scalars, stats_input, work)?,
+
+            Operator::PhysicalFilter(filter) => {
+                let child_stats = child_statistics(memo, &expr.children, 0);
+                let selectivity = estimate_selectivity_scalar(
+                    &memo.scalars,
+                    filter.predicate,
+                    &child_stats.column_statistics,
+                    work,
+                )?;
+                let (output_rows, row_count_confidence) = apply_filter(
+                    child_stats.output_row_count,
+                    child_stats.row_count_confidence,
+                    selectivity,
+                );
+                let mut column_statistics = child_stats.column_statistics;
+                for stat in column_statistics.values_mut() {
+                    cap_stat_ndv_at_rows(stat, output_rows);
+                }
+                Statistics {
+                    output_row_count: output_rows,
+                    row_count_confidence,
+                    column_statistics,
+                }
+            }
+
+            Operator::PhysicalProject(proj) => {
+                let child_stats = child_statistics(memo, &expr.children, 0);
+                let projected: HashMap<ColumnId, ColumnStatistic> = proj
+                    .items
+                    .iter()
+                    .filter_map(|item| {
+                        extract_column_id_scalar(&memo.scalars, item.expr)
+                            .and_then(|column_id| child_stats.column_statistics.get(&column_id))
+                            .cloned()
+                            .map(|cs| (item.output_column_id, cs))
+                    })
+                    .collect();
+                Statistics {
+                    output_row_count: child_stats.output_row_count,
+                    row_count_confidence: Confidence::Estimated,
+                    column_statistics: projected,
+                }
+            }
+
+            Operator::PhysicalHashAggregate(agg) => {
+                let child_stats = child_statistics(memo, &expr.children, 0);
+                if agg.group_by.is_empty() {
+                    return Ok(Statistics {
+                        output_row_count: 1.0,
                         row_count_confidence: Confidence::Estimated,
-                        column_statistics: remap_cte_consume_column_statistics(
-                            props,
-                            &cte.output_columns,
+                        column_statistics: HashMap::new(),
+                    });
+                }
+                let group_key_ndvs: Vec<f64> = agg
+                    .group_by
+                    .iter()
+                    .map(|gb_expr| {
+                        get_expr_ndv_scalar(&memo.scalars, *gb_expr, &child_stats.column_statistics)
+                    })
+                    .collect();
+                let output_rows = agg_group_rows(&group_key_ndvs, child_stats.output_row_count);
+                let column_statistics = aggregate_group_column_statistics_scalar(
+                    &memo.scalars,
+                    &agg.group_by,
+                    &agg.output_columns,
+                    &child_stats,
+                    output_rows,
+                );
+                Statistics {
+                    output_row_count: output_rows,
+                    row_count_confidence: Confidence::derive(
+                        &[child_stats.row_count_confidence],
+                        false,
+                    ),
+                    column_statistics,
+                }
+            }
+
+            Operator::PhysicalHashJoin(join) => {
+                let left_stats = child_statistics(memo, &expr.children, 0);
+                let right_stats = child_statistics(memo, &expr.children, 1);
+                #[expect(
+                    clippy::type_complexity,
+                    reason = "The tuple mirrors the independent statistics facts returned to the estimator."
+                )]
+                let eq_key_ndvs: Vec<(
+                    f64,
+                    f64,
+                    Confidence,
+                    Option<(ColumnId, ColumnId)>,
+                )> = join
+                    .eq_conditions
+                    .iter()
+                    .map(|eq| {
+                        let eq_key_pair = extract_column_id_scalar(&memo.scalars, eq.left)
+                            .zip(extract_column_id_scalar(&memo.scalars, eq.right));
+                        let (left_ndv, left_confidence) = best_join_key_ndv_scalar(
+                            &memo.scalars,
+                            eq.left,
+                            &left_stats.column_statistics,
+                            &right_stats.column_statistics,
+                        );
+                        let (right_ndv, right_confidence) = best_join_key_ndv_scalar(
+                            &memo.scalars,
+                            eq.right,
+                            &right_stats.column_statistics,
+                            &left_stats.column_statistics,
+                        );
+                        (
+                            left_ndv,
+                            right_ndv,
+                            left_confidence.combine(right_confidence),
+                            eq_key_pair,
+                        )
+                    })
+                    .collect();
+                let mut eq_key_ndvs_for_cardinality = Vec::new();
+                let mut eq_key_pairs = Vec::new();
+                for (left_ndv, right_ndv, confidence, pair) in eq_key_ndvs {
+                    eq_key_ndvs_for_cardinality.push((left_ndv, right_ndv, confidence));
+                    if let Some(pair) = pair {
+                        eq_key_pairs.push(pair);
+                    }
+                }
+
+                let (output_rows, row_count_confidence) =
+                    estimate_join_cardinality(&JoinCardInput {
+                        left: (left_stats.output_row_count, left_stats.row_count_confidence),
+                        right: (
+                            right_stats.output_row_count,
+                            right_stats.row_count_confidence,
                         ),
+                        kind: join.join_type,
+                        eq_key_ndvs: eq_key_ndvs_for_cardinality,
+                        non_equi_selectivity: None,
+                    });
+
+                let column_statistics = merge_join_column_statistics(
+                    &left_stats,
+                    &right_stats,
+                    output_rows,
+                    row_count_confidence,
+                    join.join_type,
+                    &eq_key_pairs,
+                );
+                Statistics {
+                    output_row_count: output_rows,
+                    row_count_confidence,
+                    column_statistics,
+                }
+            }
+
+            Operator::PhysicalNestLoopJoin(join) => {
+                let left_stats = child_statistics(memo, &expr.children, 0);
+                let right_stats = child_statistics(memo, &expr.children, 1);
+                let non_equi_selectivity = join
+                    .condition
+                    .map(|cond| -> Result<_, SqlCompileError> {
+                        Ok((
+                            estimate_selectivity_scalar(
+                                &memo.scalars,
+                                cond,
+                                &left_stats.column_statistics,
+                                work,
+                            )?,
+                            Confidence::Estimated,
+                        ))
+                    })
+                    .transpose()?;
+                let eq_key_pairs =
+                    collect_equi_join_column_pairs_scalar(&memo.scalars, join.condition);
+
+                let (output_rows, row_count_confidence) =
+                    estimate_join_cardinality(&JoinCardInput {
+                        left: (left_stats.output_row_count, left_stats.row_count_confidence),
+                        right: (
+                            right_stats.output_row_count,
+                            right_stats.row_count_confidence,
+                        ),
+                        kind: join.join_type,
+                        eq_key_ndvs: Vec::new(),
+                        non_equi_selectivity,
+                    });
+
+                let column_statistics = merge_join_column_statistics(
+                    &left_stats,
+                    &right_stats,
+                    output_rows,
+                    row_count_confidence,
+                    join.join_type,
+                    &eq_key_pairs,
+                );
+                Statistics {
+                    output_row_count: output_rows,
+                    row_count_confidence,
+                    column_statistics,
+                }
+            }
+
+            Operator::PhysicalSort(sort) => {
+                let child_stats = child_statistics(memo, &expr.children, 0);
+                if let Some(k) = sort.partition_limit {
+                    let output_rows = sort_partition_limit_output_rows_scalar(
+                        &memo.scalars,
+                        child_stats.output_row_count,
+                        &sort.analytic_partition_exprs,
+                        &child_stats.column_statistics,
+                        k,
+                    );
+                    Statistics {
+                        output_row_count: output_rows,
+                        row_count_confidence: Confidence::Estimated,
+                        column_statistics: child_stats.column_statistics,
+                    }
+                } else {
+                    child_stats
+                }
+            }
+
+            Operator::PhysicalTopN(topn) => {
+                // TopN limits output rows to at most limit+offset.
+                let child_stats = child_statistics(memo, &expr.children, 0);
+                let limit_rows = match (topn.limit, topn.offset) {
+                    (Some(l), Some(o)) => {
+                        ((l as f64) + (o as f64)).min(child_stats.output_row_count)
+                    }
+                    (Some(l), None) => (l as f64).min(child_stats.output_row_count),
+                    _ => child_stats.output_row_count,
+                };
+                Statistics {
+                    output_row_count: limit_rows.max(0.0),
+                    row_count_confidence: Confidence::Estimated,
+                    column_statistics: child_stats.column_statistics,
+                }
+            }
+
+            Operator::PhysicalLimit(limit) => {
+                let child_stats = child_statistics(memo, &expr.children, 0);
+                let output_rows = if let Some(lim) = limit.limit {
+                    (lim as f64).min(child_stats.output_row_count)
+                } else {
+                    child_stats.output_row_count
+                };
+                Statistics {
+                    output_row_count: output_rows.max(0.0),
+                    row_count_confidence: Confidence::Estimated,
+                    column_statistics: child_stats.column_statistics,
+                }
+            }
+
+            Operator::PhysicalWindow(window) => {
+                let child_stats = child_statistics(memo, &expr.children, 0);
+                derive_window_statistics_scalar(
+                    child_stats,
+                    window.window_exprs.len(),
+                    &window.output_columns,
+                )
+            }
+
+            Operator::PhysicalDistribution(_) => {
+                // Distribution enforcer preserves row count.
+                child_statistics(memo, &expr.children, 0)
+            }
+
+            Operator::PhysicalCTEProduce(_) => child_statistics(memo, &expr.children, 0),
+
+            Operator::PhysicalCTEConsume(cte) => {
+                // Look up the CTEProduce group's row count from the memo.
+                if let Some(&produce_group_id) = memo.cte_produce_groups.get(&cte.cte_id) {
+                    if let Some(ref props) = memo.groups[produce_group_id].logical_props {
+                        Statistics {
+                            output_row_count: props.row_count,
+                            row_count_confidence: Confidence::Estimated,
+                            column_statistics: remap_cte_consume_column_statistics(
+                                props,
+                                &cte.output_columns,
+                            ),
+                        }
+                    } else {
+                        Statistics {
+                            output_row_count: 10_000.0,
+                            row_count_confidence: Confidence::Fallback,
+                            column_statistics: HashMap::new(),
+                        }
                     }
                 } else {
                     Statistics {
@@ -568,111 +616,126 @@ pub(crate) fn derive_statistics(
                         column_statistics: HashMap::new(),
                     }
                 }
-            } else {
+            }
+
+            Operator::PhysicalCTEAnchor(_) => child_statistics(memo, &expr.children, 1),
+
+            Operator::PhysicalRepeat(repeat) => {
+                let child_stats = child_statistics(memo, &expr.children, 0);
+                let repeat_times = repeat.repeat_column_ref_list.len() as f64;
                 Statistics {
-                    output_row_count: 10_000.0,
-                    row_count_confidence: Confidence::Fallback,
-                    column_statistics: HashMap::new(),
+                    output_row_count: child_stats.output_row_count * repeat_times,
+                    row_count_confidence: Confidence::Estimated,
+                    column_statistics: child_stats.column_statistics,
                 }
             }
-        }
 
-        Operator::PhysicalCTEAnchor(_) => child_statistics(memo, &expr.children, 1),
-
-        Operator::PhysicalRepeat(repeat) => {
-            let child_stats = child_statistics(memo, &expr.children, 0);
-            let repeat_times = repeat.repeat_column_ref_list.len() as f64;
-            Statistics {
-                output_row_count: child_stats.output_row_count * repeat_times,
-                row_count_confidence: Confidence::Estimated,
-                column_statistics: child_stats.column_statistics,
+            Operator::PhysicalChangeEventExpand(expand) => {
+                derive_change_event_expand_statistics(expand, expr, memo)
             }
-        }
 
-        Operator::PhysicalChangeEventExpand(expand) => {
-            derive_change_event_expand_statistics(expand, expr, memo)
-        }
-
-        Operator::PhysicalUnion(union_op) => derive_set_op_statistics(
-            memo,
-            &expr.children,
-            &union_op.output_columns,
-            SetOpKind::Union { all: union_op.all },
-        ),
-
-        Operator::PhysicalIntersect(intersect_op) => derive_set_op_statistics(
-            memo,
-            &expr.children,
-            &intersect_op.output_columns,
-            SetOpKind::Intersect,
-        ),
-
-        Operator::PhysicalExcept(except_op) => derive_set_op_statistics(
-            memo,
-            &expr.children,
-            &except_op.output_columns,
-            SetOpKind::Except,
-        ),
-
-        Operator::PhysicalValues(vals) => Statistics {
-            output_row_count: vals.rows.len() as f64,
-            row_count_confidence: Confidence::Exact,
-            column_statistics: values_column_statistics_scalar(
-                &memo.scalars,
-                &vals.rows,
-                &vals.columns,
+            Operator::PhysicalUnion(union_op) => derive_set_op_statistics(
+                memo,
+                &expr.children,
+                &union_op.output_columns,
+                SetOpKind::Union { all: union_op.all },
             ),
-        },
 
-        Operator::PhysicalGenerateSeries(gs) => Statistics {
-            output_row_count: generate_series_row_count_f64(gs.start, gs.end, gs.step),
-            row_count_confidence: Confidence::Exact,
-            column_statistics: generate_series_column_statistics(
-                gs.output_column_id,
-                gs.start,
-                gs.end,
-                gs.step,
+            Operator::PhysicalIntersect(intersect_op) => derive_set_op_statistics(
+                memo,
+                &expr.children,
+                &intersect_op.output_columns,
+                SetOpKind::Intersect,
             ),
-        },
-        Operator::PhysicalTableFunction(tf) => {
-            derive_table_function_stats(tf.is_left_join, expr, memo)
-        }
 
-        Operator::LogicalAssertOneRow(_) | Operator::PhysicalAssertOneRow(_) => {
-            let child_stats = child_statistics(memo, &expr.children, 0);
-            Statistics {
-                output_row_count: child_stats.output_row_count.min(1.0),
-                row_count_confidence: Confidence::Estimated,
-                column_statistics: child_stats.column_statistics,
+            Operator::PhysicalExcept(except_op) => derive_set_op_statistics(
+                memo,
+                &expr.children,
+                &except_op.output_columns,
+                SetOpKind::Except,
+            ),
+
+            Operator::PhysicalValues(vals) => Statistics {
+                output_row_count: vals.rows.len() as f64,
+                row_count_confidence: Confidence::Exact,
+                column_statistics: values_column_statistics_scalar(
+                    &memo.scalars,
+                    &vals.rows,
+                    &vals.columns,
+                    control,
+                    work,
+                )?,
+            },
+
+            Operator::PhysicalGenerateSeries(gs) => Statistics {
+                output_row_count: generate_series_row_count_f64(gs.start, gs.end, gs.step),
+                row_count_confidence: Confidence::Exact,
+                column_statistics: generate_series_column_statistics(
+                    gs.output_column_id,
+                    gs.start,
+                    gs.end,
+                    gs.step,
+                ),
+            },
+            Operator::PhysicalTableFunction(tf) => {
+                derive_table_function_stats(tf.is_left_join, expr, memo)
             }
-        }
 
-        // Apply and IMV markers are eliminated by the rewrite stage before
-        // statistics derivation. Reaching here indicates a planner bug.
-        Operator::LogicalApply(_) => {
-            unreachable!(
-                "Apply operator must be eliminated by SubqueryRewrite before statistics derivation"
-            )
-        }
-        Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
-            unreachable!(
-                "IMV marker operators must be eliminated by the IMV rewrite stage before statistics derivation"
-            )
-        }
+            Operator::LogicalAssertOneRow(_) | Operator::PhysicalAssertOneRow(_) => {
+                let child_stats = child_statistics(memo, &expr.children, 0);
+                Statistics {
+                    output_row_count: child_stats.output_row_count.min(1.0),
+                    row_count_confidence: Confidence::Estimated,
+                    column_statistics: child_stats.column_statistics,
+                }
+            }
+
+            // Apply and IMV markers are eliminated by the rewrite stage before
+            // statistics derivation. Reaching here indicates a planner bug.
+            Operator::LogicalApply(_) => {
+                unreachable!(
+                    "Apply operator must be eliminated by SubqueryRewrite before statistics derivation"
+                )
+            }
+            Operator::LogicalImvDelta(_) | Operator::LogicalImvVersion(_) => {
+                unreachable!(
+                    "IMV marker operators must be eliminated by the IMV rewrite stage before statistics derivation"
+                )
+            }
+        })
+    })();
+    if matches!(
+        &result,
+        Err(SqlCompileError::Cancelled
+            | SqlCompileError::DeadlineExceeded
+            | SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
     }
+    // The caller owns this scope. Flush its actual completed work on ordinary
+    // failure as well as success before publishing any candidate statistics.
+    work.flush()?;
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    result
 }
 
 pub(crate) fn derive_opt_expr_statistics(
     expr: &OptExpr,
     arena: &ScalarArena,
     stats_input: &OptimizerStatsInput,
-) -> Statistics {
-    let mut memo = Memo::new();
-    // Donate a clone of the caller's arena so the memo can materialize scalars.
+    control: &dyn PureCompileControl,
+) -> Result<Statistics, SqlCompileError> {
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    let mut memo =
+        Memo::with_scalar_arena(ScalarArena::with_constant_policy(arena.constant_policy()));
+    // The arena clone remains opaque; this is observation around the existing
+    // operation, not a claim of cooperative work inside its allocations.
     memo.scalars = arena.clone();
-    let root_group = super::memo_copy::opt_expr_to_memo(expr, &mut memo);
-    derive_group_statistics(&mut memo, stats_input);
-    memo.groups
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    let root_group = super::memo_copy::opt_expr_to_memo(expr, &mut memo, control)?;
+    derive_group_statistics(&mut memo, stats_input, control)?;
+    let result = memo
+        .groups
         .get(root_group)
         .and_then(|group| group.logical_props.as_ref())
         .map(|props| Statistics {
@@ -684,7 +747,9 @@ pub(crate) fn derive_opt_expr_statistics(
             output_row_count: 1.0,
             row_count_confidence: Confidence::Fallback,
             column_statistics: HashMap::new(),
-        })
+        });
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    Ok(result)
 }
 
 const DEFAULT_EXPR_NDV: f64 = 10.0;
@@ -793,31 +858,42 @@ fn estimate_selectivity_scalar(
     arena: &ScalarArena,
     expr: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
-) -> f64 {
-    match arena.node(expr) {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<f64, SqlCompileError> {
+    let node = arena.node(expr);
+    work.step()?;
+    Ok(match node {
         ScalarNode::BinaryOp {
             left, op, right, ..
         } => match *op {
             BinOp::And => {
                 let mut conjuncts = Vec::new();
-                flatten_and_scalar(arena, expr, &mut conjuncts);
-                let sels: Vec<f64> = conjuncts
-                    .iter()
-                    .map(|conjunct| estimate_selectivity_scalar(arena, *conjunct, column_stats))
-                    .collect();
-                damped_conjunction(&sels)
+                flatten_and_scalar(arena, expr, &mut conjuncts, work)?;
+                let mut sels = Vec::new();
+                for conjunct in conjuncts {
+                    sels.push(estimate_selectivity_scalar(
+                        arena,
+                        conjunct,
+                        column_stats,
+                        work,
+                    )?);
+                    work.step()?;
+                }
+                observed_damped_conjunction(&sels, work)?
             }
             BinOp::Or => {
-                let l = estimate_selectivity_scalar(arena, *left, column_stats);
-                let r = estimate_selectivity_scalar(arena, *right, column_stats);
+                let l = estimate_selectivity_scalar(arena, *left, column_stats, work)?;
+                let r = estimate_selectivity_scalar(arena, *right, column_stats, work)?;
                 l + r - l * r
             }
             BinOp::Eq | BinOp::EqForNull => {
-                estimate_eq_selectivity_scalar(arena, *left, *right, column_stats)
+                estimate_eq_selectivity_scalar(arena, *left, *right, column_stats, work)?
             }
-            BinOp::Ne => 1.0 - estimate_eq_selectivity_scalar(arena, *left, *right, column_stats),
+            BinOp::Ne => {
+                1.0 - estimate_eq_selectivity_scalar(arena, *left, *right, column_stats, work)?
+            }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                estimate_range_selectivity_scalar(arena, *left, *right, *op, column_stats)
+                estimate_range_selectivity_scalar(arena, *left, *right, *op, column_stats, work)?
             }
             _ => PREDICATE_UNKNOWN_FILTER,
         },
@@ -844,7 +920,6 @@ fn estimate_selectivity_scalar(
             let ndv = col_id
                 .and_then(|column_id| column_stats.get(&column_id))
                 .and_then(ColumnStatistic::trusted_ndv_value);
-
             let sel = if let Some(ndv) = ndv {
                 (list.len() as f64 / ndv).min(1.0)
             } else {
@@ -858,44 +933,86 @@ fn estimate_selectivity_scalar(
             high,
             negated,
         } => {
-            let ge =
-                estimate_range_selectivity_scalar(arena, *child, *low, BinOp::Ge, column_stats);
-            let le =
-                estimate_range_selectivity_scalar(arena, *child, *high, BinOp::Le, column_stats);
+            let ge = estimate_range_selectivity_scalar(
+                arena,
+                *child,
+                *low,
+                BinOp::Ge,
+                column_stats,
+                work,
+            )?;
+            let le = estimate_range_selectivity_scalar(
+                arena,
+                *child,
+                *high,
+                BinOp::Le,
+                column_stats,
+                work,
+            )?;
             let sel = ge * le;
             if *negated { 1.0 - sel } else { sel }
         }
         ScalarNode::Like { negated, .. } => {
-            let sel = PREDICATE_UNKNOWN_FILTER;
-            if *negated { 1.0 - sel } else { sel }
+            if *negated {
+                1.0 - PREDICATE_UNKNOWN_FILTER
+            } else {
+                PREDICATE_UNKNOWN_FILTER
+            }
         }
         ScalarNode::UnaryOp {
             op: UnOp::Not,
             child,
-        } => 1.0 - estimate_selectivity_scalar(arena, *child, column_stats),
+        } => 1.0 - estimate_selectivity_scalar(arena, *child, column_stats, work)?,
         ScalarNode::IsTruthValue { negated, .. } => {
-            let base = 0.5;
-            if *negated { 1.0 - base } else { base }
+            if *negated {
+                1.0 - 0.5
+            } else {
+                0.5
+            }
         }
-        ScalarNode::Nested(inner) => estimate_selectivity_scalar(arena, *inner, column_stats),
+        ScalarNode::Nested(inner) => {
+            estimate_selectivity_scalar(arena, *inner, column_stats, work)?
+        }
         _ => PREDICATE_UNKNOWN_FILTER,
-    }
+    })
 }
 
-fn flatten_and_scalar(arena: &ScalarArena, expr: ScalarId, out: &mut Vec<ScalarId>) {
-    match arena.node(expr) {
-        ScalarNode::BinaryOp {
-            op: BinOp::And,
-            left,
-            right,
-            ..
-        } => {
-            flatten_and_scalar(arena, *left, out);
-            flatten_and_scalar(arena, *right, out);
+fn observed_damped_conjunction(
+    selectivities: &[f64],
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<f64, SqlCompileError> {
+    // Keep the existing sort and arithmetic, including non-finite filtering.
+    // These boundaries do not prove cooperation inside that library helper.
+    work.flush()?;
+    let result = damped_conjunction(selectivities);
+    work.flush()?;
+    Ok(result)
+}
+
+fn flatten_and_scalar(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    out: &mut Vec<ScalarId>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), SqlCompileError> {
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match arena.node(expr) {
+            ScalarNode::BinaryOp {
+                op: BinOp::And,
+                left,
+                right,
+                ..
+            } => {
+                pending.push(*right);
+                pending.push(*left);
+            }
+            ScalarNode::Nested(inner) => pending.push(*inner),
+            _ => out.push(expr),
         }
-        ScalarNode::Nested(inner) => flatten_and_scalar(arena, *inner, out),
-        _ => out.push(expr),
+        work.step()?;
     }
+    Ok(())
 }
 
 fn estimate_eq_selectivity_scalar(
@@ -903,39 +1020,41 @@ fn estimate_eq_selectivity_scalar(
     left: ScalarId,
     right: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
-) -> f64 {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<f64, SqlCompileError> {
     if let Some((column_id, column_expr, literal_expr)) =
-        extract_column_literal_pair_scalar(arena, left, right)
+        extract_column_literal_pair_scalar(arena, left, right, work)?
         && let Some(cs) = column_stats.get(&column_id)
     {
         if let Some(ndv) = cs.trusted_ndv_value() {
-            return 1.0 / ndv;
+            return Ok(1.0 / ndv);
         }
         if let Some(selectivity) =
-            discrete_domain_equality_selectivity_scalar(arena, column_expr, literal_expr, cs)
+            discrete_domain_equality_selectivity_scalar(arena, column_expr, literal_expr, cs, work)?
         {
-            return selectivity;
+            return Ok(selectivity);
         }
     }
-    PREDICATE_UNKNOWN_FILTER
+    Ok(PREDICATE_UNKNOWN_FILTER)
 }
 
 fn extract_column_literal_pair_scalar(
     arena: &ScalarArena,
     left: ScalarId,
     right: ScalarId,
-) -> Option<(ColumnId, ScalarId, ScalarId)> {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<(ColumnId, ScalarId, ScalarId)>, SqlCompileError> {
     if let Some(column_id) = extract_column_id_scalar(arena, left)
-        && scalar_literal_f64(arena, right).is_some()
+        && scalar_literal_f64(arena, right, work)?.is_some()
     {
-        return Some((column_id, left, right));
+        return Ok(Some((column_id, left, right)));
     }
     if let Some(column_id) = extract_column_id_scalar(arena, right)
-        && scalar_literal_f64(arena, left).is_some()
+        && scalar_literal_f64(arena, left, work)?.is_some()
     {
-        return Some((column_id, right, left));
+        return Ok(Some((column_id, right, left)));
     }
-    None
+    Ok(None)
 }
 
 fn discrete_domain_equality_selectivity_scalar(
@@ -943,21 +1062,24 @@ fn discrete_domain_equality_selectivity_scalar(
     column_expr: ScalarId,
     literal_expr: ScalarId,
     stat: &ColumnStatistic,
-) -> Option<f64> {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<f64>, SqlCompileError> {
     if !is_discrete_numeric_domain(arena.data_type(column_expr)) {
-        return None;
+        return Ok(None);
     }
     let min = stat.min_value;
     let max = stat.max_value;
     if !min.is_finite() || !max.is_finite() || max < min {
-        return None;
+        return Ok(None);
     }
-    let value = scalar_literal_f64(arena, literal_expr)?;
+    let Some(value) = scalar_literal_f64(arena, literal_expr, work)? else {
+        return Ok(None);
+    };
     if value < min || value > max {
-        return Some(0.0);
+        return Ok(Some(0.0));
     }
     let domain_width = (max.floor() - min.ceil() + 1.0).max(1.0);
-    Some((1.0 / domain_width).clamp(0.0, 1.0))
+    Ok(Some((1.0 / domain_width).clamp(0.0, 1.0)))
 }
 
 fn is_discrete_numeric_domain(data_type: &arrow::datatypes::DataType) -> bool {
@@ -982,10 +1104,10 @@ fn estimate_range_selectivity_scalar(
     right: ScalarId,
     op: BinOp,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
-) -> f64 {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<f64, SqlCompileError> {
     let col_id = extract_column_id_scalar(arena, left);
-    let literal_val = scalar_literal_f64(arena, right);
-
+    let literal_val = scalar_literal_f64(arena, right, work)?;
     if let (Some(column_id), Some(val)) = (col_id, literal_val)
         && let Some(cs) = column_stats.get(&column_id)
     {
@@ -993,32 +1115,33 @@ fn estimate_range_selectivity_scalar(
         let max = cs.max_value;
         if min.is_finite() && max.is_finite() && max > min {
             let range = max - min;
-            return match op {
+            return Ok(match op {
                 BinOp::Lt => ((val - min) / range).clamp(0.01, 0.99),
                 BinOp::Le => ((val - min + 1.0) / range).clamp(0.01, 0.99),
                 BinOp::Gt => ((max - val) / range).clamp(0.01, 0.99),
                 BinOp::Ge => ((max - val + 1.0) / range).clamp(0.01, 0.99),
                 _ => 0.5,
-            };
+            });
         }
     }
-    0.5
+    Ok(0.5)
 }
 
-fn scalar_literal_f64(arena: &ScalarArena, expr: ScalarId) -> Option<f64> {
-    match arena.node(expr) {
-        ScalarNode::Literal(value) => match &value.0 {
-            LiteralValue::Int(v) => Some(*v as f64),
-            LiteralValue::LargeInt(v) => Some(*v as f64),
-            LiteralValue::Float(v) => Some(*v),
-            LiteralValue::Decimal(s) => s.parse::<f64>().ok(),
-            _ => None,
+fn scalar_literal_f64(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<f64>, SqlCompileError> {
+    // Share the sole selected CV/type/NULL author with VALUES statistics.
+    // Cast remains a transparent syntax wrapper, as in the previous estimator;
+    // this is not execution of an implicit numeric cast.
+    let control = work.control();
+    Ok(
+        match values_literal_f64_observed(arena, expr, control, work)? {
+            ValuesLiteral::Number(value) => Some(value),
+            ValuesLiteral::Null | ValuesLiteral::Unsupported => None,
         },
-        ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
-            scalar_literal_f64(arena, *child)
-        }
-        _ => None,
-    }
+    )
 }
 
 fn aggregate_group_column_statistics_scalar(
@@ -1048,8 +1171,14 @@ fn aggregate_group_column_statistics_scalar(
 /// before their parents, group 0 is the deepest leaf and the last group
 /// is the root. This guarantees that all child groups have their
 /// `logical_props` set before any parent group is processed.
-pub(crate) fn derive_group_statistics(memo: &mut Memo, stats_input: &OptimizerStatsInput) {
+pub(crate) fn derive_group_statistics(
+    memo: &mut Memo,
+    stats_input: &OptimizerStatsInput,
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
     for group_idx in 0..memo.groups.len() {
+        work.step()?;
         // Memoized derive: a group's logical_props are computed exactly once,
         // when first needed (StarRocks isStatsDerived semantics). Under the
         // per-group argmax collapse (`pick_group_representative`), a group's
@@ -1080,8 +1209,12 @@ pub(crate) fn derive_group_statistics(memo: &mut Memo, stats_input: &OptimizerSt
         if memo.groups[group_idx].logical_props.is_some() {
             continue;
         }
-        derive_group_statistics_for(memo, group_idx, stats_input);
+        let candidate = derive_group_candidate(memo, group_idx, stats_input, control, &mut work)?;
+        control.checkpoint(CompilePhase::Validate, 0)?;
+        memo.groups[group_idx].logical_props = Some(candidate);
     }
+    work.finish()?;
+    Ok(())
 }
 
 /// Derive and store [`super::memo::LogicalProperties`] for a single group. The
@@ -1102,7 +1235,26 @@ pub(crate) fn derive_group_statistics_for(
     memo: &mut Memo,
     group_idx: usize,
     stats_input: &OptimizerStatsInput,
-) {
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let candidate = derive_group_candidate(memo, group_idx, stats_input, control, &mut work)?;
+    // Retain the previously published properties on every failure, including
+    // an interruption while observing a short candidate's final work batch.
+    work.finish()?;
+    memo.groups[group_idx].logical_props = Some(candidate);
+    Ok(())
+}
+
+fn derive_group_candidate(
+    memo: &Memo,
+    group_idx: usize,
+    stats_input: &OptimizerStatsInput,
+    control: &dyn PureCompileControl,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<super::memo::LogicalProperties, SqlCompileError> {
+    work.step()?;
+    control.checkpoint(CompilePhase::Validate, 0)?;
     // Output columns are a group-level invariant: all members of a memo group
     // are logically equivalent and expose the identical output columns, so
     // picking them via `first()` here is consistent with the argmax-chosen
@@ -1117,27 +1269,33 @@ pub(crate) fn derive_group_statistics_for(
     // `derive_for_expr` with the chosen member; `derive_for_group` would re-pick
     // `first()` internally and break member-consistency when argmax selects a
     // non-first member.
-    if let Some((chosen, stats)) = pick_group_representative(memo, group_idx, stats_input) {
-        memo.groups[group_idx].logical_props = Some(super::logical_props::derive_for_expr(
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    let candidate = if let Some((chosen, stats)) =
+        pick_group_representative_observed(memo, group_idx, stats_input, control, work)?
+    {
+        super::logical_props::derive_for_expr(
             &chosen,
             memo,
             output_columns,
             stats.output_row_count,
             stats.row_count_confidence,
             stats.column_statistics,
-        ));
+        )
     } else {
         // Empty group: keep today's behavior — default statistics plus
         // `derive_for_group`, which handles the no-member case correctly.
-        memo.groups[group_idx].logical_props = Some(super::logical_props::derive_for_group(
+        super::logical_props::derive_for_group(
             memo,
             group_idx,
             output_columns,
             1.0,
             Confidence::Fallback,
             HashMap::new(),
-        ));
-    }
+        )
+    };
+    // Structural-property derivation is still an opaque existing helper.
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    Ok(candidate)
 }
 
 /// Pick a group's representative member by source-confidence argmax:
@@ -1158,60 +1316,101 @@ pub(crate) fn pick_group_representative(
     memo: &Memo,
     group_idx: usize,
     stats_input: &OptimizerStatsInput,
-) -> Option<(MExpr, Statistics)> {
-    // Build the member list as logical_exprs then physical_exprs. Cloning each
-    // member releases the borrow on `memo.groups[..]`, so we can pass `memo`
-    // immutably to `derive_statistics` below.
-    let members: Vec<MExpr> = {
-        let group = &memo.groups[group_idx];
-        group
-            .logical_exprs
-            .iter()
-            .chain(group.physical_exprs.iter())
-            .cloned()
-            .collect()
-    };
-
-    let mut iter = members.into_iter();
-    let first = iter.next()?;
-    let first_stats = derive_statistics(&first, memo, stats_input);
-    let first_key = first_stats.row_count_confidence;
-    let mut best = (first, first_stats, first_key);
-
-    for cand in iter {
-        let cand_stats = derive_statistics(&cand, memo, stats_input);
-        let cand_key = cand_stats.row_count_confidence;
-        // Strict-greater replacement: replace only on a strict improvement so
-        // ties keep the lower index (canonical-first / zero-regression).
-        let replace = cand_key > best.2
-            || (cand_key == best.2
-                && inner_join_conjunct_count(&cand.op, &memo.scalars)
-                    .zip(inner_join_conjunct_count(&best.0.op, &memo.scalars))
-                    .is_some_and(|(cand_conj, best_conj)| cand_conj < best_conj));
-        if replace {
-            best = (cand, cand_stats, cand_key);
-        }
-    }
-
-    Some((best.0, best.1))
+    control: &dyn PureCompileControl,
+) -> Result<Option<(MExpr, Statistics)>, SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let result =
+        pick_group_representative_observed(memo, group_idx, stats_input, control, &mut work)?;
+    work.finish()?;
+    Ok(result)
 }
 
-/// Conjunct count of an INNER `LogicalJoin`'s condition (an AND-tree split into
-/// conjuncts), used as the FFewerConj sub-tie-break. Returns `None` for any
-/// operator that is not an inner LogicalJoin, so the tie-break only fires when
-/// BOTH tied members are inner joins (GPORCA FFewerConj semantics).
-fn inner_join_conjunct_count(op: &Operator, scalars: &ScalarArena) -> Option<usize> {
-    match op {
-        Operator::LogicalJoin(join) if join.join_type == JoinKind::Inner => match join.condition {
-            Some(sid) => {
-                let mut conjuncts = Vec::new();
-                flatten_and_scalar(scalars, sid, &mut conjuncts);
-                Some(conjuncts.len())
+fn pick_group_representative_observed(
+    memo: &Memo,
+    group_idx: usize,
+    stats_input: &OptimizerStatsInput,
+    control: &dyn PureCompileControl,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<(MExpr, Statistics)>, SqlCompileError> {
+    let group = &memo.groups[group_idx];
+    let mut best: Option<(&MExpr, Statistics)> = None;
+    // Visit the original members directly in the same canonical order. Avoid
+    // cloning an entire member list before the first bounded observation.
+    for cand in group
+        .logical_exprs
+        .iter()
+        .chain(group.physical_exprs.iter())
+    {
+        work.step()?;
+        let cand_stats = derive_statistics(cand, memo, stats_input, work, control)?;
+        let replace = match &best {
+            None => true,
+            Some((incumbent, incumbent_stats)) => {
+                let cand_key = cand_stats.row_count_confidence;
+                let best_key = incumbent_stats.row_count_confidence;
+                if cand_key > best_key {
+                    true
+                } else if cand_key == best_key {
+                    inner_join_conjunct_count(&cand.op, &memo.scalars, work)?
+                        .zip(inner_join_conjunct_count(
+                            &incumbent.op,
+                            &memo.scalars,
+                            work,
+                        )?)
+                        .is_some_and(|(cand_conj, best_conj)| cand_conj < best_conj)
+                } else {
+                    false
+                }
             }
-            None => Some(0),
-        },
-        _ => None,
+        };
+        if replace {
+            best = Some((cand, cand_stats));
+        }
     }
+    let result = best.map(|(expr, stats)| (expr.clone(), stats));
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    Ok(result)
+}
+
+/// Count real scalar conjuncts in an inner join, preserving the original
+/// source-confidence tie break without a temporary flattened predicate list.
+fn inner_join_conjunct_count(
+    op: &Operator,
+    scalars: &ScalarArena,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<usize>, SqlCompileError> {
+    let Operator::LogicalJoin(join) = op else {
+        return Ok(None);
+    };
+    if join.join_type != JoinKind::Inner {
+        return Ok(None);
+    }
+    let Some(root) = join.condition else {
+        return Ok(Some(0));
+    };
+    let mut stack = vec![root];
+    let mut count = 0usize;
+    while let Some(id) = stack.pop() {
+        work.step()?;
+        match scalars.node(id) {
+            ScalarNode::BinaryOp {
+                op: BinOp::And,
+                left,
+                right,
+                ..
+            } => {
+                stack.push(*right);
+                stack.push(*left);
+            }
+            ScalarNode::Nested(inner) => stack.push(*inner),
+            _ => {
+                count = count
+                    .checked_add(1)
+                    .ok_or(SqlCompileError::ResourceExhausted)?
+            }
+        }
+    }
+    Ok(Some(count))
 }
 
 /// Materialize a [`JoinTree`] candidate order bottom-up into the memo, returning
@@ -1223,23 +1422,40 @@ pub(crate) fn copy_in_join_tree(
     memo: &mut Memo,
     tree: &JoinTree,
     stats_input: &OptimizerStatsInput,
-) -> GroupId {
+    control: &dyn PureCompileControl,
+) -> Result<GroupId, SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let group = copy_in_join_tree_observed(memo, tree, stats_input, control, &mut work)?;
+    work.finish()?;
+    Ok(group)
+}
+
+fn copy_in_join_tree_observed(
+    memo: &mut Memo,
+    tree: &JoinTree,
+    stats_input: &OptimizerStatsInput,
+    control: &dyn PureCompileControl,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<GroupId, SqlCompileError> {
+    work.step()?;
     match tree {
-        JoinTree::Leaf(group_id) => *group_id,
+        JoinTree::Leaf(group_id) => Ok(*group_id),
         JoinTree::Join { left, right, op } => {
             // Recurse children first so child group ids are always allocated
             // before the parent (the bottom-up invariant M2 relies on).
-            let left_id = copy_in_join_tree(memo, left, stats_input);
-            let right_id = copy_in_join_tree(memo, right, stats_input);
+            let left_id = copy_in_join_tree_observed(memo, left, stats_input, control, work)?;
+            let right_id = copy_in_join_tree_observed(memo, right, stats_input, control, work)?;
             let operator = Operator::LogicalJoin(op.clone());
             // Dedup: reuse an existing group for the same operator + child
             // groups, so candidates sharing intermediate sub-joins do not mint
             // duplicate groups.
+            control.checkpoint(CompilePhase::Validate, 0)?;
             let key = (format!("{operator:?}"), vec![left_id, right_id]);
+            control.checkpoint(CompilePhase::Validate, 0)?;
             if let Some(&existing) = memo.join_group_index.get(&key) {
-                return existing;
+                return Ok(existing);
             }
-            let id = memo.next_expr_id();
+            let id = super::next_expr_id_observed(memo, work)?;
             let group_id = memo.new_group(MExpr {
                 id,
                 op: operator,
@@ -1252,9 +1468,9 @@ pub(crate) fn copy_in_join_tree(
             // Stamp statistics immediately: implement() runs before the bulk
             // re-derive (mod.rs), and JoinToHashJoin reads child column ids from
             // logical_props — without this a bushy join degrades to NestLoop (M1).
-            derive_group_statistics_for(memo, group_id, stats_input);
+            derive_group_statistics_for(memo, group_id, stats_input, control)?;
             memo.join_group_index.insert(key, group_id);
-            group_id
+            Ok(group_id)
         }
     }
 }
@@ -1344,25 +1560,37 @@ fn values_column_statistics_scalar(
     arena: &ScalarArena,
     rows: &[Vec<ScalarId>],
     columns: &[OutputColumn],
-) -> HashMap<ColumnId, ColumnStatistic> {
+    control: &dyn PureCompileControl,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<HashMap<ColumnId, ColumnStatistic>, SqlCompileError> {
     let mut out = HashMap::new();
     let row_count = rows.len() as f64;
     if row_count == 0.0 {
-        return out;
+        return Ok(out);
     }
     for (col_idx, column) in columns.iter().enumerate() {
+        work.step()?;
         if column.column_id == ColumnId::UNSET {
             continue;
         }
+        // Vector/hash-map allocation and the original library sort remain
+        // opaque. Observation does not authorize growth or prove internal
+        // cooperation within those standard-library operations.
+        control.checkpoint(CompilePhase::Validate, 0)?;
         let mut values: Vec<f64> = Vec::with_capacity(rows.len());
+        control.checkpoint(CompilePhase::Validate, 0)?;
         let mut nulls = 0usize;
         let mut all_numeric_or_null = true;
         for row in rows {
-            match row.get(col_idx) {
+            work.step()?;
+            let cell = row.get(col_idx);
+            work.step()?;
+            match cell {
                 Some(expr) if scalar_is_null_literal(arena, *expr) => nulls += 1,
-                Some(expr) => match scalar_literal_f64(arena, *expr) {
-                    Some(v) => values.push(v),
-                    None => {
+                Some(expr) => match values_literal_f64_observed(arena, *expr, control, work)? {
+                    ValuesLiteral::Number(v) => values.push(v),
+                    ValuesLiteral::Null => nulls += 1,
+                    ValuesLiteral::Unsupported => {
                         all_numeric_or_null = false;
                         break;
                     }
@@ -1377,24 +1605,49 @@ fn values_column_statistics_scalar(
             continue;
         }
         let non_null = values.len();
-        let mut distinct = values.clone();
+        control.checkpoint(CompilePhase::Validate, 0)?;
+        let mut distinct = Vec::with_capacity(non_null);
+        control.checkpoint(CompilePhase::Validate, 0)?;
+        for &value in &values {
+            work.step()?;
+            distinct.push(value);
+        }
+        // Keep the exact old comparator, including its non-total NaN behavior;
+        // substituting a sort algorithm would change that existing oracle.
+        control.checkpoint(CompilePhase::Validate, 0)?;
         distinct.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        distinct.dedup_by(|a, b| (*a - *b).abs() < f64::EPSILON);
-        let min = values
-            .iter()
-            .copied()
-            .reduce(f64::min)
-            .unwrap_or(f64::NEG_INFINITY);
-        let max = values
-            .iter()
-            .copied()
-            .reduce(f64::max)
-            .unwrap_or(f64::INFINITY);
+        control.checkpoint(CompilePhase::Validate, 0)?;
+        // Preserve Vec::dedup_by's comparison with the last retained value and
+        // the exact EPSILON predicate, including NaN and signed-zero behavior.
+        let mut retained = 0usize;
+        for read in 0..distinct.len() {
+            work.step()?;
+            if retained == 0
+                || (distinct[read] - distinct[retained - 1])
+                    .abs()
+                    .partial_cmp(&f64::EPSILON)
+                    != Some(std::cmp::Ordering::Less)
+            {
+                distinct[retained] = distinct[read];
+                retained += 1;
+            }
+        }
+        distinct.truncate(retained);
+        let mut min: Option<f64> = None;
+        let mut max: Option<f64> = None;
+        // Preserve the original input order of both f64 reductions.
+        for &value in &values {
+            work.step()?;
+            min = Some(min.map_or(value, |previous| previous.min(value)));
+            max = Some(max.map_or(value, |previous| previous.max(value)));
+        }
+        work.step()?;
+        control.checkpoint(CompilePhase::Validate, 0)?;
         out.insert(
             column.column_id,
             ColumnStatistic {
-                min_value: min,
-                max_value: max,
+                min_value: min.unwrap_or(f64::NEG_INFINITY),
+                max_value: max.unwrap_or(f64::INFINITY),
                 nulls_fraction: nulls as f64 / row_count,
                 average_row_size: 8.0,
                 confidence: Confidence::Exact,
@@ -1406,8 +1659,107 @@ fn values_column_statistics_scalar(
                 StatsSource::Derived,
             ),
         );
+        control.checkpoint(CompilePhase::Validate, 0)?;
     }
-    out
+    Ok(out)
+}
+
+// Follow the same literal/Cast/Nested path as scalar_literal_f64 without
+// retaining a recursive frame or skipping its actual scalar traversal.
+enum ValuesLiteral {
+    Number(f64),
+    Null,
+    Unsupported,
+}
+
+fn values_literal_f64_observed(
+    arena: &ScalarArena,
+    mut expr: ScalarId,
+    control: &dyn PureCompileControl,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ValuesLiteral, SqlCompileError> {
+    loop {
+        work.step()?;
+        match arena.node(expr) {
+            ScalarNode::Literal(value) => {
+                return Ok(match &value.0 {
+                    LiteralValue::Int(v) => Some(*v as f64),
+                    LiteralValue::LargeInt(v) => Some(*v as f64),
+                    LiteralValue::Float(v) => Some(*v),
+                    LiteralValue::Decimal(s) => {
+                        // Decimal parsing remains an opaque standard helper.
+                        control.checkpoint(CompilePhase::Validate, 0)?;
+                        let value = s.parse::<f64>().ok();
+                        control.checkpoint(CompilePhase::Validate, 0)?;
+                        value
+                    }
+                    _ => None,
+                }
+                .map_or(ValuesLiteral::Unsupported, ValuesLiteral::Number));
+            }
+            ScalarNode::Constant(value) => {
+                return values_constant_f64_observed(arena, expr, value, control, work);
+            }
+            ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => expr = *child,
+            _ => return Ok(ValuesLiteral::Unsupported),
+        }
+    }
+}
+
+fn values_constant_f64_observed(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    value: &novarocks_functions::ConstantValue,
+    control: &dyn PureCompileControl,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ValuesLiteral, SqlCompileError> {
+    use arrow::datatypes::DataType;
+    use novarocks_functions::ConstantError;
+    use novarocks_type_contract::ValueLogicalType;
+    if !arena
+        .value_type(expr)
+        .exactly_equals_observed(value.value_type(), || {
+            work.step().map_err(ConstantError::from)
+        })?
+    {
+        return Err(SqlCompileError::InvalidRequest(
+            "VALUES constant source differs from its frozen scalar type".into(),
+        ));
+    }
+    // Flush completed parent work before borrowing the sole logical-NULL
+    // author. This observes only the checked selected value, not other rows.
+    work.flush()?;
+    if value.is_null_observed(CompilePhase::Validate, control)? {
+        return Ok(ValuesLiteral::Null);
+    }
+    let ty = value.value_type();
+    let number = match (&ty.logical_type, &ty.data_type) {
+        (
+            ValueLogicalType::Physical,
+            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
+        ) => value.try_i64()?.map(|v| v as f64),
+        (
+            ValueLogicalType::Physical,
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64,
+        ) => value.try_u64()?.map(|v| v as f64),
+        (ValueLogicalType::Physical, DataType::Float32) => {
+            value.try_f32_bits()?.map(|v| f32::from_bits(v) as f64)
+        }
+        (ValueLogicalType::Physical, DataType::Float64) => {
+            value.try_f64_bits()?.map(f64::from_bits)
+        }
+        (ValueLogicalType::Physical, DataType::Decimal128(_, scale)) => value
+            .try_decimal128()?
+            .map(|v| (v as f64) * 10f64.powi(-i32::from(*scale))),
+        (ValueLogicalType::LargeInt, DataType::FixedSizeBinary(16)) => {
+            value.try_largeint()?.map(|v| v as f64)
+        }
+        _ => None,
+    };
+    work.step()?;
+    // f64 is the existing statistics representation, not constant equality.
+    // Read integers with their actual signedness before that approximation.
+    Ok(number.map_or(ValuesLiteral::Unsupported, ValuesLiteral::Number))
 }
 
 fn scalar_is_null_literal(arena: &ScalarArena, expr: ScalarId) -> bool {
@@ -1812,7 +2164,8 @@ fn derive_scan(
     scan: &super::operator::ScanOp,
     scalars: &ScalarArena,
     stats_input: &OptimizerStatsInput,
-) -> Statistics {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Statistics, SqlCompileError> {
     match resolve_scan_table_statistics(scan, stats_input) {
         ScanStatsResolution::Resolved(resolved) => derive_scan_statistics_scalar(
             &scan.columns,
@@ -1821,6 +2174,7 @@ fn derive_scan(
             Some(&resolved.table_stats),
             resolved.row_count_confidence,
             MISSING_BASE_ROW_COUNT_FALLBACK,
+            work,
         ),
         ScanStatsResolution::MissingBoundRef => derive_scan_statistics_scalar(
             &scan.columns,
@@ -1829,6 +2183,7 @@ fn derive_scan(
             None,
             Confidence::Fallback,
             MISSING_BASE_ROW_COUNT_FALLBACK,
+            work,
         ),
     }
 }
@@ -1872,7 +2227,8 @@ fn derive_scan_statistics_scalar(
     table_stats: Option<&TableStatistics>,
     table_row_count_confidence: Confidence,
     default_rows: f64,
-) -> Statistics {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Statistics, SqlCompileError> {
     if let Some(ts) = table_stats {
         let row_count = ts.row_count.max(1) as f64;
 
@@ -1880,7 +2236,9 @@ fn derive_scan_statistics_scalar(
         let mut row_count_confidence = table_row_count_confidence;
         let table_column_statistics = map_table_column_stats_to_ids(columns, ts);
         for pred in predicates {
-            let selectivity = estimate_selectivity_scalar(scalars, *pred, &table_column_statistics);
+            let selectivity =
+                estimate_selectivity_scalar(scalars, *pred, &table_column_statistics, work)?;
+            work.step()?;
             (output_rows, row_count_confidence) =
                 apply_filter(output_rows, row_count_confidence, selectivity);
         }
@@ -1899,11 +2257,11 @@ fn derive_scan_statistics_scalar(
             .collect();
         cap_column_ndvs(&mut column_statistics, output_rows);
 
-        Statistics {
+        Ok(Statistics {
             output_row_count: output_rows,
             row_count_confidence,
             column_statistics,
-        }
+        })
     } else {
         let mut column_statistics: HashMap<ColumnId, ColumnStatistic> = columns
             .iter()
@@ -1912,16 +2270,18 @@ fn derive_scan_statistics_scalar(
         let mut output_rows = default_rows;
         let mut row_count_confidence = Confidence::Fallback;
         for pred in predicates {
-            let selectivity = estimate_selectivity_scalar(scalars, *pred, &column_statistics);
+            let selectivity =
+                estimate_selectivity_scalar(scalars, *pred, &column_statistics, work)?;
+            work.step()?;
             (output_rows, row_count_confidence) =
                 apply_filter(output_rows, row_count_confidence, selectivity);
         }
         cap_column_ndvs(&mut column_statistics, output_rows);
-        Statistics {
+        Ok(Statistics {
             output_row_count: output_rows,
             row_count_confidence,
             column_statistics,
-        }
+        })
     }
 }
 
@@ -1948,9 +2308,10 @@ fn estimate_join_condition_scalar(
     condition: Option<ScalarId>,
     left_stats: &HashMap<ColumnId, ColumnStatistic>,
     right_stats: &HashMap<ColumnId, ColumnStatistic>,
-) -> ScalarJoinConditionEstimate {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ScalarJoinConditionEstimate, SqlCompileError> {
     let Some(condition) = condition else {
-        return ScalarJoinConditionEstimate::default();
+        return Ok(ScalarJoinConditionEstimate::default());
     };
 
     let mut estimate = ScalarJoinConditionEstimate::default();
@@ -1962,19 +2323,30 @@ fn estimate_join_condition_scalar(
         right_stats,
         &mut estimate,
         &mut residuals,
-    );
+        work,
+    )?;
 
     if !residuals.is_empty() {
+        work.flush()?;
         let combined_stats = combined_column_statistics(left_stats, right_stats);
-        let selectivities: Vec<_> = residuals
-            .iter()
-            .map(|expr| estimate_join_residual_selectivity_scalar(arena, *expr, &combined_stats))
-            .collect();
-        estimate.residual_selectivity =
-            Some((damped_conjunction(&selectivities), Confidence::Estimated));
+        work.flush()?;
+        let mut selectivities = Vec::new();
+        for expr in residuals {
+            selectivities.push(estimate_join_residual_selectivity_scalar(
+                arena,
+                expr,
+                &combined_stats,
+                work,
+            )?);
+            work.step()?;
+        }
+        estimate.residual_selectivity = Some((
+            observed_damped_conjunction(&selectivities, work)?,
+            Confidence::Estimated,
+        ));
     }
 
-    estimate
+    Ok(estimate)
 }
 
 fn collect_join_conjuncts_scalar(
@@ -1984,47 +2356,36 @@ fn collect_join_conjuncts_scalar(
     right_stats: &HashMap<ColumnId, ColumnStatistic>,
     estimate: &mut ScalarJoinConditionEstimate,
     residuals: &mut Vec<ScalarId>,
-) {
-    match arena.node(expr) {
-        ScalarNode::BinaryOp {
-            left,
-            op: BinOp::And,
-            right,
-            ..
-        } => {
-            collect_join_conjuncts_scalar(
-                arena,
-                *left,
-                left_stats,
-                right_stats,
-                estimate,
-                residuals,
-            );
-            collect_join_conjuncts_scalar(
-                arena,
-                *right,
-                left_stats,
-                right_stats,
-                estimate,
-                residuals,
-            );
-        }
-        ScalarNode::Nested(inner) => {
-            collect_join_conjuncts_scalar(
-                arena,
-                *inner,
-                left_stats,
-                right_stats,
-                estimate,
-                residuals,
-            );
-        }
-        _ => {
-            if !try_collect_equi_key_scalar(arena, expr, left_stats, right_stats, estimate) {
-                residuals.push(expr);
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), SqlCompileError> {
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match arena.node(expr) {
+            ScalarNode::BinaryOp {
+                left,
+                op: BinOp::And,
+                right,
+                ..
+            } => {
+                pending.push(*right);
+                pending.push(*left);
+            }
+            ScalarNode::Nested(inner) => pending.push(*inner),
+            _ => {
+                // Existing equi-key/NDV extraction stays opaque; do not claim
+                // that these observations bound its internal scalar walks.
+                work.flush()?;
+                let equi =
+                    try_collect_equi_key_scalar(arena, expr, left_stats, right_stats, estimate);
+                work.flush()?;
+                if !equi {
+                    residuals.push(expr);
+                }
             }
         }
+        work.step()?;
     }
+    Ok(())
 }
 
 fn try_collect_equi_key_scalar(
@@ -2088,14 +2449,15 @@ fn estimate_join_residual_selectivity_scalar(
     arena: &ScalarArena,
     expr: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
-) -> f64 {
-    let selectivity = estimate_selectivity_scalar(arena, expr, column_stats);
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<f64, SqlCompileError> {
+    let selectivity = estimate_selectivity_scalar(arena, expr, column_stats, work)?;
     if (selectivity - PREDICATE_UNKNOWN_FILTER).abs() < f64::EPSILON
-        && is_unknown_column_literal_eq_scalar(arena, expr, column_stats)
+        && is_unknown_column_literal_eq_scalar(arena, expr, column_stats, work)?
     {
-        UNKNOWN_JOIN_RESIDUAL_EQ_FILTER
+        Ok(UNKNOWN_JOIN_RESIDUAL_EQ_FILTER)
     } else {
-        selectivity
+        Ok(selectivity)
     }
 }
 
@@ -2103,7 +2465,8 @@ fn is_unknown_column_literal_eq_scalar(
     arena: &ScalarArena,
     expr: ScalarId,
     column_stats: &HashMap<ColumnId, ColumnStatistic>,
-) -> bool {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, SqlCompileError> {
     let ScalarNode::BinaryOp {
         left,
         op: BinOp::Eq | BinOp::EqForNull,
@@ -2111,29 +2474,37 @@ fn is_unknown_column_literal_eq_scalar(
         ..
     } = arena.node(expr)
     else {
-        return false;
+        return Ok(false);
     };
 
     let Some(column_id) =
         extract_column_id_scalar(arena, *left).or_else(|| extract_column_id_scalar(arena, *right))
     else {
-        return false;
+        return Ok(false);
     };
-    if !(scalar_is_literal_like(arena, *left) || scalar_is_literal_like(arena, *right)) {
-        return false;
+    if !(scalar_is_literal_like(arena, *left, work)?
+        || scalar_is_literal_like(arena, *right, work)?)
+    {
+        return Ok(false);
     }
-    column_stats
+    Ok(column_stats
         .get(&column_id)
-        .is_none_or(|cs| cs.trusted_ndv().is_none())
+        .is_none_or(|cs| cs.trusted_ndv().is_none()))
 }
 
-fn scalar_is_literal_like(arena: &ScalarArena, expr: ScalarId) -> bool {
-    match arena.node(expr) {
-        ScalarNode::Literal(_) => true,
-        ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => {
-            scalar_is_literal_like(arena, *child)
+fn scalar_is_literal_like(
+    arena: &ScalarArena,
+    mut expr: ScalarId,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, SqlCompileError> {
+    loop {
+        let node = arena.node(expr);
+        work.step()?;
+        match node {
+            ScalarNode::Literal(_) | ScalarNode::Constant(_) => return Ok(true),
+            ScalarNode::Cast { child, .. } | ScalarNode::Nested(child) => expr = *child,
+            _ => return Ok(false),
         }
-        _ => false,
     }
 }
 
@@ -2151,13 +2522,15 @@ fn derive_join(
     scalars: &ScalarArena,
     left_stats: &Statistics,
     right_stats: &Statistics,
-) -> Statistics {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Statistics, SqlCompileError> {
     let join_condition = estimate_join_condition_scalar(
         scalars,
         join.condition,
         &left_stats.column_statistics,
         &right_stats.column_statistics,
-    );
+        work,
+    )?;
     let (output_rows, row_count_confidence) = estimate_join_cardinality(&JoinCardInput {
         left: (left_stats.output_row_count, left_stats.row_count_confidence),
         right: (
@@ -2178,11 +2551,11 @@ fn derive_join(
         &join_condition.eq_key_pairs,
     );
 
-    Statistics {
+    Ok(Statistics {
         output_row_count: output_rows,
         row_count_confidence,
         column_statistics,
-    }
+    })
 }
 
 /// Widen the nullable flags of `left_cols` and `right_cols` according to the
@@ -2203,7 +2576,7 @@ fn widen_for_join_kind(
     fn widen(cols: Vec<crate::common::OutputColumn>) -> Vec<crate::common::OutputColumn> {
         cols.into_iter()
             .map(|mut c| {
-                c.nullable = true;
+                c.value_type.nullable = true;
                 c
             })
             .collect()
@@ -2251,8 +2624,8 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::common::Ou
             .map(|item| crate::common::OutputColumn {
                 column_id: item.output_column_id,
                 name: item.output_name.clone(),
-                data_type: memo.scalars.data_type(item.expr).clone(),
-                nullable: memo.scalars.nullable(item.expr),
+                value_type: memo.scalars.value_type(item.expr).clone(),
+
                 is_internal: false,
             })
             .collect(),
@@ -2267,8 +2640,11 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::common::Ou
             vec![crate::common::OutputColumn {
                 column_id: g.output_column_id,
                 name: g.column_name.clone(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }]
         }
@@ -2327,8 +2703,8 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::common::Ou
             .map(|item| crate::common::OutputColumn {
                 column_id: item.output_column_id,
                 name: item.output_name.clone(),
-                data_type: memo.scalars.data_type(item.expr).clone(),
-                nullable: memo.scalars.nullable(item.expr),
+                value_type: memo.scalars.value_type(item.expr).clone(),
+
                 is_internal: false,
             })
             .collect(),
@@ -2343,8 +2719,11 @@ fn derive_output_columns(memo: &Memo, group_idx: usize) -> Vec<crate::common::Ou
             vec![crate::common::OutputColumn {
                 column_id: g.output_column_id,
                 name: g.column_name.clone(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }]
         }
@@ -2443,15 +2822,18 @@ fn repeat_output_columns(
                 .iter()
                 .any(|set| !set.contains(&column.column_id))
         {
-            column.nullable = true;
+            column.value_type.nullable = true;
         }
     }
     columns.extend(repeat.grouping_fn_ids.iter().map(|(name, column_id)| {
         crate::common::OutputColumn {
             column_id: *column_id,
             name: name.clone(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
+
             is_internal: true,
         }
     }));
@@ -2464,6 +2846,18 @@ fn repeat_output_columns(
 
 #[cfg(test)]
 mod tests {
+    fn derive_statistics(
+        expr: &super::MExpr,
+        memo: &super::Memo,
+        input: &super::OptimizerStatsInput,
+    ) -> super::Statistics {
+        let control = crate::optimizer::test_optimizer_control();
+        let mut work =
+            super::CompileCheckpoints::try_new(control, super::CompilePhase::Validate).unwrap();
+        let statistics = super::derive_statistics(expr, memo, input, &mut work, control).unwrap();
+        work.finish().unwrap();
+        statistics
+    }
     use std::num::{NonZeroU32, NonZeroU64};
 
     use super::*;
@@ -2492,10 +2886,16 @@ mod tests {
         let mut opt_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             plan,
             &mut memo.scalars,
+            crate::optimizer::test_optimizer_control(),
         )
         .expect("logical plan to opt expr");
         bind_test_scan_refs(&mut opt_expr);
-        crate::optimizer::memo_copy::opt_expr_to_memo(&opt_expr, memo)
+        crate::optimizer::memo_copy::opt_expr_to_memo(
+            &opt_expr,
+            memo,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
     }
 
     fn bind_test_scan_refs(expr: &mut OptExpr) {
@@ -2524,7 +2924,8 @@ mod tests {
         column_stats: &HashMap<ColumnId, ColumnStatistic>,
     ) -> f64 {
         let mut arena = ScalarArena::new();
-        let id = intern_typed(&mut arena, expr);
+        let id =
+            intern_typed(&mut arena, expr, crate::optimizer::test_optimizer_control()).unwrap();
         estimate_selectivity(&arena, id, column_stats)
     }
 
@@ -2682,8 +3083,8 @@ mod tests {
             .map(|c| OutputColumn {
                 column_id: test_col_id(c),
                 name: c.to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
                 is_internal: false,
             })
             .collect();
@@ -2737,8 +3138,8 @@ mod tests {
             .map(|c| OutputColumn {
                 column_id: test_col_id(c),
                 name: c.to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
                 is_internal: false,
             })
             .collect();
@@ -2782,7 +3183,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // Neutral fallback rows = 100000; unknown-column eq selectivity
         // = PREDICATE_UNKNOWN_FILTER (0.25) -> 100000 * 0.25 = 25000.
@@ -2798,7 +3204,13 @@ mod tests {
         for table_name in ["store_sales", "tiny_dim"] {
             let stats_ref = StatsRef::new(42);
             let scan = bound_scan_opt_expr(table_name, &["k"], stats_ref);
-            let stats = derive_opt_expr_statistics(&scan, &ScalarArena::new(), &stats_input);
+            let stats = derive_opt_expr_statistics(
+                &scan,
+                &ScalarArena::new(),
+                &stats_input,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
 
             assert!((stats.output_row_count - MISSING_BASE_ROW_COUNT_FALLBACK).abs() < 1.0);
             assert_eq!(stats.row_count_confidence, Confidence::Fallback);
@@ -2824,7 +3236,13 @@ mod tests {
         );
         let scan = bound_scan_opt_expr("misleading_sales_table", &["k"], stats_ref);
         let stats_input = OptimizerStatsInput::from_query_stats(&snapshot);
-        let stats = derive_opt_expr_statistics(&scan, &ScalarArena::new(), &stats_input);
+        let stats = derive_opt_expr_statistics(
+            &scan,
+            &ScalarArena::new(),
+            &stats_input,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         assert!((stats.output_row_count - 2.0).abs() < 1.0);
         assert_eq!(stats.row_count_confidence, Confidence::Estimated);
@@ -2849,7 +3267,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 100_000.0).abs() < 1.0);
@@ -2878,7 +3301,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 1_000.0).abs() < 1.0);
@@ -2895,7 +3323,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert_eq!(props.row_count, 1.0);
@@ -2920,7 +3353,12 @@ mod tests {
             unreachable!("scan_plan_with_predicates always returns a Scan");
         };
         let mut memo = Memo::new();
-        let predicates = intern_exprs(&mut memo.scalars, &scan.predicates);
+        let predicates = intern_exprs(
+            &mut memo.scalars,
+            &scan.predicates,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let expr = MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalScan(ScanOp {
@@ -2981,8 +3419,8 @@ mod tests {
             OutputColumn {
                 column_id: ColumnId::new_for_test(id),
                 name: name.to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: name.starts_with('_'),
             }
         }
@@ -3052,8 +3490,10 @@ mod tests {
                     qualifier: Some("t".to_string()),
                     column: name.to_string(),
                 },
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
             }
         }
 
@@ -3061,8 +3501,11 @@ mod tests {
             OutputColumn {
                 column_id: ColumnId::new_for_test(id),
                 name: name.to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }
         }
@@ -3070,15 +3513,17 @@ mod tests {
         fn count_call() -> AggregateCall {
             AggregateCall {
                 name: "count".to_string(),
-                args: vec![col_ref(2, "v")],
                 distinct: false,
                 result_type: arrow::datatypes::DataType::Int64,
-                order_by: vec![],
                 output_column_id: ColumnId::new_for_test(3),
-                resolved: crate::functions::test_resolved_aggregate(
-                    "count",
-                    &[arrow::datatypes::DataType::Int64],
-                    false,
+                source: crate::binding::AggregateArgumentSource::uncertified(
+                    vec![col_ref(2, "v")],
+                    vec![],
+                    crate::functions::test_resolved_aggregate(
+                        "count",
+                        &[arrow::datatypes::DataType::Int64],
+                        false,
+                    ),
                 ),
             }
         }
@@ -3117,8 +3562,18 @@ mod tests {
             is_merge: Vec<bool>,
             is_split: bool,
         ) -> MExpr {
-            let group_by = intern_exprs(&mut memo.scalars, &[col_ref(1, "k")]);
-            let aggregates = intern_aggregate_calls(&mut memo.scalars, &[count_call()]);
+            let group_by = intern_exprs(
+                &mut memo.scalars,
+                &[col_ref(1, "k")],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+            let aggregates = intern_aggregate_calls(
+                &mut memo.scalars,
+                &[count_call()],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
             let output_columns = vec![output_column(1, "k"), output_column(3, "count(v)")];
             let output_layout = full_aggregate_output_layout(group_by.len(), &output_columns);
             MExpr {
@@ -3136,8 +3591,18 @@ mod tests {
             }
         }
 
-        let single_group_by = intern_exprs(&mut memo.scalars, &[col_ref(1, "k")]);
-        let single_aggregates = intern_aggregate_calls(&mut memo.scalars, &[count_call()]);
+        let single_group_by = intern_exprs(
+            &mut memo.scalars,
+            &[col_ref(1, "k")],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let single_aggregates = intern_aggregate_calls(
+            &mut memo.scalars,
+            &[count_call()],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let single_output_columns = vec![output_column(1, "k"), output_column(3, "count(v)")];
         let single_output_layout =
             full_aggregate_output_layout(single_group_by.len(), &single_output_columns);
@@ -3191,8 +3656,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -3516,7 +3981,12 @@ mod tests {
     }
 
     fn aggregate_group_key_ids(memo: &mut Memo) -> Vec<ScalarId> {
-        intern_exprs(&mut memo.scalars, &aggregate_group_keys())
+        intern_exprs(
+            &mut memo.scalars,
+            &aggregate_group_keys(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
     }
 
     fn aggregate_output_columns() -> Vec<OutputColumn> {
@@ -3746,16 +4216,21 @@ mod tests {
                     qualifier: Some("t".to_string()),
                     column: name.to_string(),
                 },
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
             }
         }
         fn output_column(id: u32, name: &str) -> OutputColumn {
             OutputColumn {
                 column_id: ColumnId::new_for_test(id),
                 name: name.to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }
         }
@@ -3785,7 +4260,12 @@ mod tests {
             g
         }
         fn agg_over(child: usize, memo: &mut Memo) -> MExpr {
-            let group_by = intern_exprs(&mut memo.scalars, &[col_ref(1, "k")]);
+            let group_by = intern_exprs(
+                &mut memo.scalars,
+                &[col_ref(1, "k")],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
             let output_columns = vec![output_column(1, "k")];
             MExpr {
                 id: memo.next_expr_id(), // id is irrelevant to derive_statistics
@@ -3833,23 +4313,21 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         }
     }
 
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(crate::analysis::LiteralValue::Int(v)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
     fn eq_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(left),
                 op: crate::analysis::BinOp::Eq,
@@ -3861,8 +4339,8 @@ mod tests {
 
     fn and_expr(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(left),
                 op: crate::analysis::BinOp::And,
@@ -3874,8 +4352,8 @@ mod tests {
 
     fn nested_expr(expr: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::Nested(Box::new(expr)),
         }
     }
@@ -3939,7 +4417,9 @@ mod tests {
                 predicate: intern_typed(
                     &mut memo.scalars,
                     &eq_expr(col_ref("filter_col"), int_lit(1)),
-                ),
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
             }),
             children: vec![child],
         };
@@ -3959,7 +4439,9 @@ mod tests {
                 predicate: intern_typed(
                     &mut memo.scalars,
                     &eq_expr(col_ref("filter_col"), int_lit(1)),
-                ),
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
             }),
             children: vec![child],
         };
@@ -3976,7 +4458,12 @@ mod tests {
         let plan = scan_plan("orders", &["id"]);
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 100_000.0).abs() < 1.0);
@@ -4000,7 +4487,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // Scan group (0): 10000 rows
         let scan_props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -4060,13 +4552,33 @@ mod tests {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![
                     PhysicalHashJoinEqCondition {
-                        left: intern_typed(&mut memo.scalars, &col_ref("l_k1")),
-                        right: intern_typed(&mut memo.scalars, &col_ref("r_k1")),
+                        left: intern_typed(
+                            &mut memo.scalars,
+                            &col_ref("l_k1"),
+                            crate::optimizer::test_optimizer_control(),
+                        )
+                        .unwrap(),
+                        right: intern_typed(
+                            &mut memo.scalars,
+                            &col_ref("r_k1"),
+                            crate::optimizer::test_optimizer_control(),
+                        )
+                        .unwrap(),
                         null_safe: false,
                     },
                     PhysicalHashJoinEqCondition {
-                        left: intern_typed(&mut memo.scalars, &col_ref("l_k2")),
-                        right: intern_typed(&mut memo.scalars, &col_ref("r_k2")),
+                        left: intern_typed(
+                            &mut memo.scalars,
+                            &col_ref("l_k2"),
+                            crate::optimizer::test_optimizer_control(),
+                        )
+                        .unwrap(),
+                        right: intern_typed(
+                            &mut memo.scalars,
+                            &col_ref("r_k2"),
+                            crate::optimizer::test_optimizer_control(),
+                        )
+                        .unwrap(),
                         null_safe: false,
                     },
                 ],
@@ -4138,8 +4650,18 @@ mod tests {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: intern_typed(&mut memo.scalars, &col_ref("l_key")),
-                    right: intern_typed(&mut memo.scalars, &col_ref("r_key")),
+                    left: intern_typed(
+                        &mut memo.scalars,
+                        &col_ref("l_key"),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                    right: intern_typed(
+                        &mut memo.scalars,
+                        &col_ref("r_key"),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
                     null_safe: false,
                 }],
                 other_condition: None,
@@ -4217,10 +4739,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(intern_typed(
-                    &mut memo.scalars,
-                    &eq_expr(col_ref("l_key"), col_ref("r_key")),
-                )),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &eq_expr(col_ref("l_key"), col_ref("r_key")),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -4287,10 +4813,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(intern_typed(
-                    &mut memo.scalars,
-                    &eq_expr(col_ref("l_key"), col_ref("r_key")),
-                )),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &eq_expr(col_ref("l_key"), col_ref("r_key")),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -4370,7 +4900,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(intern_typed(&mut memo.scalars, &condition)),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &condition,
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -4422,10 +4959,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(intern_typed(
-                    &mut memo.scalars,
-                    &eq_expr(col_ref("r_key"), col_ref("l_key")),
-                )),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &eq_expr(col_ref("r_key"), col_ref("l_key")),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -4490,7 +5031,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(intern_typed(&mut memo.scalars, &condition)),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &condition,
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -4556,10 +5104,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(intern_typed(
-                    &mut memo.scalars,
-                    &eq_expr(col_ref("l_key"), col_ref("r_key")),
-                )),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &eq_expr(col_ref("l_key"), col_ref("r_key")),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -4613,8 +5165,7 @@ mod tests {
                     qualifier: None,
                     column: "id".to_string(),
                 },
-                data_type: DataType::Int32,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
             }
         }
 
@@ -4643,10 +5194,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
-                condition: Some(intern_typed(
-                    &mut memo.scalars,
-                    &eq_expr(col_ref_with_id(left_id), col_ref_with_id(right_id)),
-                )),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &eq_expr(col_ref_with_id(left_id), col_ref_with_id(right_id)),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -4707,10 +5262,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
                 join_type: JoinKind::LeftSemi,
-                condition: Some(intern_typed(
-                    &mut memo.scalars,
-                    &eq_expr(col_ref("l_filter"), int_lit(7)),
-                )),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &eq_expr(col_ref("l_filter"), int_lit(7)),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -4770,10 +5329,14 @@ mod tests {
             id: memo.next_expr_id(),
             op: Operator::PhysicalNestLoopJoin(PhysicalNestLoopJoinOp {
                 join_type: JoinKind::RightAnti,
-                condition: Some(intern_typed(
-                    &mut memo.scalars,
-                    &eq_expr(col_ref("r_filter"), int_lit(7)),
-                )),
+                condition: Some(
+                    intern_typed(
+                        &mut memo.scalars,
+                        &eq_expr(col_ref("r_filter"), int_lit(7)),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                ),
             }),
             children: vec![left, right],
         };
@@ -4857,7 +5420,12 @@ mod tests {
 
         let mut memo = Memo::new();
         let child = child_group(&mut memo);
-        let logical_window_exprs = intern_window_exprs(&mut memo.scalars, &[window_expr("rn")]);
+        let logical_window_exprs = intern_window_exprs(
+            &mut memo.scalars,
+            &[window_expr("rn")],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let logical_window = MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalWindow(WindowOp {
@@ -4872,7 +5440,12 @@ mod tests {
             &empty_stats_input(),
         ));
 
-        let physical_window_exprs = intern_window_exprs(&mut memo.scalars, &[window_expr("rn")]);
+        let physical_window_exprs = intern_window_exprs(
+            &mut memo.scalars,
+            &[window_expr("rn")],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let physical_window = MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalWindow(WindowOp {
@@ -4911,7 +5484,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // Join group should have stats derived.
         let join_props = memo.groups[2].logical_props.as_ref().unwrap();
@@ -4934,8 +5512,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: "status".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 already_pushed: false,
@@ -4946,7 +5527,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // Agg group: real NDV(status)=5 now flows through child_statistics,
         // so output = min(5, 100000) = 5.
@@ -4972,7 +5558,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let limit_props = memo.groups[1].logical_props.as_ref().unwrap();
         assert!((limit_props.row_count - 10.0).abs() < 0.01);
@@ -4994,8 +5585,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
             }),
@@ -5009,8 +5603,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 producer_column_ids: vec![ColumnId::UNSET],
@@ -5026,7 +5623,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&anchor, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // Group 0: Scan (250000 rows from table stats)
         let scan_props = memo.groups[0].logical_props.as_ref().unwrap();
@@ -5139,8 +5741,7 @@ mod tests {
                     qualifier: None,
                     column: name.to_string(),
                 },
-                data_type: DataType::Int32,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
             }
         }
 
@@ -5198,8 +5799,18 @@ mod tests {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![PhysicalHashJoinEqCondition {
-                    left: intern_typed(&mut memo.scalars, &col_ref_id(701, "customer_id")),
-                    right: intern_typed(&mut memo.scalars, &col_ref_id(801, "customer_id")),
+                    left: intern_typed(
+                        &mut memo.scalars,
+                        &col_ref_id(701, "customer_id"),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
+                    right: intern_typed(
+                        &mut memo.scalars,
+                        &col_ref_id(801, "customer_id"),
+                        crate::optimizer::test_optimizer_control(),
+                    )
+                    .unwrap(),
                     null_safe: false,
                 }],
                 other_condition: None,
@@ -5244,8 +5855,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: test_col_id("id"),
                     name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
             }),
@@ -5259,8 +5873,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: test_col_id("consume_id"),
                     name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 producer_column_ids: vec![test_col_id("id")],
@@ -5276,7 +5893,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&anchor, &mut memo);
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // Group 2: CTEConsume — must now carry the producer's column statistics.
         let consume_props = memo.groups[2].logical_props.as_ref().unwrap();
@@ -5306,8 +5928,11 @@ mod tests {
                 columns: vec![OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: "x".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
             }),
@@ -5317,7 +5942,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &empty_stats_input());
+        derive_group_statistics(
+            &mut memo,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let props = memo.groups[0].logical_props.as_ref().unwrap();
         assert!((props.row_count - 3.0).abs() < 0.01);
@@ -5370,9 +6000,24 @@ mod tests {
         let col = ColumnId::new_for_test(7);
         let mut memo = Memo::new();
         let rows = vec![
-            intern_exprs(&mut memo.scalars, &[int_lit(1)]),
-            intern_exprs(&mut memo.scalars, &[int_lit(2)]),
-            intern_exprs(&mut memo.scalars, &[int_lit(3)]),
+            intern_exprs(
+                &mut memo.scalars,
+                &[int_lit(1)],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap(),
+            intern_exprs(
+                &mut memo.scalars,
+                &[int_lit(2)],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap(),
+            intern_exprs(
+                &mut memo.scalars,
+                &[int_lit(3)],
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap(),
         ];
         let expr = MExpr {
             id: memo.next_expr_id(),
@@ -5501,7 +6146,13 @@ mod tests {
         let tree = abc_join_tree(a, b, c);
 
         let groups_before = memo.groups.len();
-        let root = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let root = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // Two new groups materialized: (A join B) and the root.
         assert_eq!(memo.groups.len(), groups_before + 2);
@@ -5527,11 +6178,23 @@ mod tests {
         let c = join_leaf_group(&mut memo, 3, 50.0, 500.0);
         let tree = abc_join_tree(a, b, c);
 
-        let r1 = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let r1 = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let after_first = memo.groups.len();
         // Re-materializing the identical tree reuses every group: same root,
         // zero new groups (dedup via join_group_index).
-        let r2 = copy_in_join_tree(&mut memo, &tree, &empty_stats_input());
+        let r2 = copy_in_join_tree(
+            &mut memo,
+            &tree,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         assert_eq!(r1, r2, "identical tree must dedup to the same root group");
         assert_eq!(
             memo.groups.len(),
@@ -5548,8 +6211,10 @@ mod tests {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
                     output_name: "col1".to_string(),
                     output_column_id: out_id,
@@ -5569,7 +6234,12 @@ mod tests {
 
         let mut memo = Memo::new();
         logical_plan_to_memo_for_test(&plan, &mut memo);
-        derive_group_statistics(&mut memo, &empty_stats_input());
+        derive_group_statistics(
+            &mut memo,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let props = memo.groups[1].logical_props.as_ref().unwrap();
         assert_eq!(props.output_columns.len(), 1);
@@ -5588,8 +6258,8 @@ mod tests {
 
     fn between_expr(expr: TypedExpr, low: TypedExpr, high: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::Between {
                 expr: Box::new(expr),
                 low: Box::new(low),
@@ -5622,8 +6292,8 @@ mod tests {
         // The negated value (~0.89) is clearly distinct from the positive (~0.11),
         // so this test genuinely exercises the negated branch.
         let pred = TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::Between {
                 expr: Box::new(col_ref("a")),
                 low: Box::new(int_lit(0)),
@@ -5669,7 +6339,12 @@ mod tests {
         });
         assert!(memo.groups[group_b].logical_props.is_none());
 
-        derive_group_statistics(&mut memo, &empty_stats_input());
+        derive_group_statistics(
+            &mut memo,
+            &empty_stats_input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // Group A was memoized/skipped — sentinel preserved (NOT recomputed to 0).
         assert_eq!(
@@ -5738,9 +6413,14 @@ mod tests {
         );
 
         // argmax must pick the Exact member (index 1), not first().
-        let (chosen, stats) =
-            pick_group_representative(&memo, group, &query_stats_input_for_test(&table_stats))
-                .expect("non-empty group");
+        let (chosen, stats) = pick_group_representative(
+            &memo,
+            group,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
+        .expect("non-empty group");
         assert_eq!(
             stats.row_count_confidence,
             Confidence::Exact,
@@ -5757,7 +6437,13 @@ mod tests {
         );
 
         // The cached logical_props (Site 1) must reflect the same argmax pick.
-        derive_group_statistics_for(&mut memo, group, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics_for(
+            &mut memo,
+            group,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let props = memo.groups[group].logical_props.as_ref().unwrap();
         assert_eq!(props.row_count_confidence, Confidence::Exact);
         assert!((props.row_count - 1_000.0).abs() < 1.0);
@@ -5779,9 +6465,14 @@ mod tests {
         let group = memo.new_group(scan_mexpr("eq_tbl", "a"));
         memo.add_expr_to_group(group, scan_mexpr("eq_tbl", "b"));
 
-        let (chosen, _) =
-            pick_group_representative(&memo, group, &query_stats_input_for_test(&table_stats))
-                .expect("non-empty group");
+        let (chosen, _) = pick_group_representative(
+            &memo,
+            group,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
+        .expect("non-empty group");
         // Lowest index wins the tie → the "a" scan (logical_exprs[0]).
         assert!(
             matches!(&chosen.op, Operator::LogicalScan(s)
@@ -5807,7 +6498,13 @@ mod tests {
         let group = memo.new_group(scan_mexpr("unregistered_tbl", "a"));
         memo.add_expr_to_group(group, scan_mexpr("consistent_tbl", "a"));
 
-        derive_group_statistics_for(&mut memo, group, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics_for(
+            &mut memo,
+            group,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let props = memo.groups[group].logical_props.as_ref().unwrap();
 
         // Row-level props come from the argmax (Exact) member.
@@ -5869,15 +6566,23 @@ mod tests {
         // single conjunct, one with two. The literals are arbitrary — only the
         // conjunct COUNT matters to FFewerConj.
         let lit = |v: i64| TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::Literal(LiteralValue::Int(v)),
         };
-        let one_conjunct = intern_typed(&mut memo.scalars, &lit(1));
+        let one_conjunct = intern_typed(
+            &mut memo.scalars,
+            &lit(1),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let two_conjuncts = {
             let and = TypedExpr {
-                data_type: DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    false,
+                ),
+
                 kind: ExprKind::BinaryOp {
                     op: BinOp::And,
                     left: Box::new(lit(1)),
@@ -5886,7 +6591,12 @@ mod tests {
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
             };
-            intern_typed(&mut memo.scalars, &and)
+            intern_typed(
+                &mut memo.scalars,
+                &and,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap()
         };
 
         // Member 0 (first): TWO conjuncts. Member 1: ONE conjunct. Both inner
@@ -5914,14 +6624,25 @@ mod tests {
             },
         );
 
-        let (chosen, _) =
-            pick_group_representative(&memo, group, &query_stats_input_for_test(&table_stats))
-                .expect("non-empty group");
+        let (chosen, _) = pick_group_representative(
+            &memo,
+            group,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
+        .expect("non-empty group");
         match &chosen.op {
             Operator::LogicalJoin(j) => {
                 let sid = j.condition.expect("join has a condition");
                 let mut conjuncts = Vec::new();
-                flatten_and_scalar(&memo.scalars, sid, &mut conjuncts);
+                let mut work = CompileCheckpoints::try_new(
+                    crate::optimizer::test_optimizer_control(),
+                    CompilePhase::Validate,
+                )
+                .unwrap();
+                flatten_and_scalar(&memo.scalars, sid, &mut conjuncts, &mut work).unwrap();
+                work.finish().unwrap();
                 assert_eq!(
                     conjuncts.len(),
                     1,
@@ -5955,7 +6676,12 @@ mod tests {
         let group = memo.new_group(scan_mexpr("unregistered_tbl", "a"));
 
         // ── Step 2: derive via the bulk pass (first derivation). ──────────
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         // The group now has cached props — single member is Fallback.
         let props = memo.groups[group]
@@ -5975,7 +6701,12 @@ mod tests {
 
         // ── Step 4: hazard — bulk pass SKIPS the group. ───────────────────
         // The guard sees `logical_props.is_some()` and does not re-run argmax.
-        derive_group_statistics(&mut memo, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics(
+            &mut memo,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let props_after_bulk = memo.groups[group]
             .logical_props
             .as_ref()
@@ -5989,7 +6720,13 @@ mod tests {
 
         // ── Step 5: fix — eager re-derive via derive_group_statistics_for. ─
         // This is what a real producer MUST call at append time.
-        derive_group_statistics_for(&mut memo, group, &query_stats_input_for_test(&table_stats));
+        derive_group_statistics_for(
+            &mut memo,
+            group,
+            &query_stats_input_for_test(&table_stats),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let props_after_eager = memo.groups[group]
             .logical_props
@@ -6018,8 +6755,8 @@ mod join_widening_tests {
         OutputColumn {
             column_id: ColumnId::UNSET,
             name: name.into(),
-            data_type: DataType::Int32,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, nullable),
+
             is_internal: false,
         }
     }
@@ -6028,8 +6765,8 @@ mod join_widening_tests {
     fn inner_preserves_nullability() {
         let out = widen_for_join_kind(JoinKind::Inner, vec![c("a", false)], vec![c("b", false)]);
         assert_eq!(out.len(), 2);
-        assert!(!out[0].nullable);
-        assert!(!out[1].nullable);
+        assert!(!out[0].value_type.nullable);
+        assert!(!out[1].value_type.nullable);
     }
 
     #[test]
@@ -6039,8 +6776,8 @@ mod join_widening_tests {
             vec![c("a", false)],
             vec![c("b", false)],
         );
-        assert!(!out[0].nullable, "left side preserved");
-        assert!(out[1].nullable, "right side widened");
+        assert!(!out[0].value_type.nullable, "left side preserved");
+        assert!(out[1].value_type.nullable, "right side widened");
     }
 
     #[test]
@@ -6050,8 +6787,8 @@ mod join_widening_tests {
             vec![c("a", false)],
             vec![c("b", false)],
         );
-        assert!(out[0].nullable, "left side widened");
-        assert!(!out[1].nullable, "right side preserved");
+        assert!(out[0].value_type.nullable, "left side widened");
+        assert!(!out[1].value_type.nullable, "right side preserved");
     }
 
     #[test]
@@ -6061,8 +6798,8 @@ mod join_widening_tests {
             vec![c("a", false)],
             vec![c("b", false)],
         );
-        assert!(out[0].nullable);
-        assert!(out[1].nullable);
+        assert!(out[0].value_type.nullable);
+        assert!(out[1].value_type.nullable);
     }
 
     #[test]
@@ -6070,7 +6807,7 @@ mod join_widening_tests {
         let out = widen_for_join_kind(JoinKind::LeftSemi, vec![c("a", false)], vec![c("b", false)]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "a");
-        assert!(!out[0].nullable);
+        assert!(!out[0].value_type.nullable);
     }
 
     #[test]
@@ -6094,10 +6831,13 @@ mod join_widening_tests {
             vec![c("b", false)],
         );
         assert_eq!(out.len(), 3);
-        assert!(out[0].nullable, "nullable source stays nullable");
-        assert!(!out[1].nullable, "non-nullable source stays non-nullable");
+        assert!(out[0].value_type.nullable, "nullable source stays nullable");
         assert!(
-            !out[2].nullable,
+            !out[1].value_type.nullable,
+            "non-nullable source stays non-nullable"
+        );
+        assert!(
+            !out[2].value_type.nullable,
             "non-nullable source on right stays non-nullable"
         );
     }
@@ -6118,10 +6858,9 @@ mod sort_partition_limit_tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         };
-        intern_typed(scalars, &expr)
+        intern_typed(scalars, &expr, crate::optimizer::test_optimizer_control()).unwrap()
     }
 
     fn col_stat_with_ndv(ndv: f64) -> ColumnStatistic {
@@ -6222,5 +6961,610 @@ mod sort_partition_limit_tests {
             (result - 50.0).abs() < 1e-9,
             "expected 50.0 with default NDV, got {result}"
         );
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    use crate::optimizer::memo::LogicalProperties;
+    use crate::optimizer::operator::ValuesOp;
+    use novarocks_type_contract::CompileControlError;
+    use std::sync::Mutex;
+
+    // Explicit fixture driver for the mandatory shared-work production entry.
+    fn derive_statistics(
+        expr: &MExpr,
+        memo: &Memo,
+        input: &OptimizerStatsInput,
+        control: &dyn PureCompileControl,
+    ) -> Result<Statistics, SqlCompileError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+        let statistics = super::derive_statistics(expr, memo, input, &mut work, control)?;
+        work.finish()?;
+        Ok(statistics)
+    }
+
+    struct Control {
+        units: Mutex<Vec<u32>>,
+        fail: Option<CompileControlError>,
+        trigger: u32,
+    }
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            self.units.lock().unwrap().push(units);
+            if units == self.trigger {
+                self.fail.map_or(Ok(()), Err)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    fn owner(trigger: u32, fail: Option<CompileControlError>) -> Control {
+        Control {
+            units: Mutex::new(vec![]),
+            fail,
+            trigger,
+        }
+    }
+    fn input() -> OptimizerStatsInput {
+        OptimizerStatsInput::from_test_table_statistics(&HashMap::new())
+    }
+    fn values(id: usize, rows: usize) -> MExpr {
+        MExpr {
+            id,
+            op: Operator::LogicalValues(ValuesOp {
+                rows: vec![vec![]; rows],
+                columns: vec![],
+            }),
+            children: vec![],
+        }
+    }
+    fn assert_class(error: SqlCompileError, expected: CompileControlError) {
+        assert!(matches!(
+            (error, expected),
+            (SqlCompileError::Cancelled, CompileControlError::Cancelled)
+                | (
+                    SqlCompileError::DeadlineExceeded,
+                    CompileControlError::DeadlineExceeded
+                )
+                | (
+                    SqlCompileError::ResourceExhausted,
+                    CompileControlError::ResourceExhausted
+                )
+        ));
+    }
+    #[test]
+    fn statistics_control_entry_preserves_errors_even_for_empty_or_cached_groups() {
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let mut memo = Memo::new();
+            let root = memo.new_group(values(0, 0));
+            memo.groups[root].logical_props = Some(LogicalProperties::new(vec![], 999.0));
+            let control = owner(0, Some(error));
+            assert_class(
+                derive_group_statistics(&mut memo, &input(), &control).unwrap_err(),
+                error,
+            );
+            memo.groups[root].logical_exprs.clear();
+            assert_class(
+                pick_group_representative(&memo, root, &input(), &control).unwrap_err(),
+                error,
+            );
+            assert_class(
+                copy_in_join_tree(&mut memo, &JoinTree::Leaf(root), &input(), &control)
+                    .unwrap_err(),
+                error,
+            );
+            assert_eq!(
+                memo.groups[root].logical_props.as_ref().unwrap().row_count,
+                999.0
+            );
+        }
+    }
+    #[test]
+    fn statistics_control_observes_real_members_and_preserves_canonical_ties() {
+        let mut memo = Memo::new();
+        let root = memo.new_group(values(0, 5));
+        for id in 1..320 {
+            memo.add_expr_to_group(root, values(id, 9));
+        }
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = owner(256, Some(error));
+            assert_class(
+                pick_group_representative(&memo, root, &input(), &control).unwrap_err(),
+                error,
+            );
+            assert_eq!(
+                control
+                    .units
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .copied()
+                    .filter(|u| *u > 0)
+                    .collect::<Vec<_>>(),
+                vec![256]
+            );
+        }
+        let control = owner(256, None);
+        let (chosen, stats) = pick_group_representative(&memo, root, &input(), &control)
+            .unwrap()
+            .unwrap();
+        assert_eq!(chosen.id, 0);
+        assert_eq!(stats.output_row_count, 5.0);
+        assert_eq!(
+            control
+                .units
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|u| *u > 0)
+                .collect::<Vec<_>>(),
+            vec![256, 256, 128]
+        );
+    }
+    #[test]
+    fn statistics_control_late_finish_keeps_previously_published_properties() {
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let mut memo = Memo::new();
+            let root = memo.new_group(values(0, 7));
+            memo.groups[root].logical_props = Some(LogicalProperties::new(vec![], 999.0));
+            // Candidate, member, and actual per-expression derive each charge
+            // one unit; this trigger observes the final completed candidate.
+            let control = owner(3, Some(error));
+            assert_class(
+                derive_group_statistics_for(&mut memo, root, &input(), &control).unwrap_err(),
+                error,
+            );
+            assert_eq!(
+                memo.groups[root].logical_props.as_ref().unwrap().row_count,
+                999.0
+            );
+            assert_eq!(control.units.lock().unwrap().last(), Some(&3));
+            derive_group_statistics_for(
+                &mut memo,
+                root,
+                &input(),
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+            assert_eq!(
+                memo.groups[root].logical_props.as_ref().unwrap().row_count,
+                7.0
+            );
+        }
+    }
+    #[test]
+    fn statistics_control_observes_actual_cached_group_walk_and_short_finish() {
+        let mut memo = Memo::new();
+        for id in 0..320 {
+            let group = memo.new_group(values(id, 0));
+            memo.groups[group].logical_props = Some(LogicalProperties::new(vec![], id as f64));
+        }
+        let control = owner(256, Some(CompileControlError::ResourceExhausted));
+        assert!(matches!(
+            derive_group_statistics(&mut memo, &input(), &control),
+            Err(SqlCompileError::ResourceExhausted)
+        ));
+        let control = owner(256, None);
+        derive_group_statistics(&mut memo, &input(), &control).unwrap();
+        assert_eq!(control.units.lock().unwrap().clone(), vec![0, 256, 64]);
+        assert_eq!(
+            memo.groups[319].logical_props.as_ref().unwrap().row_count,
+            319.0
+        );
+    }
+
+    fn literal_values(
+        memo: &mut Memo,
+        rows: Vec<Vec<LiteralValue>>,
+        types: &[arrow::datatypes::DataType],
+        physical: bool,
+    ) -> MExpr {
+        use crate::optimizer::scalar::HashableLiteral;
+        use arrow::datatypes::DataType;
+        let rows = rows
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .map(|literal| {
+                        let data_type = match &literal {
+                            LiteralValue::Null => DataType::Null,
+                            LiteralValue::Float(_) => DataType::Float64,
+                            LiteralValue::Int(_) => DataType::Int64,
+                            LiteralValue::String(_) => DataType::Utf8,
+                            _ => panic!("test fixture requires an explicit literal carrier"),
+                        };
+                        let nullable = matches!(&literal, LiteralValue::Null);
+                        memo.scalars.intern(
+                            ScalarNode::Literal(HashableLiteral(literal)),
+                            novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let values = ValuesOp {
+            rows,
+            columns: types
+                .iter()
+                .enumerate()
+                .map(|(ordinal, ty)| OutputColumn {
+                    column_id: ColumnId::new_for_test(ordinal as u32 + 1),
+                    name: format!("v{ordinal}"),
+                    value_type: novarocks_type_contract::FunctionValueType::new(ty.clone(), true),
+
+                    is_internal: false,
+                })
+                .collect(),
+        };
+        MExpr {
+            id: memo.next_expr_id(),
+            op: if physical {
+                Operator::PhysicalValues(values)
+            } else {
+                Operator::LogicalValues(values)
+            },
+            children: vec![],
+        }
+    }
+    fn wide_numeric_values(memo: &mut Memo, physical: bool) -> MExpr {
+        literal_values(
+            memo,
+            (0..320)
+                .map(|row| {
+                    vec![
+                        LiteralValue::Float((row % 16) as f64),
+                        if row % 4 == 0 {
+                            LiteralValue::Null
+                        } else {
+                            LiteralValue::Float((row % 8) as f64)
+                        },
+                    ]
+                })
+                .collect(),
+            &[
+                arrow::datatypes::DataType::Float64,
+                arrow::datatypes::DataType::Float64,
+            ],
+            physical,
+        )
+    }
+    fn positive_units(control: &Control) -> Vec<u32> {
+        control
+            .units
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|units| *units > 0)
+            .collect()
+    }
+    #[test]
+    fn values_real_cells_keep_exact_rows_ndv_nulls_and_bounded_batches() {
+        for physical in [false, true] {
+            let mut memo = Memo::new();
+            let expr = wide_numeric_values(&mut memo, physical);
+            let control = owner(256, None);
+            let statistics = derive_statistics(&expr, &memo, &input(), &control).unwrap();
+            assert_eq!(statistics.output_row_count, 320.0);
+            assert_eq!(statistics.row_count_confidence, Confidence::Exact);
+            let first = &statistics.column_statistics[&ColumnId::new_for_test(1)];
+            assert_eq!(first.min_value, 0.0);
+            assert_eq!(first.max_value, 15.0);
+            assert_eq!(first.ndv_or_legacy_unknown_sentinel_for_test(), 16.0);
+            assert_eq!(first.nulls_fraction, 0.0);
+            let nullable = &statistics.column_statistics[&ColumnId::new_for_test(2)];
+            assert_eq!(nullable.min_value, 1.0);
+            assert_eq!(nullable.max_value, 7.0);
+            assert_eq!(nullable.ndv_or_legacy_unknown_sentinel_for_test(), 6.0);
+            assert_eq!(nullable.nulls_fraction, 0.25);
+            assert_eq!(nullable.confidence, Confidence::Exact);
+            // Per-expression entry + columns + rows/cells + scalar reads +
+            // numeric copy/dedup/reduction + emitted column facts: 3525 units.
+            let mut expected = vec![256; 13];
+            expected.push(197);
+            assert_eq!(positive_units(&control), expected);
+            assert!(
+                control
+                    .units
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|units| *units <= 256)
+            );
+        }
+    }
+    #[test]
+    fn values_typed_control_stops_inside_real_cells_and_postscan_passes() {
+        for physical in [false, true] {
+            let mut memo = Memo::new();
+            let expr = wide_numeric_values(&mut memo, physical);
+            for error in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                for trigger in [0, 256, 197] {
+                    let control = owner(trigger, Some(error));
+                    assert_class(
+                        derive_statistics(&expr, &memo, &input(), &control).unwrap_err(),
+                        error,
+                    );
+                    let units = control.units.lock().unwrap();
+                    assert!(units.iter().all(|units| *units <= 256));
+                    assert_eq!(units.last(), Some(&trigger));
+                    if trigger == 0 {
+                        assert_eq!(units.len(), 1);
+                    }
+                }
+            }
+        }
+        // Failure during a complete VALUES derivation must reach the same
+        // representative owner, rather than a surrounding legacy helper.
+        let mut memo = Memo::new();
+        let expr = wide_numeric_values(&mut memo, false);
+        let root = memo.new_group(expr);
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = owner(256, Some(error));
+            assert_class(
+                pick_group_representative(&memo, root, &input(), &control).unwrap_err(),
+                error,
+            );
+        }
+    }
+    #[test]
+    fn values_all_null_nonnumeric_and_missing_cells_keep_existing_oracle() {
+        use arrow::datatypes::DataType;
+        for physical in [false, true] {
+            let mut memo = Memo::new();
+            let expr = literal_values(
+                &mut memo,
+                vec![vec![LiteralValue::Null]; 320],
+                &[DataType::Float64],
+                physical,
+            );
+            let control = owner(256, None);
+            let stats = derive_statistics(&expr, &memo, &input(), &control).unwrap();
+            assert_eq!(stats.output_row_count, 320.0);
+            let null = &stats.column_statistics[&ColumnId::new_for_test(1)];
+            assert_eq!(null.min_value, f64::NEG_INFINITY);
+            assert_eq!(null.max_value, f64::INFINITY);
+            assert_eq!(null.nulls_fraction, 1.0);
+            assert_eq!(null.ndv_or_legacy_unknown_sentinel_for_test(), 1.0);
+            assert_eq!(positive_units(&control), vec![256, 256, 131]);
+            let expr = literal_values(
+                &mut memo,
+                vec![
+                    vec![LiteralValue::String("first".into()), LiteralValue::Null],
+                    vec![LiteralValue::String("second".into())],
+                ],
+                &[DataType::Utf8, DataType::Float64],
+                physical,
+            );
+            let stats = derive_statistics(
+                &expr,
+                &memo,
+                &input(),
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+            assert_eq!(stats.output_row_count, 2.0);
+            assert_eq!(stats.row_count_confidence, Confidence::Exact);
+            assert!(
+                stats.column_statistics.is_empty(),
+                "unknown/missing columns stay absent"
+            );
+            let expr = literal_values(&mut memo, vec![], &[DataType::Float64], physical);
+            let stats = derive_statistics(
+                &expr,
+                &memo,
+                &input(),
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+            assert_eq!(stats.output_row_count, 0.0);
+            assert!(stats.column_statistics.is_empty());
+        }
+    }
+    #[test]
+    fn values_float_nan_signed_zero_and_epsilon_match_precontrol_baseline() {
+        use arrow::datatypes::DataType;
+        // This is the old library-sort/reduce oracle, including non-total NaN
+        // comparison. It intentionally does not infer a new total float order.
+        for source in [
+            vec![0.0, -0.0, 0.0, -0.0],
+            vec![f64::NAN, -0.0, 0.0, 1.0, f64::NAN, -1.0],
+            vec![f64::from_bits(0x7ff8_0000_0000_0007)],
+            vec![0.0, f64::EPSILON / 2.0, f64::EPSILON, f64::EPSILON * 2.0],
+        ] {
+            let mut distinct = source.clone();
+            distinct.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            distinct.dedup_by(|a, b| (*a - *b).abs() < f64::EPSILON);
+            let expected_ndv = (distinct.len() as f64).max(1.0);
+            let expected_min = source.iter().copied().reduce(f64::min).unwrap();
+            let expected_max = source.iter().copied().reduce(f64::max).unwrap();
+            for physical in [false, true] {
+                let mut memo = Memo::new();
+                let rows = source
+                    .iter()
+                    .copied()
+                    .map(|value| vec![LiteralValue::Float(value)])
+                    .collect();
+                let expr = literal_values(&mut memo, rows, &[DataType::Float64], physical);
+                let stats = derive_statistics(
+                    &expr,
+                    &memo,
+                    &input(),
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap();
+                let column = &stats.column_statistics[&ColumnId::new_for_test(1)];
+                assert_eq!(column.min_value.to_bits(), expected_min.to_bits());
+                assert_eq!(column.max_value.to_bits(), expected_max.to_bits());
+                assert_eq!(
+                    column.ndv_or_legacy_unknown_sentinel_for_test(),
+                    expected_ndv
+                );
+                assert_eq!(column.nulls_fraction, 0.0);
+            }
+        }
+    }
+    #[test]
+    fn values_actual_scalar_nesting_keeps_literal_and_nested_null_behavior() {
+        use crate::optimizer::scalar::HashableLiteral;
+        use arrow::datatypes::DataType;
+        let mut memo = Memo::new();
+        let literal = memo.scalars.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(7))),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        );
+        let mut nested = literal;
+        for _ in 0..320 {
+            nested = memo.scalars.intern(
+                ScalarNode::Nested(nested),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            );
+        }
+        let column = OutputColumn {
+            column_id: ColumnId::new_for_test(1),
+            name: "nested".into(),
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
+            is_internal: false,
+        };
+        let expr = MExpr {
+            id: 0,
+            op: Operator::LogicalValues(ValuesOp {
+                rows: vec![vec![nested]],
+                columns: vec![column],
+            }),
+            children: vec![],
+        };
+        let control = owner(256, Some(CompileControlError::Cancelled));
+        assert!(matches!(
+            derive_statistics(&expr, &memo, &input(), &control),
+            Err(SqlCompileError::Cancelled)
+        ));
+        let stats = derive_statistics(
+            &expr,
+            &memo,
+            &input(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let stat = &stats.column_statistics[&ColumnId::new_for_test(1)];
+        assert_eq!(stat.min_value, 7.0);
+        assert_eq!(stat.max_value, 7.0);
+        assert_eq!(stat.ndv_or_legacy_unknown_sentinel_for_test(), 1.0);
+        let null = memo.scalars.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Null, true),
+        );
+        let nested_null = memo.scalars.intern(
+            ScalarNode::Nested(null),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
+        let cast_null = memo.scalars.intern(
+            ScalarNode::Cast {
+                child: null,
+                target: DataType::Int64,
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
+        for wrapped_null in [nested_null, cast_null] {
+            let expr = MExpr {
+                id: 1,
+                op: Operator::LogicalValues(ValuesOp {
+                    rows: vec![vec![wrapped_null]],
+                    columns: vec![OutputColumn {
+                        column_id: ColumnId::new_for_test(1),
+                        name: "wrapped_null".into(),
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
+                        is_internal: false,
+                    }],
+                }),
+                children: vec![],
+            };
+            let stats = derive_statistics(
+                &expr,
+                &memo,
+                &input(),
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+            assert!(
+                stats.column_statistics.is_empty(),
+                "only a direct NULL literal contributes the old NULL statistic"
+            );
+            assert_eq!(stats.output_row_count, 1.0);
+        }
+    }
+    #[test]
+    fn values_wide_columns_share_one_counter_and_keep_every_exact_fact() {
+        use arrow::datatypes::DataType;
+        let mut memo = Memo::new();
+        let types = vec![DataType::Float64; 320];
+        let row = (0..320)
+            .map(|value| LiteralValue::Float(value as f64))
+            .collect();
+        let expr = literal_values(&mut memo, vec![row], &types, false);
+        let control = owner(256, None);
+        let stats = derive_statistics(&expr, &memo, &input(), &control).unwrap();
+        assert_eq!(stats.output_row_count, 1.0);
+        assert_eq!(stats.column_statistics.len(), 320);
+        let mut expected = vec![256; 10];
+        expected.push(1);
+        assert_eq!(positive_units(&control), expected);
+        for value in 0..320 {
+            let stat = &stats.column_statistics[&ColumnId::new_for_test(value + 1)];
+            assert_eq!(stat.min_value, value as f64);
+            assert_eq!(stat.max_value, value as f64);
+            assert_eq!(stat.ndv_or_legacy_unknown_sentinel_for_test(), 1.0);
+        }
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let control = owner(256, Some(error));
+            assert_class(
+                derive_statistics(&expr, &memo, &input(), &control).unwrap_err(),
+                error,
+            );
+        }
+    }
+    #[test]
+    fn statistics_fixture_driver_and_shared_work_do_not_retain_control() {
+        let mut memo = Memo::new();
+        let expr = wide_numeric_values(&mut memo, false);
+        let control = std::sync::Arc::new(owner(256, None));
+        let weak = std::sync::Arc::downgrade(&control);
+        let stats = derive_statistics(&expr, &memo, &input(), control.as_ref()).unwrap();
+        drop(control);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(stats.output_row_count, 320.0);
     }
 }

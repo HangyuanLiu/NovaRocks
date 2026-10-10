@@ -310,11 +310,16 @@ impl IcebergWriteSessionControl {
                 ))
                 .map_err(connector_unsupported)?;
             scope.active()?;
-            let table = self
+            let physical = self
                 .runtime
                 .load_table_for_request(namespace, table_name, &request.context)
-                .map_err(|e| unavailable(e.to_string()))?
-                .into_table();
+                .map_err(|e| unavailable(e.to_string()))?;
+            let cow_read_access =
+                crate::loaded_table::IcebergAttemptTableAccess::freeze_with_original_scope(
+                    &physical, &scope,
+                )?;
+            let table = physical.into_table();
+            let read_metadata = table.metadata_ref();
             let metadata = IcebergAdmissionStatisticsMetadata::from_loaded_table(&table, true);
             scope.active()?;
             crate::commit::validation::ensure_iceberg_write_supported_from_metadata(&metadata)
@@ -420,10 +425,28 @@ impl IcebergWriteSessionControl {
                 })
                 .map_err(unavailable)??;
             scope.cover_total(files.simultaneous_upper)?;
+            // Same original ReadSnapshot facts and loaded-table authority, moved
+            // into typed base holders without another observation or SDK clone.
+            scope.reserve(mul(
+                files.files.len() as u64,
+                size_of::<crate::commit::write_stack::copy_on_write::IcebergCowFrozenBaseFile>()
+                    as u64,
+            )?)?;
+            let base_files = files
+                .files
+                .into_iter()
+                .map(|file| {
+                    crate::commit::write_stack::copy_on_write::IcebergCowFrozenBaseFile::new(
+                        file,
+                        read_metadata.clone(),
+                        cow_read_access.clone(),
+                    )
+                })
+                .collect();
             let recipes=crate::commit::write_stack::copy_on_write::freeze_copy_on_write_branches_with_original_scope(
                 selection,match_contract,crate::commit::write_stack::copy_on_write::IcebergCowFreezeInput{
                     owner:&self.key,catalog:&self.key.instance_id,namespace,table_name,metadata:&metadata,
-                    snapshot_id,base_files:files.files,input:&material.input,base_version_digest:base_digest,
+                    snapshot_id,base_files,input:&material.input,base_version_digest:base_digest,
                     max_handle_payload_bytes:request.context.max_handle_payload_bytes()},&scope)?;
             // All simultaneous flavor/target clones are authorized before either
             // planner starts. Clone capacities use initialized lengths, shared
@@ -498,9 +521,55 @@ impl IcebergWriteSessionControl {
             scope.active()?;
             // COW cleanup preflight owns only table strings and one maximum UUID;
             // its canonical JSON is a bounded representation of these same facts.
+            // Admission evidence clones two formatted subjects into its DTO,
+            // then serializes that DTO into a geometrically grown byte Vec.
+            // Borrow the exact subjects before any format/clone/encode occurs.
+            let table_ident = add(
+                add(
+                    handle.table().namespace().len() as u64,
+                    handle.table().table_name().len() as u64,
+                )?,
+                1,
+            )?;
+            let staging = add(
+                handle.table().data_location().trim_end_matches('/').len() as u64,
+                ("/_staging/".len() + 36) as u64,
+            )?;
+            let op = match handle.commit_op_kind() {
+                crate::commit::types::CommitOpKind::FastAppend => "FastAppend",
+                crate::commit::types::CommitOpKind::Overwrite => "Overwrite",
+                crate::commit::types::CommitOpKind::RowDelta => "RowDelta",
+                crate::commit::types::CommitOpKind::RowDeltaDv => "RowDeltaDv",
+                crate::commit::types::CommitOpKind::RowDeltaDvFromFiles => "RowDeltaDvFromFiles",
+                crate::commit::types::CommitOpKind::RewriteDataFiles => "RewriteDataFiles",
+                crate::commit::types::CommitOpKind::SelectedRewrite => "SelectedRewrite",
+                crate::commit::types::CommitOpKind::CowUpdate => "CowUpdate",
+                crate::commit::types::CommitOpKind::Truncate => "Truncate",
+                crate::commit::types::CommitOpKind::OverwritePartitions => "OverwritePartitions",
+                crate::commit::types::CommitOpKind::RewriteManifests => "RewriteManifests",
+            };
+            let dto_text = add(
+                add(table_ident, staging)?,
+                add(
+                    handle.table().target_ref().len() as u64,
+                    (op.len() + 36 + 36) as u64,
+                )?,
+            )?;
+            // Empty string slots plus maximum decimal widths describe every
+            // fixed delimiter/key/scalar emitted by this exact COW DTO.
+            const FIXED_JSON: &str = r#"{"version":65535,"session_id":"","table_ident":"","target_ref":"","op_kind":"","base_snapshot_id":-9223372036854775808,"base_sequence_number":-9223372036854775808,"staging_dir":"","manifest_cleanup_token":"","document_manifest_digest":null}"#;
+            let json = add(FIXED_JSON.len() as u64, mul(dto_text, 6)?)?;
+            let formatted = mul(add(table_ident.max(8), staging.max(8))?, 3)?;
+            let string_buffers = add(
+                add(formatted, dto_text)?,
+                add(36, mul((op.len() as u64).max(8), 3)?)?,
+            )?;
             let evidence = add(
-                mul(table_heap(handle.table())?, 8)?,
-                (size_of::<crate::commit::service::RecoveryEvidence>() + 36) as u64,
+                add(string_buffers, mul(json.max(128), 3)?)?,
+                (size_of::<crate::commit::service::RecoveryEvidence>()
+                    + size_of::<super::IcebergWriteSessionEvidenceV1>()
+                    + size_of::<novarocks_spi::connector::ExternalMutationEvidence>()
+                    + 3 * size_of::<usize>()) as u64,
             )?;
             scope.reserve(evidence)?;
             self.preflight_evidence_at_admission(&handle)?;

@@ -109,6 +109,8 @@ impl SqlMode {
 pub struct SqlSemanticSettings {
     sql_mode: SqlMode,
     decimal_overflow_to_double: bool,
+    /// Raw value projected from the actual admitted SessionExecutionSettings.
+    group_concat_max_len: Option<i64>,
 }
 
 impl SqlSemanticSettings {
@@ -118,6 +120,14 @@ impl SqlSemanticSettings {
 
     pub const fn decimal_overflow_to_double(&self) -> bool {
         self.decimal_overflow_to_double
+    }
+
+    pub const fn group_concat_max_len(&self) -> Option<i64> {
+        self.group_concat_max_len
+    }
+    pub fn with_group_concat_max_len(mut self, value: i64) -> Self {
+        self.group_concat_max_len = Some(value);
+        self
     }
 
     pub fn with_decimal_overflow_to_double(mut self, value: bool) -> Self {

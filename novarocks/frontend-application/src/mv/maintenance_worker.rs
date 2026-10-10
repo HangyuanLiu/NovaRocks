@@ -672,14 +672,34 @@ impl TableMaintenanceAutomaticRunner {
             }
             Err(error) => automatic_terminal_disposition(error.state),
         };
-        action.record_terminal(
-            disposition,
-            self.readiness.as_ref(),
-            self.connector_control.as_ref(),
-        )?;
-        result
-            .map(AutomaticMaintenanceOutcome::into_action_outcome)
-            .map_err(automatic_terminal_error)
+        finish_automatic_action(
+            result,
+            action.record_terminal(
+                disposition,
+                self.readiness.as_ref(),
+                self.connector_control.as_ref(),
+            ),
+        )
+        .map(AutomaticMaintenanceOutcome::into_action_outcome)
+    }
+}
+
+fn finish_automatic_action<T>(
+    result: Result<T, novarocks_table_maintenance::runtime::TerminalError>,
+    terminal: Result<(), MvBackgroundEngineError>,
+) -> Result<T, MvBackgroundEngineError> {
+    match terminal {
+        Ok(()) => result.map_err(automatic_terminal_error),
+        Err(error) => {
+            // Terminal-recording failures retain their existing disposition and
+            // diagnostic, while the first compilation cause survives cleanup.
+            let original = result
+                .as_ref()
+                .err()
+                .and_then(|error| error.compile_control);
+            let control = original.or(error.compile_control_error());
+            Err(error.with_compile_control(control))
+        }
     }
 }
 
@@ -720,6 +740,7 @@ fn automatic_terminal_error(
             error.message
         ),
     )
+    .with_compile_control(error.compile_control)
 }
 
 impl AutomaticMaintenanceRunner for TableMaintenanceAutomaticRunner {
@@ -773,12 +794,14 @@ impl AutomaticMaintenanceRunner for TableMaintenanceAutomaticRunner {
             ) => EffectDisposition::KnownUncommitted,
             Err(error) => automatic_terminal_disposition(error.state),
         };
-        action.record_terminal(
-            disposition,
-            self.readiness.as_ref(),
-            self.connector_control.as_ref(),
-        )?;
-        match result.map_err(automatic_terminal_error)? {
+        match finish_automatic_action(
+            result,
+            action.record_terminal(
+                disposition,
+                self.readiness.as_ref(),
+                self.connector_control.as_ref(),
+            ),
+        )? {
             AutomaticOptimizeOutcome::Finished { handle, .. } => {
                 Ok(OptimizeDurableOutcome::Finished { handle })
             }
@@ -872,5 +895,95 @@ mod tests {
         assert_eq!(target.catalog, "target_catalog");
         assert_eq!(target.namespace, "target_namespace");
         assert_eq!(target.table, "target_mv");
+    }
+    #[test]
+    fn automatic_terminal_compile_control_cause_survives_background_and_scheduler_bridges() {
+        use novarocks_mv_application::scheduler::MvSchedulerConfig;
+        use novarocks_mv_application::scheduler_runtime::{
+            MvRefreshDisposition, MvRefreshRuntimeDecision, MvRefreshSchedulerRuntime,
+        };
+        use novarocks_table_maintenance::runtime::TerminalError;
+        use novarocks_type_contract::CompileControlError as C;
+        for control in [C::Cancelled, C::DeadlineExceeded, C::ResourceExhausted] {
+            for before_dispatch in [false, true] {
+                let error = if before_dispatch {
+                    TerminalError::cancelled_before_dispatch("original failure")
+                } else {
+                    TerminalError::known_uncommitted("original failure")
+                }
+                .with_compile_control(Some(control));
+                let background = automatic_terminal_error(error);
+                assert_eq!(background.compile_control_error(), Some(control));
+                assert_eq!(
+                    background.kind(),
+                    if before_dispatch {
+                        MvBackgroundEngineErrorKind::ShutdownCancelled
+                    } else {
+                        MvBackgroundEngineErrorKind::TerminalFailure
+                    }
+                );
+                let disposition = MvRefreshDisposition::from_background_error(background);
+                assert_eq!(disposition.compile_control_error(), Some(control));
+                let mut runtime = MvRefreshSchedulerRuntime::<i64, ()>::new(
+                    MvSchedulerConfig::new(true, 1, 1, 10, 40),
+                );
+                let decision = runtime.record(&7, disposition, 100);
+                assert_eq!(decision.compile_control_error(), Some(control));
+                assert_eq!(runtime.is_suppressed(&7, 100), !before_dispatch);
+                assert_eq!(
+                    matches!(decision, MvRefreshRuntimeDecision::NoChange { .. }),
+                    before_dispatch
+                );
+            }
+        }
+    }
+    #[test]
+    fn automatic_terminal_recording_failure_retains_first_control_and_existing_policy() {
+        use novarocks_table_maintenance::runtime::TerminalError;
+        use novarocks_type_contract::CompileControlError as C;
+        for control in [C::Cancelled, C::DeadlineExceeded, C::ResourceExhausted] {
+            let primary = || {
+                TerminalError::known_uncommitted("primary failure")
+                    .with_compile_control(Some(control))
+            };
+            let recorded = finish_automatic_action::<()>(Err(primary()), Ok(())).unwrap_err();
+            assert_eq!(recorded.compile_control_error(), Some(control));
+            assert_eq!(
+                recorded.kind(),
+                MvBackgroundEngineErrorKind::TerminalFailure
+            );
+            assert!(recorded.message().contains("primary failure"));
+            let secondary = MvBackgroundEngineError::new(
+                MvBackgroundEngineErrorKind::InvariantViolation,
+                "terminal recording failed",
+            )
+            .with_compile_control(Some(C::DeadlineExceeded));
+            let error = finish_automatic_action::<()>(Err(primary()), Err(secondary)).unwrap_err();
+            assert_eq!(error.compile_control_error(), Some(control));
+            assert_eq!(
+                error.kind(),
+                MvBackgroundEngineErrorKind::InvariantViolation
+            );
+            assert_eq!(error.message(), "terminal recording failed");
+        }
+        let error = finish_automatic_action::<()>(
+            Err(TerminalError::known_uncommitted(
+                "pure compilation was cancelled",
+            )),
+            Err(automatic_pre_dispatch_error("terminal recording failed")),
+        )
+        .unwrap_err();
+        assert_eq!(error.compile_control_error(), None);
+        assert_eq!(error.kind(), MvBackgroundEngineErrorKind::TerminalFailure);
+        assert_eq!(error.message(), "terminal recording failed");
+        let error = finish_automatic_action(
+            Ok(7),
+            Err(automatic_pre_dispatch_error("terminal recording failed")
+                .with_compile_control(Some(C::ResourceExhausted))),
+        )
+        .unwrap_err();
+        assert_eq!(error.compile_control_error(), Some(C::ResourceExhausted));
+        assert_eq!(error.kind(), MvBackgroundEngineErrorKind::TerminalFailure);
+        assert_eq!(finish_automatic_action(Ok(7), Ok(())).unwrap(), 7);
     }
 }

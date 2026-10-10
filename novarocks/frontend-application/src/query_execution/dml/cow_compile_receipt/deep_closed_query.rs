@@ -185,7 +185,7 @@ fn select(s: &Select) -> Result<u64> {
 }
 
 /// Root Query inline + every actual owned block. The same topology/capacity
-/// walk bounds the two existing Clone graphs when their exact construction
+/// walk bounds the existing compiler Clone graphs when their exact construction
 /// contract is retained; no extra arbitrary per-cell coefficient is used.
 pub fn query_owned(q: &Query) -> Result<u64> {
     if q.with.is_some()

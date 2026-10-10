@@ -186,7 +186,7 @@ pub(crate) fn bind_prepared_mv_first_refresh_staging(
     exact_lease: &ConnectorWriteLease,
     execution: &QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PreparedMvNativeWriteAssembly, String> {
+) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
     // The session is opened before the plan is compiled because the plan's
     // writer node carries the recipe it seals: a plan and the session that
     // sealed it must not be separable.
@@ -244,7 +244,7 @@ fn bind_first_refresh_write_dataflow(
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     write_session: &Arc<ConnectorWriteSession>,
-) -> Result<PreparedMvNativeWriteAssembly, String> {
+) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
     let expected_target_snapshot_id = prepared.expected_target_snapshot_id();
     let target_catalog = prepared.target_catalog().to_string();
     let target_namespace = prepared.target_namespace().to_string();
@@ -295,15 +295,12 @@ fn bind_first_refresh_write_dataflow(
                     ),
                 );
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
-            let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-                execution.deadline(),
-                crate::query_execution::planning::sql_cancellation_observation(
-                    execution.cancellation().clone(),
-                ),
-            );
+            let compile_control =
+                crate::query_execution::planning::sql_compile_control_from_execution(execution);
             let analyzed = analyze_mv_first_refresh_connector_write(
                 physical_sql,
                 SqlMvFirstRefreshAnalyzeContext {
+                    emission_mode: query_kernel.static_plan_carrier().sql_emission_mode(),
                     current_catalog: current_catalog.clone(),
                     current_database: current_database.clone(),
                     optimizer_settings: execution.optimizer_settings().clone(),
@@ -311,6 +308,7 @@ fn bind_first_refresh_write_dataflow(
                     catalog: &catalog,
                     functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
+                    constant_policy: query_kernel.constant_policy(),
                     control: compile_control.clone(),
                     sink,
                 },
@@ -320,6 +318,7 @@ fn bind_first_refresh_write_dataflow(
                 Arc::clone(&bindings),
                 connector_context,
             )?;
+            let finish_control = compile_control.clone();
             let (completion, needs) = begin_final_mv_first_refresh_connector_write_plan(
                 analyzed,
                 &statistics,
@@ -338,7 +337,10 @@ fn bind_first_refresh_write_dataflow(
                 sealed_write_targets,
                 needs,
                 field_names,
-                |version, dop, reads, targets| completion.finish(version, dop, reads, targets),
+                |version, dop, reads, targets| {
+                    completion.finish(version, dop, reads, targets, &finish_control)
+                },
+                &finish_control,
             )
         }
         MvFirstRefreshExecutionArtifact::Logical(logical) => {
@@ -398,14 +400,11 @@ fn bind_first_refresh_write_dataflow(
                 frozen_base_overlays,
             );
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
-            let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-                execution.deadline(),
-                crate::query_execution::planning::sql_cancellation_observation(
-                    execution.cancellation().clone(),
-                ),
-            );
+            let compile_control =
+                crate::query_execution::planning::sql_compile_control_from_execution(execution);
             let analyzed =
                 analyze_join_first_refresh_connector_write(SqlMvJoinFirstRefreshAnalyzeContext {
+                    emission_mode: query_kernel.static_plan_carrier().sql_emission_mode(),
                     canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
                     rewrite_snapshot: refresh_rewrite.to_sql_rewrite_snapshot(target_binding)?,
                     expected_root_hash_column: root_hash_column,
@@ -416,6 +415,7 @@ fn bind_first_refresh_write_dataflow(
                     catalog: &catalog,
                     functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
+                    constant_policy: query_kernel.constant_policy(),
                     control: compile_control.clone(),
                     sink,
                 })?;
@@ -424,6 +424,7 @@ fn bind_first_refresh_write_dataflow(
                 materializer.query_table_bindings(),
                 connector_context,
             )?;
+            let finish_control = compile_control.clone();
             let (completion, needs) = begin_final_join_first_refresh_connector_write_plan(
                 analyzed,
                 &statistics,
@@ -442,7 +443,10 @@ fn bind_first_refresh_write_dataflow(
                 sealed_write_targets,
                 needs,
                 field_names,
-                |version, dop, reads, targets| completion.finish(version, dop, reads, targets),
+                |version, dop, reads, targets| {
+                    completion.finish(version, dop, reads, targets, &finish_control)
+                },
+                &finish_control,
             )
         }
     }

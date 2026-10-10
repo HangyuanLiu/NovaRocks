@@ -258,7 +258,9 @@ impl PlanUnpivotNode {
         output_columns: Vec<OutputColumn>,
         max_output_rows: usize,
         max_output_bytes: usize,
-    ) -> Result<Self, String> {
+        constant_policy: novarocks_functions::ConstantPolicy,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Self, crate::compiler::SqlCompileError> {
         let node = Self {
             passthrough_columns,
             value_output_column_id,
@@ -268,11 +270,38 @@ impl PlanUnpivotNode {
             max_output_rows,
             max_output_bytes,
         };
-        node.validate_against(input_columns)?;
+        node.validate_against(input_columns, constant_policy, control)?;
         Ok(node)
     }
 
-    pub(crate) fn validate_against(&self, input_columns: &[OutputColumn]) -> Result<(), String> {
+    pub(crate) fn validate_against(
+        &self,
+        input_columns: &[OutputColumn],
+        constant_policy: novarocks_functions::ConstantPolicy,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), crate::compiler::SqlCompileError> {
+        use crate::compiler::SqlCompileError;
+        use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+        let result = self.validate_unpivot_core(input_columns, constant_policy, &mut work);
+        if matches!(
+            &result,
+            Err(SqlCompileError::Cancelled
+                | SqlCompileError::DeadlineExceeded
+                | SqlCompileError::ResourceExhausted)
+        ) {
+            return result;
+        }
+        work.finish()?;
+        result
+    }
+
+    fn validate_unpivot_core(
+        &self,
+        input_columns: &[OutputColumn],
+        constant_policy: novarocks_functions::ConstantPolicy,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+    ) -> Result<(), crate::compiler::SqlCompileError> {
         use std::collections::{HashMap, HashSet};
 
         const MAX_UNPIVOT_MAPPINGS: usize = 4_096;
@@ -281,36 +310,49 @@ impl PlanUnpivotNode {
         const MAX_UNPIVOT_CONSTANT_BYTES: usize = 16 * 1024 * 1024;
 
         if self.max_output_rows == 0 {
-            return Err("Unpivot max_output_rows must be greater than zero".to_string());
+            return Err(crate::compiler::SqlCompileError::InvalidRequest(
+                "Unpivot max_output_rows must be greater than zero".to_string(),
+            ));
         }
         if self.max_output_bytes == 0 {
-            return Err("Unpivot max_output_bytes must be greater than zero".to_string());
+            return Err(crate::compiler::SqlCompileError::InvalidRequest(
+                "Unpivot max_output_bytes must be greater than zero".to_string(),
+            ));
         }
         if self.value_mappings.is_empty() {
-            return Err("Unpivot requires at least one value mapping".to_string());
+            return Err(crate::compiler::SqlCompileError::InvalidRequest(
+                "Unpivot requires at least one value mapping".to_string(),
+            ));
         }
         if self.value_mappings.len() > MAX_UNPIVOT_MAPPINGS {
-            return Err("Unpivot exceeds the value mapping limit".to_string());
+            return Err(crate::compiler::SqlCompileError::InvalidRequest(
+                "Unpivot exceeds the value mapping limit".to_string(),
+            ));
         }
 
         let mut constant_count = 0usize;
         let mut nested_element_count = 0usize;
         let mut constant_bytes = 0usize;
         for (mapping_index, mapping) in self.value_mappings.iter().enumerate() {
+            work.step()?;
             constant_count = constant_count
                 .checked_add(mapping.constants.len())
                 .ok_or_else(|| "Unpivot constant count overflowed".to_string())?;
             for (constant_index, constant) in mapping.constants.iter().enumerate() {
+                work.step()?;
                 match constant {
                     crate::analysis::UnpivotConstant::Scalar(expression) => {
-                        if !matches!(expression.kind, crate::analysis::ExprKind::Literal(_)) {
-                            return Err(format!(
-                                "Unpivot mapping {mapping_index} scalar constant {constant_index} is not a literal expression"
-                            ));
-                        }
+                        work.flush()?;
+                        let bytes = scalar_constant_bytes_observed(
+                            expression,
+                            constant_policy,
+                            work.control(),
+                        )?;
+                        work.flush()?;
                         constant_bytes = constant_bytes
-                            .checked_add(scalar_literal_retained_bytes(expression))
+                            .checked_add(bytes)
                             .ok_or_else(|| "Unpivot constant byte charge overflowed".to_string())?;
+                        work.step()?;
                     }
                     crate::analysis::UnpivotConstant::Int32List(values) => {
                         nested_element_count = nested_element_count
@@ -326,14 +368,19 @@ impl PlanUnpivotNode {
                             .ok_or_else(|| "Unpivot nested element count overflowed".to_string())?;
                         let mut previous = None;
                         for (entry_index, (key, value)) in entries.iter().enumerate() {
+                            work.step()?;
                             if key.is_empty() {
-                                return Err(format!(
-                                    "Unpivot mapping {mapping_index} map constant {constant_index} entry {entry_index} has an empty key"
+                                return Err(crate::compiler::SqlCompileError::InvalidRequest(
+                                    format!(
+                                        "Unpivot mapping {mapping_index} map constant {constant_index} entry {entry_index} has an empty key"
+                                    ),
                                 ));
                             }
                             if previous.is_some_and(|previous: &str| previous >= key.as_str()) {
-                                return Err(format!(
-                                    "Unpivot mapping {mapping_index} map constant {constant_index} keys must be strictly increasing"
+                                return Err(crate::compiler::SqlCompileError::InvalidRequest(
+                                    format!(
+                                        "Unpivot mapping {mapping_index} map constant {constant_index} keys must be strictly increasing"
+                                    ),
                                 ));
                             }
                             constant_bytes = constant_bytes
@@ -349,41 +396,50 @@ impl PlanUnpivotNode {
             }
         }
         if constant_count > MAX_UNPIVOT_CONSTANTS {
-            return Err("Unpivot exceeds the constant count limit".to_string());
+            return Err(crate::compiler::SqlCompileError::InvalidRequest(
+                "Unpivot exceeds the constant count limit".to_string(),
+            ));
         }
         if nested_element_count > MAX_UNPIVOT_NESTED_ELEMENTS {
-            return Err("Unpivot exceeds the nested element limit".to_string());
+            return Err(crate::compiler::SqlCompileError::InvalidRequest(
+                "Unpivot exceeds the nested element limit".to_string(),
+            ));
         }
         if constant_bytes > MAX_UNPIVOT_CONSTANT_BYTES {
-            return Err("Unpivot exceeds the decoded constant byte limit".to_string());
+            return Err(crate::compiler::SqlCompileError::InvalidRequest(
+                "Unpivot exceeds the decoded constant byte limit".to_string(),
+            ));
         }
 
         let mut input_by_id = HashMap::with_capacity(input_columns.len());
         for column in input_columns {
+            work.step()?;
             if input_by_id.insert(column.column_id, column).is_some() {
-                return Err(format!(
+                return Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
                     "Unpivot input contains duplicate column id {}",
                     column.column_id
-                ));
+                )));
             }
         }
         let mut output_by_id = HashMap::with_capacity(self.output_columns.len());
         for column in &self.output_columns {
+            work.step()?;
             if output_by_id.insert(column.column_id, column).is_some() {
-                return Err(format!(
+                return Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
                     "Unpivot output contains duplicate column id {}",
                     column.column_id
-                ));
+                )));
             }
         }
 
         let mut assigned_outputs = HashSet::new();
         for mapping in &self.passthrough_columns {
+            work.step()?;
             if !assigned_outputs.insert(mapping.output_column_id) {
-                return Err(format!(
+                return Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
                     "Unpivot output column id {} has multiple producers",
                     mapping.output_column_id
-                ));
+                )));
             }
             let input = input_by_id.get(&mapping.input_column_id).ok_or_else(|| {
                 format!(
@@ -397,14 +453,17 @@ impl PlanUnpivotNode {
                     mapping.output_column_id
                 )
             })?;
-            require_exact_column_shape("passthrough", input, output)?;
+            work.flush()?;
+            require_exact_column_shape("passthrough", input, output, work)?;
+            work.step()?;
+            work.flush()?;
         }
 
         if !assigned_outputs.insert(self.value_output_column_id) {
-            return Err(format!(
+            return Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
                 "Unpivot value output column id {} has multiple producers",
                 self.value_output_column_id
-            ));
+            )));
         }
         let value_output = output_by_id
             .get(&self.value_output_column_id)
@@ -416,6 +475,7 @@ impl PlanUnpivotNode {
             })?;
         let mut value_nullable = false;
         for (index, mapping) in self.value_mappings.iter().enumerate() {
+            work.step()?;
             let input = input_by_id
                 .get(&mapping.input_value_column_id)
                 .ok_or_else(|| {
@@ -424,39 +484,44 @@ impl PlanUnpivotNode {
                         mapping.input_value_column_id
                     )
                 })?;
-            if input.data_type != value_output.data_type {
-                return Err(format!(
+            if !same_unpivot_value_domain_observed(
+                &input.value_type,
+                &value_output.value_type,
+                work,
+            )? {
+                return Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
                     "Unpivot value mapping {index} type mismatch: input {:?}, output {:?}",
-                    input.data_type, value_output.data_type
-                ));
+                    input.value_type.data_type, value_output.value_type.data_type
+                )));
             }
-            value_nullable |= input.nullable;
+            value_nullable |= input.value_type.nullable;
             if mapping.constants.len() != self.literal_output_column_ids.len() {
-                return Err(format!(
+                return Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
                     "Unpivot value mapping {index} literal count mismatch: expected {}, got {}",
                     self.literal_output_column_ids.len(),
                     mapping.constants.len()
-                ));
+                )));
             }
         }
-        if value_output.nullable != value_nullable {
-            return Err(format!(
+        if value_output.value_type.nullable != value_nullable {
+            return Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
                 "Unpivot value output column id {} nullability mismatch: expected {}, got {}",
-                self.value_output_column_id, value_nullable, value_output.nullable
-            ));
+                self.value_output_column_id, value_nullable, value_output.value_type.nullable
+            )));
         }
 
         let mut literal_outputs = HashSet::new();
         for (literal_index, output_id) in self.literal_output_column_ids.iter().enumerate() {
+            work.step()?;
             if !literal_outputs.insert(*output_id) {
-                return Err(format!(
+                return Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
                     "Unpivot has duplicate literal output column id {output_id}"
-                ));
+                )));
             }
             if !assigned_outputs.insert(*output_id) {
-                return Err(format!(
+                return Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
                     "Unpivot output column id {output_id} has multiple producers"
-                ));
+                )));
             }
             let output = output_by_id.get(output_id).ok_or_else(|| {
                 format!(
@@ -466,35 +531,94 @@ impl PlanUnpivotNode {
             let mut nullable = false;
             for (mapping_index, mapping) in self.value_mappings.iter().enumerate() {
                 let constant = &mapping.constants[literal_index];
-                if constant.data_type() != output.data_type {
-                    return Err(format!(
+                work.step()?;
+                let same_domain = match constant {
+                    crate::analysis::UnpivotConstant::Scalar(expression) => {
+                        same_unpivot_value_domain_observed(
+                            &expression.value_type,
+                            &output.value_type,
+                            work,
+                        )?
+                    }
+                    // The collection authority and its legacy closed grammar
+                    // remain unchanged in this scalar-only migration.
+                    _ => {
+                        work.flush()?;
+                        let equal = constant.data_type() == output.value_type.data_type;
+                        work.step()?;
+                        work.flush()?;
+                        equal
+                    }
+                };
+                if !same_domain {
+                    return Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
                         "Unpivot value mapping {mapping_index} constant {literal_index} type mismatch: constant {:?}, output {:?}",
                         constant.data_type(),
-                        output.data_type
-                    ));
+                        output.value_type.data_type
+                    )));
                 }
                 nullable |= constant.nullable();
             }
-            if output.nullable != nullable {
-                return Err(format!(
+            if output.value_type.nullable != nullable {
+                return Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
                     "Unpivot literal output column id {output_id} nullability mismatch: expected {nullable}, got {}",
-                    output.nullable
-                ));
+                    output.value_type.nullable
+                )));
             }
         }
 
         if assigned_outputs.len() != output_by_id.len() {
+            work.flush()?;
             let extras = output_by_id
                 .keys()
                 .filter(|id| !assigned_outputs.contains(id))
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(", ");
-            return Err(format!(
+            work.step()?;
+            work.flush()?;
+            return Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
                 "Unpivot output columns contain unassigned column ids [{extras}]"
-            ));
+            )));
         }
         Ok(())
+    }
+}
+
+fn scalar_constant_bytes_observed(
+    expression: &TypedExpr,
+    policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<usize, crate::compiler::SqlCompileError> {
+    if !matches!(
+        expression.kind,
+        crate::analysis::ExprKind::Literal(_) | crate::analysis::ExprKind::Constant(_)
+    ) {
+        return Err(crate::compiler::SqlCompileError::InvalidRequest(
+            "Unpivot scalar constant is not a syntax or checked constant expression".into(),
+        ));
+    }
+    let argument = crate::analysis::function_argument(expression, policy, control)?;
+    let novarocks_functions::FunctionArgument::Value {
+        constant: Some(value),
+        ..
+    } = argument
+    else {
+        return Err(crate::compiler::SqlCompileError::InvalidRequest(
+            "Unpivot scalar constant has no checked value".into(),
+        ));
+    };
+    match &expression.kind {
+        crate::analysis::ExprKind::Constant(_) => {
+            let bytes = value.selected_payload_bytes_observed(
+                novarocks_type_contract::CompilePhase::Validate,
+                control,
+            )?;
+            usize::try_from(bytes).map_err(|_| crate::compiler::SqlCompileError::ResourceExhausted)
+        }
+        // Preserve the existing syntax-source charge rather than replacing
+        // decimal spelling bytes with its smaller materialized payload width.
+        _ => Ok(scalar_literal_retained_bytes(expression)),
     }
 }
 
@@ -512,21 +636,45 @@ fn scalar_literal_retained_bytes(expression: &TypedExpr) -> usize {
     }
 }
 
+fn same_unpivot_value_domain_observed(
+    input: &novarocks_type_contract::FunctionValueType,
+    output: &novarocks_type_contract::FunctionValueType,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<bool, crate::compiler::SqlCompileError> {
+    let logical_equal = input.logical_type == output.logical_type;
+    work.step()?;
+    if !logical_equal {
+        return Ok(false);
+    }
+    Ok(novarocks_type_contract::arrow_data_types_exact_observed::<
+        novarocks_functions::FunctionBindingError,
+    >(&input.data_type, &output.data_type, || {
+        work.step().map_err(Into::into)
+    })?)
+}
+
 fn require_exact_column_shape(
     role: &str,
     input: &OutputColumn,
     output: &OutputColumn,
-) -> Result<(), String> {
-    if input.data_type != output.data_type || input.nullable != output.nullable {
-        Err(format!(
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<(), crate::compiler::SqlCompileError> {
+    if !input
+        .value_type
+        .exactly_equals_observed::<novarocks_functions::FunctionBindingError>(
+            &output.value_type,
+            || work.step().map_err(Into::into),
+        )?
+    {
+        Err(crate::compiler::SqlCompileError::InvalidRequest(format!(
             "Unpivot {role} column shape mismatch: input id {} is {:?} nullable={}, output id {} is {:?} nullable={}",
             input.column_id,
-            input.data_type,
-            input.nullable,
+            input.value_type.data_type,
+            input.value_type.nullable,
             output.column_id,
-            output.data_type,
-            output.nullable
-        ))
+            output.value_type.data_type,
+            output.value_type.nullable
+        )))
     } else {
         Ok(())
     }
@@ -541,8 +689,8 @@ mod unpivot_tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             is_internal: false,
         }
     }
@@ -550,12 +698,11 @@ mod unpivot_tests {
     fn string_literal(value: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::String(value.to_string())),
-            data_type: DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         }
     }
 
-    fn valid_node() -> Result<PlanUnpivotNode, String> {
+    fn valid_node() -> Result<PlanUnpivotNode, crate::compiler::SqlCompileError> {
         PlanUnpivotNode::try_new(
             &[
                 column(1, "group", DataType::Utf8, false),
@@ -589,6 +736,8 @@ mod unpivot_tests {
             ],
             1024,
             1024 * 1024,
+            crate::constant::test_constant_policy(),
+            crate::optimizer::test_optimizer_control(),
         )
     }
 
@@ -612,9 +761,11 @@ mod unpivot_tests {
             vec![column(2, "value", DataType::Utf8, false)],
             1,
             1024,
+            crate::constant::test_constant_policy(),
+            crate::optimizer::test_optimizer_control(),
         )
         .unwrap_err();
-        assert!(error.contains("type mismatch"), "{error}");
+        assert!(error.to_string().contains("type mismatch"), "{error}");
     }
 
     #[test]
@@ -626,8 +777,17 @@ mod unpivot_tests {
             column(2, "v1", DataType::Int64, true),
             column(3, "v2", DataType::Int64, false),
         ];
-        let error = node.validate_against(&input).unwrap_err();
-        assert!(error.contains("constant 0 type mismatch"), "{error}");
+        let error = node
+            .validate_against(
+                &input,
+                crate::constant::test_constant_policy(),
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("constant 0 type mismatch"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -658,6 +818,8 @@ mod unpivot_tests {
             ],
             4_096,
             32 * 1024 * 1024,
+            crate::constant::test_constant_policy(),
+            crate::optimizer::test_optimizer_control(),
         )
         .expect("4,096 mappings with three constants each fit the 16,384 limit");
 
@@ -843,11 +1005,9 @@ pub(crate) struct WindowExpr {
 #[derive(Clone, Debug)]
 pub(crate) struct AggregateCall {
     pub name: String,
-    pub args: Vec<TypedExpr>,
     pub distinct: bool,
     pub result_type: DataType,
-    pub order_by: Vec<SortItem>,
-    pub resolved: crate::binding::SqlFunctionBinding,
+    pub source: crate::binding::AggregateArgumentSource<TypedExpr, SortItem>,
     /// G1: id of THIS aggregate's output column. Planner-created calls are
     /// minted by `collect_aggregates`; rewrite paths should preserve existing
     /// ids or allocate ids for newly-defined aggregate outputs. Fixtures and
@@ -855,3 +1015,7 @@ pub(crate) struct AggregateCall {
     /// bindings.
     pub output_column_id: crate::column_id::ColumnId,
 }
+
+#[cfg(test)]
+#[path = "payload/unpivot_constant_tests.rs"]
+mod unpivot_constant_tests;

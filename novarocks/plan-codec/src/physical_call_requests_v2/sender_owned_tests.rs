@@ -1,0 +1,492 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::*;
+
+fn invoke(
+    fixture: &Fixture,
+    types: &EncodedTypeTable<'_>,
+    ids: &[CallRequestTypeIds<'_>],
+    control: &Control,
+    invoice: usize,
+    limits: CallRequestProjectionLimits,
+    parent: &mut CallRequestAdmit<'_>,
+) -> Result<(wire::FragmentCallRequests, CallRequestProjectionFacts), Error> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+    let result = (|| {
+        let token = prepare_call_requests_encode_in(
+            fixture.fragment.call_requests(),
+            types,
+            ids,
+            &fixture.pools,
+            invoice,
+            limits,
+            parent,
+            &mut work,
+        )?;
+        let facts = *token.facts();
+        Ok((token.emit_in(parent, &mut work)?, facts))
+    })();
+    finish(work, result)
+}
+fn ids<'a>(parameters: &'a [u32]) -> [ArgumentTypeIds<'a>; 3] {
+    [
+        ArgumentTypeIds::Value(0),
+        ArgumentTypeIds::Value(0),
+        ArgumentTypeIds::Lambda {
+            parameters,
+            result: 0,
+        },
+    ]
+}
+fn exact(facts: CallRequestProjectionFacts) -> CallRequestProjectionLimits {
+    CallRequestProjectionLimits {
+        max_definitions: facts.definition_count,
+        max_type_references: facts.type_reference_count,
+        max_request_bytes: facts.request_bytes_upper_bound,
+        max_allocation_requests: facts.allocation_requests_upper_bound,
+        max_coexisting_source_and_request_bytes: facts
+            .coexisting_source_and_request_bytes_upper_bound,
+        max_work: facts.cumulative_work_upper_bound,
+    }
+}
+
+#[test]
+fn caller_sender_retains_original_none_cv_lambda_constraint_and_exact_six_axes() {
+    let f = fixture();
+    let c = Control::default();
+    let types = encode_type_table_sources(&f.roots, &[], types_limits(), &c).unwrap();
+    let params = [u32::MAX];
+    let args = ids(&params);
+    let requests = project(&params, &args);
+    let (plain, plain_facts) = run(&f, &Control::default(), limits(), SOURCE, false).unwrap();
+    c.arm(None);
+    let mut prefixes = Vec::new();
+    let (actual, facts) = invoke(
+        &f,
+        &types,
+        &requests,
+        &c,
+        SOURCE,
+        limits(),
+        &mut |current| {
+            prefixes.push(*current);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(actual, plain);
+    assert_eq!(facts, plain_facts);
+    assert_eq!(facts.definition_count, 1);
+    assert_eq!(facts.type_reference_count, 5);
+    assert_eq!(facts.allocation_requests_upper_bound, 3);
+    assert_eq!(
+        facts.request_bytes_upper_bound,
+        size_of::<wire::OriginalCallRequest>()
+            + 3 * size_of::<wire::OriginalFunctionArgument>()
+            + size_of::<u32>()
+    );
+    assert_eq!(
+        facts.coexisting_source_and_request_bytes_upper_bound,
+        SOURCE + facts.request_bytes_upper_bound
+    );
+    for pair in prefixes.windows(2) {
+        assert!(pair[0].request_bytes_upper_bound <= pair[1].request_bytes_upper_bound);
+        assert!(pair[0].cumulative_work_upper_bound <= pair[1].cumulative_work_upper_bound);
+    }
+    assert_eq!(prefixes.last(), Some(&facts));
+    assert!(matches!(&actual.entries[0].arguments[0].kind,
+        Some(wire::original_function_argument::Kind::Value(v)) if v.constant.is_none()));
+    assert!(matches!(&actual.entries[0].arguments[1].kind,
+        Some(wire::original_function_argument::Kind::Value(v)) if v.constant.as_ref().is_some_and(|r| r.pool_id==Some(u32::MAX) && r.row_ordinal==1)));
+    let original = f
+        .pools
+        .resolve_source_observed(
+            p::ConstantReference {
+                pool: p::ConstantPoolId::new(u32::MAX),
+                ordinal: 1,
+            },
+            &mut CompileCheckpoints::try_new(&Control::default(), CompilePhase::Validate).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(original.ordinal(), 1);
+    assert!(Arc::ptr_eq(
+        original.pool().field_ref(),
+        f.pools.entries()[&p::ConstantPoolId::new(u32::MAX)].field_ref()
+    ));
+    c.arm(None);
+    invoke(&f, &types, &requests, &c, SOURCE, exact(facts), &mut |_| {
+        Ok(())
+    })
+    .unwrap();
+    for axis in 0..6 {
+        let mut cap = exact(facts);
+        match axis {
+            0 => cap.max_definitions -= 1,
+            1 => cap.max_type_references -= 1,
+            2 => cap.max_request_bytes -= 1,
+            3 => cap.max_allocation_requests -= 1,
+            4 => cap.max_coexisting_source_and_request_bytes -= 1,
+            _ => cap.max_work -= 1,
+        }
+        c.arm(None);
+        assert!(
+            matches!(
+                invoke(&f, &types, &requests, &c, SOURCE, cap, &mut |_| Ok(())),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ),
+            "axis {axis}"
+        );
+    }
+    // The fixture author explicitly supplies an unconstrained original
+    // request; it is not inferred from the call result or physical children.
+    let mut unconstrained = f.fragment.call_requests().entries()
+        [&PhysicalCallDefinition::Expression(p::ExprId::new(0))]
+        .clone();
+    unconstrained.expected_result_type = None;
+    let source = Fixture {
+        fragment: f
+            .fragment
+            .clone()
+            .with_call_requests_observed(
+                vec![(
+                    PhysicalCallDefinition::Expression(p::ExprId::new(0)),
+                    unconstrained,
+                )],
+                &Control::default(),
+            )
+            .unwrap(),
+        roots: f.roots.clone(),
+        pools: f.pools.clone(),
+    };
+    let requests = [CallRequestTypeIds {
+        definition: PhysicalCallDefinition::Expression(p::ExprId::new(0)),
+        arguments: &args,
+        expected_result_type: None,
+    }];
+    c.arm(None);
+    let (wire, facts) = invoke(
+        &source,
+        &types,
+        &requests,
+        &c,
+        SOURCE,
+        limits(),
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(wire.entries[0].expected_result_value_type_id, None);
+    assert_eq!(facts.type_reference_count, 4);
+}
+
+#[test]
+fn caller_sender_known_header_and_emit_refusal_precede_pending_control_and_foreign_work() {
+    let f = fixture();
+    let c = Control::default();
+    let types = encode_type_table_sources(&f.roots, &[], types_limits(), &c).unwrap();
+    let params = [u32::MAX];
+    let args = ids(&params);
+    let requests = project(&params, &args);
+    for cause in CAUSES {
+        for local in [true, false] {
+            c.arm(Some((1, cause)));
+            let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Encode).unwrap();
+            for _ in 0..255 {
+                work.step().unwrap();
+            }
+            let mut count = 0;
+            let mut cap = limits();
+            if local {
+                cap.max_request_bytes = 0;
+            }
+            let outcome = prepare_call_requests_encode_in(
+                f.fragment.call_requests(),
+                &types,
+                &requests,
+                &f.pools,
+                SOURCE,
+                cap,
+                &mut |facts| {
+                    count += 1;
+                    assert!(facts.request_bytes_upper_bound > 0);
+                    Err(CompileControlError::ResourceExhausted)
+                },
+                &mut work,
+            )
+            .map(|_| ());
+            assert!(matches!(
+                finish(work, outcome),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            assert_eq!(count, usize::from(!local));
+            assert_eq!(c.trace(), [(CompilePhase::Encode, 0)]);
+        }
+        c.arm(None);
+        let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Encode).unwrap();
+        let token = prepare_call_requests_encode_in(
+            f.fragment.call_requests(),
+            &types,
+            &requests,
+            &f.pools,
+            SOURCE,
+            limits(),
+            &mut |_| Ok(()),
+            &mut work,
+        )
+        .unwrap();
+        c.arm(Some((0, cause)));
+        let result = encode_call_requests_in(
+            token,
+            &mut |_| Err(CompileControlError::ResourceExhausted),
+            &mut work,
+        );
+        assert!(matches!(
+            finish(work, result),
+            Err(Error::Control(CompileControlError::ResourceExhausted))
+        ));
+        assert!(c.trace().is_empty());
+        c.arm(None);
+        let token = prepare_call_requests_encode_in(
+            f.fragment.call_requests(),
+            &types,
+            &requests,
+            &f.pools,
+            SOURCE,
+            limits(),
+            &mut |_| Ok(()),
+            &mut CompileCheckpoints::try_new(&c, CompilePhase::Encode).unwrap(),
+        )
+        .unwrap();
+        let foreign = Control::default();
+        foreign.arm(None);
+        let mut work = CompileCheckpoints::try_new(&foreign, CompilePhase::Encode).unwrap();
+        let mut parent_calls = 0;
+        assert!(matches!(
+            token.emit_in(
+                &mut |_| {
+                    parent_calls += 1;
+                    Ok(())
+                },
+                &mut work
+            ),
+            Err(Error::InvalidShape(
+                "request encoder belongs to another controller"
+            ))
+        ));
+        assert_eq!(parent_calls, 0);
+        assert_eq!(foreign.trace(), [(CompilePhase::Encode, 0)]);
+    }
+}
+
+#[test]
+fn caller_sender_actual_success_and_ordinary_failure_preserve_every_control_prefix() {
+    let f = fixture();
+    let c = Control::default();
+    let types = encode_type_table_sources(&f.roots, &[], types_limits(), &c).unwrap();
+    for bad in [false, true] {
+        let params = [if bad { 7 } else { u32::MAX }];
+        let args = ids(&params);
+        let requests = project(&params, &args);
+        c.arm(None);
+        let baseline = invoke(&f, &types, &requests, &c, SOURCE, limits(), &mut |_| Ok(()));
+        if bad {
+            assert!(matches!(
+                baseline,
+                Err(Error::InvalidShape(
+                    "request complete type differs from its supplied type root"
+                ))
+            ));
+        } else {
+            baseline.unwrap();
+        }
+        let trace = c.trace();
+        assert!(!trace.is_empty());
+        for at in 0..trace.len() {
+            for cause in CAUSES {
+                c.arm(Some((at, cause)));
+                assert!(
+                    matches!(invoke(&f,&types,&requests,&c,SOURCE,limits(),&mut |_|Ok(())),Err(Error::Control(actual)) if actual==cause)
+                );
+                assert_eq!(c.trace(), trace[..=at]);
+            }
+        }
+    }
+    c.arm(None);
+    assert!(matches!(
+        invoke(
+            &f,
+            &types,
+            &project(&[u32::MAX], &ids(&[u32::MAX])),
+            &c,
+            0,
+            limits(),
+            &mut |_| Ok(())
+        ),
+        Err(Error::InvalidShape(
+            "request source invoice omits original backing"
+        ))
+    ));
+}
+
+#[test]
+fn caller_sender_captured_constant_address_and_complete_type_keep_original_failures() {
+    for reference in [
+        p::ConstantReference {
+            pool: p::ConstantPoolId::new(1),
+            ordinal: 1,
+        },
+        p::ConstantReference {
+            pool: p::ConstantPoolId::new(u32::MAX),
+            ordinal: 3,
+        },
+    ] {
+        let f = fixture_with_reference(reference);
+        let c = Control::default();
+        let types = encode_type_table_sources(&f.roots, &[], types_limits(), &c).unwrap();
+        let params = [u32::MAX];
+        let args = ids(&params);
+        let requests = project(&params, &args);
+        c.arm(None);
+        let result = invoke(&f, &types, &requests, &c, SOURCE, limits(), &mut |_| Ok(()));
+        if reference.pool.get() == 1 {
+            assert!(
+                matches!(result,Err(Error::Constant(p::ConstantReferenceError::MissingPool(id))) if id==reference.pool)
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(Error::Constant(p::ConstantReferenceError::Constant(_)))
+            ));
+        }
+    }
+    let mut f = fixture();
+    let setup = Control::default();
+    let ty = FunctionValueType::new(DataType::Int64, false);
+    let pool = p::ConstantPool::try_new(
+        Arc::new(Field::new("different-nullability", DataType::Int64, false)),
+        ty,
+        Arc::new(Int64Array::from(vec![11, 22, 33])).to_data(),
+        admission(),
+        CompilePhase::Validate,
+        &setup,
+    )
+    .unwrap();
+    f.pools = ConstantPools::empty();
+    f.pools
+        .insert(p::ConstantPoolId::new(u32::MAX), pool)
+        .unwrap();
+    let types = encode_type_table_sources(&f.roots, &[], types_limits(), &setup).unwrap();
+    let params = [u32::MAX];
+    let args = ids(&params);
+    let requests = project(&params, &args);
+    setup.arm(None);
+    assert!(
+        matches!(invoke(&f,&types,&requests,&setup,SOURCE,limits(),&mut |_|Ok(())),Err(Error::Constant(p::ConstantReferenceError::SourceTypeMismatch(r))) if r.ordinal==1 && r.pool.get()==u32::MAX)
+    );
+}
+
+#[test]
+fn caller_sender_wide_actual_lambda_emission_observes_and_refuses_real_quantum() {
+    let f = fixture_with_parameters(
+        p::ConstantReference {
+            pool: p::ConstantPoolId::new(u32::MAX),
+            ordinal: 1,
+        },
+        320,
+    );
+    let c = Control::default();
+    let types = encode_type_table_sources(&f.roots, &[], types_limits(), &c).unwrap();
+    let params = vec![u32::MAX; 320];
+    let args = ids(&params);
+    let requests = project(&params, &args);
+    let mut cap = limits();
+    cap.max_work = 1usize << 34;
+    c.arm(None);
+    let (output, _) = invoke(&f, &types, &requests, &c, SOURCE, cap, &mut |_| Ok(())).unwrap();
+    assert!(
+        matches!(&output.entries[0].arguments[2].kind,Some(wire::original_function_argument::Kind::Lambda(v)) if v.parameter_value_type_ids==params)
+    );
+    let trace = c.trace();
+    let quantum = trace
+        .iter()
+        .position(|(_, units)| *units == 256)
+        .expect("actual owned Lambda emission quantum");
+    for at in [0, quantum, trace.len() / 2, trace.len() - 1] {
+        for cause in CAUSES {
+            c.arm(Some((at, cause)));
+            assert!(
+                matches!(invoke(&f,&types,&requests,&c,SOURCE,cap,&mut |_|Ok(())),Err(Error::Control(actual)) if actual==cause)
+            );
+            assert_eq!(c.trace(), trace[..=at]);
+        }
+    }
+}
+
+#[test]
+fn caller_sender_actual_captured_type_and_cv_prefix_refuse_before_pending_flush() {
+    let f = fixture();
+    let c = Control::default();
+    let types = encode_type_table_sources(&f.roots, &[], types_limits(), &c).unwrap();
+    let mut initial =
+        Model::<std::convert::Infallible>::new(SOURCE, &types, &f.pools, None).unwrap();
+    initial.check(limits()).unwrap();
+    let initial_work = initial.facts.cumulative_work_upper_bound;
+    // Exercise the actual captured loan helpers at a caller-owned pending
+    // tail. This private seam is not a complete Package publication proof.
+    for constant in [false, true] {
+        for cause in CAUSES {
+            c.arm(Some((1, cause)));
+            let mut work = CompileCheckpoints::try_new(&c, CompilePhase::Encode).unwrap();
+            for _ in 0..255 {
+                work.step().unwrap();
+            }
+            let mut captures = 0;
+            let mut parent = |facts: &CallRequestProjectionFacts| {
+                if facts.cumulative_work_upper_bound > initial_work {
+                    captures += 1;
+                    return Err(CompileControlError::ResourceExhausted);
+                }
+                Ok(())
+            };
+            let mut host_parent = |facts: &CallRequestProjectionFacts| {
+                parent(facts).map_err(HostError::<std::convert::Infallible>::from)
+            };
+            let mut model = Model::new(SOURCE, &types, &f.pools, Some(&mut host_parent)).unwrap();
+            let outcome = if constant {
+                validate_constant(
+                    p::ConstantReference {
+                        pool: p::ConstantPoolId::new(u32::MAX),
+                        ordinal: 1,
+                    },
+                    &int(),
+                    &f.pools,
+                    &mut model,
+                    limits(),
+                    &mut work,
+                )
+            } else {
+                verify_id(&types, 0, &int(), &mut model, limits(), &mut work)
+            };
+            assert!(matches!(
+                finish(work, outcome.map_err(ProjectionFailure::without_host)),
+                Err(Error::Control(CompileControlError::ResourceExhausted))
+            ));
+            assert_eq!(captures, 1);
+            assert_eq!(c.trace(), [(CompilePhase::Encode, 0)]);
+        }
+    }
+}

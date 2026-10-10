@@ -86,7 +86,7 @@ pub enum RewriteCommit {
 /// Opaque provider/native session for one product-owned rewrite transition.
 pub trait DistributedRewriteSession: Send {
     fn plan_facts(&self) -> RewritePlanFacts;
-    fn execute_cohort(&mut self, ordinal: usize) -> Result<(), String>;
+    fn execute_cohort(&mut self, ordinal: usize) -> Result<(), TerminalError>;
     fn commit(&mut self) -> Result<RewriteCommit, String>;
     fn finalize_committed(&mut self) -> Result<RewriteReceiptFacts, String>;
     fn abort(&mut self, reason: String) -> Result<(), String>;
@@ -282,7 +282,7 @@ impl TableMaintenanceProduct {
         &self,
         effects: &P,
         request: MaintenanceActionRequest,
-    ) -> Result<MaintenanceActionOutcome, String> {
+    ) -> Result<MaintenanceActionOutcome, TerminalError> {
         effects.reject_user_action_on_mv(request.target())?;
         self.execute_action(effects, request).await
     }
@@ -294,13 +294,13 @@ impl TableMaintenanceProduct {
         &self,
         effects: &P,
         request: MaintenanceActionRequest,
-    ) -> Result<MaintenanceActionOutcome, String> {
+    ) -> Result<MaintenanceActionOutcome, TerminalError> {
         match request {
             MaintenanceActionRequest::RewriteDataFiles { target, .. } => {
                 let _permit = self
                     .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
                     .map_err(|error| error.to_string())?;
-                self.execute_rewrite(
+                self.execute_rewrite_terminal(
                     effects,
                     &target,
                     RewriteIntent::DataFiles { rewrite_all: true },
@@ -314,7 +314,7 @@ impl TableMaintenanceProduct {
                 let _permit = self
                     .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
                     .map_err(|error| error.to_string())?;
-                self.execute_rewrite(
+                self.execute_rewrite_terminal(
                     effects,
                     &target,
                     rewrite_position_delete_intent(&options, where_clause.as_deref())?,
@@ -323,13 +323,18 @@ impl TableMaintenanceProduct {
             MaintenanceActionRequest::RemoveOrphanFiles {
                 target,
                 older_than_ms,
-            } => self.execute_cleanup(effects, target, older_than_ms).await,
+            } => self
+                .execute_cleanup(effects, target, older_than_ms)
+                .await
+                .map_err(TerminalError::from),
             request => {
                 let target = request.target().clone();
                 let _permit = self
                     .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
                     .map_err(|error| error.to_string())?;
-                effects.execute_metadata(request)
+                effects
+                    .execute_metadata(request)
+                    .map_err(TerminalError::from)
             }
         }
     }
@@ -390,16 +395,6 @@ impl TableMaintenanceProduct {
         let intent = RewriteIntent::DataFiles { rewrite_all: true };
         let session = effects.begin_rewrite_with_id(target, intent.clone(), effect_id)?;
         Self::run_rewrite_session_terminal(session, intent)
-    }
-
-    fn execute_rewrite<P: TableMaintenanceEffectPort + ?Sized>(
-        &self,
-        effects: &P,
-        target: &MaintenanceTarget,
-        intent: RewriteIntent,
-    ) -> Result<MaintenanceActionOutcome, String> {
-        self.execute_rewrite_terminal(effects, target, intent)
-            .map_err(|error| error.message)
     }
 
     pub fn execute_rewrite_terminal<P: TableMaintenanceEffectPort + ?Sized>(
@@ -579,13 +574,15 @@ async fn mature_owned_ref_indexes(
 
 fn abort_rewrite_terminal(
     session: &mut dyn DistributedRewriteSession,
-    error: String,
+    error: TerminalError,
 ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
-    match session.abort(error.clone()) {
-        Ok(()) => Err(TerminalError::known_uncommitted(error)),
+    match session.abort(error.message.clone()) {
+        Ok(()) => Err(TerminalError::known_uncommitted(error.message)
+            .with_compile_control(error.compile_control)),
         Err(abort) => Err(TerminalError::commit_unknown(format!(
             "{error}; distributed rewrite abort failed: {abort}"
-        ))),
+        ))
+        .with_compile_control(error.compile_control)),
     }
 }
 
@@ -751,7 +748,7 @@ mod tests {
             }
         }
 
-        fn execute_cohort(&mut self, _ordinal: usize) -> Result<(), String> {
+        fn execute_cohort(&mut self, _ordinal: usize) -> Result<(), TerminalError> {
             Ok(())
         }
 
@@ -858,7 +855,7 @@ mod tests {
             }
         }
 
-        fn execute_cohort(&mut self, _ordinal: usize) -> Result<(), String> {
+        fn execute_cohort(&mut self, _ordinal: usize) -> Result<(), TerminalError> {
             Ok(())
         }
 
@@ -1254,5 +1251,74 @@ mod tests {
             MaintenanceJobState::KnownCommittedFinalizationFailed
         );
         assert!(error.message.contains("projection unavailable"));
+    }
+    struct CompileFailureSession {
+        control: novarocks_type_contract::CompileControlError,
+        abort_fails: bool,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl DistributedRewriteSession for CompileFailureSession {
+        fn plan_facts(&self) -> RewritePlanFacts {
+            RewritePlanFacts {
+                noop: false,
+                cohort_count: 2,
+                input_bytes: 1,
+            }
+        }
+        fn execute_cohort(&mut self, ordinal: usize) -> Result<(), TerminalError> {
+            assert_eq!(ordinal, 0);
+            self.calls.lock().unwrap().push("cohort");
+            Err(TerminalError::from_compile_control(self.control))
+        }
+        fn commit(&mut self) -> Result<RewriteCommit, String> {
+            panic!("a compilation failure must not commit")
+        }
+        fn finalize_committed(&mut self) -> Result<RewriteReceiptFacts, String> {
+            panic!("a compilation failure must not finalize")
+        }
+        fn abort(&mut self, reason: String) -> Result<(), String> {
+            assert_eq!(reason, self.control.to_string());
+            self.calls.lock().unwrap().push("abort");
+            if self.abort_fails {
+                Err("lost abort reply".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn cohort_compilation_failure_aborts_once_and_retains_cause_and_disposition() {
+        use novarocks_type_contract::CompileControlError;
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for abort_fails in [false, true] {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let session = CompileFailureSession {
+                    control,
+                    abort_fails,
+                    calls: calls.clone(),
+                };
+                let failure = TableMaintenanceProduct::run_rewrite_session_terminal(
+                    Box::new(session),
+                    RewriteIntent::DataFiles { rewrite_all: true },
+                )
+                .unwrap_err();
+                assert_eq!(failure.compile_control, Some(control));
+                assert_eq!(
+                    failure.state,
+                    if abort_fails {
+                        MaintenanceJobState::CommitUnknown
+                    } else {
+                        MaintenanceJobState::KnownUncommitted
+                    }
+                );
+                assert_eq!(*calls.lock().unwrap(), ["cohort", "abort"]);
+            }
+        }
     }
 }

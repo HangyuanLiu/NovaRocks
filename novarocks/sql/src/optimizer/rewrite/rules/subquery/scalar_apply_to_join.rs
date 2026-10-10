@@ -32,6 +32,7 @@
 //!   then a `Project` that maps the Apply output column to `anyval` and adds an
 //!   internal `assert_true(cnt IS NULL OR cnt <= 1, ...)` per-group row-check.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
@@ -75,7 +76,11 @@ impl LogicalRewriteRule for ScalarApplyToJoin {
         matches_apply_fields(apply_payload_after_pattern_gate(expr))
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let arena = ctx.scalar_arena();
         let mut arena = arena.borrow_mut();
         match apply_opt(expr, ctx, &mut arena)? {
@@ -100,7 +105,7 @@ fn apply_opt(
     expr: OptExpr,
     ctx: &mut RewriteContext,
     arena: &mut ScalarArena,
-) -> Result<Option<OptExpr>, String> {
+) -> Result<Option<OptExpr>, SqlCompileError> {
     let OptExpr {
         op,
         mut children,
@@ -128,6 +133,8 @@ fn apply_opt(
             &right,
             a.inner_output_column_id,
             &a.output_column,
+            ctx.decimal_overflow_policy(),
+            &ctx.control_view(),
         )?;
 
         let inner_plan = if provably_le_one_row {
@@ -159,7 +166,8 @@ fn apply_opt(
 
     // --- Correlated, no-check arm (PushDownApplyAggFilter ran) ---
     if !a.need_check_max_rows {
-        let cond = scalar_utils::combine_and(arena, a.correlation_conjuncts.clone());
+        let cond =
+            scalar_utils::combine_and(arena, a.correlation_conjuncts.clone(), &ctx.control_view())?;
         let project_items = build_output_project_items(
             ctx.function_catalog(),
             arena,
@@ -167,6 +175,8 @@ fn apply_opt(
             &right,
             a.inner_output_column_id,
             &a.output_column,
+            ctx.decimal_overflow_policy(),
+            &ctx.control_view(),
         )?;
 
         let join = scalar_utils::join(left, right, JoinKind::LeftOuter, cond);
@@ -194,29 +204,35 @@ fn apply_opt(
     }
 
     // Mint cnt and anyval output column ids.
-    let factory = ctx
-        .column_ref_factory()
-        .ok_or_else(|| "ScalarApplyToJoin requires ColumnRefFactory".to_string())?;
+    let factory = ctx.column_ref_factory().ok_or_else(|| {
+        SqlCompileError::Compilation("ScalarApplyToJoin requires ColumnRefFactory".to_string())
+    })?;
     let mut factory = factory.borrow_mut();
 
-    let inner_scalar_type = scalar_utils::find_column_type(&right, arena, a.inner_output_column_id)
-        .unwrap_or(DataType::Null);
-    let inner_scalar_nullable =
-        scalar_utils::find_column_nullable(&right, arena, a.inner_output_column_id).unwrap_or(true);
+    let inner_scalar_value_type = scalar_utils::opt_output_columns(&right, arena)
+        .map_err(SqlCompileError::Compilation)?
+        .into_iter()
+        .find(|column| column.column_id == a.inner_output_column_id)
+        .map(|column| column.value_type)
+        .ok_or_else(|| {
+            SqlCompileError::Compilation("missing scalar subquery output column".into())
+        })?;
 
-    let cnt_id = factory.create(None, "count(1)".to_string(), DataType::Int64, false);
-    let anyval_id = factory.create(
+    let cnt_id = factory.create(
         None,
-        "any_value".to_string(),
-        inner_scalar_type.clone(),
-        true,
+        "count(1)".to_string(),
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
     );
+    let anyval_id = factory.create(None, "any_value".to_string(), {
+        let mut value_type = inner_scalar_value_type.clone();
+        value_type.nullable = true;
+        value_type
+    });
     // Mint internal assertion column id.
     let assert_id = factory.create(
         None,
         "__subquery_assertion".to_string(),
-        DataType::Boolean,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     );
     drop(factory);
 
@@ -228,7 +244,8 @@ fn apply_opt(
     let agg_input = ensure_exposes_columns(right, &group_by, arena)?;
 
     // Build group-key OutputColumns (reuse existing column ids, do NOT mint).
-    let agg_input_columns = scalar_utils::opt_output_columns(&agg_input, arena)?;
+    let agg_input_columns = scalar_utils::opt_output_columns(&agg_input, arena)
+        .map_err(SqlCompileError::Compilation)?;
     let gk_output_cols: Vec<OutputColumn> = group_by
         .iter()
         .map(|expr| {
@@ -241,12 +258,12 @@ fn apply_opt(
         .collect::<Result<Vec<_>, _>>()?;
 
     // Build the vector aggregate: group by corr-key, count(1), any_value(scalar).
-    let inner_scalar_ref = arena.intern(
+    let inner_scalar_ref = arena.intern_observed(
         ScalarNode::ColumnRef(a.inner_output_column_id),
-        inner_scalar_type.clone(),
-        inner_scalar_nullable,
-    );
-    let count_argument = scalar_utils::int_literal(arena, 1);
+        inner_scalar_value_type.clone(),
+        &ctx.control_view(),
+    )?;
+    let count_argument = scalar_utils::int_literal(arena, 1, &ctx.control_view())?;
     let count_resolved = crate::optimizer::scalar::resolve_aggregate_binding(
         ctx.function_catalog(),
         arena,
@@ -254,8 +271,9 @@ fn apply_opt(
         &[count_argument],
         &[],
         true,
-    )
-    .map_err(|error| format!("failed to resolve optimizer count aggregate: {error}"))?;
+        ctx.decimal_overflow_policy(),
+        &ctx.control_view(),
+    )?;
     let any_value_resolved = crate::optimizer::scalar::resolve_aggregate_binding(
         ctx.function_catalog(),
         arena,
@@ -263,8 +281,9 @@ fn apply_opt(
         &[inner_scalar_ref],
         &[],
         true,
-    )
-    .map_err(|error| format!("failed to resolve optimizer any_value aggregate: {error}"))?;
+        ctx.decimal_overflow_policy(),
+        &ctx.control_view(),
+    )?;
     if let Some(inner_column) =
         scalar_utils::find_output_column(&agg_input_columns, a.inner_output_column_id)
     {
@@ -279,15 +298,19 @@ fn apply_opt(
     let cnt_output = OutputColumn {
         column_id: cnt_id,
         name: "count(1)".to_string(),
-        data_type: DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
         is_internal: false,
     };
     let anyval_output = OutputColumn {
         column_id: anyval_id,
         name: "any_value".to_string(),
-        data_type: inner_scalar_type.clone(),
-        nullable: true,
+        value_type: {
+            let mut value_type = inner_scalar_value_type.clone();
+            value_type.nullable = true;
+            value_type
+        },
+
         is_internal: false,
     };
     agg_output_cols.push(cnt_output.clone());
@@ -309,7 +332,7 @@ fn apply_opt(
         Operator::LogicalAggregate(LogicalAggregateOp::single(
             group_by,
             vec![
-                scalar_utils::count_one_spec(arena, cnt_id, count_resolved),
+                scalar_utils::count_one_spec(arena, cnt_id, count_resolved, &ctx.control_view())?,
                 scalar_utils::any_value_spec(inner_scalar_ref, anyval_id, any_value_resolved),
             ],
             output_layout,
@@ -319,15 +342,16 @@ fn apply_opt(
     );
 
     // LEFT OUTER JOIN on the correlation conjuncts.
-    let cond = scalar_utils::combine_and(arena, a.correlation_conjuncts.clone());
-    let mut items = scalar_utils::left_project_items(&left, arena)?;
+    let cond =
+        scalar_utils::combine_and(arena, a.correlation_conjuncts.clone(), &ctx.control_view())?;
+    let mut items = scalar_utils::left_project_items(&left, arena, &ctx.control_view())?;
     let join = scalar_utils::join(left, vector_agg, JoinKind::LeftOuter, cond);
 
     // Build the output project.
     // Items: all left columns (pass-through) + anyval item (scalar output) +
     // internal assert_true item (row-check).
     // Map output_column to anyval (the scalar subquery result).
-    let anyval_ref = scalar_utils::column_ref(arena, &anyval_output);
+    let anyval_ref = scalar_utils::column_ref(arena, &anyval_output, &ctx.control_view())?;
     items.push(ScalarProjectItem {
         expr: anyval_ref,
         output_name: a.output_column.name.clone(),
@@ -337,19 +361,26 @@ fn apply_opt(
 
     // Build the assert_true condition: cnt IS NULL OR cnt <= 1
     let mut joined_cnt_output = cnt_output.clone();
-    joined_cnt_output.nullable = true;
-    let cnt_ref = scalar_utils::column_ref(arena, &joined_cnt_output);
-    let cnt_is_null = arena.intern(
+    joined_cnt_output.value_type.nullable = true;
+    let cnt_ref = scalar_utils::column_ref(arena, &joined_cnt_output, &ctx.control_view())?;
+    let cnt_is_null = arena.intern_observed(
         ScalarNode::IsNull {
             child: cnt_ref,
             negated: false,
         },
+        novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+        &ctx.control_view(),
+    )?;
+    let one = scalar_utils::int_literal(arena, 1, &ctx.control_view())?;
+    let cnt_le_1 = scalar_utils::binary_op(
+        arena,
+        BinOp::Le,
+        cnt_ref,
+        one,
         DataType::Boolean,
         false,
-    );
-    let one = scalar_utils::int_literal(arena, 1);
-    let cnt_le_1 =
-        scalar_utils::binary_op(arena, BinOp::Le, cnt_ref, one, DataType::Boolean, false);
+        &ctx.control_view(),
+    )?;
     let assert_cond = scalar_utils::binary_op(
         arena,
         BinOp::Or,
@@ -357,12 +388,15 @@ fn apply_opt(
         cnt_le_1,
         DataType::Boolean,
         false,
-    );
+        &ctx.control_view(),
+    )?;
     let assert_expr = scalar_utils::assert_true(
         ctx.function_catalog(),
         arena,
         assert_cond,
         "correlate scalar subquery result must 1 row",
+        ctx.decimal_overflow_policy(),
+        &ctx.control_view(),
     )?;
     items.push(ScalarProjectItem {
         expr: assert_expr,
@@ -402,24 +436,38 @@ fn build_output_project_items(
     right: &OptExpr,
     inner_output_column_id: ColumnId,
     output_col: &OutputColumn,
-) -> Result<Vec<ScalarProjectItem>, String> {
-    let mut items = scalar_utils::left_project_items(left, arena)?;
-    let inner_out_type = scalar_utils::find_column_type(right, arena, inner_output_column_id)
-        .unwrap_or(DataType::Null);
-    let inner_nullable =
-        scalar_utils::find_column_nullable(right, arena, inner_output_column_id).unwrap_or(true);
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<ScalarProjectItem>, SqlCompileError> {
+    let mut items = scalar_utils::left_project_items(left, arena, control)?;
+    let inner_value_type = scalar_utils::opt_output_columns(right, arena)
+        .map_err(SqlCompileError::Compilation)?
+        .into_iter()
+        .find(|column| column.column_id == inner_output_column_id)
+        .map(|column| column.value_type)
+        .ok_or_else(|| {
+            SqlCompileError::Compilation("missing scalar subquery output column".into())
+        })?;
+    let inner_out_type = inner_value_type.data_type.clone();
 
-    let inner_col_ref = arena.intern(
+    let inner_col_ref = arena.intern_observed(
         ScalarNode::ColumnRef(inner_output_column_id),
-        inner_out_type.clone(),
-        inner_nullable,
-    );
+        inner_value_type,
+        control,
+    )?;
 
     let scalar_expr =
         if scalar_utils::is_count_aggregate_result(right, arena, inner_output_column_id) {
             // ifnull(count_result, 0): count(1) with LEFT OUTER returns NULL when no
             // match; normalize to 0 (SQL COUNT semantics).
-            scalar_utils::ifnull_zero(function_catalog, arena, inner_col_ref, inner_out_type)?
+            scalar_utils::ifnull_zero(
+                function_catalog,
+                arena,
+                inner_col_ref,
+                inner_out_type,
+                policy,
+                control,
+            )?
         } else {
             inner_col_ref
         };
@@ -473,8 +521,8 @@ fn ensure_exposes_columns(
             .unwrap_or_else(|| OutputColumn {
                 column_id,
                 name: format!("col_{}", column_id.0),
-                data_type: arena.data_type(*group_key).clone(),
-                nullable: arena.nullable(*group_key),
+                value_type: arena.value_type(*group_key).clone(),
+
                 is_internal: false,
             });
         new_items.push(ScalarProjectItem {
@@ -545,8 +593,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: dt,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(dt, false),
         }
     }
 
@@ -557,8 +604,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: dt,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(dt, true),
         }
     }
 
@@ -570,12 +616,11 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
-    fn ctx_with_factory() -> RewriteContext {
+    fn ctx_with_factory() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_column_ref_factory(Rc::new(RefCell::new(ColumnRefFactory::new())));
@@ -598,8 +643,11 @@ mod tests {
                 columns: vec![OutputColumn {
                     column_id: T1_K,
                     name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
             }),
@@ -625,15 +673,21 @@ mod tests {
                     OutputColumn {
                         column_id: T2_K,
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: T2_V2,
                         name: "v2".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -654,7 +708,13 @@ mod tests {
         let expr = to_opt_expr(make_left_values(), &mut ctx);
 
         assert!(
-            bind_tree(&rule.pattern(), &expr).is_none(),
+            bind_tree(
+                &rule.pattern(),
+                &expr,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none(),
             "ScalarApplyToJoin pattern must only match Apply roots"
         );
     }
@@ -666,22 +726,23 @@ mod tests {
                 group_by: vec![],
                 aggregates: vec![AggregateCall {
                     name: "max".to_string(),
-                    args: vec![col_ref(T2_V2, "v2", DataType::Int64)],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: vec![],
                     output_column_id: MAX_RESULT,
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "max",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_ref(T2_V2, "v2", DataType::Int64)],
+                        vec![],
+                        crate::functions::test_resolved_aggregate("max", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![OutputColumn {
                     column_id: MAX_RESULT,
                     name: "max(v2)".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 }],
                 already_pushed: false,
@@ -708,8 +769,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: MAX_RESULT,
@@ -804,8 +868,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: T2_V2,
@@ -880,30 +947,34 @@ mod tests {
                 group_by: vec![col_ref(T2_K, "k", DataType::Int64)],
                 aggregates: vec![AggregateCall {
                     name: "max".to_string(),
-                    args: vec![col_ref(T2_V2, "v2", DataType::Int64)],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: vec![],
                     output_column_id: MAX_RESULT,
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "max",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_ref(T2_V2, "v2", DataType::Int64)],
+                        vec![],
+                        crate::functions::test_resolved_aggregate("max", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![
                     OutputColumn {
                         column_id: T2_K,
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: MAX_RESULT,
                         name: "max(v2)".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -926,8 +997,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: MAX_RESULT,
@@ -1021,8 +1095,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: T2_V2,
@@ -1102,7 +1179,7 @@ mod tests {
         let ExprKind::ColumnRef {
             column_id: av_arg_id,
             ..
-        } = &anyval_call.args[0].kind
+        } = &anyval_call.source.arguments()[0].kind
         else {
             panic!("any_value arg must be ColumnRef");
         };
@@ -1189,7 +1266,7 @@ mod tests {
         };
         assert_eq!(*isnull_id, cnt_id, "IS NULL must check cnt column");
         assert!(
-            isnull_expr.nullable,
+            isnull_expr.value_type.nullable,
             "LEFT OUTER JOIN can null-extend count(1), so the row-check reference must be nullable"
         );
 
@@ -1211,7 +1288,7 @@ mod tests {
         };
         assert_eq!(*le_id, cnt_id, "<= must check cnt column");
         assert!(
-            le_left.nullable,
+            le_left.value_type.nullable,
             "LEFT OUTER JOIN can null-extend count(1), so the comparison reference must be nullable"
         );
         let ExprKind::Literal(LiteralValue::Int(1)) = &le_right.kind else {
@@ -1245,8 +1322,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: APPLY_OUT,
                     name: "subq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: T2_V2,

@@ -22,10 +22,14 @@
 use std::collections::HashMap;
 
 use crate::column_id::ColumnId;
+use crate::compiler::SqlCompileError;
 use crate::optimizer::operator::ScalarAggregateSpec;
 use crate::optimizer::scalar::{ScalarArena, ScalarId};
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 
-use super::column_mapping::{NormExpr, normalize};
+use super::column_mapping::{
+    NormArgumentOrder, NormExpr, NormIndex, NormSortKey, norm_contains, normalize,
+};
 use super::descriptor::{SpjgAggregate, SpjgOutput, SpjgOutputExpr};
 
 #[derive(Debug)]
@@ -60,26 +64,57 @@ fn norm_agg(
     arena: &ScalarArena,
     call: &ScalarAggregateSpec,
     base_names: &HashMap<ColumnId, String>,
-) -> Option<NormExpr> {
-    // `order_by` is intentionally NOT part of the key: every aggregate on the
-    // current whitelist (sum/min/max/count) is order-insensitive, and SPJG-MV
-    // aggregate calls carry no order_by. If an order-sensitive aggregate
-    // (e.g. group_concat / array_agg) is ever whitelisted, order_by MUST be
-    // folded into this key, or two differently-ordered calls would wrongly
-    // match.
-    Some(NormExpr::Call {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Option<NormExpr>, SqlCompileError> {
+    let novarocks_functions::FunctionResultType::Scalar(value_type) =
+        &call.source.binding().selected.result_type
+    else {
+        work.step()?;
+        return Ok(None);
+    };
+    let mut order_by = Vec::with_capacity(call.source.order_by().len());
+    for key in call.source.order_by() {
+        work.flush()?;
+        let Some(expr) = normalize(arena, key.expr, base_names, work.control())? else {
+            return Ok(None);
+        };
+        order_by.push(NormSortKey {
+            expr,
+            asc: key.asc,
+            nulls_first: key.nulls_first,
+        });
+        work.step()?;
+    }
+    let mut args = Vec::with_capacity(call.source.arguments().len());
+    for arg in call.source.arguments() {
+        work.flush()?;
+        let Some(expr) = normalize(arena, *arg, base_names, work.control())? else {
+            return Ok(None);
+        };
+        args.push(expr);
+        work.step()?;
+    }
+    // These borrowed catalog facts are copied only after the original scope is
+    // observed. Their opaque library work is not a memory admission claim.
+    work.flush()?;
+    let normalized = NormExpr::Call {
+        value_type: value_type.clone(),
         name: format!("agg:{}", call.name.to_ascii_lowercase()),
         distinct: call.distinct,
-        args: call
-            .args
-            .iter()
-            .map(|arg| normalize(arena, *arg, base_names))
-            .collect::<Option<Vec<_>>>()?,
-    })
+        binding: Some(call.source.binding().clone()),
+        decimal_overflow_policy: None,
+        argument_order: NormArgumentOrder::Ordered,
+        order_by,
+        args,
+    };
+    work.step()?;
+    work.flush()?;
+    Ok(Some(normalized))
 }
 
 /// Decide whether (and how) the query aggregate can be answered from the MV.
-/// Returns None when not rewritable.
+/// Returns None when not rewritable. No candidate is published before the
+/// original scope observes its completed tail.
 #[expect(
     clippy::too_many_arguments,
     reason = "These are distinct frozen SQL planning facts and grouping them would obscure the compiler boundary."
@@ -93,71 +128,117 @@ pub(crate) fn plan_rollup(
     mv_outputs: &[SpjgOutput],
     mv_arena: &ScalarArena,
     mv_base_names: &HashMap<ColumnId, String>,
-) -> Option<RollupPlan> {
-    // Normalized group-key sets.
-    let q_keys: Vec<NormExpr> = query_group_by
-        .iter()
-        .map(|expr| normalize(query_arena, *expr, query_base_names))
-        .collect::<Option<Vec<_>>>()?;
-    let m_keys: Vec<NormExpr> = mv_agg
-        .group_by
-        .iter()
-        .map(|expr| normalize(mv_arena, *expr, mv_base_names))
-        .collect::<Option<Vec<_>>>()?;
-    if !q_keys.iter().all(|k| m_keys.contains(k)) {
-        return None; // query groups by something the MV did not preserve
-    }
-    let equal = q_keys.len() == m_keys.len() && m_keys.iter().all(|k| q_keys.contains(k));
-
-    // MV aggregate outputs by normalized call.
-    let mut mv_agg_by_norm: HashMap<NormExpr, usize> = HashMap::new();
-    for (i, out) in mv_outputs.iter().enumerate() {
-        if let SpjgOutputExpr::Aggregate(call) = &out.expr
-            && let Some(n) = norm_agg(mv_arena, call, mv_base_names)
-        {
-            mv_agg_by_norm.insert(n, i);
+    control: &dyn PureCompileControl,
+) -> Result<Option<RollupPlan>, SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let result = (|| {
+        let mut q_keys = Vec::with_capacity(query_group_by.len());
+        for expr in query_group_by {
+            work.flush()?;
+            let Some(key) = normalize(query_arena, *expr, query_base_names, control)? else {
+                return Ok(None);
+            };
+            q_keys.push(key);
+            work.step()?;
         }
-    }
-
-    let scalar_query = query_group_by.is_empty();
-    let mut items = Vec::with_capacity(query_aggregates.len());
-    for q in query_aggregates {
-        if q.distinct {
-            return None; // DISTINCT aggregates never rewrite onto SPJG MVs
+        let mut m_keys = Vec::with_capacity(mv_agg.group_by.len());
+        for expr in &mv_agg.group_by {
+            work.flush()?;
+            let Some(key) = normalize(mv_arena, *expr, mv_base_names, control)? else {
+                return Ok(None);
+            };
+            m_keys.push(key);
+            work.step()?;
         }
-        let qn = norm_agg(query_arena, q, query_base_names)?;
-        let mv_idx = *mv_agg_by_norm.get(&qn)?; // exact same call materialized?
+        for key in &q_keys {
+            work.flush()?;
+            if !norm_contains(&m_keys, key, control)? {
+                return Ok(None);
+            }
+            work.step()?;
+        }
+        let mut equal = q_keys.len() == m_keys.len();
         if equal {
+            for key in &m_keys {
+                work.flush()?;
+                if !norm_contains(&q_keys, key, control)? {
+                    equal = false;
+                    break;
+                }
+                work.step()?;
+            }
+        }
+
+        // Exact overwrites preserve the original last materialized output.
+        let mut mv_agg_by_norm = NormIndex::new();
+        for (i, out) in mv_outputs.iter().enumerate() {
+            if let SpjgOutputExpr::Aggregate(call) = &out.expr
+                && let Some(n) = norm_agg(mv_arena, call, mv_base_names, &mut work)?
+            {
+                work.flush()?;
+                mv_agg_by_norm.insert(n, i, control)?;
+            }
+            work.step()?;
+        }
+        let scalar_query = query_group_by.is_empty();
+        let mut items = Vec::with_capacity(query_aggregates.len());
+        for q in query_aggregates {
+            work.step()?;
+            if q.distinct {
+                return Ok(None);
+            }
+            let Some(qn) = norm_agg(query_arena, q, query_base_names, &mut work)? else {
+                return Ok(None);
+            };
+            work.flush()?;
+            let Some(&mv_idx) = mv_agg_by_norm.get(&qn, control)? else {
+                return Ok(None);
+            };
+            if equal {
+                items.push(RollupItem {
+                    mv_output_index: mv_idx,
+                    rollup_fn: "",
+                    needs_coalesce: false,
+                });
+                continue;
+            }
+            // The rollup whitelist is deliberately unchanged.
+            work.flush()?;
+            let name = q.name.to_ascii_lowercase();
+            work.step()?;
+            work.flush()?;
+            let (rollup_fn, is_count) = match name.as_str() {
+                "sum" => ("sum", false),
+                "min" => ("min", false),
+                "max" => ("max", false),
+                "count" => ("sum", true),
+                _ => return Ok(None),
+            };
             items.push(RollupItem {
                 mv_output_index: mv_idx,
-                rollup_fn: "",
-                needs_coalesce: false,
+                rollup_fn,
+                needs_coalesce: is_count && scalar_query,
             });
-            continue;
         }
-        // Rollup whitelist.
-        let (rollup_fn, is_count) = match q.name.to_ascii_lowercase().as_str() {
-            "sum" => ("sum", false),
-            "min" => ("min", false),
-            "max" => ("max", false),
-            "count" => ("sum", true),
-            _ => return None, // includes avg and everything exotic
-        };
-        items.push(RollupItem {
-            mv_output_index: mv_idx,
-            rollup_fn,
-            needs_coalesce: is_count && scalar_query,
-        });
+        Ok(Some(RollupPlan {
+            kind: if equal {
+                RollupKind::Direct
+            } else {
+                RollupKind::Rollup
+            },
+            items,
+        }))
+    })();
+    if matches!(
+        &result,
+        Err(SqlCompileError::Cancelled
+            | SqlCompileError::DeadlineExceeded
+            | SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
     }
-
-    Some(RollupPlan {
-        kind: if equal {
-            RollupKind::Direct
-        } else {
-            RollupKind::Rollup
-        },
-        items,
-    })
+    work.finish()?;
+    result
 }
 
 #[cfg(test)]
@@ -176,14 +257,42 @@ mod tests {
 
     use super::super::descriptor::{SpjgAggregate, SpjgOutput, SpjgOutputExpr};
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The fixture mirrors the checked rollup port."
+    )]
+    fn plan_rollup(
+        query_group_by: &[ScalarId],
+        query_aggregates: &[ScalarAggregateSpec],
+        query_arena: &ScalarArena,
+        query_base_names: &HashMap<ColumnId, String>,
+        mv_agg: &SpjgAggregate,
+        mv_outputs: &[SpjgOutput],
+        mv_arena: &ScalarArena,
+        mv_base_names: &HashMap<ColumnId, String>,
+    ) -> Option<RollupPlan> {
+        super::plan_rollup(
+            query_group_by,
+            query_aggregates,
+            query_arena,
+            query_base_names,
+            mv_agg,
+            mv_outputs,
+            mv_arena,
+            mv_base_names,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
+    }
+
     // --- construction helpers (mirror sibling test modules) ---
 
     fn col(id: u32, name: &str) -> OutputColumn {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -195,8 +304,7 @@ mod tests {
                 qualifier: None,
                 column: c.name.clone(),
             },
-            data_type: c.data_type.clone(),
-            nullable: c.nullable,
+            value_type: c.value_type.clone(),
         }
     }
 
@@ -216,28 +324,43 @@ mod tests {
     ) -> AggregateCall {
         let argument_types = args
             .iter()
-            .map(|arg| arg.data_type.clone())
+            .map(|arg| arg.value_type.data_type.clone())
             .collect::<Vec<_>>();
         AggregateCall {
             name: name.to_string(),
-            args,
             distinct,
             result_type: DataType::Int64,
-            order_by: vec![],
             output_column_id,
-            resolved: crate::functions::test_resolved_aggregate(name, &argument_types, distinct),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                args,
+                vec![],
+                crate::functions::test_resolved_aggregate(name, &argument_types, distinct),
+            ),
         }
     }
 
     /// Wrap an aggregate call as a materialized MV output column.
     fn scalar_exprs(arena: &mut ScalarArena, exprs: Vec<TypedExpr>) -> Vec<ScalarId> {
-        exprs.iter().map(|expr| intern_typed(arena, expr)).collect()
+        exprs
+            .iter()
+            .map(|expr| {
+                intern_typed(
+                    arena,
+                    expr,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap()
+            })
+            .collect()
     }
 
     fn scalar_aggs(arena: &mut ScalarArena, calls: Vec<AggregateCall>) -> Vec<ScalarAggregateSpec> {
         calls
             .iter()
-            .map(|call| intern_aggregate_call(arena, call))
+            .map(|call| {
+                intern_aggregate_call(arena, call, crate::optimizer::test_optimizer_control())
+                    .unwrap()
+            })
             .collect()
     }
 
@@ -245,7 +368,10 @@ mod tests {
         SpjgOutput {
             name: out.name.clone(),
             column_id: out.column_id,
-            expr: SpjgOutputExpr::Aggregate(intern_aggregate_call(arena, &call)),
+            expr: SpjgOutputExpr::Aggregate(
+                intern_aggregate_call(arena, &call, crate::optimizer::test_optimizer_control())
+                    .unwrap(),
+            ),
         }
     }
 
@@ -254,7 +380,14 @@ mod tests {
         SpjgOutput {
             name: out.name.clone(),
             column_id: out.column_id,
-            expr: SpjgOutputExpr::Dimension(intern_typed(arena, &expr)),
+            expr: SpjgOutputExpr::Dimension(
+                intern_typed(
+                    arena,
+                    &expr,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap(),
+            ),
         }
     }
 
@@ -578,3 +711,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "consumer_tests.rs"]
+mod consumer_tests;

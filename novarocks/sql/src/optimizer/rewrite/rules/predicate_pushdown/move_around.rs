@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use crate::column_id::ColumnId;
@@ -57,7 +58,11 @@ impl LogicalRewriteRule for JoinPredicateMoveAround {
         matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) && join.condition.is_some()
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             mut children,
@@ -99,7 +104,8 @@ impl LogicalRewriteRule for JoinPredicateMoveAround {
             &right_ids,
             &join_groups,
             &child_groups,
-        );
+            &ctx.control_view(),
+        )?;
 
         let left_existing = existing_child_predicate_keys(&left, &arena);
         let right_existing = existing_child_predicate_keys(&right, &arena);
@@ -127,14 +133,16 @@ impl LogicalRewriteRule for JoinPredicateMoveAround {
             left
         } else {
             let predicate =
-                scalar_expr::combine_conjuncts(&mut arena, left_fresh).expect("non-empty");
+                scalar_expr::combine_conjuncts(&mut arena, left_fresh, &ctx.control_view())?
+                    .expect("non-empty");
             OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![left])
         };
         let new_right = if right_fresh.is_empty() {
             right
         } else {
             let predicate =
-                scalar_expr::combine_conjuncts(&mut arena, right_fresh).expect("non-empty");
+                scalar_expr::combine_conjuncts(&mut arena, right_fresh, &ctx.control_view())?
+                    .expect("non-empty");
             OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![right])
         };
 
@@ -310,8 +318,8 @@ mod tests {
 
     fn col_expr(alias: &str, name: &str, id: u32) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int32,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+
             kind: ExprKind::ColumnRef {
                 column_id: col_id(id),
                 qualifier: Some(alias.to_string()),
@@ -322,16 +330,16 @@ mod tests {
 
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             kind: ExprKind::Literal(LiteralValue::Int(v)),
         }
     }
 
     fn eq(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(left),
                 op: BinOp::Eq,
@@ -343,8 +351,8 @@ mod tests {
 
     fn and(left: TypedExpr, right: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(left),
                 op: BinOp::And,
@@ -358,8 +366,8 @@ mod tests {
         OutputColumn {
             column_id: col_id(id),
             name: name.to_string(),
-            data_type: DataType::Int32,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+
             is_internal: false,
         }
     }
@@ -399,7 +407,12 @@ mod tests {
     }
 
     fn make_filter(arena: &mut ScalarArena, predicate: TypedExpr, child: OptExpr) -> OptExpr {
-        let pred_id = intern_typed(arena, &predicate);
+        let pred_id = intern_typed(
+            arena,
+            &predicate,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         OptExpr::new(
             Operator::LogicalFilter(FilterOp { predicate: pred_id }),
             vec![child],
@@ -412,7 +425,12 @@ mod tests {
         left: OptExpr,
         right: OptExpr,
     ) -> OptExpr {
-        let cond_id = intern_typed(arena, &condition);
+        let cond_id = intern_typed(
+            arena,
+            &condition,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
@@ -422,7 +440,7 @@ mod tests {
         )
     }
 
-    fn make_ctx(arena: ScalarArena) -> RewriteContext {
+    fn make_ctx(arena: ScalarArena) -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(std::iter::empty::<String>());
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         ctx
@@ -474,7 +492,9 @@ mod tests {
         let cond_id = intern_typed(
             &mut arena,
             &eq(col_expr("l", "a", 1), col_expr("r", "b", 2)),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let join = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::LeftOuter,
@@ -576,7 +596,9 @@ mod tests {
                 eq(col_expr("a", "k", 1), col_expr("b", "k", 2)),
                 eq(col_expr("b", "k", 2), int_lit(7)),
             ),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let left_child = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::LeftOuter,
@@ -609,7 +631,13 @@ mod tests {
         let rule = JoinPredicateMoveAround;
 
         assert!(
-            bind_tree(&rule.pattern(), &scan).is_none(),
+            bind_tree(
+                &rule.pattern(),
+                &scan,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none(),
             "JoinPredicateMoveAround pattern must only match Join roots"
         );
     }

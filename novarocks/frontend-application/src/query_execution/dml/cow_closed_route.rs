@@ -614,7 +614,7 @@ pub(super) fn preflight_target(
     template.constructor_transient_upper = template
         .constructor_transient_upper
         .max(compiler_handoff_upper);
-    // The whole original window, including both compiler clones, rejects
+    // The whole original window, including all four compiler copies, rejects
     // before any row/cell AST constructor. No row recipe storage is created.
     let mut target = recipe.begin_target(template).map_err(map_footprint)?;
     for row in rows {

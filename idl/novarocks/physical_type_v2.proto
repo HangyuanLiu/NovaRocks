@@ -1,0 +1,127 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package novarocks.physical_type_v2;
+
+import "plan.proto";
+
+// Flat type vocabulary for the v2 physical package. This file is a component,
+// not a fragment envelope. Carrier, field and value-type IDs have separate
+// sparse namespaces; zero is a valid identity, never an absence sentinel.
+// Repeated tables reject duplicate identities. References must resolve to an
+// actual table entry; receivers allocate by entry count, not by maximum ID.
+message TypeTable {
+  repeated CarrierTypeDefinition carriers = 1;
+  repeated FieldDefinition fields = 2;
+  repeated ValueTypeDefinition value_types = 3;
+}
+
+// Explicit logical identity is independent of the Arrow carrier. UNSPECIFIED
+// is invalid; FixedSizeBinary(16) alone does not imply LARGEINT or UUID.
+enum LogicalType {
+  LOGICAL_TYPE_UNSPECIFIED = 0;
+  LOGICAL_TYPE_PHYSICAL = 1;
+  LOGICAL_TYPE_JSON = 2;
+  LOGICAL_TYPE_VARIANT = 3;
+  LOGICAL_TYPE_HLL = 4;
+  LOGICAL_TYPE_BITMAP = 5;
+  LOGICAL_TYPE_OBJECT = 6;
+  LOGICAL_TYPE_PERCENTILE = 7;
+  LOGICAL_TYPE_LARGE_INT = 8;
+  LOGICAL_TYPE_UUID = 9;
+}
+
+message ValueTypeDefinition {
+  uint32 id = 1;
+  optional uint32 carrier_type_id = 2;
+  bool nullable = 3;
+  LogicalType logical_type = 4;
+}
+
+// All Arrow field attributes survive independently. Nested logical identity
+// lives in the exact field metadata; metadata entries are sorted and unique,
+// rather than a protobuf map that would silently replace duplicate keys.
+message FieldDefinition {
+  uint32 id = 1;
+  string name = 2;
+  bool nullable = 3;
+  optional uint32 carrier_type_id = 4;
+  repeated novarocks.plan.ArrowFieldMetadataEntry metadata = 5;
+  optional int64 dictionary_id = 6;
+  optional bool dictionary_is_ordered = 7;
+}
+
+// Nesting uses table references only. No carrier or field message recursively
+// embeds another definition. The application separately enforces semantic
+// type depth, expansion, field metadata and allocation bounds.
+message CarrierTypeDefinition {
+  uint32 id = 1;
+  oneof kind {
+    novarocks.plan.ArrowPrimitiveType primitive = 2;
+    novarocks.plan.ArrowTimestampType timestamp = 3;
+    novarocks.plan.ArrowTimeType time32 = 4;
+    novarocks.plan.ArrowTimeType time64 = 5;
+    novarocks.plan.ArrowTimeType duration = 6;
+    novarocks.plan.ArrowIntervalUnit interval = 7;
+    int32 fixed_size_binary = 8;
+    novarocks.plan.ArrowDecimalType decimal32 = 9;
+    novarocks.plan.ArrowDecimalType decimal64 = 10;
+    novarocks.plan.ArrowDecimalType decimal128 = 11;
+    novarocks.plan.ArrowDecimalType decimal256 = 12;
+    uint32 list_field_id = 13;
+    uint32 list_view_field_id = 14;
+    FixedSizeList fixed_size_list = 15;
+    uint32 large_list_field_id = 16;
+    uint32 large_list_view_field_id = 17;
+    StructFields struct_type = 18;
+    UnionFields union_type = 19;
+    DictionaryTypes dictionary = 20;
+    MapField map = 21;
+    RunEndEncodedFields run_end_encoded = 22;
+  }
+}
+
+message FixedSizeList {
+  optional uint32 item_field_id = 1;
+  int32 length = 2;
+}
+message StructFields {
+  // Order and repeated field occurrences are significant.
+  repeated uint32 field_ids = 1;
+}
+message UnionField {
+  int32 type_id = 1;
+  optional uint32 field_id = 2;
+}
+message UnionFields {
+  novarocks.plan.ArrowUnionMode mode = 1;
+  repeated UnionField fields = 2;
+}
+message DictionaryTypes {
+  optional uint32 key_type_id = 1;
+  optional uint32 value_type_id = 2;
+}
+message MapField {
+  optional uint32 entries_field_id = 1;
+  bool ordered = 2;
+}
+message RunEndEncodedFields {
+  optional uint32 run_ends_field_id = 1;
+  optional uint32 values_field_id = 2;
+}

@@ -326,16 +326,14 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         }
     }
 
     fn int_lit(value: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(value)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -347,8 +345,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -360,18 +357,16 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
     fn nested(expr: TypedExpr) -> TypedExpr {
-        let data_type = expr.data_type.clone();
-        let nullable = expr.nullable;
+        let data_type = expr.value_type.data_type.clone();
+        let nullable = expr.value_type.nullable;
         TypedExpr {
             kind: ExprKind::Nested(Box::new(expr)),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
         }
     }
 
@@ -395,7 +390,8 @@ mod tests {
 
     fn estimate_typed(expr: &TypedExpr, column_stats: &HashMap<ColumnId, ColumnStatistic>) -> f64 {
         let mut arena = ScalarArena::new();
-        let id = intern_typed(&mut arena, expr);
+        let id =
+            intern_typed(&mut arena, expr, crate::optimizer::test_optimizer_control()).unwrap();
         estimate_selectivity(&arena, id, column_stats)
     }
 
@@ -492,8 +488,7 @@ mod tests {
                 list: vec![int_lit(1), int_lit(2), int_lit(3)],
                 negated: false,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         };
 
         assert_eq!(

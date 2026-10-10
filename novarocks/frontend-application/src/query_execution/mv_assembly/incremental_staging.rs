@@ -214,11 +214,13 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     exact_lease: &ConnectorWriteLease,
     execution: &QueryExecutionContext,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PreparedMvNativeWriteAssembly, String> {
+) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
     let (request, facts, mode, evidence, execution_artifact, publication_intent) =
         prepared.into_parts();
     if !exact_lease.matches_provider_binding_key(&request.observed_binding) {
-        return Err("MV incremental write lease drifted from prepared binding".to_string());
+        return Err("MV incremental write lease drifted from prepared binding"
+            .to_string()
+            .into());
     }
     let refresh_rewrite = crate::query_execution::mv_assembly::first_refresh_staging::rebuild_frozen_mv_rewrite_context(
         ports,
@@ -291,7 +293,7 @@ fn bind_incremental_write_dataflow(
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     write_session: &Arc<ConnectorWriteSession>,
-) -> Result<PreparedMvNativeWriteAssembly, String> {
+) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
     let target = crate::catalog_application::resolver::TargetBackend {
         provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
             .expect("static Iceberg provider ID"),
@@ -361,14 +363,11 @@ fn bind_incremental_write_dataflow(
                     novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::RowDelta
                 }
             };
-            let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-                execution.deadline(),
-                crate::query_execution::planning::sql_cancellation_observation(
-                    execution.cancellation().clone(),
-                ),
-            );
+            let compile_control =
+                crate::query_execution::planning::sql_compile_control_from_execution(execution);
             let analyzed = novarocks_sql::planning::mv::first_refresh::analyze_mv_incremental_refresh_change_stream(
                 novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalRefreshAnalyzeContext {
+ emission_mode:query_kernel.static_plan_carrier().sql_emission_mode(),
                     canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
                     imv_rewrite: imv_rewrite_input,
                     write_mode,
@@ -379,6 +378,7 @@ fn bind_incremental_write_dataflow(
                     catalog: &catalog,
                     functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
+                    constant_policy: query_kernel.constant_policy(),
                     control: compile_control.clone(),
                 },
             )?;
@@ -387,6 +387,7 @@ fn bind_incremental_write_dataflow(
                 analyzer_catalog.query_table_bindings(),
                 connector_context,
             )?;
+            let finish_control = compile_control.clone();
             let (completion, needs) = novarocks_sql::planning::mv::first_refresh::begin_final_mv_incremental_refresh_change_stream(
                 analyzed,
                 &statistics,
@@ -408,14 +409,21 @@ fn bind_incremental_write_dataflow(
                 field_names,
                 |version, dop, reads, targets| {
                     completion
-                        .finish(novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
-                            novarocks_sql::planning::dml::DmlFinalPlanContext::new(
-                                version, dop, reads,
+                        .finish(
+                            novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
+                                novarocks_sql::planning::dml::DmlFinalPlanContext::new(
+                                    version,
+                                    dop,
+                                    reads,
+                                    query_kernel.static_plan_carrier().sql_emission_mode(),
+                                ),
+                                targets,
                             ),
-                            targets,
-                        ))
+                            &finish_control,
+                        )
                         .map(|completed| completed.into_parts().0)
                 },
+                &finish_control,
             )
         }
         MvIncrementalExecutionArtifact::JoinLogical {
@@ -455,14 +463,11 @@ fn bind_incremental_write_dataflow(
                 base_overlays,
             );
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
-            let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-                execution.deadline(),
-                crate::query_execution::planning::sql_cancellation_observation(
-                    execution.cancellation().clone(),
-                ),
-            );
+            let compile_control =
+                crate::query_execution::planning::sql_compile_control_from_execution(execution);
             let analyzed = novarocks_sql::planning::mv::first_refresh::analyze_join_incremental_refresh_change_stream(
                 novarocks_sql::planning::mv::first_refresh::SqlMvJoinIncrementalRefreshAnalyzeContext {
+ emission_mode:query_kernel.static_plan_carrier().sql_emission_mode(),
                     canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
                     rewrite_snapshot: refresh_rewrite.to_sql_rewrite_snapshot(target_binding)?,
                     join_mode,
@@ -475,6 +480,7 @@ fn bind_incremental_write_dataflow(
                     catalog: &catalog,
                     functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
+                    constant_policy: query_kernel.constant_policy(),
                     control: compile_control.clone(),
                 },
             )?;
@@ -483,6 +489,7 @@ fn bind_incremental_write_dataflow(
                 analyzer_catalog.query_table_bindings(),
                 connector_context,
             )?;
+            let finish_control = compile_control.clone();
             let (completion, needs) = novarocks_sql::planning::mv::first_refresh::begin_final_join_incremental_refresh_change_stream(
                 analyzed,
                 &statistics,
@@ -504,14 +511,21 @@ fn bind_incremental_write_dataflow(
                 field_names,
                 |version, dop, reads, targets| {
                     completion
-                        .finish(novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
-                            novarocks_sql::planning::dml::DmlFinalPlanContext::new(
-                                version, dop, reads,
+                        .finish(
+                            novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
+                                novarocks_sql::planning::dml::DmlFinalPlanContext::new(
+                                    version,
+                                    dop,
+                                    reads,
+                                    query_kernel.static_plan_carrier().sql_emission_mode(),
+                                ),
+                                targets,
                             ),
-                            targets,
-                        ))
+                            &finish_control,
+                        )
                         .map(|completed| completed.into_parts().0)
                 },
+                &finish_control,
             )
         }
     }

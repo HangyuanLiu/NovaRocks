@@ -15,11 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 use crate::exec::chunk::Chunk;
-use crate::exec::expr::function::pattern_memo::PatternMemo;
 use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, StringArray};
-use regex::Regex;
-use std::sync::Arc;
 
 pub fn eval_regexp_replace(
     arena: &ExprArena,
@@ -35,27 +32,18 @@ pub fn eval_regexp_replace(
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| "regexp_replace expects string".to_string())?;
-    let p_arr = pat_arr
+    let _p_arr = pat_arr
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| "regexp_replace expects string".to_string())?;
-    let r_arr = rep_arr
+    let _r_arr = rep_arr
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| "regexp_replace expects string".to_string())?;
     let len = s_arr.len();
-    let mut patterns = PatternMemo::new();
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        if s_arr.is_null(i) || p_arr.is_null(i) || r_arr.is_null(i) {
-            out.push(None);
-            continue;
-        }
-        let re = patterns
-            .get_or_compile(p_arr.value(i), Regex::new)
-            .map_err(|e| e.to_string())?;
-        let val = re.replace_all(s_arr.value(i), r_arr.value(i)).to_string();
-        out.push(Some(val));
-    }
-    Ok(Arc::new(StringArray::from(out)) as ArrayRef)
+    novarocks_functions::builtin::string_extended::evaluate_legacy(
+        novarocks_functions::builtin::string_extended::StringOperation::RegexpReplace,
+        &[str_arr, pat_arr, rep_arr],
+        len,
+    )
 }

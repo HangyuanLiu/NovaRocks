@@ -76,15 +76,19 @@ impl ConnectorPrivateDecoder<IcebergRuntimeRelation> for IcebergReadWireCodec {
         payload: &[u8],
         context: &mut ConnectorDecodeContext<'_>,
     ) -> Result<IcebergRuntimeRelation, ConnectorCodecError> {
-        let raw = decode_root::<dto::IcebergReadTablePayload>(
-            payload,
-            context,
-            ConnectorFieldPath::root("iceberg_read_table"),
-            Schema::ReadTable,
-        )?;
-        let value = decode_relation(&raw)?;
-        charge_retained(context, payload.len(), size_of::<IcebergRuntimeRelation>())?;
-        Ok(value)
+        let result = (|| {
+            let raw = decode_root::<dto::IcebergReadTablePayload>(
+                payload,
+                context,
+                ConnectorFieldPath::root("iceberg_read_table"),
+                Schema::ReadTable,
+            )?;
+            let value = decode_relation(&raw, context)?;
+            charge_retained(context, payload.len(), size_of::<IcebergRuntimeRelation>())?;
+            Ok(value)
+        })();
+        context.observe_compile_step()?;
+        finish_decode(result, context)
     }
 }
 
@@ -103,22 +107,26 @@ impl ConnectorPrivateDecoder<IcebergReadView> for IcebergReadWireCodec {
         payload: &[u8],
         context: &mut ConnectorDecodeContext<'_>,
     ) -> Result<IcebergReadView, ConnectorCodecError> {
-        let raw = decode_root::<dto::IcebergReadViewPayload>(
-            payload,
-            context,
-            ConnectorFieldPath::root("iceberg_read_view"),
-            Schema::ReadView,
-        )?;
-        let transaction = raw.transaction.as_ref().ok_or_else(|| {
-            codec_error(
-                "iceberg_read_view.transaction",
-                ConnectorCodecErrorKind::MissingField,
-                "Iceberg read view requires a transaction marker",
-            )
-        })?;
-        let value = IcebergReadView::new(decode_transaction(transaction)?);
-        charge_retained(context, payload.len(), size_of::<IcebergReadView>())?;
-        Ok(value)
+        let result = (|| {
+            let raw = decode_root::<dto::IcebergReadViewPayload>(
+                payload,
+                context,
+                ConnectorFieldPath::root("iceberg_read_view"),
+                Schema::ReadView,
+            )?;
+            let transaction = raw.transaction.as_ref().ok_or_else(|| {
+                codec_error(
+                    "iceberg_read_view.transaction",
+                    ConnectorCodecErrorKind::MissingField,
+                    "Iceberg read view requires a transaction marker",
+                )
+            })?;
+            let value = IcebergReadView::new(decode_transaction(transaction, context)?);
+            charge_retained(context, payload.len(), size_of::<IcebergReadView>())?;
+            Ok(value)
+        })();
+        context.observe_compile_step()?;
+        finish_decode(result, context)
     }
 }
 
@@ -134,15 +142,19 @@ impl ConnectorPrivateDecoder<IcebergColumnHandle> for IcebergReadWireCodec {
         payload: &[u8],
         context: &mut ConnectorDecodeContext<'_>,
     ) -> Result<IcebergColumnHandle, ConnectorCodecError> {
-        let raw = decode_root::<dto::IcebergColumnHandle>(
-            payload,
-            context,
-            ConnectorFieldPath::root("iceberg_read_column"),
-            Schema::Column,
-        )?;
-        let value = decode_column(&raw)?;
-        charge_retained(context, payload.len(), size_of::<IcebergColumnHandle>())?;
-        Ok(value)
+        let result = (|| {
+            let raw = decode_root::<dto::IcebergColumnHandle>(
+                payload,
+                context,
+                ConnectorFieldPath::root("iceberg_read_column"),
+                Schema::Column,
+            )?;
+            let value = decode_column(&raw, context)?;
+            charge_retained(context, payload.len(), size_of::<IcebergColumnHandle>())?;
+            Ok(value)
+        })();
+        context.observe_compile_step()?;
+        finish_decode(result, context)
     }
 }
 
@@ -161,21 +173,25 @@ impl IcebergReadWireCodec {
         facts: &novarocks_spi::connector::read_stack::ConnectorReadSplitFacts,
         context: &mut ConnectorDecodeContext<'_>,
     ) -> Result<IcebergReadSplit, ConnectorCodecError> {
-        let raw = decode_root::<dto::IcebergReadSplitPayload>(
-            payload,
-            context,
-            ConnectorFieldPath::root("iceberg_read_split"),
-            Schema::ReadSplit,
-        )?;
-        validate_common_split_facts(facts)?;
-        let split = decode_split(&raw, facts)?;
-        validate_materialized_split_facts(&split, facts)?;
-        charge_retained(
-            context,
-            payload.len(),
-            usize::try_from(split.retained_size_in_bytes()).unwrap_or(usize::MAX),
-        )?;
-        Ok(split)
+        let result = (|| {
+            let raw = decode_root::<dto::IcebergReadSplitPayload>(
+                payload,
+                context,
+                ConnectorFieldPath::root("iceberg_read_split"),
+                Schema::ReadSplit,
+            )?;
+            validate_common_split_facts(facts)?;
+            let split = decode_split(&raw, facts, context)?;
+            validate_materialized_split_facts(&split, facts)?;
+            charge_retained(
+                context,
+                payload.len(),
+                usize::try_from(split.retained_size_in_bytes()).unwrap_or(usize::MAX),
+            )?;
+            Ok(split)
+        })();
+        context.observe_compile_step()?;
+        finish_decode(result, context)
     }
 }
 
@@ -196,13 +212,16 @@ fn decode_root<M: Message + Default>(
     let scalar_before = context.ledger().scalar_bytes();
     let items_before = context.ledger().items();
     scan_message(payload, context, path.clone(), schema, 0)?;
+    context.flush_compile_control()?;
     let decoded = M::decode(payload).map_err(|error| {
         ConnectorCodecError::new(
             path,
             ConnectorCodecErrorKind::InvalidValue,
             format!("malformed Iceberg private protobuf: {error}"),
         )
-    })?;
+    });
+    context.observe_compile_step()?;
+    let decoded = finish_decode(decoded, context)?;
     let scalar_bytes = context
         .ledger()
         .scalar_bytes()
@@ -244,6 +263,7 @@ enum Schema {
     ReadView,
     Pinned,
     ReadDomain,
+    CowSourceProof,
     Table,
     TableFunction,
     ChangeWindowHandle,
@@ -398,6 +418,11 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             6 | 7 => repeated(MapI32String),
             _ => return None,
         },
+        CowSourceProof => match field {
+            1..=3 => singular(Scalar),
+            4 => repeated(Message(Column)),
+            _ => return None,
+        },
         Table => match field {
             1 => singular(Message(SchemaName)),
             2 | 4 | 6 | 9 => singular(Varint),
@@ -408,6 +433,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             13 => repeated(MapStringString),
             14 => singular(Message(Pinned)),
             15 => singular(Message(ReadDomain)),
+            17 => singular(Message(CowSourceProof)),
             _ => return None,
         },
         TableFunction => match field {
@@ -560,12 +586,14 @@ fn scan_message(
     context.ledger().check_depth(depth)?;
     let mut seen = BTreeSet::new();
     let mut seen_oneof = false;
+    let mut cow_metadata_members = 0_usize;
     let mut map_keys: BTreeMap<u32, BTreeSet<Vec<u8>>> = BTreeMap::new();
     while !input.is_empty() {
         context.ledger().charge_items(1)?;
-        let key = read_varint(&mut input, &path)?;
+        let key = read_varint(&mut input, context, &path)?;
         let field = u32::try_from(key >> 3).map_err(|_| malformed(&path))?;
         let wire = u8::try_from(key & 7).map_err(|_| malformed(&path))?;
+        context.observe_compile_step()?;
         let field_path = path.field(format!("field_{field}"));
         let rule = field_rule(schema, field).ok_or_else(|| {
             ConnectorCodecError::new(
@@ -600,9 +628,22 @@ fn scan_message(
                 "Iceberg private payload repeats a singular or oneof field",
             ));
         }
+        if matches!(schema, Schema::CowSourceProof) && field == 4 {
+            cow_metadata_members += 1;
+            if cow_metadata_members
+                > crate::typed_read::ALWAYS_BOUND_METADATA_COLUMNS.len()
+                    + crate::typed_read::ROW_LINEAGE_METADATA_COLUMNS.len()
+            {
+                return Err(codec_error(
+                    "iceberg_table.frozen_cow_source.metadata_columns",
+                    ConnectorCodecErrorKind::InvalidValue,
+                    "Iceberg COW metadata proof exceeds its original four-field shape",
+                ));
+            }
+        }
         match rule.value {
             WireValue::Varint => {
-                read_varint(&mut input, &path)?;
+                read_varint(&mut input, context, &path)?;
             }
             WireValue::Fixed64 => {
                 take(&mut input, 8, &path)?;
@@ -611,22 +652,34 @@ fn scan_message(
                 take(&mut input, 4, &path)?;
             }
             WireValue::Scalar => {
-                let len = usize::try_from(read_varint(&mut input, &path)?)
+                let len = usize::try_from(read_varint(&mut input, context, &path)?)
                     .map_err(|_| malformed(&path))?;
                 context.ledger().charge_scalar(len)?;
                 take(&mut input, len, &path)?;
             }
             WireValue::PackedVarint => {
-                let len = usize::try_from(read_varint(&mut input, &path)?)
+                let len = usize::try_from(read_varint(&mut input, context, &path)?)
                     .map_err(|_| malformed(&path))?;
                 let mut packed = take(&mut input, len, &path)?;
                 while !packed.is_empty() {
                     context.ledger().charge_items(1)?;
-                    read_varint(&mut packed, &path)?;
+                    read_varint(&mut packed, context, &path)?;
+                    context.observe_compile_step()?;
                 }
             }
             WireValue::Message(child) => {
-                let len = usize::try_from(read_varint(&mut input, &path)?)
+                // The DTO proof and its inline column elements survive Prost
+                // decode separately from the later typed proof representation.
+                // Preflight charges that real raw extent before Prost allocates.
+                if matches!(schema, Schema::Table) && field == 17 {
+                    context.ledger().charge_retained(
+                        size_of::<dto::IcebergCowSourceProof>()
+                            + (crate::typed_read::ALWAYS_BOUND_METADATA_COLUMNS.len()
+                                + crate::typed_read::ROW_LINEAGE_METADATA_COLUMNS.len())
+                                * size_of::<dto::IcebergColumnHandle>(),
+                    )?;
+                }
+                let len = usize::try_from(read_varint(&mut input, context, &path)?)
                     .map_err(|_| malformed(&path))?;
                 let nested = take(&mut input, len, &path)?;
                 scan_message(
@@ -643,7 +696,7 @@ fn scan_message(
                     // including a sparsely occupied BTree node, before decode.
                     context.ledger().charge_retained(256)?;
                 }
-                let len = usize::try_from(read_varint(&mut input, &path)?)
+                let len = usize::try_from(read_varint(&mut input, context, &path)?)
                     .map_err(|_| malformed(&path))?;
                 let entry = take(&mut input, len, &path)?;
                 let key = scan_map_entry(
@@ -653,7 +706,10 @@ fn scan_message(
                     matches!(rule.value, WireValue::MapStringString),
                     depth + 1,
                 )?;
-                if !map_keys.entry(field).or_default().insert(key) {
+                context.flush_compile_control()?;
+                let duplicate = !map_keys.entry(field).or_default().insert(key);
+                context.observe_compile_step()?;
+                if duplicate {
                     return Err(ConnectorCodecError::new(
                         path.field(format!("field_{field}")),
                         ConnectorCodecErrorKind::DuplicateField,
@@ -678,26 +734,31 @@ fn scan_map_entry(
     let mut value_seen = false;
     while !input.is_empty() {
         context.ledger().charge_items(1)?;
-        let raw_key = read_varint(&mut input, path)?;
+        let raw_key = read_varint(&mut input, context, path)?;
         let field = u32::try_from(raw_key >> 3).map_err(|_| malformed(path))?;
         let wire = u8::try_from(raw_key & 7).map_err(|_| malformed(path))?;
+        context.observe_compile_step()?;
         match field {
             1 if key_value.is_none()
                 && ((!string_key && wire == 0) || (string_key && wire == 2)) =>
             {
                 if string_key {
-                    let len = usize::try_from(read_varint(&mut input, path)?)
+                    let len = usize::try_from(read_varint(&mut input, context, path)?)
                         .map_err(|_| malformed(path))?;
                     context.ledger().charge_scalar(len)?;
-                    key_value = Some(take(&mut input, len, path)?.to_vec());
+                    key_value = Some(copy_slice(take(&mut input, len, path)?, context)?);
                 } else {
-                    key_value = Some(read_varint(&mut input, path)?.to_le_bytes().to_vec());
+                    key_value = Some(
+                        read_varint(&mut input, context, path)?
+                            .to_le_bytes()
+                            .to_vec(),
+                    );
                 }
             }
             2 if !value_seen && wire == 2 => {
                 value_seen = true;
-                let len =
-                    usize::try_from(read_varint(&mut input, path)?).map_err(|_| malformed(path))?;
+                let len = usize::try_from(read_varint(&mut input, context, path)?)
+                    .map_err(|_| malformed(path))?;
                 context.ledger().charge_scalar(len)?;
                 take(&mut input, len, path)?;
             }
@@ -733,17 +794,25 @@ fn scan_map_entry(
     }))
 }
 
-fn read_varint(input: &mut &[u8], path: &ConnectorFieldPath) -> Result<u64, ConnectorCodecError> {
+fn read_varint(
+    input: &mut &[u8],
+    context: &mut ConnectorDecodeContext<'_>,
+    path: &ConnectorFieldPath,
+) -> Result<u64, ConnectorCodecError> {
     let mut value = 0_u64;
     for shift in (0..70).step_by(7) {
         let Some((&byte, rest)) = input.split_first() else {
             return Err(malformed(path));
         };
         *input = rest;
-        if shift == 63 && byte > 1 {
+        let overflow = shift == 63 && byte > 1;
+        if !overflow {
+            value |= u64::from(byte & 0x7f) << shift;
+        }
+        context.observe_compile_step()?;
+        if overflow {
             return Err(malformed(path));
         }
-        value |= u64::from(byte & 0x7f) << shift;
         if byte & 0x80 == 0 {
             return Ok(value);
         }
@@ -836,117 +905,126 @@ fn encode_value_type(value_type: ConnectorValueType) -> dto::ValueType {
     }
 }
 
-fn decode_value_type(raw: &dto::ValueType) -> Result<ConnectorValueType, ConnectorCodecError> {
-    let kind = dto::ValueTypeKind::try_from(raw.kind).map_err(|_| {
-        codec_error(
-            "value_type.kind",
-            ConnectorCodecErrorKind::InvalidEnum,
-            "unknown Iceberg predicate value type",
-        )
-    })?;
-    let value_type = match kind {
-        dto::ValueTypeKind::Unspecified => {
-            return Err(codec_error(
+fn decode_value_type(
+    raw: &dto::ValueType,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<ConnectorValueType, ConnectorCodecError> {
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        let kind = dto::ValueTypeKind::try_from(raw.kind).map_err(|_| {
+            codec_error(
                 "value_type.kind",
                 ConnectorCodecErrorKind::InvalidEnum,
-                "Iceberg predicate value type must be specified",
-            ));
-        }
-        dto::ValueTypeKind::Decimal => {
-            let precision = raw.decimal_precision.ok_or_else(|| {
-                codec_error(
-                    "value_type.decimal_precision",
-                    ConnectorCodecErrorKind::MissingField,
-                    "decimal precision is required",
-                )
-            })?;
-            let scale = raw.decimal_scale.ok_or_else(|| {
-                codec_error(
-                    "value_type.decimal_scale",
-                    ConnectorCodecErrorKind::MissingField,
-                    "decimal scale is required",
-                )
-            })?;
-            if precision == 0 || precision > 38 || scale < 0 || scale > precision as i32 {
+                "unknown Iceberg predicate value type",
+            )
+        })?;
+        let value_type = match kind {
+            dto::ValueTypeKind::Unspecified => {
                 return Err(codec_error(
-                    "value_type",
-                    ConnectorCodecErrorKind::InvalidValue,
-                    "decimal precision or scale is out of range",
+                    "value_type.kind",
+                    ConnectorCodecErrorKind::InvalidEnum,
+                    "Iceberg predicate value type must be specified",
                 ));
             }
-            if raw.fixed_length.is_some() {
-                return Err(codec_error(
-                    "value_type.fixed_length",
-                    ConnectorCodecErrorKind::InconsistentFields,
-                    "decimal type must not carry fixed length",
-                ));
+            dto::ValueTypeKind::Decimal => {
+                let precision = raw.decimal_precision.ok_or_else(|| {
+                    codec_error(
+                        "value_type.decimal_precision",
+                        ConnectorCodecErrorKind::MissingField,
+                        "decimal precision is required",
+                    )
+                })?;
+                let scale = raw.decimal_scale.ok_or_else(|| {
+                    codec_error(
+                        "value_type.decimal_scale",
+                        ConnectorCodecErrorKind::MissingField,
+                        "decimal scale is required",
+                    )
+                })?;
+                if precision == 0 || precision > 38 || scale < 0 || scale > precision as i32 {
+                    return Err(codec_error(
+                        "value_type",
+                        ConnectorCodecErrorKind::InvalidValue,
+                        "decimal precision or scale is out of range",
+                    ));
+                }
+                if raw.fixed_length.is_some() {
+                    return Err(codec_error(
+                        "value_type.fixed_length",
+                        ConnectorCodecErrorKind::InconsistentFields,
+                        "decimal type must not carry fixed length",
+                    ));
+                }
+                ConnectorValueType::Decimal {
+                    precision: precision as u8,
+                    scale: scale as i8,
+                }
             }
-            ConnectorValueType::Decimal {
-                precision: precision as u8,
-                scale: scale as i8,
+            dto::ValueTypeKind::Fixed => {
+                let length = raw.fixed_length.ok_or_else(|| {
+                    codec_error(
+                        "value_type.fixed_length",
+                        ConnectorCodecErrorKind::MissingField,
+                        "fixed type length is required",
+                    )
+                })?;
+                if length == 0 || length > 64 * 1024 {
+                    return Err(codec_error(
+                        "value_type.fixed_length",
+                        ConnectorCodecErrorKind::InvalidValue,
+                        "fixed type length is out of range",
+                    ));
+                }
+                if raw.decimal_precision.is_some() || raw.decimal_scale.is_some() {
+                    return Err(codec_error(
+                        "value_type.decimal_precision",
+                        ConnectorCodecErrorKind::InconsistentFields,
+                        "fixed type must not carry decimal parameters",
+                    ));
+                }
+                ConnectorValueType::Fixed { length }
             }
-        }
-        dto::ValueTypeKind::Fixed => {
-            let length = raw.fixed_length.ok_or_else(|| {
-                codec_error(
-                    "value_type.fixed_length",
-                    ConnectorCodecErrorKind::MissingField,
-                    "fixed type length is required",
-                )
-            })?;
-            if length == 0 || length > 64 * 1024 {
-                return Err(codec_error(
-                    "value_type.fixed_length",
-                    ConnectorCodecErrorKind::InvalidValue,
-                    "fixed type length is out of range",
-                ));
+            simple => {
+                if raw.decimal_precision.is_some()
+                    || raw.decimal_scale.is_some()
+                    || raw.fixed_length.is_some()
+                {
+                    return Err(codec_error(
+                        "value_type",
+                        ConnectorCodecErrorKind::InconsistentFields,
+                        "simple value type carries unrelated parameters",
+                    ));
+                }
+                match simple {
+                    dto::ValueTypeKind::Boolean => ConnectorValueType::Boolean,
+                    dto::ValueTypeKind::TinyInt => ConnectorValueType::TinyInt,
+                    dto::ValueTypeKind::SmallInt => ConnectorValueType::SmallInt,
+                    dto::ValueTypeKind::Integer => ConnectorValueType::Integer,
+                    dto::ValueTypeKind::BigInt => ConnectorValueType::BigInt,
+                    dto::ValueTypeKind::Real => ConnectorValueType::Real,
+                    dto::ValueTypeKind::Double => ConnectorValueType::Double,
+                    dto::ValueTypeKind::Date => ConnectorValueType::Date,
+                    dto::ValueTypeKind::TimeMicros => ConnectorValueType::TimeMicros,
+                    dto::ValueTypeKind::TimestampMicros => ConnectorValueType::TimestampMicros,
+                    dto::ValueTypeKind::TimestampMillis => ConnectorValueType::TimestampMillis,
+                    dto::ValueTypeKind::TimestampTzMicros => ConnectorValueType::TimestampTzMicros,
+                    dto::ValueTypeKind::TimestampNanos => ConnectorValueType::TimestampNanos,
+                    dto::ValueTypeKind::TimestampTzNanos => ConnectorValueType::TimestampTzNanos,
+                    dto::ValueTypeKind::Varchar => ConnectorValueType::Varchar,
+                    dto::ValueTypeKind::Varbinary => ConnectorValueType::Varbinary,
+                    dto::ValueTypeKind::Uuid => ConnectorValueType::Uuid,
+                    dto::ValueTypeKind::NonComparable => ConnectorValueType::NonComparable,
+                    dto::ValueTypeKind::Unspecified
+                    | dto::ValueTypeKind::Decimal
+                    | dto::ValueTypeKind::Fixed => unreachable!("handled above"),
+                }
             }
-            if raw.decimal_precision.is_some() || raw.decimal_scale.is_some() {
-                return Err(codec_error(
-                    "value_type.decimal_precision",
-                    ConnectorCodecErrorKind::InconsistentFields,
-                    "fixed type must not carry decimal parameters",
-                ));
-            }
-            ConnectorValueType::Fixed { length }
-        }
-        simple => {
-            if raw.decimal_precision.is_some()
-                || raw.decimal_scale.is_some()
-                || raw.fixed_length.is_some()
-            {
-                return Err(codec_error(
-                    "value_type",
-                    ConnectorCodecErrorKind::InconsistentFields,
-                    "simple value type carries unrelated parameters",
-                ));
-            }
-            match simple {
-                dto::ValueTypeKind::Boolean => ConnectorValueType::Boolean,
-                dto::ValueTypeKind::TinyInt => ConnectorValueType::TinyInt,
-                dto::ValueTypeKind::SmallInt => ConnectorValueType::SmallInt,
-                dto::ValueTypeKind::Integer => ConnectorValueType::Integer,
-                dto::ValueTypeKind::BigInt => ConnectorValueType::BigInt,
-                dto::ValueTypeKind::Real => ConnectorValueType::Real,
-                dto::ValueTypeKind::Double => ConnectorValueType::Double,
-                dto::ValueTypeKind::Date => ConnectorValueType::Date,
-                dto::ValueTypeKind::TimeMicros => ConnectorValueType::TimeMicros,
-                dto::ValueTypeKind::TimestampMicros => ConnectorValueType::TimestampMicros,
-                dto::ValueTypeKind::TimestampMillis => ConnectorValueType::TimestampMillis,
-                dto::ValueTypeKind::TimestampTzMicros => ConnectorValueType::TimestampTzMicros,
-                dto::ValueTypeKind::TimestampNanos => ConnectorValueType::TimestampNanos,
-                dto::ValueTypeKind::TimestampTzNanos => ConnectorValueType::TimestampTzNanos,
-                dto::ValueTypeKind::Varchar => ConnectorValueType::Varchar,
-                dto::ValueTypeKind::Varbinary => ConnectorValueType::Varbinary,
-                dto::ValueTypeKind::Uuid => ConnectorValueType::Uuid,
-                dto::ValueTypeKind::NonComparable => ConnectorValueType::NonComparable,
-                dto::ValueTypeKind::Unspecified
-                | dto::ValueTypeKind::Decimal
-                | dto::ValueTypeKind::Fixed => unreachable!("handled above"),
-            }
-        }
-    };
-    Ok(value_type)
+        };
+        Ok(value_type)
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_value(value: &ConnectorValue) -> dto::Value {
@@ -985,100 +1063,113 @@ fn encode_value(value: &ConnectorValue) -> dto::Value {
 fn decode_value(
     raw: &dto::Value,
     expected: ConnectorValueType,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<ConnectorValue, ConnectorCodecError> {
-    let raw = raw.value.as_ref().ok_or_else(|| {
-        codec_error(
-            "value",
-            ConnectorCodecErrorKind::MissingField,
-            "predicate value is required",
-        )
-    })?;
-    let value = match raw {
-        dto::value::Value::Boolean(value) => ConnectorValue::Boolean(*value),
-        dto::value::Value::TinyInt(value) => {
-            ConnectorValue::TinyInt(i8::try_from(*value).map_err(|_| {
-                codec_error(
-                    "value.tiny_int",
-                    ConnectorCodecErrorKind::InvalidValue,
-                    "tiny integer is out of range",
-                )
-            })?)
-        }
-        dto::value::Value::SmallInt(value) => {
-            ConnectorValue::SmallInt(i16::try_from(*value).map_err(|_| {
-                codec_error(
-                    "value.small_int",
-                    ConnectorCodecErrorKind::InvalidValue,
-                    "small integer is out of range",
-                )
-            })?)
-        }
-        dto::value::Value::Integer(value) => ConnectorValue::Integer(*value),
-        dto::value::Value::BigInt(value) => ConnectorValue::BigInt(*value),
-        dto::value::Value::Real(value) => ConnectorValue::Real(*value),
-        dto::value::Value::DoubleValue(value) => ConnectorValue::Double(*value),
-        dto::value::Value::Decimal(value) => {
-            if value.unscaled.len() != 16 {
-                return Err(codec_error(
-                    "value.decimal.unscaled",
-                    ConnectorCodecErrorKind::InvalidValue,
-                    "decimal unscaled value must contain 16 bytes",
-                ));
-            }
-            let mut unscaled = [0_u8; 16];
-            unscaled.copy_from_slice(&value.unscaled);
-            ConnectorValue::try_decimal(
-                i128::from_be_bytes(unscaled),
-                u8::try_from(value.precision).map_err(|_| {
-                    codec_error(
-                        "value.decimal.precision",
-                        ConnectorCodecErrorKind::InvalidValue,
-                        "decimal precision is out of range",
-                    )
-                })?,
-                i8::try_from(value.scale).map_err(|_| {
-                    codec_error(
-                        "value.decimal.scale",
-                        ConnectorCodecErrorKind::InvalidValue,
-                        "decimal scale is out of range",
-                    )
-                })?,
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        let raw = raw.value.as_ref().ok_or_else(|| {
+            codec_error(
+                "value",
+                ConnectorCodecErrorKind::MissingField,
+                "predicate value is required",
             )
-            .map_err(|error| domain_error("value.decimal", error))?
-        }
-        dto::value::Value::Date(value) => ConnectorValue::Date(*value),
-        dto::value::Value::TimeMicros(value) => ConnectorValue::TimeMicros(*value),
-        dto::value::Value::TimestampMicros(value) => ConnectorValue::TimestampMicros(*value),
-        dto::value::Value::TimestampMillis(value) => ConnectorValue::TimestampMillis(*value),
-        dto::value::Value::TimestampTzMicros(value) => ConnectorValue::TimestampTzMicros(*value),
-        dto::value::Value::TimestampNanos(value) => ConnectorValue::TimestampNanos(*value),
-        dto::value::Value::TimestampTzNanos(value) => ConnectorValue::TimestampTzNanos(*value),
-        dto::value::Value::Varchar(value) => ConnectorValue::Varchar(Arc::from(value.as_str())),
-        dto::value::Value::Varbinary(value) => {
-            ConnectorValue::Varbinary(Arc::from(value.as_slice()))
-        }
-        dto::value::Value::Uuid(value) => {
-            if value.len() != 16 {
-                return Err(codec_error(
-                    "value.uuid",
-                    ConnectorCodecErrorKind::InvalidValue,
-                    "UUID value must contain 16 bytes",
-                ));
+        })?;
+        let value = match raw {
+            dto::value::Value::Boolean(value) => ConnectorValue::Boolean(*value),
+            dto::value::Value::TinyInt(value) => {
+                ConnectorValue::TinyInt(i8::try_from(*value).map_err(|_| {
+                    codec_error(
+                        "value.tiny_int",
+                        ConnectorCodecErrorKind::InvalidValue,
+                        "tiny integer is out of range",
+                    )
+                })?)
             }
-            let mut uuid = [0_u8; 16];
-            uuid.copy_from_slice(value);
-            ConnectorValue::Uuid(uuid)
+            dto::value::Value::SmallInt(value) => {
+                ConnectorValue::SmallInt(i16::try_from(*value).map_err(|_| {
+                    codec_error(
+                        "value.small_int",
+                        ConnectorCodecErrorKind::InvalidValue,
+                        "small integer is out of range",
+                    )
+                })?)
+            }
+            dto::value::Value::Integer(value) => ConnectorValue::Integer(*value),
+            dto::value::Value::BigInt(value) => ConnectorValue::BigInt(*value),
+            dto::value::Value::Real(value) => ConnectorValue::Real(*value),
+            dto::value::Value::DoubleValue(value) => ConnectorValue::Double(*value),
+            dto::value::Value::Decimal(value) => {
+                if value.unscaled.len() != 16 {
+                    return Err(codec_error(
+                        "value.decimal.unscaled",
+                        ConnectorCodecErrorKind::InvalidValue,
+                        "decimal unscaled value must contain 16 bytes",
+                    ));
+                }
+                let mut unscaled = [0_u8; 16];
+                unscaled.copy_from_slice(&value.unscaled);
+                ConnectorValue::try_decimal(
+                    i128::from_be_bytes(unscaled),
+                    u8::try_from(value.precision).map_err(|_| {
+                        codec_error(
+                            "value.decimal.precision",
+                            ConnectorCodecErrorKind::InvalidValue,
+                            "decimal precision is out of range",
+                        )
+                    })?,
+                    i8::try_from(value.scale).map_err(|_| {
+                        codec_error(
+                            "value.decimal.scale",
+                            ConnectorCodecErrorKind::InvalidValue,
+                            "decimal scale is out of range",
+                        )
+                    })?,
+                )
+                .map_err(|error| domain_error("value.decimal", error))?
+            }
+            dto::value::Value::Date(value) => ConnectorValue::Date(*value),
+            dto::value::Value::TimeMicros(value) => ConnectorValue::TimeMicros(*value),
+            dto::value::Value::TimestampMicros(value) => ConnectorValue::TimestampMicros(*value),
+            dto::value::Value::TimestampMillis(value) => ConnectorValue::TimestampMillis(*value),
+            dto::value::Value::TimestampTzMicros(value) => {
+                ConnectorValue::TimestampTzMicros(*value)
+            }
+            dto::value::Value::TimestampNanos(value) => ConnectorValue::TimestampNanos(*value),
+            dto::value::Value::TimestampTzNanos(value) => ConnectorValue::TimestampTzNanos(*value),
+            dto::value::Value::Varchar(value) => {
+                ConnectorValue::Varchar(Arc::from(copy_string(value, context)?))
+            }
+            dto::value::Value::Varbinary(value) => {
+                ConnectorValue::Varbinary(Arc::from(copy_slice(value, context)?))
+            }
+            dto::value::Value::Uuid(value) => {
+                if value.len() != 16 {
+                    return Err(codec_error(
+                        "value.uuid",
+                        ConnectorCodecErrorKind::InvalidValue,
+                        "UUID value must contain 16 bytes",
+                    ));
+                }
+                let mut uuid = [0_u8; 16];
+                uuid.copy_from_slice(value);
+                ConnectorValue::Uuid(uuid)
+            }
+            dto::value::Value::Fixed(value) => {
+                ConnectorValue::Fixed(Arc::from(copy_slice(value, context)?))
+            }
+        };
+        if value.value_type() != expected || value.payload_bytes() > 64 * 1024 {
+            return Err(codec_error(
+                "value",
+                ConnectorCodecErrorKind::InconsistentFields,
+                "predicate value does not match its exact declared type",
+            ));
         }
-        dto::value::Value::Fixed(value) => ConnectorValue::Fixed(Arc::from(value.as_slice())),
-    };
-    if value.value_type() != expected || value.payload_bytes() > 64 * 1024 {
-        return Err(codec_error(
-            "value",
-            ConnectorCodecErrorKind::InconsistentFields,
-            "predicate value does not match its exact declared type",
-        ));
-    }
-    Ok(value)
+        Ok(value)
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_identity(value: &ColumnIdentity) -> dto::ColumnIdentity {
@@ -1095,27 +1186,42 @@ fn encode_identity(value: &ColumnIdentity) -> dto::ColumnIdentity {
     }
 }
 
-fn decode_identity(raw: &dto::ColumnIdentity) -> Result<ColumnIdentity, ConnectorCodecError> {
-    let category = match dto::ColumnIdentityCategory::try_from(raw.category) {
-        Ok(dto::ColumnIdentityCategory::Primitive) => ColumnIdentityCategory::Primitive,
-        Ok(dto::ColumnIdentityCategory::Struct) => ColumnIdentityCategory::Struct,
-        Ok(dto::ColumnIdentityCategory::Array) => ColumnIdentityCategory::Array,
-        Ok(dto::ColumnIdentityCategory::Map) => ColumnIdentityCategory::Map,
-        Ok(dto::ColumnIdentityCategory::Unspecified) | Err(_) => {
-            return Err(codec_error(
-                "column_identity.category",
-                ConnectorCodecErrorKind::InvalidEnum,
-                "Iceberg column identity category must be known",
-            ));
+fn decode_identity(
+    raw: &dto::ColumnIdentity,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<ColumnIdentity, ConnectorCodecError> {
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        let category = match dto::ColumnIdentityCategory::try_from(raw.category) {
+            Ok(dto::ColumnIdentityCategory::Primitive) => ColumnIdentityCategory::Primitive,
+            Ok(dto::ColumnIdentityCategory::Struct) => ColumnIdentityCategory::Struct,
+            Ok(dto::ColumnIdentityCategory::Array) => ColumnIdentityCategory::Array,
+            Ok(dto::ColumnIdentityCategory::Map) => ColumnIdentityCategory::Map,
+            Ok(dto::ColumnIdentityCategory::Unspecified) | Err(_) => {
+                return Err(codec_error(
+                    "column_identity.category",
+                    ConnectorCodecErrorKind::InvalidEnum,
+                    "Iceberg column identity category must be known",
+                ));
+            }
+        };
+        let children = convert_slice(&raw.children, context, decode_identity)?;
+        {
+            let opaque_arguments = (raw.field_id, &raw.name, category, children);
+            observe_opaque(context, || {
+                ColumnIdentity::try_new(
+                    opaque_arguments.0,
+                    opaque_arguments.1,
+                    opaque_arguments.2,
+                    opaque_arguments.3,
+                )
+            })?
         }
-    };
-    let children = raw
-        .children
-        .iter()
-        .map(decode_identity)
-        .collect::<Result<Vec<_>, _>>()?;
-    ColumnIdentity::try_new(raw.field_id, &raw.name, category, children)
         .map_err(|error| domain_error("column_identity", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_column(value: &IcebergColumnHandle) -> dto::IcebergColumnHandle {
@@ -1134,31 +1240,47 @@ fn encode_column(value: &IcebergColumnHandle) -> dto::IcebergColumnHandle {
 
 fn decode_column(
     raw: &dto::IcebergColumnHandle,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<IcebergColumnHandle, ConnectorCodecError> {
-    let identity = raw.base_column_identity.as_ref().ok_or_else(|| {
-        codec_error(
-            "iceberg_column.base_column_identity",
-            ConnectorCodecErrorKind::MissingField,
-            "Iceberg column requires its base identity",
-        )
-    })?;
-    IcebergColumnHandle::try_new(IcebergColumnHandleParams {
-        base_column_identity: decode_identity(identity)?,
-        base_type_json: raw.base_type_json.clone(),
-        field_id_path: raw.field_id_path.clone(),
-        type_json: raw.type_json.clone(),
-        nullable: raw.nullable,
-        comment: raw.comment.clone(),
-    })
-    .and_then(|column| {
-        column.with_scalar_integer_domain(
-            raw.scalar_integer_domain
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        let identity = raw.base_column_identity.as_ref().ok_or_else(|| {
+            codec_error(
+                "iceberg_column.base_column_identity",
+                ConnectorCodecErrorKind::MissingField,
+                "Iceberg column requires its base identity",
+            )
+        })?;
+        let parameters = IcebergColumnHandleParams {
+            base_column_identity: decode_identity(identity, context)?,
+            base_type_json: copy_string(&raw.base_type_json, context)?,
+            field_id_path: copy_slice(&raw.field_id_path, context)?,
+            type_json: copy_string(&raw.type_json, context)?,
+            nullable: raw.nullable,
+            comment: raw
+                .comment
                 .as_deref()
-                .map(crate::scalar_integer_domain::ScalarIntegerDomain::parse)
+                .map(|value| copy_string(value, context))
                 .transpose()?,
-        )
-    })
-    .map_err(|error| domain_error("iceberg_column", error))
+        };
+        let column = observe_opaque(context, || IcebergColumnHandle::try_new(parameters))?
+            .map_err(|error| domain_error("iceberg_column", error))?;
+        let domain = raw
+            .scalar_integer_domain
+            .as_deref()
+            .map(|value| {
+                observe_opaque(context, || {
+                    crate::scalar_integer_domain::ScalarIntegerDomain::parse(value)
+                })?
+                .map_err(|error| domain_error("iceberg_column", error))
+            })
+            .transpose()?;
+        observe_opaque(context, || column.with_scalar_integer_domain(domain))?
+            .map_err(|error| domain_error("iceberg_column", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_tuple_domain(value: &TupleDomain<IcebergColumnHandle>) -> dto::TupleDomain {
@@ -1182,42 +1304,64 @@ fn encode_tuple_domain(value: &TupleDomain<IcebergColumnHandle>) -> dto::TupleDo
 
 fn decode_tuple_domain(
     raw: &dto::TupleDomain,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<TupleDomain<IcebergColumnHandle>, ConnectorCodecError> {
-    if raw.none {
-        if !raw.column_domains.is_empty() {
-            return Err(codec_error(
-                "tuple_domain.column_domains",
-                ConnectorCodecErrorKind::InconsistentFields,
-                "an empty tuple domain must carry no columns",
-            ));
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        if raw.none {
+            if !raw.column_domains.is_empty() {
+                return Err(codec_error(
+                    "tuple_domain.column_domains",
+                    ConnectorCodecErrorKind::InconsistentFields,
+                    "an empty tuple domain must carry no columns",
+                ));
+            }
+            return Ok(TupleDomain::none());
         }
-        return Ok(TupleDomain::none());
-    }
-    let mut domains = BTreeMap::new();
-    for entry in &raw.column_domains {
-        let column = decode_column(entry.column.as_ref().ok_or_else(|| {
-            codec_error(
-                "tuple_domain.column",
-                ConnectorCodecErrorKind::MissingField,
-                "column domain requires a column",
-            )
-        })?)?;
-        let domain = decode_domain(entry.domain.as_ref().ok_or_else(|| {
-            codec_error(
-                "tuple_domain.domain",
-                ConnectorCodecErrorKind::MissingField,
-                "column domain requires a value domain",
-            )
-        })?)?;
-        if domains.insert(column, domain).is_some() {
-            return Err(codec_error(
-                "tuple_domain.column",
-                ConnectorCodecErrorKind::DuplicateField,
-                "tuple domain repeats an Iceberg column",
-            ));
+        let mut domains = BTreeMap::new();
+        for entry in &raw.column_domains {
+            let column = decode_column(
+                entry.column.as_ref().ok_or_else(|| {
+                    codec_error(
+                        "tuple_domain.column",
+                        ConnectorCodecErrorKind::MissingField,
+                        "column domain requires a column",
+                    )
+                })?,
+                context,
+            )?;
+            let domain = decode_domain(
+                entry.domain.as_ref().ok_or_else(|| {
+                    codec_error(
+                        "tuple_domain.domain",
+                        ConnectorCodecErrorKind::MissingField,
+                        "column domain requires a value domain",
+                    )
+                })?,
+                context,
+            )?;
+            context.flush_compile_control()?;
+            let duplicate = domains.insert(column, domain).is_some();
+            context.observe_compile_step()?;
+            if duplicate {
+                return Err(codec_error(
+                    "tuple_domain.column",
+                    ConnectorCodecErrorKind::DuplicateField,
+                    "tuple domain repeats an Iceberg column",
+                ));
+            }
         }
-    }
-    TupleDomain::with_column_domains(domains).map_err(|error| domain_error("tuple_domain", error))
+        {
+            let opaque_arguments = (domains,);
+            observe_opaque(context, || {
+                TupleDomain::with_column_domains(opaque_arguments.0)
+            })?
+        }
+        .map_err(|error| domain_error("tuple_domain", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_domain(value: &Domain) -> dto::Domain {
@@ -1230,29 +1374,44 @@ fn encode_domain(value: &Domain) -> dto::Domain {
     }
 }
 
-fn decode_domain(raw: &dto::Domain) -> Result<Domain, ConnectorCodecError> {
-    let raw_values = raw.values.as_ref().ok_or_else(|| {
-        codec_error(
-            "domain.values",
-            ConnectorCodecErrorKind::MissingField,
-            "domain requires a value set",
-        )
-    })?;
-    let value_type = decode_value_type(raw_values.value_type.as_ref().ok_or_else(|| {
-        codec_error(
-            "value_set.value_type",
-            ConnectorCodecErrorKind::MissingField,
-            "value set requires an exact type",
-        )
-    })?)?;
-    let ranges = raw_values
-        .ranges
-        .iter()
-        .map(|range| decode_range(range, value_type))
-        .collect::<Result<Vec<_>, _>>()?;
-    let values = ValueSet::of_ranges(value_type, ranges)
+fn decode_domain(
+    raw: &dto::Domain,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<Domain, ConnectorCodecError> {
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        let raw_values = raw.values.as_ref().ok_or_else(|| {
+            codec_error(
+                "domain.values",
+                ConnectorCodecErrorKind::MissingField,
+                "domain requires a value set",
+            )
+        })?;
+        let value_type = decode_value_type(
+            raw_values.value_type.as_ref().ok_or_else(|| {
+                codec_error(
+                    "value_set.value_type",
+                    ConnectorCodecErrorKind::MissingField,
+                    "value set requires an exact type",
+                )
+            })?,
+            context,
+        )?;
+        let ranges = convert_slice(&raw_values.ranges, context, |range, context| {
+            decode_range(range, value_type, context)
+        })?;
+        let values = {
+            let opaque_arguments = (value_type, ranges);
+            observe_opaque(context, || {
+                ValueSet::of_ranges(opaque_arguments.0, opaque_arguments.1)
+            })?
+        }
         .map_err(|error| domain_error("value_set", error))?;
-    Ok(Domain::new(values, raw.null_allowed))
+        Ok(Domain::new(values, raw.null_allowed))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_range(value: &Range) -> dto::Range {
@@ -1265,31 +1424,45 @@ fn encode_range(value: &Range) -> dto::Range {
 fn decode_range(
     raw: &dto::Range,
     value_type: ConnectorValueType,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<Range, ConnectorCodecError> {
-    Range::try_new(
-        value_type,
-        decode_bound(
-            raw.low.as_ref().ok_or_else(|| {
-                codec_error(
-                    "range.low",
-                    ConnectorCodecErrorKind::MissingField,
-                    "range requires its low bound",
-                )
-            })?,
-            value_type,
-        )?,
-        decode_bound(
-            raw.high.as_ref().ok_or_else(|| {
-                codec_error(
-                    "range.high",
-                    ConnectorCodecErrorKind::MissingField,
-                    "range requires its high bound",
-                )
-            })?,
-            value_type,
-        )?,
-    )
-    .map_err(|error| domain_error("range", error))
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        {
+            let opaque_arguments = (
+                value_type,
+                decode_bound(
+                    raw.low.as_ref().ok_or_else(|| {
+                        codec_error(
+                            "range.low",
+                            ConnectorCodecErrorKind::MissingField,
+                            "range requires its low bound",
+                        )
+                    })?,
+                    value_type,
+                    context,
+                )?,
+                decode_bound(
+                    raw.high.as_ref().ok_or_else(|| {
+                        codec_error(
+                            "range.high",
+                            ConnectorCodecErrorKind::MissingField,
+                            "range requires its high bound",
+                        )
+                    })?,
+                    value_type,
+                    context,
+                )?,
+            );
+            observe_opaque(context, || {
+                Range::try_new(opaque_arguments.0, opaque_arguments.1, opaque_arguments.2)
+            })?
+        }
+        .map_err(|error| domain_error("range", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_bound(value: &Bound) -> dto::Bound {
@@ -1312,8 +1485,11 @@ fn encode_bound(value: &Bound) -> dto::Bound {
 fn decode_bound(
     raw: &dto::Bound,
     value_type: ConnectorValueType,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<Bound, ConnectorCodecError> {
-    match dto::BoundKind::try_from(raw.kind) {
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| match dto::BoundKind::try_from(raw.kind) {
         Ok(dto::BoundKind::Unbounded) => {
             if raw.value.is_some() {
                 return Err(codec_error(
@@ -1333,6 +1509,7 @@ fn decode_bound(
                 )
             })?,
             value_type,
+            context,
         )?)),
         Ok(dto::BoundKind::Exclusive) => Ok(Bound::Exclusive(decode_value(
             raw.value.as_ref().ok_or_else(|| {
@@ -1343,13 +1520,16 @@ fn decode_bound(
                 )
             })?,
             value_type,
+            context,
         )?)),
         Ok(dto::BoundKind::Unspecified) | Err(_) => Err(codec_error(
             "bound.kind",
             ConnectorCodecErrorKind::InvalidEnum,
             "range bound kind must be known",
         )),
-    }
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_schema_name(value: &SchemaTableName) -> dto::SchemaTableName {
@@ -1359,9 +1539,23 @@ fn encode_schema_name(value: &SchemaTableName) -> dto::SchemaTableName {
     }
 }
 
-fn decode_schema_name(raw: &dto::SchemaTableName) -> Result<SchemaTableName, ConnectorCodecError> {
-    SchemaTableName::try_new(&raw.schema_name, &raw.table_name)
+fn decode_schema_name(
+    raw: &dto::SchemaTableName,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<SchemaTableName, ConnectorCodecError> {
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        {
+            let opaque_arguments = (&raw.schema_name, &raw.table_name);
+            observe_opaque(context, || {
+                SchemaTableName::try_new(opaque_arguments.0, opaque_arguments.1)
+            })?
+        }
         .map_err(|error| domain_error("schema_table_name", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_transaction(value: &HiveTransactionHandle) -> dto::HiveTransactionHandle {
@@ -1373,15 +1567,22 @@ fn encode_transaction(value: &HiveTransactionHandle) -> dto::HiveTransactionHand
 
 fn decode_transaction(
     raw: &dto::HiveTransactionHandle,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<HiveTransactionHandle, ConnectorCodecError> {
-    let uuid: [u8; 16] = raw.uuid.as_slice().try_into().map_err(|_| {
-        codec_error(
-            "read_view.transaction.uuid",
-            ConnectorCodecErrorKind::InvalidValue,
-            "Iceberg transaction UUID must contain exactly 16 bytes",
-        )
-    })?;
-    Ok(HiveTransactionHandle::new(raw.auto_commit, uuid))
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        let uuid: [u8; 16] = raw.uuid.as_slice().try_into().map_err(|_| {
+            codec_error(
+                "read_view.transaction.uuid",
+                ConnectorCodecErrorKind::InvalidValue,
+                "Iceberg transaction UUID must contain exactly 16 bytes",
+            )
+        })?;
+        Ok(HiveTransactionHandle::new(raw.auto_commit, uuid))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_table(value: &IcebergTableHandle) -> dto::IcebergTableHandle {
@@ -1394,6 +1595,9 @@ fn encode_table(value: &IcebergTableHandle) -> dto::IcebergTableHandle {
         read_domain: value.read_domain().map(|domain| encode_read_domain(domain)),
         schema_table_name: Some(encode_schema_name(value.schema_table_name())),
         snapshot_id: value.snapshot_id(),
+        frozen_cow_source: value
+            .frozen_cow_source()
+            .map(crate::typed_read::cow_source_proof::IcebergCowSourceProof::to_proto),
         table_schema_json: value.table_schema_json().to_string(),
         spec_id: value.spec_id(),
         partition_spec_jsons: value
@@ -1425,86 +1629,155 @@ fn encode_table(value: &IcebergTableHandle) -> dto::IcebergTableHandle {
     }
 }
 
-fn decode_table(raw: &dto::IcebergTableHandle) -> Result<IcebergTableHandle, ConnectorCodecError> {
-    let projected_columns = raw
-        .projected_columns
-        .iter()
-        .map(decode_column)
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    let pinned_data_files = raw
-        .pinned_data_files
-        .as_ref()
-        .map(|files| crate::typed_read::IcebergPinnedDataFileSet::try_new(&files.paths))
-        .transpose()
-        .map_err(|error| domain_error("iceberg_table.pinned_data_files", error))?;
-    IcebergTableHandle::try_new(IcebergTableHandleParams {
-        read_domain: raw
-            .read_domain
+fn decode_cow_source_proof(
+    raw: &dto::IcebergCowSourceProof,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<crate::typed_read::cow_source_proof::IcebergCowSourceProof, ConnectorCodecError> {
+    use crate::typed_read::cow_source_proof::IcebergCowSourceProof;
+    let result = (|| {
+        let digest = raw.source_digest.as_slice().try_into().map_err(|_| {
+            codec_error(
+                "iceberg_table.frozen_cow_source.source_digest",
+                ConnectorCodecErrorKind::InvalidValue,
+                "Iceberg COW source digest must be 32 bytes",
+            )
+        })?;
+        let base = raw.signed_base.as_slice().try_into().map_err(|_| {
+            codec_error(
+                "iceberg_table.frozen_cow_source.signed_base",
+                ConnectorCodecErrorKind::InvalidValue,
+                "Iceberg COW signed base must be 32 bytes",
+            )
+        })?;
+        if raw.metadata_columns.len() > 4 {
+            return Err(codec_error(
+                "iceberg_table.frozen_cow_source.metadata_columns",
+                ConnectorCodecErrorKind::InvalidValue,
+                "Iceberg COW metadata proof exceeds its original four-field shape",
+            ));
+        }
+        // Admit the actual typed representation before its Vec/path copies.
+        // These decode limits do not confer execution memory capacity.
+        context.ledger().charge_retained(
+            size_of::<IcebergCowSourceProof>()
+                + raw.metadata_columns.len() * size_of::<IcebergColumnHandle>(),
+        )?;
+        let path = copy_string(&raw.data_file_path, context)?;
+        let mut columns = Vec::with_capacity(raw.metadata_columns.len());
+        for column in &raw.metadata_columns {
+            columns.push(decode_column(column, context)?);
+            context.observe_compile_step()?;
+        }
+        observe_opaque(context, || {
+            IcebergCowSourceProof::try_new(digest, base, path, columns)
+        })?
+        .map_err(|error| domain_error("iceberg_table.frozen_cow_source", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
+}
+
+fn decode_table(
+    raw: &dto::IcebergTableHandle,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<IcebergTableHandle, ConnectorCodecError> {
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        let mut projected_columns = BTreeSet::new();
+        for column in &raw.projected_columns {
+            let column = decode_column(column, context)?;
+            context.flush_compile_control()?;
+            projected_columns.insert(column);
+            context.observe_compile_step()?;
+        }
+        let pinned_data_files = raw
+            .pinned_data_files
             .as_ref()
-            .map(decode_read_domain)
-            .transpose()
-            .map_err(|e| domain_error("iceberg_table.read_domain", e))?,
-        schema_table_name: decode_schema_name(raw.schema_table_name.as_ref().ok_or_else(
-            || {
-                codec_error(
-                    "iceberg_table.schema_table_name",
-                    ConnectorCodecErrorKind::MissingField,
-                    "Iceberg table requires a schema table name",
-                )
-            },
-        )?)?,
-        snapshot_id: raw.snapshot_id,
-        table_schema_json: raw.table_schema_json.clone(),
-        spec_id: raw.spec_id,
-        partition_spec_jsons: raw
-            .partition_spec_jsons
-            .iter()
-            .map(|(key, value)| (*key, value.clone()))
-            .collect(),
-        format_version: raw.format_version,
-        unenforced_predicate: decode_tuple_domain(raw.unenforced_predicate.as_ref().ok_or_else(
-            || {
-                codec_error(
-                    "iceberg_table.unenforced_predicate",
-                    ConnectorCodecErrorKind::MissingField,
-                    "Iceberg table requires an unenforced predicate",
-                )
-            },
-        )?)?,
-        enforced_predicate: decode_tuple_domain(raw.enforced_predicate.as_ref().ok_or_else(
-            || {
-                codec_error(
-                    "iceberg_table.enforced_predicate",
-                    ConnectorCodecErrorKind::MissingField,
-                    "Iceberg table requires an enforced predicate",
-                )
-            },
-        )?)?,
-        limit: raw.limit,
-        projected_columns,
-        name_mapping_json: raw.name_mapping_json.clone(),
-        table_location: raw.table_location.clone(),
-        storage_properties: raw
-            .storage_properties
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-        pinned_data_files,
-    })
-    .and_then(|table| {
-        table.with_scalar_integer_domains(
-            raw.scalar_integer_domains
-                .iter()
-                .map(|(id, value)| {
-                    Ok((
-                        *id,
-                        crate::scalar_integer_domain::ScalarIntegerDomain::parse(value)?,
-                    ))
-                })
-                .collect::<Result<_, novarocks_spi::connector::ConnectorError>>()?,
-        )
-    })
-    .map_err(|error| domain_error("iceberg_table", error))
+            .map(|files| {
+                observe_opaque(context, || {
+                    crate::typed_read::IcebergPinnedDataFileSet::try_new(&files.paths)
+                })?
+                .map_err(|error| domain_error("iceberg_table.pinned_data_files", error))
+            })
+            .transpose()?;
+        let parameters = IcebergTableHandleParams {
+            read_domain: raw
+                .read_domain
+                .as_ref()
+                .map(|raw| decode_read_domain_observed(raw, context, "iceberg_table.read_domain"))
+                .transpose()?,
+            schema_table_name: decode_schema_name(
+                raw.schema_table_name.as_ref().ok_or_else(|| {
+                    codec_error(
+                        "iceberg_table.schema_table_name",
+                        ConnectorCodecErrorKind::MissingField,
+                        "Iceberg table requires a schema table name",
+                    )
+                })?,
+                context,
+            )?,
+            snapshot_id: raw.snapshot_id,
+            table_schema_json: copy_string(&raw.table_schema_json, context)?,
+            spec_id: raw.spec_id,
+            partition_spec_jsons: copy_i32_string_map(&raw.partition_spec_jsons, context)?,
+            format_version: raw.format_version,
+            unenforced_predicate: decode_tuple_domain(
+                raw.unenforced_predicate.as_ref().ok_or_else(|| {
+                    codec_error(
+                        "iceberg_table.unenforced_predicate",
+                        ConnectorCodecErrorKind::MissingField,
+                        "Iceberg table requires an unenforced predicate",
+                    )
+                })?,
+                context,
+            )?,
+            enforced_predicate: decode_tuple_domain(
+                raw.enforced_predicate.as_ref().ok_or_else(|| {
+                    codec_error(
+                        "iceberg_table.enforced_predicate",
+                        ConnectorCodecErrorKind::MissingField,
+                        "Iceberg table requires an enforced predicate",
+                    )
+                })?,
+                context,
+            )?,
+            limit: raw.limit,
+            projected_columns,
+            name_mapping_json: raw
+                .name_mapping_json
+                .as_deref()
+                .map(|value| copy_string(value, context))
+                .transpose()?,
+            table_location: copy_string(&raw.table_location, context)?,
+            storage_properties: copy_string_map(&raw.storage_properties, context)?,
+            pinned_data_files,
+        };
+        let table = observe_opaque(context, || IcebergTableHandle::try_new(parameters))?
+            .map_err(|error| domain_error("iceberg_table", error))?;
+        let mut scalar_integer_domains = BTreeMap::new();
+        for (id, value) in &raw.scalar_integer_domains {
+            let domain = observe_opaque(context, || {
+                crate::scalar_integer_domain::ScalarIntegerDomain::parse(value)
+            })?
+            .map_err(|error| domain_error("iceberg_table", error))?;
+            scalar_integer_domains.insert(*id, domain);
+            context.observe_compile_step()?;
+        }
+        let table = observe_opaque(context, || {
+            table.with_scalar_integer_domains(scalar_integer_domains)
+        })?
+        .map_err(|error| domain_error("iceberg_table", error))?;
+        let source = raw
+            .frozen_cow_source
+            .as_ref()
+            .map(|source| decode_cow_source_proof(source, context))
+            .transpose()?;
+        observe_opaque(context, || table.with_frozen_cow_source(source))?
+            .map_err(|error| domain_error("iceberg_table.frozen_cow_source", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_table_function(value: &TableChangesFunctionHandle) -> dto::TableChangesFunctionHandle {
@@ -1520,28 +1793,41 @@ fn encode_table_function(value: &TableChangesFunctionHandle) -> dto::TableChange
 
 fn decode_table_function(
     raw: &dto::TableChangesFunctionHandle,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<TableChangesFunctionHandle, ConnectorCodecError> {
-    TableChangesFunctionHandle::try_new(TableChangesFunctionHandleParams {
-        schema_table_name: decode_schema_name(raw.schema_table_name.as_ref().ok_or_else(
-            || {
-                codec_error(
-                    "table_changes.schema_table_name",
-                    ConnectorCodecErrorKind::MissingField,
-                    "table_changes requires a schema table name",
-                )
-            },
-        )?)?,
-        table_schema_json: raw.table_schema_json.clone(),
-        columns: raw
-            .columns
-            .iter()
-            .map(decode_column)
-            .collect::<Result<Vec<_>, _>>()?,
-        name_mapping_json: raw.name_mapping_json.clone(),
-        start_snapshot_id: raw.start_snapshot_id,
-        end_snapshot_id: raw.end_snapshot_id,
-    })
-    .map_err(|error| domain_error("table_changes", error))
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        {
+            let opaque_arguments = (TableChangesFunctionHandleParams {
+                schema_table_name: decode_schema_name(
+                    raw.schema_table_name.as_ref().ok_or_else(|| {
+                        codec_error(
+                            "table_changes.schema_table_name",
+                            ConnectorCodecErrorKind::MissingField,
+                            "table_changes requires a schema table name",
+                        )
+                    })?,
+                    context,
+                )?,
+                table_schema_json: copy_string(&raw.table_schema_json, context)?,
+                columns: convert_slice(&raw.columns, context, decode_column)?,
+                name_mapping_json: raw
+                    .name_mapping_json
+                    .as_deref()
+                    .map(|value| copy_string(value, context))
+                    .transpose()?,
+                start_snapshot_id: raw.start_snapshot_id,
+                end_snapshot_id: raw.end_snapshot_id,
+            },);
+            observe_opaque(context, || {
+                TableChangesFunctionHandle::try_new(opaque_arguments.0)
+            })?
+        }
+        .map_err(|error| domain_error("table_changes", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_change_window(value: &IcebergChangeWindowHandle) -> dto::IcebergChangeWindowHandle {
@@ -1564,49 +1850,64 @@ fn encode_change_window(value: &IcebergChangeWindowHandle) -> dto::IcebergChange
 
 fn decode_change_window(
     raw: &dto::IcebergChangeWindowHandle,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<IcebergChangeWindowHandle, ConnectorCodecError> {
-    IcebergChangeWindowHandle::try_new(IcebergChangeWindowHandleParams {
-        from_read_domain: decode_read_domain(raw.from_read_domain.as_ref().ok_or_else(|| {
-            codec_error(
-                "change_window.from_read_domain",
-                ConnectorCodecErrorKind::MissingField,
-                "change window requires From domain",
-            )
-        })?)
-        .map_err(|e| domain_error("change_window.from_read_domain", e))?,
-        to_read_domain: decode_read_domain(raw.to_read_domain.as_ref().ok_or_else(|| {
-            codec_error(
-                "change_window.to_read_domain",
-                ConnectorCodecErrorKind::MissingField,
-                "change window requires To domain",
-            )
-        })?)
-        .map_err(|e| domain_error("change_window.to_read_domain", e))?,
-        schema_table_name: decode_schema_name(raw.schema_table_name.as_ref().ok_or_else(
-            || {
-                codec_error(
-                    "change_window.schema_table_name",
-                    ConnectorCodecErrorKind::MissingField,
-                    "change window requires a schema table name",
-                )
-            },
-        )?)?,
-        table_schema_json: raw.table_schema_json.clone(),
-        columns: raw
-            .columns
-            .iter()
-            .map(decode_column)
-            .collect::<Result<Vec<_>, _>>()?,
-        name_mapping_json: raw.name_mapping_json.clone(),
-        from_snapshot_id_exclusive: raw.from_snapshot_id_exclusive,
-        to_snapshot_id_inclusive: raw.to_snapshot_id_inclusive,
-        partition_spec_jsons: raw
-            .partition_spec_jsons
-            .iter()
-            .map(|(key, value)| (*key, value.clone()))
-            .collect(),
-    })
-    .map_err(|error| domain_error("change_window", error))
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        {
+            let opaque_arguments = (IcebergChangeWindowHandleParams {
+                from_read_domain: decode_read_domain_observed(
+                    raw.from_read_domain.as_ref().ok_or_else(|| {
+                        codec_error(
+                            "change_window.from_read_domain",
+                            ConnectorCodecErrorKind::MissingField,
+                            "change window requires From domain",
+                        )
+                    })?,
+                    context,
+                    "change_window.from_read_domain",
+                )?,
+                to_read_domain: decode_read_domain_observed(
+                    raw.to_read_domain.as_ref().ok_or_else(|| {
+                        codec_error(
+                            "change_window.to_read_domain",
+                            ConnectorCodecErrorKind::MissingField,
+                            "change window requires To domain",
+                        )
+                    })?,
+                    context,
+                    "change_window.to_read_domain",
+                )?,
+                schema_table_name: decode_schema_name(
+                    raw.schema_table_name.as_ref().ok_or_else(|| {
+                        codec_error(
+                            "change_window.schema_table_name",
+                            ConnectorCodecErrorKind::MissingField,
+                            "change window requires a schema table name",
+                        )
+                    })?,
+                    context,
+                )?,
+                table_schema_json: copy_string(&raw.table_schema_json, context)?,
+                columns: convert_slice(&raw.columns, context, decode_column)?,
+                name_mapping_json: raw
+                    .name_mapping_json
+                    .as_deref()
+                    .map(|value| copy_string(value, context))
+                    .transpose()?,
+                from_snapshot_id_exclusive: raw.from_snapshot_id_exclusive,
+                to_snapshot_id_inclusive: raw.to_snapshot_id_inclusive,
+                partition_spec_jsons: copy_i32_string_map(&raw.partition_spec_jsons, context)?,
+            },);
+            observe_opaque(context, || {
+                IcebergChangeWindowHandle::try_new(opaque_arguments.0)
+            })?
+        }
+        .map_err(|error| domain_error("change_window", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_system_table(value: &IcebergSystemTableReference) -> dto::IcebergSystemTableReference {
@@ -1629,39 +1930,52 @@ fn encode_system_table(value: &IcebergSystemTableReference) -> dto::IcebergSyste
 
 fn decode_system_table(
     raw: &dto::IcebergSystemTableReference,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<IcebergSystemTableReference, ConnectorCodecError> {
-    let system_table_type = match dto::IcebergSystemTableType::try_from(raw.system_table_type) {
-        Ok(dto::IcebergSystemTableType::Files) => IcebergSystemTableType::Files,
-        Ok(dto::IcebergSystemTableType::Entries) => IcebergSystemTableType::Entries,
-        Ok(dto::IcebergSystemTableType::Snapshots) => IcebergSystemTableType::Snapshots,
-        Ok(dto::IcebergSystemTableType::History) => IcebergSystemTableType::History,
-        Ok(dto::IcebergSystemTableType::Refs) => IcebergSystemTableType::Refs,
-        Ok(dto::IcebergSystemTableType::Manifests) => IcebergSystemTableType::Manifests,
-        Ok(dto::IcebergSystemTableType::Partitions) => IcebergSystemTableType::Partitions,
-        Ok(dto::IcebergSystemTableType::Unspecified) | Err(_) => {
-            return Err(codec_error(
-                "system_table.system_table_type",
-                ConnectorCodecErrorKind::InvalidEnum,
-                "Iceberg system table type must be known",
-            ));
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        let system_table_type = match dto::IcebergSystemTableType::try_from(raw.system_table_type) {
+            Ok(dto::IcebergSystemTableType::Files) => IcebergSystemTableType::Files,
+            Ok(dto::IcebergSystemTableType::Entries) => IcebergSystemTableType::Entries,
+            Ok(dto::IcebergSystemTableType::Snapshots) => IcebergSystemTableType::Snapshots,
+            Ok(dto::IcebergSystemTableType::History) => IcebergSystemTableType::History,
+            Ok(dto::IcebergSystemTableType::Refs) => IcebergSystemTableType::Refs,
+            Ok(dto::IcebergSystemTableType::Manifests) => IcebergSystemTableType::Manifests,
+            Ok(dto::IcebergSystemTableType::Partitions) => IcebergSystemTableType::Partitions,
+            Ok(dto::IcebergSystemTableType::Unspecified) | Err(_) => {
+                return Err(codec_error(
+                    "system_table.system_table_type",
+                    ConnectorCodecErrorKind::InvalidEnum,
+                    "Iceberg system table type must be known",
+                ));
+            }
+        };
+        {
+            let opaque_arguments = (IcebergSystemTableReferenceParams {
+                schema_table_name: decode_schema_name(
+                    raw.schema_table_name.as_ref().ok_or_else(|| {
+                        codec_error(
+                            "system_table.schema_table_name",
+                            ConnectorCodecErrorKind::MissingField,
+                            "system table requires a schema table name",
+                        )
+                    })?,
+                    context,
+                )?,
+                system_table_type,
+                metadata_file_location: copy_string(&raw.metadata_file_location, context)?,
+                table_uuid: copy_string(&raw.table_uuid, context)?,
+                snapshot_id: raw.snapshot_id,
+            },);
+            observe_opaque(context, || {
+                IcebergSystemTableReference::try_new(opaque_arguments.0)
+            })?
         }
-    };
-    IcebergSystemTableReference::try_new(IcebergSystemTableReferenceParams {
-        schema_table_name: decode_schema_name(raw.schema_table_name.as_ref().ok_or_else(
-            || {
-                codec_error(
-                    "system_table.schema_table_name",
-                    ConnectorCodecErrorKind::MissingField,
-                    "system table requires a schema table name",
-                )
-            },
-        )?)?,
-        system_table_type,
-        metadata_file_location: raw.metadata_file_location.clone(),
-        table_uuid: raw.table_uuid.clone(),
-        snapshot_id: raw.snapshot_id,
-    })
-    .map_err(|error| domain_error("system_table", error))
+        .map_err(|error| domain_error("system_table", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_procedure(value: IcebergProcedureId) -> dto::IcebergProcedureId {
@@ -1680,8 +1994,13 @@ fn encode_procedure(value: IcebergProcedureId) -> dto::IcebergProcedureId {
     }
 }
 
-fn decode_procedure(raw: i32) -> Result<IcebergProcedureId, ConnectorCodecError> {
-    match dto::IcebergProcedureId::try_from(raw) {
+fn decode_procedure(
+    raw: i32,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<IcebergProcedureId, ConnectorCodecError> {
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = match dto::IcebergProcedureId::try_from(raw) {
         Ok(dto::IcebergProcedureId::Optimize) => Ok(IcebergProcedureId::Optimize),
         Ok(dto::IcebergProcedureId::OptimizeManifests) => Ok(IcebergProcedureId::OptimizeManifests),
         Ok(dto::IcebergProcedureId::DropExtendedStats) => Ok(IcebergProcedureId::DropExtendedStats),
@@ -1700,7 +2019,9 @@ fn decode_procedure(raw: i32) -> Result<IcebergProcedureId, ConnectorCodecError>
             ConnectorCodecErrorKind::InvalidEnum,
             "Iceberg procedure must be known",
         )),
-    }
+    };
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_table_execute(value: &IcebergTableExecuteHandle) -> dto::IcebergTableExecuteHandle {
@@ -1736,71 +2057,116 @@ fn encode_table_execute(value: &IcebergTableExecuteHandle) -> dto::IcebergTableE
 
 fn decode_table_execute(
     raw: &dto::IcebergTableExecuteHandle,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<IcebergTableExecuteHandle, ConnectorCodecError> {
-    let procedure_handle = match raw.procedure_handle.as_ref() {
-        None => None,
-        Some(dto::iceberg_table_execute_handle::ProcedureHandle::Optimize(handle)) => {
-            Some(IcebergTableExecuteProcedureHandle::Optimize(
-                IcebergOptimizeHandle::try_new(
-                    decode_table(handle.table_handle.as_ref().ok_or_else(|| {
-                        codec_error(
-                            "table_execute.optimize.table_handle",
-                            ConnectorCodecErrorKind::MissingField,
-                            "Iceberg optimize requires a table handle",
-                        )
-                    })?)?,
-                    handle.min_file_size_bytes,
-                )
-                .map_err(|error| domain_error("table_execute.optimize", error))?,
-            ))
-        }
-        Some(dto::iceberg_table_execute_handle::ProcedureHandle::RewritePositionDeleteFiles(
-            handle,
-        )) => {
-            let artifact = handle.artifact.as_ref().ok_or_else(|| {
-                codec_error(
-                    "table_execute.rewrite.artifact",
-                    ConnectorCodecErrorKind::MissingField,
-                    "Iceberg rewrite requires its content identity",
-                )
-            })?;
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        let procedure_handle = match raw.procedure_handle.as_ref() {
+            None => None,
+            Some(dto::iceberg_table_execute_handle::ProcedureHandle::Optimize(handle)) => {
+                Some(IcebergTableExecuteProcedureHandle::Optimize(
+                    {
+                        let opaque_arguments = (
+                            decode_table(
+                                handle.table_handle.as_ref().ok_or_else(|| {
+                                    codec_error(
+                                        "table_execute.optimize.table_handle",
+                                        ConnectorCodecErrorKind::MissingField,
+                                        "Iceberg optimize requires a table handle",
+                                    )
+                                })?,
+                                context,
+                            )?,
+                            handle.min_file_size_bytes,
+                        );
+                        observe_opaque(context, || {
+                            IcebergOptimizeHandle::try_new(opaque_arguments.0, opaque_arguments.1)
+                        })?
+                    }
+                    .map_err(|error| domain_error("table_execute.optimize", error))?,
+                ))
+            }
             Some(
-                IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(
-                    IcebergRewritePositionDeleteFilesHandle::try_new(
-                        decode_table(handle.table_handle.as_ref().ok_or_else(|| {
-                            codec_error(
-                                "table_execute.rewrite.table_handle",
-                                ConnectorCodecErrorKind::MissingField,
-                                "Iceberg rewrite requires a table handle",
-                            )
-                        })?)?,
-                        IcebergRewriteArtifactContentId::try_new(
-                            &artifact.artifact_location,
-                            &artifact.artifact_digest_hex,
-                        )
-                        .map_err(|error| domain_error("table_execute.rewrite.artifact", error))?,
-                        &handle.group_digest_hex,
-                    )
-                    .map_err(|error| domain_error("table_execute.rewrite", error))?,
+                dto::iceberg_table_execute_handle::ProcedureHandle::RewritePositionDeleteFiles(
+                    handle,
                 ),
-            )
-        }
-    };
-    IcebergTableExecuteHandle::try_new(IcebergTableExecuteHandleParams {
-        schema_table_name: decode_schema_name(raw.schema_table_name.as_ref().ok_or_else(
-            || {
-                codec_error(
-                    "table_execute.schema_table_name",
-                    ConnectorCodecErrorKind::MissingField,
-                    "Iceberg table execute requires a schema table name",
+            ) => {
+                let artifact = handle.artifact.as_ref().ok_or_else(|| {
+                    codec_error(
+                        "table_execute.rewrite.artifact",
+                        ConnectorCodecErrorKind::MissingField,
+                        "Iceberg rewrite requires its content identity",
+                    )
+                })?;
+                Some(
+                    IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(
+                        {
+                            let opaque_arguments = (
+                                decode_table(
+                                    handle.table_handle.as_ref().ok_or_else(|| {
+                                        codec_error(
+                                            "table_execute.rewrite.table_handle",
+                                            ConnectorCodecErrorKind::MissingField,
+                                            "Iceberg rewrite requires a table handle",
+                                        )
+                                    })?,
+                                    context,
+                                )?,
+                                {
+                                    let opaque_arguments = (
+                                        &artifact.artifact_location,
+                                        &artifact.artifact_digest_hex,
+                                    );
+                                    observe_opaque(context, || {
+                                        IcebergRewriteArtifactContentId::try_new(
+                                            opaque_arguments.0,
+                                            opaque_arguments.1,
+                                        )
+                                    })?
+                                }
+                                .map_err(|error| {
+                                    domain_error("table_execute.rewrite.artifact", error)
+                                })?,
+                                &handle.group_digest_hex,
+                            );
+                            observe_opaque(context, || {
+                                IcebergRewritePositionDeleteFilesHandle::try_new(
+                                    opaque_arguments.0,
+                                    opaque_arguments.1,
+                                    opaque_arguments.2,
+                                )
+                            })?
+                        }
+                        .map_err(|error| domain_error("table_execute.rewrite", error))?,
+                    ),
                 )
-            },
-        )?)?,
-        procedure_id: decode_procedure(raw.procedure_id)?,
-        table_location: raw.table_location.clone(),
-        procedure_handle,
-    })
-    .map_err(|error| domain_error("table_execute", error))
+            }
+        };
+        {
+            let opaque_arguments = (IcebergTableExecuteHandleParams {
+                schema_table_name: decode_schema_name(
+                    raw.schema_table_name.as_ref().ok_or_else(|| {
+                        codec_error(
+                            "table_execute.schema_table_name",
+                            ConnectorCodecErrorKind::MissingField,
+                            "Iceberg table execute requires a schema table name",
+                        )
+                    })?,
+                    context,
+                )?,
+                procedure_id: decode_procedure(raw.procedure_id, context)?,
+                table_location: copy_string(&raw.table_location, context)?,
+                procedure_handle,
+            },);
+            observe_opaque(context, || {
+                IcebergTableExecuteHandle::try_new(opaque_arguments.0)
+            })?
+        }
+        .map_err(|error| domain_error("table_execute", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_insert_handle(value: &IcebergInsertTableHandle) -> dto::IcebergInsertTableHandle {
@@ -1815,23 +2181,36 @@ fn encode_insert_handle(value: &IcebergInsertTableHandle) -> dto::IcebergInsertT
 
 fn decode_insert_handle(
     raw: &dto::IcebergInsertTableHandle,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<IcebergInsertTableHandle, ConnectorCodecError> {
-    IcebergInsertTableHandle::try_new(IcebergInsertTableHandleParams {
-        schema_table_name: decode_schema_name(raw.schema_table_name.as_ref().ok_or_else(
-            || {
-                codec_error(
-                    "merge.insert.schema_table_name",
-                    ConnectorCodecErrorKind::MissingField,
-                    "Iceberg insert handle requires a schema table name",
-                )
-            },
-        )?)?,
-        table_schema_json: raw.table_schema_json.clone(),
-        table_location: raw.table_location.clone(),
-        format_version: raw.format_version,
-        spec_id: raw.spec_id,
-    })
-    .map_err(|error| domain_error("merge.insert", error))
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        {
+            let opaque_arguments = (IcebergInsertTableHandleParams {
+                schema_table_name: decode_schema_name(
+                    raw.schema_table_name.as_ref().ok_or_else(|| {
+                        codec_error(
+                            "merge.insert.schema_table_name",
+                            ConnectorCodecErrorKind::MissingField,
+                            "Iceberg insert handle requires a schema table name",
+                        )
+                    })?,
+                    context,
+                )?,
+                table_schema_json: copy_string(&raw.table_schema_json, context)?,
+                table_location: copy_string(&raw.table_location, context)?,
+                format_version: raw.format_version,
+                spec_id: raw.spec_id,
+            },);
+            observe_opaque(context, || {
+                IcebergInsertTableHandle::try_new(opaque_arguments.0)
+            })?
+        }
+        .map_err(|error| domain_error("merge.insert", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_merge(value: &IcebergMergeTableHandle) -> dto::IcebergMergeTableHandle {
@@ -1843,24 +2222,42 @@ fn encode_merge(value: &IcebergMergeTableHandle) -> dto::IcebergMergeTableHandle
 
 fn decode_merge(
     raw: &dto::IcebergMergeTableHandle,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<IcebergMergeTableHandle, ConnectorCodecError> {
-    IcebergMergeTableHandle::try_new(
-        decode_table(raw.table_handle.as_ref().ok_or_else(|| {
-            codec_error(
-                "merge.table_handle",
-                ConnectorCodecErrorKind::MissingField,
-                "Iceberg merge requires a read table handle",
-            )
-        })?)?,
-        decode_insert_handle(raw.insert_table_handle.as_ref().ok_or_else(|| {
-            codec_error(
-                "merge.insert_table_handle",
-                ConnectorCodecErrorKind::MissingField,
-                "Iceberg merge requires an insert table handle",
-            )
-        })?)?,
-    )
-    .map_err(|error| domain_error("merge", error))
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        {
+            let opaque_arguments = (
+                decode_table(
+                    raw.table_handle.as_ref().ok_or_else(|| {
+                        codec_error(
+                            "merge.table_handle",
+                            ConnectorCodecErrorKind::MissingField,
+                            "Iceberg merge requires a read table handle",
+                        )
+                    })?,
+                    context,
+                )?,
+                decode_insert_handle(
+                    raw.insert_table_handle.as_ref().ok_or_else(|| {
+                        codec_error(
+                            "merge.insert_table_handle",
+                            ConnectorCodecErrorKind::MissingField,
+                            "Iceberg merge requires an insert table handle",
+                        )
+                    })?,
+                    context,
+                )?,
+            );
+            observe_opaque(context, || {
+                IcebergMergeTableHandle::try_new(opaque_arguments.0, opaque_arguments.1)
+            })?
+        }
+        .map_err(|error| domain_error("merge", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_relation(value: &IcebergRuntimeRelation) -> dto::IcebergReadTablePayload {
@@ -1891,8 +2288,11 @@ fn encode_relation(value: &IcebergRuntimeRelation) -> dto::IcebergReadTablePaylo
 
 fn decode_relation(
     raw: &dto::IcebergReadTablePayload,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<IcebergRuntimeRelation, ConnectorCodecError> {
-    match raw.relation.as_ref().ok_or_else(|| {
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| match raw.relation.as_ref().ok_or_else(|| {
         codec_error(
             "iceberg_read_table.relation",
             ConnectorCodecErrorKind::MissingField,
@@ -1900,24 +2300,26 @@ fn decode_relation(
         )
     })? {
         dto::iceberg_read_table_payload::Relation::Table(value) => {
-            Ok(IcebergRuntimeRelation::Table(decode_table(value)?))
+            Ok(IcebergRuntimeRelation::Table(decode_table(value, context)?))
         }
         dto::iceberg_read_table_payload::Relation::TableFunction(value) => Ok(
-            IcebergRuntimeRelation::TableFunction(decode_table_function(value)?),
+            IcebergRuntimeRelation::TableFunction(decode_table_function(value, context)?),
         ),
         dto::iceberg_read_table_payload::Relation::ChangeWindow(value) => Ok(
-            IcebergRuntimeRelation::ChangeWindow(decode_change_window(value)?),
+            IcebergRuntimeRelation::ChangeWindow(decode_change_window(value, context)?),
         ),
         dto::iceberg_read_table_payload::Relation::SystemTable(value) => Ok(
-            IcebergRuntimeRelation::SystemTable(decode_system_table(value)?),
+            IcebergRuntimeRelation::SystemTable(decode_system_table(value, context)?),
         ),
         dto::iceberg_read_table_payload::Relation::TableExecute(value) => Ok(
-            IcebergRuntimeRelation::TableExecute(decode_table_execute(value)?),
+            IcebergRuntimeRelation::TableExecute(decode_table_execute(value, context)?),
         ),
-        dto::iceberg_read_table_payload::Relation::MergeTable(value) => {
-            Ok(IcebergRuntimeRelation::MergeTable(decode_merge(value)?))
-        }
-    }
+        dto::iceberg_read_table_payload::Relation::MergeTable(value) => Ok(
+            IcebergRuntimeRelation::MergeTable(decode_merge(value, context)?),
+        ),
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_file_format(value: IcebergFileFormat) -> i32 {
@@ -1929,8 +2331,13 @@ fn encode_file_format(value: IcebergFileFormat) -> i32 {
     }) as i32
 }
 
-fn decode_file_format(raw: i32) -> Result<IcebergFileFormat, ConnectorCodecError> {
-    match dto::IcebergFileFormat::try_from(raw) {
+fn decode_file_format(
+    raw: i32,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<IcebergFileFormat, ConnectorCodecError> {
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = match dto::IcebergFileFormat::try_from(raw) {
         Ok(dto::IcebergFileFormat::Orc) => Ok(IcebergFileFormat::Orc),
         Ok(dto::IcebergFileFormat::Parquet) => Ok(IcebergFileFormat::Parquet),
         Ok(dto::IcebergFileFormat::Avro) => Ok(IcebergFileFormat::Avro),
@@ -1940,7 +2347,9 @@ fn decode_file_format(raw: i32) -> Result<IcebergFileFormat, ConnectorCodecError
             ConnectorCodecErrorKind::InvalidEnum,
             "Iceberg file format must be known",
         )),
-    }
+    };
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_decryption(value: &ParquetFileDecryptionData) -> dto::ParquetFileDecryptionData {
@@ -1952,9 +2361,24 @@ fn encode_decryption(value: &ParquetFileDecryptionData) -> dto::ParquetFileDecry
 
 fn decode_decryption(
     raw: &dto::ParquetFileDecryptionData,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<ParquetFileDecryptionData, ConnectorCodecError> {
-    ParquetFileDecryptionData::try_new(raw.key_metadata.clone(), raw.aad_prefix.clone())
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        {
+            let opaque_arguments = (
+                copy_slice(&raw.key_metadata, context)?,
+                copy_slice(&raw.aad_prefix, context)?,
+            );
+            observe_opaque(context, || {
+                ParquetFileDecryptionData::try_new(opaque_arguments.0, opaque_arguments.1)
+            })?
+        }
         .map_err(|error| domain_error("iceberg_split.decryption_data", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_delete(value: &IcebergDeleteFile) -> dto::IcebergDeleteFile {
@@ -1984,50 +2408,66 @@ fn encode_delete(value: &IcebergDeleteFile) -> dto::IcebergDeleteFile {
     }
 }
 
-fn decode_delete(raw: &dto::IcebergDeleteFile) -> Result<IcebergDeleteFile, ConnectorCodecError> {
-    let content = match dto::IcebergDeleteFileContent::try_from(raw.content) {
-        Ok(dto::IcebergDeleteFileContent::PositionDeletes) => {
-            IcebergDeleteFileContent::PositionDeletes
+fn decode_delete(
+    raw: &dto::IcebergDeleteFile,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<IcebergDeleteFile, ConnectorCodecError> {
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        let content = match dto::IcebergDeleteFileContent::try_from(raw.content) {
+            Ok(dto::IcebergDeleteFileContent::PositionDeletes) => {
+                IcebergDeleteFileContent::PositionDeletes
+            }
+            Ok(dto::IcebergDeleteFileContent::EqualityDeletes) => {
+                IcebergDeleteFileContent::EqualityDeletes
+            }
+            Ok(dto::IcebergDeleteFileContent::Unspecified) | Err(_) => {
+                return Err(codec_error(
+                    "iceberg_delete.content",
+                    ConnectorCodecErrorKind::InvalidEnum,
+                    "Iceberg delete content must be known",
+                ));
+            }
+        };
+        {
+            let opaque_arguments = (IcebergDeleteFileParams {
+                partition_spec_id: raw.partition_spec_id.ok_or_else(|| {
+                    codec_error(
+                        "iceberg_delete.partition_spec_id",
+                        ConnectorCodecErrorKind::MissingField,
+                        "Iceberg delete requires its own spec",
+                    )
+                })?,
+                partition_data_json: copy_string(&raw.partition_data_json, context)?,
+                content,
+                path: copy_string(&raw.path, context)?,
+                format: decode_file_format(raw.format, context)?,
+                record_count: raw.record_count,
+                file_size_in_bytes: raw.file_size_in_bytes,
+                equality_field_ids: copy_slice(&raw.equality_field_ids, context)?,
+                row_position_lower_bound: raw.row_position_lower_bound,
+                row_position_upper_bound: raw.row_position_upper_bound,
+                data_sequence_number: raw.data_sequence_number,
+                content_offset: raw.content_offset,
+                content_size_in_bytes: raw.content_size_in_bytes,
+                referenced_data_file: raw
+                    .referenced_data_file
+                    .as_deref()
+                    .map(|value| copy_string(value, context))
+                    .transpose()?,
+                decryption_data: raw
+                    .decryption_data
+                    .as_ref()
+                    .map(|value| decode_decryption(value, context))
+                    .transpose()?,
+            },);
+            observe_opaque(context, || IcebergDeleteFile::try_new(opaque_arguments.0))?
         }
-        Ok(dto::IcebergDeleteFileContent::EqualityDeletes) => {
-            IcebergDeleteFileContent::EqualityDeletes
-        }
-        Ok(dto::IcebergDeleteFileContent::Unspecified) | Err(_) => {
-            return Err(codec_error(
-                "iceberg_delete.content",
-                ConnectorCodecErrorKind::InvalidEnum,
-                "Iceberg delete content must be known",
-            ));
-        }
-    };
-    IcebergDeleteFile::try_new(IcebergDeleteFileParams {
-        partition_spec_id: raw.partition_spec_id.ok_or_else(|| {
-            codec_error(
-                "iceberg_delete.partition_spec_id",
-                ConnectorCodecErrorKind::MissingField,
-                "Iceberg delete requires its own spec",
-            )
-        })?,
-        partition_data_json: raw.partition_data_json.clone(),
-        content,
-        path: raw.path.clone(),
-        format: decode_file_format(raw.format)?,
-        record_count: raw.record_count,
-        file_size_in_bytes: raw.file_size_in_bytes,
-        equality_field_ids: raw.equality_field_ids.clone(),
-        row_position_lower_bound: raw.row_position_lower_bound,
-        row_position_upper_bound: raw.row_position_upper_bound,
-        data_sequence_number: raw.data_sequence_number,
-        content_offset: raw.content_offset,
-        content_size_in_bytes: raw.content_size_in_bytes,
-        referenced_data_file: raw.referenced_data_file.clone(),
-        decryption_data: raw
-            .decryption_data
-            .as_ref()
-            .map(decode_decryption)
-            .transpose()?,
-    })
-    .map_err(|error| domain_error("iceberg_delete", error))
+        .map_err(|error| domain_error("iceberg_delete", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_data_split(value: &IcebergSplit) -> Result<dto::IcebergSplit, ConnectorCodecError> {
@@ -2061,50 +2501,59 @@ fn decode_data_split(
     raw: &dto::IcebergSplit,
     split_weight: SplitWeight,
     affinity_key: Option<String>,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<IcebergSplit, ConnectorCodecError> {
-    IcebergSplit::try_new(IcebergSplitParams {
-        read_domain: decode_read_domain(raw.read_domain.as_ref().ok_or_else(|| {
-            codec_error(
-                "iceberg_split.read_domain",
-                ConnectorCodecErrorKind::MissingField,
-                "Iceberg split requires its domain",
-            )
-        })?)
-        .map_err(|e| domain_error("iceberg_split.read_domain", e))?,
-        path: raw.path.clone(),
-        start: raw.start,
-        length: raw.length,
-        file_size: raw.file_size,
-        file_record_count: raw.file_record_count,
-        file_format: decode_file_format(raw.file_format)?,
-        partition_spec_id: raw.partition_spec_id,
-        partition_data_json: raw.partition_data_json.clone(),
-        deletes: raw
-            .deletes
-            .iter()
-            .map(decode_delete)
-            .collect::<Result<Vec<_>, _>>()?
-            .into(),
-        file_statistics_domain: decode_tuple_domain(
-            raw.file_statistics_domain.as_ref().ok_or_else(|| {
-                codec_error(
-                    "iceberg_split.file_statistics_domain",
-                    ConnectorCodecErrorKind::MissingField,
-                    "Iceberg data split requires a statistics domain",
-                )
-            })?,
-        )?,
-        data_sequence_number: raw.data_sequence_number,
-        file_first_row_id: raw.file_first_row_id,
-        decryption_data: raw
-            .decryption_data
-            .as_ref()
-            .map(decode_decryption)
-            .transpose()?,
-        split_weight,
-        affinity_key,
-    })
-    .map_err(|error| domain_error("iceberg_split", error))
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        {
+            let opaque_arguments = (IcebergSplitParams {
+                read_domain: decode_read_domain_observed(
+                    raw.read_domain.as_ref().ok_or_else(|| {
+                        codec_error(
+                            "iceberg_split.read_domain",
+                            ConnectorCodecErrorKind::MissingField,
+                            "Iceberg split requires its domain",
+                        )
+                    })?,
+                    context,
+                    "iceberg_split.read_domain",
+                )?,
+                path: copy_string(&raw.path, context)?,
+                start: raw.start,
+                length: raw.length,
+                file_size: raw.file_size,
+                file_record_count: raw.file_record_count,
+                file_format: decode_file_format(raw.file_format, context)?,
+                partition_spec_id: raw.partition_spec_id,
+                partition_data_json: copy_string(&raw.partition_data_json, context)?,
+                deletes: convert_slice(&raw.deletes, context, decode_delete)?.into(),
+                file_statistics_domain: decode_tuple_domain(
+                    raw.file_statistics_domain.as_ref().ok_or_else(|| {
+                        codec_error(
+                            "iceberg_split.file_statistics_domain",
+                            ConnectorCodecErrorKind::MissingField,
+                            "Iceberg data split requires a statistics domain",
+                        )
+                    })?,
+                    context,
+                )?,
+                data_sequence_number: raw.data_sequence_number,
+                file_first_row_id: raw.file_first_row_id,
+                decryption_data: raw
+                    .decryption_data
+                    .as_ref()
+                    .map(|value| decode_decryption(value, context))
+                    .transpose()?,
+                split_weight,
+                affinity_key,
+            },);
+            observe_opaque(context, || IcebergSplit::try_new(opaque_arguments.0))?
+        }
+        .map_err(|error| domain_error("iceberg_split", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_table_changes_split(value: &TableChangesSplit) -> dto::TableChangesSplit {
@@ -2131,39 +2580,49 @@ fn encode_table_changes_split(value: &TableChangesSplit) -> dto::TableChangesSpl
 fn decode_table_changes_split(
     raw: &dto::TableChangesSplit,
     split_weight: SplitWeight,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<TableChangesSplit, ConnectorCodecError> {
-    let change_type = match dto::TableChangesChangeType::try_from(raw.change_type) {
-        Ok(dto::TableChangesChangeType::AddedFile) => TableChangesChangeType::AddedFile,
-        Ok(dto::TableChangesChangeType::DeletedFile) => TableChangesChangeType::DeletedFile,
-        Ok(dto::TableChangesChangeType::Unspecified) | Err(_) => {
-            return Err(codec_error(
-                "table_changes_split.change_type",
-                ConnectorCodecErrorKind::InvalidEnum,
-                "table_changes split type must be known",
-            ));
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        let change_type = match dto::TableChangesChangeType::try_from(raw.change_type) {
+            Ok(dto::TableChangesChangeType::AddedFile) => TableChangesChangeType::AddedFile,
+            Ok(dto::TableChangesChangeType::DeletedFile) => TableChangesChangeType::DeletedFile,
+            Ok(dto::TableChangesChangeType::Unspecified) | Err(_) => {
+                return Err(codec_error(
+                    "table_changes_split.change_type",
+                    ConnectorCodecErrorKind::InvalidEnum,
+                    "table_changes split type must be known",
+                ));
+            }
+        };
+        {
+            let opaque_arguments = (TableChangesSplitParams {
+                change_type,
+                snapshot_id: raw.snapshot_id,
+                snapshot_timestamp_millis: raw.snapshot_timestamp_millis,
+                change_ordinal: raw.change_ordinal,
+                path: copy_string(&raw.path, context)?,
+                start: raw.start,
+                length: raw.length,
+                file_size: raw.file_size,
+                file_record_count: raw.file_record_count,
+                file_format: decode_file_format(raw.file_format, context)?,
+                partition_spec_id: raw.partition_spec_id,
+                partition_data_json: copy_string(&raw.partition_data_json, context)?,
+                decryption_data: raw
+                    .decryption_data
+                    .as_ref()
+                    .map(|value| decode_decryption(value, context))
+                    .transpose()?,
+                split_weight,
+            },);
+            observe_opaque(context, || TableChangesSplit::try_new(opaque_arguments.0))?
         }
-    };
-    TableChangesSplit::try_new(TableChangesSplitParams {
-        change_type,
-        snapshot_id: raw.snapshot_id,
-        snapshot_timestamp_millis: raw.snapshot_timestamp_millis,
-        change_ordinal: raw.change_ordinal,
-        path: raw.path.clone(),
-        start: raw.start,
-        length: raw.length,
-        file_size: raw.file_size,
-        file_record_count: raw.file_record_count,
-        file_format: decode_file_format(raw.file_format)?,
-        partition_spec_id: raw.partition_spec_id,
-        partition_data_json: raw.partition_data_json.clone(),
-        decryption_data: raw
-            .decryption_data
-            .as_ref()
-            .map(decode_decryption)
-            .transpose()?,
-        split_weight,
-    })
-    .map_err(|error| domain_error("table_changes_split", error))
+        .map_err(|error| domain_error("table_changes_split", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_change_split(
@@ -2191,9 +2650,9 @@ fn encode_change_split(
     Ok(dto::IcebergChangeSplit { rows: Some(rows) })
 }
 
-fn required_data<'a>(
-    raw: Option<&'a dto::IcebergSplit>,
-) -> Result<&'a dto::IcebergSplit, ConnectorCodecError> {
+fn required_data(
+    raw: Option<&dto::IcebergSplit>,
+) -> Result<&dto::IcebergSplit, ConnectorCodecError> {
     raw.ok_or_else(|| {
         codec_error(
             "change_window_split.data",
@@ -2207,53 +2666,80 @@ fn decode_change_split(
     raw: &dto::IcebergChangeSplit,
     split_weight: SplitWeight,
     affinity_key: Option<String>,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<IcebergChangeSplit, ConnectorCodecError> {
-    use dto::iceberg_change_split::Rows;
-    match raw.rows.as_ref().ok_or_else(|| {
-        codec_error(
-            "change_window_split.rows",
-            ConnectorCodecErrorKind::MissingField,
-            "Iceberg change split requires one row variant",
-        )
-    })? {
-        Rows::AddedRows(rows) => Ok(IcebergChangeSplit::AddedRows(
-            IcebergAddedRows::try_new(
-                decode_data_split(
-                    required_data(rows.data.as_ref())?,
-                    split_weight,
-                    affinity_key,
-                )?,
-                rows.restricted_row_ids.clone(),
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        use dto::iceberg_change_split::Rows;
+        match raw.rows.as_ref().ok_or_else(|| {
+            codec_error(
+                "change_window_split.rows",
+                ConnectorCodecErrorKind::MissingField,
+                "Iceberg change split requires one row variant",
             )
-            .map_err(|error| domain_error("change_window_split.added_rows", error))?,
-        )),
-        Rows::VisibilityDifference(rows) => Ok(IcebergChangeSplit::VisibilityDifference(
-            IcebergVisibilityDifferenceRows::try_new(
-                decode_data_split(
-                    required_data(rows.data.as_ref())?,
-                    split_weight,
-                    affinity_key,
-                )?,
-                rows.from_deletes
-                    .iter()
-                    .map(decode_delete)
-                    .collect::<Result<Vec<_>, _>>()?,
-                rows.to_deletes
-                    .iter()
-                    .map(decode_delete)
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-            .map_err(|error| domain_error("change_window_split.visibility_difference", error))?,
-        )),
-        Rows::DeletedDataFileRows(rows) => Ok(IcebergChangeSplit::DeletedDataFileRows(
-            IcebergDeletedDataFileRows::try_new(decode_data_split(
-                required_data(rows.data.as_ref())?,
-                split_weight,
-                affinity_key,
-            )?)
-            .map_err(|error| domain_error("change_window_split.deleted_data_file_rows", error))?,
-        )),
-    }
+        })? {
+            Rows::AddedRows(rows) => Ok(IcebergChangeSplit::AddedRows(
+                {
+                    let opaque_arguments = (
+                        decode_data_split(
+                            required_data(rows.data.as_ref())?,
+                            split_weight,
+                            affinity_key,
+                            context,
+                        )?,
+                        copy_slice(&rows.restricted_row_ids, context)?,
+                    );
+                    observe_opaque(context, || {
+                        IcebergAddedRows::try_new(opaque_arguments.0, opaque_arguments.1)
+                    })?
+                }
+                .map_err(|error| domain_error("change_window_split.added_rows", error))?,
+            )),
+            Rows::VisibilityDifference(rows) => Ok(IcebergChangeSplit::VisibilityDifference(
+                {
+                    let opaque_arguments = (
+                        decode_data_split(
+                            required_data(rows.data.as_ref())?,
+                            split_weight,
+                            affinity_key,
+                            context,
+                        )?,
+                        convert_slice(&rows.from_deletes, context, decode_delete)?,
+                        convert_slice(&rows.to_deletes, context, decode_delete)?,
+                    );
+                    observe_opaque(context, || {
+                        IcebergVisibilityDifferenceRows::try_new(
+                            opaque_arguments.0,
+                            opaque_arguments.1,
+                            opaque_arguments.2,
+                        )
+                    })?
+                }
+                .map_err(|error| {
+                    domain_error("change_window_split.visibility_difference", error)
+                })?,
+            )),
+            Rows::DeletedDataFileRows(rows) => Ok(IcebergChangeSplit::DeletedDataFileRows(
+                {
+                    let opaque_arguments = (decode_data_split(
+                        required_data(rows.data.as_ref())?,
+                        split_weight,
+                        affinity_key,
+                        context,
+                    )?,);
+                    observe_opaque(context, || {
+                        IcebergDeletedDataFileRows::try_new(opaque_arguments.0)
+                    })?
+                }
+                .map_err(|error| {
+                    domain_error("change_window_split.deleted_data_file_rows", error)
+                })?,
+            )),
+        }
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_manifest(value: &TrinoManifestFile) -> dto::TrinoManifestFile {
@@ -2276,36 +2762,48 @@ fn encode_manifest(value: &TrinoManifestFile) -> dto::TrinoManifestFile {
     }
 }
 
-fn decode_manifest(raw: &dto::TrinoManifestFile) -> Result<TrinoManifestFile, ConnectorCodecError> {
-    let content = match raw.content {
-        0 => TrinoManifestContent::Data,
-        1 => TrinoManifestContent::Deletes,
-        _ => {
-            return Err(codec_error(
-                "files_split.manifest.content",
-                ConnectorCodecErrorKind::InvalidEnum,
-                "Iceberg manifest content must be data or deletes",
-            ));
+fn decode_manifest(
+    raw: &dto::TrinoManifestFile,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<TrinoManifestFile, ConnectorCodecError> {
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        let content = match raw.content {
+            0 => TrinoManifestContent::Data,
+            1 => TrinoManifestContent::Deletes,
+            _ => {
+                return Err(codec_error(
+                    "files_split.manifest.content",
+                    ConnectorCodecErrorKind::InvalidEnum,
+                    "Iceberg manifest content must be data or deletes",
+                ));
+            }
+        };
+        {
+            let opaque_arguments = (TrinoManifestFileParams {
+                path: copy_string(&raw.path, context)?,
+                length: raw.length,
+                partition_spec_id: raw.partition_spec_id,
+                content,
+                sequence_number: raw.sequence_number,
+                min_sequence_number: raw.min_sequence_number,
+                added_snapshot_id: raw.added_snapshot_id,
+                added_files_count: raw.added_files_count,
+                existing_files_count: raw.existing_files_count,
+                deleted_files_count: raw.deleted_files_count,
+                added_rows_count: raw.added_rows_count,
+                existing_rows_count: raw.existing_rows_count,
+                deleted_rows_count: raw.deleted_rows_count,
+                first_row_id: raw.first_row_id,
+                key_metadata: copy_slice(&raw.key_metadata, context)?,
+            },);
+            observe_opaque(context, || TrinoManifestFile::try_new(opaque_arguments.0))?
         }
-    };
-    TrinoManifestFile::try_new(TrinoManifestFileParams {
-        path: raw.path.clone(),
-        length: raw.length,
-        partition_spec_id: raw.partition_spec_id,
-        content,
-        sequence_number: raw.sequence_number,
-        min_sequence_number: raw.min_sequence_number,
-        added_snapshot_id: raw.added_snapshot_id,
-        added_files_count: raw.added_files_count,
-        existing_files_count: raw.existing_files_count,
-        deleted_files_count: raw.deleted_files_count,
-        added_rows_count: raw.added_rows_count,
-        existing_rows_count: raw.existing_rows_count,
-        deleted_rows_count: raw.deleted_rows_count,
-        first_row_id: raw.first_row_id,
-        key_metadata: raw.key_metadata.clone(),
-    })
-    .map_err(|error| domain_error("files_split.manifest", error))
+        .map_err(|error| domain_error("files_split.manifest", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_files_split(value: &FilesTableSplit) -> dto::FilesTableSplit {
@@ -2324,27 +2822,50 @@ fn encode_files_split(value: &FilesTableSplit) -> dto::FilesTableSplit {
     }
 }
 
-fn decode_files_split(raw: &dto::FilesTableSplit) -> Result<FilesTableSplit, ConnectorCodecError> {
-    FilesTableSplit::try_new(FilesTableSplitParams {
-        manifest: decode_manifest(raw.manifest.as_ref().ok_or_else(|| {
-            codec_error(
-                "files_split.manifest",
-                ConnectorCodecErrorKind::MissingField,
-                "Iceberg files split requires a manifest",
-            )
-        })?)?,
-        table_schema_json: raw.table_schema_json.clone(),
-        metadata_table_schema_json: raw.metadata_table_schema_json.clone(),
-        partition_spec_jsons: raw
-            .partition_spec_jsons
-            .iter()
-            .map(|(key, value)| (*key, value.clone()))
-            .collect(),
-        partition_column_type_json: raw.partition_column_type_json.clone(),
-        bounds_column_type_json: raw.bounds_column_type_json.clone(),
-        encryption_key_id: raw.encryption_key_id.clone(),
-    })
-    .map_err(|error| domain_error("files_split", error))
+fn decode_files_split(
+    raw: &dto::FilesTableSplit,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<FilesTableSplit, ConnectorCodecError> {
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        {
+            let opaque_arguments = (FilesTableSplitParams {
+                manifest: decode_manifest(
+                    raw.manifest.as_ref().ok_or_else(|| {
+                        codec_error(
+                            "files_split.manifest",
+                            ConnectorCodecErrorKind::MissingField,
+                            "Iceberg files split requires a manifest",
+                        )
+                    })?,
+                    context,
+                )?,
+                table_schema_json: copy_string(&raw.table_schema_json, context)?,
+                metadata_table_schema_json: copy_string(&raw.metadata_table_schema_json, context)?,
+                partition_spec_jsons: copy_i32_string_map(&raw.partition_spec_jsons, context)?,
+                partition_column_type_json: raw
+                    .partition_column_type_json
+                    .as_deref()
+                    .map(|value| copy_string(value, context))
+                    .transpose()?,
+                bounds_column_type_json: raw
+                    .bounds_column_type_json
+                    .as_deref()
+                    .map(|value| copy_string(value, context))
+                    .transpose()?,
+                encryption_key_id: raw
+                    .encryption_key_id
+                    .as_deref()
+                    .map(|value| copy_string(value, context))
+                    .transpose()?,
+            },);
+            observe_opaque(context, || FilesTableSplit::try_new(opaque_arguments.0))?
+        }
+        .map_err(|error| domain_error("files_split", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_rewrite_split(
@@ -2366,20 +2887,32 @@ fn encode_rewrite_split(
 fn decode_rewrite_split(
     raw: &dto::IcebergRewritePositionDeleteFilesSplit,
     split_weight: SplitWeight,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<IcebergRewritePositionDeleteFilesSplit, ConnectorCodecError> {
-    IcebergRewritePositionDeleteFilesSplit::try_new(IcebergRewritePositionDeleteFilesSplitParams {
-        data_file_path: raw.data_file_path.clone(),
-        data_file_size: raw.data_file_size,
-        partition_spec_id: raw.partition_spec_id,
-        partition_data_json: raw.partition_data_json.clone(),
-        selected_position_deletes: raw
-            .selected_position_deletes
-            .iter()
-            .map(decode_delete)
-            .collect::<Result<Vec<_>, _>>()?,
-        split_weight,
-    })
-    .map_err(|error| domain_error("rewrite_position_delete_files_split", error))
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        {
+            let opaque_arguments = (IcebergRewritePositionDeleteFilesSplitParams {
+                data_file_path: copy_string(&raw.data_file_path, context)?,
+                data_file_size: raw.data_file_size,
+                partition_spec_id: raw.partition_spec_id,
+                partition_data_json: copy_string(&raw.partition_data_json, context)?,
+                selected_position_deletes: convert_slice(
+                    &raw.selected_position_deletes,
+                    context,
+                    decode_delete,
+                )?,
+                split_weight,
+            },);
+            observe_opaque(context, || {
+                IcebergRewritePositionDeleteFilesSplit::try_new(opaque_arguments.0)
+            })?
+        }
+        .map_err(|error| domain_error("rewrite_position_delete_files_split", error))
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn encode_split(
@@ -2403,49 +2936,67 @@ fn encode_split(
 fn decode_split(
     raw: &dto::IcebergReadSplitPayload,
     facts: &novarocks_spi::connector::read_stack::ConnectorReadSplitFacts,
+    context: &mut ConnectorDecodeContext<'_>,
 ) -> Result<IcebergReadSplit, ConnectorCodecError> {
-    use dto::iceberg_read_split_payload::Split;
-    match raw.split.as_ref().ok_or_else(|| {
-        codec_error(
-            "iceberg_read_split.split",
-            ConnectorCodecErrorKind::MissingField,
-            "Iceberg private split payload requires one split",
-        )
-    })? {
-        Split::Data(value) => Ok(IcebergReadSplit::Data(decode_data_split(
-            value,
-            facts.split_weight(),
-            facts.affinity_key().map(str::to_string),
-        )?)),
-        Split::TableChanges(value) => {
-            require_no_affinity(facts, "table_changes_split")?;
-            Ok(IcebergReadSplit::TableChanges(decode_table_changes_split(
+    // Existing serde/domain/library operations remain opaque inside this boundary.
+    context.flush_compile_control()?;
+    let result = (|| {
+        use dto::iceberg_read_split_payload::Split;
+        match raw.split.as_ref().ok_or_else(|| {
+            codec_error(
+                "iceberg_read_split.split",
+                ConnectorCodecErrorKind::MissingField,
+                "Iceberg private split payload requires one split",
+            )
+        })? {
+            Split::Data(value) => Ok(IcebergReadSplit::Data(decode_data_split(
                 value,
                 facts.split_weight(),
-            )?))
-        }
-        Split::ChangeWindow(value) => Ok(IcebergReadSplit::ChangeWindow(decode_change_split(
-            value,
-            facts.split_weight(),
-            facts.affinity_key().map(str::to_string),
-        )?)),
-        Split::SystemFiles(value) => {
-            require_no_affinity(facts, "files_split")?;
-            if facts.split_weight() != SplitWeight::STANDARD {
-                return Err(codec_error(
-                    "files_split.split_weight",
-                    ConnectorCodecErrorKind::InconsistentFields,
-                    "Iceberg files split requires standard split weight",
-                ));
+                facts
+                    .affinity_key()
+                    .map(|value| copy_string(value, context))
+                    .transpose()?,
+                context,
+            )?)),
+            Split::TableChanges(value) => {
+                require_no_affinity(facts, "table_changes_split")?;
+                Ok(IcebergReadSplit::TableChanges(decode_table_changes_split(
+                    value,
+                    facts.split_weight(),
+                    context,
+                )?))
             }
-            Ok(IcebergReadSplit::SystemFiles(decode_files_split(value)?))
+            Split::ChangeWindow(value) => Ok(IcebergReadSplit::ChangeWindow(decode_change_split(
+                value,
+                facts.split_weight(),
+                facts
+                    .affinity_key()
+                    .map(|value| copy_string(value, context))
+                    .transpose()?,
+                context,
+            )?)),
+            Split::SystemFiles(value) => {
+                require_no_affinity(facts, "files_split")?;
+                if facts.split_weight() != SplitWeight::STANDARD {
+                    return Err(codec_error(
+                        "files_split.split_weight",
+                        ConnectorCodecErrorKind::InconsistentFields,
+                        "Iceberg files split requires standard split weight",
+                    ));
+                }
+                Ok(IcebergReadSplit::SystemFiles(decode_files_split(
+                    value, context,
+                )?))
+            }
+            Split::RewritePositionDeleteFiles(value) => {
+                Ok(IcebergReadSplit::RewritePositionDeleteFiles(
+                    decode_rewrite_split(value, facts.split_weight(), context)?,
+                ))
+            }
         }
-        Split::RewritePositionDeleteFiles(value) => {
-            Ok(IcebergReadSplit::RewritePositionDeleteFiles(
-                decode_rewrite_split(value, facts.split_weight())?,
-            ))
-        }
-    }
+    })();
+    context.observe_compile_step()?;
+    finish_decode(result, context)
 }
 
 fn validate_common_split_facts(
@@ -2492,6 +3043,116 @@ fn validate_materialized_split_facts(
         ));
     }
     Ok(())
+}
+
+// Copy only codec-owned backing cooperatively. Legacy runtime decoding keeps
+// its original fast-copy path; interruption never selects that path.
+fn copy_slice<T: Copy>(
+    values: &[T],
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<Vec<T>, ConnectorCodecError> {
+    if !context.is_compile_observed() {
+        return Ok(values.to_vec());
+    }
+    let mut result = Vec::with_capacity(values.len());
+    for value in values {
+        result.push(*value);
+        context.observe_compile_step()?;
+    }
+    Ok(result)
+}
+fn copy_string(
+    value: &str,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<String, ConnectorCodecError> {
+    if !context.is_compile_observed() {
+        return Ok(value.to_owned());
+    }
+    let mut result = String::with_capacity(value.len());
+    for character in value.chars() {
+        result.push(character);
+        context.observe_compile_step()?;
+    }
+    Ok(result)
+}
+fn copy_i32_string_map(
+    values: &BTreeMap<i32, String>,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<BTreeMap<i32, String>, ConnectorCodecError> {
+    if !context.is_compile_observed() {
+        return Ok(values.clone());
+    }
+    let mut result = BTreeMap::new();
+    for (key, value) in values {
+        let value = copy_string(value, context)?;
+        result.insert(*key, value);
+        context.observe_compile_step()?;
+    }
+    Ok(result)
+}
+fn copy_string_map(
+    values: &BTreeMap<String, String>,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<BTreeMap<String, String>, ConnectorCodecError> {
+    if !context.is_compile_observed() {
+        return Ok(values.clone());
+    }
+    let mut result = BTreeMap::new();
+    for (key, value) in values {
+        let key = copy_string(key, context)?;
+        let value = copy_string(value, context)?;
+        // The standard BTree comparator/allocator is an opaque library owner.
+        context.flush_compile_control()?;
+        result.insert(key, value);
+        context.observe_compile_step()?;
+    }
+    Ok(result)
+}
+fn convert_slice<T, U>(
+    values: &[T],
+    context: &mut ConnectorDecodeContext<'_>,
+    mut convert: impl FnMut(&T, &mut ConnectorDecodeContext<'_>) -> Result<U, ConnectorCodecError>,
+) -> Result<Vec<U>, ConnectorCodecError> {
+    let mut result = Vec::with_capacity(values.len());
+    for value in values {
+        result.push(convert(value, context)?);
+        context.observe_compile_step()?;
+    }
+    Ok(result)
+}
+// Opaque domain/library work is bracketed with the original compile control.
+// Its own recursive validation, allocation and comparison are not cooperative.
+fn observe_opaque<T>(
+    context: &mut ConnectorDecodeContext<'_>,
+    operation: impl FnOnce() -> T,
+) -> Result<T, ConnectorCodecError> {
+    context.flush_compile_control()?;
+    let result = operation();
+    context.observe_compile_step()?;
+    context.flush_compile_control()?;
+    Ok(result)
+}
+
+fn decode_read_domain_observed(
+    raw: &dto::IcebergReadDomain,
+    context: &mut ConnectorDecodeContext<'_>,
+    path: &'static str,
+) -> Result<Arc<crate::delete_semantics::ReadDomain>, ConnectorCodecError> {
+    observe_opaque(context, || decode_read_domain(raw))?.map_err(|error| domain_error(path, error))
+}
+
+fn finish_decode<T>(
+    result: Result<T, ConnectorCodecError>,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<T, ConnectorCodecError> {
+    if result
+        .as_ref()
+        .is_err_and(|error| error.compile_control_error().is_some())
+    {
+        return result;
+    }
+    context.flush_compile_control()?;
+    result
 }
 
 #[cfg(test)]
@@ -2967,7 +3628,12 @@ mod tests {
             )
             .expect("strict value wire");
             assert_eq!(
-                decode_value(&raw, value.value_type()).expect("decoded value"),
+                decode_value(
+                    &raw,
+                    value.value_type(),
+                    &mut ConnectorDecodeContext::new(&header, &mut ledger)
+                )
+                .expect("decoded value"),
                 value
             );
         }
@@ -3093,6 +3759,634 @@ mod change_window_wire_tests {
                 )
                 .is_err()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod compile_control_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
+        ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorEnvelopeHeader, ConnectorInstanceId,
+        ConnectorProviderId,
+    };
+    use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+
+    #[derive(Default)]
+    struct Control {
+        trace: Mutex<Vec<(CompilePhase, u32)>>,
+        refuse: Option<(usize, CompileControlError)>,
+    }
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            let mut trace = self.trace.lock().unwrap();
+            trace.push((phase, units));
+            if let Some((index, cause)) = self.refuse
+                && trace.len() == index
+            {
+                return Err(cause);
+            }
+            Ok(())
+        }
+    }
+    fn causes() -> [CompileControlError; 3] {
+        [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ]
+    }
+    fn header(category: ConnectorCodecCategory) -> ConnectorEnvelopeHeader {
+        ConnectorEnvelopeHeader::new(
+            ConnectorProviderId::parse(crate::PROVIDER_ID).unwrap(),
+            CatalogHandle::new(
+                ConnectorInstanceId::try_from_canonical("lake").unwrap(),
+                CatalogVersion::from_bytes([7; 32]),
+            ),
+            category,
+            ConnectorCodecRevision::try_new(crate::contract_revision::ICEBERG_CONTRACT_REVISION)
+                .unwrap(),
+        )
+    }
+    fn ledger() -> ConnectorDecodeLedger {
+        ConnectorDecodeLedger::new(
+            ConnectorDecodeLimits::try_new(4 << 20, 8 << 20, 4 << 20, 100_000, 64).unwrap(),
+        )
+    }
+    fn column() -> IcebergColumnHandle {
+        IcebergColumnHandle::try_new(IcebergColumnHandleParams {
+            base_column_identity: ColumnIdentity::try_new(
+                1,
+                "id",
+                ColumnIdentityCategory::Primitive,
+                vec![],
+            )
+            .unwrap(),
+            base_type_json: "\"long\"".into(),
+            field_id_path: vec![],
+            type_json: "\"long\"".into(),
+            nullable: false,
+            comment: Some("中文-column-comment-".repeat(321)),
+        })
+        .unwrap()
+    }
+    fn relations() -> Vec<IcebergRuntimeRelation> {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap();
+        let spec = crate::iceberg::spec::PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .build()
+            .unwrap();
+        let domain =
+            crate::delete_semantics::test_read_domain(&schema, std::slice::from_ref(&spec), 11);
+        let schema_json = domain.endpoint().schema_json().to_string();
+        let specs: BTreeMap<_, _> = domain
+            .endpoint()
+            .partition_spec_jsons()
+            .iter()
+            .map(|(id, json)| (*id, json.to_string()))
+            .collect();
+        let name = SchemaTableName::try_new("db", "events").unwrap();
+        let location = "s3://warehouse/db/events";
+        let table = IcebergTableHandle::try_new(IcebergTableHandleParams {
+            schema_table_name: name.clone(),
+            snapshot_id: Some(11),
+            read_domain: Some(domain.clone()),
+            table_schema_json: schema_json.clone(),
+            spec_id: Some(0),
+            partition_spec_jsons: specs.clone(),
+            format_version: 2,
+            unenforced_predicate: TupleDomain::all(),
+            enforced_predicate: TupleDomain::all(),
+            limit: None,
+            projected_columns: [column()].into_iter().collect(),
+            name_mapping_json: None,
+            table_location: location.into(),
+            storage_properties: (0..321)
+                .map(|i| (format!("property-{i}"), format!("value-{i}")))
+                .collect(),
+            pinned_data_files: None,
+        })
+        .unwrap();
+        let table_function =
+            TableChangesFunctionHandle::try_new(TableChangesFunctionHandleParams {
+                schema_table_name: name.clone(),
+                table_schema_json: schema_json.clone(),
+                columns: vec![column()],
+                name_mapping_json: None,
+                start_snapshot_id: 10,
+                end_snapshot_id: 11,
+            })
+            .unwrap();
+        let window = IcebergChangeWindowHandle::try_new(IcebergChangeWindowHandleParams {
+            schema_table_name: name.clone(),
+            table_schema_json: schema_json.clone(),
+            columns: vec![column()],
+            name_mapping_json: None,
+            from_snapshot_id_exclusive: 10,
+            to_snapshot_id_inclusive: 11,
+            from_read_domain: crate::delete_semantics::test_read_domain(
+                &schema,
+                std::slice::from_ref(&spec),
+                10,
+            ),
+            to_read_domain: domain,
+            partition_spec_jsons: specs,
+        })
+        .unwrap();
+        let system = IcebergSystemTableReference::try_new(IcebergSystemTableReferenceParams {
+            schema_table_name: name.clone(),
+            system_table_type: IcebergSystemTableType::Files,
+            metadata_file_location: "s3://warehouse/metadata/v1.json".into(),
+            table_uuid: "00000000-0000-0000-0000-000000000007".into(),
+            snapshot_id: Some(11),
+        })
+        .unwrap();
+        let execute = IcebergTableExecuteHandle::try_new(IcebergTableExecuteHandleParams {
+            schema_table_name: name.clone(),
+            procedure_id: IcebergProcedureId::ExpireSnapshots,
+            table_location: location.into(),
+            procedure_handle: None,
+        })
+        .unwrap();
+        let insert = IcebergInsertTableHandle::try_new(IcebergInsertTableHandleParams {
+            schema_table_name: name,
+            table_schema_json: schema_json,
+            table_location: location.into(),
+            format_version: 2,
+            spec_id: Some(0),
+        })
+        .unwrap();
+        let merge = IcebergMergeTableHandle::try_new(table.clone(), insert).unwrap();
+        vec![
+            IcebergRuntimeRelation::Table(table),
+            IcebergRuntimeRelation::TableFunction(table_function),
+            IcebergRuntimeRelation::ChangeWindow(window),
+            IcebergRuntimeRelation::SystemTable(system),
+            IcebergRuntimeRelation::TableExecute(execute),
+            IcebergRuntimeRelation::MergeTable(merge),
+        ]
+    }
+    fn run_column(
+        payload: &[u8],
+        control: &Control,
+    ) -> Result<IcebergColumnHandle, ConnectorCodecError> {
+        let expected = header(ConnectorCodecCategory::ReadColumn);
+        let mut budget = ledger();
+        let mut context =
+            ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, control)?;
+        IcebergReadWireCodec.decode_private(payload, &mut context)
+    }
+
+    #[test]
+    fn actual_six_relation_variants_keep_legacy_values_and_ledger_charges() {
+        let expected = header(ConnectorCodecCategory::ReadTable);
+        for relation in relations() {
+            let payload = IcebergReadWireCodec.encode_private(&relation).unwrap();
+            let mut legacy_budget = ledger();
+            let old: IcebergRuntimeRelation = IcebergReadWireCodec
+                .decode_private(
+                    &payload,
+                    &mut ConnectorDecodeContext::new(&expected, &mut legacy_budget),
+                )
+                .unwrap();
+            let control = Control::default();
+            let mut compile_budget = ledger();
+            let new: IcebergRuntimeRelation = IcebergReadWireCodec
+                .decode_private(
+                    &payload,
+                    &mut ConnectorDecodeContext::try_new_for_compile(
+                        &expected,
+                        &mut compile_budget,
+                        &control,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(IcebergReadWireCodec.encode_private(&old).unwrap(), payload);
+            assert_eq!(IcebergReadWireCodec.encode_private(&new).unwrap(), payload);
+            assert_eq!(legacy_budget.raw_bytes(), compile_budget.raw_bytes());
+            assert_eq!(legacy_budget.items(), compile_budget.items());
+            assert_eq!(legacy_budget.scalar_bytes(), compile_budget.scalar_bytes());
+            assert_eq!(
+                legacy_budget.retained_bytes(),
+                compile_budget.retained_bytes()
+            );
+            let trace = control.trace.lock().unwrap();
+            assert!(
+                trace
+                    .iter()
+                    .all(|(phase, units)| *phase == CompilePhase::ProviderValidation
+                        && *units <= 256)
+            );
+            assert_eq!(trace.last().unwrap().1, 1);
+        }
+    }
+
+    #[test]
+    fn actual_long_column_refuses_entry_copy_interior_and_publication_each_cause() {
+        let payload = IcebergReadWireCodec.encode_private(&column()).unwrap();
+        let baseline = Control::default();
+        assert_eq!(run_column(&payload, &baseline).unwrap(), column());
+        let trace = baseline.trace.lock().unwrap().clone();
+        let positives: Vec<_> = trace
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, units))| (*units == 256).then_some(i + 1))
+            .collect();
+        assert!(positives.len() > 10);
+        let mut checkpoints = vec![
+            1,
+            positives[0],
+            positives[positives.len() / 2],
+            *positives.last().unwrap(),
+            trace.len(),
+        ];
+        checkpoints.sort_unstable();
+        checkpoints.dedup();
+        for cause in causes() {
+            for &index in &checkpoints {
+                let control = Control {
+                    trace: Default::default(),
+                    refuse: Some((index, cause)),
+                };
+                let error = run_column(&payload, &control).unwrap_err();
+                assert_eq!(error.compile_control_error(), Some(cause));
+                assert_eq!(error.kind(), ConnectorCodecErrorKind::CompileControl(cause));
+                assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
+            }
+        }
+    }
+
+    #[test]
+    fn actual_packed_path_scanner_observes_every_consumed_item_without_domain_guesses() {
+        let expected = header(ConnectorCodecCategory::ReadColumn);
+        let raw = dto::IcebergColumnHandle {
+            field_id_path: (0..321).collect(),
+            ..Default::default()
+        };
+        let payload = raw.encode_to_vec();
+        let baseline = Control::default();
+        let mut budget = ledger();
+        let mut context =
+            ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &baseline).unwrap();
+        let decoded: dto::IcebergColumnHandle = decode_root(
+            &payload,
+            &mut context,
+            ConnectorFieldPath::root("packed"),
+            Schema::Column,
+        )
+        .unwrap();
+        assert_eq!(decoded, raw);
+        assert_eq!(budget.items(), 322);
+        let trace = baseline.trace.lock().unwrap().clone();
+        let index = trace.iter().position(|(_, units)| *units == 256).unwrap() + 1;
+        for cause in causes() {
+            let control = Control {
+                trace: Default::default(),
+                refuse: Some((index, cause)),
+            };
+            let mut budget = ledger();
+            let mut context =
+                ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
+                    .unwrap();
+            assert_eq!(
+                decode_root::<dto::IcebergColumnHandle>(
+                    &payload,
+                    &mut context,
+                    ConnectorFieldPath::root("packed"),
+                    Schema::Column
+                )
+                .unwrap_err()
+                .compile_control_error(),
+                Some(cause)
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
+        }
+    }
+
+    #[test]
+    fn actual_identity_children_and_predicate_ranges_are_observed_in_source_order() {
+        let expected = header(ConnectorCodecCategory::ReadColumn);
+        let identity = dto::ColumnIdentity {
+            field_id: 999,
+            name: "record".into(),
+            category: dto::ColumnIdentityCategory::Struct as i32,
+            children: (1..=321)
+                .map(|id| dto::ColumnIdentity {
+                    field_id: id,
+                    name: format!("f{id}"),
+                    category: dto::ColumnIdentityCategory::Primitive as i32,
+                    children: vec![],
+                })
+                .collect(),
+        };
+        let bound = |n| dto::Bound {
+            kind: dto::BoundKind::Inclusive as i32,
+            value: Some(dto::Value {
+                value: Some(dto::value::Value::BigInt(n)),
+            }),
+        };
+        let domain = dto::Domain {
+            values: Some(dto::ValueSet {
+                value_type: Some(encode_value_type(ConnectorValueType::BigInt)),
+                ranges: (0..321)
+                    .map(|n| dto::Range {
+                        low: Some(bound(n * 3)),
+                        high: Some(bound(n * 3 + 1)),
+                    })
+                    .collect(),
+            }),
+            null_allowed: true,
+        };
+        let mut budget = ledger();
+        let baseline = Control::default();
+        let mut context =
+            ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &baseline).unwrap();
+        let decoded = decode_identity(&identity, &mut context).unwrap();
+        assert_eq!(encode_identity(&decoded), identity);
+        let decoded = decode_domain(&domain, &mut context).unwrap();
+        assert_eq!(decoded.values().ranges().len(), 321);
+        assert_eq!(encode_domain(&decoded), domain);
+        // Every child and range must pass its own opaque-domain entry/exit,
+        // even when the pending units never reach 256 before a flush.
+        assert!(baseline.trace.lock().unwrap().len() > 321 * 4);
+        for cause in causes() {
+            for use_domain in [false, true] {
+                let control = Control {
+                    trace: Default::default(),
+                    refuse: Some((700, cause)),
+                };
+                let mut budget = ledger();
+                let mut context =
+                    ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
+                        .unwrap();
+                let error = if use_domain {
+                    decode_domain(&domain, &mut context).unwrap_err()
+                } else {
+                    decode_identity(&identity, &mut context).unwrap_err()
+                };
+                assert_eq!(error.compile_control_error(), Some(cause));
+                let calls = control.trace.lock().unwrap().len();
+                assert_eq!(calls, 700);
+                assert_eq!(
+                    context
+                        .flush_compile_control()
+                        .unwrap_err()
+                        .compile_control_error(),
+                    Some(cause)
+                );
+                assert_eq!(control.trace.lock().unwrap().len(), calls);
+            }
+        }
+    }
+
+    #[test]
+    fn predicate_owned_string_and_binary_copies_keep_values_and_latch_original_controls() {
+        let expected = header(ConnectorCodecCategory::ReadColumn);
+        for (raw, ty) in [
+            (
+                dto::Value {
+                    value: Some(dto::value::Value::Varchar("é文".repeat(321))),
+                },
+                ConnectorValueType::Varchar,
+            ),
+            (
+                dto::Value {
+                    value: Some(dto::value::Value::Varbinary([0, 255, 7].repeat(321))),
+                },
+                ConnectorValueType::Varbinary,
+            ),
+            (
+                dto::Value {
+                    value: Some(dto::value::Value::Fixed(vec![13; 321])),
+                },
+                ConnectorValueType::Fixed { length: 321 },
+            ),
+        ] {
+            let mut budget = ledger();
+            let legacy = decode_value(
+                &raw,
+                ty,
+                &mut ConnectorDecodeContext::new(&expected, &mut budget),
+            )
+            .unwrap();
+            assert_eq!(encode_value(&legacy), raw);
+            for cause in causes() {
+                let control = Control {
+                    trace: Default::default(),
+                    refuse: Some((3, cause)),
+                };
+                let mut budget = ledger();
+                let mut context =
+                    ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
+                        .unwrap();
+                assert_eq!(
+                    decode_value(&raw, ty, &mut context)
+                        .unwrap_err()
+                        .compile_control_error(),
+                    Some(cause)
+                );
+                assert_eq!(control.trace.lock().unwrap()[2].1, 256);
+                assert_eq!(
+                    context
+                        .flush_compile_control()
+                        .unwrap_err()
+                        .compile_control_error(),
+                    Some(cause)
+                );
+                assert_eq!(control.trace.lock().unwrap().len(), 3);
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_domain_error_flushes_original_tail_without_text_classification() {
+        let expected = header(ConnectorCodecCategory::ReadColumn);
+        let raw = dto::ColumnIdentity {
+            field_id: 1,
+            name: String::new(),
+            category: dto::ColumnIdentityCategory::Primitive as i32,
+            children: vec![],
+        };
+        let baseline = Control::default();
+        let mut budget = ledger();
+        let mut context =
+            ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &baseline).unwrap();
+        let ordinary = decode_identity(&raw, &mut context).unwrap_err();
+        assert_eq!(ordinary.compile_control_error(), None);
+        let trace = baseline.trace.lock().unwrap().clone();
+        assert!(trace.len() > 3);
+        for cause in causes() {
+            let control = Control {
+                trace: Default::default(),
+                refuse: Some((trace.len(), cause)),
+            };
+            let mut budget = ledger();
+            let mut context =
+                ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
+                    .unwrap();
+            assert_eq!(
+                decode_identity(&raw, &mut context)
+                    .unwrap_err()
+                    .compile_control_error(),
+                Some(cause)
+            );
+        }
+        let ordinary_text = codec_error(
+            "ordinary",
+            ConnectorCodecErrorKind::InvalidValue,
+            "cancelled deadline resource exhausted",
+        );
+        assert_eq!(ordinary_text.compile_control_error(), None);
+    }
+
+    #[test]
+    fn malformed_prost_utf8_flushes_after_opaque_decode_and_keeps_legacy_error() {
+        let expected = header(ConnectorCodecCategory::ReadColumn);
+        let payload = [0x12, 1, 0xff]; // Column.base_type_json: structurally valid, invalid UTF-8.
+        let baseline = Control::default();
+        let ordinary = run_column(&payload, &baseline).unwrap_err();
+        assert_eq!(ordinary.compile_control_error(), None);
+        let trace = baseline.trace.lock().unwrap().clone();
+        assert!(
+            ordinary
+                .detail()
+                .contains("malformed Iceberg private protobuf")
+        );
+        for cause in causes() {
+            let control = Control {
+                trace: Default::default(),
+                refuse: Some((trace.len(), cause)),
+            };
+            assert_eq!(
+                run_column(&payload, &control)
+                    .unwrap_err()
+                    .compile_control_error(),
+                Some(cause)
+            );
+        }
+        let mut budget = ledger();
+        let old: Result<IcebergColumnHandle, _> = IcebergReadWireCodec.decode_private(
+            &payload,
+            &mut ConnectorDecodeContext::new(&expected, &mut budget),
+        );
+        assert_eq!(old.unwrap_err().detail(), ordinary.detail());
+    }
+
+    #[test]
+    fn varint_checkpoint_follows_consumed_byte_and_does_not_count_reservation() {
+        let expected = header(ConnectorCodecCategory::ReadColumn);
+        for cause in causes() {
+            let control = Control {
+                trace: Default::default(),
+                refuse: Some((2, cause)),
+            };
+            let mut budget = ledger();
+            let mut context =
+                ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
+                    .unwrap();
+            copy_slice(&[0u8; 255], &mut context).unwrap();
+            let mut input: &[u8] = &[7];
+            assert_eq!(
+                read_varint(
+                    &mut input,
+                    &mut context,
+                    &ConnectorFieldPath::root("varint")
+                )
+                .unwrap_err()
+                .compile_control_error(),
+                Some(cause)
+            );
+            assert!(input.is_empty());
+            assert_eq!(control.trace.lock().unwrap()[1].1, 256);
+        }
+    }
+    #[test]
+    fn actual_table_scalar_domains_and_private_maps_keep_declared_source_and_control() {
+        use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+        let schema = Schema::builder()
+            .with_fields(
+                (1..=321)
+                    .map(|id| {
+                        Arc::new(NestedField::required(
+                            id,
+                            format!("i{id}"),
+                            Type::Primitive(PrimitiveType::Int),
+                        ))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .build()
+            .unwrap();
+        let table = IcebergTableHandle::try_new(IcebergTableHandleParams {
+            schema_table_name: SchemaTableName::try_new("db", "integers").unwrap(),
+            snapshot_id: None,
+            read_domain: None,
+            table_schema_json: serde_json::to_string(&schema).unwrap(),
+            spec_id: None,
+            partition_spec_jsons: BTreeMap::new(),
+            format_version: 2,
+            unenforced_predicate: TupleDomain::all(),
+            enforced_predicate: TupleDomain::all(),
+            limit: None,
+            projected_columns: BTreeSet::new(),
+            name_mapping_json: None,
+            table_location: "s3://warehouse/integers".into(),
+            storage_properties: (0..321)
+                .map(|n| (format!("key-{n}"), "value".into()))
+                .collect(),
+            pinned_data_files: None,
+        })
+        .unwrap()
+        .with_scalar_integer_domains(
+            (1..=321)
+                .map(|id| (id, crate::scalar_integer_domain::ScalarIntegerDomain::Int8))
+                .collect(),
+        )
+        .unwrap();
+        let raw = encode_table(&table);
+        let expected = header(ConnectorCodecCategory::ReadTable);
+        let baseline = Control::default();
+        let mut budget = ledger();
+        let mut context =
+            ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &baseline).unwrap();
+        let decoded = decode_table(&raw, &mut context).unwrap();
+        assert_eq!(decoded.scalar_integer_domains().len(), 321);
+        assert_eq!(encode_table(&decoded), raw);
+        let trace = baseline.trace.lock().unwrap().clone();
+        assert!(trace.iter().any(|(_, units)| *units == 256));
+        assert!(trace.len() > 321 * 2);
+        // The scalar-domain loop follows actual table construction and the
+        // independently observed string/map copies, then precedes publication.
+        for cause in causes() {
+            for index in [trace.len() - 100, trace.len()] {
+                let control = Control {
+                    trace: Default::default(),
+                    refuse: Some((index, cause)),
+                };
+                let mut budget = ledger();
+                let mut context =
+                    ConnectorDecodeContext::try_new_for_compile(&expected, &mut budget, &control)
+                        .unwrap();
+                assert_eq!(
+                    decode_table(&raw, &mut context)
+                        .unwrap_err()
+                        .compile_control_error(),
+                    Some(cause)
+                );
+                assert_eq!(*control.trace.lock().unwrap(), trace[..index]);
+            }
         }
     }
 }

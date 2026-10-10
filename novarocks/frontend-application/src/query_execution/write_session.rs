@@ -1474,8 +1474,10 @@ pub(crate) mod tests {
                         StatisticsScanColumn::try_new(
                             0,
                             "v",
-                            arrow::datatypes::DataType::Int64,
-                            true,
+                            novarocks_type_contract::FunctionValueType::new(
+                                arrow::datatypes::DataType::Int64,
+                                true,
+                            ),
                         )?,
                         "$test_stat",
                         StatisticsArtifactIdentity::try_new(

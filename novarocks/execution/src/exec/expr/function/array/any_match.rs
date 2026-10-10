@@ -16,11 +16,7 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, BooleanArray, ListArray};
-use arrow::compute::cast;
-use arrow::datatypes::DataType;
-use std::sync::Arc;
-
+use arrow::array::ArrayRef;
 pub fn eval_any_match(
     arena: &ExprArena,
     _expr: ExprId,
@@ -28,69 +24,5 @@ pub fn eval_any_match(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let arr = arena.eval(args[0], chunk)?;
-    let list = arr
-        .as_any()
-        .downcast_ref::<ListArray>()
-        .ok_or_else(|| format!("any_match expects ListArray, got {:?}", arr.data_type()))?;
-
-    let mut values = list.values().clone();
-    if values.data_type() != &DataType::Boolean {
-        if novarocks_types::largeint::is_largeint_data_type(values.data_type()) {
-            let typed = novarocks_types::largeint::as_fixed_size_binary_array(
-                &values,
-                "any_match LARGEINT to BOOLEAN",
-            )?;
-            let mut out = Vec::with_capacity(typed.len());
-            for idx in 0..typed.len() {
-                if typed.is_null(idx) {
-                    out.push(None);
-                } else {
-                    out.push(Some(novarocks_types::largeint::value_at(typed, idx)? != 0));
-                }
-            }
-            values = Arc::new(BooleanArray::from(out)) as ArrayRef;
-        } else {
-            values = cast(&values, &DataType::Boolean)
-                .map_err(|e| format!("any_match failed to cast element to BOOLEAN: {}", e))?;
-        }
-    }
-    let values = values
-        .as_any()
-        .downcast_ref::<BooleanArray>()
-        .ok_or_else(|| "any_match failed to downcast values to BooleanArray".to_string())?;
-
-    let offsets = list.value_offsets();
-    let mut out = Vec::with_capacity(chunk.len());
-    for row in 0..chunk.len() {
-        let row_idx = super::common::row_index(row, list.len());
-        if list.is_null(row_idx) {
-            out.push(None);
-            continue;
-        }
-
-        let start = offsets[row_idx] as usize;
-        let end = offsets[row_idx + 1] as usize;
-        let mut has_null = false;
-        let mut found_true = false;
-        for idx in start..end {
-            if values.is_null(idx) {
-                has_null = true;
-                continue;
-            }
-            if values.value(idx) {
-                found_true = true;
-                break;
-            }
-        }
-
-        if found_true {
-            out.push(Some(true));
-        } else if has_null {
-            out.push(None);
-        } else {
-            out.push(Some(false));
-        }
-    }
-
-    Ok(Arc::new(BooleanArray::from(out)) as ArrayRef)
+    novarocks_functions::builtin::array_match_core::any_match(&arr, chunk.len())
 }

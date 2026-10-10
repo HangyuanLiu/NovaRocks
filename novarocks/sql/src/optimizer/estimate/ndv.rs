@@ -154,14 +154,14 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         }
     }
 
     fn expr_id(expr: &TypedExpr) -> (ScalarArena, ScalarId) {
         let mut arena = ScalarArena::new();
-        let id = intern_typed(&mut arena, expr);
+        let id =
+            intern_typed(&mut arena, expr, crate::optimizer::test_optimizer_control()).unwrap();
         (arena, id)
     }
 

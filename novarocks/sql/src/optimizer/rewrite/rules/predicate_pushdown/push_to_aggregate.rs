@@ -28,6 +28,7 @@
 //!
 //! Migrated to `OptExpr` / `LogicalRewriteRule`.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use crate::column_id::ColumnId;
@@ -74,7 +75,11 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
         !aggregate_child_is_repeat(input.unary_input())
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             mut children,
@@ -151,7 +156,9 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
             return Ok(RewriteResult::Unchanged);
         }
 
-        let Some(pushed_id) = scalar_expr::combine_conjuncts(&mut arena, pushable) else {
+        let Some(pushed_id) =
+            scalar_expr::combine_conjuncts(&mut arena, pushable, &ctx.control_view())?
+        else {
             return Ok(RewriteResult::Unchanged);
         };
         let new_child = OptExpr::new(
@@ -163,7 +170,12 @@ impl LogicalRewriteRule for PushDownPredicateAggregate {
         let mut new_agg_expr = OptExpr::new(Operator::LogicalAggregate(agg), vec![new_child]);
         new_agg_expr.required_output_columns = aggregate_required_output_columns;
 
-        let result = wrap_remaining_filter_opt_scalar(new_agg_expr, remaining, &mut arena);
+        let result = wrap_remaining_filter_opt_scalar(
+            new_agg_expr,
+            remaining,
+            &mut arena,
+            &ctx.control_view(),
+        )?;
         Ok(RewriteResult::Changed(result))
     }
 }
@@ -218,8 +230,8 @@ mod tests {
 
     fn col_typed_expr(name: &str) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             kind: ExprKind::ColumnRef {
                 column_id: test_col_id(name),
                 qualifier: None,
@@ -230,16 +242,16 @@ mod tests {
 
     fn int_lit_expr(v: i64) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             kind: ExprKind::Literal(LiteralValue::Int(v)),
         }
     }
 
     fn eq_expr(a: TypedExpr, b: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(a),
                 op: BinOp::Eq,
@@ -253,8 +265,8 @@ mod tests {
         OutputColumn {
             column_id: test_col_id(name),
             name: name.into(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -314,14 +326,30 @@ mod tests {
     }
 
     fn make_agg(arena: &mut ScalarArena, input: OptExpr) -> OptExpr {
-        let group_by = vec![intern_typed(arena, &col_typed_expr("a"))];
+        let group_by = vec![
+            intern_typed(
+                arena,
+                &col_typed_expr("a"),
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            )
+            .unwrap(),
+        ];
         let count_spec = ScalarAggregateSpec {
             output_column_id: test_col_id("sum_b"),
             name: "sum".into(),
-            args: vec![intern_typed(arena, &col_typed_expr("b"))],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![
+                    intern_typed(
+                        arena,
+                        &col_typed_expr("b"),
+                        crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                    )
+                    .unwrap(),
+                ],
+                vec![],
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            ),
         };
         let aggregates = vec![count_spec];
         let output_columns = vec![output_col("a"), output_col("sum_b")];
@@ -342,7 +370,7 @@ mod tests {
         OptExpr::new(Operator::LogicalAggregate(agg_op), vec![input])
     }
 
-    fn make_ctx(arena: ScalarArena) -> RewriteContext {
+    fn make_ctx(arena: ScalarArena) -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(std::iter::empty::<String>());
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         ctx
@@ -355,7 +383,12 @@ mod tests {
         let mut arena = ScalarArena::new();
         let scan = make_scan(&mut arena);
         let agg = make_agg(&mut arena, scan);
-        let filter_pred = intern_typed(&mut arena, &eq_expr(col_typed_expr("a"), int_lit_expr(1)));
+        let filter_pred = intern_typed(
+            &mut arena,
+            &eq_expr(col_typed_expr("a"), int_lit_expr(1)),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let filter = OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: filter_pred,
@@ -365,7 +398,15 @@ mod tests {
 
         let rule = PushDownPredicateAggregate;
         let mut ctx = make_ctx(arena);
-        assert!(bind_tree(&rule.pattern(), &filter).is_some());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &filter,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
         assert!(rule.matches(&filter, &ctx));
         let result = rule.apply(filter, &mut ctx).unwrap();
         let RewriteResult::Changed(out) = result else {
@@ -396,7 +437,9 @@ mod tests {
         let filter_pred = intern_typed(
             &mut arena,
             &eq_expr(col_typed_expr("sum_b"), int_lit_expr(100)),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let filter = OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: filter_pred,
@@ -406,7 +449,15 @@ mod tests {
 
         let rule = PushDownPredicateAggregate;
         let mut ctx = make_ctx(arena);
-        assert!(bind_tree(&rule.pattern(), &filter).is_some());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &filter,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
         assert!(rule.matches(&filter, &ctx));
         let result = rule.apply(filter, &mut ctx).unwrap();
         assert!(
@@ -422,7 +473,12 @@ mod tests {
         let mut arena = ScalarArena::new();
         let scan = make_scan(&mut arena);
         let agg = make_agg(&mut arena, scan);
-        let filter_pred = intern_typed(&mut arena, &eq_expr(int_lit_expr(1), int_lit_expr(1)));
+        let filter_pred = intern_typed(
+            &mut arena,
+            &eq_expr(int_lit_expr(1), int_lit_expr(1)),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let filter = OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: filter_pred,
@@ -432,7 +488,15 @@ mod tests {
 
         let rule = PushDownPredicateAggregate;
         let mut ctx = make_ctx(arena);
-        assert!(bind_tree(&rule.pattern(), &filter).is_some());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &filter,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
         assert!(rule.matches(&filter, &ctx));
         let result = rule.apply(filter, &mut ctx).unwrap();
         assert!(
@@ -447,7 +511,12 @@ mod tests {
         let scan = make_scan(&mut arena);
         let repeat = make_repeat(scan);
         let agg = make_agg(&mut arena, repeat);
-        let filter_pred = intern_typed(&mut arena, &eq_expr(col_typed_expr("a"), int_lit_expr(1)));
+        let filter_pred = intern_typed(
+            &mut arena,
+            &eq_expr(col_typed_expr("a"), int_lit_expr(1)),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let filter = OptExpr::new(
             Operator::LogicalFilter(FilterOp {
                 predicate: filter_pred,
@@ -457,7 +526,15 @@ mod tests {
 
         let rule = PushDownPredicateAggregate;
         let ctx = make_ctx(arena);
-        assert!(bind_tree(&rule.pattern(), &filter).is_some());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &filter,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
         assert!(!rule.matches(&filter, &ctx));
     }
 }

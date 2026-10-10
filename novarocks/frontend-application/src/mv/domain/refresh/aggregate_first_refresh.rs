@@ -876,13 +876,14 @@ mod tests {
         let outputs = vec![
             SqlMvOutputColumnFacts {
                 name: group_key.to_string(),
-                data_type: DataType::Utf8,
-                nullable: group_key_nullable,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Utf8,
+                    group_key_nullable,
+                ),
             },
             SqlMvOutputColumnFacts {
                 name: "c".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             },
         ];
         let facts =

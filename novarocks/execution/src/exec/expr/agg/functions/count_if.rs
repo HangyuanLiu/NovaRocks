@@ -110,59 +110,38 @@ impl AggregateFunction for CountIfAgg {
     }
     fn update_batch(
         &self,
-        _spec: &AggSpec,
+        spec: &AggSpec,
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
     ) -> Result<(), String> {
-        let AggInputView::Bool(arr) = input else {
-            return Err("count_if batch input type mismatch".to_string());
-        };
-        for (row, &base) in state_ptrs.iter().enumerate() {
-            if arr.is_null(row) {
-                continue;
-            }
-            if arr.value(row) {
-                let slot = unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
-                *slot += 1;
-            }
+        if !matches!(input, AggInputView::Bool(_)) {
+            return Err("count_if batch input type mismatch".to_owned());
         }
-        Ok(())
+        super::aggregate_basic_adapter::update(spec, offset, state_ptrs, input, None)
     }
 
     fn merge_batch(
         &self,
-        _spec: &AggSpec,
+        spec: &AggSpec,
         offset: usize,
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
     ) -> Result<(), String> {
-        let AggInputView::Int(view) = input else {
-            return Err("count_if merge input type mismatch".to_string());
-        };
-        for (row, &base) in state_ptrs.iter().enumerate() {
-            let Some(value) = view.value_at(row) else {
-                continue;
-            };
-            let slot = unsafe { &mut *((base as *mut u8).add(offset) as *mut i64) };
-            *slot += value;
+        if !matches!(input, AggInputView::Int(_)) {
+            return Err("count_if merge input type mismatch".to_owned());
         }
-        Ok(())
+        super::aggregate_basic_adapter::merge(spec, offset, state_ptrs, input)
     }
 
     fn build_array(
         &self,
-        _spec: &AggSpec,
+        spec: &AggSpec,
         offset: usize,
         group_states: &[AggStatePtr],
-        _output_intermediate: bool,
+        output_intermediate: bool,
     ) -> Result<ArrayRef, String> {
-        let mut builder = Int64Builder::new();
-        for &base in group_states {
-            let state = unsafe { &*((base as *mut u8).add(offset) as *const i64) };
-            builder.append_value(*state);
-        }
-        Ok(std::sync::Arc::new(builder.finish()))
+        super::aggregate_basic_adapter::build(spec, offset, group_states, output_intermediate)
     }
 }
 

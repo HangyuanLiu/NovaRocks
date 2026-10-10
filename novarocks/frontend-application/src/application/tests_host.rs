@@ -60,6 +60,7 @@ fn execution_config() -> FrontendExecutionConfig {
             novarocks_sql::compiler::build_builtin_engine_function_catalog()
                 .expect("builtin function catalog"),
         ),
+        crate::application::test_constant_policy(),
     )
 }
 

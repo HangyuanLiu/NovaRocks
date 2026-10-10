@@ -19,6 +19,8 @@
 
 pub(crate) mod binder;
 pub(crate) mod cascades_rules;
+#[cfg(test)]
+mod control_tests;
 pub(crate) mod cost;
 mod cse_pass;
 pub(crate) mod cte_rewrite;
@@ -58,12 +60,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::column_id::ColumnRefFactory;
+use crate::compiler::SqlCompileError;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::scalar::ScalarArena;
 #[cfg(any(test, feature = "test-support"))]
 use crate::optimizer::statistics::TableStatistics;
 use crate::optimizer::stats_input::{OptimizerStatsInput, QueryStatsSnapshot};
 use memo::MExpr;
+use novarocks_type_contract::{
+    CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
+};
 use rule::Rule;
 
 /// Wall-clock timeout for the entire optimization pipeline.
@@ -85,8 +91,11 @@ const OPTIMIZE_TIMEOUT: Duration = Duration::from_secs(30);
 /// argument.
 pub(crate) struct OptimizerEnvironment<'a> {
     settings: &'a options::SessionOptimizerSettings,
+    control: &'a dyn PureCompileControl,
     constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
     function_catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    fold_dependency_observer: Option<Arc<dyn crate::compiler::SqlFoldDependencyObserver>>,
 }
 
 impl<'a> OptimizerEnvironment<'a> {
@@ -94,12 +103,24 @@ impl<'a> OptimizerEnvironment<'a> {
         settings: &'a options::SessionOptimizerSettings,
         constant_evaluator: Option<&'static dyn crate::compiler::SqlConstantEvaluator>,
         function_catalog: Arc<dyn crate::compiler::SqlFunctionCatalog>,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+        control: &'a dyn PureCompileControl,
     ) -> Self {
         Self {
             settings,
             constant_evaluator,
             function_catalog,
+            decimal_overflow_policy,
+            control,
+            fold_dependency_observer: None,
         }
+    }
+    pub(crate) fn with_fold_dependency_observer(
+        mut self,
+        observer: Option<Arc<dyn crate::compiler::SqlFoldDependencyObserver>>,
+    ) -> Self {
+        self.fold_dependency_observer = observer;
+        self
     }
 }
 
@@ -116,8 +137,10 @@ pub(crate) fn optimize(
     factory: ColumnRefFactory,
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
     environment: OptimizerEnvironment<'_>,
-) -> Result<OptimizedOperatorNode, String> {
-    validate_query_stats_bound(&plan_expr)?;
+) -> Result<OptimizedOperatorNode, SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(environment.control, CompilePhase::Validate)?;
+    validate_query_stats_bound(&plan_expr, &mut work)?;
+    work.finish()?;
     let stats_input = OptimizerStatsInput::from_query_stats(query_stats);
     optimize_with_root_property(
         plan_expr,
@@ -137,8 +160,10 @@ pub(crate) fn optimize_with_root_distribution(
     factory: ColumnRefFactory,
     root_distribution: DistributionSpec,
     environment: OptimizerEnvironment<'_>,
-) -> Result<OptimizedOperatorNode, String> {
-    validate_query_stats_bound(&plan_expr)?;
+) -> Result<OptimizedOperatorNode, SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(environment.control, CompilePhase::Validate)?;
+    validate_query_stats_bound(&plan_expr, &mut work)?;
+    work.finish()?;
     let root_required = PhysicalPropertySet {
         distribution: root_distribution,
         ordering: OrderingSpec::Any,
@@ -179,8 +204,11 @@ pub(crate) fn optimize_with_test_table_statistics(
             settings,
             None,
             crate::functions::test_function_catalog_snapshot(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            test_optimizer_control(),
         ),
     )
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -209,8 +237,11 @@ pub(crate) fn optimize_with_root_distribution_and_test_table_statistics(
             settings,
             None,
             crate::functions::test_function_catalog_snapshot(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            test_optimizer_control(),
         ),
     )
+    .map_err(|error| error.to_string())
 }
 
 fn optimize_with_root_property(
@@ -221,13 +252,22 @@ fn optimize_with_root_property(
     mv_candidates: Vec<cascades_rules::mv_rewrite::MvRewriteCandidate>,
     root_required: PhysicalPropertySet,
     environment: OptimizerEnvironment<'_>,
-) -> Result<OptimizedOperatorNode, String> {
+) -> Result<OptimizedOperatorNode, SqlCompileError> {
     let OptimizerEnvironment {
         settings: session_settings,
         constant_evaluator,
         function_catalog,
+        decimal_overflow_policy,
+        control,
+        fold_dependency_observer,
     } = environment;
     let deadline = Instant::now() + OPTIMIZE_TIMEOUT;
+    let bounded_control = OptimizerControl {
+        request: control,
+        deadline,
+    };
+    let control: &dyn PureCompileControl = &bounded_control;
+    control.checkpoint(CompilePhase::Validate, 0)?;
 
     // Wrap factory in Rc<RefCell<...>> so it can be shared with RewriteContext
     // for the duration of the rewrite phase (needed for auto-fill column minting
@@ -239,8 +279,11 @@ fn optimize_with_root_property(
     //    legacy-safe sequence: pushdown → join reorder → pushdown →
     //    variant path pushdown → aggregate pushdown → column pruning.
     let options = options::OptimizerOptions::from_session(session_settings);
-    let mut rewrite_ctx =
-        rewrite::context::RewriteContext::for_query_with_settings(session_settings.clone());
+    let mut rewrite_ctx = rewrite::context::RewriteContext::for_query_with_settings(
+        session_settings.clone(),
+        decimal_overflow_policy,
+        control,
+    );
     rewrite_ctx.policy_mut().max_iterations = options.rewrite_max_iterations;
     rewrite_ctx.set_query_stats_input(stats_input.clone());
     rewrite_ctx.set_deadline(deadline);
@@ -248,6 +291,7 @@ fn optimize_with_root_property(
     if let Some(evaluator) = constant_evaluator {
         rewrite_ctx.set_constant_evaluator(evaluator);
     }
+    rewrite_ctx.set_fold_dependency_observer(fold_dependency_observer);
     rewrite_ctx.set_function_catalog(Arc::clone(&function_catalog));
     let arena = Rc::new(RefCell::new(scalar_arena));
     rewrite_ctx.set_scalar_arena(Rc::clone(&arena));
@@ -258,16 +302,18 @@ fn optimize_with_root_property(
     // stage. The ApplyException rule reports this with rule attribution, but
     // a user-disabled rule must not let an Apply leak into memo conversion
     // (which panics by contract).
+    control.checkpoint(CompilePhase::Validate, 0)?;
     if let Some(message) = rewrite::rules::subquery::find_residual_apply(&rewritten_expr) {
-        return Err(message);
+        return Err(SqlCompileError::Compilation(message));
     }
 
     // 4. CTE cleanup: intentional pre-Memo structural rewrite for CTE shape
     //    cleanup, not a second full logical optimization pass.
-    let cte_ctx = cte_rewrite::collect_cte_counts(&rewritten_expr);
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    let cte_ctx = cte_rewrite::collect_cte_counts(&rewritten_expr, control)?;
     let rewritten_expr = {
         let mut scalar_arena = arena.borrow_mut();
-        cte_rewrite::inline_single_use_ctes(rewritten_expr, &cte_ctx, &mut scalar_arena)?
+        cte_rewrite::inline_single_use_ctes(rewritten_expr, &cte_ctx, &mut scalar_arena, control)?
     };
 
     // 5. Convert to Memo. Unwrap the factory from Rc<RefCell<...>> — rewrite
@@ -287,14 +333,15 @@ fn optimize_with_root_property(
              a rule cloned the context and did not drop the clone",
         )
         .into_inner();
-    let mut memo = Memo::new();
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    let mut memo = Memo::with_scalar_arena(arena.borrow().clone());
     memo.function_catalog = Some(function_catalog);
     memo.factory = factory;
-    memo.scalars = arena.borrow().clone();
-    let root_group = memo_copy::opt_expr_to_memo(&rewritten_expr, &mut memo);
+    let root_group = memo_copy::opt_expr_to_memo(&rewritten_expr, &mut memo, control)?;
 
     // 6. Derive initial statistics.
-    stats::derive_group_statistics(&mut memo, &stats_input);
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    stats::derive_group_statistics(&mut memo, &stats_input, control)?;
 
     // 6b. In-memo multi-candidate join reorder (StarRocks-aligned, one-shot):
     //     inject alternative join orders into each reorderable inner/cross
@@ -303,15 +350,17 @@ fn optimize_with_root_property(
     //     `SET disable_optimizer_rules='MultiJoinReorder'` turns the pass off
     //     entirely; the legacy RBO reorder was retired, so this is now the only
     //     join-reorder mechanism.
+    control.checkpoint(CompilePhase::Validate, 0)?;
     if options.is_enabled("MultiJoinReorder") {
         cascades_rules::multi_join_reorder::run_multi_join_reorder(
             &mut memo,
             &options.reorder,
             &stats_input,
-        );
+            control,
+        )?;
     }
 
-    check_deadline(deadline)?;
+    control.checkpoint(CompilePhase::Validate, 0)?;
 
     // 7. Explore: apply transformation rules (logical -> logical). When the
     //    caller supplied usable MV candidates, append the MvRewrite rule so it
@@ -322,28 +371,30 @@ fn optimize_with_root_property(
             cascades_rules::mv_rewrite::rule::MvRewriteRule::new(mv_candidates),
         ));
     }
-    explore(&mut memo, &transform_rules, &options, deadline)?;
+    explore(&mut memo, &transform_rules, &options, control)?;
 
-    check_deadline(deadline)?;
+    control.checkpoint(CompilePhase::Validate, 0)?;
 
     // 8. Implement: apply implementation rules (logical -> physical).
     let impl_rules = cascades_rules::all_implementation_rules();
-    implement(&mut memo, &impl_rules, &options);
+    implement(&mut memo, &impl_rules, &options, control)?;
 
     // 9. Re-derive statistics for any newly created groups (e.g. from AggSplit).
-    stats::derive_group_statistics(&mut memo, &stats_input);
+    control.checkpoint(CompilePhase::Validate, 0)?;
+    stats::derive_group_statistics(&mut memo, &stats_input, control)?;
 
-    check_deadline(deadline)?;
+    control.checkpoint(CompilePhase::Validate, 0)?;
 
     // 10. Top-down search with property enforcement.
-    let mut ctx = search::SearchContext::new(stats_input.clone(), options.cost_options.clone());
+    let mut ctx =
+        search::SearchContext::new(stats_input.clone(), options.cost_options.clone(), control);
     ctx.optimize_group(&memo, root_group, &root_required)?;
 
-    check_deadline(deadline)?;
+    control.checkpoint(CompilePhase::Validate, 0)?;
 
     // 11. Extract best plan.
     let mut optimized_tree =
-        extract::extract_best(&mut memo, root_group, &root_required, &ctx.winners)?;
+        extract::extract_best(&mut memo, root_group, &root_required, &ctx.winners, control)?;
 
     // Optimizer output contract: the physical tree produced here carries no
     // runtime-filter annotations. CSE and pure physical/scalar rewrites may
@@ -353,29 +404,42 @@ fn optimize_with_root_property(
     // Do not add downstream execution annotations to optimizer output here.
 
     // 12. Common-subexpression elimination (materializes repeats as Project columns).
+    control.checkpoint(CompilePhase::Validate, 0)?;
     cse_pass::rewrite(
         &mut optimized_tree,
         &mut memo.scalars,
         &mut memo.factory,
         &options,
-    );
+        control,
+    )?;
     optimized_tree::attach_scalar_arena(&mut optimized_tree, Arc::new(memo.scalars.clone()));
 
+    control.checkpoint(CompilePhase::Validate, 0)?;
     Ok(optimized_tree)
 }
 
-fn validate_query_stats_bound(expr: &OptExpr) -> Result<(), String> {
-    match &expr.op {
-        Operator::LogicalScan(scan) | Operator::PhysicalScan(scan) if scan.stats_ref.is_none() => {
-            return Err(format!(
-                "optimizer scan statistics are not bound for table {}",
-                scan.table.name
-            ));
+fn validate_query_stats_bound(
+    expr: &OptExpr,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), SqlCompileError> {
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        work.step()?;
+        match &expr.op {
+            Operator::LogicalScan(scan) | Operator::PhysicalScan(scan)
+                if scan.stats_ref.is_none() =>
+            {
+                return Err(SqlCompileError::Compilation(format!(
+                    "optimizer scan statistics are not bound for table {}",
+                    scan.table.name
+                )));
+            }
+            _ => {}
         }
-        _ => {}
-    }
-    for child in &expr.children {
-        validate_query_stats_bound(child)?;
+        for child in expr.children.iter().rev() {
+            work.step()?;
+            pending.push(child);
+        }
     }
     Ok(())
 }
@@ -404,8 +468,8 @@ fn optimizer_rejects_unbound_scan_stats() {
         columns: vec![OutputColumn {
             column_id: crate::column_id::ColumnId::new_for_test(1),
             name: "k".to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }],
         predicates: vec![],
@@ -414,9 +478,13 @@ fn optimizer_rejects_unbound_scan_stats() {
         mv_rewritten_from: None,
     }));
 
-    let err = validate_query_stats_bound(&expr).expect_err("unbound scan must be rejected");
+    let mut work =
+        CompileCheckpoints::try_new(test_optimizer_control(), CompilePhase::Validate).unwrap();
+    let err =
+        validate_query_stats_bound(&expr, &mut work).expect_err("unbound scan must be rejected");
     assert!(
-        err.contains("optimizer scan statistics are not bound"),
+        err.to_string()
+            .contains("optimizer scan statistics are not bound"),
         "unexpected error: {err}"
     );
 }
@@ -445,14 +513,27 @@ pub(crate) fn is_known_rule_name(name: &str) -> bool {
         || name == cascades_rules::mv_rewrite::RULE_NAME
 }
 
-fn check_deadline(deadline: Instant) -> Result<(), String> {
-    if Instant::now() > deadline {
-        return Err(format!(
-            "optimizer timeout: exceeded {}s budget",
-            OPTIMIZE_TIMEOUT.as_secs()
-        ));
+/// The existing optimizer time allowance can only shorten the admitted request.
+/// Work accounting remains with the caller; this wrapper creates no work budget.
+struct OptimizerControl<'a> {
+    request: &'a dyn PureCompileControl,
+    deadline: Instant,
+}
+impl PureCompileControl for OptimizerControl<'_> {
+    fn checkpoint(&self, phase: CompilePhase, work: u32) -> Result<(), CompileControlError> {
+        self.request.checkpoint(phase, work)?;
+        if Instant::now() >= self.deadline {
+            return Err(CompileControlError::DeadlineExceeded);
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn test_optimizer_control() -> &'static dyn PureCompileControl {
+    static CONTROL: std::sync::LazyLock<crate::compiler::SqlCompileControl> =
+        std::sync::LazyLock::new(crate::compiler::SqlCompileControl::unbounded);
+    &*CONTROL
 }
 
 /// Apply transformation rules to all groups in a fixed-point loop.
@@ -468,27 +549,24 @@ fn explore(
     memo: &mut Memo,
     rules: &[Box<dyn Rule>],
     options: &options::OptimizerOptions,
-    deadline: Instant,
-) -> Result<(), String> {
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
     for _round in 0..EXPLORE_MAX_ITERATIONS {
-        if Instant::now() > deadline {
-            return Err(format!(
-                "optimizer timeout during exploration: exceeded {}s budget",
-                OPTIMIZE_TIMEOUT.as_secs()
-            ));
-        }
+        work.step()?;
         let mut changed = false;
         let num_groups = memo.groups.len();
         for group_id in 0..num_groups {
-            if Instant::now() > deadline {
-                return Err(format!(
-                    "optimizer timeout: exceeded {}s budget",
-                    OPTIMIZE_TIMEOUT.as_secs()
-                ));
+            work.step()?;
+            let mut exprs = Vec::with_capacity(memo.groups[group_id].logical_exprs.len());
+            for expr in &memo.groups[group_id].logical_exprs {
+                work.step()?;
+                exprs.push(expr.clone());
             }
-            let exprs: Vec<MExpr> = memo.groups[group_id].logical_exprs.clone();
             for (expr_index, expr) in exprs.iter().enumerate() {
+                work.step()?;
                 for rule in rules {
+                    work.step()?;
                     if !options.is_enabled(rule.name()) {
                         continue;
                     }
@@ -513,26 +591,35 @@ fn explore(
                         // reorder/remove, so existing indices are stable.
                         // (MExpr ids are not unique across snapshots, so we key
                         // on position, not id.)
-                        let bindings =
-                            crate::optimizer::binder::bind(&pattern, memo, group_id, expr_index);
+                        let bindings = crate::optimizer::binder::bind(
+                            &pattern, memo, group_id, expr_index, control,
+                        )?;
                         let bindings_slice: &[_] = if rule.first_match_only() {
                             &bindings[..bindings.len().min(1)]
                         } else {
                             &bindings
                         };
                         for binding in bindings_slice {
-                            let new_exprs = rule.apply_bound(binding, memo);
+                            work.step()?;
+                            work.flush()?;
+                            let new_exprs = rule.apply_bound(binding, memo, control)?;
                             for new_expr in new_exprs {
+                                work.step()?;
                                 // Dedup: compare operator AND children to avoid
                                 // infinite JoinCommutativity A<->B oscillation.
-                                let already_exists =
-                                    memo.groups[group_id].logical_exprs.iter().any(|existing| {
-                                        existing.children == new_expr.children
-                                            && op_equal(&existing.op, &new_expr.op)
-                                    });
+                                let mut already_exists = false;
+                                for existing in &memo.groups[group_id].logical_exprs {
+                                    work.step()?;
+                                    if existing.children == new_expr.children
+                                        && op_equal(&existing.op, &new_expr.op)
+                                    {
+                                        already_exists = true;
+                                        break;
+                                    }
+                                }
                                 if !already_exists {
                                     let mexpr = MExpr {
-                                        id: memo.next_expr_id(),
+                                        id: next_expr_id_observed(memo, &mut work)?,
                                         op: new_expr.op,
                                         children: new_expr.children,
                                     };
@@ -549,6 +636,7 @@ fn explore(
             // plan is extracted from whatever groups exist. Application
             // diagnostics, not the compiler, own observability of the cap.
             if memo.groups.len() > options.cbo_max_groups {
+                work.finish()?;
                 return Ok(());
             }
         }
@@ -556,6 +644,7 @@ fn explore(
             break;
         }
     }
+    work.finish()?;
     Ok(())
 }
 
@@ -567,16 +656,30 @@ fn explore(
 /// that allocate fresh child groups on every apply can keep the loop alive
 /// indefinitely. Physical alternatives are deduplicated by both operator and
 /// children so child-distinct alternatives remain visible to search.
-fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>], options: &options::OptimizerOptions) {
+fn implement(
+    memo: &mut Memo,
+    rules: &[Box<dyn Rule>],
+    options: &options::OptimizerOptions,
+    control: &dyn PureCompileControl,
+) -> Result<(), SqlCompileError> {
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
     let mut implemented_logical_rules = HashSet::new();
     let mut changed = true;
     while changed {
+        work.step()?;
         changed = false;
         let num_groups = memo.groups.len();
         for group_id in 0..num_groups {
-            let exprs: Vec<MExpr> = memo.groups[group_id].logical_exprs.clone();
+            work.step()?;
+            let mut exprs = Vec::with_capacity(memo.groups[group_id].logical_exprs.len());
+            for expr in &memo.groups[group_id].logical_exprs {
+                work.step()?;
+                exprs.push(expr.clone());
+            }
             for (expr_index, expr) in exprs.iter().enumerate() {
+                work.step()?;
                 for rule in rules {
+                    work.step()?;
                     if !options.is_enabled(rule.name()) {
                         continue;
                     }
@@ -606,24 +709,33 @@ fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>], options: &options::Optimi
                         // elsewhere/at the tail), so existing logical indices are
                         // stable. (MExpr ids are not unique, so we key on
                         // position, not id.)
-                        let bindings =
-                            crate::optimizer::binder::bind(&pattern, memo, group_id, expr_index);
+                        let bindings = crate::optimizer::binder::bind(
+                            &pattern, memo, group_id, expr_index, control,
+                        )?;
                         let bindings_slice: &[_] = if rule.first_match_only() {
                             &bindings[..bindings.len().min(1)]
                         } else {
                             &bindings
                         };
                         for binding in bindings_slice {
-                            let new_exprs = rule.apply_bound(binding, memo);
+                            work.step()?;
+                            work.flush()?;
+                            let new_exprs = rule.apply_bound(binding, memo, control)?;
                             for new_expr in new_exprs {
-                                let already_exists =
-                                    memo.groups[group_id].physical_exprs.iter().any(|existing| {
-                                        existing.children == new_expr.children
-                                            && op_equal(&existing.op, &new_expr.op)
-                                    });
+                                work.step()?;
+                                let mut already_exists = false;
+                                for existing in &memo.groups[group_id].physical_exprs {
+                                    work.step()?;
+                                    if existing.children == new_expr.children
+                                        && op_equal(&existing.op, &new_expr.op)
+                                    {
+                                        already_exists = true;
+                                        break;
+                                    }
+                                }
                                 if !already_exists {
                                     let mexpr = MExpr {
-                                        id: memo.next_expr_id(),
+                                        id: next_expr_id_observed(memo, &mut work)?,
                                         op: new_expr.op,
                                         children: new_expr.children,
                                     };
@@ -637,6 +749,23 @@ fn implement(memo: &mut Memo, rules: &[Box<dyn Rule>], options: &options::Optimi
             }
         }
     }
+    work.finish()?;
+    Ok(())
+}
+
+fn next_expr_id_observed(
+    memo: &Memo,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<usize, SqlCompileError> {
+    let mut count = 0usize;
+    for group in &memo.groups {
+        work.step()?;
+        count = count
+            .checked_add(group.logical_exprs.len())
+            .and_then(|count| count.checked_add(group.physical_exprs.len()))
+            .ok_or(SqlCompileError::ResourceExhausted)?;
+    }
+    Ok(count)
 }
 
 fn should_skip_single_dedup_implementation(
@@ -731,14 +860,21 @@ mod is_known_rule_name_tests {
             matches!(op, Operator::LogicalLimit(_))
         }
 
-        fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+        fn apply(
+            &self,
+            expr: &MExpr,
+            memo: &mut Memo,
+            control: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+            let _ = control;
+
             let previous_count = self.apply_count.fetch_add(1, Ordering::SeqCst);
             assert_eq!(
                 previous_count, 0,
                 "same logical expression should not be implemented twice by one rule"
             );
             let Operator::LogicalLimit(limit) = &expr.op else {
-                return vec![];
+                return Ok(vec![]);
             };
             let child_group = memo.new_group(MExpr {
                 id: memo.next_expr_id(),
@@ -748,13 +884,13 @@ mod is_known_rule_name_tests {
                 }),
                 children: vec![],
             });
-            vec![NewExpr {
+            Ok(vec![NewExpr {
                 op: Operator::PhysicalLimit(LimitOp {
                     limit: limit.limit,
                     offset: limit.offset,
                 }),
                 children: vec![child_group],
-            }]
+            }])
         }
     }
 
@@ -773,17 +909,24 @@ mod is_known_rule_name_tests {
             matches!(op, Operator::LogicalLimit(_))
         }
 
-        fn apply(&self, expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
+        fn apply(
+            &self,
+            expr: &MExpr,
+            _memo: &mut Memo,
+            control: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+            let _ = control;
+
             let Operator::LogicalLimit(limit) = &expr.op else {
-                return vec![];
+                return Ok(vec![]);
             };
-            vec![NewExpr {
+            Ok(vec![NewExpr {
                 op: Operator::PhysicalLimit(LimitOp {
                     limit: limit.limit,
                     offset: limit.offset,
                 }),
                 children: expr.children.clone(),
-            }]
+            }])
         }
     }
 
@@ -813,14 +956,19 @@ mod is_known_rule_name_tests {
         let key_id = crate::column_id::ColumnId::new_for_test(9001);
         let key = memo.scalars.intern(
             crate::optimizer::scalar::ScalarNode::ColumnRef(key_id),
-            arrow::datatypes::DataType::Int32,
-            false,
+            novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int32,
+                false,
+            ),
         );
         let output = crate::analysis::OutputColumn {
             column_id: key_id,
             name: "k".to_string(),
-            data_type: arrow::datatypes::DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int32,
+                false,
+            ),
+
             is_internal: false,
         };
         MExpr {
@@ -856,7 +1004,7 @@ mod is_known_rule_name_tests {
         });
         let options = options::OptimizerOptions::default_settings();
 
-        implement(&mut memo, &[rule], &options);
+        implement(&mut memo, &[rule], &options, test_optimizer_control()).unwrap();
 
         assert_eq!(memo.groups[root].physical_exprs.len(), 1);
         assert_eq!(memo.groups.len(), 3);
@@ -872,7 +1020,7 @@ mod is_known_rule_name_tests {
         let rule: Box<dyn Rule> = Box::new(LimitToPhysicalWithOriginalChildren);
         let options = options::OptimizerOptions::default_settings();
 
-        implement(&mut memo, &[rule], &options);
+        implement(&mut memo, &[rule], &options, test_optimizer_control()).unwrap();
 
         let physical_children: Vec<_> = memo.groups[root]
             .physical_exprs
@@ -901,7 +1049,7 @@ mod is_known_rule_name_tests {
                 cascades_rules::split_aggregate::SplitAggregateRule,
             )],
             &options,
-            Instant::now() + Duration::from_secs(30),
+            test_optimizer_control(),
         )
         .expect("split aggregate exploration");
         assert!(
@@ -916,7 +1064,9 @@ mod is_known_rule_name_tests {
             &mut memo,
             &[Box::new(cascades_rules::implement::AggToHashAgg)],
             &options,
-        );
+            test_optimizer_control(),
+        )
+        .unwrap();
 
         let modes = hash_aggregate_modes(&memo, root);
         assert!(
@@ -944,7 +1094,7 @@ mod is_known_rule_name_tests {
                 cascades_rules::split_aggregate::SplitAggregateRule,
             )],
             &options,
-            Instant::now() + Duration::from_secs(30),
+            test_optimizer_control(),
         )
         .expect("disabled split aggregate exploration");
         assert!(
@@ -959,7 +1109,9 @@ mod is_known_rule_name_tests {
             &mut memo,
             &[Box::new(cascades_rules::implement::AggToHashAgg)],
             &options,
-        );
+            test_optimizer_control(),
+        )
+        .unwrap();
 
         let modes = hash_aggregate_modes(&memo, root);
         assert!(
@@ -1059,7 +1211,12 @@ mod is_known_rule_name_tests {
         settings: &crate::optimizer::options::SessionOptimizerSettings,
     ) -> Result<OptimizedOperatorNode, String> {
         let mut scalar_arena = ScalarArena::new();
-        let plan_expr = try_to_optimizer_expr(&plan, &mut scalar_arena)?;
+        let plan_expr = try_to_optimizer_expr(
+            &plan,
+            &mut scalar_arena,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         optimize_with_test_table_statistics(
             plan_expr,
             scalar_arena,
@@ -1077,7 +1234,12 @@ mod is_known_rule_name_tests {
         root_distribution: DistributionSpec,
     ) -> Result<OptimizedOperatorNode, String> {
         let mut scalar_arena = ScalarArena::new();
-        let plan_expr = try_to_optimizer_expr(&plan, &mut scalar_arena)?;
+        let plan_expr = try_to_optimizer_expr(
+            &plan,
+            &mut scalar_arena,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         optimize_with_root_distribution_and_test_table_statistics(
             plan_expr,
             scalar_arena,
@@ -1142,8 +1304,8 @@ mod is_known_rule_name_tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -1155,16 +1317,14 @@ mod is_known_rule_name_tests {
         arena.remember_source_column_display(column.column_id, None, column.name.clone());
         arena.intern(
             ScalarNode::ColumnRef(column.column_id),
-            column.data_type.clone(),
-            column.nullable,
+            column.value_type.clone(),
         )
     }
 
     fn scalar_int(arena: &mut ScalarArena, value: i64) -> crate::optimizer::scalar::ScalarId {
         arena.intern(
             ScalarNode::Literal(HashableLiteral(crate::common::LiteralValue::Int(value))),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         )
     }
 
@@ -1182,8 +1342,7 @@ mod is_known_rule_name_tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         )
     }
 
@@ -1197,8 +1356,7 @@ mod is_known_rule_name_tests {
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         )
     }
 
@@ -1214,8 +1372,7 @@ mod is_known_rule_name_tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         )
     }
 
@@ -1355,6 +1512,7 @@ mod is_known_rule_name_tests {
         let mv_desc = cascades_rules::mv_rewrite::descriptor::SpjgDescriptor::from_opt_expr(
             &mv_expr,
             &mut mv_scalars,
+            test_optimizer_control(),
         )
         .expect("mv descriptor");
         let candidate = cascades_rules::mv_rewrite::MvRewriteCandidate {
@@ -1396,6 +1554,8 @@ mod is_known_rule_name_tests {
                 &crate::optimizer::options::SessionOptimizerSettings::default(),
                 None,
                 crate::functions::test_function_catalog_snapshot(),
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                test_optimizer_control(),
             ),
         )
         .expect("optimize");
@@ -1464,14 +1624,19 @@ mod is_known_rule_name_tests {
                         qualifier: None,
                         column: "sq".to_string(),
                     },
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                 },
                 output_column: OutputColumn {
                     column_id: ColumnId(5),
                     name: "sq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: ColumnId(5),
@@ -1567,8 +1732,13 @@ mod is_known_rule_name_tests {
         };
         let (resolved, cte_registry, mut factory) =
             crate::analyzer::analyze(query, &MinimalCatalog, "default").expect("analyze");
-        let logical =
-            crate::planner::plan_query(resolved, cte_registry, &mut factory).expect("plan query");
+        let logical = crate::planner::plan_query(
+            resolved,
+            cte_registry,
+            &mut factory,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .expect("plan query");
         let hash_col = match &logical.kind {
             LogicalPlanKind::Project(project) => match &project.items[0].expr.kind {
                 ExprKind::ColumnRef { column_id, .. } => *column_id,
@@ -1703,12 +1873,18 @@ mod is_known_rule_name_tests {
         };
         let (resolved, cte_registry, mut factory) =
             crate::analyzer::analyze(query, &RankingCatalog, "default").expect("analyze");
-        let logical =
-            crate::planner::plan_query(resolved, cte_registry, &mut factory).expect("plan query");
+        let logical = crate::planner::plan_query(
+            resolved,
+            cte_registry,
+            &mut factory,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .expect("plan query");
         let mut scalars = crate::optimizer::scalar::ScalarArena::new();
         let opt_plan = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             &logical,
             &mut scalars,
+            crate::optimizer::test_optimizer_control(),
         )
         .expect("logical to opt expr");
         let mut rewrite_ctx =
@@ -1816,8 +1992,13 @@ mod is_known_rule_name_tests {
                 .expect("analyze with apply framework must succeed");
 
         // plan_query: turns the ApplyScalarSpec into LogicalPlanKind::Apply.
-        let plan = crate::planner::plan_query(resolved, cte_registry, &mut factory)
-            .expect("plan_query with apply framework must succeed");
+        let plan = crate::planner::plan_query(
+            resolved,
+            cte_registry,
+            &mut factory,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .expect("plan_query with apply framework must succeed");
 
         // optimize: M1b's decorrelation rules must rewrite the Apply to a
         // join; no ApplyException error, no residual Apply.

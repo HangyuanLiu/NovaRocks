@@ -33,7 +33,15 @@ pub fn client_render_schema(
     plan: &PhysicalPlan,
     timezone_offset_seconds: i32,
 ) -> Result<ClientRenderSchema, String> {
-    let result = plan.result_port().ok_or_else(invalid)?;
+    client_render_schema_from_port(plan.result_port(), timezone_offset_seconds)
+}
+
+/// Render the same published SQL public declaration, without using computed nullability.
+pub fn client_render_schema_from_port(
+    port: Option<&novarocks_physical_plan::ResultPort>,
+    timezone_offset_seconds: i32,
+) -> Result<ClientRenderSchema, String> {
+    let result = port.ok_or_else(invalid)?;
     schema(&result.fields, timezone_offset_seconds)
 }
 
@@ -372,10 +380,7 @@ mod tests {
             alias: None,
             value: ValueId::new(1),
             domain,
-            ty: ValueType {
-                data_type,
-                nullable: true,
-            },
+            ty: ValueType::new(data_type, true),
         }
     }
     #[test]

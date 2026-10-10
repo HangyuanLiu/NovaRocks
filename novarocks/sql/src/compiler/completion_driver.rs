@@ -29,7 +29,7 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
     MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId,
-    ProviderReadOccurrenceId, ScanReadBudget, ValueType,
+    ProviderReadOccurrenceId, ScanReadBudget,
 };
 use novarocks_spi::connector::StatisticsMetric;
 
@@ -38,7 +38,7 @@ use super::completion::{
     MaterializedViewFact, MaterializedViewNeed, MaterializedViewOutcome, ProviderReadColumnNeed,
     ProviderReadFact, ProviderReadNeed, ProviderReadStaticContract, SqlCompileRequest,
     SqlDisplayIntent, SqlNeedBatch, StatisticsFact, StatisticsNeed,
-    provider_connector_type_for_engine, provider_relation_need_from_sql_scan,
+    provider_relation_need_from_sql_scan,
 };
 use super::completion_catalog::CatalogCompletionState;
 use super::completion_predicate::{ProviderPredicateColumn, lower_provider_predicates};
@@ -68,6 +68,8 @@ pub struct SqlFinalPlanCompileRequest {
     environment: SqlPlanningEnvironment,
     functions: Arc<dyn SqlFunctionCatalog>,
     constant_evaluator: &'static dyn SqlConstantEvaluator,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    emission_mode: super::SqlPhysicalEmissionMode,
     control: SqlCompileControl,
     dop_domain: PipelineDopDomain,
     scan_read_budget: ScanReadBudget,
@@ -83,6 +85,7 @@ impl fmt::Debug for SqlFinalPlanCompileRequest {
             .field("intent", &self.intent)
             .field("session", &self.session)
             .field("environment", &self.environment)
+            .field("emission_mode", &self.emission_mode)
             .field("dop_domain", &self.dop_domain)
             .field("scan_read_budget", &self.scan_read_budget)
             .field("limits", &self.limits)
@@ -103,6 +106,8 @@ impl SqlFinalPlanCompileRequest {
         environment: SqlPlanningEnvironment,
         functions: Arc<dyn SqlFunctionCatalog>,
         constant_evaluator: &'static dyn SqlConstantEvaluator,
+        constant_policy: novarocks_functions::ConstantPolicy,
+        emission_mode: super::SqlPhysicalEmissionMode,
         control: SqlCompileControl,
         dop_domain: PipelineDopDomain,
         scan_read_budget: ScanReadBudget,
@@ -116,6 +121,8 @@ impl SqlFinalPlanCompileRequest {
             environment,
             functions: functions.snapshot(),
             constant_evaluator,
+            constant_policy,
+            emission_mode,
             control,
             dop_domain,
             scan_read_budget,
@@ -141,6 +148,8 @@ impl SqlFinalPlanCompileRequest {
             environment,
             functions,
             constant_evaluator,
+            constant_policy,
+            emission_mode,
             control,
             dop_domain,
             scan_read_budget,
@@ -155,7 +164,7 @@ impl SqlFinalPlanCompileRequest {
             super::parse_query(&statement)?,
             &session.sql_semantics,
         )
-        .map_err(SqlCompileError::Analyze)?;
+        .map_err(SqlCompileError::from)?;
         let common = FinalPlanCommon {
             version,
             intent,
@@ -163,6 +172,8 @@ impl SqlFinalPlanCompileRequest {
             environment,
             functions,
             constant_evaluator,
+            constant_policy,
+            emission_mode,
             dop_domain,
             scan_read_budget,
             display_intent,
@@ -173,17 +184,17 @@ impl SqlFinalPlanCompileRequest {
         // catalog needs so an unrelated candidate cannot fail the base query.
         let consumer_requires_semantic_snapshot =
             crate::sql_mode::query_uses_group_concat_legacy(&common.session.sql_semantics, &query)
-                .map_err(SqlCompileError::Analyze)?
+                .map_err(SqlCompileError::from)?
                 || crate::sql_mode::query_uses_decimal_overflow_to_double(
                     &common.session.sql_semantics,
                     &query,
                 )
-                .map_err(SqlCompileError::Analyze)?
+                .map_err(SqlCompileError::from)?
                 || crate::sql_mode::query_uses_error_if_overflow(
                     &common.session.sql_semantics,
                     &query,
                 )
-                .map_err(SqlCompileError::Analyze)?;
+                .map_err(SqlCompileError::from)?;
         let mv_enabled = common.session.optimizer_settings.mv_rewrite_enabled()
             && !consumer_requires_semantic_snapshot;
         let initial_catalog = CatalogCompletionState::try_new(
@@ -286,6 +297,8 @@ struct FinalPlanCommon {
     environment: SqlPlanningEnvironment,
     functions: Arc<dyn SqlFunctionCatalog>,
     constant_evaluator: &'static dyn SqlConstantEvaluator,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    emission_mode: super::SqlPhysicalEmissionMode,
     dop_domain: PipelineDopDomain,
     scan_read_budget: ScanReadBudget,
     display_intent: SqlDisplayIntent,
@@ -310,6 +323,7 @@ pub(crate) struct SqlStatisticsCompletionState {
 }
 
 pub(crate) struct SqlProviderReadCompletionState {
+    root_allow_throw_exception: bool,
     common: FinalPlanCommon,
     root_semantics: super::root_output::RootOutputSemantics,
     physical: PhysicalPlanNode,
@@ -534,6 +548,8 @@ fn analyze_with_catalog(
         common.functions.as_ref(),
         common.constant_evaluator,
         mv_definitions,
+        common.constant_policy,
+        common.emission_mode,
         control.clone(),
     );
     match SqlCompiler::analyze(request)? {
@@ -714,12 +730,14 @@ fn optimize_and_prepare_provider(
     control: &SqlCompileControl,
 ) -> Result<CompilerStep, SqlCompileError> {
     let optimized = optimize_to_physical(analyzed, &statistics_snapshot, control)?;
-    provider_or_ready_step(common, optimized, next_need_ordinal)
+    provider_or_ready_step(common, optimized, next_need_ordinal, control)
 }
 
 /// The optimizer result and the immutable base-table facts it consumed travel
 /// together until final-plan completion. Provider negotiation cannot replace them.
 struct OptimizedPhysicalPlan {
+    functions: Arc<dyn SqlFunctionCatalog>,
+    root_allow_throw_exception: bool,
     physical: PhysicalPlanNode,
     root_semantics: super::root_output::RootOutputSemantics,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -735,10 +753,13 @@ fn optimize_to_physical(
         factory,
         intent,
         settings,
+        decimal_overflow_policy,
+        root_allow_throw_exception,
         change_stream: _,
         mv_rewrite,
         function_catalog,
         constant_evaluator,
+        constant_policy,
     } = analyzed;
     control.check()?;
     let root_semantics = super::root_output::RootOutputSemantics::capture(
@@ -747,12 +768,13 @@ fn optimize_to_physical(
         &factory,
     )
     .map_err(SqlCompileError::Compilation)?;
-    let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
+    let mut scalar_arena =
+        crate::optimizer::scalar::ScalarArena::with_constant_policy(constant_policy);
     let mut optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical_plan,
         &mut scalar_arena,
-    )
-    .map_err(SqlCompileError::Compilation)?;
+        control,
+    )?;
     let mut statistics = super::collect_statistics(statistics_snapshot, &mut optimizer_expr)?;
     control.check()?;
     let (mv_rewrite, factory) = super::mv_rewrite::attach_candidate_statistics(
@@ -764,7 +786,13 @@ fn optimize_to_physical(
     let super::mv_rewrite::SqlMvRewritePreparation {
         candidates,
         diagnostics: _,
+        constant_policy: mv_constant_policy,
     } = mv_rewrite;
+    if mv_constant_policy != constant_policy {
+        return Err(SqlCompileError::InvalidRequest(
+            "MV constant policy differs from its analyzed request".into(),
+        ));
+    }
     let root_distribution = match &intent {
         SqlCompileIntent::IcebergWrite { root_distribution } => {
             super::resolve_root_distribution_requirement(&logical_plan, root_distribution)?
@@ -775,7 +803,10 @@ fn optimize_to_physical(
         &settings,
         constant_evaluator,
         Arc::clone(&function_catalog),
-    );
+        decimal_overflow_policy,
+        control,
+    )
+    .with_fold_dependency_observer(control.fold_dependency_observer().cloned());
     let optimized = match root_distribution {
         Some(distribution) => crate::optimizer::optimize_with_root_distribution(
             optimizer_expr,
@@ -793,8 +824,7 @@ fn optimize_to_physical(
             candidates,
             environment,
         ),
-    }
-    .map_err(SqlCompileError::Compilation)?;
+    }?;
     control.check()?;
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&optimized)
         .map_err(SqlCompileError::Compilation)?;
@@ -802,6 +832,8 @@ fn optimize_to_physical(
         .domains(&physical.output_columns)
         .map_err(SqlCompileError::Compilation)?;
     Ok(OptimizedPhysicalPlan {
+        functions: function_catalog,
+        root_allow_throw_exception,
         root_semantics,
         physical,
         query_statistics: statistics.snapshot,
@@ -809,15 +841,21 @@ fn optimize_to_physical(
 }
 
 fn provider_or_ready_step(
-    common: FinalPlanCommon,
+    mut common: FinalPlanCommon,
     optimized: OptimizedPhysicalPlan,
     next_need_ordinal: u32,
+    control: &SqlCompileControl,
 ) -> Result<CompilerStep, SqlCompileError> {
     let OptimizedPhysicalPlan {
+        functions,
+        root_allow_throw_exception,
         mut physical,
         root_semantics,
         query_statistics,
     } = optimized;
+    // Retain the exact catalogue snapshot that authored optimizer bindings,
+    // rather than the earlier request snapshot whose outer owner may differ.
+    common.functions = functions;
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
         &mut physical,
         &common.session.optimizer_settings,
@@ -826,11 +864,13 @@ fn provider_or_ready_step(
         .session
         .optimizer_settings
         .connector_static_predicate_pushdown_enabled();
-    let (physical, needs) = collect_provider_needs(physical, next_need_ordinal, offer_predicates)?;
+    let (physical, needs) =
+        collect_provider_needs(physical, next_need_ordinal, offer_predicates, control)?;
     if !needs.is_empty() {
         return Ok(CompilerStep::need(
             SqlNeedBatch::ProviderReads(needs.clone()),
             CompilerContinuation::provider_read(SqlProviderReadCompletionState {
+                root_allow_throw_exception,
                 common,
                 physical,
                 root_semantics,
@@ -839,19 +879,24 @@ fn provider_or_ready_step(
             }),
         ));
     }
-    let mut builder =
+    let mut draft =
         crate::planner::distributed::build::lower_final_physical_plan_with_root_semantics(
             &physical,
             common.version,
             common.dop_domain,
             None,
             root_semantics,
+            common.functions,
+            root_allow_throw_exception,
+            common.constant_policy,
+            common.emission_mode,
+            control,
         )
-        .map_err(|error| SqlCompileError::Compilation(error.to_string()))?;
-    query_statistics.annotate_final_plan(&mut builder);
+        .map_err(SqlCompileError::from)?;
+    query_statistics.annotate_final_plan(&mut draft);
     Ok(CompilerStep::ready(
         common.version,
-        builder,
+        draft,
         common.display_intent,
         [],
     ))
@@ -868,6 +913,7 @@ pub(crate) fn collect_provider_needs(
     plan: PhysicalPlanNode,
     mut next_need_ordinal: u32,
     offer_predicates: bool,
+    control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<(PhysicalPlanNode, Box<[ProviderReadNeed]>), SqlCompileError> {
     #[derive(Default)]
     struct ProviderReadOccurrenceAllocator {
@@ -890,7 +936,9 @@ pub(crate) fn collect_provider_needs(
         occurrence_allocator: &mut ProviderReadOccurrenceAllocator,
         needs: &mut Vec<ProviderReadNeed>,
         offer_predicates: bool,
+        work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
     ) -> Result<PhysicalPlanNode, SqlCompileError> {
+        work.step()?;
         let PhysicalPlanNode {
             kind,
             children,
@@ -907,6 +955,7 @@ pub(crate) fn collect_provider_needs(
                     occurrence_allocator,
                     needs,
                     offer_predicates,
+                    work,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -930,7 +979,7 @@ pub(crate) fn collect_provider_needs(
                     &source.kind,
                 )
                 .map_err(|error| SqlCompileError::Compilation(error.to_string()))?;
-                let (columns, predicate_columns) = provider_columns(&output_columns, &scan)?;
+                let (columns, predicate_columns) = provider_columns(&output_columns, &scan, work)?;
                 let predicates = if offer_predicates {
                     lower_provider_predicates(&scan, &predicate_columns)
                 } else {
@@ -963,6 +1012,10 @@ pub(crate) fn collect_provider_needs(
         })
     }
 
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::ProviderValidation,
+    )?;
     let mut needs = Vec::new();
     let mut occurrence_allocator = ProviderReadOccurrenceAllocator::default();
     let plan = walk(
@@ -971,8 +1024,33 @@ pub(crate) fn collect_provider_needs(
         &mut occurrence_allocator,
         &mut needs,
         offer_predicates,
+        &mut work,
     )?;
+    work.finish()?;
     Ok((plan, needs.into_boxed_slice()))
+}
+
+enum ProviderColumnProjectionError {
+    Source(novarocks_types::ColumnValueTypeError),
+    Control(novarocks_type_contract::CompileControlError),
+}
+impl From<novarocks_types::ColumnValueTypeError> for ProviderColumnProjectionError {
+    fn from(error: novarocks_types::ColumnValueTypeError) -> Self {
+        Self::Source(error)
+    }
+}
+impl From<novarocks_type_contract::ValueTypeError> for ProviderColumnProjectionError {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Source(error.into())
+    }
+}
+impl ProviderColumnProjectionError {
+    fn into_compile_error(self) -> SqlCompileError {
+        match self {
+            Self::Control(error) => SqlCompileError::from(error),
+            Self::Source(error) => SqlCompileError::Compilation(error.to_string()),
+        }
+    }
 }
 
 type ProviderColumnProjection = (
@@ -980,34 +1058,55 @@ type ProviderColumnProjection = (
     BTreeMap<crate::column_id::ColumnId, ProviderPredicateColumn>,
 );
 
+fn preflight_provider_value_type(
+    value_type: &novarocks_type_contract::FunctionValueType,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<(), SqlCompileError> {
+    use novarocks_functions::KernelFailure;
+    novarocks_functions::validate_function_value_type_observed(value_type, work).map_err(|error| {
+        match error {
+            KernelFailure::Cancelled => SqlCompileError::Cancelled,
+            KernelFailure::DeadlineExceeded => SqlCompileError::DeadlineExceeded,
+            KernelFailure::ResourceExhausted => SqlCompileError::ResourceExhausted,
+            error => SqlCompileError::Compilation(error.to_string()),
+        }
+    })
+}
+
 fn provider_columns(
     output_columns: &[crate::analysis::OutputColumn],
     scan: &crate::planner::payload::PlanScanNode,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
 ) -> Result<ProviderColumnProjection, SqlCompileError> {
-    let synthetic = scan
-        .variant_columns
-        .iter()
-        .map(|column| column.synthetic_column_id)
-        .collect::<BTreeSet<_>>();
+    let mut synthetic = BTreeSet::new();
+    for column in &scan.variant_columns {
+        work.step()?;
+        synthetic.insert(column.synthetic_column_id());
+    }
     let source_columns = scan
         .table
         .columns
         .iter()
-        .chain(&scan.table.iceberg_row_lineage_metadata_columns)
-        .collect::<Vec<_>>();
-    let source_scan_columns = scan
-        .columns
-        .iter()
-        .filter(|column| !synthetic.contains(&column.column_id))
-        .collect::<Vec<_>>();
+        .chain(&scan.table.iceberg_row_lineage_metadata_columns);
+    let mut source_scan_columns = BTreeMap::<_, Vec<_>>::new();
+    for column in &scan.columns {
+        work.step()?;
+        if !synthetic.contains(&column.column_id) {
+            source_scan_columns
+                .entry(column.column_id)
+                .or_default()
+                .push(column);
+        }
+    }
     // A scan names the provider fields it reads, which need not be all of
     // them: a statement rewritten onto a materialized view reads the columns
     // that view was matched for. So each one is found by the name it carries
     // rather than by standing at the field's position.
     let mut source_by_name = BTreeMap::new();
-    for column in &source_columns {
+    for column in source_columns {
+        work.step()?;
         if source_by_name
-            .insert(column.name.as_str(), *column)
+            .insert(column.name.as_str(), column)
             .is_some()
         {
             return Err(SqlCompileError::Compilation(format!(
@@ -1019,36 +1118,53 @@ fn provider_columns(
     let mut columns = Vec::new();
     let mut predicate_columns = BTreeMap::new();
     for output in output_columns {
+        work.step()?;
         if synthetic.contains(&output.column_id) {
             continue;
         }
-        let mut matches = source_scan_columns
-            .iter()
-            .filter(|column| column.column_id == output.column_id);
-        let logical = matches.next().ok_or_else(|| {
+        let matches = source_scan_columns.get(&output.column_id).ok_or_else(|| {
             SqlCompileError::Compilation(format!(
                 "scan output column id {} has no exact source-column binding",
-                output.column_id
+                output.column_id,
             ))
         })?;
-        if matches.next().is_some() {
+        if matches.len() != 1 {
             return Err(SqlCompileError::Compilation(format!(
                 "scan output column id {} repeats its source-column binding",
-                output.column_id
+                output.column_id,
             )));
         }
+        let logical = matches[0];
         let source = source_by_name.get(logical.name.as_str()).ok_or_else(|| {
             SqlCompileError::Compilation(format!(
                 "scan source column '{}' is not a field of the provider schema",
                 logical.name
             ))
         })?;
+        let source_value_type = source
+            .declared_value_type_observed(|| {
+                work.step().map_err(ProviderColumnProjectionError::Control)
+            })
+            .map_err(ProviderColumnProjectionError::into_compile_error)?;
+        // The exact walk hashes metadata lookup keys. Admit all three actual
+        // types under the existing frozen field bounds before that operation.
+        for value_type in [&source_value_type, &logical.value_type, &output.value_type] {
+            preflight_provider_value_type(value_type, work)?;
+        }
         if logical.name != source.name
-            || logical.data_type != source.data_type
-            || logical.nullable != source.nullable
+            || !logical
+                .value_type
+                .exactly_equals_observed(&source_value_type, || {
+                    work.step().map_err(ProviderColumnProjectionError::Control)
+                })
+                .map_err(ProviderColumnProjectionError::into_compile_error)?
             || output.name != source.name
-            || output.data_type != source.data_type
-            || output.nullable != source.nullable
+            || !output
+                .value_type
+                .exactly_equals_observed(&source_value_type, || {
+                    work.step().map_err(ProviderColumnProjectionError::Control)
+                })
+                .map_err(ProviderColumnProjectionError::into_compile_error)?
         {
             return Err(SqlCompileError::Compilation(format!(
                 "scan output '{}' differs from its exact provider schema column",
@@ -1056,12 +1172,13 @@ fn provider_columns(
             )));
         }
         let connector_type =
-            provider_connector_type_for_engine(&source.data_type).ok_or_else(|| {
-                SqlCompileError::Compilation(format!(
-                    "scan output '{}' has no exact provider value type",
-                    output.name
-                ))
-            })?;
+            novarocks_connector_contract::connector_type_for_value_type(&source_value_type)
+                .ok_or_else(|| {
+                    SqlCompileError::Compilation(format!(
+                        "scan output '{}' has no exact provider value type",
+                        output.name,
+                    ))
+                })?;
         let ordinal = u32::try_from(columns.len()).map_err(|_| {
             SqlCompileError::Compilation("provider projection exceeds u32".to_string())
         })?;
@@ -1069,7 +1186,7 @@ fn provider_columns(
             ProviderReadColumnNeed::try_new(
                 ordinal,
                 source.name.clone(),
-                ValueType::new(source.data_type.clone(), source.nullable),
+                source_value_type,
                 connector_type,
             )
             .map_err(|error| SqlCompileError::Compilation(error.to_string()))?,
@@ -1118,19 +1235,24 @@ pub(super) fn resume_provider_read(
             .into_iter()
             .map(|fact| (fact, state.common.scan_read_budget)),
     )?;
-    let mut builder =
+    let mut draft =
         crate::planner::distributed::build::lower_final_physical_plan_with_root_semantics(
             &state.physical,
             state.common.version,
             state.common.dop_domain,
             Some(reads),
             state.root_semantics,
+            state.common.functions,
+            state.root_allow_throw_exception,
+            state.common.constant_policy,
+            state.common.emission_mode,
+            control,
         )
-        .map_err(|error| SqlCompileError::Compilation(error.to_string()))?;
-    state.query_statistics.annotate_final_plan(&mut builder);
+        .map_err(SqlCompileError::from)?;
+    state.query_statistics.annotate_final_plan(&mut draft);
     Ok(CompilerStep::ready(
         state.common.version,
-        builder,
+        draft,
         state.common.display_intent,
         [],
     ))
@@ -1142,6 +1264,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use arrow::datatypes::DataType;
+    use novarocks_physical_plan::ValueType;
     use novarocks_physical_plan::{
         ExactInputVersion, NodeKind, PredicateGuaranteeKind, ProviderColumnReference,
         ProviderReadReference,
@@ -1167,7 +1290,7 @@ mod tests {
     };
     use crate::planning::dml::DmlStatisticsEvidence;
 
-    fn request(sql: &str, intent: SqlCompileIntent) -> SqlFinalPlanCompileRequest {
+    pub(super) fn request(sql: &str, intent: SqlCompileIntent) -> SqlFinalPlanCompileRequest {
         request_with_mv(sql, intent, false)
     }
 
@@ -1202,6 +1325,8 @@ mod tests {
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
             noop_constant_evaluator(),
+            crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control,
             PipelineDopDomain {
                 min: 1,
@@ -1217,88 +1342,354 @@ mod tests {
     }
 
     #[test]
-    fn m07_scalar_root_identity_survives_owned_final_completion() {
-        use novarocks_physical_plan::ResultValueDomain as D;
-        use novarocks_result_contract::ScalarValueType as V;
-        for (sql, domain, value) in [
-            ("select json_object('k', 1) as j", D::Json, V::Json),
+    fn completion_optimizer_carries_the_analyzed_root_allow_override() {
+        for (session_mode, sql, expected_allow) in [
+            ("ERROR_IF_OVERFLOW", "SELECT 1", false),
             (
-                "select coalesce(json_object('k', 1), null) as j",
-                D::Json,
-                V::Json,
+                "ERROR_IF_OVERFLOW",
+                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ 1",
+                true,
             ),
             (
-                "select if(true, json_object('k', 1), null) as j",
-                D::Json,
-                V::Json,
-            ),
-            (
-                "select case when true then json_object('k', 1) else null end as j",
-                D::Json,
-                V::Json,
-            ),
-            (
-                "with q as (select json_object('k', 1) as j) select j from q",
-                D::Json,
-                V::Json,
-            ),
-            (
-                "select cast(json_object('k', 1) as varchar) as j",
-                D::Plain,
-                V::String,
-            ),
-            (
-                "select coalesce(json_object('k', 1), 'plain') as j",
-                D::Plain,
-                V::String,
-            ),
-            (
-                "select json_object('k', 1) as j union all select null",
-                D::Json,
-                V::Json,
+                "ALLOW_THROW_EXCEPTION",
+                "SELECT /*+ SET_VAR(sql_mode=32) */ 1",
+                false,
             ),
         ] {
-            let progress = SqlCompiler::start(
-                request(sql, SqlCompileIntent::Query)
-                    .try_into_completion()
-                    .unwrap(),
-            )
+            let mut input = request(sql, SqlCompileIntent::Query);
+            input.session.sql_semantics = input
+                .session
+                .sql_semantics
+                .clone()
+                .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode));
+            let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+            let snapshot = SqlPlannerTableSnapshot::new(&catalog);
+            let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
+                input.statement,
+                input.intent,
+                input.session,
+                input.environment,
+                &snapshot,
+                input.functions.as_ref(),
+                input.constant_evaluator,
+                None,
+                crate::constant::test_constant_policy(),
+                input.emission_mode,
+                input.control.clone(),
+            ))
+            .unwrap()
+            .into_pending()
             .unwrap();
-            let SqlCompileProgress::Complete(completed) = progress else {
-                panic!("source-free scalar unexpectedly needs observations: {sql}");
-            };
-            let result = completed.plan().result_port().unwrap();
-            assert_eq!(result.fields[0].domain, domain, "{sql}");
-            let schema = completed.scalar_schema().unwrap();
-            assert_eq!(schema.field().value_type, value, "{sql}");
-            assert_eq!(
-                schema.field().nullable,
-                result.fields[0].ty.nullable,
-                "{sql}"
-            );
-            assert_eq!(schema.source_slot(), None);
-            let plan = completed
-                .into_plan()
-                .with_root_output(novarocks_result_contract::RootOutputContract::new(
-                    novarocks_result_contract::RootProfileId::V1,
-                    novarocks_result_contract::FrozenRootOutput::ScalarValue(schema),
-                ))
-                .unwrap();
-            novarocks_physical_plan::validate_plan(&plan).unwrap();
+            assert_eq!(analyzed.root_allow_throw_exception(), expected_allow);
+            let optimized =
+                optimize_to_physical(analyzed, &DmlStatisticsSnapshot::empty(), &input.control)
+                    .unwrap();
+            assert_eq!(optimized.root_allow_throw_exception, expected_allow);
+        }
+    }
+
+    fn provider_type_scan(value_type: ValueType, count: usize) -> PhysicalPlanNode {
+        use crate::analysis::OutputColumn;
+        use crate::binding::SqlTableBindingScopeId;
+        use crate::column_id::ColumnId;
+        use crate::planner::payload::PlanScanNode;
+        use crate::planner::physical::{PhysicalPlanKind, PhysicalPlanStats, PlannerConfidence};
+        use std::num::{NonZeroU32, NonZeroU64};
+        let columns = (0..count)
+            .map(|index| OutputColumn {
+                column_id: ColumnId(index as u32 + 1),
+                name: format!("c{index}"),
+                value_type: value_type.clone(),
+                is_internal: false,
+            })
+            .collect::<Vec<_>>();
+        let scan = PlanScanNode {
+            database: "db".into(),
+            table: TableDef {
+                name: "t".into(),
+                columns: columns
+                    .iter()
+                    .map(|column| {
+                        novarocks_types::schema::ColumnDef::from_value_type(
+                            column.name.clone(),
+                            column.value_type.clone(),
+                            None,
+                        )
+                        .unwrap()
+                    })
+                    .collect(),
+                iceberg_row_lineage_metadata_columns: vec![],
+                source: ScanSource::Sql(SqlScanSource::new(
+                    SqlTableBindingId::new(
+                        SqlTableBindingScopeId::new(NonZeroU64::new(1).unwrap()),
+                        NonZeroU32::new(1).unwrap(),
+                    ),
+                    SqlTableIdentity {
+                        catalog: "iceberg".into(),
+                        namespace: "db".into(),
+                        table: "t".into(),
+                    },
+                    SqlScanKind::Data {
+                        version: SqlTableVersionSelector::Current,
+                    },
+                )),
+            },
+            alias: None,
+            columns: columns.clone(),
+            predicates: vec![],
+            required_columns: None,
+            variant_columns: vec![],
+            mv_rewritten_from: None,
+        };
+        PhysicalPlanNode {
+            kind: PhysicalPlanKind::Scan(scan.into()),
+            children: vec![],
+            output_columns: columns,
+            stats: PhysicalPlanStats {
+                output_row_count: 0.0,
+                row_count_confidence: PlannerConfidence::Fallback,
+                column_statistics: Default::default(),
+                cost_estimate: None,
+                broadcast_decision: None,
+            },
+            probe_runtime_filters: vec![],
         }
     }
 
     #[test]
-    fn m07_scalar_schema_refuses_multiple_root_occurrences() {
-        let SqlCompileProgress::Complete(completed) = SqlCompiler::start(
-            request("select 1, 2", SqlCompileIntent::Query)
-                .try_into_completion()
-                .unwrap(),
-        )
-        .unwrap() else {
-            panic!("unexpected observation");
+    fn provider_completion_keeps_source_uuid_and_rejects_same_carrier_root_forgery() {
+        use novarocks_type_contract::ValueLogicalType;
+        for logical in [ValueLogicalType::Uuid, ValueLogicalType::Physical] {
+            let value_type =
+                ValueType::try_with_logical_type(DataType::FixedSizeBinary(16), true, logical)
+                    .unwrap();
+            let plan = provider_type_scan(value_type.clone(), 1);
+            let (_, needs) =
+                collect_provider_needs(plan.clone(), 7, false, &SqlCompileControl::unbounded())
+                    .unwrap();
+            assert_eq!(needs[0].columns()[0].engine_type(), &value_type);
+            let mut forged = plan;
+            forged.output_columns[0].value_type.logical_type = if logical == ValueLogicalType::Uuid
+            {
+                ValueLogicalType::Physical
+            } else {
+                ValueLogicalType::Uuid
+            };
+            assert!(matches!(
+                collect_provider_needs(forged, 7, false, &SqlCompileControl::unbounded()),
+                Err(SqlCompileError::Compilation(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn provider_completion_controls_actual_work_and_never_returns_partial_needs() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Owner {
+            observations: std::sync::Mutex<Vec<u32>>,
+            failure: Option<CompileControlError>,
+            fail_at: usize,
+        }
+        impl PureCompileControl for Owner {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                assert_eq!(phase, CompilePhase::ProviderValidation);
+                let mut observations = self.observations.lock().unwrap();
+                observations.push(units);
+                if observations.len() == self.fail_at
+                    && let Some(error) = self.failure
+                {
+                    return Err(error);
+                }
+                Ok(())
+            }
+        }
+        let plan = provider_type_scan(ValueType::new(DataType::Int32, false), 320);
+        let owner = Owner {
+            observations: Default::default(),
+            failure: None,
+            fail_at: usize::MAX,
         };
-        assert!(completed.scalar_schema().is_err());
+        let (_, needs) = collect_provider_needs(plan.clone(), 0, false, &owner).unwrap();
+        assert_eq!(needs[0].columns().len(), 320);
+        let observations = owner.observations.lock().unwrap().clone();
+        assert_eq!(observations[0], 0);
+        assert!(observations.iter().all(|units| *units <= 256));
+        assert!(observations.iter().sum::<u32>() >= 320 * 3);
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            // Entry, real interior work and final publication all preserve the
+            // exact typed error even if the owner would allow another call.
+            for fail_at in [1, 2, observations.len()] {
+                let owner = Owner {
+                    observations: Default::default(),
+                    failure: Some(error),
+                    fail_at,
+                };
+                let result = collect_provider_needs(plan.clone(), 0, false, &owner);
+                assert!(matches!(result, Err(actual) if actual == SqlCompileError::from(error)));
+                assert_eq!(owner.observations.lock().unwrap().len(), fail_at);
+            }
+        }
+    }
+
+    #[test]
+    fn provider_completion_controls_interior_of_one_nested_column_comparison() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Owner {
+            failure: CompileControlError,
+            fail_at: usize,
+            observations: std::sync::Mutex<Vec<u32>>,
+        }
+        impl PureCompileControl for Owner {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                assert_eq!(phase, CompilePhase::ProviderValidation);
+                let mut observations = self.observations.lock().unwrap();
+                observations.push(units);
+                if observations.len() == self.fail_at {
+                    Err(self.failure)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let value_type = ValueType::new(
+            DataType::Struct(
+                (0..100)
+                    .map(|index| {
+                        arrow::datatypes::Field::new(
+                            format!("child{index}"),
+                            DataType::Int32,
+                            false,
+                        )
+                    })
+                    .collect(),
+            ),
+            false,
+        );
+        let mut plan = provider_type_scan(value_type, 1);
+        let crate::planner::physical::PhysicalPlanKind::Scan(scan) = &mut plan.kind else {
+            panic!("scan fixture");
+        };
+        // The actual physical source has no declaration to project. Count its
+        // traversal separately so the failure below must occur in comparison.
+        scan.table.columns[0].logical_type = None;
+        let mut source_work = 0;
+        let source_value_type = scan.table.columns[0]
+            .declared_value_type_observed::<novarocks_types::ColumnValueTypeError>(|| {
+                source_work += 1;
+                Ok(())
+            })
+            .unwrap();
+        let counter = Owner {
+            failure: CompileControlError::Cancelled,
+            fail_at: usize::MAX,
+            observations: Default::default(),
+        };
+        let mut preflight_work = novarocks_type_contract::CompileCheckpoints::try_new(
+            &counter,
+            CompilePhase::ProviderValidation,
+        )
+        .unwrap();
+        for value_type in [
+            &source_value_type,
+            &scan.columns[0].value_type,
+            &plan.output_columns[0].value_type,
+        ] {
+            super::preflight_provider_value_type(value_type, &mut preflight_work).unwrap();
+        }
+        preflight_work.finish().unwrap();
+        let preflight_units = counter.observations.lock().unwrap().iter().sum::<u32>() as usize;
+        // Four outer steps precede the source projection and frozen preflight.
+        // Their first following full checkpoint must be inside exact Eq.
+        let fail_at = (source_work + preflight_units + 4) / 256 + 2;
+        for failure in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let owner = Owner {
+                failure,
+                fail_at,
+                observations: Default::default(),
+            };
+            assert!(
+                matches!(collect_provider_needs(plan.clone(), 0, false, &owner),
+                Err(actual) if actual == SqlCompileError::from(failure))
+            );
+            let observations = owner.observations.lock().unwrap();
+            assert_eq!(observations.len(), fail_at);
+            assert_eq!(observations[0], 0);
+            assert!(observations[1..].iter().all(|units| *units == 256));
+        }
+        let (_, needs) =
+            collect_provider_needs(plan, 0, false, &SqlCompileControl::unbounded()).unwrap();
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].columns().len(), 1);
+    }
+
+    #[test]
+    fn provider_completion_preflights_metadata_before_exact_comparison() {
+        use novarocks_type_contract::{
+            MAX_ARROW_FIELD_METADATA_KEY_BYTES, MAX_ARROW_FIELD_METADATA_VALUE_BYTES,
+        };
+        let value_type = |key_bytes, value_bytes| {
+            ValueType::new(
+                DataType::Struct(
+                    vec![
+                        arrow::datatypes::Field::new("nested", DataType::Int32, false)
+                            .with_metadata(
+                                [("k".repeat(key_bytes), "v".repeat(value_bytes))].into(),
+                            ),
+                    ]
+                    .into(),
+                ),
+                false,
+            )
+        };
+        let near = value_type(
+            MAX_ARROW_FIELD_METADATA_KEY_BYTES,
+            MAX_ARROW_FIELD_METADATA_VALUE_BYTES,
+        );
+        let (_, needs) = collect_provider_needs(
+            provider_type_scan(near.clone(), 1),
+            0,
+            false,
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        assert_eq!(needs[0].columns()[0].engine_type(), &near);
+        for over in [
+            value_type(MAX_ARROW_FIELD_METADATA_KEY_BYTES + 1, 1),
+            value_type(1, MAX_ARROW_FIELD_METADATA_VALUE_BYTES + 1),
+        ] {
+            for position in 0..3 {
+                let mut plan = provider_type_scan(near.clone(), 1);
+                let crate::planner::physical::PhysicalPlanKind::Scan(scan) = &mut plan.kind else {
+                    panic!("scan fixture")
+                };
+                match position {
+                    0 => scan.table.columns[0].data_type = over.data_type.clone(),
+                    1 => scan.columns[0].value_type = over.clone(),
+                    2 => plan.output_columns[0].value_type = over.clone(),
+                    _ => unreachable!(),
+                }
+                assert!(matches!(
+                    collect_provider_needs(plan, 0, false, &SqlCompileControl::unbounded()),
+                    Err(SqlCompileError::ResourceExhausted)
+                ));
+            }
+        }
     }
 
     struct CancelOnSecondObservation(AtomicUsize);
@@ -1328,7 +1719,7 @@ mod tests {
         }
     }
 
-    fn incomplete(progress: SqlCompileProgress) -> SqlCompilation {
+    pub(super) fn incomplete(progress: SqlCompileProgress) -> SqlCompilation {
         match progress {
             SqlCompileProgress::Incomplete(compilation) => {
                 assert_eq!(
@@ -1403,7 +1794,7 @@ mod tests {
         )
     }
 
-    fn provider_contract(need: &ProviderReadNeed) -> ProviderReadStaticContract {
+    pub(super) fn provider_contract(need: &ProviderReadNeed) -> ProviderReadStaticContract {
         let binding = connector_binding();
         ProviderReadStaticContract {
             sql_binding: need.binding(),
@@ -1449,8 +1840,6 @@ mod tests {
                 ProviderReadLimitFact::Exact,
             ),
             provided_properties: ProviderReadProperties::unconstrained(),
-            artifact_inputs: Box::default(),
-            artifact_refs: Box::default(),
             coverage_evidence: Box::default(),
         }
     }
@@ -1470,7 +1859,7 @@ mod tests {
         SqlFactBatch::CatalogRelations(facts.into_boxed_slice())
     }
 
-    fn answer_catalog(compilation: SqlCompilation) -> SqlCompileProgress {
+    pub(super) fn answer_catalog(compilation: SqlCompilation) -> SqlCompileProgress {
         let facts = catalog_facts(&compilation);
         SqlCompiler::finish(compilation, facts, &SqlCompileControl::unbounded())
             .expect("catalog round")
@@ -1504,7 +1893,7 @@ mod tests {
         .expect("statistics round")
     }
 
-    fn answer_provider(compilation: SqlCompilation) -> SqlCompileProgress {
+    pub(super) fn answer_provider(compilation: SqlCompilation) -> SqlCompileProgress {
         let needs = match compilation.needs() {
             SqlNeedBatch::ProviderReads(needs) => needs.to_vec(),
             other => panic!("expected provider needs, got {other:?}"),
@@ -1530,9 +1919,180 @@ mod tests {
             .try_into_completion()
             .expect("completion seed");
 
-        let progress = SqlCompiler::start(seed).expect("completed values plan");
+        let progress = SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+            .expect("completed values plan");
 
         assert!(matches!(progress, SqlCompileProgress::Complete(_)));
+    }
+
+    fn complete_root_intrinsic_fixture(
+        sql: &str,
+        session_mode: &str,
+    ) -> super::super::SqlCompletedPlan {
+        let mut input = request(sql, SqlCompileIntent::Query);
+        input.session.sql_semantics = input
+            .session
+            .sql_semantics
+            .clone()
+            .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode));
+        let mut progress = SqlCompiler::start(
+            input.try_into_completion().unwrap(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        loop {
+            match progress {
+                SqlCompileProgress::Complete(completed) => return completed,
+                SqlCompileProgress::Incomplete(compilation) => {
+                    progress = match compilation.needs() {
+                        SqlNeedBatch::CatalogRelations(_) => answer_catalog(compilation),
+                        SqlNeedBatch::Statistics(_) => answer_statistics(compilation),
+                        SqlNeedBatch::ProviderReads(_) => answer_provider(compilation),
+                        SqlNeedBatch::MaterializedViews(_) => {
+                            panic!("fixture disabled optional MV discovery")
+                        }
+                    };
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn completed_arithmetic_and_cast_refs_freeze_the_exact_admitted_root_allow_value() {
+        use novarocks_physical_plan::{BinaryOperator, ExprKind};
+        use novarocks_type_contract::{
+            DecimalOverflowPolicy::{OutputNull, ReportError},
+            SemanticParameterId, SemanticParameterKey, SemanticParameterValue,
+        };
+        let ordinary =
+            "SELECT order_key + 1 AS a, CAST(order_key AS DECIMAL(18,6)) AS d FROM orders";
+        for (mode, sql, expected_allow, expected_policy) in [
+            ("32", ordinary, false, OutputNull),
+            ("ALLOW_THROW_EXCEPTION", ordinary, true, OutputNull),
+            ("ERROR_IF_OVERFLOW", ordinary, false, ReportError),
+            (
+                "ALLOW_THROW_EXCEPTION,ERROR_IF_OVERFLOW",
+                ordinary,
+                true,
+                ReportError,
+            ),
+            (
+                "ALLOW_THROW_EXCEPTION",
+                "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ order_key + 1 AS a, CAST(order_key AS DECIMAL(18,6)) AS d FROM orders",
+                false,
+                ReportError,
+            ),
+            (
+                "ERROR_IF_OVERFLOW",
+                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ order_key + 1 AS a, CAST(order_key AS DECIMAL(18,6)) AS d FROM orders",
+                true,
+                OutputNull,
+            ),
+        ] {
+            let completed = complete_root_intrinsic_fixture(sql, mode);
+            let plan = completed.plan();
+            assert_eq!(plan.parameters().entries().len(), 1);
+            let mut arithmetic = 0;
+            let mut casts = 0;
+            for fragment in plan.fragments().values() {
+                for (_, expression) in fragment.expressions().iter() {
+                    let (reference, policy) = match &expression.kind {
+                        ExprKind::Binary {
+                            op: BinaryOperator::Add,
+                            allow_throw_exception: Some(reference),
+                            decimal_overflow_policy,
+                            ..
+                        } => {
+                            arithmetic += 1;
+                            (*reference, *decimal_overflow_policy)
+                        }
+                        ExprKind::Cast {
+                            allow_throw_exception,
+                            decimal_overflow_policy,
+                            ..
+                        } => {
+                            casts += 1;
+                            (*allow_throw_exception, *decimal_overflow_policy)
+                        }
+                        _ => continue,
+                    };
+                    assert_eq!(reference.id, SemanticParameterId::new(0));
+                    assert_eq!(
+                        reference.expected_key,
+                        SemanticParameterKey::AllowThrowException
+                    );
+                    assert_eq!(
+                        plan.parameters().require(reference).unwrap(),
+                        &SemanticParameterValue::AllowThrowException(expected_allow),
+                    );
+                    assert_eq!(policy, expected_policy);
+                }
+            }
+            assert!(arithmetic > 0, "column arithmetic must not be folded away");
+            assert!(casts > 0, "column conversion must retain its actual cast");
+        }
+    }
+
+    #[test]
+    fn completed_nested_decimal_scope_keeps_root_allow_refs_and_local_policy_separate() {
+        use novarocks_physical_plan::{BinaryOperator, ExprKind};
+        use novarocks_type_contract::{
+            DecimalOverflowPolicy::{OutputNull, ReportError},
+            SemanticParameterValue,
+        };
+        let completed = complete_root_intrinsic_fixture(
+            "SELECT x + 1 AS a FROM (SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(order_key AS DECIMAL(18,6)) AS x FROM orders) s",
+            "ALLOW_THROW_EXCEPTION",
+        );
+        let plan = completed.plan();
+        assert_eq!(plan.parameters().entries().len(), 1);
+        let mut saw_root_arithmetic = false;
+        let mut saw_nested_cast = false;
+        for fragment in plan.fragments().values() {
+            for (_, expression) in fragment.expressions().iter() {
+                for reference in expression.kind.intrinsic_parameter_references() {
+                    assert_eq!(
+                        plan.parameters().require(*reference).unwrap(),
+                        &SemanticParameterValue::AllowThrowException(true),
+                    );
+                }
+                match &expression.kind {
+                    ExprKind::Binary {
+                        op: BinaryOperator::Add,
+                        decimal_overflow_policy: OutputNull,
+                        allow_throw_exception: Some(_),
+                        ..
+                    } => saw_root_arithmetic = true,
+                    ExprKind::Cast {
+                        decimal_overflow_policy: ReportError,
+                        ..
+                    } => saw_nested_cast = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(saw_root_arithmetic);
+        assert!(saw_nested_cast);
+    }
+
+    #[test]
+    fn completed_plans_without_intrinsic_consumers_do_not_invent_an_allow_parameter() {
+        for mode in ["32", "ALLOW_THROW_EXCEPTION"] {
+            for sql in ["SELECT 1", "SELECT order_key FROM orders"] {
+                let completed = complete_root_intrinsic_fixture(sql, mode);
+                let plan = completed.plan();
+                assert!(plan.parameters().entries().is_empty());
+                assert!(plan.fragments().values().all(|fragment| {
+                    fragment.expressions().iter().all(|(_, expression)| {
+                        expression
+                            .kind
+                            .intrinsic_parameter_references()
+                            .next()
+                            .is_none()
+                    })
+                }));
+            }
+        }
     }
 
     #[test]
@@ -1548,7 +2108,8 @@ mod tests {
         .expect("completion seed");
 
         let SqlCompileProgress::Complete(completed) =
-            SqlCompiler::start(seed).expect("completed explain plan")
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("completed explain plan")
         else {
             panic!("values explain must not request external observations");
         };
@@ -1567,7 +2128,8 @@ mod tests {
             .try_into_completion()
             .expect("completion seed");
 
-        let progress = SqlCompiler::start(seed).expect("catalog need");
+        let progress = SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+            .expect("catalog need");
 
         assert!(matches!(
             &progress,
@@ -1599,7 +2161,8 @@ mod tests {
             weak.upgrade().is_none(),
             "the completion request must release its initial runtime control"
         );
-        let _ = SqlCompiler::start(seed).expect("the pure completion state remains usable");
+        let _ = SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+            .expect("the pure completion state remains usable");
     }
 
     #[test]
@@ -1607,7 +2170,10 @@ mod tests {
         let seed = request("select order_key from orders", SqlCompileIntent::Query)
             .try_into_completion()
             .expect("completion seed");
-        let compilation = incomplete(SqlCompiler::start(seed).expect("catalog need"));
+        let compilation = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("catalog need"),
+        );
         let facts = catalog_facts(&compilation);
         let control = SqlCompileControl::new(
             None,
@@ -1625,7 +2191,10 @@ mod tests {
         let seed = request("select order_key from orders", SqlCompileIntent::Query)
             .try_into_completion()
             .expect("completion seed");
-        let compilation = incomplete(SqlCompiler::start(seed).expect("catalog need"));
+        let compilation = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("catalog need"),
+        );
         let facts = catalog_facts(&compilation);
         let control = SqlCompileControl::new(
             Some(Instant::now() + Duration::from_millis(50)),
@@ -1702,7 +2271,8 @@ mod tests {
             let discovery_calls = AtomicUsize::new(0);
             let target_catalog_reads = AtomicUsize::new(0);
             complete_base_query_with_counters(
-                SqlCompiler::start(seed).expect("start base query"),
+                SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                    .expect("start base query"),
                 &discovery_calls,
                 &target_catalog_reads,
             );
@@ -1729,7 +2299,9 @@ mod tests {
             .clone()
             .with_sql_mode(SqlMode::from_assignment("GROUP_CONCAT_LEGACY"));
         let seed = request.try_into_completion().unwrap();
-        let compilation = incomplete(SqlCompiler::start(seed).unwrap());
+        let compilation = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded()).unwrap(),
+        );
         assert!(matches!(
             compilation.needs(),
             SqlNeedBatch::MaterializedViews(_)
@@ -1749,7 +2321,9 @@ mod tests {
         )
         .try_into_completion()
         .unwrap();
-        let mv = incomplete(SqlCompiler::start(seed).unwrap());
+        let mv = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded()).unwrap(),
+        );
         let need = match mv.needs() {
             SqlNeedBatch::MaterializedViews(needs) => needs[0].clone(),
             other => panic!("modern query retains MV discovery, got {other:?}"),
@@ -1841,7 +2415,8 @@ mod tests {
             let discovery_calls = AtomicUsize::new(0);
             let target_catalog_reads = AtomicUsize::new(0);
             complete_base_query_with_counters(
-                SqlCompiler::start(seed).expect("start base query"),
+                SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                    .expect("start base query"),
                 &discovery_calls,
                 &target_catalog_reads,
             );
@@ -1866,8 +2441,13 @@ mod tests {
                 .sql_semantics
                 .clone()
                 .with_decimal_overflow_to_double(true);
-            let compilation =
-                incomplete(SqlCompiler::start(request.try_into_completion().unwrap()).unwrap());
+            let compilation = incomplete(
+                SqlCompiler::start(
+                    request.try_into_completion().unwrap(),
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap(),
+            );
             assert!(matches!(
                 compilation.needs(),
                 SqlNeedBatch::MaterializedViews(_)
@@ -1888,7 +2468,9 @@ mod tests {
         )
         .try_into_completion()
         .unwrap();
-        let mv = incomplete(SqlCompiler::start(seed).unwrap());
+        let mv = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded()).unwrap(),
+        );
         let need = match mv.needs() {
             SqlNeedBatch::MaterializedViews(needs) => needs[0].clone(),
             other => panic!("modern query retains MV discovery, got {other:?}"),
@@ -1962,7 +2544,10 @@ mod tests {
         )
         .try_into_completion()
         .expect("completion seed");
-        let mv = incomplete(SqlCompiler::start(seed).expect("MV need"));
+        let mv = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("MV need"),
+        );
         let mv_need = match mv.needs() {
             SqlNeedBatch::MaterializedViews(needs) if needs.len() == 1 => needs[0].clone(),
             other => panic!("expected one MV need, got {other:?}"),
@@ -1992,7 +2577,10 @@ mod tests {
         let seed = request("select order_key from orders", SqlCompileIntent::Query)
             .try_into_completion()
             .expect("completion seed");
-        let catalog = incomplete(SqlCompiler::start(seed).expect("catalog need"));
+        let catalog = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("catalog need"),
+        );
         let statistics = incomplete(answer_catalog(catalog));
         let provider = incomplete(answer_statistics(statistics));
 
@@ -2009,7 +2597,10 @@ mod tests {
         )
         .try_into_completion()
         .expect("completion seed");
-        let catalog = incomplete(SqlCompiler::start(seed).expect("catalog need"));
+        let catalog = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("catalog need"),
+        );
         let statistics = incomplete(answer_catalog(catalog));
         let provider = incomplete(answer_statistics(statistics));
         let provider_needs = match provider.needs() {
@@ -2069,7 +2660,10 @@ mod tests {
         let seed = request("select order_key from orders", SqlCompileIntent::Query)
             .try_into_completion()
             .expect("completion seed");
-        let catalog = incomplete(SqlCompiler::start(seed).expect("catalog need"));
+        let catalog = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("catalog need"),
+        );
         let statistics = incomplete(answer_catalog(catalog));
         let provider = incomplete(answer_statistics(statistics));
         let original = match provider.needs() {
@@ -2105,7 +2699,7 @@ mod tests {
         ));
     }
 
-    fn available_statistics_evidence(rows: u64) -> DmlStatisticsEvidence {
+    pub(super) fn available_statistics_evidence(rows: u64) -> DmlStatisticsEvidence {
         available_statistics_evidence_with_average_size(rows, None)
     }
 
@@ -2166,7 +2760,10 @@ mod tests {
         }
     }
 
-    fn answer_exact_statistics(compilation: SqlCompilation, rows: u64) -> SqlCompileProgress {
+    pub(super) fn answer_exact_statistics(
+        compilation: SqlCompilation,
+        rows: u64,
+    ) -> SqlCompileProgress {
         answer_frozen_statistics(compilation, available_statistics_evidence(rows))
     }
 
@@ -2239,7 +2836,7 @@ mod tests {
         .expect("statistics round")
     }
 
-    fn complete_with_exact_statistics(
+    pub(super) fn complete_with_exact_statistics(
         sql: &str,
         intent: SqlCompileIntent,
         rows: u64,
@@ -2249,6 +2846,7 @@ mod tests {
                 request(sql, intent)
                     .try_into_completion()
                     .expect("completion seed"),
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .expect("catalog need"),
         );
@@ -2259,7 +2857,9 @@ mod tests {
             .expect("completed plan")
     }
 
-    fn frozen_table_statistics(plan: &novarocks_physical_plan::PhysicalPlan) -> Vec<&str> {
+    pub(super) fn frozen_table_statistics(
+        plan: &novarocks_physical_plan::PhysicalPlan,
+    ) -> Vec<&str> {
         plan.annotations()
             .iter()
             .filter_map(|annotation| {
@@ -2310,6 +2910,7 @@ mod tests {
                 let costs = crate::explain::completed_tree::render_completed_plan_tree(
                     plan,
                     crate::explain::ExplainLevel::Costs,
+                    &SqlCompileControl::unbounded(),
                 )
                 .expect("costs text");
                 assert!(costs.iter().any(|line| line == &expected));
@@ -2319,12 +2920,14 @@ mod tests {
                     crate::explain::ExplainLevel::Contract,
                     None,
                     crate::explain::completed::ExplainRenderBudget::default(),
+                    &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .expect("contract text");
                 assert!(contract.iter().any(|line| line.contains(&expected)));
                 let normal = crate::explain::completed_tree::render_completed_plan_tree(
                     plan,
                     crate::explain::ExplainLevel::Normal,
+                    &SqlCompileControl::unbounded(),
                 )
                 .expect("normal text");
                 assert!(!normal.iter().any(|line| line.starts_with("TABLE STATS")));
@@ -2367,6 +2970,7 @@ mod tests {
                 request("select order_key from orders", SqlCompileIntent::Query)
                     .try_into_completion()
                     .expect("seed"),
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .expect("catalog"),
         );
@@ -2384,6 +2988,7 @@ mod tests {
             request("select 1", SqlCompileIntent::Query)
                 .try_into_completion()
                 .expect("seed"),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("values")
         .into_complete()
@@ -2391,7 +2996,7 @@ mod tests {
         assert!(frozen_table_statistics(values.plan()).is_empty());
     }
 
-    struct FrozenOrdersCatalog;
+    pub(super) struct FrozenOrdersCatalog;
 
     impl crate::catalog::PlannerTableProvider for FrozenOrdersCatalog {
         fn resolve_table_for_analysis(
@@ -2448,6 +3053,8 @@ mod tests {
             functions,
             noop_constant_evaluator(),
             None,
+            crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             SqlCompileControl::unbounded(),
         ))
         .expect("analysis")
@@ -2461,6 +3068,7 @@ mod tests {
                 SqlCompileControl::unbounded(),
             ),
             &SessionOptimizerSettings::default(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         )
         .expect("optimized DML source");
         drop(statistics);
@@ -2485,14 +3093,16 @@ mod tests {
                     requires_power_of_two: true,
                 },
                 reads,
+                &SqlCompileControl::unbounded(),
             )
             .expect("DML final plan");
         let expected = "TABLE STATS ref=0 table=iceberg.db.orders rows=23 confidence=Exact source=IcebergManifest";
-        assert_eq!(frozen_table_statistics(&plan), vec![expected]);
+        assert_eq!(frozen_table_statistics(plan.plan()), vec![expected]);
         assert!(
             crate::explain::completed_tree::render_completed_plan_tree(
-                &plan,
-                crate::explain::ExplainLevel::Costs
+                plan.plan(),
+                crate::explain::ExplainLevel::Costs,
+                &SqlCompileControl::unbounded(),
             )
             .expect("DML costs")
             .iter()
@@ -2515,8 +3125,11 @@ mod tests {
             .optimizer_settings
             .cbo_broadcast_node_mem_budget_bytes = Some(268435456.0);
         let catalog = incomplete(
-            SqlCompiler::start(compile_request.try_into_completion().expect("seed"))
-                .expect("catalog"),
+            SqlCompiler::start(
+                compile_request.try_into_completion().expect("seed"),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .expect("catalog"),
         );
         let statistics = incomplete(answer_catalog(catalog));
         let provider = incomplete(answer_exact_statistics(statistics, 10));
@@ -2577,8 +3190,11 @@ mod tests {
                 .optimizer_settings
                 .cbo_broadcast_node_mem_budget_bytes = Some(268435456.0);
             let catalog = incomplete(
-                SqlCompiler::start(compile_request.try_into_completion().expect("seed"))
-                    .expect("catalog"),
+                SqlCompiler::start(
+                    compile_request.try_into_completion().expect("seed"),
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .expect("catalog"),
             );
             let statistics = incomplete(answer_catalog(catalog));
             let provider = incomplete(answer_frozen_statistics(
@@ -2627,6 +3243,7 @@ mod tests {
             let text = crate::explain::completed_tree::render_completed_plan_tree(
                 completed.plan(),
                 crate::explain::ExplainLevel::Costs,
+                &SqlCompileControl::unbounded(),
             )
             .expect("completed costs");
             assert!(
@@ -2668,15 +3285,18 @@ mod tests {
                 .session
                 .optimizer_settings
                 .cbo_broadcast_node_mem_budget_bytes = Some(268435456.0);
-            let completed =
-                SqlCompiler::start(compile_request.try_into_completion().expect("seed"))
-                    .expect("source-free compilation")
-                    .into_complete()
-                    .expect("no catalog/statistics/provider needs");
+            let completed = SqlCompiler::start(
+                compile_request.try_into_completion().expect("seed"),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .expect("source-free compilation")
+            .into_complete()
+            .expect("no catalog/statistics/provider needs");
             assert!(frozen_table_statistics(completed.plan()).is_empty());
             let text = crate::explain::completed_tree::render_completed_plan_tree(
                 completed.plan(),
                 crate::explain::ExplainLevel::Costs,
+                &SqlCompileControl::unbounded(),
             )
             .expect("completed costs");
             if small_build {
@@ -2725,4 +3345,108 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn m07_scalar_root_identity_survives_owned_final_completion() {
+        use novarocks_physical_plan::ResultValueDomain as D;
+        use novarocks_result_contract::ScalarValueType as V;
+        for (sql, domain, value) in [
+            ("select json_object('k', 1) as j", D::Json, V::Json),
+            (
+                "select coalesce(json_object('k', 1), null) as j",
+                D::Json,
+                V::Json,
+            ),
+            (
+                "select if(true, json_object('k', 1), null) as j",
+                D::Json,
+                V::Json,
+            ),
+            (
+                "select case when true then json_object('k', 1) else null end as j",
+                D::Json,
+                V::Json,
+            ),
+            (
+                "with q as (select json_object('k', 1) as j) select j from q",
+                D::Json,
+                V::Json,
+            ),
+            (
+                "select cast(json_object('k', 1) as varchar) as j",
+                D::Plain,
+                V::String,
+            ),
+            (
+                "select coalesce(json_object('k', 1), 'plain') as j",
+                D::Plain,
+                V::String,
+            ),
+            (
+                "select json_object('k', 1) as j union all select null",
+                D::Json,
+                V::Json,
+            ),
+        ] {
+            let progress = SqlCompiler::start(
+                request(sql, SqlCompileIntent::Query)
+                    .try_into_completion()
+                    .unwrap(),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            let SqlCompileProgress::Complete(completed) = progress else {
+                panic!("source-free scalar unexpectedly needs observations: {sql}");
+            };
+            let result = completed.plan().result_port().unwrap();
+            assert_eq!(result.fields[0].domain, domain, "{sql}");
+            let schema = completed.scalar_schema().unwrap();
+            assert_eq!(schema.field().value_type, value, "{sql}");
+            assert_eq!(
+                schema.field().nullable,
+                result.fields[0].ty.nullable,
+                "{sql}"
+            );
+            assert_eq!(schema.source_slot(), None);
+            let plan = completed
+                .into_plan()
+                .with_root_output(novarocks_result_contract::RootOutputContract::new(
+                    novarocks_result_contract::RootProfileId::V1,
+                    novarocks_result_contract::FrozenRootOutput::ScalarValue(schema),
+                ))
+                .unwrap();
+            novarocks_physical_plan::validate_plan(plan.plan()).unwrap();
+        }
+    }
+
+    #[test]
+    fn m07_scalar_schema_refuses_multiple_root_occurrences() {
+        let SqlCompileProgress::Complete(completed) = SqlCompiler::start(
+            request("select 1, 2", SqlCompileIntent::Query)
+                .try_into_completion()
+                .unwrap(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap() else {
+            panic!("unexpected observation");
+        };
+        assert!(completed.scalar_schema().is_err());
+    }
 }
+
+#[cfg(test)]
+pub(crate) fn compile_authored_aggregate_for_test(sql: &str) -> super::SqlAuthoredPhysicalPlan {
+    tests::complete_with_exact_statistics(sql, SqlCompileIntent::Query, 13).into_plan()
+}
+
+#[cfg(test)]
+#[path = "owned_plan_movement_tests.rs"]
+mod owned_plan_movement_tests;
+
+#[cfg(test)]
+#[path = "package_semantics_tests.rs"]
+mod package_semantics_tests;
+
+#[cfg(test)]
+#[path = "catalogue_retention_tests.rs"]
+mod catalogue_retention_tests;

@@ -169,6 +169,7 @@ pub struct IcebergTableHandle {
     table_location: Arc<str>,
     storage_properties: BTreeMap<String, String>,
     pinned_data_files: Option<IcebergPinnedDataFileSet>,
+    frozen_cow_source: Option<super::cow_source_proof::IcebergCowSourceProof>,
 }
 
 impl IcebergTableHandle {
@@ -311,7 +312,23 @@ impl IcebergTableHandle {
             table_location: Arc::from(table_location.as_str()),
             storage_properties,
             pinned_data_files,
+            frozen_cow_source: None,
         })
+    }
+
+    pub fn frozen_cow_source(&self) -> Option<&super::cow_source_proof::IcebergCowSourceProof> {
+        self.frozen_cow_source.as_ref()
+    }
+
+    pub(crate) fn with_frozen_cow_source(
+        mut self,
+        source: Option<super::cow_source_proof::IcebergCowSourceProof>,
+    ) -> Result<Self, ConnectorError> {
+        if let Some(source) = &source {
+            source.check_table(&self)?;
+        }
+        self.frozen_cow_source = source;
+        Ok(self)
     }
 
     pub const fn snapshot_id(&self) -> Option<i64> {
@@ -617,6 +634,10 @@ impl IcebergTableHandle {
                 table_name: self.schema_table_name.table_name().to_string(),
             }),
             snapshot_id: self.snapshot_id,
+            frozen_cow_source: self
+                .frozen_cow_source
+                .as_ref()
+                .map(super::cow_source_proof::IcebergCowSourceProof::to_proto),
             read_domain: self
                 .read_domain
                 .as_deref()
@@ -702,6 +723,12 @@ impl IcebergTableHandle {
                 .map(IcebergPinnedDataFileSet::from_proto)
                 .transpose()?,
         })?
+        .with_frozen_cow_source(
+            raw.frozen_cow_source
+                .as_ref()
+                .map(super::cow_source_proof::IcebergCowSourceProof::from_proto)
+                .transpose()?,
+        )?
         .with_scalar_integer_domains(
             raw.scalar_integer_domains
                 .iter()

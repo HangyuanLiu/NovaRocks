@@ -75,14 +75,17 @@ pub(crate) fn coerce_literal_for_comparison(left: &TypedExpr, right: TypedExpr) 
     if !is_column_ref(left) {
         return right;
     }
-    if !is_coercible_target(&left.data_type) {
+    if !is_coercible_target(&left.value_type.data_type) {
         return right;
     }
-    if !matches!(right.data_type, DataType::Utf8 | DataType::LargeUtf8) {
+    if !matches!(
+        right.value_type.data_type,
+        DataType::Utf8 | DataType::LargeUtf8
+    ) {
         return right;
     }
     // Reuse the existing coercion that already handles STRING → DATE / TIMESTAMP.
-    super::resolve_expr::coerce_to_target_type(right, &left.data_type)
+    super::resolve_expr::coerce_to_target_type(right, &left.value_type.data_type)
 }
 
 #[cfg(test)]
@@ -98,16 +101,14 @@ mod coercion_tests {
                 qualifier: None,
                 column: "c".to_string(),
             },
-            data_type: ty,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(ty, false),
         }
     }
 
     fn string_lit(s: &str) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::String(s.to_string())),
-            data_type: DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         }
     }
 
@@ -117,7 +118,7 @@ mod coercion_tests {
         let right = string_lit("2020-01-01 00:00:00.012");
         let coerced = coerce_literal_for_comparison(&left, right);
         assert!(matches!(
-            coerced.data_type,
+            coerced.value_type.data_type,
             DataType::Timestamp(TimeUnit::Microsecond, _)
         ));
         assert!(matches!(coerced.kind, ExprKind::Cast { .. }));
@@ -128,7 +129,7 @@ mod coercion_tests {
         let left = column(DataType::Date32);
         let right = string_lit("2020-01-01");
         let coerced = coerce_literal_for_comparison(&left, right);
-        assert_eq!(coerced.data_type, DataType::Date32);
+        assert_eq!(coerced.value_type.data_type, DataType::Date32);
     }
 
     #[test]
@@ -136,12 +137,11 @@ mod coercion_tests {
         // expr-vs-literal: skip coercion to avoid surprising arithmetic results.
         let left = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(5)),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         };
         let right = string_lit("foo");
         let coerced = coerce_literal_for_comparison(&left, right);
-        assert_eq!(coerced.data_type, DataType::Utf8);
+        assert_eq!(coerced.value_type.data_type, DataType::Utf8);
     }
 
     #[test]
@@ -155,8 +155,10 @@ mod coercion_tests {
         let left = column(DataType::Timestamp(TimeUnit::Microsecond, None));
         let right = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(1_672_531_200_000_000)),
-            data_type: DataType::Timestamp(TimeUnit::Microsecond, None),
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                false,
+            ),
         };
         let coerced = coerce_literal_for_comparison(&left, right);
         assert!(matches!(
@@ -170,6 +172,6 @@ mod coercion_tests {
         let left = column(DataType::Boolean);
         let right = string_lit("true");
         let coerced = coerce_literal_for_comparison(&left, right);
-        assert_eq!(coerced.data_type, DataType::Utf8);
+        assert_eq!(coerced.value_type.data_type, DataType::Utf8);
     }
 }

@@ -84,8 +84,10 @@ mod tests {
                 qualifier: None,
                 column: "id".into(),
             },
-            data_type: arrow::datatypes::DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int32,
+                false,
+            ),
         };
         let mut scalars = ScalarArena::new();
         let op = SortOp {
@@ -96,7 +98,9 @@ mod tests {
                     asc: true,
                     nulls_first: false,
                 }],
-            ),
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap(),
             analytic_partition_exprs: Vec::new(),
             partition_limit: None,
             topn_type: None,
@@ -114,11 +118,18 @@ mod tests {
                 qualifier: None,
                 column: "k".into(),
             },
-            data_type: arrow::datatypes::DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int32,
+                false,
+            ),
         };
         let mut scalars = ScalarArena::new();
-        let partition = intern_typed(&mut scalars, &partition);
+        let partition = intern_typed(
+            &mut scalars,
+            &partition,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let op = SortOp {
             items: vec![],
             analytic_partition_exprs: vec![partition],

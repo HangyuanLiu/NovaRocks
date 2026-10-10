@@ -14,14 +14,17 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use super::common::{BC_EPOCH_JULIAN, date_from_julian, naive_to_date32};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, Date32Array, Int32Array, Int64Array};
-use std::sync::Arc;
-
-pub const FROM_DAYS_MAX_VALID: i64 = 3_652_424;
-const ZERO_DATE_TO_DAYS: i64 = -32;
+use arrow::array::ArrayRef;
+use arrow::datatypes::DataType;
+use novarocks_functions::builtin::calendar_extended_shared::{
+    CalendarOperation, evaluate_legacy_calendar,
+};
+pub use novarocks_functions::builtin::calendar_extended_shared::{
+    FROM_DAYS_MAX_VALID, calendar_from_days_value as from_days_value,
+    calendar_zero_date_sentinel_date32 as zero_date_sentinel_date32,
+};
 
 pub fn eval_from_days(
     arena: &ExprArena,
@@ -29,48 +32,12 @@ pub fn eval_from_days(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    let arr = arena.eval(args[0], chunk)?;
-    let mut out = Vec::with_capacity(arr.len());
-    if let Some(arr) = arr.as_any().downcast_ref::<Int32Array>() {
-        for i in 0..arr.len() {
-            if arr.is_null(i) {
-                out.push(None);
-            } else {
-                out.push(from_days_value(arr.value(i) as i64));
-            }
-        }
-    } else if let Some(arr) = arr.as_any().downcast_ref::<Int64Array>() {
-        for i in 0..arr.len() {
-            if arr.is_null(i) {
-                out.push(None);
-            } else {
-                out.push(from_days_value(arr.value(i)));
-            }
-        }
-    } else {
-        return Err("from_days expects int".to_string());
-    }
-    Ok(Arc::new(Date32Array::from(out)) as ArrayRef)
-}
-
-pub fn zero_date_sentinel_date32() -> i32 {
-    let julian = BC_EPOCH_JULIAN + ZERO_DATE_TO_DAYS as i32;
-    match date_from_julian(julian) {
-        Some(date) => naive_to_date32(date),
-        None => 0,
-    }
-}
-
-pub fn from_days_value(days: i64) -> Option<i32> {
-    if days < i32::MIN as i64 || days > i32::MAX as i64 {
-        return None;
-    }
-
-    if (0..=FROM_DAYS_MAX_VALID).contains(&days) {
-        let julian = BC_EPOCH_JULIAN as i64 + days;
-        let julian = i32::try_from(julian).ok()?;
-        return date_from_julian(julian).map(naive_to_date32);
-    }
-
-    Some(zero_date_sentinel_date32())
+    let value = arena.eval(args[0], chunk)?;
+    let rows = value.len();
+    evaluate_legacy_calendar(
+        CalendarOperation::FromDays,
+        &[value],
+        &DataType::Date32,
+        rows,
+    )
 }

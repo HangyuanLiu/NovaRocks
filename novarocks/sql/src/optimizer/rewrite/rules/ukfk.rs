@@ -17,6 +17,7 @@
 
 //! UK/FK-based logical rewrites over frozen SQL table facts.
 
+use crate::compiler::SqlCompileError;
 use std::collections::{HashMap, HashSet};
 
 use arrow::datatypes::DataType;
@@ -68,7 +69,11 @@ impl LogicalRewriteRule for PruneUkFkJoin {
         true
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let settings = ctx.session_settings();
         let table_prune_enabled = settings.enable_query_rewrite_table_prune
             || settings.enable_cbo_table_prune
@@ -106,11 +111,14 @@ impl LogicalRewriteRule for PruneUkFkJoin {
         let arena_rc = ctx.scalar_arena();
 
         let retained_side =
-            match project_referenced_side(&project.items, &left, &right, &arena_rc.borrow())? {
+            match project_referenced_side(&project.items, &left, &right, &arena_rc.borrow())
+                .map_err(SqlCompileError::Compilation)?
+            {
                 Some(s) => s,
                 None => return Ok(RewriteResult::Unchanged),
             };
-        let eq_pairs = join_equality_pairs(&join, &left, &right, &arena_rc.borrow())?;
+        let eq_pairs = join_equality_pairs(&join, &left, &right, &arena_rc.borrow())
+            .map_err(SqlCompileError::Compilation)?;
         if eq_pairs.is_empty() {
             return Ok(RewriteResult::Unchanged);
         }
@@ -142,7 +150,8 @@ impl LogicalRewriteRule for PruneUkFkJoin {
                     left_scan,
                     &left_cols,
                     &mut arena_rc.borrow_mut(),
-                ))
+                    &ctx.control_view(),
+                )?)
             }
             (JoinKind::Inner, Side::Right)
                 if settings.enable_ukfk_opt
@@ -153,7 +162,8 @@ impl LogicalRewriteRule for PruneUkFkJoin {
                     right_scan,
                     &right_cols,
                     &mut arena_rc.borrow_mut(),
-                ))
+                    &ctx.control_view(),
+                )?)
             }
             _ => None,
         };
@@ -194,7 +204,11 @@ impl LogicalRewriteRule for EliminateUniqueAggregate {
         true
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let settings = ctx.session_settings();
         if !settings.enable_eliminate_agg {
             return Ok(RewriteResult::Unchanged);
@@ -237,34 +251,33 @@ impl LogicalRewriteRule for EliminateUniqueAggregate {
         if group_columns.is_empty() || !table_has_unique_key(scan, &group_columns) {
             return Ok(RewriteResult::Unchanged);
         }
-        if aggregate.aggregates.is_empty()
-            || !aggregate
-                .aggregates
-                .iter()
-                .all(|a| is_eliminable_count(a, &arena_rc.borrow()))
-        {
+        if aggregate.aggregates.is_empty() {
             return Ok(RewriteResult::Unchanged);
         }
-        let eliminated_count_outputs: HashSet<ColumnId> = aggregate
-            .aggregates
-            .iter()
-            .map(|aggregate| aggregate.output_column_id)
-            .filter(|id| *id != ColumnId::UNSET)
-            .collect();
-        let items = project
-            .items
-            .into_iter()
-            .map(|item| {
-                rewrite_eliminated_aggregate_project_item(
-                    item,
-                    &eliminated_count_outputs,
-                    &mut arena_rc.borrow_mut(),
-                )
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(items) = items else {
-            return Ok(RewriteResult::Unchanged);
-        };
+        let mut eliminated_count_outputs = HashMap::new();
+        for aggregate in &aggregate.aggregates {
+            let Some(value) =
+                eliminated_count_value(aggregate, &arena_rc.borrow(), &ctx.control_view())?
+            else {
+                return Ok(RewriteResult::Unchanged);
+            };
+            if aggregate.output_column_id != ColumnId::UNSET {
+                eliminated_count_outputs.insert(aggregate.output_column_id, value);
+            }
+        }
+        let mut items = Vec::with_capacity(project.items.len());
+        for item in project.items {
+            let Some(item) = rewrite_eliminated_aggregate_project_item(
+                item,
+                &eliminated_count_outputs,
+                &mut arena_rc.borrow_mut(),
+                &ctx.control_view(),
+            )?
+            else {
+                return Ok(RewriteResult::Unchanged);
+            };
+            items.push(item);
+        }
 
         Ok(RewriteResult::Changed(OptExpr {
             op: Operator::LogicalProject(ProjectOp {
@@ -576,7 +589,8 @@ fn add_not_null_filter(
     scan: &ScanOp,
     columns: &[String],
     arena: &mut ScalarArena,
-) -> OptExpr {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<OptExpr, SqlCompileError> {
     let qualifier = scan
         .alias
         .clone()
@@ -596,82 +610,120 @@ fn add_not_null_filter(
             Some(qualifier.clone()),
             output.name.clone(),
         );
-        let child = arena.intern(
+        let child = arena.intern_observed(
             ScalarNode::ColumnRef(output.column_id),
-            output.data_type.clone(),
-            output.nullable,
-        );
-        predicates.push(arena.intern(
+            output.value_type.clone(),
+            control,
+        )?;
+        predicates.push(arena.intern_observed(
             ScalarNode::IsNull {
                 child,
                 negated: true,
             },
-            DataType::Boolean,
-            false,
-        ));
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+            control,
+        )?);
     }
     if predicates.is_empty() {
-        return plan;
+        return Ok(plan);
     }
-    match scalar_expr::combine_conjuncts(arena, predicates) {
-        Some(predicate) => {
-            OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![plan])
-        }
-        None => plan,
-    }
+    Ok(
+        match scalar_expr::combine_conjuncts(arena, predicates, control)? {
+            Some(predicate) => {
+                OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![plan])
+            }
+            None => plan,
+        },
+    )
 }
 
-fn is_eliminable_count(aggregate: &ScalarAggregateSpec, arena: &ScalarArena) -> bool {
-    if !aggregate.name.eq_ignore_ascii_case("count") {
-        return false;
+fn eliminated_count_value(
+    aggregate: &ScalarAggregateSpec,
+    arena: &ScalarArena,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<i64>, SqlCompileError> {
+    if !aggregate.name.eq_ignore_ascii_case("count")
+        || !is_builtin_count_binding(aggregate.source.binding())
+        || aggregate.distinct
+        || !aggregate.source.order_by().is_empty()
+    {
+        return Ok(None);
     }
-    if aggregate.distinct {
-        return false;
+    count_arguments_value(aggregate.source.arguments(), arena, control)
+}
+
+fn is_builtin_count_binding(binding: &crate::binding::SqlFunctionBinding) -> bool {
+    // These exact identities are authored by the builtin aggregate catalogue.
+    // A same-spelling foreign aggregate is not the COUNT proof used here.
+    binding.kind == novarocks_functions::FunctionKind::Aggregate
+        && binding.function_id.as_str() == "builtin.aggregate/count/v1"
+        && binding.selected.overload.as_str() == "builtin.aggregate/count/derived-v1"
+}
+
+fn count_arguments_value(
+    args: &[ScalarId],
+    arena: &ScalarArena,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<i64>, SqlCompileError> {
+    match args {
+        [] => Ok(Some(1)),
+        [argument] => scalar_expr::literal_count_value(arena, *argument, control),
+        _ => Ok(None),
     }
-    if !aggregate.order_by.is_empty() {
-        return false;
-    }
-    aggregate
-        .args
-        .iter()
-        .all(|id| scalar_expr::is_literal_count_arg(arena, *id))
 }
 
 fn rewrite_eliminated_aggregate_project_item(
     item: ScalarProjectItem,
-    eliminated_count_outputs: &HashSet<ColumnId>,
+    eliminated_count_outputs: &HashMap<ColumnId, i64>,
     arena: &mut ScalarArena,
-) -> Option<ScalarProjectItem> {
-    let new_expr_id =
-        rewrite_eliminated_aggregate_expr(arena, item.expr, eliminated_count_outputs)?;
-    Some(ScalarProjectItem {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarProjectItem>, SqlCompileError> {
+    let Some(new_expr_id) =
+        rewrite_eliminated_aggregate_expr(arena, item.expr, eliminated_count_outputs, control)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ScalarProjectItem {
         expr: new_expr_id,
         output_name: item.output_name,
         output_column_id: item.output_column_id,
         expr_display: item.expr_display,
-    })
+    }))
 }
 
 fn rewrite_eliminated_aggregate_expr(
     arena: &mut ScalarArena,
     expr: ScalarId,
-    eliminated_count_outputs: &HashSet<ColumnId>,
-) -> Option<ScalarId> {
-    match arena.node(expr).clone() {
-        ScalarNode::ColumnRef(column_id) if eliminated_count_outputs.contains(&column_id) => {
-            Some(scalar_expr::int_literal(arena, 1))
+    eliminated_count_outputs: &HashMap<ColumnId, i64>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, SqlCompileError> {
+    Ok(match arena.node(expr).clone() {
+        ScalarNode::ColumnRef(column_id) if eliminated_count_outputs.contains_key(&column_id) => {
+            Some(scalar_expr::int_literal(
+                arena,
+                eliminated_count_outputs[&column_id],
+                control,
+            )?)
         }
         ScalarNode::AggregateCall {
             name,
             distinct,
             order_by,
-            ..
-        } if name.eq_ignore_ascii_case("count") && !distinct && order_by.is_empty() => {
-            Some(scalar_expr::int_literal(arena, 1))
+            args,
+            resolved,
+        } if name.eq_ignore_ascii_case("count")
+            && is_builtin_count_binding(&resolved)
+            && !distinct
+            && order_by.is_empty() =>
+        {
+            match count_arguments_value(&args, arena, control)? {
+                Some(value) => Some(scalar_expr::int_literal(arena, value, control)?),
+                None => None,
+            }
         }
         _ if !scalar_expr::contains_aggregate(arena, expr) => Some(expr),
         _ => None,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -699,8 +751,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -747,8 +799,7 @@ mod tests {
     fn col(arena: &mut ScalarArena, id: u32) -> ScalarId {
         arena.intern(
             ScalarNode::ColumnRef(ColumnId::new_for_test(id)),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         )
     }
 
@@ -793,8 +844,24 @@ mod tests {
         let project_join = empty_project(join_expr());
         let project_aggregate = empty_project(aggregate_expr(scan_expr("t", &[(1, "k")])));
 
-        assert!(bind_tree(&rule.pattern(), &project_join).is_some());
-        assert!(bind_tree(&rule.pattern(), &project_aggregate).is_none());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &project_join,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &project_aggregate,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -803,8 +870,24 @@ mod tests {
         let project_aggregate = empty_project(aggregate_expr(scan_expr("t", &[(1, "k")])));
         let project_join = empty_project(join_expr());
 
-        assert!(bind_tree(&rule.pattern(), &project_aggregate).is_some());
-        assert!(bind_tree(&rule.pattern(), &project_join).is_none());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &project_aggregate,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &project_join,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -821,8 +904,7 @@ mod tests {
                 right: right_key,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );
         let items = vec![ScalarProjectItem {
             expr,
@@ -844,15 +926,17 @@ mod tests {
         let right = scan_expr("right_t", &[(2, "right_key")]);
         let left_key = col(&mut arena, 1);
         let right_key = col(&mut arena, 2);
-        let nested_left = arena.intern(ScalarNode::Nested(left_key), DataType::Int64, false);
+        let nested_left = arena.intern(
+            ScalarNode::Nested(left_key),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        );
         let cast_right = arena.intern(
             ScalarNode::Cast {
                 child: right_key,
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );
         let condition = arena.intern(
             ScalarNode::BinaryOp {
@@ -861,8 +945,7 @@ mod tests {
                 right: cast_right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
         let join = LogicalJoinOp {
             join_type: JoinKind::Inner,
@@ -880,57 +963,384 @@ mod tests {
         let mut arena = ScalarArena::new();
         let one = arena.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );
         let null = arena.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Null)),
-            DataType::Null,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Null, true),
         );
 
         let count_one = ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(9001),
             name: "count".to_string(),
-            args: vec![one],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![one],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false),
+            ),
         };
         let count_null = ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(9002),
             name: "count".to_string(),
-            args: vec![null],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("count", &[DataType::Null], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![null],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[DataType::Null], false),
+            ),
         };
 
-        assert!(is_eliminable_count(&count_one, &arena));
-        assert!(is_eliminable_count(&count_null, &arena));
+        assert_eq!(
+            eliminated_count_value(
+                &count_one,
+                &arena,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            eliminated_count_value(
+                &count_null,
+                &arena,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap(),
+            Some(0)
+        );
     }
 
     #[test]
     fn eliminated_unique_aggregate_rewrites_count_output_ref_to_literal() {
         let mut arena = ScalarArena::new();
         let count_output = ColumnId::new_for_test(9001);
-        let count_ref = arena.intern(ScalarNode::ColumnRef(count_output), DataType::Int64, false);
+        let count_ref = arena.intern(
+            ScalarNode::ColumnRef(count_output),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        );
         let item = ScalarProjectItem {
             expr: count_ref,
             output_name: "cnt".to_string(),
             output_column_id: ColumnId::new_for_test(9002),
             expr_display: None,
         };
-        let eliminated_outputs = HashSet::from([count_output]);
+        let eliminated_outputs = HashMap::from([(count_output, 1)]);
 
-        let rewritten =
-            rewrite_eliminated_aggregate_project_item(item, &eliminated_outputs, &mut arena)
-                .expect("count output reference should be rewritten");
+        let rewritten = rewrite_eliminated_aggregate_project_item(
+            item,
+            &eliminated_outputs,
+            &mut arena,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap()
+        .expect("count output reference should be rewritten");
 
+        assert_eq!(selected_count_output(&arena, rewritten.expr), 1);
+    }
+
+    fn selected_count_output(arena: &ScalarArena, expr: ScalarId) -> i64 {
+        assert_eq!(
+            arena.value_type(expr),
+            &novarocks_type_contract::FunctionValueType::new(DataType::Int64, false)
+        );
+        match arena.node(expr) {
+            ScalarNode::Constant(value) => value.try_i64().unwrap().unwrap(),
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(value))) => *value,
+            _ => panic!("expected integer count output"),
+        }
+    }
+
+    fn selected_count_elimination_fixture(
+        unique: bool,
+    ) -> (OptExpr, std::rc::Rc<std::cell::RefCell<ScalarArena>>) {
+        use arrow::array::{Array, Int64Array};
+        use novarocks_functions::ConstantPool;
+        use novarocks_type_contract::{CompilePhase, FunctionValueType};
+
+        let control = crate::optimizer::test_optimizer_control();
+        let ty = FunctionValueType::new(DataType::Int64, true);
+        let pool = ConstantPool::try_new(
+            Arc::new(ty.try_to_field("count.source").unwrap()),
+            ty.clone(),
+            Int64Array::from(vec![Some(7), None]).to_data(),
+            crate::constant::test_constant_policy(),
+            CompilePhase::Validate,
+            control,
+        )
+        .unwrap();
+        let mut arena = ScalarArena::new();
+        let mut specs = Vec::new();
+        let mut outputs = Vec::new();
+        let mut items = Vec::new();
+        for (ordinal, output_id) in [(1, 9001), (0, 9002)] {
+            let argument = arena
+                .intern_observed(
+                    ScalarNode::Constant(pool.value(ordinal).unwrap()),
+                    ty.clone(),
+                    control,
+                )
+                .unwrap();
+            specs.push(ScalarAggregateSpec {
+                output_column_id: ColumnId::new_for_test(output_id),
+                name: "count".to_owned(),
+                distinct: false,
+                source: crate::binding::AggregateArgumentSource::uncertified(
+                    vec![argument],
+                    vec![],
+                    crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false),
+                ),
+            });
+            outputs.push(output_col(output_id, "count.result"));
+            items.push(ScalarProjectItem {
+                expr: col(&mut arena, output_id),
+                output_name: format!("count_{ordinal}"),
+                output_column_id: ColumnId::new_for_test(output_id + 100),
+                expr_display: None,
+            });
+        }
+        let group = col(&mut arena, 1);
+        let mut input = scan_expr("unique_source", &[(1, "source_key")]);
+        if unique {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "source_key",
+                DataType::Int64,
+                false,
+            )]));
+            let context = ConnectorRequestContext::try_new(
+                Instant::now() + Duration::from_secs(1),
+                ConnectorStopOwner::new().view(),
+                4096,
+                4096,
+            )
+            .unwrap();
+            let facts = ConnectorTablePlanningFacts::try_new(
+                &schema,
+                vec![],
+                vec![ConnectorTableUniqueConstraint::new(vec![0])],
+                vec![],
+                vec![],
+                &context,
+            )
+            .unwrap();
+            let Operator::LogicalScan(scan) = &mut input.op else {
+                unreachable!()
+            };
+            let ScanSource::Sql(source) = scan.table.source.clone() else {
+                unreachable!()
+            };
+            scan.table.source = ScanSource::Sql(source.with_ukfk_facts(
+                SqlUkFkTableFacts::from_connector_planning_facts(&schema, &facts),
+            ));
+        }
+        let layout = AggregateOutputLayout::new(vec![output_col(1, "source_key")], outputs.clone());
+        let aggregate = OptExpr::new(
+            Operator::LogicalAggregate(LogicalAggregateOp::single(
+                vec![group],
+                specs,
+                layout,
+                outputs,
+            )),
+            vec![input],
+        );
+        let project = OptExpr::new(
+            Operator::LogicalProject(ProjectOp {
+                items,
+                output_qualifier: None,
+            }),
+            vec![aggregate],
+        );
+        (project, std::rc::Rc::new(std::cell::RefCell::new(arena)))
+    }
+
+    fn count_rewrite_context<'a>(
+        arena: std::rc::Rc<std::cell::RefCell<ScalarArena>>,
+        control: &'a dyn novarocks_type_contract::PureCompileControl,
+    ) -> RewriteContext<'a> {
+        let mut ctx = RewriteContext::new(
+            crate::optimizer::rewrite::context::RewriteConsumer::Query,
+            crate::optimizer::options::SessionOptimizerSettings {
+                enable_eliminate_agg: true,
+                ..Default::default()
+            },
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            control,
+        );
+        ctx.set_scalar_arena(arena);
+        ctx
+    }
+
+    #[test]
+    fn unique_count_elimination_preserves_selected_null_zero_and_nonnull_one() {
+        let (project, arena) = selected_count_elimination_fixture(true);
+        let mut ctx =
+            count_rewrite_context(arena.clone(), crate::optimizer::test_optimizer_control());
+        let RewriteResult::Changed(rewritten) =
+            EliminateUniqueAggregate.apply(project, &mut ctx).unwrap()
+        else {
+            panic!("real unique-key proof should eliminate counts")
+        };
+        assert!(matches!(rewritten.children[0].op, Operator::LogicalScan(_)));
+        let Operator::LogicalProject(project) = rewritten.op else {
+            unreachable!()
+        };
+        let arena = arena.borrow();
+        assert_eq!(selected_count_output(&arena, project.items[0].expr), 0);
+        assert_eq!(selected_count_output(&arena, project.items[1].expr), 1);
+        drop(arena);
+
+        let (project, arena) = selected_count_elimination_fixture(false);
+        let nodes = arena.borrow().node_count();
+        let mut ctx =
+            count_rewrite_context(arena.clone(), crate::optimizer::test_optimizer_control());
         assert!(matches!(
-            arena.node(rewritten.expr),
-            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1)))
+            EliminateUniqueAggregate.apply(project, &mut ctx).unwrap(),
+            RewriteResult::Unchanged
         ));
+        assert_eq!(arena.borrow().node_count(), nodes);
+    }
+
+    #[test]
+    fn unique_count_elimination_refuses_same_spelling_foreign_binding_or_overload() {
+        for foreign_overload in [false, true] {
+            let (mut project, arena) = selected_count_elimination_fixture(true);
+            let Operator::LogicalAggregate(aggregate) = &mut project.children[0].op else {
+                unreachable!()
+            };
+            let spec = &mut aggregate.aggregates[0];
+            let mut foreign = spec.source.binding().resolved().clone();
+            if foreign_overload {
+                foreign.selected.overload = novarocks_functions::FunctionOverloadId::try_new(
+                    "foreign.aggregate/count/derived-v1",
+                )
+                .unwrap();
+            } else {
+                foreign.function_id =
+                    novarocks_functions::FunctionId::try_new("foreign.aggregate/count/v1").unwrap();
+            }
+            spec.source = crate::binding::AggregateArgumentSource::uncertified(
+                spec.source.arguments().to_vec(),
+                spec.source.order_by().to_vec(),
+                crate::binding::SqlFunctionBinding::new(
+                    foreign,
+                    spec.source.binding().decimal_overflow_policy(),
+                ),
+            );
+            let direct = arena.borrow_mut().intern(
+                ScalarNode::AggregateCall {
+                    name: spec.name.clone(),
+                    args: spec.source.arguments().to_vec(),
+                    distinct: false,
+                    order_by: vec![],
+                    resolved: spec.source.binding().clone(),
+                },
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            );
+            let nodes = arena.borrow().node_count();
+            assert!(
+                rewrite_eliminated_aggregate_expr(
+                    &mut arena.borrow_mut(),
+                    direct,
+                    &HashMap::new(),
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap()
+                .is_none()
+            );
+            let mut ctx =
+                count_rewrite_context(arena.clone(), crate::optimizer::test_optimizer_control());
+            assert!(matches!(
+                EliminateUniqueAggregate.apply(project, &mut ctx).unwrap(),
+                RewriteResult::Unchanged
+            ));
+            assert_eq!(arena.borrow().node_count(), nodes);
+        }
+    }
+
+    #[test]
+    fn direct_count_null_rewrite_and_original_control_failure_do_not_publish_replacement() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        use std::sync::Mutex;
+        #[derive(Default)]
+        struct Control {
+            trace: Mutex<Vec<u32>>,
+            refuse: Option<(usize, CompileControlError)>,
+        }
+        impl PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                assert_eq!(phase, CompilePhase::Validate);
+                assert!(units <= 256);
+                let mut trace = self.trace.lock().unwrap();
+                trace.push(units);
+                match self.refuse {
+                    Some((at, cause)) if trace.len() == at + 1 => Err(cause),
+                    _ => Ok(()),
+                }
+            }
+        }
+        let (project, arena) = selected_count_elimination_fixture(true);
+        let Operator::LogicalAggregate(aggregate) = &project.children[0].op else {
+            unreachable!()
+        };
+        let spec = &aggregate.aggregates[0];
+        let direct = arena.borrow_mut().intern(
+            ScalarNode::AggregateCall {
+                name: spec.name.clone(),
+                args: spec.source.arguments().to_vec(),
+                distinct: false,
+                order_by: vec![],
+                resolved: spec.source.binding().clone(),
+            },
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+        );
+        let baseline = Control::default();
+        let mut baseline_arena = arena.borrow().clone();
+        let rewritten = rewrite_eliminated_aggregate_expr(
+            &mut baseline_arena,
+            direct,
+            &HashMap::new(),
+            &baseline,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected_count_output(&baseline_arena, rewritten), 0);
+        let trace = baseline.trace.into_inner().unwrap();
+        for at in 0..trace.len() {
+            for (cause, expected) in [
+                (CompileControlError::Cancelled, SqlCompileError::Cancelled),
+                (
+                    CompileControlError::DeadlineExceeded,
+                    SqlCompileError::DeadlineExceeded,
+                ),
+                (
+                    CompileControlError::ResourceExhausted,
+                    SqlCompileError::ResourceExhausted,
+                ),
+            ] {
+                let control = Control {
+                    refuse: Some((at, cause)),
+                    ..Default::default()
+                };
+                let mut actual_arena = arena.borrow().clone();
+                let nodes = actual_arena.node_count();
+                assert_eq!(
+                    rewrite_eliminated_aggregate_expr(
+                        &mut actual_arena,
+                        direct,
+                        &HashMap::new(),
+                        &control,
+                    )
+                    .unwrap_err(),
+                    expected
+                );
+                assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+                assert_eq!(actual_arena.node_count(), nodes);
+            }
+        }
     }
 
     #[test]

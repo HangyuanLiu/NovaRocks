@@ -15,11 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compiler::SqlCompileError;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::rewrite::context::RewriteContext;
 use crate::optimizer::rewrite::phase::RewritePhase;
 use crate::optimizer::rewrite::rule::LogicalRewriteRule;
 use crate::optimizer::rewrite::tree::rewrite_with_rule;
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
 
 pub(crate) struct RewriteStage {
     name: &'static str,
@@ -93,20 +95,29 @@ impl RewritePipeline {
         &self,
         plan: OptExpr,
         ctx: &mut RewriteContext,
-    ) -> Result<OptExpr, String> {
+    ) -> Result<OptExpr, SqlCompileError> {
+        let control = ctx.control_view();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Validate)
+            .map_err(crate::compiler::SqlCompileError::from)?;
         let mut current = plan;
 
         for stage in &self.stages {
+            work.step()
+                .map_err(crate::compiler::SqlCompileError::from)?;
             let phase = stage.phase;
             ctx.check_deadline(stage.name)?;
             ctx.trace_mut().phase_started_with_stage(phase, stage.name);
 
             for iteration in 1..=ctx.policy().max_iterations {
+                work.step()
+                    .map_err(crate::compiler::SqlCompileError::from)?;
                 ctx.check_deadline(stage.name)?;
                 ctx.trace_mut().iteration_started(phase, iteration);
                 let mut phase_changed = false;
 
                 for rule in &stage.rules {
+                    work.step()
+                        .map_err(crate::compiler::SqlCompileError::from)?;
                     ctx.check_deadline(rule.name())?;
                     let rule_name = rule.name();
                     if !ctx.is_rule_enabled(rule_name) {
@@ -134,12 +145,15 @@ impl RewritePipeline {
             ctx.trace_mut().phase_ended(phase);
         }
 
+        work.finish()
+            .map_err(crate::compiler::SqlCompileError::from)?;
         Ok(current)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::compiler::SqlCompileError;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -174,7 +188,7 @@ mod tests {
             &self,
             _expr: OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
+        ) -> Result<RewriteResult, SqlCompileError> {
             Ok(RewriteResult::Unchanged)
         }
     }
@@ -198,8 +212,8 @@ mod tests {
             &self,
             _expr: OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
-            Err("boom".to_string())
+        ) -> Result<RewriteResult, SqlCompileError> {
+            Err(SqlCompileError::Compilation("boom".to_string()))
         }
     }
 
@@ -222,7 +236,7 @@ mod tests {
             &self,
             _expr: OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
+        ) -> Result<RewriteResult, SqlCompileError> {
             Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
                 self.name(),
                 "not supported",
@@ -249,7 +263,7 @@ mod tests {
             &self,
             _expr: OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
+        ) -> Result<RewriteResult, SqlCompileError> {
             Ok(RewriteResult::Changed(OptExpr::new(
                 Operator::LogicalGenerateSeries(GenerateSeriesOp {
                     start: 1,
@@ -283,7 +297,7 @@ mod tests {
             &self,
             _expr: OptExpr,
             _ctx: &mut RewriteContext,
-        ) -> Result<RewriteResult, String> {
+        ) -> Result<RewriteResult, SqlCompileError> {
             Ok(RewriteResult::Changed(empty_values_plan()))
         }
     }
@@ -380,7 +394,10 @@ mod tests {
 
         let result = pipeline.rewrite(empty_values_plan(), &mut ctx);
 
-        assert_eq!(result.unwrap_err(), "boom");
+        assert_eq!(
+            result.unwrap_err(),
+            crate::compiler::SqlCompileError::Compilation("boom".to_string())
+        );
         assert_eq!(count_failed_events(&ctx, "FailingRule"), 1);
     }
 
@@ -394,7 +411,10 @@ mod tests {
 
         let result = pipeline.rewrite(empty_values_plan(), &mut ctx);
 
-        assert_eq!(result.unwrap_err(), "not supported");
+        assert_eq!(
+            result.unwrap_err(),
+            crate::compiler::SqlCompileError::Compilation("not supported".to_string())
+        );
         assert_eq!(count_rejected_events(&ctx, "RejectingRule"), 1);
         assert_eq!(count_failed_events(&ctx, "RejectingRule"), 0);
     }
@@ -476,5 +496,117 @@ mod tests {
             }),
             vec![],
         )
+    }
+
+    #[test]
+    fn empty_pipeline_checks_entry_and_finish_without_rules() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Stop {
+            calls: AtomicUsize,
+            stop_at: usize,
+            error: CompileControlError,
+        }
+        impl PureCompileControl for Stop {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                assert_eq!(units, 0);
+                if self.calls.fetch_add(1, Ordering::SeqCst) == self.stop_at {
+                    Err(self.error)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for stop_at in [0, 1] {
+                let control = Stop {
+                    calls: AtomicUsize::new(0),
+                    stop_at,
+                    error,
+                };
+                let mut ctx = RewriteContext::for_query_with_settings(
+                    Default::default(),
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    &control,
+                );
+                let pipeline = RewritePipeline::from_stages(vec![]);
+                assert_eq!(
+                    pipeline.rewrite(empty_values_plan(), &mut ctx).unwrap_err(),
+                    crate::compiler::SqlCompileError::from(error)
+                );
+                assert_eq!(control.calls.load(Ordering::SeqCst), stop_at + 1);
+                assert!(ctx.trace().events().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn control_after_apply_never_enters_collect_diagnostics() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Owner {
+            stopped: std::sync::atomic::AtomicBool,
+            error: CompileControlError,
+        }
+        impl PureCompileControl for Owner {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                if self.stopped.load(Ordering::SeqCst) {
+                    Err(self.error)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        struct StopAndReject<'a>(&'a Owner);
+        impl LogicalRewriteRule for StopAndReject<'_> {
+            fn name(&self) -> &'static str {
+                "StopAndReject"
+            }
+            fn phase(&self) -> RewritePhase {
+                RewritePhase::LogicalNormalize
+            }
+            fn matches(&self, _: &OptExpr, _: &RewriteContext) -> bool {
+                true
+            }
+            fn apply(
+                &self,
+                _: OptExpr,
+                _: &mut RewriteContext,
+            ) -> Result<RewriteResult, SqlCompileError> {
+                self.0.stopped.store(true, Ordering::SeqCst);
+                Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
+                    self.name(),
+                    "ordinary candidate rejection",
+                )))
+            }
+        }
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let owner = Owner {
+                stopped: Default::default(),
+                error,
+            };
+            let mut ctx = RewriteContext::for_query_with_settings(
+                Default::default(),
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                &owner,
+            );
+            // Direct invocation borrows the real rule owner; pipeline boxes are
+            // static by contract and need no capability-bearing test shim.
+            let failure = crate::optimizer::rewrite::tree::rewrite_with_rule(
+                empty_values_plan(),
+                &StopAndReject(&owner),
+                &mut ctx,
+            )
+            .unwrap_err();
+            assert_eq!(failure, crate::compiler::SqlCompileError::from(error));
+            assert_eq!(count_rejected_events(&ctx, "StopAndReject"), 0);
+            assert_eq!(count_failed_events(&ctx, "StopAndReject"), 0);
+        }
     }
 }

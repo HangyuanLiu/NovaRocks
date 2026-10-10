@@ -60,19 +60,26 @@ impl Rule for JoinAssociativity {
         )
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalJoin(outer_op) = &expr.op else {
-            return vec![];
+            return Ok(vec![]);
         };
 
         // Outer join must be INNER.
         if outer_op.join_type != JoinKind::Inner {
-            return vec![];
+            return Ok(vec![]);
         }
 
         // Must have two children: child[0] = inner join group, child[1] = C.
         if expr.children.len() != 2 {
-            return vec![];
+            return Ok(vec![]);
         }
 
         let inner_group_id = expr.children[0];
@@ -91,12 +98,12 @@ impl Rule for JoinAssociativity {
         });
 
         let Some(inner_expr) = inner_join else {
-            return vec![];
+            return Ok(vec![]);
         };
 
         // inner_expr represents LogicalJoin(A, B) with INNER join.
         if inner_expr.children.len() != 2 {
-            return vec![];
+            return Ok(vec![]);
         }
 
         let a_group = inner_expr.children[0];
@@ -104,13 +111,13 @@ impl Rule for JoinAssociativity {
 
         let inner_op = match &inner_expr.op {
             Operator::LogicalJoin(op) => op,
-            _ => return vec![],
+            _ => return Ok(vec![]),
         };
 
         // Copy the `Copy` ids out before borrowing `&mut memo` in the helper.
         let outer_cond = outer_op.condition;
         let inner_cond = inner_op.condition;
-        self.associate(memo, outer_cond, inner_cond, a_group, b_group, c_group)
+        Ok(self.associate(memo, outer_cond, inner_cond, a_group, b_group, c_group))
     }
 
     fn pattern(&self) -> Pattern {
@@ -142,33 +149,40 @@ impl Rule for JoinAssociativity {
         true
     }
 
-    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply_bound(
+        &self,
+        binding: &Binding,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         // interior 0 = outer join, interior 1 = inner join (binder guarantees
         // both are Join kind; field predicates are checked here).
         let Operator::LogicalJoin(outer) = binding.op(memo, 0).clone() else {
-            return vec![];
+            return Ok(vec![]);
         };
         if outer.join_type != JoinKind::Inner {
-            return vec![];
+            return Ok(vec![]);
         }
         let Operator::LogicalJoin(inner) = binding.op(memo, 1).clone() else {
-            return vec![];
+            return Ok(vec![]);
         };
         if inner.join_type != JoinKind::Inner {
-            return vec![];
+            return Ok(vec![]);
         }
         // inner = LogicalJoin(A, B); outer child[1] = C.
         let inner_children = binding.children(1);
         let (a_group, b_group) = (inner_children[0], inner_children[1]);
         let c_group = binding.children(0)[1];
-        self.associate(
+        Ok(self.associate(
             memo,
             outer.condition,
             inner.condition,
             a_group,
             b_group,
             c_group,
-        )
+        ))
     }
 }
 

@@ -982,13 +982,20 @@ mod tests {
         MvAggregateRuntimeLayout::try_new(
             "__row_id__".to_string(),
             vec![
-                MvAggregateVisibleColumn::new("group_key".to_string(), DataType::Int64, false, 0),
-                MvAggregateVisibleColumn::new("count_v".to_string(), DataType::Int64, false, 1),
+                MvAggregateVisibleColumn::new(
+                    "group_key".to_string(),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                    0,
+                ),
+                MvAggregateVisibleColumn::new(
+                    "count_v".to_string(),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                    1,
+                ),
             ],
             vec![MvAggregateStateColumn::new(
                 "count_state".to_string(),
-                DataType::LargeBinary,
-                false,
+                novarocks_type_contract::FunctionValueType::new(DataType::LargeBinary, false),
                 1,
                 0,
                 MvAggregateRuntimeKind::Count,
@@ -1039,14 +1046,21 @@ mod tests {
         let layout = MvAggregateRuntimeLayout::try_new(
             "__row_id__".to_string(),
             vec![
-                MvAggregateVisibleColumn::new("group_key".to_string(), DataType::Int64, false, 0),
-                MvAggregateVisibleColumn::new("avg_v".to_string(), DataType::Float64, true, 1),
+                MvAggregateVisibleColumn::new(
+                    "group_key".to_string(),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+                    0,
+                ),
+                MvAggregateVisibleColumn::new(
+                    "avg_v".to_string(),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Float64, true),
+                    1,
+                ),
             ],
             vec![
                 MvAggregateStateColumn::new(
                     "avg_sum".to_string(),
-                    DataType::LargeBinary,
-                    false,
+                    novarocks_type_contract::FunctionValueType::new(DataType::LargeBinary, false),
                     1,
                     0,
                     MvAggregateRuntimeKind::Avg,
@@ -1055,8 +1069,7 @@ mod tests {
                 ),
                 MvAggregateStateColumn::new(
                     "avg_count".to_string(),
-                    DataType::LargeBinary,
-                    false,
+                    novarocks_type_contract::FunctionValueType::new(DataType::LargeBinary, false),
                     1,
                     0,
                     MvAggregateRuntimeKind::Avg,

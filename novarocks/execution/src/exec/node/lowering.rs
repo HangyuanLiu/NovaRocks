@@ -60,7 +60,7 @@ pub enum ExternalSinkRequirement {
 }
 
 /// The exact runtime capabilities removed while a decoded plan is frozen.
-/// They are keyed by local node identity and never enter LocalProgram.
+/// They are keyed by local node identity and never enter LocalProgramGraph.
 pub struct LocalRuntimeBindings {
     pub(crate) scans: BTreeMap<lp::ProgramNodeId, Arc<dyn super::scan::ScanSource>>,
     pub(crate) writers: BTreeMap<lp::ProgramNodeId, super::table_writer::TableWriterRuntimeBinding>,
@@ -117,7 +117,7 @@ impl ExecPlan {
         profile: lp::CompileProfile,
         scan_sources: BTreeMap<i32, lp::StaticConnectorScan>,
         sink_requirements: Vec<ExternalSinkRequirement>,
-    ) -> Result<lp::LocalProgram> {
+    ) -> Result<lp::LocalProgramGraph> {
         self.lower_with_optional_sink(profile, scan_sources, sink_requirements, None)
             .map(|(program, _runtime)| program)
     }
@@ -131,7 +131,7 @@ impl ExecPlan {
         scan_sources: BTreeMap<i32, lp::StaticConnectorScan>,
         sink_requirements: Vec<ExternalSinkRequirement>,
         sink: lp::StaticSinkProgram,
-    ) -> Result<(lp::LocalProgram, LocalRuntimeBindings)> {
+    ) -> Result<(lp::LocalProgramGraph, LocalRuntimeBindings)> {
         self.lower_with_optional_sink(profile, scan_sources, sink_requirements, Some(sink))
     }
 
@@ -141,7 +141,7 @@ impl ExecPlan {
         mut scan_sources: BTreeMap<i32, lp::StaticConnectorScan>,
         sink_requirements: Vec<ExternalSinkRequirement>,
         sink: Option<lp::StaticSinkProgram>,
-    ) -> Result<(lp::LocalProgram, LocalRuntimeBindings)> {
+    ) -> Result<(lp::LocalProgramGraph, LocalRuntimeBindings)> {
         preflight(&self.root)?;
         let ExecPlan { arena, root } = self;
         let expressions = Arc::new(arena.into_immutable().map_err(|error| {
@@ -195,7 +195,7 @@ impl ExecPlan {
         }
         let requirements = lp::BindingRequirements::try_new(lowering.requirements)
             .map_err(|error| LocalProgramLoweringError::new(error.to_string()))?;
-        let program = lp::LocalProgram::try_new_with_sink(
+        let program = lp::LocalProgramGraph::try_new_with_sink(
             lowering.nodes,
             root,
             expressions,
@@ -435,7 +435,7 @@ impl Lowering<'_> {
                     n.node_id,
                     P::Filter {
                         input,
-                        predicate: expr(n.predicate),
+                        predicates: vec![expr(n.predicate)].into_boxed_slice(),
                     },
                 )
             }
@@ -534,9 +534,9 @@ impl Lowering<'_> {
                 (
                     node_id,
                     P::Scan {
-                        source,
+                        source: source.into(),
                         runtime_filters,
-                        conjunct_predicate: conjunct_predicate.map(expr),
+                        residuals: conjunct_predicate.map(expr).into_iter().collect(),
                         limit,
                     },
                 )
@@ -574,6 +574,7 @@ impl Lowering<'_> {
                     .into_iter()
                     .zip(n.resolved_aggregates)
                     .map(|(function, resolved)| lp::StaticAggregateCall {
+                        state_interpretation: None,
                         name: Arc::from(function.name),
                         inputs: function.inputs.into_iter().map(expr).collect(),
                         input_is_intermediate: function.input_is_intermediate,
@@ -663,6 +664,7 @@ impl Lowering<'_> {
                         eq_null_safe: n.eq_null_safe,
                         residual_predicate: n.residual_predicate.map(expr),
                         runtime_filters,
+                        runtime_filter_consumers: vec![],
                     },
                 )
             }
@@ -770,18 +772,19 @@ impl Lowering<'_> {
             }
             ExecNodeKind::Analytic(n) => {
                 let input = self.node(*n.input)?;
+                let frame = n.window.map(freeze_window_frame);
                 (
                     n.node_id,
                     P::Analytic {
                         input,
                         partition_exprs: n.partition_exprs.into_iter().map(expr).collect(),
                         order_by_exprs: n.order_by_exprs.into_iter().map(expr).collect(),
+                        // Every legacy call copies its node's one frame.
                         functions: n
                             .functions
                             .into_iter()
-                            .map(freeze_window_function)
+                            .map(|function| freeze_window_function(function, frame))
                             .collect(),
-                        window: n.window.map(freeze_window_frame),
                         output_columns: n
                             .output_columns
                             .into_iter()
@@ -1126,8 +1129,17 @@ fn freeze_window_frame(frame: super::analytic::WindowFrame) -> lp::WindowFrame {
 
 fn freeze_window_function(
     function: super::analytic::WindowFunctionSpec,
+    frame: Option<lp::WindowFrame>,
 ) -> lp::StaticWindowFunction {
     use super::analytic::WindowFunctionKind as W;
+    let ignore_nulls = match function.kind {
+        W::FirstValue { ignore_nulls }
+        | W::FirstValueRewrite { ignore_nulls }
+        | W::LastValue { ignore_nulls }
+        | W::Lead { ignore_nulls }
+        | W::Lag { ignore_nulls } => ignore_nulls,
+        _ => false,
+    };
     lp::StaticWindowFunction {
         kind: match function.kind {
             W::RowNumber => lp::WindowFunctionKind::RowNumber,
@@ -1136,13 +1148,11 @@ fn freeze_window_function(
             W::CumeDist => lp::WindowFunctionKind::CumeDist,
             W::PercentRank => lp::WindowFunctionKind::PercentRank,
             W::Ntile => lp::WindowFunctionKind::Ntile,
-            W::FirstValue { ignore_nulls } => lp::WindowFunctionKind::FirstValue { ignore_nulls },
-            W::FirstValueRewrite { ignore_nulls } => {
-                lp::WindowFunctionKind::FirstValueRewrite { ignore_nulls }
-            }
-            W::LastValue { ignore_nulls } => lp::WindowFunctionKind::LastValue { ignore_nulls },
-            W::Lead { ignore_nulls } => lp::WindowFunctionKind::Lead { ignore_nulls },
-            W::Lag { ignore_nulls } => lp::WindowFunctionKind::Lag { ignore_nulls },
+            W::FirstValue { .. } => lp::WindowFunctionKind::FirstValue,
+            W::FirstValueRewrite { .. } => lp::WindowFunctionKind::FirstValueRewrite,
+            W::LastValue { .. } => lp::WindowFunctionKind::LastValue,
+            W::Lead { .. } => lp::WindowFunctionKind::Lead,
+            W::Lag { .. } => lp::WindowFunctionKind::Lag,
             W::SessionNumber => lp::WindowFunctionKind::SessionNumber,
             W::Count => lp::WindowFunctionKind::Count,
             W::Sum => lp::WindowFunctionKind::Sum,
@@ -1175,6 +1185,8 @@ fn freeze_window_function(
         aggregate_binding: function
             .aggregate_binding
             .map(|binding| (Arc::from(binding.function_name), binding.resolved)),
+        frame,
+        ignore_nulls,
     }
 }
 
@@ -1303,7 +1315,10 @@ mod tests {
                 nulls_first: key.nulls_first,
             })
             .collect();
-        let runtime_arena = Arc::new(ExprArena::from_immutable(program.expressions()));
+        let runtime_arena = Arc::new(
+            ExprArena::from_immutable(program.expressions())
+                .expect("legacy frozen expression fixture"),
+        );
         let factory = SortProcessorFactory::new_topn(
             2,
             runtime_arena,
@@ -1373,7 +1388,7 @@ mod tests {
             lp::ProgramNodeKind::Values { .. }
         ));
         assert!(
-            matches!(program.nodes()[1].kind(), lp::ProgramNodeKind::Filter { predicate, .. } if *predicate == lp::ProgramExprId::new(0))
+            matches!(program.nodes()[1].kind(), lp::ProgramNodeKind::Filter { predicates, .. } if predicates.as_ref() == [lp::ProgramExprId::new(0)])
         );
         assert_eq!(program.requirements().entries().len(), 1);
         assert!(matches!(

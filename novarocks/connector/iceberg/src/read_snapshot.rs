@@ -271,7 +271,7 @@ pub(crate) async fn build_cow_read_files_at_with_original_scope(
     table: &Table,
     snapshot_id: i64,
     budget: &CaptureBudget<'_>,
-) -> Result<Vec<CowReadFile>, ReadFailure> {
+) -> Result<Vec<IcebergReadFile>, ReadFailure> {
     budget.active()?;
     let metadata = table.metadata();
     let snapshot = metadata
@@ -285,7 +285,7 @@ pub(crate) async fn build_cow_read_files_at_with_original_scope(
     let schema_bytes = budget.json(schema.as_ref())?;
     budget.json_working(schema_bytes)?;
     let domain = mint_read_domain(metadata, snapshot_id, &schema)?;
-    observe_read_files::<CowDataFileProjection>(table, domain, None, Some(budget)).await
+    observe_read_files::<FrozenCowDataFileProjection>(table, domain, None, Some(budget)).await
 }
 
 /// One common observation retains the original entry, delete and lineage checks.
@@ -964,6 +964,118 @@ impl ObservedDataFileProjection for CowDataFileProjection {
             first_row_id: facts.first_row_id,
             data_sequence_number: Some(facts.data_sequence_number),
             deletes: facts.deletes,
+        })
+    }
+}
+
+/// Keep the exact typed manifest remainder required by frozen read authority.
+/// Only public immutable fields of the original SDK entry are copied, and every
+/// backing is covered before construction; no complete SDK DataFile is cloned.
+struct FrozenCowDataFileProjection {
+    stats: CowDataFileProjection,
+    manifest: Arc<IcebergDataFileMetadata>,
+}
+impl ObservedDataFileProjection for FrozenCowDataFileProjection {
+    type File = IcebergReadFile;
+    fn capture(
+        df: &DataFile,
+        names: &HashMap<i32, String>,
+        budget: Option<&CaptureBudget<'_>>,
+    ) -> Result<Self, ReadFailure> {
+        use cow_capture::geometry::{add, arc_slice, hash_max, slots};
+        use novarocks_spi::connector::ConnectorCowBeginCause;
+        let stats = CowDataFileProjection::capture(df, names, budget)?;
+        if let Some(budget) = budget {
+            let mut upper =
+                recipe(arc_slice::<ConnectorCowBeginCause, IcebergDataFileMetadata>(1))?;
+            upper = recipe(add::<ConnectorCowBeginCause>(
+                upper,
+                recipe(slots::<ConnectorCowBeginCause, i64>(
+                    df.split_offsets().unwrap_or_default().len(),
+                ))?,
+            ))?;
+            upper = recipe(add::<ConnectorCowBeginCause>(
+                upper,
+                df.key_metadata().unwrap_or_default().len() as u64,
+            ))?;
+            for counts in [
+                df.value_counts(),
+                df.null_value_counts(),
+                df.nan_value_counts(),
+            ] {
+                upper = recipe(add::<ConnectorCowBeginCause>(
+                    upper,
+                    recipe(hash_max::<ConnectorCowBeginCause, (i32, u64)>(counts.len()))?,
+                ))?;
+            }
+            for bounds in [df.lower_bounds(), df.upper_bounds()] {
+                upper = recipe(add::<ConnectorCowBeginCause>(
+                    upper,
+                    recipe(hash_max::<
+                        ConnectorCowBeginCause,
+                        (i32, crate::iceberg::spec::Datum),
+                    >(bounds.len()))?,
+                ))?;
+                for datum in bounds.values() {
+                    budget.active()?;
+                    let bytes = match datum.literal() {
+                        PrimitiveLiteral::String(value) => value.len(),
+                        PrimitiveLiteral::Binary(value) => value.len(),
+                        _ => 0,
+                    };
+                    upper = recipe(add::<ConnectorCowBeginCause>(upper, bytes as u64))?;
+                }
+            }
+            budget.charge(upper)?;
+        }
+        // Rebuild insert-only maps from the exact original pairs. This gives a
+        // prospective layout from their known lengths even if the SDK input
+        // maps retained spare buckets or tombstones from prior construction.
+        let counts = |map: &HashMap<i32, u64>| -> Result<HashMap<i32, u64>, ReadFailure> {
+            let mut output = HashMap::with_capacity(map.len());
+            for (&id, &value) in map {
+                check_cow_active(budget)?;
+                output.insert(id, value);
+            }
+            Ok(output)
+        };
+        let bounds = |map: &HashMap<i32,crate::iceberg::spec::Datum>| -> Result<HashMap<i32,crate::iceberg::spec::Datum>,ReadFailure> {
+            let mut output = HashMap::with_capacity(map.len());
+            for (&id,value) in map { check_cow_active(budget)?; output.insert(id,value.clone()); }
+            Ok(output)
+        };
+        let manifest = Arc::new(IcebergDataFileMetadata {
+            file_format: df.file_format(),
+            split_offsets: df.split_offsets().unwrap_or_default().to_vec(),
+            key_metadata: df.key_metadata().unwrap_or_default().to_vec(),
+            value_counts: counts(df.value_counts())?,
+            null_value_counts: counts(df.null_value_counts())?,
+            nan_value_counts: counts(df.nan_value_counts())?,
+            lower_bounds: bounds(df.lower_bounds())?,
+            upper_bounds: bounds(df.upper_bounds())?,
+        });
+        check_cow_active(budget)?;
+        Ok(Self { stats, manifest })
+    }
+    fn into_file(
+        self,
+        facts: FinalReadFileFacts,
+        names: &HashMap<i32, String>,
+    ) -> Result<Self::File, String> {
+        let file = self.stats.into_file(facts, names)?;
+        Ok(IcebergReadFile {
+            path: file.path,
+            size: file.size,
+            record_count: file.record_count,
+            column_stats: file.column_stats,
+            partition_spec_id: file.partition_spec_id,
+            partition_key: file.partition_key,
+            partition_values: file.partition_values,
+            manifest_path: file.manifest_path,
+            first_row_id: file.first_row_id,
+            data_sequence_number: file.data_sequence_number,
+            manifest: self.manifest,
+            deletes: file.deletes,
         })
     }
 }

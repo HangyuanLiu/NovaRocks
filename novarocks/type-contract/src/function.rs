@@ -26,8 +26,16 @@ macro_rules! stable_identity {
         pub struct $name(Box<str>);
 
         impl $name {
+            /// Validate a borrowed identity with the constructor's exact grammar.
+            /// This performs no allocation and does not retain the input.
+            pub fn validate_str(value: &str) -> Result<(), FunctionIdentityError> {
+                validate_identity($kind, value)
+            }
+
             pub fn try_new(value: impl AsRef<str>) -> Result<Self, FunctionIdentityError> {
-                validate_identity($kind, value.as_ref()).map(|()| Self(value.as_ref().into()))
+                let value = value.as_ref();
+                Self::validate_str(value)?;
+                Ok(Self(value.into()))
             }
 
             pub fn as_str(&self) -> &str {
@@ -47,17 +55,36 @@ stable_identity!(FunctionOverloadId, "function overload");
 pub struct AggregateStateFormatId(Box<str>);
 
 impl AggregateStateFormatId {
+    /// Validate a borrowed state identity with the constructor's exact grammar.
+    /// This performs no allocation and does not retain the input.
+    pub fn validate_str(value: &str) -> Result<(), FunctionIdentityError> {
+        Self::validate_str_observed(value, || Ok(()))
+    }
+
+    /// Observe each byte actually inspected by the same identity grammar.
+    /// Length rejection precedes the scan; a callback refusal is returned
+    /// directly before any later byte or identity error is produced.
+    pub fn validate_str_observed<E: From<FunctionIdentityError>>(
+        value: &str,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
+        validate_identity("aggregate state format", value)?;
+        for byte in value.bytes() {
+            let allowed = byte.is_ascii_graphic() && !matches!(byte, b'|' | b',');
+            observe()?;
+            if !allowed {
+                return Err(FunctionIdentityError::InvalidCharacters {
+                    kind: "aggregate state format",
+                }
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     pub fn try_new(value: impl AsRef<str>) -> Result<Self, FunctionIdentityError> {
         let value = value.as_ref();
-        validate_identity("aggregate state format", value)?;
-        if !value
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'|' | b','))
-        {
-            return Err(FunctionIdentityError::InvalidCharacters {
-                kind: "aggregate state format",
-            });
-        }
+        Self::validate_str(value)?;
         Ok(Self(value.into()))
     }
 
@@ -66,10 +93,42 @@ impl AggregateStateFormatId {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+/// Original overload owner's constraints on the logical argument types used
+/// to interpret its intermediate state. This does not change any call's exact
+/// signature, state/result type, ORDER BY channels, or runtime failure policy.
+/// Installed binding validation must check this against the owner declaration.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AggregateStateArgumentContract {
+    /// Every complete argument type must be identical across state phases.
+    ExactSignature,
+    /// Only logical scalar arguments' root nullability may differ. Nested
+    /// nullability, field metadata, nominal domains and ORDER BY remain exact.
+    ValueRootNullabilityIndependent,
+}
+
+#[derive(Clone, Debug)]
 pub struct FunctionValueType {
     pub data_type: DataType,
     pub nullable: bool,
+    pub logical_type: crate::ValueLogicalType,
+}
+
+impl PartialEq for FunctionValueType {
+    fn eq(&self, other: &Self) -> bool {
+        self.nullable == other.nullable
+            && self.logical_type == other.logical_type
+            && crate::arrow_data_types_exact(&self.data_type, &other.data_type)
+    }
+}
+impl Eq for FunctionValueType {}
+impl std::hash::Hash for FunctionValueType {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Arrow's coarser dictionary equality/hash may collide for different
+        // frozen dictionary identities; exact equality still distinguishes them.
+        std::hash::Hash::hash(&self.data_type, state);
+        std::hash::Hash::hash(&self.nullable, state);
+        std::hash::Hash::hash(&self.logical_type, state);
+    }
 }
 
 impl FunctionValueType {
@@ -77,7 +136,121 @@ impl FunctionValueType {
         Self {
             data_type,
             nullable,
+            logical_type: crate::ValueLogicalType::Physical,
         }
+    }
+
+    /// Read an explicitly authored root domain from its actual Arrow field.
+    /// Missing metadata declares Physical; no carrier confers another identity.
+    pub fn try_from_field(field: &arrow_schema::Field) -> Result<Self, crate::ValueTypeError> {
+        Self::try_with_logical_type(
+            field.data_type().clone(),
+            field.is_nullable(),
+            crate::field_logical_type(field)?,
+        )
+    }
+
+    /// Materialize a new schema field from this exact authored value type.
+    /// Root identity is explicit metadata; nested fields remain unchanged.
+    pub fn try_to_field(&self, name: impl Into<String>) -> Result<Field, crate::ValueTypeError> {
+        self.validate()?;
+        let field = Field::new(name, self.data_type.clone(), self.nullable);
+        Ok(match self.logical_type.metadata_value() {
+            Some(tag) => field
+                .with_metadata([(crate::NR_LOGICAL_TYPE_KEY.to_owned(), tag.to_owned())].into()),
+            None => field,
+        })
+    }
+
+    pub fn try_with_logical_type(
+        data_type: DataType,
+        nullable: bool,
+        logical_type: crate::ValueLogicalType,
+    ) -> Result<Self, crate::ValueTypeError> {
+        let value = Self {
+            data_type,
+            nullable,
+            logical_type,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn validate(&self) -> Result<(), crate::ValueTypeError> {
+        self.validate_core(crate::validate_nested_logical_types)
+    }
+
+    /// Validate the original root carrier and nested logical grammar using
+    /// caller-owned scratch and borrowed events. The caller admits scratch
+    /// initialization before this call; this method owns no scope or footer.
+    pub fn validate_with_scratch_observed<'a, E: From<crate::ValueTypeError>>(
+        &'a self,
+        scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
+        observe: impl FnMut(crate::ValueTypeVisit<'a>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.validate_core(|root| {
+            crate::validate_value_type_structure_with_scratch_observed(root, scratch, observe)
+        })
+    }
+
+    fn validate_core<'a, E: From<crate::ValueTypeError>>(
+        &'a self,
+        validate_nested: impl FnOnce(&'a DataType) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.logical_type.validate_carrier(&self.data_type)?;
+        validate_nested(&self.data_type)
+    }
+
+    pub fn fits_value_type(&self, expected: &Self) -> bool {
+        self.logical_type == expected.logical_type
+            && (expected.nullable || !self.nullable)
+            && fits_nested_nullability(&self.data_type, &expected.data_type)
+            && self.validate().is_ok()
+            && expected.validate().is_ok()
+    }
+
+    /// Compare the exact frozen value type, including nested provider and
+    /// dictionary facts. This observes the borrowed traversal; it does not
+    /// replace the owner's metadata admission or allocation policy.
+    pub fn exactly_equals_observed<E: From<crate::ValueTypeError>>(
+        &self,
+        other: &Self,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        observe()?;
+        if self.nullable != other.nullable || self.logical_type != other.logical_type {
+            return Ok(false);
+        }
+        crate::arrow_data_types_exact_observed(&self.data_type, &other.data_type, observe)
+    }
+
+    pub fn same_value_domain_observed<E: From<crate::ValueTypeError>>(
+        &self,
+        other: &Self,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        observe()?;
+        self.logical_type.validate_carrier(&self.data_type)?;
+        other.logical_type.validate_carrier(&other.data_type)?;
+        if self.logical_type != other.logical_type {
+            return Ok(false);
+        }
+        Ok(
+            fits_nested_nullability_observed(&self.data_type, &other.data_type, &mut observe)?
+                && fits_nested_nullability_observed(
+                    &other.data_type,
+                    &self.data_type,
+                    &mut observe,
+                )?,
+        )
+    }
+
+    pub fn same_value_domain(&self, other: &Self) -> bool {
+        self.logical_type == other.logical_type
+            && fits_nested_nullability(&self.data_type, &other.data_type)
+            && fits_nested_nullability(&other.data_type, &self.data_type)
+            && self.validate().is_ok()
+            && other.validate().is_ok()
     }
 }
 
@@ -207,37 +380,269 @@ fn validate_identity(kind: &'static str, value: &str) -> Result<(), FunctionIden
 /// same direction nullability travels everywhere else. A field that may be
 /// null standing where a non-null one is asked for is the mismatch.
 pub fn fits_nested_nullability(actual: &DataType, expected: &DataType) -> bool {
-    fn field_fits(actual: &Field, expected: &Field) -> bool {
-        actual.name() == expected.name()
-            && (expected.is_nullable() || !actual.is_nullable())
-            && fits_nested_nullability(actual.data_type(), expected.data_type())
+    fits_nested_nullability_observed::<crate::ValueTypeError>(actual, expected, || Ok(()))
+        .unwrap_or(false)
+}
+
+/// Preserve the same value-domain/nullability rule while observing recursive
+/// schemas and pair comparisons. Nonlogical field annotations do not change
+/// this semantic domain; exact physical-carrier comparison remains separate.
+pub fn fits_nested_nullability_observed<E: From<crate::ValueTypeError>>(
+    actual: &DataType,
+    expected: &DataType,
+    mut observe: impl FnMut() -> Result<(), E>,
+) -> Result<bool, E> {
+    crate::validate_nested_logical_types_observed(actual, &mut observe)?;
+    crate::validate_nested_logical_types_observed(expected, &mut observe)?;
+    #[allow(deprecated)]
+    fn field_fits<E>(
+        actual: &Field,
+        expected: &Field,
+        observe: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        observe()?;
+        if actual.name() != expected.name()
+            || (!expected.is_nullable() && actual.is_nullable())
+            || actual.dict_id() != expected.dict_id()
+            || actual.dict_is_ordered() != expected.dict_is_ordered()
+            || crate::field_logical_type(actual) != crate::field_logical_type(expected)
+        {
+            return Ok(false);
+        }
+        fits(actual.data_type(), expected.data_type(), observe)
     }
-    match (actual, expected) {
-        (DataType::List(actual), DataType::List(expected))
-        | (DataType::LargeList(actual), DataType::LargeList(expected)) => {
-            field_fits(actual, expected)
+    fn fits<E>(
+        actual: &DataType,
+        expected: &DataType,
+        observe: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        observe()?;
+        match (actual, expected) {
+            (DataType::List(actual), DataType::List(expected))
+            | (DataType::LargeList(actual), DataType::LargeList(expected))
+            | (DataType::ListView(actual), DataType::ListView(expected))
+            | (DataType::LargeListView(actual), DataType::LargeListView(expected)) => {
+                field_fits(actual, expected, observe)
+            }
+            (DataType::FixedSizeList(actual, al), DataType::FixedSizeList(expected, el)) => {
+                if al != el {
+                    Ok(false)
+                } else {
+                    field_fits(actual, expected, observe)
+                }
+            }
+            (DataType::Struct(actual), DataType::Struct(expected)) => {
+                if actual.len() != expected.len() {
+                    return Ok(false);
+                }
+                for (actual, expected) in actual.iter().zip(expected) {
+                    if !field_fits(actual, expected, observe)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            (DataType::Map(actual, asorted), DataType::Map(expected, esorted)) => {
+                if asorted != esorted {
+                    Ok(false)
+                } else {
+                    field_fits(actual, expected, observe)
+                }
+            }
+            (DataType::Union(actual, amode), DataType::Union(expected, emode)) => {
+                if amode != emode || actual.len() != expected.len() {
+                    return Ok(false);
+                }
+                for ((ai, actual), (ei, expected)) in actual.iter().zip(expected.iter()) {
+                    if ai != ei || !field_fits(actual, expected, observe)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            (DataType::Dictionary(ak, av), DataType::Dictionary(ek, ev)) => {
+                Ok(fits(ak, ek, observe)? && fits(av, ev, observe)?)
+            }
+            (DataType::RunEndEncoded(ar, av), DataType::RunEndEncoded(er, ev)) => {
+                Ok(field_fits(ar, er, observe)? && field_fits(av, ev, observe)?)
+            }
+            (actual, expected) => Ok(actual == expected),
         }
-        (
-            DataType::FixedSizeList(actual, actual_len),
-            DataType::FixedSizeList(expected, expected_len),
-        ) => actual_len == expected_len && field_fits(actual, expected),
-        (DataType::Struct(actual), DataType::Struct(expected)) => {
-            actual.len() == expected.len()
-                && actual
-                    .iter()
-                    .zip(expected.iter())
-                    .all(|(actual, expected)| field_fits(actual, expected))
-        }
-        (DataType::Map(actual, actual_sorted), DataType::Map(expected, expected_sorted)) => {
-            actual_sorted == expected_sorted && field_fits(actual, expected)
-        }
-        (actual, expected) => actual == expected,
     }
+    fits(actual, expected, &mut observe)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{AggregateStateFormatId, FunctionId, FunctionIdentityError};
+
+    #[test]
+    fn observed_value_type_equality_preserves_exact_frozen_identity() {
+        use crate::{FunctionValueType, NR_LOGICAL_TYPE_KEY, ValueLogicalType, ValueTypeError};
+        use arrow_schema::{DataType, Field};
+        #[allow(deprecated)]
+        let nested = |dict_id, ordered, nullable, annotation: &str, logical: &str| {
+            FunctionValueType::new(
+                DataType::Struct(
+                    vec![
+                        Field::new_dict(
+                            "dictionary",
+                            DataType::Dictionary(
+                                Box::new(DataType::Int8),
+                                Box::new(DataType::Utf8),
+                            ),
+                            nullable,
+                            dict_id,
+                            ordered,
+                        )
+                        .with_metadata([("provider".to_owned(), annotation.to_owned())].into()),
+                        if logical.is_empty() {
+                            Field::new("payload", DataType::Utf8, false)
+                        } else {
+                            Field::new("payload", DataType::Utf8, false).with_metadata(
+                                [(NR_LOGICAL_TYPE_KEY.to_owned(), logical.to_owned())].into(),
+                            )
+                        },
+                    ]
+                    .into(),
+                ),
+                false,
+            )
+        };
+        let value = nested(7, false, true, "source", "json");
+        for other in [
+            value.clone(),
+            nested(8, false, true, "source", "json"),
+            nested(7, true, true, "source", "json"),
+            nested(7, false, false, "source", "json"),
+            nested(7, false, true, "other", "json"),
+            nested(7, false, true, "source", ""),
+        ] {
+            assert_eq!(
+                value
+                    .exactly_equals_observed::<ValueTypeError>(&other, || Ok(()))
+                    .unwrap(),
+                value == other,
+            );
+        }
+        let physical = FunctionValueType::new(DataType::FixedSizeBinary(16), false);
+        let uuid = FunctionValueType::try_with_logical_type(
+            physical.data_type.clone(),
+            false,
+            ValueLogicalType::Uuid,
+        )
+        .unwrap();
+        assert!(
+            !physical
+                .exactly_equals_observed::<ValueTypeError>(&uuid, || Ok(()))
+                .unwrap()
+        );
+        assert!(
+            !physical
+                .exactly_equals_observed::<ValueTypeError>(
+                    &FunctionValueType::new(physical.data_type.clone(), true),
+                    || Ok(()),
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn observed_value_type_equality_preserves_control_failure_at_entry_and_interior() {
+        use crate::{CompileControlError, FunctionValueType, ValueTypeError};
+        use arrow_schema::{DataType, Field};
+        #[derive(Debug, PartialEq)]
+        enum Failure {
+            Type(ValueTypeError),
+            Control(CompileControlError),
+        }
+        impl From<ValueTypeError> for Failure {
+            fn from(value: ValueTypeError) -> Self {
+                Self::Type(value)
+            }
+        }
+        let value = FunctionValueType::new(
+            DataType::Struct(
+                (0..320)
+                    .map(|index| Field::new(index.to_string(), DataType::Int32, false))
+                    .collect(),
+            ),
+            false,
+        );
+        let mut visits = 0;
+        assert!(
+            value
+                .exactly_equals_observed::<ValueTypeError>(&value, || {
+                    visits += 1;
+                    Ok(())
+                })
+                .unwrap()
+        );
+        assert!(visits > 960);
+        for failure in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for stop in [1, 256, visits] {
+                let mut observed = 0;
+                let result = value.exactly_equals_observed::<Failure>(&value, || {
+                    observed += 1;
+                    if observed == stop {
+                        Err(Failure::Control(failure))
+                    } else {
+                        Ok(())
+                    }
+                });
+                assert_eq!(result, Err(Failure::Control(failure)));
+                assert_eq!(observed, stop);
+            }
+        }
+    }
+
+    #[test]
+    fn source_field_value_domain_is_explicit_and_validated() {
+        use crate::{FunctionValueType, NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+        use arrow_schema::{DataType, Field};
+        let physical = Field::new("bytes", DataType::FixedSizeBinary(16), false);
+        assert_eq!(
+            FunctionValueType::try_from_field(&physical).unwrap(),
+            FunctionValueType::new(DataType::FixedSizeBinary(16), false)
+        );
+        let uuid = physical
+            .clone()
+            .with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), "uuid".to_owned())].into());
+        let exact_uuid = FunctionValueType::try_from_field(&uuid).unwrap();
+        assert_eq!(exact_uuid.logical_type, ValueLogicalType::Uuid);
+        assert_eq!(
+            FunctionValueType::try_from_field(&exact_uuid.try_to_field("roundtrip").unwrap())
+                .unwrap(),
+            exact_uuid
+        );
+        assert!(
+            FunctionValueType::try_from_field(&uuid.with_data_type(DataType::FixedSizeBinary(15)))
+                .is_err()
+        );
+        let unknown =
+            physical.with_metadata([(NR_LOGICAL_TYPE_KEY.to_owned(), "unknown".to_owned())].into());
+        assert!(FunctionValueType::try_from_field(&unknown).is_err());
+        let item = Field::new("provider_item", DataType::Utf8, false).with_metadata(
+            [
+                (NR_LOGICAL_TYPE_KEY.to_owned(), "json".to_owned()),
+                ("provider.field_id".to_owned(), "91".to_owned()),
+            ]
+            .into(),
+        );
+        let nested = Field::new(
+            "values",
+            DataType::LargeList(std::sync::Arc::new(item)),
+            true,
+        );
+        assert_eq!(
+            FunctionValueType::try_from_field(&nested).unwrap(),
+            FunctionValueType::new(nested.data_type().clone(), true)
+        );
+    }
 
     #[test]
     fn stable_function_identity_is_bounded() {
@@ -266,3 +671,11 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "function/identity_tests.rs"]
+mod identity_tests;
+
+#[cfg(test)]
+#[path = "function/value_type_scratch_tests.rs"]
+mod value_type_scratch_tests;

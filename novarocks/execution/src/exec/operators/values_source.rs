@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use crate::exec::chunk::Chunk;
 
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
@@ -105,11 +107,13 @@ impl ProcessorOperator for ValuesSourceOperator {
         !self.is_finished()
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
-        Err("values source operator does not accept input".to_string())
+    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
+        Err("values source operator does not accept input"
+            .to_string()
+            .into())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         if self.emitted {
             return Ok(None);
         }
@@ -129,7 +133,7 @@ impl ProcessorOperator for ValuesSourceOperator {
         Ok(Some(self.chunk.clone()))
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         Ok(())
     }
 }

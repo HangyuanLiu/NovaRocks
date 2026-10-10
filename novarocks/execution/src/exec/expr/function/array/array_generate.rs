@@ -542,7 +542,8 @@ mod tests {
             out_type,
         );
         let frozen = arena.into_immutable().unwrap();
-        let prepared = ExprArena::from_immutable(&frozen);
+        let prepared =
+            ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
         let output = prepared.eval(expr, &chunk).unwrap();
         let list = output.as_any().downcast_ref::<ListArray>().unwrap();
         for (row, values) in [
@@ -662,7 +663,8 @@ mod tests {
             dtype,
         );
         let frozen = arena.into_immutable().unwrap();
-        let prepared = ExprArena::from_immutable(&frozen);
+        let prepared =
+            ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
         let output = prepared.eval(empty, &chunk).unwrap();
         let list = output.as_any().downcast_ref::<ListArray>().unwrap();
         assert!(!list.is_null(0));
@@ -848,7 +850,8 @@ mod tests {
             dtype,
         );
         let frozen = arena.into_immutable().unwrap();
-        let prepared = ExprArena::from_immutable(&frozen);
+        let prepared =
+            ExprArena::from_immutable(&frozen).expect("legacy frozen expression fixture");
         for expr in errors {
             // NULL row zero is visited first; overflow in the next real row
             // refuses the whole batch instead of returning partial output.

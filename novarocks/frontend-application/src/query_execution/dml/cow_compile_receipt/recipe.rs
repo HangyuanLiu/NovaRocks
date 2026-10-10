@@ -31,6 +31,22 @@ fn mul(a: u64, b: u64) -> Result<u64> {
     a.checked_mul(b).ok_or(Failure::ResourceExhausted)
 }
 
+// Concrete simultaneously live copies: FE's prepared query, SqlCompiler's
+// ParsedQuery clone, the analyzer's normalization clone, and the prepass
+// unroller clone. Once analysis returns, semantic detectors use the third
+// slot serially. General
+// analyzer/optimizer graphs remain planning Work, outside this conversion.
+fn current_compiler_copies_upper(one_query: u64) -> Result<u64> {
+    let fe_prepared_query = one_query;
+    let compiler_parsed_query = one_query;
+    let analyzer_or_semantic_detector_query = one_query;
+    let prepass_rewritten_query = one_query;
+    add(
+        add(fe_prepared_query, compiler_parsed_query)?,
+        add(analyzer_or_semantic_detector_query, prepass_rewritten_query)?,
+    )
+}
+
 /// All fields require a concrete original-owner receipt. Wire/content lengths
 /// are not receipts. Shared source ownership is counted once physically.
 /// Existing catalog/provider runtime metadata does not become Internal merely
@@ -213,7 +229,7 @@ impl Recipe {
                 )?,
                 minimum,
             )?,
-            add(mul(maximum_clone, 2)?, transient)?,
+            add(current_compiler_copies_upper(maximum_clone)?, transient)?,
         )?;
         if lower_peak > ORIGINAL_INTERNAL_PEAK {
             return Err(Failure::ResourceExhausted);
@@ -256,8 +272,8 @@ impl Recipe {
     }
 
     /// A conservative envelope covering construction AND compilation. Every
-    /// target original AST is held, plus the current FE-prepared and
-    /// ParsedQuery clone. Constructor transient is retained conservatively;
+    /// target original AST is held, plus the current FE-prepared, ParsedQuery
+    /// and analyzer/semantic-detector/prepass copies. Constructor transient is retained conservatively;
     /// it is not a second pool and is not spent again by another target.
     pub fn peak(&self) -> Result<u64> {
         add(
@@ -266,7 +282,7 @@ impl Recipe {
                     add(self.baseline_existing, self.all_targets_owned_metadata)?,
                     self.all_targets_ast,
                 )?,
-                mul(self.maximum_current_target_clone, 2)?,
+                current_compiler_copies_upper(self.maximum_current_target_clone)?,
             )?,
             self.maximum_current_cell_transient,
         )

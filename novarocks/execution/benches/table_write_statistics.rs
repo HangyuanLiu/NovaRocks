@@ -24,6 +24,7 @@
 
 #![recursion_limit = "256"]
 
+use novarocks_execution::runtime::fragment::ExecutionResult;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -368,7 +369,7 @@ fn main() {
     }
 }
 
-fn run() -> Result<(), String> {
+fn run() -> ExecutionResult<()> {
     let config = Config::from_env()?;
     let function_set = build_function_set()?;
     let runtime = build_runtime(Arc::clone(&function_set))?;
@@ -512,7 +513,7 @@ fn run_once(
     inputs: &[Chunk],
     function_set: Arc<SealedExecutionFunctionSet>,
     runtime: Arc<ExecutionRuntime>,
-) -> Result<RunResult, String> {
+) -> ExecutionResult<RunResult> {
     let driver_thread_id = std::thread::current().id();
     let provider = BenchProvider::new();
     let adapter = WriteRuntimeAdapter::new(provider);
@@ -762,13 +763,13 @@ fn run_once(
         return Err(format!(
             "invalid benchmark output for {}: summary={summary_rows}, fragments={prepared_fragment_rows}, artifacts={artifact_rows}, row_count={published_row_count:?}",
             case.name()
-        ));
+        ).into());
     }
     if current_memory_bytes_after_drop != 0 {
         return Err(format!(
             "benchmark query memory did not return to zero for {}: {current_memory_bytes_after_drop}",
             case.name()
-        ));
+        ).into());
     }
 
     let throughput = config.rows as f64 / (wall_ns as f64 / 1_000_000_000.0);
@@ -938,7 +939,7 @@ fn build_theta_plan(
     let channel = WriterAuxiliaryChannel::try_new(
         THETA_PARTIAL_SLOT.0,
         "theta_partial",
-        resolved.intermediate_type.clone(),
+        novarocks_type_contract::FunctionValueType::new(resolved.intermediate_type.clone(), true),
     )
     .map_err(|error| error.to_string())?;
     let relation = WriterMultiplexRelationSchema::try_new(
@@ -1022,7 +1023,7 @@ fn push_processor_chunk(
     chunk: Chunk,
     deadline: Instant,
     blocked_polls: &mut u64,
-) -> Result<(), String> {
+) -> ExecutionResult<()> {
     loop {
         check_progress(deadline, state)?;
         if processor
@@ -1050,10 +1051,12 @@ fn decode_exchange_into_finish(
     state: &RuntimeState,
     deadline: Instant,
     blocked_polls: &mut u64,
-) -> Result<ExchangeObservation, String> {
+) -> ExecutionResult<ExchangeObservation> {
     frames.sort_by_key(|frame| frame.sequence);
     if frames.is_empty() {
-        return Err("writer relation exchange emitted no frames".to_string());
+        return Err("writer relation exchange emitted no frames"
+            .to_string()
+            .into());
     }
     let mut actual_sent_bytes = 0u64;
     let mut data_frame_count = 0u64;
@@ -1061,14 +1064,18 @@ fn decode_exchange_into_finish(
     let mut saw_eos = false;
     for frame in frames {
         if saw_eos {
-            return Err("writer relation exchange emitted a frame after EOS".to_string());
+            return Err("writer relation exchange emitted a frame after EOS"
+                .to_string()
+                .into());
         }
         if frame.destination_fragment_instance_id != EXCHANGE_DESTINATION_FINST
             || frame.sender_fragment_instance_id != EXCHANGE_SOURCE_FINST
             || frame.destination_node_id != EXCHANGE_DESTINATION_NODE_ID
             || frame.sender_id != EXCHANGE_SENDER_ID
         {
-            return Err("writer relation exchange frame identity drifted".to_string());
+            return Err("writer relation exchange frame identity drifted"
+                .to_string()
+                .into());
         }
         actual_sent_bytes = actual_sent_bytes.saturating_add(
             u64::try_from(frame.payload.len())
@@ -1086,7 +1093,9 @@ fn decode_exchange_into_finish(
             &frame.payload,
         )?;
         if frame.eos && !decoded.is_empty() {
-            return Err("writer relation exchange EOS decoded data rows".to_string());
+            return Err("writer relation exchange EOS decoded data rows"
+                .to_string()
+                .into());
         }
         for chunk in decoded {
             push_processor_chunk(finish, state, chunk, deadline, blocked_polls)?;
@@ -1095,7 +1104,7 @@ fn decode_exchange_into_finish(
     if eos_frame_count != 1 || data_frame_count == 0 {
         return Err(format!(
             "writer relation exchange frame coverage is invalid: data={data_frame_count}, eos={eos_frame_count}"
-        ));
+        ).into());
     }
 
     let encoded_payload_bytes = required_u64_counter(profiles, "SerializedBytes")?;
@@ -1108,7 +1117,7 @@ fn decode_exchange_into_finish(
     {
         return Err(format!(
             "writer relation exchange accounting mismatch: encoded={encoded_payload_bytes}, profile_sent={sent_payload_bytes}, transmitter_sent={actual_sent_bytes}, requests={request_count}, frames={expected_requests}"
-        ));
+        ).into());
     }
     Ok(ExchangeObservation {
         encoded_payload_bytes,
@@ -1212,12 +1221,16 @@ fn observation(value: impl Serialize, source: &'static str) -> Value {
     })
 }
 
-fn check_progress(deadline: Instant, state: &RuntimeState) -> Result<(), String> {
+fn check_progress(deadline: Instant, state: &RuntimeState) -> ExecutionResult<()> {
     if let Some(error) = state.error() {
-        return Err(format!("execution runtime failed: {error}"));
+        return Err(error);
     }
     if Instant::now() >= deadline {
-        return Err("benchmark watchdog expired while waiting for operator progress".to_string());
+        return Err(
+            "benchmark watchdog expired while waiting for operator progress"
+                .to_string()
+                .into(),
+        );
     }
     Ok(())
 }

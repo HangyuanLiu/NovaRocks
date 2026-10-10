@@ -74,6 +74,31 @@ use novarocks_workload_control::WorkloadConfig;
 use crate::paimon_access::ServerPaimonRoleFileIoFactory;
 use crate::provider_manifest::ServerProviderManifest;
 use crate::scan_io::ScanIoServices;
+use crate::static_plan::{FrontendStaticPlanCarrier, ServerStaticPlan};
+use novarocks_execution::exec::expr::agg::{
+    ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
+    contribute_builtin_aggregate_implementations,
+};
+
+/// Seals the one process-wide engine function set: builtin metadata, builtin
+/// aggregate implementations and the Iceberg function bundle.
+pub fn compose_process_function_set() -> anyhow::Result<std::sync::Arc<SealedExecutionFunctionSet>>
+{
+    let mut builder = ExecutionFunctionSetBuilder::new();
+    novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
+        .map_err(|error| anyhow!("contribute builtin function metadata: {error}"))?;
+    contribute_builtin_aggregate_implementations(&mut builder)
+        .map_err(|error| anyhow!("contribute builtin aggregate implementations: {error}"))?;
+    builder
+        .register_typed_aggregate(
+            novarocks_connector_iceberg_functions::iceberg_theta_registration()
+                .map_err(|error| anyhow!("build Iceberg function bundle: {error}"))?,
+        )
+        .map_err(|error| anyhow!("contribute Iceberg function bundle: {error}"))?;
+    Ok(std::sync::Arc::new(builder.seal().map_err(|error| {
+        anyhow!("seal process engine function set: {error}")
+    })?))
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IcebergMvStorageObservationAdapter {
@@ -433,6 +458,7 @@ pub fn compose_backend_server_config(
     config: &NovaRocksConfig,
     native_trust: &NativeTrustSnapshot,
     native_compatibility_id: NativeCompatibilityId,
+    static_plan: &ServerStaticPlan,
     function_set: std::sync::Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet>,
     provider_manifest: std::sync::Arc<ServerProviderManifest>,
     memory_authority: std::sync::Arc<novarocks_memory::MemoryAuthority>,
@@ -550,6 +576,7 @@ pub fn compose_backend_server_config(
         },
         execution_role_binding_factories: provider_manifest
             .compose_execution_factories(config, runtime, scan_io)?,
+        static_plan_interpreter: static_plan.backend_interpreter()?,
         process_memory: backend_process_memory_observation(memory_authority),
     })
 }
@@ -605,6 +632,7 @@ pub fn compose_frontend_role_config(
     native_trust: &NativeTrustSnapshot,
     port_override: Option<u16>,
     native_compatibility_id: NativeCompatibilityId,
+    static_plan: &ServerStaticPlan,
     function_catalog: std::sync::Arc<novarocks_functions::EngineFunctionCatalog>,
     provider_manifest: std::sync::Arc<ServerProviderManifest>,
     memory_authority: std::sync::Arc<novarocks_memory::MemoryAuthority>,
@@ -612,6 +640,11 @@ pub fn compose_frontend_role_config(
 ) -> anyhow::Result<FrontendRoleConfig> {
     crate::sdk_listing_profile::validate_current()?;
     let runtime_config = &config.runtime;
+    let constant_policy = runtime_config
+        .frontend_constant_policy
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("runtime.frontend_constant_policy is required for FE"))?
+        .policy();
     let runtime_filter_worker_count = NonZeroUsize::new(runtime_config.actual_exec_threads())
         .ok_or_else(|| anyhow::anyhow!("frontend runtime-filter worker count must be nonzero"))?;
     let query_blocking_workers = NonZeroUsize::new(runtime_config.actual_query_blocking_workers())
@@ -637,6 +670,7 @@ pub fn compose_frontend_role_config(
         native_compatibility_id,
         function_catalog,
         logical_runtime,
+        constant_policy,
     )
     .with_catalog_desired_state_source(catalog_source)
     .try_with_catalog_prune_config(
@@ -697,6 +731,21 @@ pub fn compose_frontend_role_config(
         query_blocking_workers,
         query_blocking_queue,
     ));
+    // Static plan carrier hook: the frontend freezes the one carrier this
+    // island's backends interpret, under the same package admission the
+    // backend receiver uses. Production keeps the frontend's plan-tree
+    // carrier untouched.
+    match static_plan.frontend_carrier() {
+        FrontendStaticPlanCarrier::PlanTree => {}
+        #[cfg(feature = "physical-wire-v2-candidate")]
+        FrontendStaticPlanCarrier::CompiledPackage { admission, limits } => {
+            execution = execution.with_static_plan_carrier(
+                novarocks_frontend_application::StaticPlanCarrier::CompiledPackage(
+                    novarocks_frontend_application::CompiledPackageCarrier::new(admission, limits),
+                ),
+            );
+        }
+    }
     let (remote_effect_policy, management_audit, startup_isolation) =
         mv_management_continuation(config)?;
     execution =

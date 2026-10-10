@@ -21,7 +21,7 @@ use std::fmt::{self, Write};
 
 use arrow::datatypes::DataType;
 
-use super::completed::{ExplainRenderBudget, ExplainRenderOutput};
+use super::completed::{ExplainRenderBudget, ExplainRenderOutput, RenderDiagnostic};
 use super::{ExplainLevel, PlanNodeExplainStage};
 use crate::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, ProjectItem, SortItem, TypedExpr, UnOp,
@@ -38,26 +38,50 @@ use crate::planner::table::{
 // and line bounds remain independently enforced by ExplainRenderOutput.
 const MAX_DEPTH: usize = 64;
 
+pub(super) fn render_observed(
+    plan: &LogicalPlanNode,
+    level: ExplainLevel,
+    budget: ExplainRenderBudget,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<String>, crate::compiler::SqlCompileError> {
+    let mut output = ExplainRenderOutput::new_observed(budget, control)?;
+    let diagnostic = RenderDiagnostic::new(control);
+    let result = visit(plan, level, 0, &mut output, &diagnostic);
+    if let Some(error) = diagnostic.take_error() {
+        return Err(error);
+    }
+    result?;
+    output.finish_observed()
+}
+#[cfg(test)]
 pub(super) fn render(
     plan: &LogicalPlanNode,
     level: ExplainLevel,
     budget: ExplainRenderBudget,
 ) -> Result<Vec<String>, String> {
-    let mut output = ExplainRenderOutput::new(budget);
-    visit(plan, level, 0, &mut output)?;
-    Ok(output.finish())
+    render_observed(
+        plan,
+        level,
+        budget,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn visit(
     plan: &LogicalPlanNode,
     level: ExplainLevel,
     depth: usize,
-    output: &mut ExplainRenderOutput,
-) -> Result<(), String> {
+    output: &mut ExplainRenderOutput<'_>,
+    diagnostic: &RenderDiagnostic<'_>,
+) -> Result<(), crate::compiler::SqlCompileError> {
     if depth >= MAX_DEPTH {
-        return Err("logical EXPLAIN exceeds its 64-level rendering depth".into());
+        return Err(crate::compiler::SqlCompileError::InvalidRequest(
+            "logical EXPLAIN exceeds its 64-level rendering depth".into(),
+        ));
     }
-    validate_node_expressions(&plan.kind)?;
+    validate_node_expressions(&plan.kind)
+        .map_err(crate::compiler::SqlCompileError::InvalidRequest)?;
     let pad = Indent(depth);
     let verbose = matches!(
         level,
@@ -65,14 +89,14 @@ fn visit(
     );
     macro_rules! line {
         ($($arguments:tt)*) => {
-            output.push(format_args!($($arguments)*)).map_err(|error| error.to_string())?
+            output.push(format_args!($($arguments)*))?
         };
     }
     let children = match &plan.kind {
         LogicalPlanKind::Scan(node) => {
             line!(
                 "{pad}0:{}",
-                Header(&plan.kind, PlanNodeExplainStage::Logical)
+                Header(&plan.kind, PlanNodeExplainStage::Logical, Some(diagnostic))
             );
             if verbose && let Some(columns) = &node.required_columns {
                 line!(
@@ -100,14 +124,17 @@ fn visit(
             if !node.predicates.is_empty() {
                 line!(
                     "{pad}     predicates: {}",
-                    Expressions(&node.predicates, " AND ")
+                    Expressions(&node.predicates, " AND ", Some(diagnostic))
                 );
             }
             0
         }
         LogicalPlanKind::Filter(node) => {
             line!("{pad}FILTER");
-            line!("{pad}  predicate: {}", Expression(&node.predicate));
+            line!(
+                "{pad}  predicate: {}",
+                Expression(&node.predicate, Some(diagnostic))
+            );
             1
         }
         LogicalPlanKind::Project(_)
@@ -116,13 +143,19 @@ fn visit(
         | LogicalPlanKind::TableFunction(_)
         | LogicalPlanKind::Repeat(_)
         | LogicalPlanKind::AssertOneRow(_) => {
-            line!("{pad}{}", Header(&plan.kind, PlanNodeExplainStage::Logical));
+            line!(
+                "{pad}{}",
+                Header(&plan.kind, PlanNodeExplainStage::Logical, Some(diagnostic))
+            );
             1
         }
         LogicalPlanKind::Aggregate(node) => {
             line!("{pad}AGGREGATE");
             if !node.group_by.is_empty() {
-                line!("{pad}  group by: {}", Expressions(&node.group_by, ", "));
+                line!(
+                    "{pad}  group by: {}",
+                    Expressions(&node.group_by, ", ", Some(diagnostic))
+                );
             }
             if !node.aggregates.is_empty() {
                 line!(
@@ -134,7 +167,7 @@ fn visit(
                             if aggregate.distinct {
                                 out.write_str("DISTINCT ")?;
                             }
-                            expressions(out, &aggregate.args, ", ", 0)?;
+                            expressions(out, aggregate.source.arguments(), ", ", 0, Some(diagnostic))?;
                             out.write_char(')')?;
                         }
                         Ok(())
@@ -158,7 +191,7 @@ fn visit(
             };
             line!("{pad}{kind}");
             if let Some(condition) = &node.condition {
-                line!("{pad}  on: {}", Expression(condition));
+                line!("{pad}  on: {}", Expression(condition, Some(diagnostic)));
             }
             2
         }
@@ -193,7 +226,10 @@ fn visit(
             plan.children.len()
         }
         LogicalPlanKind::Values(_) | LogicalPlanKind::GenerateSeries(_) => {
-            line!("{pad}{}", Header(&plan.kind, PlanNodeExplainStage::Logical));
+            line!(
+                "{pad}{}",
+                Header(&plan.kind, PlanNodeExplainStage::Logical, Some(diagnostic))
+            );
             0
         }
         LogicalPlanKind::CTEAnchor(node) => {
@@ -224,14 +260,18 @@ fn visit(
             2
         }
         LogicalPlanKind::ImvDelta(_) | LogicalPlanKind::ImvVersion(_) => {
-            return Err("imv marker leaked into non-IMV plan".into());
+            return Err(crate::compiler::SqlCompileError::InvalidRequest(
+                "imv marker leaked into non-IMV plan".into(),
+            ));
         }
     };
     if plan.children.len() != children {
-        return Err("logical EXPLAIN node has an invalid child count".into());
+        return Err(crate::compiler::SqlCompileError::InvalidRequest(
+            "logical EXPLAIN node has an invalid child count".into(),
+        ));
     }
     for child in &plan.children {
-        visit(child, level, depth + 1, output)?;
+        visit(child, level, depth + 1, output, diagnostic)?;
     }
     Ok(())
 }
@@ -263,7 +303,11 @@ fn separator(out: &mut dyn fmt::Write, index: usize, separator: &str) -> fmt::Re
     Ok(())
 }
 
-pub(super) struct Header<'a>(pub &'a LogicalPlanKind, pub PlanNodeExplainStage);
+pub(super) struct Header<'a>(
+    pub &'a LogicalPlanKind,
+    pub PlanNodeExplainStage,
+    pub Option<&'a RenderDiagnostic<'a>>,
+);
 impl fmt::Display for Header<'_> {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
@@ -279,20 +323,20 @@ impl fmt::Display for Header<'_> {
                 out.write_str("PROJECT [")?;
                 for (index, item) in node.items.iter().enumerate() {
                     separator(out, index, ", ")?;
-                    project(out, item)?;
+                    project(out, item, self.2)?;
                 }
                 out.write_char(']')
             }
             LogicalPlanKind::Sort(node) => {
                 out.write_str("SORT BY [")?;
-                sort_items(out, &node.items, true)?;
+                sort_items(out, &node.items, true, self.2)?;
                 out.write_char(']')
             }
             LogicalPlanKind::Window(node) => {
                 out.write_str("WINDOW [")?;
                 for (index, window) in node.window_exprs.iter().enumerate() {
                     separator(out, index, "; ")?;
-                    window_expr(out, window, self.1)?;
+                    window_expr(out, window, self.1, self.2)?;
                 }
                 out.write_char(']')
             }
@@ -447,17 +491,21 @@ impl fmt::Display for ScanLabel<'_> {
     }
 }
 
-pub(super) struct Expression<'a>(pub &'a TypedExpr);
+pub(super) struct Expression<'a>(pub &'a TypedExpr, pub Option<&'a RenderDiagnostic<'a>>);
 impl fmt::Display for Expression<'_> {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
-        expression(out, self.0, 0)
+        expression(out, self.0, 0, self.1)
     }
 }
 
-struct Expressions<'a>(&'a [TypedExpr], &'static str);
+struct Expressions<'a>(
+    &'a [TypedExpr],
+    &'static str,
+    Option<&'a RenderDiagnostic<'a>>,
+);
 impl fmt::Display for Expressions<'_> {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
-        expressions(out, self.0, self.1, 0)
+        expressions(out, self.0, self.1, 0, self.2)
     }
 }
 
@@ -466,10 +514,11 @@ fn expressions(
     items: &[TypedExpr],
     delimiter: &str,
     depth: usize,
+    diagnostic: Option<&RenderDiagnostic<'_>>,
 ) -> fmt::Result {
     for (index, item) in items.iter().enumerate() {
         separator(out, index, delimiter)?;
-        expression(out, item, depth)?;
+        expression(out, item, depth, diagnostic)?;
     }
     Ok(())
 }
@@ -492,14 +541,18 @@ impl fmt::Write for ComparingWrite<'_, '_> {
     }
 }
 
-pub(super) struct Project<'a>(pub &'a ProjectItem);
+pub(super) struct Project<'a>(pub &'a ProjectItem, pub Option<&'a RenderDiagnostic<'a>>);
 impl fmt::Display for Project<'_> {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
-        project(out, self.0)
+        project(out, self.0, self.1)
     }
 }
 
-fn project(out: &mut dyn fmt::Write, item: &ProjectItem) -> fmt::Result {
+fn project(
+    out: &mut dyn fmt::Write,
+    item: &ProjectItem,
+    diagnostic: Option<&RenderDiagnostic<'_>>,
+) -> fmt::Result {
     let equal = {
         let mut comparison = ComparingWrite {
             out,
@@ -507,7 +560,7 @@ fn project(out: &mut dyn fmt::Write, item: &ProjectItem) -> fmt::Result {
             offset: 0,
             equal: true,
         };
-        expression(&mut comparison, &item.expr, 0)?;
+        expression(&mut comparison, &item.expr, 0, diagnostic)?;
         comparison.equal && comparison.offset == comparison.name.len()
     };
     if !equal {
@@ -516,10 +569,27 @@ fn project(out: &mut dyn fmt::Write, item: &ProjectItem) -> fmt::Result {
     Ok(())
 }
 
-fn sort_items(out: &mut dyn fmt::Write, items: &[SortItem], nulls: bool) -> fmt::Result {
+#[cfg(test)]
+pub(super) struct SortItems<'a>(
+    pub &'a [SortItem],
+    pub Option<&'a RenderDiagnostic<'a>>,
+);
+#[cfg(test)]
+impl fmt::Display for SortItems<'_> {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        sort_items(out, self.0, true, self.1)
+    }
+}
+
+fn sort_items(
+    out: &mut dyn fmt::Write,
+    items: &[SortItem],
+    nulls: bool,
+    diagnostic: Option<&RenderDiagnostic<'_>>,
+) -> fmt::Result {
     for (index, item) in items.iter().enumerate() {
         separator(out, index, ", ")?;
-        expression(out, &item.expr, 0)?;
+        expression(out, &item.expr, 0, diagnostic)?;
         write!(out, " {}", if item.asc { "ASC" } else { "DESC" })?;
         if nulls {
             out.write_str(if item.nulls_first {
@@ -536,29 +606,35 @@ fn window_expr(
     out: &mut dyn fmt::Write,
     window: &WindowExpr,
     stage: PlanNodeExplainStage,
+    diagnostic: Option<&RenderDiagnostic<'_>>,
 ) -> fmt::Result {
     write!(out, "{}(", window.name)?;
-    expressions(out, &window.args, ", ", 0)?;
+    expressions(out, &window.args, ", ", 0, diagnostic)?;
     out.write_char(')')?;
     if stage == PlanNodeExplainStage::Logical {
         out.write_str(" OVER (")?;
         if !window.partition_by.is_empty() {
             out.write_str("PARTITION BY ")?;
-            expressions(out, &window.partition_by, ", ", 0)?;
+            expressions(out, &window.partition_by, ", ", 0, diagnostic)?;
         }
         if !window.order_by.is_empty() {
             if !window.partition_by.is_empty() {
                 out.write_char(' ')?;
             }
             out.write_str("ORDER BY ")?;
-            sort_items(out, &window.order_by, false)?;
+            sort_items(out, &window.order_by, false, diagnostic)?;
         }
         out.write_char(')')?;
     }
     Ok(())
 }
 
-fn expression(out: &mut dyn fmt::Write, expr: &TypedExpr, depth: usize) -> fmt::Result {
+fn expression(
+    out: &mut dyn fmt::Write,
+    expr: &TypedExpr,
+    depth: usize,
+    diagnostic: Option<&RenderDiagnostic<'_>>,
+) -> fmt::Result {
     if depth >= MAX_DEPTH {
         return Err(fmt::Error);
     }
@@ -573,6 +649,10 @@ fn expression(out: &mut dyn fmt::Write, expr: &TypedExpr, depth: usize) -> fmt::
             out.write_str(column)
         }
         ExprKind::LambdaParamRef { name, .. } => out.write_str(name),
+        ExprKind::Constant(value) => match diagnostic {
+            Some(diagnostic) => diagnostic.constant(value, out),
+            None => Err(fmt::Error),
+        },
         ExprKind::Literal(value) => match value {
             LiteralValue::Null => out.write_str("NULL"),
             LiteralValue::Bool(value) => write!(out, "{value}"),
@@ -616,9 +696,9 @@ fn expression(out: &mut dyn fmt::Write, expr: &TypedExpr, depth: usize) -> fmt::
             } else {
                 (left.as_ref(), right.as_ref())
             };
-            expression(out, left, next)?;
+            expression(out, left, next, diagnostic)?;
             write!(out, " {op_str} ")?;
-            expression(out, right, next)
+            expression(out, right, next, diagnostic)
         }
         ExprKind::UnaryOp { op, expr } => {
             out.write_str(match op {
@@ -626,7 +706,7 @@ fn expression(out: &mut dyn fmt::Write, expr: &TypedExpr, depth: usize) -> fmt::
                 UnOp::Negate => "- ",
                 UnOp::BitwiseNot => "~ ",
             })?;
-            expression(out, expr, next)
+            expression(out, expr, next, diagnostic)
         }
         ExprKind::FunctionCall {
             name,
@@ -644,12 +724,12 @@ fn expression(out: &mut dyn fmt::Write, expr: &TypedExpr, depth: usize) -> fmt::
             if *distinct {
                 out.write_str("DISTINCT ")?;
             }
-            expressions(out, args, ", ", next)?;
+            expressions(out, args, ", ", next, diagnostic)?;
             out.write_char(')')
         }
         ExprKind::WindowCall { name, args, .. } => {
             write!(out, "{name}(")?;
-            expressions(out, args, ", ", next)?;
+            expressions(out, args, ", ", next, diagnostic)?;
             out.write_char(')')
         }
         ExprKind::LambdaFunction { params, body } => {
@@ -659,7 +739,7 @@ fn expression(out: &mut dyn fmt::Write, expr: &TypedExpr, depth: usize) -> fmt::
                 out.write_str(&param.name)?;
             }
             out.write_str(") -> ")?;
-            expression(out, body, next)
+            expression(out, body, next, diagnostic)
         }
         ExprKind::Lambda { params, body } => {
             if params.len() != 1 {
@@ -673,18 +753,18 @@ fn expression(out: &mut dyn fmt::Write, expr: &TypedExpr, depth: usize) -> fmt::
                 out.write_char(')')?;
             }
             out.write_str(" -> ")?;
-            expression(out, body, next)
+            expression(out, body, next, diagnostic)
         }
         ExprKind::Cast { expr, target, .. } => {
             // Arrow Debug recursively walks child types; validate its bounded
             // depth before asking that third-party formatter to descend.
             validate_type_depth(target, 0)?;
             out.write_str("CAST(")?;
-            expression(out, expr, next)?;
+            expression(out, expr, next, diagnostic)?;
             write!(out, " AS {target:?})")
         }
         ExprKind::IsNull { expr, negated } => {
-            expression(out, expr, next)?;
+            expression(out, expr, next, diagnostic)?;
             out.write_str(if *negated { " IS NOT NULL" } else { " IS NULL" })
         }
         ExprKind::IsTruthValue {
@@ -692,7 +772,7 @@ fn expression(out: &mut dyn fmt::Write, expr: &TypedExpr, depth: usize) -> fmt::
             value,
             negated,
         } => {
-            expression(out, expr, next)?;
+            expression(out, expr, next, diagnostic)?;
             write!(
                 out,
                 " IS{} {}",
@@ -705,9 +785,9 @@ fn expression(out: &mut dyn fmt::Write, expr: &TypedExpr, depth: usize) -> fmt::
             list,
             negated,
         } => {
-            expression(out, expr, next)?;
+            expression(out, expr, next, diagnostic)?;
             out.write_str(if *negated { " NOT IN (" } else { " IN (" })?;
-            expressions(out, list, ", ", next)?;
+            expressions(out, list, ", ", next, diagnostic)?;
             out.write_char(')')
         }
         ExprKind::Between {
@@ -716,24 +796,24 @@ fn expression(out: &mut dyn fmt::Write, expr: &TypedExpr, depth: usize) -> fmt::
             high,
             negated,
         } => {
-            expression(out, expr, next)?;
+            expression(out, expr, next, diagnostic)?;
             out.write_str(if *negated {
                 " NOT BETWEEN "
             } else {
                 " BETWEEN "
             })?;
-            expression(out, low, next)?;
+            expression(out, low, next, diagnostic)?;
             out.write_str(" AND ")?;
-            expression(out, high, next)
+            expression(out, high, next, diagnostic)
         }
         ExprKind::Like {
             expr,
             pattern,
             negated,
         } => {
-            expression(out, expr, next)?;
+            expression(out, expr, next, diagnostic)?;
             out.write_str(if *negated { " NOT LIKE " } else { " LIKE " })?;
-            expression(out, pattern, next)
+            expression(out, pattern, next, diagnostic)
         }
         ExprKind::Case {
             operand,
@@ -743,21 +823,21 @@ fn expression(out: &mut dyn fmt::Write, expr: &TypedExpr, depth: usize) -> fmt::
             out.write_str("CASE")?;
             if let Some(operand) = operand {
                 out.write_char(' ')?;
-                expression(out, operand, next)?;
+                expression(out, operand, next, diagnostic)?;
             }
             for (when, then) in when_then {
                 out.write_str(" WHEN ")?;
-                expression(out, when, next)?;
+                expression(out, when, next, diagnostic)?;
                 out.write_str(" THEN ")?;
-                expression(out, then, next)?;
+                expression(out, then, next, diagnostic)?;
             }
             if let Some(otherwise) = else_expr {
                 out.write_str(" ELSE ")?;
-                expression(out, otherwise, next)?;
+                expression(out, otherwise, next, diagnostic)?;
             }
             out.write_str(" END")
         }
-        ExprKind::Nested(inner) => expression(out, inner, next),
+        ExprKind::Nested(inner) => expression(out, inner, next, diagnostic),
         ExprKind::SubqueryPlaceholder { id, .. } => write!(out, "<subquery_{id}>"),
     }
 }
@@ -803,7 +883,7 @@ fn validate_node_expressions(kind: &LogicalPlanKind) -> Result<(), String> {
                 check(expr)?;
             }
             for aggregate in &node.aggregates {
-                for expr in &aggregate.args {
+                for expr in aggregate.source.arguments() {
                     check(expr)?;
                 }
             }
@@ -955,8 +1035,7 @@ mod tests {
         let pointer = (text.as_ptr(), text.len());
         let literal = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::String(text)),
-            data_type: DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         };
         let mut probe = SourceProbe {
             remaining: 8,
@@ -964,7 +1043,7 @@ mod tests {
             borrowed: Some(pointer),
             saw_borrowed: false,
         };
-        assert!(write!(&mut probe, "{}", Expression(&literal)).is_err());
+        assert!(write!(&mut probe, "{}", Expression(&literal, None)).is_err());
         assert!(
             probe.saw_borrowed,
             "the source literal must reach the writer without an owned rendering"
@@ -975,8 +1054,7 @@ mod tests {
         );
         let binary = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Binary(vec![0xab; 4096])),
-            data_type: DataType::Binary,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Binary, false),
         };
         let mut probe = SourceProbe {
             remaining: 8,
@@ -984,7 +1062,7 @@ mod tests {
             borrowed: None,
             saw_borrowed: false,
         };
-        assert!(write!(&mut probe, "{}", Expression(&binary)).is_err());
+        assert!(write!(&mut probe, "{}", Expression(&binary, None)).is_err());
         assert!(
             probe.calls < 16,
             "the binary source must stop after a finite emitted prefix"

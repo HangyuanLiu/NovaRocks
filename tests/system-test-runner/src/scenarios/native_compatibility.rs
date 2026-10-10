@@ -830,6 +830,7 @@ fn raw_create_task(query_context: proto::QueryContextRef) -> proto::TaskOperatio
         .expect("raw query context carries a backend identity");
     let fragment_instance_id = common::UniqueId { hi: 93, lo: 94 };
     let frozen_fragment = proto::FrozenFragment {
+        package: Default::default(),
         plan_version: vec![1; 16].into(),
         plan_contract_revision: 1,
         fragment_contract_version: 1,

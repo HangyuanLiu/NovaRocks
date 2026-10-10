@@ -18,7 +18,7 @@
 """Verify the pure final physical-plan Cargo dependency boundary.
 
 The final physical plan is a carrier-neutral semantic contract.  It may reuse
-the neutral type and Connector handle vocabularies, but it must not acquire an
+the neutral type, Connector and immutable constant vocabularies, but no
 application, execution kernel, provider implementation, wire codec, RPC stack,
 or task runtime.
 
@@ -28,14 +28,15 @@ dependency tree:
 * every declared dependency kind includes optional dependencies that default
   feature resolution does not activate, and preserves a dependency's canonical
   package name even when the crate is renamed;
-* `cargo tree -p --target all` computes the resolved normal closure for every
+* `cargo tree -p --target all` computes the resolved normal/build closure for every
   target in the physical-plan package's own feature context, so inactive target
   edges remain visible while features enabled only by unrelated workspace
   members cannot create false dependencies;
-* every package in the selected normal closure is inspected for build
-  dependencies and build scripts, because either executes while compiling the
-  contract even though it is absent from a normal-only dependency tree;
-* the two repository-owned neutral contracts expose no Cargo feature or target
+* every normal/build package is admitted by exact Cargo identity. Audited
+  Arrow build scripts and proc macros have separate exact authority lists;
+  repository-owned contracts may execute neither, except the type contract
+  build receipt that rejects unsupported compiler/allocation source profiles;
+* the repository-owned neutral contracts expose no Cargo feature or target
   variation, so optional and target-specific edges cannot hide an unaudited
   closure behind a different build configuration.
 
@@ -56,13 +57,15 @@ from pathlib import Path
 PACKAGE_NAME = "novarocks-physical-plan"
 TYPE_CONTRACT = "novarocks-type-contract"
 CONNECTOR_CONTRACT = "novarocks-connector-contract"
+CONSTANT_CONTRACT = "novarocks-constant-contract"
 RESULT_CONTRACT = "novarocks-result-contract"
+FUNCTION_CONTRACT = "novarocks-function-contract"
 
 # These are allowed direct internal dependencies, not required dependencies.
 # Removing one as the contract gets smaller remains legal.
-DIRECT_INTERNAL_ALLOW_LIST = frozenset({TYPE_CONTRACT, CONNECTOR_CONTRACT, RESULT_CONTRACT})
+DIRECT_INTERNAL_ALLOW_LIST = frozenset({TYPE_CONTRACT, CONNECTOR_CONTRACT, CONSTANT_CONTRACT, RESULT_CONTRACT, FUNCTION_CONTRACT})
 DIRECT_PACKAGE_ALLOW_LIST = frozenset(
-    {"arrow-schema", TYPE_CONTRACT, CONNECTOR_CONTRACT, RESULT_CONTRACT}
+    {"arrow-schema", TYPE_CONTRACT, CONNECTOR_CONTRACT, CONSTANT_CONTRACT, RESULT_CONTRACT, FUNCTION_CONTRACT}
 )
 
 # Dependency direction is part of the architecture. The type contract is the
@@ -70,28 +73,33 @@ DIRECT_PACKAGE_ALLOW_LIST = frozenset(
 # contract may acquire physical-plan or application authority.
 INTERNAL_CONTRACT_NORMAL_ALLOW_LISTS = {
     TYPE_CONTRACT: frozenset({"arrow-schema", RESULT_CONTRACT}),
-    CONNECTOR_CONTRACT: frozenset({"bytes", TYPE_CONTRACT}),
     RESULT_CONTRACT: frozenset(),
+    FUNCTION_CONTRACT: frozenset({TYPE_CONTRACT, CONSTANT_CONTRACT}),
+    CONSTANT_CONTRACT: frozenset({"arrow-array", "arrow-buffer", "arrow-data",
+                                  "arrow-schema", "arrow-cast", TYPE_CONTRACT}),
+    # Complete public read/write recipes freeze exact Arrow schemas, while
+    # arrays, decoding, storage and executable capabilities stay outside.
+    CONNECTOR_CONTRACT: frozenset({"arrow-schema", "bytes", TYPE_CONTRACT}),
 }
 
 # This vocabulary is used only for declared-edge diagnostics. Resolved closure
 # admission below uses exact Cargo package identities and must never fall back
 # to these names.
-RESOLVED_PACKAGE_ALLOW_LIST = frozenset(
-    {
-        "arrow-schema",
-        "bytes",
-        "novarocks-connector-contract",
-        "novarocks-type-contract",
-        RESULT_CONTRACT,
-    }
-)
-
 CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
-EXTERNAL_PACKAGE_SOURCES = {
-    "arrow-schema": CRATES_IO_SOURCE,
-    "bytes": CRATES_IO_SOURCE,
+# Audited immutable Arrow backing closure, including all target and build edges.
+# Membership is permission, not a requirement that every package be selected.
+EXTERNAL_PACKAGE_NAMES = frozenset(['ahash', 'android_system_properties', 'arrow-array', 'arrow-buffer', 'arrow-cast', 'arrow-data', 'arrow-ord', 'arrow-schema', 'arrow-select', 'atoi', 'base64', 'lexical-core', 'lexical-parse-float', 'lexical-parse-integer', 'lexical-util', 'lexical-write-float', 'lexical-write-integer', 'ryu', 'autocfg', 'bumpalo', 'bytes', 'cc', 'cfg-if', 'chrono', 'const-random', 'const-random-macro', 'core-foundation-sys', 'crunchy', 'find-msvc-tools', 'getrandom', 'half', 'hashbrown', 'iana-time-zone', 'iana-time-zone-haiku', 'js-sys', 'libc', 'libm', 'log', 'num-bigint', 'num-complex', 'num-integer', 'num-traits', 'once_cell', 'proc-macro2', 'quote', 'r-efi', 'rustversion', 'shlex', 'syn', 'tiny-keccak', 'unicode-ident', 'version_check', 'wasi', 'wasip2', 'wasm-bindgen', 'wasm-bindgen-macro', 'wasm-bindgen-macro-support', 'wasm-bindgen-shared', 'windows-core', 'windows-implement', 'windows-interface', 'windows-link', 'windows-result', 'windows-strings', 'wit-bindgen', 'zerocopy', 'zerocopy-derive'])
+EXTERNAL_PACKAGE_SOURCES = {name: CRATES_IO_SOURCE for name in EXTERNAL_PACKAGE_NAMES}
+EXTERNAL_IDENTITY_UNIQUE_NAMES = frozenset({"arrow-array", "arrow-buffer", "arrow-cast", "arrow-data", "arrow-ord", "arrow-schema", "arrow-select", "bytes"})
+EXTERNAL_BUILD_TARGETS = frozenset(['ahash', 'crunchy', 'getrandom', 'iana-time-zone-haiku', 'libc', 'libm', 'num-traits', 'proc-macro2', 'quote', 'rustversion', 'tiny-keccak', 'wasm-bindgen', 'wasm-bindgen-shared', 'wit-bindgen', 'zerocopy'])
+EXTERNAL_PROC_MACROS = frozenset(['const-random-macro', 'rustversion', 'wasm-bindgen-macro', 'windows-implement', 'windows-interface', 'zerocopy-derive'])
+EXTERNAL_BUILD_EDGES = {
+    "ahash": frozenset({"version_check"}),
+    "iana-time-zone-haiku": frozenset({"cc"}),
+    "num-traits": frozenset({"autocfg"}),
+    "wasm-bindgen": frozenset({"rustversion"}),
 }
+RESOLVED_PACKAGE_ALLOW_LIST = EXTERNAL_PACKAGE_NAMES | DIRECT_INTERNAL_ALLOW_LIST
 
 NORMAL = None
 
@@ -122,7 +130,10 @@ WIRE_AND_RPC = Capability(
 
 TASK_RUNTIME = Capability(
     "task runtime capability",
-    exact={"async-std", "rayon", "smol", "tokio"},
+    exact={"async-std", "rayon", "smol", "tokio", "mio", "async-executor",
+           "hyper", "h2", "reqwest", "object_store", "opendal", "sqlx",
+           "rusqlite", "rocksdb", "redb"},
+    prefixes=("tokio-", "hyper-", "async-std-", "sqlx-"),
 )
 
 APPLICATION_OWNER = Capability(
@@ -194,7 +205,7 @@ def cargo_metadata(manifest_path):
 
 
 def resolved_normal_packages(manifest_path, graph):
-    """Return the package-selected normal closure with exact Cargo identities."""
+    """Return package-selected normal/build closure with exact Cargo identities."""
 
     command = [
         "cargo",
@@ -202,7 +213,7 @@ def resolved_normal_packages(manifest_path, graph):
         "--package",
         PACKAGE_NAME,
         "--edges",
-        "normal",
+        "normal,build",
         "--target",
         "all",
         "--no-dedupe",
@@ -245,7 +256,9 @@ def resolved_normal_packages(manifest_path, graph):
             if parent is None:
                 fail([f"Cargo tree has no parent for depth {depth}: {line}"])
             package = graph.package_from_tree_label(
-                label, graph.normal_dependency_ids(parent["id"])
+                label, {edge["pkg"] for edge in graph.resolve_nodes[parent["id"]]["deps"]
+                        if any(kind["kind"] in (NORMAL, "build")
+                               for kind in edge["dep_kinds"])}
             )
         parents[depth] = package
         parents = {
@@ -367,13 +380,8 @@ def describe_package_identity(package):
 
 
 def resolved_package_allow_list(graph):
-    """Resolve the audited identities without trusting a dependency's name."""
-
-    packages = [
-        graph.workspace_package(TYPE_CONTRACT),
-        graph.workspace_package(CONNECTOR_CONTRACT),
-        graph.workspace_package(RESULT_CONTRACT),
-    ]
+    """Resolve the audited authorities from Cargo's actual package identities."""
+    packages = [graph.workspace_package(name) for name in DIRECT_INTERNAL_ALLOW_LIST]
     packages.extend(
         package
         for name, source in sorted(EXTERNAL_PACKAGE_SOURCES.items())
@@ -386,7 +394,7 @@ def verify_external_identity_uniqueness(closure):
     """Allow removal, but never multiple authorities for one external name."""
 
     violations = []
-    for name in sorted(EXTERNAL_PACKAGE_SOURCES):
+    for name in sorted(EXTERNAL_IDENTITY_UNIQUE_NAMES):
         identities = {
             package_identity(package): package
             for package in closure.values()
@@ -487,7 +495,7 @@ def verify_declared_dependencies(package):
             "declares build dependencies, but the physical-plan contract permits none: "
             + ", ".join(sorted(build))
         )
-    if dev:
+    if dev - {"arrow-array"}:
         violations.extend(capability_violations(dev, "declared dev dependencies"))
         violations.append(
             "declares dev dependencies, but the physical-plan contract permits none: "
@@ -528,18 +536,56 @@ def verify_declared_dependencies(package):
 
 
 def verify_package_targets(package, owner=PACKAGE_NAME):
-    custom_build_targets = sorted(
-        target["name"]
-        for target in package.get("targets", [])
-        if "custom-build" in target.get("kind", [])
-    )
-    if not custom_build_targets:
-        return []
-    return [
-        f"{owner} declares a custom build target, but the physical-plan closure "
-        "permits no build.rs: "
-        + ", ".join(custom_build_targets)
-    ]
+    violations = []
+    for kind, label in (("custom-build", "custom build target"),
+                        ("proc-macro", "proc-macro target")):
+        targets = sorted(target["name"] for target in package.get("targets", [])
+                         if kind in target.get("kind", []))
+        if kind == "custom-build" and owner == TYPE_CONTRACT:
+            audited = Path(package["manifest_path"]).parent / "build.rs"
+            targets = [target["name"] for target in package.get("targets", [])
+                       if kind in target.get("kind", [])
+                       and Path(target["src_path"]).resolve() != audited.resolve()]
+        if targets:
+            violations.append(
+                f"{owner} declares a {label}, but repository-owned pure contracts "
+                "permit no build.rs or proc-macro authority: " + ", ".join(targets))
+    return violations
+
+
+def verify_external_authority(package, names=EXTERNAL_PACKAGE_NAMES,
+                              build_targets=EXTERNAL_BUILD_TARGETS,
+                              proc_macros=EXTERNAL_PROC_MACROS,
+                              build_edges=EXTERNAL_BUILD_EDGES):
+    """Admit exact registry authorities, never a same-name source replacement."""
+    name, version = package["name"], package["version"]
+    manifest = Path(package["manifest_path"])
+    identity_ok = (name in names
+                   and package["source"] == CRATES_IO_SOURCE
+                   and package["id"] == f"{CRATES_IO_SOURCE}#{name}@{version}"
+                   and manifest.name == "Cargo.toml"
+                   and manifest.parent.name == f"{name}-{version}")
+    violations = []
+    if not identity_ok:
+        violations.append("unaudited external package identity: "
+                          + describe_package_identity(package))
+    dependencies, unknown = declared_dependencies_by_kind(package)
+    if unknown:
+        violations.append(f"{name} has unknown dependency kinds: {sorted(unknown)}")
+    unexpected_build = dependencies["build"] - build_edges.get(name, frozenset())
+    if unexpected_build:
+        violations.append(f"{name} declares unaudited build dependencies: "
+                          + ", ".join(sorted(unexpected_build)))
+    for target in package.get("targets", []):
+        for kind, allow in (("custom-build", build_targets), ("proc-macro", proc_macros)):
+            if kind in target.get("kind", []):
+                if not identity_ok or name not in allow:
+                    violations.append(f"{name} declares unaudited {kind} authority: "
+                                      + target["name"])
+                source = target.get("src_path")
+                if source is None or not Path(source).resolve().is_relative_to(manifest.parent.resolve()):
+                    violations.append(f"{name} {kind} source escapes its audited package")
+    return violations
 
 
 def verify_internal_contract_surface(graph):
@@ -594,7 +640,8 @@ def verify_internal_contract_surface(graph):
                 "permits none: " + ", ".join(sorted(build_dependencies))
             )
         dev_dependencies = dependencies["dev"]
-        if dev_dependencies:
+        dev_allow = {"arrow-array", "arrow-schema"} if name == FUNCTION_CONTRACT else set()
+        if dev_dependencies - dev_allow:
             violations.extend(
                 capability_violations(
                     dev_dependencies, f"{name} declared dev dependencies"
@@ -620,12 +667,14 @@ def verify_closure_declared_boundary(closure):
     for package in sorted(closure.values(), key=lambda item: item["id"]):
         name = package["name"]
         dependencies, unknown_kinds = declared_dependencies_by_kind(package)
-        build_dependencies = dependencies["build"]
-        if build_dependencies:
-            violations.append(
-                f"resolved normal dependency {name} declares build dependencies: "
-                + ", ".join(sorted(build_dependencies))
-            )
+        if package["source"] is None:
+            build_dependencies = dependencies["build"]
+            if build_dependencies:
+                violations.append(f"resolved normal dependency {name} declares build dependencies: "
+                                  + ", ".join(sorted(build_dependencies)))
+            violations.extend(verify_package_targets(package, name))
+        else:
+            violations.extend(verify_external_authority(package))
         if unknown_kinds:
             violations.append(
                 f"resolved normal dependency {name} contains unknown dependency kinds: "
@@ -635,6 +684,7 @@ def verify_closure_declared_boundary(closure):
             dependency["name"]
             for dependency in package["dependencies"]
             if dependency["kind"] is NORMAL and dependency["target"] is not None
+            and not dependency["optional"]
         }
         violations.extend(
             capability_violations(
@@ -651,14 +701,13 @@ def verify_closure_declared_boundary(closure):
                 "dependencies outside the exact audited closure allow-list: "
                 + ", ".join(unexpected_targeted)
             )
-        violations.extend(verify_package_targets(package, name))
     return violations
 
 
 def verify_resolved_closure(manifest_path, graph):
     closure = resolved_normal_packages(manifest_path, graph)
     names = {package["name"] for package in closure.values()}
-    violations = capability_violations(names, "resolved normal dependency closure")
+    violations = capability_violations(names, "resolved normal/build dependency closure")
     allowed_identities = resolved_package_allow_list(graph)
     unexpected = sorted(
         (
@@ -670,7 +719,7 @@ def verify_resolved_closure(manifest_path, graph):
     )
     if unexpected:
         violations.append(
-            "resolved normal dependency closure contains package identities outside "
+            "resolved normal/build dependency closure contains package identities outside "
             "the exact audited allow-list: "
             + "; ".join(describe_package_identity(package) for package in unexpected)
         )
@@ -718,7 +767,7 @@ def main():
         + (", ".join(sorted(declared[NORMAL])) if declared[NORMAL] else "none")
     )
     print(
-        f"novarocks-physical-plan resolved normal dependency closure: "
+        f"novarocks-physical-plan resolved normal/build dependency closure: "
         f"{len(closure)} package identities; internal crates: "
         + (", ".join(internal) if internal else "none")
     )

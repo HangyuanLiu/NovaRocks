@@ -193,6 +193,7 @@ mod tests {
 
     fn frozen_fragment(dop: u32) -> novarocks::FrozenFragment {
         novarocks::FrozenFragment {
+            package: Default::default(),
             plan_version: vec![1; 16],
             plan_contract_revision: 1,
             fragment_contract_version: 1,

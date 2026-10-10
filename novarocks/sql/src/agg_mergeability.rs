@@ -54,11 +54,11 @@ fn has_two_phase_merge(name: &str) -> bool {
 
 #[cfg(test)]
 pub(crate) fn aggregate_mergeability(call: &AggregateCall) -> AggMergeability {
-    aggregate_mergeability_from_parts(&call.name, call.distinct, call.order_by.is_empty())
+    aggregate_mergeability_from_parts(&call.name, call.distinct, call.source.order_by().is_empty())
 }
 
 pub(crate) fn scalar_aggregate_mergeability(call: &ScalarAggregateSpec) -> AggMergeability {
-    aggregate_mergeability_from_parts(&call.name, call.distinct, call.order_by.is_empty())
+    aggregate_mergeability_from_parts(&call.name, call.distinct, call.source.order_by().is_empty())
 }
 
 fn aggregate_mergeability_from_parts(
@@ -88,8 +88,7 @@ mod tests {
                 qualifier: None,
                 column: "v".into(),
             },
-            data_type: ty,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(ty, true),
         }
     }
 
@@ -101,24 +100,26 @@ mod tests {
         };
         let argument_types = args
             .iter()
-            .map(|arg| arg.data_type.clone())
+            .map(|arg| arg.value_type.data_type.clone())
             .collect::<Vec<_>>();
         AggregateCall {
             name: name.into(),
-            args,
             distinct,
             result_type: DataType::Float64,
-            order_by: if ordered {
-                vec![SortItem {
-                    expr: arg(DataType::Int64),
-                    asc: true,
-                    nulls_first: false,
-                }]
-            } else {
-                vec![]
-            },
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                args,
+                if ordered {
+                    vec![SortItem {
+                        expr: arg(DataType::Int64),
+                        asc: true,
+                        nulls_first: false,
+                    }]
+                } else {
+                    vec![]
+                },
+                crate::functions::test_resolved_aggregate(name, &argument_types, distinct),
+            ),
             output_column_id: ColumnId::UNSET,
-            resolved: crate::functions::test_resolved_aggregate(name, &argument_types, distinct),
         }
     }
 
@@ -152,7 +153,11 @@ mod tests {
     #[test]
     fn unknown_function_cannot_enter_the_aggregate_plan() {
         let error = crate::functions::builtin_sql_function_catalog()
-            .resolve_aggregate_trusted("my_udaf", &[DataType::Int64])
+            .resolve_aggregate_trusted(
+                "my_udaf",
+                &[DataType::Int64],
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
             .expect_err("unregistered aggregate must fail exact resolution");
         assert!(matches!(
             error,
@@ -178,7 +183,10 @@ mod tests {
                 &[DataType::Int64]
             };
             let resolved = crate::compiler::SqlFunctionCatalog::resolve_aggregate_signature(
-                &catalog, name, args,
+                &catalog,
+                name,
+                args,
+                &crate::compiler::SqlCompileControl::unbounded(),
             );
             assert!(
                 resolved.is_ok(),

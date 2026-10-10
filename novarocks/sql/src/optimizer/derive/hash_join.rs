@@ -495,16 +495,17 @@ mod tests {
                 qualifier: None,
                 column: format!("c{id}"),
             },
-            data_type,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
         }
     }
 
     fn nested_col(id: u32) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Nested(Box::new(col(id))),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         }
     }
 
@@ -516,8 +517,7 @@ mod tests {
                 target: target.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: target,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(target, false),
         }
     }
 
@@ -581,8 +581,18 @@ mod tests {
         let eq_conditions = eq_conditions
             .into_iter()
             .map(|(left, right, null_safe)| PhysicalHashJoinEqCondition {
-                left: intern_typed(&mut scalars, &left),
-                right: intern_typed(&mut scalars, &right),
+                left: intern_typed(
+                    &mut scalars,
+                    &left,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
+                right: intern_typed(
+                    &mut scalars,
+                    &right,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
                 null_safe,
             })
             .collect();
@@ -996,8 +1006,10 @@ mod tests {
                 qualifier: Some("a".into()),
                 column: "id".into(),
             },
-            data_type: arrow::datatypes::DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int32,
+                false,
+            ),
         };
         let right_key = TypedExpr {
             kind: ExprKind::ColumnRef {
@@ -1005,8 +1017,10 @@ mod tests {
                 qualifier: Some("b".into()),
                 column: "id".into(),
             },
-            data_type: arrow::datatypes::DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int32,
+                false,
+            ),
         };
         let op = join_op(
             JoinKind::Inner,

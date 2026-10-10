@@ -30,10 +30,13 @@ pub mod native_compatibility;
 pub mod native_trust;
 pub mod network;
 mod paimon_access;
+#[cfg(feature = "physical-wire-v2-candidate")]
+mod physical_wire_candidate;
 pub mod provider_manifest;
 pub mod roles;
 pub mod scan_io;
 mod sdk_listing_profile;
 pub mod state_store_config;
 mod state_store_limits;
+pub mod static_plan;
 pub mod supervisor;

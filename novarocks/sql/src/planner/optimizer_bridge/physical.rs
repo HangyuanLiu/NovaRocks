@@ -414,8 +414,7 @@ fn project_requested_output_columns(
             ));
         };
         if column.name != available_column.name
-            || column.data_type != available_column.data_type
-            || column.nullable != available_column.nullable
+            || column.value_type != available_column.value_type
             || column.is_internal != available_column.is_internal
         {
             return Err(format!(
@@ -462,7 +461,7 @@ fn join_output_columns_from_children(
 
 fn nullable_output_columns(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
     for column in &mut columns {
-        column.nullable = true;
+        column.value_type.nullable = true;
     }
     columns
 }
@@ -724,8 +723,7 @@ fn output_column_ref(column: &OutputColumn) -> TypedExpr {
             qualifier: None,
             column: column.name.clone(),
         },
-        data_type: column.data_type.clone(),
-        nullable: column.nullable,
+        value_type: column.value_type.clone(),
     }
 }
 
@@ -833,8 +831,10 @@ mod tests {
     fn int_expr(v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         }
     }
 
@@ -850,10 +850,77 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
+
             is_internal: false,
         }
+    }
+
+    #[test]
+    fn physical_output_occurrence_preserves_full_domain_and_rejects_same_carrier_drift() {
+        use arrow::datatypes::{DataType, Field};
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+
+        let mut source = output_column(701, "payload");
+        source.value_type =
+            FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+                .unwrap();
+        let projected = project_requested_output_columns(
+            &[source.clone()],
+            &[source.clone()],
+            "full-domain fixture",
+        )
+        .unwrap();
+        assert_eq!(projected[0].value_type, source.value_type);
+        assert_eq!(
+            output_column_ref(&projected[0]).value_type,
+            source.value_type
+        );
+        let mut wrong_domain = source.clone();
+        wrong_domain.value_type.logical_type = ValueLogicalType::Physical;
+        assert!(
+            project_requested_output_columns(
+                &[wrong_domain],
+                &[source.clone()],
+                "full-domain fixture",
+            )
+            .is_err()
+        );
+
+        source.value_type = FunctionValueType::new(
+            DataType::Struct(
+                vec![
+                    Field::new("nested", DataType::Utf8, false)
+                        .with_metadata([("provider.field-id".into(), "17".into())].into()),
+                ]
+                .into(),
+            ),
+            false,
+        );
+        let mut wrong_field = source.clone();
+        wrong_field.value_type.data_type = DataType::Struct(
+            vec![
+                Field::new("nested", DataType::Utf8, false)
+                    .with_metadata([("provider.field-id".into(), "18".into())].into()),
+            ]
+            .into(),
+        );
+        assert!(
+            project_requested_output_columns(
+                &[wrong_field],
+                &[source.clone()],
+                "full-domain fixture",
+            )
+            .is_err()
+        );
+        let widened = nullable_output_columns(vec![source.clone()]);
+        let mut expected = source.value_type.clone();
+        expected.nullable = true;
+        assert_eq!(widened[0].value_type, expected);
+        assert_eq!(output_column_ref(&widened[0]).value_type, expected);
     }
 
     fn assert_output_columns_eq(actual: &[OutputColumn], expected: &[OutputColumn]) {
@@ -861,8 +928,8 @@ mod tests {
         for (actual, expected) in actual.iter().zip(expected.iter()) {
             assert_eq!(actual.column_id, expected.column_id);
             assert_eq!(actual.name, expected.name);
-            assert_eq!(actual.data_type, expected.data_type);
-            assert_eq!(actual.nullable, expected.nullable);
+            assert_eq!(actual.value_type.data_type, expected.value_type.data_type);
+            assert_eq!(actual.value_type.nullable, expected.value_type.nullable);
             assert_eq!(actual.is_internal, expected.is_internal);
         }
     }
@@ -874,8 +941,10 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         }
     }
 
@@ -924,8 +993,8 @@ mod tests {
                 .iter()
                 .map(|column| ColumnDef {
                     name: column.name.clone(),
-                    data_type: column.data_type.clone(),
-                    nullable: column.nullable,
+                    data_type: column.value_type.data_type.clone(),
+                    nullable: column.value_type.nullable,
                     write_default: None,
                     logical_type: None,
                 })
@@ -944,8 +1013,11 @@ mod tests {
                 columns: vec![OutputColumn {
                     column_id: ColumnId::new_for_test(1),
                     name: "v".to_string(),
-                    data_type: arrow::datatypes::DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
             })),
@@ -1020,15 +1092,21 @@ mod tests {
         let synthetic = OutputColumn {
             column_id: ColumnId::new_for_test(101),
             name: "__variant_payload_0".to_string(),
-            data_type: arrow::datatypes::DataType::Utf8,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Utf8,
+                true,
+            ),
+
             is_internal: true,
         };
         let extended = OutputColumn {
             column_id: ColumnId::new_for_test(102),
             name: "_row_id".to_string(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
+
             is_internal: true,
         };
         let table_columns = vec![payload.clone()];
@@ -1045,23 +1123,17 @@ mod tests {
                 synthetic.column_id,
                 extended.column_id,
             ]),
-            variant_columns: vec![ScanVariantColumn {
-                source_column_id: payload.column_id,
-                source_column: payload.name.clone(),
-                synthetic_column_id: synthetic.column_id,
-                synthetic_column: synthetic.name.clone(),
-                canonical_path: "$.k".to_string(),
-                requested_type: arrow::datatypes::DataType::Utf8,
-                requested_type_literal: "string".to_string(),
-                strict: true,
-                binding: crate::analysis::test_function_binding(
-                    "variant_get",
-                    &[],
-                    arrow::datatypes::DataType::Utf8,
-                    true,
-                    novarocks_functions::FunctionVolatility::Immutable,
-                ),
-            }],
+            variant_columns: vec![ScanVariantColumn::test_fixture(
+                payload.column_id,
+                payload.name.clone(),
+                synthetic.column_id,
+                synthetic.name.clone(),
+                "$.k".to_string(),
+                arrow::datatypes::DataType::Utf8,
+                "string".to_string(),
+                true,
+                payload.value_type.clone(),
+            )],
             mv_rewritten_from: None,
         }));
         node.output_columns = scan_columns;
@@ -1075,7 +1147,12 @@ mod tests {
     #[test]
     fn bridge_materializes_values_rows() {
         let mut arena = ScalarArena::new();
-        let one = crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &int_expr(1));
+        let one = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &int_expr(1),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let node = attach_arena(
             base_node(Operator::PhysicalValues(ValuesOp {
                 rows: vec![vec![one]],
@@ -1095,10 +1172,10 @@ mod tests {
             ExprKind::Literal(LiteralValue::Int(1))
         ));
         assert_eq!(
-            values.rows[0][0].data_type,
+            values.rows[0][0].value_type.data_type,
             arrow::datatypes::DataType::Int64
         );
-        assert!(!values.rows[0][0].nullable);
+        assert!(!values.rows[0][0].value_type.nullable);
     }
 
     #[test]
@@ -1196,10 +1273,14 @@ mod tests {
                     qualifier: Some("a".to_string()),
                     column: "k".to_string(),
                 },
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
             },
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let group_column = output_column(7, "k");
         let mut aggregate = base_node(Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::Local,
@@ -1245,9 +1326,15 @@ mod tests {
         let group_expr = crate::planner::optimizer_bridge::scalar::intern_typed(
             &mut arena,
             &col_expr(7, "map2"),
-        );
-        let distinct_expr =
-            crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &col_expr(2, "s2"));
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let distinct_expr = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &col_expr(2, "s2"),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let map2_column = output_column(7, "map2");
         let s2_column = output_column(2, "s2");
         let mut aggregate = base_node(Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
@@ -1296,10 +1383,14 @@ mod tests {
                     qualifier: Some("a".to_string()),
                     column: "k".to_string(),
                 },
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
             },
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let group_column = output_column(8, "k_group");
         let mut aggregate = base_node(Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
             mode: AggMode::Global,
@@ -1335,9 +1426,15 @@ mod tests {
         let predicate = crate::planner::optimizer_bridge::scalar::intern_typed(
             &mut arena,
             &col_expr(1, "matched"),
-        );
-        let assignment =
-            crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &int_expr(42));
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let assignment = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &int_expr(42),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let mut node = base_node(Operator::PhysicalChangeEventExpand(ChangeEventExpandOp {
             events: vec![ChangeEventSpec {
                 predicate: Some(predicate),
@@ -1506,11 +1603,11 @@ mod tests {
             let mut expected_left = left_column.clone();
             let mut expected_right = right_column.clone();
             match join_type {
-                JoinKind::LeftOuter => expected_right.nullable = true,
-                JoinKind::RightOuter => expected_left.nullable = true,
+                JoinKind::LeftOuter => expected_right.value_type.nullable = true,
+                JoinKind::RightOuter => expected_left.value_type.nullable = true,
                 JoinKind::FullOuter => {
-                    expected_left.nullable = true;
-                    expected_right.nullable = true;
+                    expected_left.value_type.nullable = true;
+                    expected_right.value_type.nullable = true;
                 }
                 _ => {}
             }
@@ -1521,16 +1618,16 @@ mod tests {
         };
 
         let left_outer = convert(JoinKind::LeftOuter);
-        assert!(!left_outer.output_columns[0].nullable);
-        assert!(left_outer.output_columns[1].nullable);
+        assert!(!left_outer.output_columns[0].value_type.nullable);
+        assert!(left_outer.output_columns[1].value_type.nullable);
 
         let right_outer = convert(JoinKind::RightOuter);
-        assert!(right_outer.output_columns[0].nullable);
-        assert!(!right_outer.output_columns[1].nullable);
+        assert!(right_outer.output_columns[0].value_type.nullable);
+        assert!(!right_outer.output_columns[1].value_type.nullable);
 
         let full_outer = convert(JoinKind::FullOuter);
-        assert!(full_outer.output_columns[0].nullable);
-        assert!(full_outer.output_columns[1].nullable);
+        assert!(full_outer.output_columns[0].value_type.nullable);
+        assert!(full_outer.output_columns[1].value_type.nullable);
         assert_eq!(
             full_outer.output_columns[0].column_id,
             left_column.column_id
@@ -1689,25 +1786,35 @@ mod tests {
                         qualifier: None,
                         column: "missing".to_string(),
                     },
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        false,
+                    ),
                 },
                 output_name: "p".to_string(),
                 output_column_id: output_id,
             }],
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let input = OutputColumn {
             column_id: input_id,
             name: "v".to_string(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
+
             is_internal: false,
         };
         let output = OutputColumn {
             column_id: output_id,
             name: "p".to_string(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
+
             is_internal: false,
         };
         let mut plan = OptimizedOperatorNode {

@@ -309,7 +309,7 @@ impl<'a> QualifiedLineageCollector<'a> {
                 })?;
                 out.push(self.resolve_field(qualifier, column)?);
             }
-            ExprKind::Literal(_) => kind.saw_literal(),
+            ExprKind::Literal(_) | ExprKind::Constant(_) => kind.saw_literal(),
             ExprKind::Cast { .. } => {
                 kind.saw_cast();
                 for child in typed_expr_children(expr) {
@@ -577,6 +577,7 @@ fn typed_expr_children(expr: &TypedExpr) -> Vec<&TypedExpr> {
         ExprKind::ColumnRef { .. }
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. } => Vec::new(),
     }
 }
@@ -622,7 +623,7 @@ fn collect_column_refs(
             out.push((qualifier.clone(), column.clone()));
             kind.saw_column();
         }
-        ExprKind::Literal(_) => {
+        ExprKind::Literal(_) | ExprKind::Constant(_) => {
             kind.saw_literal();
         }
         ExprKind::Cast { expr, .. } => {

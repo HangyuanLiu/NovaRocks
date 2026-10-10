@@ -38,13 +38,13 @@ use novarocks_spi::connector::read_stack::{
     ConnectorReadAttemptAccessReacquirer, ConnectorReadAttemptAccessSealer,
     ConnectorReadAttemptAccessSource, ConnectorReadAttemptRuntime, ConnectorReadChangeWindow,
     ConnectorReadColumnHandle, ConnectorReadDistribution, ConnectorReadInputVersion,
-    ConnectorReadMetadataRequest, ConnectorReadProperties, ConnectorReadRelation,
-    ConnectorReadRelationKind, ConnectorReadRelationVersion, ConnectorReadRequestControl,
-    ConnectorReadRequestControlFactory, ConnectorReadSplit, ConnectorReadSplitFacts,
-    ConnectorReadStaticFacts, ConnectorReadTableExecuteProcedure, ConnectorReadTableHandle,
-    ConnectorReadTransactionHandle, ConnectorSession, ConnectorSplitBatch, Constraint,
-    DynamicFilter, DynamicFilterSnapshot, OwnedConnectorPageStream, SchemaTableName,
-    SplitSourceProfile,
+    ConnectorReadMetadataRequest, ConnectorReadProperties, ConnectorReadPublicSchema,
+    ConnectorReadRelation, ConnectorReadRelationKind, ConnectorReadRelationVersion,
+    ConnectorReadRequestControl, ConnectorReadRequestControlFactory, ConnectorReadSplit,
+    ConnectorReadSplitFacts, ConnectorReadStaticFacts, ConnectorReadTableExecuteProcedure,
+    ConnectorReadTableHandle, ConnectorReadTransactionHandle, ConnectorSession,
+    ConnectorSplitBatch, Constraint, DynamicFilter, DynamicFilterSnapshot,
+    OwnedConnectorPageStream, SchemaTableName, SplitSourceProfile,
 };
 use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, ConnectorBeginScanRequest, ConnectorCodecCategory,
@@ -90,6 +90,7 @@ use crate::sdk_control::{PaimonSdkExecutionResources, PaimonSdkReadControl};
 use crate::split_source::{PaimonSplitPlanningLimits, PaimonSplitSource, plan_splits};
 use crate::wire::read::PaimonReadWireCodec;
 
+mod program_recipe;
 mod recipe;
 pub use recipe::PaimonReadRecipeCompiler;
 
@@ -329,6 +330,8 @@ impl ProviderReadRuntime for PaimonReadRuntime {
 }
 
 impl ProviderReadMetadata for PaimonReadRuntime {
+    type FrozenSource = novarocks_spi::connector::read_stack::adapter::UnsupportedFrozenReadSource;
+
     fn get_table_handle(
         &self,
         _session: &ConnectorSession,
@@ -395,6 +398,21 @@ impl ProviderReadMetadata for PaimonReadRuntime {
             ConnectorReadArtifactCoverage::NoArtifactInputs,
             Vec::new(),
         )
+    }
+
+    fn read_public_schema(
+        &self,
+        _session: &ConnectorSession,
+        table: &Self::Table,
+        columns: &[Self::Column],
+    ) -> Result<ConnectorReadPublicSchema, ConnectorError> {
+        // Only the frontend freeze holds the table's catalog-visible columns.
+        // A relation decoded from the wire carries none, so it has no column
+        // set against which to publish a schema.
+        let recipe = table.recipe.as_ref().ok_or_else(|| {
+            unsupported("Paimon publishes a public read schema only for a frontend-frozen read")
+        })?;
+        program_recipe::public_read_schema(recipe.columns(), columns)
     }
 
     fn apply_filter(
@@ -2022,6 +2040,45 @@ mod tests {
         )
         .expect("domain-valid split");
         assert!(validate_local_split_binding(&bound, &noncanonical).is_err());
+    }
+
+    #[test]
+    fn a_decoded_relation_refuses_to_publish_a_public_read_schema() {
+        let location = "s3://warehouse/paimon/db.db/events";
+        let table = PaimonTable::try_new(
+            SchemaTableName::try_new("db", "events").expect("table name"),
+            location,
+            PaimonMergeEngine::AppendOnly,
+            PaimonBucketMode::Unbucketed,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("table");
+        let view =
+            PaimonReadView::try_new(location, Some(1), 0, [1; 32], [2; 32], None).expect("view");
+        let bound = PaimonBoundTable::decoded(table, view).expect("bound table");
+        let catalog = CatalogHandle::new(
+            ConnectorInstanceId::parse("lake").expect("catalog"),
+            CatalogVersion::from_bytes([7; 32]),
+        );
+        let runtime = PaimonReadRuntime::template(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse(PROVIDER_ID).expect("provider"),
+                instance_id: ConnectorInstanceId::parse("lake").expect("catalog"),
+            },
+            catalog,
+            None,
+        );
+        let session =
+            ConnectorSession::try_new("q", "u", "UTC", "en_US", std::time::SystemTime::UNIX_EPOCH)
+                .expect("session");
+        let column = PaimonColumn::try_new(1, "id", crate::schema::PaimonDataType::Int64, false, 0)
+            .expect("id column");
+
+        let error = runtime
+            .read_public_schema(&session, &bound, &[column])
+            .expect_err("a wire-decoded relation has no catalog-visible column set");
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
     }
 
     #[test]

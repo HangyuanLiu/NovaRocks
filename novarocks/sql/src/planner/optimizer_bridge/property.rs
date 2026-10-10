@@ -78,8 +78,7 @@ mod tests {
                 qualifier: None,
                 column: column.to_string(),
             },
-            data_type,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
         }
     }
 
@@ -88,8 +87,7 @@ mod tests {
         let spec = ordering_spec_from_sort_items(&[SortItem {
             expr: TypedExpr {
                 kind: ExprKind::Literal(crate::analysis::LiteralValue::Int(1)),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             },
             asc: true,
             nulls_first: true,

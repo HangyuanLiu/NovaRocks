@@ -40,13 +40,24 @@ pub enum ExplainLevel {
 pub(crate) fn explain_plan_checked(
     plan: &LogicalPlanNode,
     level: ExplainLevel,
-) -> Result<Vec<String>, String> {
-    logical::render(plan, level, completed::ExplainRenderBudget::default())
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<String>, crate::compiler::SqlCompileError> {
+    logical::render_observed(
+        plan,
+        level,
+        completed::ExplainRenderBudget::default(),
+        control,
+    )
 }
 
 #[allow(dead_code)]
 pub(crate) fn explain_plan(plan: &LogicalPlanNode, level: ExplainLevel) -> Vec<String> {
-    explain_plan_checked(plan, level).expect("invalid logical plan stage")
+    explain_plan_checked(
+        plan,
+        level,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("invalid logical plan stage")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,7 +73,8 @@ pub(crate) enum PlanNodeExplainStage {
 fn format_shared_plan_node_header(
     kind: &crate::planner::logical::LogicalPlanKind,
     stage: PlanNodeExplainStage,
-) -> Option<String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<String>, crate::compiler::SqlCompileError> {
     use crate::planner::logical::LogicalPlanKind;
     match kind {
         LogicalPlanKind::Scan(_)
@@ -74,22 +86,60 @@ fn format_shared_plan_node_header(
         | LogicalPlanKind::Repeat(_)
         | LogicalPlanKind::GenerateSeries(_)
         | LogicalPlanKind::TableFunction(_)
-        | LogicalPlanKind::AssertOneRow(_) => Some(logical::single(format_args!(
-            "{}",
-            logical::Header(kind, stage)
-        ))),
-        _ => None,
+        | LogicalPlanKind::AssertOneRow(_) => {
+            let diagnostic = completed::RenderDiagnostic::new(control);
+            let mut output = completed::ExplainRenderOutput::new_observed(
+                completed::ExplainRenderBudget::default(), control,
+            )?;
+            let result = output.push(format_args!("{}", logical::Header(kind, stage, Some(&diagnostic))));
+            if let Some(error) = diagnostic.take_error() { return Err(error); }
+            result?;
+            Ok(output.finish_observed()?.pop())
+        }
+        _ => Ok(None),
     }
 }
 
 #[cfg(test)]
-fn format_expr(expr: &crate::analysis::TypedExpr) -> String {
-    logical::single(format_args!("{}", logical::Expression(expr)))
+fn format_expr(
+    expr: &crate::analysis::TypedExpr,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<String, crate::compiler::SqlCompileError> {
+    let diagnostic = completed::RenderDiagnostic::new(control);
+    let mut output = completed::ExplainRenderOutput::new_observed(
+        completed::ExplainRenderBudget::default(),
+        control,
+    )?;
+    let result = output.push(format_args!(
+        "{}",
+        logical::Expression(expr, Some(&diagnostic))
+    ));
+    if let Some(error) = diagnostic.take_error() {
+        return Err(error);
+    }
+    result?;
+    Ok(output.finish_observed()?.pop().expect("one test line"))
 }
 
 #[cfg(test)]
-fn format_project_item(item: &crate::analysis::ProjectItem) -> String {
-    logical::single(format_args!("{}", logical::Project(item)))
+fn format_project_item(
+    item: &crate::analysis::ProjectItem,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<String, crate::compiler::SqlCompileError> {
+    let diagnostic = completed::RenderDiagnostic::new(control);
+    let mut output = completed::ExplainRenderOutput::new_observed(
+        completed::ExplainRenderBudget::default(),
+        control,
+    )?;
+    let result = output.push(format_args!(
+        "{}",
+        logical::Project(item, Some(&diagnostic))
+    ));
+    if let Some(error) = diagnostic.take_error() {
+        return Err(error);
+    }
+    result?;
+    Ok(output.finish_observed()?.pop().expect("one test line"))
 }
 
 #[cfg(test)]
@@ -134,8 +184,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             is_internal: false,
         }
     }
@@ -250,16 +300,14 @@ mod tests {
                 qualifier: qualifier.map(str::to_string),
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
     fn int_literal(value: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(value)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -307,14 +355,19 @@ mod tests {
                         qualifier: None,
                         column: "sq".to_string(),
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
                 output_column: OutputColumn {
                     column_id: ColumnId(5),
                     name: "sq".to_string(),
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: ColumnId(5),
@@ -360,19 +413,39 @@ mod tests {
             LogicalPlanKind::AssertOneRow(PlanAssertOneRowNode::global_at_most_one("select 1"));
 
         assert_eq!(
-            format_shared_plan_node_header(&values, PlanNodeExplainStage::Logical),
+            format_shared_plan_node_header(
+                &values,
+                PlanNodeExplainStage::Logical,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap(),
             Some("VALUES (2 rows)".to_string())
         );
         assert_eq!(
-            format_shared_plan_node_header(&values, PlanNodeExplainStage::Distributed),
+            format_shared_plan_node_header(
+                &values,
+                PlanNodeExplainStage::Distributed,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap(),
             Some("VALUES (2 rows)".to_string())
         );
         assert_eq!(
-            format_shared_plan_node_header(&assert, PlanNodeExplainStage::Logical),
+            format_shared_plan_node_header(
+                &assert,
+                PlanNodeExplainStage::Logical,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap(),
             Some("ASSERT ONE ROW".to_string())
         );
         assert_eq!(
-            format_shared_plan_node_header(&assert, PlanNodeExplainStage::Distributed),
+            format_shared_plan_node_header(
+                &assert,
+                PlanNodeExplainStage::Distributed,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap(),
             Some("ASSERT NUM ROWS (<= 1)".to_string())
         );
 
@@ -383,7 +456,12 @@ mod tests {
             "MOR UPDATE matched target row",
         ));
         assert_eq!(
-            format_shared_plan_node_header(&keyed, PlanNodeExplainStage::Distributed),
+            format_shared_plan_node_header(
+                &keyed,
+                PlanNodeExplainStage::Distributed,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap(),
             Some("ASSERT NUM ROWS (PER KEY <= 1 BY [_row_id])".to_string())
         );
     }
@@ -412,8 +490,7 @@ mod tests {
                 right: Box::new(int_literal(10)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let filter = LogicalPlanNode::new(
             LogicalPlanKind::Filter(PlanFilterNode { predicate }),
@@ -468,7 +545,12 @@ mod tests {
         );
 
         assert_eq!(
-            format_shared_plan_node_header(&window.kind, PlanNodeExplainStage::Logical),
+            format_shared_plan_node_header(
+                &window.kind,
+                PlanNodeExplainStage::Logical,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap(),
             Some("WINDOW [row_number() OVER (PARTITION BY k ORDER BY k ASC)]".to_string())
         );
         assert_eq!(
@@ -489,8 +571,10 @@ mod tests {
             kind: ExprKind::BinaryOp {
                 left: Box::new(TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(10)),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 }),
                 op: BinOp::Eq,
                 right: Box::new(TypedExpr {
@@ -499,16 +583,20 @@ mod tests {
                         qualifier: Some("r".to_string()),
                         column: "rk".to_string(),
                     },
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 }),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
 
-        assert_eq!(format_expr(&expr), "r.rk = 10");
+        assert_eq!(
+            format_expr(&expr, &crate::compiler::SqlCompileControl::unbounded()).unwrap(),
+            "r.rk = 10"
+        );
     }
 
     #[test]
@@ -520,14 +608,16 @@ mod tests {
                     qualifier: Some("a".to_string()),
                     column: "k".to_string(),
                 },
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             },
             output_name: "k".to_string(),
             output_column_id: ColumnId(1),
         };
 
-        assert_eq!(format_project_item(&item), "a.k AS k");
+        assert_eq!(
+            format_project_item(&item, &crate::compiler::SqlCompileControl::unbounded()).unwrap(),
+            "a.k AS k"
+        );
     }
 
     #[test]
@@ -539,14 +629,16 @@ mod tests {
                     qualifier: None,
                     column: "id".to_string(),
                 },
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             },
             output_name: "alias_id".to_string(),
             output_column_id: ColumnId(1),
         };
 
-        assert_eq!(format_project_item(&item), "id AS alias_id");
+        assert_eq!(
+            format_project_item(&item, &crate::compiler::SqlCompileControl::unbounded()).unwrap(),
+            "id AS alias_id"
+        );
     }
 
     fn render_with_bound(
@@ -564,10 +656,12 @@ mod tests {
 
     #[test]
     fn logical_borrowed_expression_bytes_preserve_literals_cases_and_aliases() {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let format_expr = |expr: &TypedExpr| super::format_expr(expr, &control).unwrap();
+        let format_project_item = |item: &ProjectItem| super::format_project_item(item, &control).unwrap();
         let typed = |kind| TypedExpr {
             kind,
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         };
         let expression = typed(ExprKind::Case {
             operand: Some(Box::new(column_expr(1, None, "key"))),
@@ -643,8 +737,7 @@ mod tests {
                 LogicalPlanKind::Filter(PlanFilterNode {
                     predicate: TypedExpr {
                         kind: ExprKind::Literal(literal),
-                        data_type: DataType::Utf8,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
                     },
                 }),
                 vec![empty_values_for_test()],
@@ -660,8 +753,7 @@ mod tests {
                         list: (0..1024).map(int_literal).collect(),
                         negated: true,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
                 },
             }),
             vec![empty_values_for_test()],
@@ -706,7 +798,7 @@ mod tests {
                 None,
             );
         }
-        assert!(super::explain_plan_checked(&plan, ExplainLevel::Normal).is_ok());
+        assert!(super::explain_plan_checked(&plan, ExplainLevel::Normal, &crate::compiler::SqlCompileControl::unbounded()).is_ok());
         let too_deep = LogicalPlanNode::new(
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: int_literal(1),
@@ -714,21 +806,21 @@ mod tests {
             vec![plan],
             None,
         );
-        let failure = std::panic::catch_unwind(|| {
-            super::explain_plan_checked(&too_deep, ExplainLevel::Normal)
-        });
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::explain_plan_checked(&too_deep, ExplainLevel::Normal, &crate::compiler::SqlCompileControl::unbounded())
+        }));
         assert!(
             failure
                 .expect("depth refusal must not panic")
                 .unwrap_err()
+                .to_string()
                 .contains("depth")
         );
         let mut expr = int_literal(1);
         for _ in 0..64 {
             expr = TypedExpr {
                 kind: ExprKind::Nested(Box::new(expr)),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             };
         }
         let too_deep = LogicalPlanNode::new(
@@ -736,7 +828,7 @@ mod tests {
             vec![empty_values_for_test()],
             None,
         );
-        assert!(super::explain_plan_checked(&too_deep, ExplainLevel::Normal).is_err());
+        assert!(super::explain_plan_checked(&too_deep, ExplainLevel::Normal, &crate::compiler::SqlCompileControl::unbounded()).is_err());
     }
 
     #[test]
@@ -777,3 +869,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "cv_tests.rs"]
+mod cv_tests;

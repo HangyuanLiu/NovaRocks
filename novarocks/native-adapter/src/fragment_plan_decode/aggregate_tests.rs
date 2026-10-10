@@ -287,7 +287,8 @@ mod tests {
         let output_columns = vec![output_column(2, "sum_id", DataType::Int64)];
         let mut resolved = resolved_aggregate_signature("sum", &[DataType::Int64])
             .expect("resolved aggregate signature");
-        resolved.state_format_identity = "novarocks/sum/state-v2".to_string();
+        // A format the process catalog never installed.
+        resolved.state_format_identity = "novarocks/sum/state-v3".to_string();
         let aggregate = physical_node(
             20,
             plan::plan_node::Kind::HashAggregate(plan::HashAggregateNode {

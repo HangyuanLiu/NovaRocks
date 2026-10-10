@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashMap;
 
 use arrow::datatypes::DataType;
@@ -43,7 +44,9 @@ use crate::planner::imv_rewrite::join_refresh_descriptor::{
 };
 use crate::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
 use crate::planner::imv_rewrite::target_locator::is_target_locator_join;
-use crate::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result_mut, opt_expr_to_plan};
+use crate::planner::imv_rewrite::{
+    PlanRewriteResult, bridge_apply_result_mut_typed, opt_expr_to_plan,
+};
 use crate::planner::logical::{
     LogicalImvDeltaNode, LogicalImvVersionNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode,
     LogicalUnionNode,
@@ -82,8 +85,12 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
         )
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        bridge_apply_result_mut(expr, ctx, |plan, ctx| {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
+        bridge_apply_result_mut_typed(expr, ctx, |plan, ctx| {
             let LogicalPlanNode {
                 kind, mut children, ..
             } = plan;
@@ -104,12 +111,17 @@ impl LogicalRewriteRule for RewriteJoinDeltaRule {
                 return Err(format!(
                     "Iceberg IMV join delta rewrite supports inner/cross joins only, got {:?}",
                     join.join_type
-                ));
+                )
+                .into());
             }
 
             let action_column = match delta.action_column {
                 Some(action_column) => action_column,
-                None => allocate_imv_column(ctx, ImvActionColumn::NAME, DataType::Int8, false)?,
+                None => allocate_imv_column(
+                    ctx,
+                    ImvActionColumn::NAME,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+                )?,
             };
 
             let (left, right) = take_binary_children(&mut join_children);
@@ -189,8 +201,12 @@ impl LogicalRewriteRule for InjectJoinApplyKeyRule {
             || project_needs_join_refresh_internal_outputs(&plan)
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        bridge_apply_result_mut(expr, ctx, |plan, ctx| {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
+        bridge_apply_result_mut_typed(expr, ctx, |plan, ctx| {
             if project_needs_join_refresh_internal_outputs(&plan) {
                 return Ok(PlanRewriteResult::Changed(
                     propagate_join_refresh_internal_outputs_through_project(plan)?,
@@ -224,8 +240,12 @@ impl LogicalRewriteRule for RecordJoinRefreshDescriptorRule {
             && is_join_refresh_descriptor_candidate_context(ctx)
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        bridge_apply_result_mut(expr, ctx, |plan, ctx| {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
+        bridge_apply_result_mut_typed(expr, ctx, |plan, ctx| {
             record_join_refresh_descriptor(ctx, &plan)?;
             Ok(PlanRewriteResult::Unchanged)
         })
@@ -299,14 +319,18 @@ fn is_join_refresh_union_with_apply_key(plan: &LogicalPlanNode) -> bool {
 fn inject_join_apply_key(
     mut plan: LogicalPlanNode,
     ctx: &mut RewriteContext,
-) -> Result<LogicalPlanNode, String> {
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let ext = ctx
         .extension::<ImvExtension>()
         .ok_or_else(|| "InjectJoinApplyKey requires ImvExtension".to_string())?;
     let branch_evidence = collect_join_delta_branch_evidence(&plan, ext.snapshot.as_ref())?;
     validate_join_descriptor_contract(ext, &branch_evidence)?;
-    let join_apply_key_column =
-        allocate_imv_output_column(ctx, JOIN_APPLY_KEY_COLUMN_NAME, DataType::Utf8, false, true)?;
+    let join_apply_key_column = allocate_imv_output_column(
+        ctx,
+        JOIN_APPLY_KEY_COLUMN_NAME,
+        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+        true,
+    )?;
 
     let LogicalPlanKind::Union(union) = &mut plan.kind else {
         return Ok(plan);
@@ -317,6 +341,9 @@ fn inject_join_apply_key(
             branch,
             evidence,
             &join_apply_key_column,
+            ctx.decimal_overflow_policy(),
+            ctx.scalar_arena().borrow().constant_policy(),
+            &ctx.control_view(),
         )?;
         prune_raw_join_row_id_output_from_branch(branch, evidence)?;
     }
@@ -398,9 +425,16 @@ fn inject_join_apply_key_into_branch(
     branch: &mut LogicalPlanNode,
     evidence: &JoinDeltaBranchEvidence,
     join_apply_key_column: &OutputColumn,
-) -> Result<(), String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), crate::compiler::SqlCompileError> {
     let LogicalPlanKind::Project(project) = &mut branch.kind else {
-        return Err("join apply-key injection expected normalized Project branch".to_string());
+        return Err(
+            "join apply-key injection expected normalized Project branch"
+                .to_string()
+                .into(),
+        );
     };
     if project.items.iter().any(|item| {
         item.output_name
@@ -409,7 +443,7 @@ fn inject_join_apply_key_into_branch(
         return Ok(());
     }
     project.items.push(ProjectItem {
-        expr: join_row_key_expr(function_catalog, evidence)?,
+        expr: join_row_key_expr(function_catalog, evidence, policy, constant_policy, control)?,
         output_name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
         output_column_id: join_apply_key_column.column_id,
     });
@@ -437,21 +471,29 @@ fn prune_raw_join_row_id_output_from_branch(
 fn join_row_key_expr(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     evidence: &JoinDeltaBranchEvidence,
-) -> Result<TypedExpr, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![
         object_id_binary_literal(&evidence.left_base.table_object_id),
         column_ref_expr(&evidence.left_row_id_column),
         object_id_binary_literal(&evidence.right_base.table_object_id),
         column_ref_expr(&evidence.right_row_id_column),
     ];
-    let binding =
-        crate::analysis::resolve_function_binding(function_catalog, "join_row_key", &args)?;
+    let binding = crate::analysis::resolve_function_binding(
+        function_catalog,
+        "join_row_key",
+        &args,
+        policy,
+        constant_policy,
+        control,
+    )?;
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
     else {
-        return Err("join_row_key must return a scalar value".to_string());
+        return Err("join_row_key must return a scalar value".to_string().into());
     };
-    let data_type = result.data_type.clone();
-    let nullable = result.nullable;
+    let value_type = result.clone();
     Ok(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
@@ -460,16 +502,14 @@ fn join_row_key_expr(
             distinct: false,
             binding,
         },
-        data_type,
-        nullable,
+        value_type,
     })
 }
 
 fn object_id_binary_literal(value: &ConnectorTableObjectId) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Binary(value.as_bytes().to_vec())),
-        data_type: DataType::Binary,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Binary, false),
     }
 }
 
@@ -480,8 +520,7 @@ fn column_ref_expr(column: &OutputColumn) -> TypedExpr {
             qualifier: None,
             column: column.name.clone(),
         },
-        data_type: column.data_type.clone(),
-        nullable: column.nullable,
+        value_type: column.value_type.clone(),
     }
 }
 
@@ -1308,8 +1347,7 @@ fn action_project_item(action_output: &OutputColumn) -> ProjectItem {
                 qualifier: None,
                 column: action_output.name.clone(),
             },
-            data_type: action_output.data_type.clone(),
-            nullable: action_output.nullable,
+            value_type: action_output.value_type.clone(),
         },
         output_name: action_output.name.clone(),
         output_column_id: action_output.column_id,
@@ -1450,8 +1488,8 @@ pub(crate) fn plan_output_columns(plan: &LogicalPlanNode) -> Result<Vec<OutputCo
         LogicalPlanKind::GenerateSeries(generate) => vec![OutputColumn {
             column_id: ColumnId::UNSET,
             name: generate.column_name.clone(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }],
         LogicalPlanKind::TableFunction(table_function) => {
@@ -1506,8 +1544,8 @@ fn project_item_output_column(item: &ProjectItem) -> OutputColumn {
     OutputColumn {
         column_id: item.output_column_id,
         name: item.output_name.clone(),
-        data_type: item.expr.data_type.clone(),
-        nullable: item.expr.nullable,
+        value_type: item.expr.value_type.clone(),
+
         is_internal: item.output_name.eq_ignore_ascii_case(ImvActionColumn::NAME)
             || item.output_name.eq_ignore_ascii_case(ImvRowIdColumn::NAME)
             || item
@@ -1567,7 +1605,11 @@ impl LogicalRewriteRule for UnsupportedJoinKindCheckRule {
         plan_contains_unsupported_join(&plan, &change_stream)
     }
 
-    fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        _expr: OptExpr,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
             "UnsupportedJoinKindCheck",
             "incremental apply reached an unsupported join kind (only inner/cross are incrementalizable) — this is a bug: rewrite should have rejected it".to_string(),
@@ -1644,8 +1686,14 @@ mod tests {
             right_row_id_column: right_row_id,
         };
 
-        let expr = join_row_key_expr(crate::functions::builtin_sql_function_catalog(), &evidence)
-            .expect("join-row-key binding");
+        let expr = join_row_key_expr(
+            crate::functions::builtin_sql_function_catalog(),
+            &evidence,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("join-row-key binding");
         let ExprKind::FunctionCall { args, .. } = expr.kind else {
             panic!("expected join_row_key call");
         };
@@ -1653,17 +1701,19 @@ mod tests {
             &args[0],
             TypedExpr {
                 kind: ExprKind::Literal(crate::analysis::LiteralValue::Binary(bytes)),
-                data_type: DataType::Binary,
+                value_type,
                 ..
             } if bytes == b"left\x00object"
+                && *value_type == novarocks_type_contract::FunctionValueType::new(DataType::Binary, false)
         ));
         assert!(matches!(
             &args[2],
             TypedExpr {
                 kind: ExprKind::Literal(crate::analysis::LiteralValue::Binary(bytes)),
-                data_type: DataType::Binary,
+                value_type,
                 ..
             } if bytes == b"right\xffobject"
+                && *value_type == novarocks_type_contract::FunctionValueType::new(DataType::Binary, false)
         ));
     }
 
@@ -1879,7 +1929,10 @@ mod tests {
         let arena_rc = ctx.scalar_arena();
         let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         let err = rule.apply(expr, &mut ctx).expect_err("outer must reject");
-        assert!(err.contains("inner/cross"), "unexpected: {err}");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
+        assert!(err.to_string().contains("inner/cross"), "unexpected: {err}");
     }
 
     #[test]
@@ -2167,7 +2220,7 @@ mod tests {
         join_plan
     }
 
-    fn build_ctx() -> RewriteContext {
+    fn build_ctx() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
         ctx.set_scalar_arena(std::rc::Rc::new(
             std::cell::RefCell::new(ScalarArena::new()),
@@ -2233,8 +2286,10 @@ mod tests {
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 }),
             }),
             vec![left, right],
@@ -2267,8 +2322,8 @@ mod tests {
         let join_apply_key = OutputColumn {
             column_id: ColumnId(21),
             name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
-            data_type: DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+
             is_internal: true,
         };
         LogicalPlanNode::new(
@@ -2329,29 +2384,29 @@ mod tests {
             OutputColumn {
                 column_id: ColumnId(first_id + 2),
                 name: crate::common::ICEBERG_FILE_PATH_COL.to_string(),
-                data_type: DataType::Utf8,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+
                 is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId(first_id + 3),
                 name: crate::common::ICEBERG_ROW_POS_COL.to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId(first_id + 4),
                 name: crate::common::ICEBERG_ROW_ID_COL.to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId(first_id + 5),
                 name: crate::common::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             },
         ]);
@@ -2408,8 +2463,8 @@ mod tests {
         scan.columns.push(OutputColumn {
             column_id: ColumnId(action_id),
             name: ImvActionColumn::NAME.to_string(),
-            data_type: DataType::Int8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+
             is_internal: false,
         });
         plan
@@ -2437,8 +2492,8 @@ mod tests {
         scan.columns.push(OutputColumn {
             column_id: ColumnId(row_id),
             name: ImvRowIdColumn::NAME.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         });
         plan
@@ -2458,8 +2513,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -2490,8 +2545,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -2503,8 +2557,7 @@ mod tests {
                 right: Box::new(col_expr(10, "right_k")),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 

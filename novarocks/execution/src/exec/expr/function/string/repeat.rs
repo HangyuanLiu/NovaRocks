@@ -19,7 +19,8 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, StringArray};
 use std::sync::Arc;
 
-use super::common::{OLAP_STRING_MAX_LENGTH, downcast_int_arg_array};
+use super::common::downcast_int_arg_array;
+use novarocks_functions::string_repeat_pad_core;
 
 pub fn eval_repeat(
     arena: &ExprArena,
@@ -43,22 +44,8 @@ pub fn eval_repeat(
             continue;
         }
         let n = n_arr.value(i);
-        if n < 0 {
-            out.push(Some(String::new()));
-            continue;
-        }
-        let s = s_arr.value(i);
-        if s.is_empty() || n == 0 {
-            out.push(Some(String::new()));
-            continue;
-        }
-        let n_u128 = n as u128;
-        let bytes_u128 = s.len() as u128;
-        if bytes_u128.saturating_mul(n_u128) > OLAP_STRING_MAX_LENGTH as u128 {
-            out.push(None);
-            continue;
-        }
-        out.push(Some(s.repeat(n as usize)));
+        let plan = string_repeat_pad_core::repeat_plan(|| s_arr.value(i), n);
+        out.push(string_repeat_pad_core::repeat_original(plan));
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }

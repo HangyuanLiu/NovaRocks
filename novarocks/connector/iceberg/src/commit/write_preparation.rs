@@ -637,6 +637,16 @@ mod tests {
         }
     }
 
+    /// A target column exactly as preparation signs it. Signed fields are the
+    /// provider's frozen fields, so they carry the Iceberg field-id annotation
+    /// the frozen schema authors; a request field only selects the column.
+    fn provider_field(name: &str, data_type: DataType, nullable: bool, field_id: i32) -> Field {
+        Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
+            parquet::arrow::PARQUET_FIELD_ID_META_KEY.to_string(),
+            field_id.to_string(),
+        )]))
+    }
+
     /// The two-column `id`/`name` schema every metadata fixture here shares.
     fn fixture_schema() -> Schema {
         Schema::builder()
@@ -942,7 +952,7 @@ mod tests {
                 .iter()
                 .map(|binding| binding.field().clone())
                 .collect::<Vec<_>>(),
-            vec![Field::new("id", DataType::Int64, false)]
+            vec![provider_field("id", DataType::Int64, false, 1)]
         );
     }
 
@@ -1002,8 +1012,8 @@ mod tests {
                 .map(|binding| binding.field().clone())
                 .collect::<Vec<_>>(),
             vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("name", DataType::Utf8, true),
+                provider_field("id", DataType::Int64, false, 1),
+                provider_field("name", DataType::Utf8, true, 2),
             ]
         );
 
@@ -1142,8 +1152,8 @@ mod tests {
                 .map(|binding| binding.field().clone())
                 .collect::<Vec<_>>(),
             vec![
-                Field::new("id", DataType::Int64, false),
-                Field::new("name", DataType::Utf8, true),
+                provider_field("id", DataType::Int64, false, 1),
+                provider_field("name", DataType::Utf8, true, 2),
                 Field::new("_row_id", DataType::Int64, true),
                 Field::new("_last_updated_sequence_number", DataType::Int64, true),
             ]

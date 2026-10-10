@@ -14,55 +14,44 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use super::common::{extract_datetime_array, extract_i64_array, to_timestamp_value};
+use super::common::extract_i64_array;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{ArrayRef, TimestampMicrosecondArray};
+use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, TimeUnit};
-use chrono::Duration;
+use novarocks_functions::builtin::calendar_extended_shared::{
+    CalendarDurationShift, CalendarOperation, evaluate_legacy_calendar,
+    legacy_validate_datetime_source,
+};
 use std::sync::Arc;
 
-#[inline]
-fn eval_add_duration<F>(
+fn eval_add_duration(
     arena: &ExprArena,
     expr: ExprId,
     args: &[ExprId],
     chunk: &Chunk,
-    dur_fn: F,
-) -> Result<ArrayRef, String>
-where
-    F: Fn(i64) -> Duration,
-{
-    let date_arr = arena.eval(args[0], chunk)?;
-    let delta_arr = arena.eval(args[1], chunk)?;
-    let dts = extract_datetime_array(&date_arr)?;
-    let deltas = extract_i64_array(&delta_arr, "duration add")?;
-    if dts.len() != deltas.len() && dts.len() != 1 && deltas.len() != 1 {
+    operation: CalendarDurationShift,
+) -> Result<ArrayRef, String> {
+    let date = arena.eval(args[0], chunk)?;
+    let interval = arena.eval(args[1], chunk)?;
+    legacy_validate_datetime_source(&date)?;
+    let intervals = extract_i64_array(&interval, "duration add")?;
+    // Preserve the original malformed-caller length error before all-row selection.
+    if date.len() != intervals.len() && date.len() != 1 && intervals.len() != 1 {
         return Err("duration add argument length mismatch".to_string());
     }
+    let rows = date.len().max(intervals.len());
+    let interval: ArrayRef = Arc::new(Int64Array::from(intervals));
     let output_type = arena
         .data_type(expr)
         .cloned()
         .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
-    let len = dts.len().max(deltas.len());
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        let dt = if dts.len() == 1 { dts[0] } else { dts[i] };
-        let delta_v = if deltas.len() == 1 {
-            deltas[0]
-        } else {
-            deltas[i]
-        };
-        let Some(delta_v) = delta_v else {
-            out.push(None);
-            continue;
-        };
-        let delta = dur_fn(delta_v);
-        let v = dt.map(|d| d + delta);
-        let v = v.and_then(|d| to_timestamp_value(d, &output_type).ok());
-        out.push(v);
-    }
-    Ok(Arc::new(TimestampMicrosecondArray::from(out)) as ArrayRef)
+    evaluate_legacy_calendar(
+        CalendarOperation::DurationShift(operation),
+        &[date, interval],
+        &output_type,
+        rows,
+    )
 }
 
 pub fn eval_seconds_add(
@@ -71,7 +60,7 @@ pub fn eval_seconds_add(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_add_duration(arena, expr, args, chunk, chrono::Duration::seconds)
+    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::SecondsAdd)
 }
 
 pub fn eval_seconds_sub(
@@ -80,7 +69,7 @@ pub fn eval_seconds_sub(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_add_duration(arena, expr, args, chunk, |v| chrono::Duration::seconds(-v))
+    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::SecondsSub)
 }
 
 pub fn eval_minutes_add(
@@ -89,7 +78,7 @@ pub fn eval_minutes_add(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_add_duration(arena, expr, args, chunk, chrono::Duration::minutes)
+    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::MinutesAdd)
 }
 
 pub fn eval_minutes_sub(
@@ -98,7 +87,7 @@ pub fn eval_minutes_sub(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_add_duration(arena, expr, args, chunk, |v| chrono::Duration::minutes(-v))
+    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::MinutesSub)
 }
 
 pub fn eval_hours_add(
@@ -107,7 +96,7 @@ pub fn eval_hours_add(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_add_duration(arena, expr, args, chunk, chrono::Duration::hours)
+    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::HoursAdd)
 }
 
 pub fn eval_hours_sub(
@@ -116,7 +105,7 @@ pub fn eval_hours_sub(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_add_duration(arena, expr, args, chunk, |v| chrono::Duration::hours(-v))
+    eval_add_duration(arena, expr, args, chunk, CalendarDurationShift::HoursSub)
 }
 
 pub fn eval_milliseconds_add(
@@ -125,7 +114,13 @@ pub fn eval_milliseconds_add(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_add_duration(arena, expr, args, chunk, chrono::Duration::milliseconds)
+    eval_add_duration(
+        arena,
+        expr,
+        args,
+        chunk,
+        CalendarDurationShift::MillisecondsAdd,
+    )
 }
 
 pub fn eval_milliseconds_sub(
@@ -134,9 +129,13 @@ pub fn eval_milliseconds_sub(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_add_duration(arena, expr, args, chunk, |v| {
-        chrono::Duration::milliseconds(-v)
-    })
+    eval_add_duration(
+        arena,
+        expr,
+        args,
+        chunk,
+        CalendarDurationShift::MillisecondsSub,
+    )
 }
 
 pub fn eval_microseconds_add(
@@ -145,7 +144,13 @@ pub fn eval_microseconds_add(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_add_duration(arena, expr, args, chunk, chrono::Duration::microseconds)
+    eval_add_duration(
+        arena,
+        expr,
+        args,
+        chunk,
+        CalendarDurationShift::MicrosecondsAdd,
+    )
 }
 
 pub fn eval_microseconds_sub(
@@ -154,7 +159,11 @@ pub fn eval_microseconds_sub(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_add_duration(arena, expr, args, chunk, |v| {
-        chrono::Duration::microseconds(-v)
-    })
+    eval_add_duration(
+        arena,
+        expr,
+        args,
+        chunk,
+        CalendarDurationShift::MicrosecondsSub,
+    )
 }

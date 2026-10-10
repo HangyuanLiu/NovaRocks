@@ -336,11 +336,71 @@ pub async fn extract_data_files_with_stats_at(
     extract_data_files_with_stats_at_with_control(table, snapshot_id, None).await
 }
 
+/// Original statistics and the original typed facts they do not expose.
+/// This value is provider-private and never crosses a generic/native boundary.
+pub(crate) struct FrozenReadFileWithStats {
+    pub stats: DataFileWithStats,
+    manifest: std::sync::Arc<crate::read_model::IcebergDataFileMetadata>,
+    deletes: crate::delete_semantics::LoadView,
+}
+
+impl FrozenReadFileWithStats {
+    pub(crate) fn retain(
+        stats: DataFileWithStats,
+        manifest: std::sync::Arc<crate::read_model::IcebergDataFileMetadata>,
+        deletes: crate::delete_semantics::LoadView,
+    ) -> Self {
+        Self {
+            stats,
+            manifest,
+            deletes,
+        }
+    }
+
+    /// Move the exact original fields after legacy statistics, match and
+    /// branch-source validation completed. No file fact is guessed from its
+    /// path, catalog delete DTO, current table, or partition spelling.
+    pub(crate) fn into_read_file(self) -> crate::read_model::IcebergReadFile {
+        let stats = self.stats;
+        crate::read_model::IcebergReadFile {
+            path: stats.path,
+            size: stats.size,
+            record_count: stats.record_count,
+            column_stats: stats.column_stats,
+            partition_spec_id: stats.partition_spec_id,
+            partition_key: stats.partition_key,
+            partition_values: stats.partition_values,
+            manifest_path: stats.manifest_path,
+            first_row_id: stats.first_row_id,
+            data_sequence_number: stats.data_sequence_number,
+            manifest: self.manifest,
+            deletes: self.deletes,
+        }
+    }
+}
+
 pub(crate) async fn extract_data_files_with_stats_at_with_control(
     table: &Table,
     snapshot_id: i64,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
 ) -> Result<Vec<DataFileWithStats>, String> {
+    extract_data_files_with_stats_at_projected(table, snapshot_id, control, |stats, _, _| stats)
+        .await
+}
+
+/// Run the original statistics author once. The legacy projection returns
+/// the original value directly; a frozen source may retain the exact typed
+/// remainder by move without cloning or re-decoding a manifest/delete view.
+pub(crate) async fn extract_data_files_with_stats_at_projected<O>(
+    table: &Table,
+    snapshot_id: i64,
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+    mut project: impl FnMut(
+        DataFileWithStats,
+        std::sync::Arc<crate::read_model::IcebergDataFileMetadata>,
+        crate::delete_semantics::LoadView,
+    ) -> O,
+) -> Result<Vec<O>, String> {
     let metadata = table.metadata();
     let snapshot_schema = metadata
         .snapshot_by_id(snapshot_id)
@@ -372,20 +432,24 @@ pub(crate) async fn extract_data_files_with_stats_at_with_control(
                 .members()
                 .map(|fact| canonical_delete_to_catalog_delete(fact))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(DataFileWithStats {
-                path: file.path,
-                size: file.size,
-                record_count: file.record_count,
-                column_stats: file.column_stats,
-                partition_spec_id: file.partition_spec_id,
-                partition_key: file.partition_key,
-                partition_values: file.partition_values,
-                manifest_path: file.manifest_path,
-                partition_field_values,
-                first_row_id: file.first_row_id,
-                data_sequence_number: file.data_sequence_number,
-                delete_files,
-            })
+            Ok(project(
+                DataFileWithStats {
+                    path: file.path,
+                    size: file.size,
+                    record_count: file.record_count,
+                    column_stats: file.column_stats,
+                    partition_spec_id: file.partition_spec_id,
+                    partition_key: file.partition_key,
+                    partition_values: file.partition_values,
+                    manifest_path: file.manifest_path,
+                    partition_field_values,
+                    first_row_id: file.first_row_id,
+                    data_sequence_number: file.data_sequence_number,
+                    delete_files,
+                },
+                file.manifest,
+                file.deletes,
+            ))
         })
         .collect()
 }
@@ -454,7 +518,7 @@ pub(crate) async fn extract_cow_data_files_with_stats_at_with_control(
 
 /// Original-window COW capture keeps all outputs under one neutral owner.
 pub(crate) struct CheckedCowDataFiles {
-    pub files: Vec<DataFileWithStats>,
+    pub files: Vec<FrozenReadFileWithStats>,
     pub simultaneous_upper: u64,
     pub retention_guard: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
 }
@@ -485,7 +549,7 @@ pub(crate) async fn extract_cow_data_files_with_stats_at_with_original_scope(
         .await?;
         budget.charge(recipe(geometry::slots::<
             ConnectorCowBeginCause,
-            DataFileWithStats,
+            FrozenReadFileWithStats,
         >(captured.len()))?)?;
         let mut files = Vec::with_capacity(captured.len());
         for file in captured {
@@ -553,7 +617,7 @@ pub(crate) async fn extract_cow_data_files_with_stats_at_with_original_scope(
                 budget.charge(upper)?;
                 delete_files.push(canonical_delete_to_catalog_delete(fact)?);
             }
-            files.push(DataFileWithStats {
+            let stats = DataFileWithStats {
                 path: file.path,
                 size: file.size,
                 record_count: file.record_count,
@@ -566,7 +630,12 @@ pub(crate) async fn extract_cow_data_files_with_stats_at_with_original_scope(
                 first_row_id: file.first_row_id,
                 data_sequence_number: file.data_sequence_number,
                 delete_files,
-            });
+            };
+            files.push(FrozenReadFileWithStats::retain(
+                stats,
+                file.manifest,
+                file.deletes,
+            ));
         }
         budget.active()?;
         Ok::<_, ReadFailure>(CheckedCowDataFiles {

@@ -30,6 +30,8 @@
 //!
 //! Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
@@ -63,22 +65,84 @@ use crate::exec::node::table_write_relation::{
     WriterMultiplexRelationSchema,
 };
 #[cfg(debug_assertions)]
-use crate::exec::node::table_write_relation::{
-    TableWriteAggregateBoundary, TableWriteAggregateGuard,
-};
+use crate::exec::node::table_write_relation::{TableWriteAggregateBoundary, TableWriteAggregateGuard};
 use crate::exec::node::unpivot::{UnpivotPassthroughColumn, UnpivotValueMapping};
 use crate::exec::operators::aggregate::AggregateProcessorFactory;
 use crate::exec::operators::blocked_duration::BlockedDuration;
 use crate::exec::operators::table_writer::TableWriteRelationColumns;
 use crate::exec::operators::unpivot_processor::UnpivotProcessorFactory;
-use crate::exec::pipeline::operator::{
-    FinishWatch, Operator, ProcessorOperator, forward_observable,
-};
+use crate::exec::pipeline::operator::{FinishWatch, Operator, ProcessorOperator, forward_observable};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
 use crate::runtime::profile::{OperatorProfiles, ProfileUnit};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+
+/// The slot facts a finish's statistics are checked against: each final
+/// call's intermediate input and final output channel, in call order, and
+/// each grouped Unpivot mapping's target and the final output it reads.
+/// Coverage, completeness and channel mapping are judged from these alone,
+/// identically for every statistics owner.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FinishStatisticsCoverage {
+    calls: Vec<(novarocks_types::SlotId, novarocks_types::SlotId)>,
+    mappings: Option<Vec<(u32, novarocks_types::SlotId)>>,
+}
+
+impl FinishStatisticsCoverage {
+    pub(crate) fn new(
+        calls: Vec<(novarocks_types::SlotId, novarocks_types::SlotId)>,
+        mappings: Option<Vec<(u32, novarocks_types::SlotId)>>,
+    ) -> Self {
+        Self { calls, mappings }
+    }
+
+    fn from_plan(plan: &WriterFinalAggregatePlan) -> Self {
+        Self {
+            calls: plan
+                .calls
+                .iter()
+                .map(|call| (call.intermediate_input_slot_id, call.final_output_slot_id))
+                .collect(),
+            mappings: plan.unpivot.as_ref().map(|unpivot| {
+                unpivot
+                    .mappings
+                    .iter()
+                    .map(|mapping| (mapping.grouping_key, mapping.input_value_slot_id))
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// An owner of a finish's statistics other than the plan-tree build from the
+/// process function set and the decoder's expression arena: it supplies the
+/// final aggregate over every `AGGREGATE_PARTIAL` row and the grouped Unpivot
+/// of each batch that aggregate emits.
+pub(crate) trait FinishStatisticsFactory: Send + Sync {
+    /// The final aggregate. It takes the finish's filtered `AGGREGATE_PARTIAL`
+    /// rows and emits each target group's final values once.
+    fn final_aggregate(&self, state: &RuntimeState) -> Result<Box<dyn Operator>, String>;
+
+    /// The grouped Unpivot of one final aggregate batch, emitting Root
+    /// artifact rows.
+    fn grouped_unpivot(
+        &self,
+        state: &RuntimeState,
+        final_chunk: Chunk,
+        root_schema: crate::exec::chunk::ChunkSchemaRef,
+        tracker: Option<Arc<MemTracker>>,
+    ) -> ExecutionResult<Box<dyn GroupedUnpivotSource>>;
+}
+
+/// The Root artifact rows of one final aggregate batch, one target at a time.
+pub(crate) trait GroupedUnpivotSource: Send {
+    /// The batch's targets, each at most once.
+    fn targets(&self) -> Vec<u32>;
+    fn pull(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>>;
+    fn is_finished(&self) -> bool;
+    fn source_observable(&self) -> Arc<Observable>;
+}
 
 /// Factory for the single-driver table finish operator.
 pub struct TableFinishOperatorFactory {
@@ -87,7 +151,11 @@ pub struct TableFinishOperatorFactory {
     fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
     writer_schema: WriterMultiplexRelationSchema,
     root_schema: RootWriteResultRelationSchema,
+    /// The plan-tree statistics, built from the process function set and
+    /// `arena` when `statistics` is absent.
     final_plan: WriterFinalAggregatePlan,
+    coverage: FinishStatisticsCoverage,
+    statistics: Option<Arc<dyn FinishStatisticsFactory>>,
     #[cfg(debug_assertions)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
     arena: Arc<ExprArena>,
@@ -120,11 +188,41 @@ impl TableFinishOperatorFactory {
             fragment_validator: Arc::clone(&binding.fragment_validator),
             writer_schema,
             root_schema,
+            coverage: FinishStatisticsCoverage::from_plan(&final_plan),
             final_plan,
+            statistics: None,
             #[cfg(debug_assertions)]
             aggregate_guard: Arc::clone(&binding.aggregate_guard),
             arena,
         })
+    }
+
+    /// A compiled finish over the program's positional relations. Its
+    /// statistics, if any, are the compiled owner's, checked against its
+    /// coverage facts exactly as the plan-tree statistics are; no function
+    /// set is read and the empty arena is never consulted.
+    pub(crate) fn new_compiled(
+        node_id: i32,
+        expected_targets: Vec<WriteTargetOrdinal>,
+        writer_schema: WriterMultiplexRelationSchema,
+        root_schema: RootWriteResultRelationSchema,
+        statistics: Option<(FinishStatisticsCoverage, Arc<dyn FinishStatisticsFactory>)>,
+        binding: &TableFinishRuntimeBinding,
+    ) -> Result<Self, String> {
+        let mut factory = Self::new_local(
+            node_id,
+            expected_targets,
+            writer_schema,
+            root_schema,
+            WriterFinalAggregatePlan::default(),
+            binding,
+            Arc::new(ExprArena::default()),
+        )?;
+        if let Some((coverage, statistics)) = statistics {
+            factory.coverage = coverage;
+            factory.statistics = Some(statistics);
+        }
+        Ok(factory)
     }
 
     /// Construct the NCP-8 composite with the same immutable expression arena
@@ -142,6 +240,8 @@ impl TableFinishOperatorFactory {
             writer_schema: node.writer_multiplex_schema().clone(),
             root_schema: node.root_result_schema().clone(),
             final_plan: node.final_aggregate_plan().clone(),
+            coverage: FinishStatisticsCoverage::from_plan(node.final_aggregate_plan()),
+            statistics: None,
             #[cfg(debug_assertions)]
             aggregate_guard: Arc::clone(node.aggregate_guard()),
             arena,
@@ -167,6 +267,8 @@ impl TableFinishOperatorFactory {
             writer_schema: self.writer_schema.clone(),
             root_schema: self.root_schema.clone(),
             final_plan: self.final_plan.clone(),
+            coverage: self.coverage.clone(),
+            statistics: self.statistics.clone(),
             #[cfg(debug_assertions)]
             aggregate_guard: Arc::clone(&self.aggregate_guard),
             channel_to_call: self
@@ -175,10 +277,10 @@ impl TableFinishOperatorFactory {
                 .auxiliary_channels()
                 .iter()
                 .map(|channel| {
-                    self.final_plan
+                    self.coverage
                         .calls
                         .iter()
-                        .position(|call| call.intermediate_input_slot_id.0 == channel.slot_id())
+                        .position(|(input, _)| input.0 == channel.slot_id())
                 })
                 .collect(),
             arena: Arc::clone(&self.arena),
@@ -450,6 +552,8 @@ struct TableFinishOperator {
     writer_schema: WriterMultiplexRelationSchema,
     root_schema: RootWriteResultRelationSchema,
     final_plan: WriterFinalAggregatePlan,
+    coverage: FinishStatisticsCoverage,
+    statistics: Option<Arc<dyn FinishStatisticsFactory>>,
     #[cfg(debug_assertions)]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
     channel_to_call: Vec<Option<usize>>,
@@ -461,7 +565,7 @@ struct TableFinishOperator {
     aggregate: Option<Box<dyn Operator>>,
     aggregate_coverage: HashMap<u32, Vec<bool>>,
     final_groups_seen: HashSet<u32>,
-    grouped_unpivot: Option<GroupedUnpivotDriver>,
+    grouped_unpivot: Option<Box<dyn GroupedUnpivotSource>>,
     prefix_output: Option<PrefixOutputDriver>,
     phase: FinishPhase,
     mem_tracker: Option<Arc<MemTracker>>,
@@ -487,7 +591,12 @@ impl TableFinishOperator {
         self.aggregate = Some(aggregate);
     }
 
-    fn install_grouped_unpivot(&mut self, driver: GroupedUnpivotDriver) {
+    #[cfg(test)]
+    fn install_grouped_unpivot(&mut self, driver: impl GroupedUnpivotSource + 'static) {
+        self.install_grouped_unpivot_source(Box::new(driver));
+    }
+
+    fn install_grouped_unpivot_source(&mut self, driver: Box<dyn GroupedUnpivotSource>) {
         forward_observable(&driver.source_observable(), &self.source_observable);
         self.grouped_unpivot = Some(driver);
     }
@@ -504,12 +613,12 @@ impl TableFinishOperator {
         self.final_groups_seen.clear();
     }
 
-    fn fail<T>(&mut self, error: String) -> Result<T, String> {
+    fn fail<T>(&mut self, error: impl Into<ExecutionFailure>) -> ExecutionResult<T> {
         self.release_buffer();
         self.phase = FinishPhase::Failed;
         self.finish_final_aggregate_blocked_interval();
         self.sync_metrics();
-        Err(error)
+        Err(error.into())
     }
 
     /// Read one target ordinal off the signed carrier. A negative value is
@@ -620,7 +729,7 @@ impl TableFinishOperator {
                 Ok(())
             }
             WriterRowKind::AggregatePartial => {
-                if self.final_plan.calls.is_empty() {
+                if self.coverage.calls.is_empty() {
                     return Err(
                         "table finish received aggregate partials without a final aggregate plan"
                             .to_string(),
@@ -629,7 +738,7 @@ impl TableFinishOperator {
                 let coverage = self
                     .aggregate_coverage
                     .entry(target.get())
-                    .or_insert_with(|| vec![false; self.final_plan.calls.len()]);
+                    .or_insert_with(|| vec![false; self.coverage.calls.len()]);
                 for (channel, non_null) in auxiliary_non_null.into_iter().enumerate() {
                     if non_null {
                         let index = self.channel_to_call[channel].ok_or_else(|| {
@@ -645,37 +754,37 @@ impl TableFinishOperator {
     }
 
     fn validate_coverage(&self) -> Result<(), String> {
-        let Some(unpivot) = self.final_plan.unpivot.as_ref() else {
-            return if self.final_plan.calls.is_empty() {
+        let Some(mappings) = self.coverage.mappings.as_ref() else {
+            return if self.coverage.calls.is_empty() {
                 Ok(())
             } else {
                 Err("table finish final aggregates are missing grouped Unpivot".to_string())
             };
         };
         let call_by_output = self
-            .final_plan
+            .coverage
             .calls
             .iter()
             .enumerate()
-            .map(|(index, call)| (call.final_output_slot_id, index))
+            .map(|(index, (_, output))| (*output, index))
             .collect::<HashMap<_, _>>();
-        for mapping in &unpivot.mappings {
+        for (grouping_key, input_value_slot_id) in mappings {
             let call = call_by_output
-                .get(&mapping.input_value_slot_id)
+                .get(input_value_slot_id)
                 .copied()
                 .ok_or_else(|| {
                     "table finish grouped Unpivot references an unknown final output".to_string()
                 })?;
             if !self
                 .aggregate_coverage
-                .get(&mapping.grouping_key)
+                .get(grouping_key)
                 .and_then(|coverage| coverage.get(call))
                 .copied()
                 .unwrap_or(false)
             {
                 return Err(format!(
                     "table finish target {} has no non-null aggregate partial for channel {}",
-                    mapping.grouping_key, call
+                    grouping_key, call
                 ));
             }
         }
@@ -689,7 +798,7 @@ impl TableFinishOperator {
         Chunk::try_new_with_chunk_schema(batch, Arc::clone(self.writer_schema.chunk_schema()))
     }
 
-    fn begin_finalize(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn begin_finalize(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.validate_coverage()?;
         self.prefix_output = Some(PrefixOutputDriver::try_new(
             self.rows.get(),
@@ -712,37 +821,50 @@ impl TableFinishOperator {
         Ok(())
     }
 
-    fn start_grouped_unpivot(&mut self, final_chunk: Chunk) -> Result<(), String> {
-        let arena = Arc::clone(&self.arena);
-        let plan =
-            self.final_plan.unpivot.as_ref().cloned().ok_or_else(|| {
-                "table finish final aggregate is missing grouped Unpivot".to_string()
-            })?;
-        let driver = GroupedUnpivotDriver::try_new(
-            arena,
-            plan,
-            Arc::clone(self.root_schema.chunk_schema()),
-            final_chunk,
-            self.output_tracker.as_ref().map(Arc::clone),
-        )?;
+    fn start_grouped_unpivot(
+        &mut self,
+        state: &RuntimeState,
+        final_chunk: Chunk,
+    ) -> ExecutionResult<()> {
+        let driver: Box<dyn GroupedUnpivotSource> = match self.statistics.as_ref() {
+            Some(statistics) => statistics.grouped_unpivot(
+                state,
+                final_chunk,
+                Arc::clone(self.root_schema.chunk_schema()),
+                self.output_tracker.as_ref().map(Arc::clone),
+            )?,
+            None => {
+                let arena = Arc::clone(&self.arena);
+                let plan = self.final_plan.unpivot.as_ref().cloned().ok_or_else(|| {
+                    "table finish final aggregate is missing grouped Unpivot".to_string()
+                })?;
+                Box::new(GroupedUnpivotDriver::try_new(
+                    arena,
+                    plan,
+                    Arc::clone(self.root_schema.chunk_schema()),
+                    final_chunk,
+                    self.output_tracker.as_ref().map(Arc::clone),
+                )?)
+            }
+        };
         for target in driver.targets() {
             if !self.final_groups_seen.insert(target) {
                 return Err(format!(
                     "table finish final aggregate produced duplicate target {target} across output batches"
-                ));
+                ).into());
             }
         }
-        self.install_grouped_unpivot(driver);
+        self.install_grouped_unpivot_source(driver);
         Ok(())
     }
 
     fn validate_final_groups_complete(&self) -> Result<(), String> {
         let expected = self
-            .final_plan
-            .unpivot
-            .as_ref()
-            .into_iter()
-            .flat_map(|plan| plan.mappings.iter().map(|mapping| mapping.grouping_key))
+            .coverage
+            .mappings
+            .iter()
+            .flatten()
+            .map(|(grouping_key, _)| *grouping_key)
             .collect::<HashSet<_>>();
         if expected == self.final_groups_seen {
             return Ok(());
@@ -761,7 +883,7 @@ impl TableFinishOperator {
         ))
     }
 
-    fn runtime_error(&self) -> Option<String> {
+    fn runtime_error(&self) -> Option<ExecutionFailure> {
         self.runtime_error.as_ref().and_then(|state| state.error())
     }
 
@@ -950,10 +1072,6 @@ impl GroupedUnpivotDriver {
         self.active = Some(active);
     }
 
-    fn targets(&self) -> impl Iterator<Item = u32> + '_ {
-        self.rows.iter().map(|(target, _)| *target)
-    }
-
     fn output_schema(&self, target: u32) -> Result<crate::exec::chunk::ChunkSchemaRef, String> {
         let slots = [
             self.plan.passthrough_output_slot_id,
@@ -1007,7 +1125,7 @@ impl GroupedUnpivotDriver {
         ChunkSchema::try_new(fields).map(Arc::new)
     }
 
-    fn start_next(&mut self, state: &RuntimeState) -> Result<bool, String> {
+    fn start_next(&mut self, state: &RuntimeState) -> ExecutionResult<bool> {
         let Some((target, row)) = self.rows.get(self.next_row).copied() else {
             return Ok(false);
         };
@@ -1051,7 +1169,7 @@ impl GroupedUnpivotDriver {
         Ok(true)
     }
 
-    fn pull(&mut self, state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         loop {
             if self.active.is_none() && !self.start_next(state)? {
                 return Ok(None);
@@ -1062,7 +1180,11 @@ impl GroupedUnpivotDriver {
                 .expect("grouped Unpivot processor")
                 .pull_chunk(state)?
             {
-                return root_artifact_chunk(chunk, &self.root_schema, self.tracker.as_ref());
+                return Ok(root_artifact_chunk(
+                    chunk,
+                    &self.root_schema,
+                    self.tracker.as_ref(),
+                )?);
             }
             if !active.is_finished() {
                 return Ok(None);
@@ -1070,6 +1192,16 @@ impl GroupedUnpivotDriver {
             self.active = None;
             self.next_row += 1;
         }
+    }
+}
+
+impl GroupedUnpivotSource for GroupedUnpivotDriver {
+    fn targets(&self) -> Vec<u32> {
+        self.rows.iter().map(|(target, _)| *target).collect()
+    }
+
+    fn pull(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+        GroupedUnpivotDriver::pull(self, state)
     }
 
     fn is_finished(&self) -> bool {
@@ -1081,7 +1213,10 @@ impl GroupedUnpivotDriver {
     }
 }
 
-fn root_artifact_chunk(
+/// Validate one grouped Unpivot artifact batch and lift it onto the Root
+/// relation: every row is an `ARTIFACT_DRAFT` of its target, with the
+/// relation's own carriers.
+pub(crate) fn root_artifact_chunk(
     artifact: Chunk,
     root_schema: &crate::exec::chunk::ChunkSchemaRef,
     tracker: Option<&Arc<MemTracker>>,
@@ -1237,25 +1372,26 @@ impl Operator for TableFinishOperator {
         &self.name
     }
 
-    fn prepare(&mut self) -> Result<(), String> {
+    fn prepare(&mut self) -> ExecutionResult<()> {
         if let Some(error) = self.parallelism_error.take() {
             self.phase = FinishPhase::Failed;
-            return Err(error);
+            return Err(error.into());
         }
-        if self.final_plan.calls.is_empty() != self.final_plan.unpivot.is_none() {
+        if self.coverage.calls.is_empty() != self.coverage.mappings.is_none() {
             self.phase = FinishPhase::Failed;
             return Err(
                 "table finish final aggregate and grouped Unpivot must be both empty or both present"
-                    .to_string(),
+                    .to_string().into(),
             );
         }
         if self.channel_to_call.iter().any(Option::is_none)
-            || self.channel_to_call.len() != self.final_plan.calls.len()
+            || self.channel_to_call.len() != self.coverage.calls.len()
         {
             self.phase = FinishPhase::Failed;
             return Err(
                 "table finish final aggregates do not exactly cover the frozen writer tail"
-                    .to_string(),
+                    .to_string()
+                    .into(),
             );
         }
         Ok(())
@@ -1272,19 +1408,25 @@ impl Operator for TableFinishOperator {
         self.sync_metrics();
     }
 
-    fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.runtime_error = Some(state.error_state());
-        if self.final_plan.calls.is_empty() {
+        if self.coverage.calls.is_empty() {
             return Ok(());
         }
-        let arena = Arc::clone(&self.arena);
-        let function_set = state
-            .execution_runtime()
-            .map(|runtime| Arc::clone(runtime.function_set()))
-            .ok_or_else(|| {
-                "table finish aggregate plan requires the execution function set".to_string()
-            })?;
-        let mut aggregate = build_final_aggregate(&self.final_plan, &arena, function_set, -1)?;
+        let mut aggregate = match self.statistics.as_ref() {
+            Some(statistics) => statistics.final_aggregate(state)?,
+            None => {
+                let arena = Arc::clone(&self.arena);
+                let function_set = state
+                    .execution_runtime()
+                    .map(|runtime| Arc::clone(runtime.function_set()))
+                    .ok_or_else(|| {
+                        "table finish aggregate plan requires the execution function set"
+                            .to_string()
+                    })?;
+                build_final_aggregate(&self.final_plan, &arena, function_set, -1)?
+            }
+        };
         if let Some(tracker) = self.mem_tracker.as_ref() {
             aggregate.set_mem_tracker(MemTracker::new_child("TableFinishFinalAggregate", tracker));
         }
@@ -1299,7 +1441,7 @@ impl Operator for TableFinishOperator {
         Ok(())
     }
 
-    fn activate(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn activate(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         if let Some(aggregate) = self.aggregate.as_mut() {
             aggregate.activate(state)?;
         }
@@ -1313,7 +1455,7 @@ impl Operator for TableFinishOperator {
         self.sync_metrics();
     }
 
-    fn close(&mut self) -> Result<(), String> {
+    fn close(&mut self) -> ExecutionResult<()> {
         self.finish_final_aggregate_blocked_interval();
         self.sync_metrics();
         Ok(())
@@ -1404,15 +1546,17 @@ impl ProcessorOperator for TableFinishOperator {
         self.runtime_error().is_some() || (producing && (other_output || aggregate_ready))
     }
 
-    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if chunk.is_empty() {
             return Ok(());
         }
         if self.phase != FinishPhase::Consuming {
-            return Err("table finish received a writer row after EOS".to_string());
+            return Err("table finish received a writer row after EOS"
+                .to_string()
+                .into());
         }
         if let Some(error) = self.runtime_error() {
-            return self.fail(format!("table finish runtime failed: {error}"));
+            return self.fail(error);
         }
         if self.aggregate.as_ref().is_some_and(|aggregate| {
             !aggregate
@@ -1429,7 +1573,9 @@ impl ProcessorOperator for TableFinishOperator {
                 "table finish writer relation schema drifted from the frozen plan".to_string(),
             );
         }
-        let columns = match TableWriteRelationColumns::try_from_chunk(&chunk) {
+        // The chunk is exactly the frozen relation (checked above), so its
+        // prefix is read at the relation's positions, whatever its slots.
+        let columns = match TableWriteRelationColumns::try_from_relation(&chunk) {
             Ok(columns) => columns,
             Err(error) => return self.fail(error),
         };
@@ -1474,7 +1620,7 @@ impl ProcessorOperator for TableFinishOperator {
                 .expect("final aggregate processor")
                 .push_chunk(state, filtered)
             {
-                return self.fail(format!("table finish final aggregate merge: {error}"));
+                return self.fail(error);
             }
         }
         if let Some(profiles) = self.profiles.as_ref() {
@@ -1488,9 +1634,9 @@ impl ProcessorOperator for TableFinishOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         if let Some(error) = self.runtime_error() {
-            return self.fail(format!("table finish runtime failed: {error}"));
+            return self.fail(error);
         }
         if self.phase != FinishPhase::Producing {
             return Ok(None);
@@ -1554,7 +1700,7 @@ impl ProcessorOperator for TableFinishOperator {
                 }
                 match result {
                     Ok(Some(final_chunk)) => {
-                        if let Err(error) = self.start_grouped_unpivot(final_chunk) {
+                        if let Err(error) = self.start_grouped_unpivot(state, final_chunk) {
                             return self.fail(error);
                         }
                         continue;
@@ -1567,9 +1713,7 @@ impl ProcessorOperator for TableFinishOperator {
                         );
                     }
                     Err(error) => {
-                        return self.fail(format!(
-                            "table finish final aggregate output failed: {error}"
-                        ));
+                        return self.fail(error);
                     }
                 }
             }
@@ -1591,7 +1735,7 @@ impl ProcessorOperator for TableFinishOperator {
         }
     }
 
-    fn set_finishing(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         if matches!(
             self.phase,
             FinishPhase::Finalizing | FinishPhase::Producing | FinishPhase::Finished
@@ -1599,7 +1743,9 @@ impl ProcessorOperator for TableFinishOperator {
             return Ok(());
         }
         if self.phase == FinishPhase::Failed {
-            return Err("table finish cannot finalize a failed write stream".to_string());
+            return Err("table finish cannot finalize a failed write stream"
+                .to_string()
+                .into());
         }
         self.phase = FinishPhase::Finalizing;
         self.finish_final_aggregate_blocked_interval();
@@ -1863,22 +2009,22 @@ mod tests {
             self.finishing && self.ready.load(Ordering::Acquire) && !self.outputs.is_empty()
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
             if !self.need_input() {
-                return Err("scripted final aggregate is blocked".to_string());
+                return Err("scripted final aggregate is blocked".to_string().into());
             }
             self.pushed_rows += chunk.len();
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             if !self.has_output() {
                 return Ok(None);
             }
             Ok(self.outputs.pop_front())
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             self.finishing = true;
             Ok(())
         }
@@ -1921,15 +2067,15 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
             state
                 .error_state()
                 .set_error("scripted final aggregate failed asynchronously".to_string());
@@ -1962,16 +2108,16 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
-            Err("scripted synchronous finalize failure".to_string())
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+            Err("scripted synchronous finalize failure".to_string().into())
         }
     }
 
@@ -2126,7 +2272,7 @@ mod tests {
                     WriterAuxiliaryChannel::try_new(
                         100 + u32::try_from(index).expect("channel slot"),
                         format!("partial_{index}"),
-                        DataType::Binary,
+                        novarocks_type_contract::FunctionValueType::new(DataType::Binary, true),
                     )
                     .expect("auxiliary channel")
                 })
@@ -2309,7 +2455,7 @@ mod tests {
         (kinds, ordinals, row_counts, fragments)
     }
 
-    fn run(operator: &mut Box<dyn Operator>, chunks: Vec<Chunk>) -> Result<Vec<Chunk>, String> {
+    fn run(operator: &mut Box<dyn Operator>, chunks: Vec<Chunk>) -> ExecutionResult<Vec<Chunk>> {
         let state = RuntimeState::default();
         let processor = operator.as_processor_mut().expect("processor");
         for chunk in chunks {
@@ -2341,13 +2487,13 @@ mod tests {
 
         let mut wide = factory.create(4, 0);
         let error = wide.prepare().expect_err("DOP > 1 must fail closed");
-        assert!(error.contains("must run at DOP 1"));
+        assert!(error.detail().contains("must run at DOP 1"));
 
         let mut second_driver = factory.create(1, 1);
         let error = second_driver
             .prepare()
             .expect_err("a second driver must fail closed");
-        assert!(error.contains("must run at DOP 1"));
+        assert!(error.detail().contains("must run at DOP 1"));
     }
 
     #[test]
@@ -2473,7 +2619,7 @@ mod tests {
                 .push_chunk(&state, writer_rows(rows))
                 .expect_err("invalid row shape");
             assert!(
-                error.contains(expected),
+                error.detail().contains(expected),
                 "expected {expected:?} in error {error:?}"
             );
         }
@@ -2490,7 +2636,11 @@ mod tests {
             .expect("processor")
             .push_chunk(&state, writer_rows(vec![row_count_row(2, 1)]))
             .expect_err("ordinal outside the sealed set");
-        assert!(error.contains("outside the sealed set of 2 targets"));
+        assert!(
+            error
+                .detail()
+                .contains("outside the sealed set of 2 targets")
+        );
     }
 
     #[test]
@@ -2506,7 +2656,11 @@ mod tests {
             .expect("processor")
             .push_chunk(&state, writer_rows(vec![fragment_row(0, b"junk".to_vec())]))
             .expect_err("foreign carrier");
-        assert!(error.contains("not a canonical carrier of the expected provider"));
+        assert!(
+            error
+                .detail()
+                .contains("not a canonical carrier of the expected provider")
+        );
     }
 
     #[test]
@@ -2526,7 +2680,7 @@ mod tests {
         let error = processor
             .push_chunk(&state, writer_rows(vec![row_count_row(0, i64::MAX)]))
             .expect_err("row count overflow");
-        assert!(error.contains("row count overflowed"));
+        assert!(error.detail().contains("row count overflowed"));
     }
 
     #[test]
@@ -2544,7 +2698,7 @@ mod tests {
             .push_chunk(&state, writer_rows(vec![row_count_row(0, -1)]))
             .expect_err("a negative row count is corrupt data");
         assert!(
-            error.contains("payload does not match"),
+            error.detail().contains("payload does not match"),
             "unexpected error {error:?}"
         );
     }
@@ -2561,7 +2715,7 @@ mod tests {
             .push_chunk(&state, writer_rows(vec![row_count_row(-1, 1)]))
             .expect_err("a negative target ordinal is corrupt data");
         assert!(
-            error.contains("target ordinal is negative"),
+            error.detail().contains("target ordinal is negative"),
             "unexpected error {error:?}"
         );
     }
@@ -2598,7 +2752,11 @@ mod tests {
                 )]),
             )
             .expect_err("over the single-fragment budget");
-        assert!(error.contains("exceeds the frozen single-fragment budget"));
+        assert!(
+            error
+                .detail()
+                .contains("exceeds the frozen single-fragment budget")
+        );
     }
 
     #[test]
@@ -2623,7 +2781,7 @@ mod tests {
         let error = processor
             .push_chunk(&state, writer_rows(vec![fragment_row(0, vec![1])]))
             .expect_err("over the set byte budget");
-        assert!(error.contains("exceeds the frozen byte budget"));
+        assert!(error.detail().contains("exceeds the frozen byte budget"));
     }
 
     #[test]
@@ -2642,7 +2800,7 @@ mod tests {
         let error = processor
             .push_chunk(&state, writer_rows(vec![fragment_row(0, vec![1])]))
             .expect_err("over the entry budget");
-        assert!(error.contains("exceeds the frozen entry budget"));
+        assert!(error.detail().contains("exceeds the frozen entry budget"));
     }
 
     #[test]
@@ -2787,11 +2945,19 @@ mod tests {
                 )]),
             )
             .expect_err("invalid row");
-        assert!(error.contains("payload does not match its row kind"));
+        assert!(
+            error
+                .detail()
+                .contains("payload does not match its row kind")
+        );
         let finish_error = processor
             .set_finishing(&state)
             .expect_err("a failed stream cannot be repaired into a summary");
-        assert!(finish_error.contains("cannot finalize a failed write stream"));
+        assert!(
+            finish_error
+                .detail()
+                .contains("cannot finalize a failed write stream")
+        );
         assert!(!processor.has_output());
     }
 
@@ -2806,7 +2972,7 @@ mod tests {
         let error = processor
             .push_chunk(&state, writer_rows(vec![row_count_row(0, 1)]))
             .expect_err("a row after EOS is a contract violation");
-        assert!(error.contains("after EOS"));
+        assert!(error.detail().contains("after EOS"));
     }
 
     #[test]
@@ -2863,7 +3029,7 @@ mod tests {
         let error = processor
             .push_chunk(&state, writer_rows(vec![row_count_row(0, 1)]))
             .expect_err("a target this query never compiled a writer for");
-        assert!(error.contains("outside the sealed set"), "{error}");
+        assert!(error.detail().contains("outside the sealed set"), "{error}");
     }
 
     #[test]
@@ -3403,7 +3569,7 @@ mod tests {
         let error = operator
             .pull_chunk(&state)
             .expect_err("runtime finalization error");
-        assert!(error.contains("failed asynchronously"), "{error}");
+        assert!(error.detail().contains("failed asynchronously"), "{error}");
         assert!(operator.is_finished());
     }
 
@@ -3443,7 +3609,10 @@ mod tests {
         let error = operator
             .set_finishing(&state)
             .expect_err("final aggregate rejects finalize");
-        assert!(error.contains("synchronous finalize failure"), "{error}");
+        assert!(
+            error.detail().contains("synchronous finalize failure"),
+            "{error}"
+        );
         assert!(operator.is_finished());
         assert_eq!(tracker.current(), 0, "failed finalize releases all buffers");
     }
@@ -3475,7 +3644,7 @@ mod tests {
             )
             .expect_err("final merge fault");
 
-        assert!(error.contains("FinalMerge"), "{error}");
+        assert!(error.detail().contains("FinalMerge"), "{error}");
         assert!(operator.is_finished(), "the Root operator must fail closed");
         assert!(
             !operator.has_output(),
@@ -3520,7 +3689,7 @@ mod tests {
             .set_finishing(&state)
             .expect_err("final finalize fault");
 
-        assert!(error.contains("FinalFinalize"), "{error}");
+        assert!(error.detail().contains("FinalFinalize"), "{error}");
         assert!(operator.is_finished(), "the Root operator must fail closed");
         assert!(
             !operator.has_output(),
@@ -3624,7 +3793,11 @@ mod tests {
             .expect("processor")
             .set_finishing(&state)
             .expect_err("the second channel never arrived");
-        assert!(error.contains("no non-null aggregate partial for channel 1"));
+        assert!(
+            error
+                .detail()
+                .contains("no non-null aggregate partial for channel 1")
+        );
         assert!(operator.is_finished());
     }
 
@@ -3651,7 +3824,11 @@ mod tests {
                 ),
             )
             .expect_err("an all-null partial carries no contribution");
-        assert!(error.contains("payload does not match its row kind"));
+        assert!(
+            error
+                .detail()
+                .contains("payload does not match its row kind")
+        );
 
         let mut drifted = factory.create(1, 0);
         drifted.prepare().expect("prepare");
@@ -3661,7 +3838,11 @@ mod tests {
             .expect("processor")
             .push_chunk(&state, writer_rows(vec![row_count_row(0, 1)]))
             .expect_err("the four-column legacy schema is not the frozen multiplex schema");
-        assert!(error.contains("schema drifted from the frozen plan"));
+        assert!(
+            error
+                .detail()
+                .contains("schema drifted from the frozen plan")
+        );
     }
 
     #[test]

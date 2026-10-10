@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::sync::Arc;
 
 use super::broadcast_join_shared::BroadcastJoinSharedState;
@@ -222,17 +224,21 @@ impl ProcessorOperator for BroadcastJoinProbeProcessorOperator {
             && (self.core.is_build_loaded() || self.state.has_build())
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }
         self.init_profile_if_needed();
         if self.finishing {
-            return Err("broadcast join probe received input after set_finishing".to_string());
+            return Err("broadcast join probe received input after set_finishing"
+                .to_string()
+                .into());
         }
         if self.pending_output.is_some() {
             return Err(
-                "broadcast join probe received input while output buffer is full".to_string(),
+                "broadcast join probe received input while output buffer is full"
+                    .to_string()
+                    .into(),
             );
         }
         if !self.core.is_build_loaded() {
@@ -243,7 +249,7 @@ impl ProcessorOperator for BroadcastJoinProbeProcessorOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         if self.pending_output.is_none() && self.core.has_pending_output() {
             self.pending_output = self.core.pop_pending_output()?;
         }
@@ -263,7 +269,7 @@ impl ProcessorOperator for BroadcastJoinProbeProcessorOperator {
         Ok(out)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }

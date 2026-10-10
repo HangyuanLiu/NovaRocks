@@ -47,12 +47,21 @@ use crate::planner::payload::{
 pub(crate) fn try_to_optimizer_expr(
     plan: &LogicalPlanNode,
     scalars: &mut ScalarArena,
-) -> Result<OptExpr, String> {
-    Ok(to_optimizer_expr_unchecked(plan, scalars))
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<OptExpr, crate::compiler::SqlCompileError> {
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::LowerProgram,
+    )?;
+    let expression = to_optimizer_expr_unchecked(plan, scalars, &mut work)?;
+    work.finish()?;
+    Ok(expression)
 }
 
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn to_optimizer_expr(plan: &LogicalPlanNode, scalars: &mut ScalarArena) -> OptExpr {
-    try_to_optimizer_expr(plan, scalars).expect("invalid logical plan stage")
+    try_to_optimizer_expr(plan, scalars, crate::optimizer::test_optimizer_control())
+        .expect("invalid logical plan stage")
 }
 
 fn aggregate_output_layout_from_plan(
@@ -96,34 +105,42 @@ fn aggregate_output_layout_from_plan(
     AggregateOutputLayout::new(group_key_columns, aggregate_columns)
 }
 
-fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena) -> OptExpr {
+fn to_optimizer_expr_unchecked(
+    plan: &LogicalPlanNode,
+    scalars: &mut ScalarArena,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<OptExpr, crate::compiler::SqlCompileError> {
+    work.step()?;
+    let control = work.control();
     if matches!(plan.kind, LogicalPlanKind::Project(_)) && plan.children.len() == 1 {
         let mut spine = Vec::new();
         let mut base = plan;
         while matches!(base.kind, LogicalPlanKind::Project(_)) && base.children.len() == 1 {
+            work.step()?;
             spine.push(base);
             base = &base.children[0];
         }
         if spine.len() > 1 {
-            let mut child = to_optimizer_expr_unchecked(base, scalars);
+            let mut child = to_optimizer_expr_unchecked(base, scalars, work)?;
             while let Some(node) = spine.pop() {
+                work.step()?;
                 let LogicalPlanKind::Project(project) = &node.kind else {
                     unreachable!("the collected spine contains only projects")
                 };
                 child = OptExpr::new(
                     Operator::LogicalProject(ProjectOp {
-                        items: intern_project_items(scalars, &project.items),
+                        items: intern_project_items(scalars, &project.items, control)?,
                         output_qualifier: project.output_qualifier.clone(),
                     }),
                     vec![child],
                 );
                 child.required_output_columns = node.required_output_columns.clone();
             }
-            return child;
+            return Ok(child);
         }
     }
-    if let Some(flattened) = flatten_homogeneous_union_all(plan, scalars) {
-        return flattened;
+    if let Some(flattened) = flatten_homogeneous_union_all(plan, scalars, work)? {
+        return Ok(flattened);
     }
     // A parsed UNION chain is left-associated. Convert its spine bottom-up so
     // bridge stack depth depends on one branch, not the number of branches.
@@ -131,16 +148,18 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
         let mut spine = Vec::new();
         let mut base = plan;
         while matches!(base.kind, LogicalPlanKind::Union(_)) && base.children.len() == 2 {
+            work.step()?;
             spine.push(base);
             base = &base.children[0];
         }
         if spine.len() > 1 {
-            let mut left = to_optimizer_expr_unchecked(base, scalars);
+            let mut left = to_optimizer_expr_unchecked(base, scalars, work)?;
             while let Some(node) = spine.pop() {
+                work.step()?;
                 let LogicalPlanKind::Union(union) = &node.kind else {
                     unreachable!("the collected spine contains only unions")
                 };
-                let right = to_optimizer_expr_unchecked(&node.children[1], scalars);
+                let right = to_optimizer_expr_unchecked(&node.children[1], scalars, work)?;
                 let child_output_columns = node
                     .children
                     .iter()
@@ -156,12 +175,13 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
                 );
                 left.required_output_columns = node.required_output_columns.clone();
             }
-            return left;
+            return Ok(left);
         }
     }
     let mut expr = match &plan.kind {
         LogicalPlanKind::Scan(node) => {
             for column in &node.columns {
+                work.step()?;
                 scalars.remember_source_column_display(
                     column.column_id,
                     node.alias.clone(),
@@ -174,7 +194,7 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
                 alias: node.alias.clone(),
                 stats_ref: None,
                 columns: node.columns.clone(),
-                predicates: intern_exprs(scalars, &node.predicates),
+                predicates: intern_exprs(scalars, &node.predicates, control)?,
                 required_columns: node.required_columns.clone(),
                 variant_columns: node.variant_columns.clone(),
                 mv_rewritten_from: None,
@@ -183,32 +203,33 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
         }
 
         LogicalPlanKind::Filter(node) => {
-            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars);
+            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars, work)?;
             let op = Operator::LogicalFilter(FilterOp {
-                predicate: intern_typed(scalars, &node.predicate),
+                predicate: intern_typed(scalars, &node.predicate, control)?,
             });
             OptExpr::new(op, vec![child])
         }
 
         LogicalPlanKind::Project(node) => {
-            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars);
+            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars, work)?;
             let op = Operator::LogicalProject(ProjectOp {
-                items: intern_project_items(scalars, &node.items),
+                items: intern_project_items(scalars, &node.items, control)?,
                 output_qualifier: node.output_qualifier.clone(),
             });
             OptExpr::new(op, vec![child])
         }
 
         LogicalPlanKind::Aggregate(node) => {
-            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars);
-            let group_by = intern_exprs(scalars, &node.group_by);
-            let aggregates = intern_aggregate_calls(scalars, &node.aggregates);
+            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars, work)?;
+            let group_by = intern_exprs(scalars, &node.group_by, control)?;
+            let aggregates = intern_aggregate_calls(scalars, &node.aggregates, control)?;
             let output_layout = aggregate_output_layout_from_plan(
                 node.group_by.len(),
                 &aggregates,
                 &node.output_columns,
             );
             for (scalar_id, output) in group_by.iter().zip(output_layout.group_key_columns.iter()) {
+                work.step()?;
                 scalars.remember_column_display_from_scalar(output.column_id, *scalar_id);
             }
             let op = Operator::LogicalAggregate(LogicalAggregateOp::single(
@@ -221,23 +242,28 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
         }
 
         LogicalPlanKind::Join(node) => {
-            let left = to_optimizer_expr_unchecked(plan.left(), scalars);
-            let right = to_optimizer_expr_unchecked(plan.right(), scalars);
+            let left = to_optimizer_expr_unchecked(plan.left(), scalars, work)?;
+            let right = to_optimizer_expr_unchecked(plan.right(), scalars, work)?;
             let op = Operator::LogicalJoin(LogicalJoinOp {
                 join_type: node.join_type,
                 condition: node
                     .condition
                     .as_ref()
-                    .map(|condition| intern_typed(scalars, condition)),
+                    .map(|condition| intern_typed(scalars, condition, control))
+                    .transpose()?,
             });
             OptExpr::new(op, vec![left, right])
         }
 
         LogicalPlanKind::Sort(node) => {
-            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars);
+            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars, work)?;
             let op = Operator::LogicalSort(SortOp {
-                items: intern_sort_items(scalars, &node.items),
-                analytic_partition_exprs: intern_exprs(scalars, &node.analytic_partition_by),
+                items: intern_sort_items(scalars, &node.items, control)?,
+                analytic_partition_exprs: intern_exprs(
+                    scalars,
+                    &node.analytic_partition_by,
+                    control,
+                )?,
                 partition_limit: node.partition_limit,
                 topn_type: node.topn_type,
             });
@@ -245,7 +271,7 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
         }
 
         LogicalPlanKind::Limit(node) => {
-            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars);
+            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars, work)?;
             let op = Operator::LogicalLimit(LimitOp {
                 limit: node.limit,
                 offset: node.offset,
@@ -262,8 +288,8 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
             let children: Vec<OptExpr> = plan
                 .children
                 .iter()
-                .map(|input| to_optimizer_expr_unchecked(input, scalars))
-                .collect();
+                .map(|input| to_optimizer_expr_unchecked(input, scalars, work))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
             let op = Operator::LogicalUnion(UnionOp {
                 all: node.all,
                 output_columns: node.output_columns.clone(),
@@ -281,8 +307,8 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
             let children: Vec<OptExpr> = plan
                 .children
                 .iter()
-                .map(|input| to_optimizer_expr_unchecked(input, scalars))
-                .collect();
+                .map(|input| to_optimizer_expr_unchecked(input, scalars, work))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
             let op = Operator::LogicalIntersect(IntersectOp {
                 output_columns: node.output_columns.clone(),
                 child_output_columns,
@@ -299,8 +325,8 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
             let children: Vec<OptExpr> = plan
                 .children
                 .iter()
-                .map(|input| to_optimizer_expr_unchecked(input, scalars))
-                .collect();
+                .map(|input| to_optimizer_expr_unchecked(input, scalars, work))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
             let op = Operator::LogicalExcept(ExceptOp {
                 output_columns: node.output_columns.clone(),
                 child_output_columns,
@@ -310,11 +336,14 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
 
         LogicalPlanKind::Values(node) => {
             let op = Operator::LogicalValues(ValuesOp {
-                rows: node
-                    .rows
-                    .iter()
-                    .map(|row| intern_exprs(scalars, row))
-                    .collect(),
+                rows: {
+                    let mut rows = Vec::with_capacity(node.rows.len());
+                    for row in &node.rows {
+                        work.step()?;
+                        rows.push(intern_exprs(scalars, row, control)?);
+                    }
+                    rows
+                },
                 columns: node.columns.clone(),
             });
             OptExpr::leaf(op)
@@ -333,10 +362,10 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
         }
 
         LogicalPlanKind::TableFunction(node) => {
-            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars);
+            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars, work)?;
             let op = Operator::LogicalTableFunction(TableFunctionOp {
                 function_name: node.function_name.clone(),
-                args: intern_exprs(scalars, &node.args),
+                args: intern_exprs(scalars, &node.args, control)?,
                 binding: node.binding.clone(),
                 output_columns: node.output_columns.clone(),
                 alias: node.alias.clone(),
@@ -346,16 +375,16 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
         }
 
         LogicalPlanKind::Window(node) => {
-            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars);
+            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars, work)?;
             let op = Operator::LogicalWindow(WindowOp {
-                window_exprs: intern_window_exprs(scalars, &node.window_exprs),
+                window_exprs: intern_window_exprs(scalars, &node.window_exprs, control)?,
                 output_columns: node.output_columns.clone(),
             });
             OptExpr::new(op, vec![child])
         }
 
         LogicalPlanKind::Repeat(node) => {
-            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars);
+            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars, work)?;
             let op = Operator::LogicalRepeat(RepeatOp {
                 repeat_column_ref_list: node.repeat_column_ref_list.clone(),
                 repeat_column_ref_ids: node.repeat_column_ref_ids.clone(),
@@ -381,8 +410,8 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
         }
 
         LogicalPlanKind::CTEAnchor(node) => {
-            let produce = to_optimizer_expr_unchecked(plan.child(0), scalars);
-            let consumer = to_optimizer_expr_unchecked(plan.child(1), scalars);
+            let produce = to_optimizer_expr_unchecked(plan.child(0), scalars, work)?;
+            let consumer = to_optimizer_expr_unchecked(plan.child(1), scalars, work)?;
             let op = Operator::LogicalCTEAnchor(CTEAnchorOp {
                 cte_id: node.cte_id,
             });
@@ -390,7 +419,7 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
         }
 
         LogicalPlanKind::CTEProduce(node) => {
-            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars);
+            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars, work)?;
             let op = Operator::LogicalCTEProduce(CTEProduceOp {
                 cte_id: node.cte_id,
                 output_columns: node.output_columns.clone(),
@@ -399,7 +428,7 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
         }
 
         LogicalPlanKind::AssertOneRow(node) => {
-            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars);
+            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars, work)?;
             let op = Operator::LogicalAssertOneRow(AssertOneRowOp {
                 subquery_text: node.subquery_text.clone(),
             });
@@ -411,19 +440,20 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
             // conversion. Building an OptExpr here allows the rewrite rules
             // (subquery/ and imv/ dirs) to operate on OptExpr trees. After
             // rewrite the SubqueryRewrite backstop asserts no Apply remains.
-            let outer = to_optimizer_expr_unchecked(plan.left(), scalars);
-            let inner = to_optimizer_expr_unchecked(plan.right(), scalars);
+            let outer = to_optimizer_expr_unchecked(plan.left(), scalars, work)?;
+            let inner = to_optimizer_expr_unchecked(plan.right(), scalars, work)?;
             let op = Operator::LogicalApply(ApplyOp {
                 kind: node.kind,
-                subquery_expr: intern_typed(scalars, &node.subquery_expr),
+                subquery_expr: intern_typed(scalars, &node.subquery_expr, control)?,
                 output_column: node.output_column.clone(),
                 inner_output_column_id: node.inner_output_column_id,
                 correlation_column_ids: node.correlation_column_ids.clone(),
-                correlation_conjuncts: intern_exprs(scalars, &node.correlation_conjuncts),
+                correlation_conjuncts: intern_exprs(scalars, &node.correlation_conjuncts, control)?,
                 residual_predicate: node
                     .residual_predicate
                     .as_ref()
-                    .map(|e| intern_typed(scalars, e)),
+                    .map(|e| intern_typed(scalars, e, control))
+                    .transpose()?,
                 need_check_max_rows: node.need_check_max_rows,
                 use_semi_anti: node.use_semi_anti,
                 uncorrelated_outer_predicate_columns: node
@@ -435,7 +465,7 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
 
         LogicalPlanKind::ImvDelta(node) => {
             // ImvDelta wraps a child subtree (the base plan being rewritten).
-            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars);
+            let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars, work)?;
             let op = Operator::LogicalImvDelta(ImvDeltaOp {
                 is_root: node.is_root,
                 action_column: node.action_column,
@@ -452,13 +482,13 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
             if plan.children.is_empty() {
                 OptExpr::leaf(op)
             } else {
-                let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars);
+                let child = to_optimizer_expr_unchecked(plan.unary_input(), scalars, work)?;
                 OptExpr::new(op, vec![child])
             }
         }
     };
     expr.required_output_columns = plan.required_output_columns.clone();
-    expr
+    Ok(expr)
 }
 
 /// Flatten a long UNION ALL only when every branch already has the root's
@@ -467,17 +497,30 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
 fn flatten_homogeneous_union_all(
     plan: &LogicalPlanNode,
     scalars: &mut ScalarArena,
-) -> Option<OptExpr> {
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<Option<OptExpr>, crate::compiler::SqlCompileError> {
+    enum CompareError {
+        Control(novarocks_type_contract::CompileControlError),
+        Type(novarocks_type_contract::ValueTypeError),
+    }
+    impl From<novarocks_type_contract::ValueTypeError> for CompareError {
+        fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+            Self::Type(error)
+        }
+    }
+    work.step()?;
+    let control = work.control();
     let LogicalPlanKind::Union(root) = &plan.kind else {
-        return None;
+        return Ok(None);
     };
     if !root.all {
-        return None;
+        return Ok(None);
     }
     let mut pending = vec![plan];
     let mut leaves = Vec::new();
     let mut flattened = 0;
     while let Some(node) = pending.pop() {
+        work.step()?;
         match &node.kind {
             LogicalPlanKind::Union(union)
                 if union.all
@@ -492,28 +535,50 @@ fn flatten_homogeneous_union_all(
         }
     }
     if flattened < 2 {
-        return None;
+        return Ok(None);
     }
-    let child_output_columns: Vec<_> = leaves
-        .iter()
-        .map(|leaf| crate::planner::plan_output_columns(leaf).ok())
-        .collect::<Option<_>>()?;
-    if child_output_columns
-        .iter()
-        .any(|columns: &Vec<OutputColumn>| {
-            columns.len() != root.output_columns.len()
-                || columns
-                    .iter()
-                    .zip(&root.output_columns)
-                    .any(|(child, output)| child.data_type != output.data_type)
-        })
-    {
-        return None;
+    let mut child_output_columns = Vec::with_capacity(leaves.len());
+    for leaf in &leaves {
+        work.step()?;
+        // Existing output derivation/cloning is opaque. Observe its boundary;
+        // this does not claim its internal allocations are governed here.
+        work.flush()?;
+        let columns = crate::planner::plan_output_columns(leaf);
+        control.checkpoint(novarocks_type_contract::CompilePhase::LowerProgram, 0)?;
+        let Ok(columns) = columns else {
+            return Ok(None);
+        };
+        child_output_columns.push(columns);
     }
-    let children = leaves
-        .into_iter()
-        .map(|leaf| to_optimizer_expr_unchecked(leaf, scalars))
-        .collect();
+    for columns in &child_output_columns {
+        work.step()?;
+        if columns.len() != root.output_columns.len() {
+            return Ok(None);
+        }
+        for (child, output) in columns.iter().zip(&root.output_columns) {
+            work.step()?;
+            if child.value_type.logical_type != output.value_type.logical_type
+                || !novarocks_type_contract::arrow_data_types_exact_observed::<CompareError>(
+                    &child.value_type.data_type,
+                    &output.value_type.data_type,
+                    || work.step().map_err(CompareError::Control),
+                )
+                .map_err(|error| match error {
+                    CompareError::Control(error) => crate::compiler::SqlCompileError::from(error),
+                    CompareError::Type(error) => {
+                        crate::compiler::SqlCompileError::Compilation(error.to_string())
+                    }
+                })?
+            {
+                return Ok(None);
+            }
+        }
+    }
+    let mut children = Vec::with_capacity(leaves.len());
+    for leaf in leaves {
+        work.step()?;
+        children.push(to_optimizer_expr_unchecked(leaf, scalars, work)?);
+    }
     let mut expression = OptExpr::new(
         Operator::LogicalUnion(UnionOp {
             all: true,
@@ -523,7 +588,7 @@ fn flatten_homogeneous_union_all(
         children,
     );
     expression.required_output_columns = plan.required_output_columns.clone();
-    Some(expression)
+    Ok(Some(expression))
 }
 
 /// Bridge 2 (reverse): convert an `OptExpr` tree back into a `LogicalPlanNode`
@@ -723,9 +788,13 @@ mod tests {
     use std::sync::Arc;
 
     fn logical_plan_to_memo_for_test(plan: &LogicalPlanNode, memo: &mut Memo) -> GroupId {
-        let opt_expr =
-            try_to_optimizer_expr(plan, &mut memo.scalars).expect("logical plan to opt expr");
-        opt_expr_to_memo(&opt_expr, memo)
+        let opt_expr = try_to_optimizer_expr(
+            plan,
+            &mut memo.scalars,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("logical plan to opt expr");
+        opt_expr_to_memo(&opt_expr, memo, crate::optimizer::test_optimizer_control()).unwrap()
     }
 
     fn dummy_table_def() -> TableDef {
@@ -747,8 +816,8 @@ mod tests {
         vec![OutputColumn {
             column_id: ColumnId::UNSET,
             name: "id".to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
             is_internal: false,
         }]
     }
@@ -757,8 +826,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -794,8 +863,12 @@ mod tests {
         );
 
         let mut scalars = ScalarArena::new();
-        let opt_expr =
-            try_to_optimizer_expr(&scan, &mut scalars).expect("logical scan to opt expr");
+        let opt_expr = try_to_optimizer_expr(
+            &scan,
+            &mut scalars,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("logical scan to opt expr");
 
         let Operator::LogicalScan(op) = opt_expr.op else {
             panic!("expected logical scan");
@@ -819,8 +892,12 @@ mod tests {
         );
 
         let mut scalars = ScalarArena::new();
-        let opt_expr =
-            try_to_optimizer_expr(&sort, &mut scalars).expect("logical sort to opt expr");
+        let opt_expr = try_to_optimizer_expr(
+            &sort,
+            &mut scalars,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("logical sort to opt expr");
 
         let Operator::LogicalSort(op) = opt_expr.op else {
             panic!("expected logical sort");
@@ -851,8 +928,12 @@ mod tests {
         );
 
         let mut scalars = ScalarArena::new();
-        let opt_expr =
-            try_to_optimizer_expr(&repeat, &mut scalars).expect("logical repeat to opt expr");
+        let opt_expr = try_to_optimizer_expr(
+            &repeat,
+            &mut scalars,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("logical repeat to opt expr");
 
         let Operator::LogicalRepeat(op) = opt_expr.op else {
             panic!("expected logical repeat");
@@ -888,7 +969,12 @@ mod tests {
             crate::optimizer::stats_input::OptimizerStatsInput::from_test_table_statistics(
                 &std::collections::HashMap::new(),
             );
-        crate::optimizer::stats::derive_group_statistics(&mut memo, &stats_input);
+        crate::optimizer::stats::derive_group_statistics(
+            &mut memo,
+            &stats_input,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let output_columns = &memo.groups[root]
             .logical_props
@@ -950,23 +1036,19 @@ mod tests {
     fn variant_path_scan_descriptor_survives_physical_conversion() {
         let source_column_id = ColumnId::new_for_test(100);
         let synthetic_column_id = ColumnId::new_for_test(101);
-        let variant_descriptor = ScanVariantColumn {
+        let source_type =
+            novarocks_type_contract::FunctionValueType::new(DataType::LargeBinary, true);
+        let variant_descriptor = ScanVariantColumn::test_fixture(
             source_column_id,
-            source_column: "payload".to_string(),
+            "payload".to_string(),
             synthetic_column_id,
-            synthetic_column: "__nr_var_payload_0".to_string(),
-            canonical_path: "$.user.id".to_string(),
-            requested_type: DataType::Int64,
-            requested_type_literal: "bigint".to_string(),
-            strict: true,
-            binding: crate::analysis::test_function_binding(
-                "variant_get",
-                &[],
-                DataType::Int64,
-                true,
-                novarocks_functions::FunctionVolatility::Immutable,
-            ),
-        };
+            "__nr_var_payload_0".to_string(),
+            "$.user.id".to_string(),
+            DataType::Int64,
+            "bigint".to_string(),
+            true,
+            source_type.clone(),
+        );
 
         let scan = LogicalPlanNode::new(
             LogicalPlanKind::Scan(PlanScanNode {
@@ -977,15 +1059,18 @@ mod tests {
                     OutputColumn {
                         column_id: source_column_id,
                         name: "payload".to_string(),
-                        data_type: DataType::LargeBinary,
-                        nullable: true,
+                        value_type: source_type.clone(),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: synthetic_column_id,
                         name: "__nr_var_payload_0".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: true,
                     },
                 ],
@@ -1007,7 +1092,13 @@ mod tests {
         };
         logical_scan.stats_ref = Some(stats_ref);
 
-        let physical = ScanToPhysical.apply(&logical_expr, &mut memo);
+        let physical = ScanToPhysical
+            .apply(
+                &logical_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(physical.len(), 1);
         let Operator::PhysicalScan(scan) = &physical[0].op else {
@@ -1016,16 +1107,34 @@ mod tests {
         assert_eq!(scan.stats_ref, Some(stats_ref));
         assert_eq!(scan.variant_columns.len(), 1);
         let actual = &scan.variant_columns[0];
-        assert_eq!(actual.source_column_id, variant_descriptor.source_column_id);
-        assert_eq!(actual.source_column, variant_descriptor.source_column);
         assert_eq!(
-            actual.synthetic_column_id,
-            variant_descriptor.synthetic_column_id
+            actual.source_column_id(),
+            variant_descriptor.source_column_id()
         );
-        assert_eq!(actual.synthetic_column, variant_descriptor.synthetic_column);
-        assert_eq!(actual.canonical_path, variant_descriptor.canonical_path);
-        assert_eq!(actual.requested_type, variant_descriptor.requested_type);
-        assert_eq!(actual.strict, variant_descriptor.strict);
+        assert_eq!(actual.source_column(), variant_descriptor.source_column());
+        assert_eq!(
+            actual.synthetic_column_id(),
+            variant_descriptor.synthetic_column_id()
+        );
+        assert_eq!(
+            actual.synthetic_column(),
+            variant_descriptor.synthetic_column()
+        );
+        assert_eq!(actual.canonical_path(), variant_descriptor.canonical_path());
+        assert_eq!(actual.requested_type(), variant_descriptor.requested_type());
+        assert_eq!(actual.strict(), variant_descriptor.strict());
+        assert!(Arc::ptr_eq(actual.source(), variant_descriptor.source()));
+        let request = actual.source().captured().request();
+        assert_eq!(request.arguments.len(), 3);
+        let novarocks_functions::FunctionArgument::Value {
+            value_type,
+            constant,
+        } = &request.arguments[0]
+        else {
+            panic!("original variant source channel");
+        };
+        assert_eq!(value_type, &source_type);
+        assert!(constant.is_none());
     }
 
     #[test]
@@ -1050,7 +1159,13 @@ mod tests {
         let mut memo = Memo::new();
         let gid = logical_plan_to_memo_for_test(&scan, &mut memo);
         let logical_expr = memo.groups[gid].logical_exprs[0].clone();
-        let mut physical = ScanToPhysical.apply(&logical_expr, &mut memo);
+        let mut physical = ScanToPhysical
+            .apply(
+                &logical_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(physical.len(), 1);
 
         let execution_props = PlanExecutionProps {
@@ -1093,8 +1208,7 @@ mod tests {
 
         let predicate = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Bool(true)),
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
 
         let filter = LogicalPlanNode::new(
@@ -1179,5 +1293,156 @@ mod tests {
             Operator::LogicalCTEAnchor(_)
         ));
         assert_eq!(memo.groups[3].logical_exprs[0].children, vec![1, 2]);
+    }
+
+    #[test]
+    fn actual_logical_bridge_observes_entry_wide_rows_and_final_tail() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        use std::sync::Mutex;
+        struct Stop {
+            reason: CompileControlError,
+            entry: bool,
+            calls: Mutex<Vec<u32>>,
+        }
+        impl PureCompileControl for Stop {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                if phase != CompilePhase::LowerProgram {
+                    return Ok(());
+                }
+                self.calls.lock().unwrap().push(units);
+                if self.entry || units > 0 {
+                    Err(self.reason)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        for reason in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for (rows, entry) in [(0, true), (320, false), (0, false)] {
+                let plan = LogicalPlanNode::new(
+                    LogicalPlanKind::Values(PlanValuesNode {
+                        rows: vec![vec![]; rows],
+                        columns: vec![],
+                    }),
+                    vec![],
+                    None,
+                );
+                let control = Stop {
+                    reason,
+                    entry,
+                    calls: Mutex::new(Vec::new()),
+                };
+                let result = try_to_optimizer_expr(&plan, &mut ScalarArena::new(), &control);
+                assert!(
+                    matches!(result, Err(ref error) if *error == crate::compiler::SqlCompileError::from(reason))
+                );
+                let calls = control.calls.lock().unwrap();
+                let positive = calls.iter().find(|&&units| units > 0).copied();
+                if entry {
+                    assert_eq!(calls.as_slice(), &[0]);
+                } else if rows > 256 {
+                    assert_eq!(positive, Some(256));
+                } else {
+                    assert!(positive.is_some_and(|units| units < 256));
+                }
+            }
+        }
+    }
+    #[test]
+    fn actual_typed_filter_bridge_preserves_interner_control_errors() {
+        use novarocks_type_contract::{
+            CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
+        };
+        use std::sync::Mutex;
+        struct StopInterner {
+            reason: CompileControlError,
+            entry: bool,
+            calls: Mutex<Vec<u32>>,
+        }
+        impl PureCompileControl for StopInterner {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                if phase != CompilePhase::Validate {
+                    return Ok(());
+                }
+                self.calls.lock().unwrap().push(units);
+                // Small child interners complete first. Refuse the parent's
+                // actual wide InList traversal at its first full quantum.
+                if self.entry || units == 256 {
+                    Err(self.reason)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let output = test_output_column(9001, "id");
+        let child = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: output.column_id,
+                qualifier: None,
+                column: output.name.clone(),
+            },
+            value_type: output.value_type.clone(),
+        };
+        let predicate = TypedExpr {
+            kind: ExprKind::InList {
+                expr: Box::new(child.clone()),
+                list: vec![child; 320],
+                negated: false,
+            },
+            value_type: FunctionValueType::new(DataType::Boolean, false),
+        };
+        let plan = LogicalPlanNode::new(
+            LogicalPlanKind::Filter(PlanFilterNode { predicate }),
+            vec![values_with_columns(vec![output])],
+            None,
+        );
+        for reason in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for entry in [true, false] {
+                let control = StopInterner {
+                    reason,
+                    entry,
+                    calls: Mutex::new(Vec::new()),
+                };
+                let mut scalars = ScalarArena::new();
+                assert!(
+                    matches!(try_to_optimizer_expr(&plan, &mut scalars, &control), Err(error) if error == crate::compiler::SqlCompileError::from(reason))
+                );
+                let calls = control.calls.lock().unwrap();
+                if entry {
+                    assert_eq!(calls.as_slice(), &[0]);
+                } else {
+                    assert_eq!(calls.iter().find(|&&units| units == 256), Some(&256));
+                    assert_eq!(calls.last(), Some(&256));
+                }
+            }
+        }
+        // The same real typed input succeeds with the explicit fixture owner.
+        let expression = try_to_optimizer_expr(
+            &plan,
+            &mut ScalarArena::new(),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        assert!(matches!(expression.op, Operator::LogicalFilter(_)));
+        assert!(matches!(
+            expression.children[0].op,
+            Operator::LogicalValues(_)
+        ));
     }
 }

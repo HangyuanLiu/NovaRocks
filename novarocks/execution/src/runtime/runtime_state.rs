@@ -14,6 +14,8 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
@@ -42,6 +44,7 @@ pub struct RuntimeState {
     mem_tracker: Option<std::sync::Arc<MemTracker>>,
     runtime_filter_session: Option<RuntimeFilterSessionRef>,
     execution_runtime: Option<std::sync::Arc<ExecutionRuntime>>,
+    query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
 }
 
 impl std::fmt::Debug for RuntimeState {
@@ -54,14 +57,15 @@ impl std::fmt::Debug for RuntimeState {
 
 #[derive(Debug, Default)]
 pub struct RuntimeErrorState {
-    error: std::sync::Mutex<Option<String>>,
+    error: std::sync::Mutex<Option<ExecutionFailure>>,
     stopped: std::sync::Condvar,
     #[cfg(test)]
     waiting: std::sync::atomic::AtomicUsize,
 }
 
 impl RuntimeErrorState {
-    pub fn set_error(&self, err: String) {
+    pub fn set_error(&self, err: impl Into<ExecutionFailure>) {
+        let err = err.into();
         let mut guard = self.error.lock().expect("runtime error lock");
         if guard.is_none() {
             *guard = Some(err);
@@ -69,7 +73,7 @@ impl RuntimeErrorState {
         }
     }
 
-    pub fn error(&self) -> Option<String> {
+    pub fn error(&self) -> Option<ExecutionFailure> {
         self.error.lock().expect("runtime error lock").clone()
     }
 
@@ -81,7 +85,7 @@ impl RuntimeErrorState {
     /// Wait without holding execution after this exact fragment stops.
     /// The predicate and notification share the error lock, including an error
     /// published before registration and spurious condition-variable wakes.
-    pub(crate) fn wait_interruptibly(&self, duration: std::time::Duration) -> Result<(), String> {
+    pub(crate) fn wait_interruptibly(&self, duration: std::time::Duration) -> ExecutionResult<()> {
         let guard = self.error.lock().expect("runtime error lock");
         #[cfg(test)]
         self.waiting.fetch_add(1, Ordering::Release);
@@ -114,6 +118,7 @@ impl Default for RuntimeState {
             mem_tracker: None,
             runtime_filter_session: None,
             execution_runtime: None,
+            query_memory: None,
         }
     }
 }
@@ -133,6 +138,7 @@ impl Clone for RuntimeState {
             mem_tracker: self.mem_tracker.clone(),
             runtime_filter_session: self.runtime_filter_session.clone(),
             execution_runtime: self.execution_runtime.clone(),
+            query_memory: self.query_memory.clone(),
         }
     }
 }
@@ -179,9 +185,20 @@ impl RuntimeState {
             mem_tracker,
             runtime_filter_session: None,
             execution_runtime,
+            query_memory: None,
         }
     }
 
+    pub(crate) fn with_query_memory(
+        mut self,
+        binding: Option<crate::runtime::query_memory::QueryMemoryBinding>,
+    ) -> Self {
+        self.query_memory = binding;
+        self
+    }
+    pub(crate) fn query_memory(&self) -> Option<&crate::runtime::query_memory::QueryMemoryBinding> {
+        self.query_memory.as_ref()
+    }
     pub fn with_runtime_filter_session(mut self, session: Option<RuntimeFilterSessionRef>) -> Self {
         self.runtime_filter_session = session;
         self
@@ -258,7 +275,7 @@ impl RuntimeState {
         self.execution_runtime.as_deref()
     }
 
-    pub fn error(&self) -> Option<String> {
+    pub fn error(&self) -> Option<ExecutionFailure> {
         self.error_state.error()
     }
 

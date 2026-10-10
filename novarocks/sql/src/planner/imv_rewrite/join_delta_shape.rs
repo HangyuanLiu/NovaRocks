@@ -134,8 +134,8 @@ fn unique_action_output_column_id(columns: &[OutputColumn]) -> Option<ColumnId> 
 fn valid_action_output_column_id(column: &OutputColumn) -> Option<ColumnId> {
     (column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)
         && column.is_internal
-        && column.data_type == DataType::Int8
-        && !column.nullable)
+        && column.value_type.data_type == DataType::Int8
+        && !column.value_type.nullable)
         .then_some(column.column_id)
 }
 
@@ -164,8 +164,8 @@ fn valid_project_action_column_id(item: &ProjectItem) -> Option<ColumnId> {
         return None;
     };
     (*column_id == item.output_column_id
-        && item.expr.data_type == DataType::Int8
-        && !item.expr.nullable)
+        && item.expr.value_type.data_type == DataType::Int8
+        && !item.expr.value_type.nullable)
         .then_some(item.output_column_id)
 }
 
@@ -350,8 +350,11 @@ mod tests {
                 columns: vec![OutputColumn {
                     column_id,
                     name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 predicates: Vec::new(),
@@ -429,8 +432,8 @@ mod tests {
         scan.columns.push(OutputColumn {
             column_id: action_id,
             name: ImvActionColumn::NAME.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         });
         plan
@@ -444,8 +447,7 @@ mod tests {
                     qualifier: None,
                     column: name.to_string(),
                 },
-                data_type,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
             },
             output_name: name.to_string(),
             output_column_id: column_id,
@@ -456,8 +458,7 @@ mod tests {
         ProjectItem {
             expr: TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::Int(1)),
-                data_type: DataType::Int8,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
             },
             output_name: ImvActionColumn::NAME.to_string(),
             output_column_id: action_id,
@@ -573,8 +574,8 @@ mod tests {
         let union = join_delta_union(vec![OutputColumn {
             column_id: ColumnId(1),
             name: "k".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }]);
 
@@ -590,15 +591,15 @@ mod tests {
             OutputColumn {
                 column_id: ColumnId(1),
                 name: "k".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             },
             OutputColumn {
                 column_id: ColumnId(100),
                 name: ImvActionColumn::NAME.to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: true,
             },
         ]);
@@ -615,8 +616,8 @@ mod tests {
             OutputColumn {
                 column_id: ColumnId(1),
                 name: "k".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             },
             ImvActionColumn::output_column(ColumnId(101)),

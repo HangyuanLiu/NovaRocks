@@ -126,7 +126,7 @@ pub(crate) fn validate_value(
                 // The value names what the expression produces, and may admit
                 // null where the expression does not: an exact value standing
                 // where null is admitted is sound. The reverse is not.
-                if expression.ty.data_type != value.ty.data_type
+                if !expression.ty.same_value_domain(&value.ty)
                     || (expression.ty.nullable && !value.ty.nullable)
                 {
                     errors.push(ValidationError::new(
@@ -157,7 +157,7 @@ pub(crate) fn validate_value(
                 None => require_node(fragment, *node, &path, errors),
             }
             if let Some(source) = fragment.values().get(of) {
-                if source.ty.data_type != value.ty.data_type || !value.ty.nullable {
+                if !source.ty.same_value_domain(&value.ty) || !value.ty.nullable {
                     errors.push(ValidationError::new(
                         &path,
                         "null-extended value must preserve the data type and be nullable",
@@ -312,7 +312,9 @@ pub(crate) fn validate_node(
             errors,
         );
     }
-    validate_node_output_properties(fragment, node, &path, errors);
+    if errors.checks_output_and_effect_proofs() {
+        validate_node_output_properties(fragment, node, &path, errors);
+    }
     let mut expressions = Vec::new();
     node.kind.expression_references(&mut expressions);
     for expression in expressions {
@@ -352,12 +354,11 @@ pub(crate) fn validate_node_output_closure(
     let input_values = indexes
         .visible_input(node.id)
         .expect("every fragment node has one indexed visible-input port");
-    let aggregate_call_ids = match &node.kind {
-        NodeKind::Aggregate { calls, .. } => {
-            calls.iter().map(|call| call.id).collect::<BTreeSet<_>>()
-        }
-        _ => BTreeSet::new(),
-    };
+    let aggregate_call_ids = node
+        .kind
+        .aggregate_contract()
+        .map(|(_, calls)| calls.iter().map(|call| call.id).collect::<BTreeSet<_>>())
+        .unwrap_or_default();
     let repeat_grouping_values = match &node.kind {
         NodeKind::Repeat {
             grouping_values, ..
@@ -382,7 +383,10 @@ pub(crate) fn validate_node_output_closure(
         }
         NodeKind::Filter { .. }
         | NodeKind::Sort { .. }
-        | NodeKind::TopN { .. }
+        | NodeKind::TopN {
+            reduction: crate::TopNReduction::Rows,
+            ..
+        }
         | NodeKind::Limit { .. }
         | NodeKind::AssertOneRow(_) => Some(input_columns.to_vec()),
         NodeKind::Project { expressions } => {
@@ -390,6 +394,13 @@ pub(crate) fn validate_node_output_closure(
         }
         NodeKind::Aggregate {
             group_by, calls, ..
+        }
+        | NodeKind::TopN {
+            reduction:
+                crate::TopNReduction::GroupedStates {
+                    group_by, calls, ..
+                },
+            ..
         } => Some(
             group_by
                 .iter()
@@ -629,7 +640,11 @@ pub(crate) fn value_origin_allowed(
             ValueOrigin::Expr { node: owner, .. },
         ) => *owner == node.id,
         (
-            NodeKind::Aggregate { .. },
+            NodeKind::Aggregate { .. }
+            | NodeKind::TopN {
+                reduction: crate::TopNReduction::GroupedStates { .. },
+                ..
+            },
             ValueOrigin::AggregateState { call, .. } | ValueOrigin::AggregateResult { call },
         ) => aggregate_call_ids.contains(call),
         (
@@ -812,127 +827,7 @@ pub(crate) fn validate_node_semantics(
             calls,
             grouping,
         } => {
-            // A call that finalizes has read every row of its group, so a
-            // node carrying one states its groups are complete.  The reverse
-            // does not follow: a node can finish its groups and still hand on
-            // state, which is what the phase between a dedup and the rollup
-            // that reads it does.  Whether a node that claims complete groups
-            // really has them is decided by its input's distribution, not by
-            // its calls.
-            if calls.iter().any(|call| {
-                matches!(
-                    call.binding.phase,
-                    crate::AggregatePhase::Single | crate::AggregatePhase::Final { .. }
-                )
-            }) && *grouping != crate::AggregateGrouping::Complete
-            {
-                errors.push(ValidationError::new(
-                    path,
-                    "aggregate finalizes a call on groups it does not state are complete",
-                ));
-            }
-            for (expression_id, output) in group_by {
-                match (
-                    fragment.expressions().get(*expression_id),
-                    fragment.values().get(output),
-                ) {
-                    (Some(expression_node), Some(value))
-                        if expression_node.ty == value.ty
-                            && (matches!(expression_node.kind, ExprKind::Value(source) if source == *output)
-                                || matches!(
-                                    value.origin,
-                                    ValueOrigin::Expr { node: owner, expr }
-                                        if owner == node.id && expr == *expression_id
-                                )) => {}
-                    (Some(_), Some(_)) => errors.push(ValidationError::new(
-                        path,
-                        "aggregate grouping output has inconsistent expression, type or origin",
-                    )),
-                    _ => {}
-                }
-            }
-            let mut ids = BTreeSet::new();
-            // A node emits one row per group, and every call on it either
-            // finishes its value there or hands on a state -- the engine
-            // finalizes a node, not a call. Which side of that a call is on
-            // is the only phase fact the calls must share: `count(distinct x),
-            // sum(y)` finishing together reads values for one and a state for
-            // the other, and the dedup below it starts one state while
-            // merging the other.
-            let finalizes = calls
-                .first()
-                .map(|call| call.binding.phase.produces_final_result());
-            for call in calls {
-                if !ids.insert(call.id) {
-                    errors.push(ValidationError::new(
-                        path,
-                        "aggregate call identity is duplicated",
-                    ));
-                }
-                if call.binding.function.kind != FunctionKind::Aggregate {
-                    errors.push(ValidationError::new(
-                        path,
-                        "aggregate node has non-aggregate binding",
-                    ));
-                }
-                if finalizes
-                    .is_some_and(|expected| expected != call.binding.phase.produces_final_result())
-                {
-                    errors.push(ValidationError::new(
-                        path,
-                        "aggregate node finishes some calls and hands others on",
-                    ));
-                }
-                validate_aggregate_value_inputs(
-                    fragment,
-                    &call.binding,
-                    &call.arguments,
-                    &call.order_by,
-                    path,
-                    errors,
-                );
-                if !call.binding.phase.consumes_logical_arguments() && call.distinct {
-                    errors.push(ValidationError::new(
-                        path,
-                        "state-consuming aggregate phase cannot apply DISTINCT again",
-                    ));
-                }
-                if let Some(output) = fragment.values().get(&call.output) {
-                    let expected = match call.binding.phase {
-                        AggregatePhase::Single | AggregatePhase::Final { .. } => {
-                            &call.binding.function.result_type
-                        }
-                        AggregatePhase::Partial { .. } | AggregatePhase::Intermediate { .. } => {
-                            &call.binding.intermediate_type
-                        }
-                    };
-                    if &output.ty != expected {
-                        errors.push(ValidationError::new(
-                            path,
-                            "aggregate output type differs from phase output",
-                        ));
-                    }
-                    let expected_origin = match call.binding.phase {
-                        AggregatePhase::Single | AggregatePhase::Final { .. } => matches!(
-                            output.origin,
-                            ValueOrigin::AggregateResult { call: id } if id == call.id
-                        ),
-                        AggregatePhase::Partial { .. } | AggregatePhase::Intermediate { .. } => {
-                            matches!(
-                                output.origin,
-                                ValueOrigin::AggregateState { call: id, phase }
-                                    if id == call.id && phase == call.binding.phase
-                            )
-                        }
-                    };
-                    if !expected_origin {
-                        errors.push(ValidationError::new(
-                            path,
-                            "aggregate output origin differs from the call phase",
-                        ));
-                    }
-                }
-            }
+            validate_aggregate_contract(fragment, node, group_by, calls, *grouping, path, errors);
         }
         NodeKind::HashJoin {
             kind,
@@ -977,7 +872,7 @@ pub(crate) fn validate_node_semantics(
                 if let (Some(left), Some(right)) = (
                     fragment.expressions().get(key.left),
                     fragment.expressions().get(key.right),
-                ) && left.ty.data_type != right.ty.data_type
+                ) && !left.ty.same_value_domain(&right.ty)
                 {
                     errors.push(ValidationError::new(
                         path,
@@ -1128,8 +1023,7 @@ pub(crate) fn validate_node_semantics(
                 require_boolean_expression(fragment, *predicate, path, errors);
             }
             validate_null_extended(fragment, node.id, null_extended, path, errors);
-            if nest_loop_join_output_distribution(fragment, node, *kind, *distribution, *predicate)
-                .is_none()
+            if nest_loop_join_placement_distribution(fragment, node, *kind, *distribution).is_none()
             {
                 errors.push(ValidationError::new(
                     path,
@@ -1198,8 +1092,40 @@ pub(crate) fn validate_node_semantics(
             limit,
             offset,
             phase,
+            reduction,
         } => {
-            require_passthrough_output(fragment, node, path, errors);
+            match reduction {
+                crate::TopNReduction::Rows => {
+                    require_passthrough_output(fragment, node, path, errors)
+                }
+                crate::TopNReduction::GroupedStates {
+                    group_by,
+                    calls,
+                    comparator,
+                } => {
+                    validate_aggregate_contract(
+                        fragment,
+                        node,
+                        group_by,
+                        calls,
+                        crate::AggregateGrouping::Partial,
+                        path,
+                        errors,
+                    );
+                    validate_grouped_topn(
+                        fragment,
+                        node,
+                        order_by,
+                        *offset,
+                        *phase,
+                        group_by,
+                        calls,
+                        *comparator,
+                        path,
+                        errors,
+                    );
+                }
+            }
             validate_ordering_expressions(fragment, node, indexes, order_by, path, errors);
             if order_by.is_empty() {
                 errors.push(ValidationError::new(path, "TopN order is empty"));
@@ -1271,7 +1197,7 @@ pub(crate) fn validate_node_semantics(
                             fragment.values().get(input_value),
                             fragment.values().get(output_value),
                         )
-                        && (input_value.ty.data_type != output_value.ty.data_type
+                        && (!input_value.ty.same_value_domain(&output_value.ty)
                             || (input_value.ty.nullable && !output_value.ty.nullable))
                     {
                         // A set operation's column admits null when any branch
@@ -1419,6 +1345,12 @@ pub(crate) fn validate_node_semantics(
             );
             let mut target_tokens = BTreeSet::new();
             for field in &target.target_fields {
+                if field.provider_name.is_empty() {
+                    errors.push(ValidationError::new(
+                        path,
+                        "table writer target field has an empty provider name",
+                    ));
+                }
                 if !target_tokens.insert(&field.token) {
                     errors.push(ValidationError::new(
                         path,
@@ -1430,7 +1362,7 @@ pub(crate) fn validate_node_semantics(
                     // value it reads must have that data type. Either side
                     // may admit more nulls; whether this row can be written
                     // is the target's answer when the row reaches it.
-                    Some(value) if value.ty.data_type != field.ty.data_type => {
+                    Some(value) if !value.ty.same_value_domain(&field.ty) => {
                         errors.push(ValidationError::new(
                             path,
                             format!(
@@ -1567,15 +1499,13 @@ pub(crate) fn validate_node_semantics(
             outputs,
             left_outer,
         } => {
-            if !function
-                .intrinsic_row_error
-                .is_valid_for_kind(crate::FunctionKind::Table)
-            {
-                errors.push(ValidationError::new(
-                    path,
-                    "bound table function has a non-row intrinsic fact",
-                ));
-            }
+            validate_legacy_binding_metadata(
+                function.legacy_metadata.as_ref(),
+                crate::FunctionKind::Table,
+                path,
+                "bound table function has a non-row intrinsic fact",
+                errors,
+            );
             if function.result_types.is_empty() {
                 errors.push(ValidationError::new(
                     path,
@@ -1963,7 +1893,7 @@ pub(crate) fn validate_node_semantics(
                             fragment.values().get(output),
                             fragment.expressions().get(*expression),
                         )
-                        && (output.ty.data_type != expression.ty.data_type
+                        && (!output.ty.same_value_domain(&expression.ty)
                             || (expression.ty.nullable && !output.ty.nullable))
                     {
                         errors.push(ValidationError::new(
@@ -2295,7 +2225,7 @@ pub(crate) fn validate_writer_aggregates(
         // nothing in it. What the aggregate is, is its type; whether a given
         // row may be written is the target's own answer.
         if let (Some(expected), Some(actual)) = (expected_input, fragment.values().get(&call.input))
-            && expected.data_type != actual.ty.data_type
+            && !expected.same_value_domain(&actual.ty)
         {
             errors.push(ValidationError::new(
                 path,
@@ -2320,7 +2250,7 @@ pub(crate) fn validate_writer_aggregates(
         // non-null while the phase can produce a null would be read as a value
         // that was never written.
         if let Some(actual) = fragment.values().get(&call.output)
-            && (actual.ty.data_type != expected_output.data_type
+            && (!actual.ty.same_value_domain(expected_output)
                 || (expected_output.nullable && !actual.ty.nullable))
         {
             errors.push(ValidationError::new(
@@ -2457,7 +2387,7 @@ pub(crate) fn validate_unpivot(
             fragment.values().get(&mapping.input),
             fragment.values().get(&spec.value_output),
         ) {
-            if input.ty.data_type != output.ty.data_type {
+            if !input.ty.same_value_domain(&output.ty) {
                 errors.push(ValidationError::new(
                     path,
                     "unpivot mapping input type differs from its value output",
@@ -2729,7 +2659,7 @@ pub(crate) fn validate_writer_grouped_unpivot(
         if let (Some(input), Some(output)) = (
             fragment.values().get(&mapping.input),
             fragment.values().get(&spec.value_output),
-        ) && input.ty.data_type != output.ty.data_type
+        ) && !input.ty.same_value_domain(&output.ty)
         {
             errors.push(ValidationError::new(
                 path,
@@ -2815,16 +2745,10 @@ pub(crate) fn validate_unpivot_resource_limits<'a>(
                 crate::UnpivotConstant::Scalar(expression) => {
                     (0, unpivot_scalar_literal_bytes(fragment, *expression))
                 }
-                crate::UnpivotConstant::Int32List(values) => (
-                    values.len(),
-                    values.len().saturating_mul(std::mem::size_of::<i32>()),
-                ),
-                crate::UnpivotConstant::Utf8Map(entries) => (
-                    entries.len(),
-                    entries.iter().fold(0_usize, |total, (key, value)| {
-                        total.saturating_add(key.len()).saturating_add(value.len())
-                    }),
-                ),
+                // Selected collections belong to the original checked pools.
+                // Their actual per-consumer item/byte and key-policy checks
+                // run at mandatory observed plan/package publication.
+                crate::UnpivotConstant::Int32List(_) | crate::UnpivotConstant::Utf8Map(_) => (0, 0),
             };
             collection_items = collection_items.saturating_add(items);
             literal_bytes = literal_bytes.saturating_add(bytes);
@@ -2861,10 +2785,47 @@ pub(crate) fn unpivot_scalar_literal_bytes(fragment: &Fragment, expression: Expr
         | crate::LiteralValue::Time64(_)
         | crate::LiteralValue::Timestamp(_) => std::mem::size_of::<u64>(),
         crate::LiteralValue::Date32(_) => std::mem::size_of::<u32>(),
-        crate::LiteralValue::LargeInt(_)
-        | crate::LiteralValue::Decimal128(_)
-        | crate::LiteralValue::IntervalMonthDayNano(_) => std::mem::size_of::<u128>(),
+        crate::LiteralValue::LargeInt(_) | crate::LiteralValue::Decimal128(_) => {
+            std::mem::size_of::<u128>()
+        }
+        crate::LiteralValue::IntervalMonthDayNano { .. } => {
+            2 * std::mem::size_of::<i32>() + std::mem::size_of::<i64>()
+        }
         crate::LiteralValue::Decimal256(value) => value.len(),
+    }
+}
+
+pub(crate) fn unpivot_collection_carrier_matches(
+    constant: &crate::UnpivotConstant,
+    data_type: &DataType,
+) -> bool {
+    match constant {
+        crate::UnpivotConstant::Int32List(_) => matches!(
+            data_type,
+            DataType::List(field)
+                if field.name() == "item"
+                    && field.data_type() == &DataType::Int32
+                    && !field.is_nullable()
+                    && field.metadata().is_empty()
+        ),
+        crate::UnpivotConstant::Utf8Map(_) => matches!(
+            data_type,
+            DataType::Map(entries, false)
+                if entries.name() == "entries"
+                    && !entries.is_nullable()
+                    && entries.metadata().is_empty()
+                    && matches!(entries.data_type(), DataType::Struct(fields)
+                        if fields.len() == 2
+                            && fields[0].name() == "key"
+                            && fields[0].data_type() == &DataType::Utf8
+                            && !fields[0].is_nullable()
+                            && fields[0].metadata().is_empty()
+                            && fields[1].name() == "value"
+                            && fields[1].data_type() == &DataType::Utf8
+                            && !fields[1].is_nullable()
+                            && fields[1].metadata().is_empty())
+        ),
+        crate::UnpivotConstant::Scalar(_) => false,
     }
 }
 
@@ -2881,8 +2842,10 @@ pub(crate) fn validate_unpivot_constant(
         crate::UnpivotConstant::Scalar(expression) => match fragment.expressions().get(*expression)
         {
             Some(expression) => (
-                matches!(expression.kind, ExprKind::Literal(_))
-                    && expression.ty.data_type == output_type.data_type,
+                matches!(
+                    expression.kind,
+                    ExprKind::Literal(_) | ExprKind::Constant(_)
+                ) && expression.ty.same_value_domain(output_type),
                 expression.ty.nullable,
             ),
             None => {
@@ -2893,35 +2856,8 @@ pub(crate) fn validate_unpivot_constant(
                 return None;
             }
         },
-        crate::UnpivotConstant::Int32List(_) => (
-            matches!(
-                &output_type.data_type,
-                DataType::List(field)
-                    if field.name() == "item"
-                        && field.data_type() == &DataType::Int32
-                        && !field.is_nullable()
-                        && field.metadata().is_empty()
-            ),
-            false,
-        ),
-        crate::UnpivotConstant::Utf8Map(_) => (
-            matches!(
-                &output_type.data_type,
-                DataType::Map(entries, false)
-                    if entries.name() == "entries"
-                        && !entries.is_nullable()
-                        && entries.metadata().is_empty()
-                        && matches!(entries.data_type(), DataType::Struct(fields)
-                            if fields.len() == 2
-                                && fields[0].name() == "key"
-                                && fields[0].data_type() == &DataType::Utf8
-                                && !fields[0].is_nullable()
-                                && fields[0].metadata().is_empty()
-                                && fields[1].name() == "value"
-                                && fields[1].data_type() == &DataType::Utf8
-                                && !fields[1].is_nullable()
-                                && fields[1].metadata().is_empty())
-            ),
+        crate::UnpivotConstant::Int32List(_) | crate::UnpivotConstant::Utf8Map(_) => (
+            unpivot_collection_carrier_matches(constant, &output_type.data_type),
             false,
         ),
     };
@@ -2929,17 +2865,6 @@ pub(crate) fn validate_unpivot_constant(
         errors.push(ValidationError::new(
             path,
             format!("{context} constant type differs from its literal output"),
-        ));
-    }
-    if let crate::UnpivotConstant::Utf8Map(entries) = constant
-        && (entries.iter().any(|(key, _)| key.is_empty())
-            || entries
-                .windows(2)
-                .any(|pair| pair[0].0.as_ref() >= pair[1].0.as_ref()))
-    {
-        errors.push(ValidationError::new(
-            path,
-            format!("{context} map keys must be non-empty and strictly increasing"),
         ));
     }
     Some(nullable)
@@ -2972,8 +2897,7 @@ pub(crate) fn validate_relation(
             "whole-relation work requires singleton distribution and exactly one driver",
         ));
     }
-    let relation_source = relation.source_binding();
-    if relation_source.selection_digest == [0; 32] {
+    if relation.selection_digest() == [0; 32] {
         errors.push(ValidationError::new(
             path,
             "relation selection digest is zero",
@@ -2987,31 +2911,6 @@ pub(crate) fn validate_relation(
     }
     for guarantee in relation.predicate_guarantees() {
         require_boolean_expression(fragment, guarantee.predicate, path, errors);
-    }
-    let mut artifact_ids = BTreeSet::new();
-    for requirement in relation.artifact_inputs() {
-        if !artifact_ids.insert(requirement.artifact) {
-            errors.push(ValidationError::new(
-                path,
-                "relation has duplicate artifact input requirements",
-            ));
-        }
-        if requirement.format.revision == 0 || requirement.schema.is_empty() {
-            errors.push(ValidationError::new(
-                path,
-                "artifact input requirement has an invalid format or empty schema",
-            ));
-        }
-        validate_read_reference(&requirement.source.source, path, errors);
-        validate_coverage(&requirement.required_coverage, path, errors);
-        if requirement.source != relation_source
-            || requirement.required_coverage.selection_digest != requirement.source.selection_digest
-        {
-            errors.push(ValidationError::new(
-                path,
-                "artifact input requirement is not bound to the relation's exact source selection",
-            ));
-        }
     }
     validate_distribution(
         fragment,
@@ -3066,15 +2965,22 @@ pub(crate) fn validate_scan_predicate_contract(
                 "relation predicate guarantee is not owned by its scan",
             ));
         }
-        if !fragment_expressions_are_replica_deterministic(
-            fragment,
-            std::iter::once(guarantee.predicate),
-            true,
-        ) {
-            errors.push(ValidationError::new(
-                path,
-                "relation predicate guarantee must be replica deterministic",
-            ));
+        if errors.checks_output_and_effect_proofs() {
+            match fragment_expressions_are_replica_deterministic(
+                fragment,
+                std::iter::once(guarantee.predicate),
+                true,
+            ) {
+                Ok(true) => {}
+                Ok(false) => errors.push(ValidationError::new(
+                    path,
+                    "relation predicate guarantee must be replica deterministic",
+                )),
+                Err(_) => errors.push(ValidationError::unsupported_capability(
+                    path,
+                    "legacy predicate guarantee requires original binding metadata",
+                )),
+            }
         }
     }
 
@@ -3252,4 +3158,234 @@ pub(crate) fn writer_schema_shapes_match(
             .all(|(writer, finish)| {
                 writer.name == finish.name && writer.ty == finish.ty && writer.role == finish.role
             })
+}
+
+fn validate_aggregate_contract(
+    fragment: &Fragment,
+    node: &PhysicalNode,
+    group_by: &[(ExprId, ValueId)],
+    calls: &[crate::AggregateCall],
+    grouping: crate::AggregateGrouping,
+    path: &str,
+    errors: &mut ValidationContext,
+) {
+    // A call that finalizes has read every row of its group, so a
+    // node carrying one states its groups are complete.  The reverse
+    // does not follow: a node can finish its groups and still hand on
+    // state, which is what the phase between a dedup and the rollup
+    // that reads it does.  Whether a node that claims complete groups
+    // has global group co-location is checked from the input distribution.
+    // Task-wide uniqueness under the actual DOP remains a compiler obligation.
+    if calls.iter().any(|call| {
+        matches!(
+            call.binding.phase,
+            crate::AggregatePhase::Single | crate::AggregatePhase::Final { .. }
+        )
+    }) && grouping != crate::AggregateGrouping::Complete
+    {
+        errors.push(ValidationError::new(
+            path,
+            "aggregate finalizes a call on groups it does not state are complete",
+        ));
+    }
+    for (expression_id, output) in group_by {
+        match (
+            fragment.expressions().get(*expression_id),
+            fragment.values().get(output),
+        ) {
+            (Some(expression_node), Some(value))
+                if expression_node.ty == value.ty
+                    && (matches!(expression_node.kind, ExprKind::Value(source) if source == *output)
+                        || matches!(
+                            value.origin,
+                            ValueOrigin::Expr { node: owner, expr }
+                                if owner == node.id && expr == *expression_id
+                        )) => {}
+            (Some(_), Some(_)) => errors.push(ValidationError::new(
+                path,
+                "aggregate grouping output has inconsistent expression, type or origin",
+            )),
+            _ => {}
+        }
+    }
+    let mut ids = BTreeSet::new();
+    // Every call either finalizes a value or emits an exact state. Partial
+    // permits repeated group states, but the engine
+    // finalizes a node, not a call. Which side of that a call is on
+    // is the only phase fact the calls must share: `count(distinct x),
+    // sum(y)` finishing together reads values for one and a state for
+    // the other, and the dedup below it starts one state while
+    // merging the other.
+    let finalizes = calls
+        .first()
+        .map(|call| call.binding.phase.produces_final_result());
+    for call in calls {
+        if !ids.insert(call.id) {
+            errors.push(ValidationError::new(
+                path,
+                "aggregate call identity is duplicated",
+            ));
+        }
+        if call.binding.function.kind != FunctionKind::Aggregate {
+            errors.push(ValidationError::new(
+                path,
+                "aggregate node has non-aggregate binding",
+            ));
+        }
+        if finalizes.is_some_and(|expected| expected != call.binding.phase.produces_final_result())
+        {
+            errors.push(ValidationError::new(
+                path,
+                "aggregate node finishes some calls and hands others on",
+            ));
+        }
+        validate_aggregate_value_inputs(
+            fragment,
+            &call.binding,
+            &call.arguments,
+            &call.order_by,
+            path,
+            errors,
+        );
+        if !call.binding.phase.consumes_logical_arguments() && call.distinct {
+            errors.push(ValidationError::new(
+                path,
+                "state-consuming aggregate phase cannot apply DISTINCT again",
+            ));
+        }
+        if let Some(output) = fragment.values().get(&call.output) {
+            let expected = match call.binding.phase {
+                AggregatePhase::Single | AggregatePhase::Final { .. } => {
+                    &call.binding.function.result_type
+                }
+                AggregatePhase::Partial { .. } | AggregatePhase::Intermediate { .. } => {
+                    &call.binding.intermediate_type
+                }
+            };
+            if &output.ty != expected {
+                errors.push(ValidationError::new(
+                    path,
+                    "aggregate output type differs from phase output",
+                ));
+            }
+            let expected_origin = match call.binding.phase {
+                AggregatePhase::Single | AggregatePhase::Final { .. } => matches!(
+                    output.origin,
+                    ValueOrigin::AggregateResult { call: id } if id == call.id
+                ),
+                AggregatePhase::Partial { .. } | AggregatePhase::Intermediate { .. } => {
+                    matches!(
+                        output.origin,
+                        ValueOrigin::AggregateState { call: id, phase }
+                            if id == call.id && phase == call.binding.phase
+                    )
+                }
+            };
+            if !expected_origin {
+                errors.push(ValidationError::new(
+                    path,
+                    "aggregate output origin differs from the call phase",
+                ));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_grouped_topn(
+    fragment: &Fragment,
+    node: &PhysicalNode,
+    order_by: &[crate::SortExpr],
+    offset: u64,
+    phase: crate::TopNPhase,
+    group_by: &[(ExprId, ValueId)],
+    calls: &[crate::AggregateCall],
+    comparator: crate::OrderedComparisonAlgorithm,
+    path: &str,
+    errors: &mut ValidationContext,
+) {
+    if offset != 0 || !matches!(phase, crate::TopNPhase::Partial { .. }) || group_by.is_empty() {
+        errors.push(ValidationError::new(
+            path,
+            "grouped TopN requires nonempty complete keys, partial phase and zero offset",
+        ));
+    }
+    let mut keys = BTreeSet::new();
+    for (expression, output) in group_by {
+        let valid = fragment.expressions().get(*expression).is_some_and(|expr| {
+            matches!(expr.kind, ExprKind::Value(source) if source == *output)
+                && comparator.supports_value_type(&expr.ty)
+                && novarocks_type_contract::PartitionHashAlgorithm::NativeExchangeV1
+                    .supports_partition_key(&expr.ty.data_type)
+        });
+        if !valid || !keys.insert(*output) {
+            errors.push(ValidationError::new(
+                path,
+                "grouped TopN key lacks exact direct grouping/comparison equivalence",
+            ));
+        }
+    }
+    let ordered = order_by
+        .iter()
+        .filter_map(|key| crate::expression_value(fragment.expressions(), key.expr))
+        .collect::<BTreeSet<_>>();
+    if ordered != keys || order_by.len() != keys.len() {
+        errors.push(ValidationError::new(
+            path,
+            "grouped TopN order must cover every complete key exactly once",
+        ));
+    }
+    let mut consumed = keys;
+    for call in calls {
+        if !matches!(call.binding.phase, AggregatePhase::Intermediate { .. })
+            || call.distinct
+            || !call.order_by.is_empty()
+            || call.arguments.len() != 1
+        {
+            errors.push(ValidationError::new(path, "grouped TopN must merge exact intermediate states without DISTINCT or state ranking"));
+            continue;
+        }
+        let input = crate::expression_value(fragment.expressions(), call.arguments[0]);
+        if input.is_none_or(|input| input == call.output || !consumed.insert(input)) {
+            errors.push(ValidationError::new(
+                path,
+                "grouped TopN state input must be direct, distinct and produce a new identity",
+            ));
+        }
+    }
+    let input_values = node
+        .inputs
+        .first()
+        .and_then(|input| fragment.nodes().get(input))
+        .map(|input| {
+            input
+                .output
+                .columns
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let single_copy = node
+        .inputs
+        .first()
+        .and_then(|input| fragment.nodes().get(input))
+        .is_some_and(|input| {
+            input.output_properties.row_multiplicity == RowMultiplicity::SingleCopy
+        });
+    if !single_copy {
+        errors.push(ValidationError::new(
+            path,
+            "grouped TopN cannot merge replicated input contributions",
+        ));
+    }
+    let input_occurrences = node
+        .inputs
+        .first()
+        .and_then(|input| fragment.nodes().get(input))
+        .map(|input| input.output.columns.len())
+        .unwrap_or(0);
+    if consumed != input_values || input_values.len() != input_occurrences {
+        errors.push(ValidationError::new(path, "grouped TopN must merge every input state channel and retain exactly the complete keys"));
+    }
 }

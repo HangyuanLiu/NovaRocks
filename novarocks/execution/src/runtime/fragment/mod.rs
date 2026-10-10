@@ -2,6 +2,7 @@
 
 pub mod error;
 pub mod exchange;
+pub mod execution_failure;
 pub mod fact;
 pub mod handle;
 pub mod instance;
@@ -18,7 +19,14 @@ pub use error::{
 };
 pub use fact::{FragmentCancelReason, FragmentOutcome, FragmentTerminalFact};
 pub use handle::{
-    DormantFragmentHandle, FragmentPrepareContext, RunningFragmentHandle, prepare_fragment,
+    CompiledFragmentSubmission, CompiledWriterBindings, DormantFragmentHandle,
+    FragmentPrepareContext, RunningFragmentHandle, compiled_sink_kind, prepare_compiled_fragment,
+    prepare_fragment,
 };
 pub use instance::*;
 pub use submission::FragmentSubmission;
+
+pub use execution_failure::{
+    ExecutionFailure, ExecutionFailureCause, ExecutionFailureContext, ExecutionResult,
+    PipelineOperation, RequiredExpressionRowError,
+};

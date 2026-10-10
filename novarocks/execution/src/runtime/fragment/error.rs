@@ -72,7 +72,7 @@ impl fmt::Display for FragmentLaunchErrorKind {
 pub struct FragmentLaunchError {
     stage: FragmentLaunchStage,
     kind: FragmentLaunchErrorKind,
-    detail: String,
+    cause: super::ExecutionFailure,
     cleanup_diagnostics: Vec<String>,
 }
 
@@ -82,42 +82,46 @@ impl FragmentLaunchError {
         kind: FragmentLaunchErrorKind,
         detail: impl Into<String>,
     ) -> Self {
+        Self::from_failure(stage, kind, detail.into().into())
+    }
+    pub fn from_failure(
+        stage: FragmentLaunchStage,
+        kind: FragmentLaunchErrorKind,
+        cause: super::ExecutionFailure,
+    ) -> Self {
         Self {
             stage,
             kind,
-            detail: detail.into(),
+            cause,
             cleanup_diagnostics: Vec::new(),
         }
     }
-
     pub fn stage(&self) -> FragmentLaunchStage {
         self.stage
     }
-
     pub fn kind(&self) -> FragmentLaunchErrorKind {
         self.kind
     }
-
     pub fn detail(&self) -> &str {
-        &self.detail
+        self.cause.detail()
     }
-
+    pub const fn cause(&self) -> &super::ExecutionFailure {
+        &self.cause
+    }
     pub fn cleanup_diagnostics(&self) -> &[String] {
         &self.cleanup_diagnostics
     }
-
     pub fn with_cleanup_diagnostics(mut self, diagnostics: Vec<String>) -> Self {
         self.cleanup_diagnostics.extend(diagnostics);
         self
     }
 }
-
 impl fmt::Display for FragmentLaunchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "fragment launch error during {} ({}): {}",
-            self.stage, self.kind, self.detail
+            self.stage, self.kind, self.cause
         )?;
         if !self.cleanup_diagnostics.is_empty() {
             write!(
@@ -129,8 +133,11 @@ impl fmt::Display for FragmentLaunchError {
         Ok(())
     }
 }
-
-impl Error for FragmentLaunchError {}
+impl Error for FragmentLaunchError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.cause)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FragmentExecutionErrorKind {
@@ -158,23 +165,26 @@ impl fmt::Display for FragmentExecutionErrorKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FragmentExecutionError {
     kind: FragmentExecutionErrorKind,
-    detail: String,
+    cause: super::ExecutionFailure,
 }
 
 impl FragmentExecutionError {
     pub fn new(kind: FragmentExecutionErrorKind, detail: impl Into<String>) -> Self {
-        Self {
-            kind,
-            detail: detail.into(),
-        }
+        Self::from_failure(kind, detail.into().into())
+    }
+
+    pub fn from_failure(kind: FragmentExecutionErrorKind, cause: super::ExecutionFailure) -> Self {
+        Self { kind, cause }
     }
 
     pub fn kind(&self) -> FragmentExecutionErrorKind {
         self.kind
     }
-
     pub fn detail(&self) -> &str {
-        &self.detail
+        self.cause.detail()
+    }
+    pub const fn cause(&self) -> &super::ExecutionFailure {
+        &self.cause
     }
 }
 
@@ -183,12 +193,16 @@ impl fmt::Display for FragmentExecutionError {
         write!(
             f,
             "fragment execution error ({}): {}",
-            self.kind, self.detail
+            self.kind, self.cause
         )
     }
 }
 
-impl Error for FragmentExecutionError {}
+impl Error for FragmentExecutionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.cause)
+    }
+}
 
 #[cfg(test)]
 mod tests {

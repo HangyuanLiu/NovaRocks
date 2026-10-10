@@ -22,6 +22,7 @@
 //! stage of the IMV pipeline wraps the root; the `imv-validation` stage
 //! rejects any plan that still carries a marker afterwards.
 
+use crate::compiler::SqlCompileError;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::optimizer::operator::{ImvDeltaOp, Operator};
@@ -93,7 +94,11 @@ impl LogicalRewriteRule for WrapRootInImvDeltaRule {
         true
     }
 
-    fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         self.wrapped.store(true, Ordering::SeqCst);
         Ok(RewriteResult::Changed(OptExpr::new(
             Operator::LogicalImvDelta(ImvDeltaOp {
@@ -135,7 +140,11 @@ impl LogicalRewriteRule for UnresolvedMarkerCheckRule {
         plan_contains_imv_marker(&plan)
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let plan = opt_expr_to_plan(expr, ctx);
         let markers = collect_marker_kinds(&plan);
         Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
@@ -442,10 +451,14 @@ mod tests {
             .rewrite(opt_in, &mut ctx)
             .expect_err("Validation must reject the wrapped-but-unconsumed plan");
         assert!(
-            err.starts_with("IVM rewrite failed to resolve incremental markers:"),
+            err.to_string()
+                .starts_with("IVM rewrite failed to resolve incremental markers:"),
             "unexpected error message: {err}"
         );
-        assert!(err.contains("\"ImvDelta\""), "kind list missing: {err}");
+        assert!(
+            err.to_string().contains("\"ImvDelta\""),
+            "kind list missing: {err}"
+        );
 
         // Trace must record the rejection under the rule's name.
         assert!(ctx.trace().events().iter().any(|e| matches!(

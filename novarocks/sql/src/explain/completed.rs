@@ -24,8 +24,8 @@ use std::{
 };
 
 use novarocks_physical_plan::{
-    AnnotationSubject, Edge, ExprId, Fragment, FragmentId, FragmentIoCutIndex, FragmentSink,
-    NodeId, NodeKind, PhysicalNode, PhysicalPlan, PlanAnnotation, PlanVersionId, SortExpr, ValueId,
+    AnnotationSubject, Edge, ExprId, Fragment, FragmentCuts, FragmentId, FragmentSink, NodeId,
+    NodeKind, PhysicalNode, PhysicalPlan, PlanAnnotation, PlanVersionId, SortExpr, ValueId,
     WindowExpression, WriteTargetOrdinal, WriterGroupedUnpivotSpec,
 };
 use sha2::{Digest, Sha256};
@@ -53,44 +53,6 @@ where
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (index, item) in self.items.iter().enumerate() {
-            if index != 0 {
-                formatter.write_str(self.separator)?;
-            }
-            (self.render)(item, formatter)?;
-        }
-        Ok(())
-    }
-}
-
-// The iterator factory borrows owner facts and can be formatted repeatedly
-// without buffering a cut's fields or provenance payloads.
-struct JoinedIter<M, F> {
-    make: M,
-    separator: &'static str,
-    render: F,
-}
-
-fn joined_iter<M, I, F>(make: M, separator: &'static str, render: F) -> JoinedIter<M, F>
-where
-    M: Fn() -> I,
-    I: Iterator,
-    F: Fn(I::Item, &mut fmt::Formatter<'_>) -> fmt::Result,
-{
-    JoinedIter {
-        make,
-        separator,
-        render,
-    }
-}
-
-impl<M, I, F> fmt::Display for JoinedIter<M, F>
-where
-    M: Fn() -> I,
-    I: Iterator,
-    F: Fn(I::Item, &mut fmt::Formatter<'_>) -> fmt::Result,
-{
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, item) in (self.make)().enumerate() {
             if index != 0 {
                 formatter.write_str(self.separator)?;
             }
@@ -133,20 +95,6 @@ impl fmt::Display for OptionalQuoted<'_> {
         match self.0 {
             Some(value) => Quoted(value).fmt(formatter),
             None => formatter.write_str("none"),
-        }
-    }
-}
-
-struct CoverageBound<'a> {
-    value: Option<&'a [u8]>,
-    infinity: &'static str,
-}
-
-impl fmt::Display for CoverageBound<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.value {
-            Some(value) => Hex(value).fmt(formatter),
-            None => formatter.write_str(self.infinity),
         }
     }
 }
@@ -542,19 +490,110 @@ fn validate_profile(
     Ok(())
 }
 
-pub(super) struct ExplainRenderOutput {
+pub(super) struct RenderDiagnostic<'a> {
+    pub(super) control: &'a dyn novarocks_type_contract::PureCompileControl,
+    error: std::cell::RefCell<Option<SqlCompileError>>,
+}
+impl<'a> RenderDiagnostic<'a> {
+    pub(super) fn new(control: &'a dyn novarocks_type_contract::PureCompileControl) -> Self {
+        Self {
+            control,
+            error: std::cell::RefCell::new(None),
+        }
+    }
+    pub(super) fn take_error(&self) -> Option<SqlCompileError> {
+        self.error.borrow_mut().take()
+    }
+    fn fail(&self, error: SqlCompileError) -> fmt::Result {
+        let mut journal = self.error.borrow_mut();
+        if journal.is_none() {
+            *journal = Some(error);
+        }
+        Err(fmt::Error)
+    }
+    pub(super) fn constant(
+        &self,
+        value: &novarocks_constant_contract::ConstantValue,
+        output: &mut dyn fmt::Write,
+    ) -> fmt::Result {
+        match crate::constant::write_constant_observed(value, self.control, output) {
+            Ok(result) => result,
+            Err(error) => self.fail(error),
+        }
+    }
+    pub(super) fn plan_constant(
+        &self,
+        plan: &PhysicalPlan,
+        reference: novarocks_physical_plan::ConstantReference,
+        expected: &novarocks_type_contract::FunctionValueType,
+        output: &mut dyn fmt::Write,
+    ) -> fmt::Result {
+        let result = (|| -> Result<_, SqlCompileError> {
+            let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+                self.control,
+                novarocks_type_contract::CompilePhase::LowerProgram,
+            )?;
+            let value = plan
+                .constants()
+                .resolve_observed(reference, expected, &mut work)
+                .map_err(|error| match error {
+                    novarocks_physical_plan::ConstantReferenceError::Control(error) => error.into(),
+                    novarocks_physical_plan::ConstantReferenceError::Constant(error) => {
+                        error.into()
+                    }
+                    other => SqlCompileError::InvalidRequest(other.to_string()),
+                })?;
+            work.finish()?;
+            Ok(value)
+        })();
+        match result {
+            Ok(value) => self.constant(&value, output),
+            Err(error) => self.fail(error),
+        }
+    }
+}
+
+pub(super) struct ExplainRenderOutput<'control> {
     budget: ExplainRenderBudget,
     bytes: usize,
     lines: Vec<String>,
+    work: Option<novarocks_type_contract::CompileCheckpoints<'control>>,
 }
 
-impl ExplainRenderOutput {
+impl<'control> ExplainRenderOutput<'control> {
     pub(super) fn new(budget: ExplainRenderBudget) -> Self {
         Self {
             budget,
             bytes: 0,
             lines: Vec::new(),
+            work: None,
         }
+    }
+
+    pub(super) fn new_observed(
+        budget: ExplainRenderBudget,
+        control: &'control dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Self, SqlCompileError> {
+        let mut output = Self::new(budget);
+        output.work = Some(novarocks_type_contract::CompileCheckpoints::try_new(
+            control,
+            novarocks_type_contract::CompilePhase::LowerProgram,
+        )?);
+        Ok(output)
+    }
+
+    pub(super) fn observe(&mut self) -> Result<(), SqlCompileError> {
+        if let Some(work) = &mut self.work {
+            work.step()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn finish_observed(mut self) -> Result<Vec<String>, SqlCompileError> {
+        if let Some(work) = self.work.take() {
+            work.finish()?;
+        }
+        Ok(self.lines)
     }
 
     pub(super) fn push(&mut self, arguments: fmt::Arguments<'_>) -> Result<(), SqlCompileError> {
@@ -577,11 +616,21 @@ impl ExplainRenderOutput {
         // Header growth, per-line allocation allowance and bounded auxiliary
         // indexes fit separately within the Local conversion workspace.
         let mut line = String::new();
-        let mut writer = BoundedStringWriter {
-            output: &mut line,
-            remaining,
+        let mut control_error = None;
+        let result = {
+            let mut writer = BoundedStringWriter {
+                output: &mut line,
+                remaining,
+                work: self.work.as_mut(),
+                control_error: &mut control_error,
+            };
+            fmt::write(&mut writer, arguments)
         };
-        fmt::write(&mut writer, arguments).map_err(|_| explain_budget_exceeded(self.budget))?;
+        if let Some(error) = control_error {
+            return Err(error);
+        }
+        result.map_err(|_| explain_budget_exceeded(self.budget))?;
+        self.observe()?;
         let line = line.into_boxed_str().into_string();
         if self.lines.len() == self.lines.capacity() {
             let capacity = self
@@ -622,12 +671,14 @@ impl ExplainRenderOutput {
     }
 }
 
-struct BoundedStringWriter<'a> {
+struct BoundedStringWriter<'a, 'control> {
     output: &'a mut String,
     remaining: usize,
+    work: Option<&'a mut novarocks_type_contract::CompileCheckpoints<'control>>,
+    control_error: &'a mut Option<SqlCompileError>,
 }
 
-impl Write for BoundedStringWriter<'_> {
+impl Write for BoundedStringWriter<'_, '_> {
     fn write_str(&mut self, value: &str) -> fmt::Result {
         if value.len() > self.remaining {
             return Err(fmt::Error);
@@ -653,7 +704,21 @@ impl Write for BoundedStringWriter<'_> {
                 return Err(fmt::Error);
             }
         }
-        self.output.push_str(value);
+        let mut start = 0;
+        while start < value.len() {
+            let mut end = start.saturating_add(1024).min(value.len());
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.output.push_str(&value[start..end]);
+            if let Some(work) = &mut self.work {
+                if let Err(error) = work.step() {
+                    *self.control_error = Some(error.into());
+                    return Err(fmt::Error);
+                }
+            }
+            start = end;
+        }
         self.remaining -= value.len();
         Ok(())
     }
@@ -679,6 +744,7 @@ fn render_plan(
         level,
         profile,
         budget,
+        &crate::compiler::SqlCompileControl::unbounded(),
     )
 }
 
@@ -694,9 +760,10 @@ pub fn render_completed_plan(
     level: ExplainLevel,
     profile: Option<&SqlCompletedExplainProfile>,
     budget: ExplainRenderBudget,
+    control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Vec<String>, SqlCompileError> {
     let context = RenderContext::new(plan, level, profile)?;
-    let mut lines = ExplainRenderOutput::new(budget);
+    let mut lines = ExplainRenderOutput::new_observed(budget, control)?;
     lines.push(format_args!(
         "PHYSICAL PLAN version={}, contract-revision={}",
         format_hex(plan.version().as_bytes()),
@@ -706,7 +773,6 @@ pub fn render_completed_plan(
     render_display_annotations(display_annotations, &mut lines)?;
     if is_detailed(level) {
         render_annotations(&context, AnnotationSubject::Plan, "", &mut lines)?;
-        render_artifact_references(&context, &mut lines)?;
         render_edges(&context, &mut lines)?;
         render_runtime_filters(&context, &mut lines)?;
     }
@@ -738,7 +804,7 @@ pub fn render_completed_plan(
                 &mut lines,
             )?;
             for (value, annotations) in context.annotations.values_for_fragment(*fragment_id) {
-                for annotation in annotations.filter(|annotation| {
+                for annotation in annotations.iter().filter(|annotation| {
                     !annotation_is_internal_display(&annotation.key)
                         && annotation_visible(level, &annotation.key)
                 }) {
@@ -758,85 +824,134 @@ pub fn render_completed_plan(
         render_expression_definitions(&context, *fragment_id, fragment, &mut lines)?;
         render_nodes_iterative(&context, *fragment_id, fragment, &mut lines)?;
     }
-    Ok(lines.finish())
+    lines.finish_observed()
 }
 
-// Display lookup borrows the frozen annotations. It neither clones names nor
-// builds one set of vectors/maps for each annotation subject.
-struct AnnotationIndex<'a>(&'a [PlanAnnotation]);
+struct AnnotationIndex<'a> {
+    plan: Vec<&'a PlanAnnotation>,
+    fragments: BTreeMap<FragmentId, Vec<&'a PlanAnnotation>>,
+    nodes: BTreeMap<(FragmentId, NodeId), Vec<&'a PlanAnnotation>>,
+    values: BTreeMap<(FragmentId, ValueId), Vec<&'a PlanAnnotation>>,
+    plan_values: BTreeMap<&'a str, &'a str>,
+    fragment_values: BTreeMap<FragmentId, BTreeMap<&'a str, &'a str>>,
+    node_values: BTreeMap<(FragmentId, NodeId), BTreeMap<&'a str, &'a str>>,
+    value_values: BTreeMap<(FragmentId, ValueId), BTreeMap<&'a str, &'a str>>,
+}
 
 impl<'a> AnnotationIndex<'a> {
     fn new(plan: &'a PhysicalPlan) -> Self {
-        Self(plan.annotations())
+        let mut index = Self {
+            plan: Vec::new(),
+            fragments: BTreeMap::new(),
+            nodes: BTreeMap::new(),
+            values: BTreeMap::new(),
+            plan_values: BTreeMap::new(),
+            fragment_values: BTreeMap::new(),
+            node_values: BTreeMap::new(),
+            value_values: BTreeMap::new(),
+        };
+        for annotation in plan.annotations() {
+            match annotation.subject {
+                AnnotationSubject::Plan => {
+                    index.plan.push(annotation);
+                    index
+                        .plan_values
+                        .entry(&annotation.key)
+                        .or_insert(&annotation.value);
+                }
+                AnnotationSubject::Fragment(fragment) => {
+                    index
+                        .fragments
+                        .entry(fragment)
+                        .or_default()
+                        .push(annotation);
+                    index
+                        .fragment_values
+                        .entry(fragment)
+                        .or_default()
+                        .entry(&annotation.key)
+                        .or_insert(&annotation.value);
+                }
+                AnnotationSubject::Node(fragment, node) => {
+                    index
+                        .nodes
+                        .entry((fragment, node))
+                        .or_default()
+                        .push(annotation);
+                    index
+                        .node_values
+                        .entry((fragment, node))
+                        .or_default()
+                        .entry(&annotation.key)
+                        .or_insert(&annotation.value);
+                }
+                AnnotationSubject::Value(fragment, value) => {
+                    index
+                        .values
+                        .entry((fragment, value))
+                        .or_default()
+                        .push(annotation);
+                    index
+                        .value_values
+                        .entry((fragment, value))
+                        .or_default()
+                        .entry(&annotation.key)
+                        .or_insert(&annotation.value);
+                }
+            }
+        }
+        index
     }
 
-    fn get(&self, subject: AnnotationSubject) -> AnnotationRows<'a> {
-        AnnotationRows {
-            rows: self.0.iter(),
-            subject,
+    fn get(&self, subject: AnnotationSubject) -> &[&'a PlanAnnotation] {
+        match subject {
+            AnnotationSubject::Plan => &self.plan,
+            AnnotationSubject::Fragment(fragment) => self
+                .fragments
+                .get(&fragment)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            AnnotationSubject::Node(fragment, node) => self
+                .nodes
+                .get(&(fragment, node))
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            AnnotationSubject::Value(fragment, value) => self
+                .values
+                .get(&(fragment, value))
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
         }
     }
 
     fn value(&self, subject: AnnotationSubject, key: &str) -> Option<&'a str> {
-        self.get(subject)
-            .find(|annotation| annotation.key.as_ref() == key)
-            .map(|annotation| annotation.value.as_ref())
-    }
-
-    fn values_for_fragment(&self, fragment: FragmentId) -> AnnotationValues<'a> {
-        AnnotationValues {
-            rows: self.0,
-            fragment,
-            previous: None,
+        match subject {
+            AnnotationSubject::Plan => self.plan_values.get(key).copied(),
+            AnnotationSubject::Fragment(fragment) => self
+                .fragment_values
+                .get(&fragment)
+                .and_then(|values| values.get(key))
+                .copied(),
+            AnnotationSubject::Node(fragment, node) => self
+                .node_values
+                .get(&(fragment, node))
+                .and_then(|values| values.get(key))
+                .copied(),
+            AnnotationSubject::Value(fragment, value) => self
+                .value_values
+                .get(&(fragment, value))
+                .and_then(|values| values.get(key))
+                .copied(),
         }
     }
-}
 
-struct AnnotationRows<'a> {
-    rows: std::slice::Iter<'a, PlanAnnotation>,
-    subject: AnnotationSubject,
-}
-
-impl<'a> Iterator for AnnotationRows<'a> {
-    type Item = &'a PlanAnnotation;
-    fn next(&mut self) -> Option<Self::Item> {
-        self.rows
-            .find(|annotation| annotation.subject == self.subject)
-    }
-}
-
-// Keep the old value-id order, including annotations on unknown ids, without
-// allocating a second index. The plan's frozen annotation count bounds work.
-struct AnnotationValues<'a> {
-    rows: &'a [PlanAnnotation],
-    fragment: FragmentId,
-    previous: Option<ValueId>,
-}
-
-impl<'a> Iterator for AnnotationValues<'a> {
-    type Item = (ValueId, AnnotationRows<'a>);
-    fn next(&mut self) -> Option<Self::Item> {
-        let value = self
-            .rows
-            .iter()
-            .filter_map(|annotation| match annotation.subject {
-                AnnotationSubject::Value(fragment, value)
-                    if fragment == self.fragment
-                        && self.previous.is_none_or(|previous| value > previous) =>
-                {
-                    Some(value)
-                }
-                _ => None,
-            })
-            .min()?;
-        self.previous = Some(value);
-        Some((
-            value,
-            AnnotationRows {
-                rows: self.rows.iter(),
-                subject: AnnotationSubject::Value(self.fragment, value),
-            },
-        ))
+    fn values_for_fragment(
+        &self,
+        fragment: FragmentId,
+    ) -> impl Iterator<Item = (ValueId, &[&'a PlanAnnotation])> {
+        self.values
+            .range((fragment, ValueId::new(0))..=(fragment, ValueId::new(u32::MAX)))
+            .map(|((_, value), annotations)| (*value, annotations.as_slice()))
     }
 }
 
@@ -845,7 +960,9 @@ struct RenderContext<'a> {
     level: ExplainLevel,
     profile: Option<&'a SqlCompletedExplainProfile>,
     annotations: AnnotationIndex<'a>,
-    cuts: FragmentIoCutIndex<'a>,
+    inbound_edges: BTreeMap<FragmentId, Vec<&'a Edge>>,
+    outbound_edges: BTreeMap<FragmentId, Vec<&'a Edge>>,
+    cuts: BTreeMap<FragmentId, FragmentCuts>,
 }
 
 impl<'a> RenderContext<'a> {
@@ -854,16 +971,28 @@ impl<'a> RenderContext<'a> {
         level: ExplainLevel,
         profile: Option<&'a SqlCompletedExplainProfile>,
     ) -> Result<Self, SqlCompileError> {
-        let cuts = FragmentIoCutIndex::try_new(plan, 4 * 1024 * 1024).ok_or_else(|| {
-            invalid_request(
-                "completed physical plan IO cut index is invalid or exceeds its 4 MiB workspace",
-            )
+        let mut inbound_edges: BTreeMap<FragmentId, Vec<&Edge>> = BTreeMap::new();
+        let mut outbound_edges: BTreeMap<FragmentId, Vec<&Edge>> = BTreeMap::new();
+        for edge in plan.edges().values() {
+            inbound_edges
+                .entry(edge.destination.fragment)
+                .or_default()
+                .push(edge);
+            outbound_edges
+                .entry(edge.source.fragment)
+                .or_default()
+                .push(edge);
+        }
+        let cuts = novarocks_physical_plan::derive_fragment_cuts(plan).ok_or_else(|| {
+            invalid_request("completed physical plan cannot derive fragment cut contracts")
         })?;
         Ok(Self {
             plan,
             level,
             profile,
             annotations: AnnotationIndex::new(plan),
+            inbound_edges,
+            outbound_edges,
             cuts,
         })
     }
@@ -927,36 +1056,6 @@ fn render_result_schema(
     Ok(())
 }
 
-fn render_artifact_references(
-    context: &RenderContext<'_>,
-    lines: &mut ExplainRenderOutput,
-) -> Result<(), SqlCompileError> {
-    if context.plan.artifact_refs().is_empty() {
-        return Ok(());
-    }
-    lines.push(format_args!("SEALED ARTIFACT REFERENCES"))?;
-    for artifact in context.plan.artifact_refs().values() {
-        lines.push(format_args!(
-            "  artifact{} kind={} format={}@{} schema=[{}] source={} coverage={} location={} content-digest={} schema-digest={} objects={} rows={}",
-            artifact.id.get(),
-            artifact.kind.as_str(),
-            artifact.format.id.as_str(),
-            artifact.format.revision,
-            joined(&artifact.schema, ",", |ty: &novarocks_physical_plan::ValueType, output: &mut fmt::Formatter<'_>| {
-                format_value_type(ty).fmt(output)
-            }),
-            format_artifact_source(&artifact.source),
-            format_coverage_set(&artifact.coverage),
-            quote_text(&artifact.location),
-            format_hex(&artifact.content_digest),
-            format_hex(&artifact.schema_digest),
-            artifact.object_count,
-            artifact.row_count
-        ))?;
-    }
-    Ok(())
-}
-
 fn render_edges(
     context: &RenderContext<'_>,
     lines: &mut ExplainRenderOutput,
@@ -971,97 +1070,77 @@ fn render_edges(
     Ok(())
 }
 
-struct EdgeAttachments<'a> {
-    plan: &'a PhysicalPlan,
-    fragment: FragmentId,
-    inbound: bool,
-}
-
-impl fmt::Display for EdgeAttachments<'_> {
-    fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut separator = "";
-        for edge in self.plan.edges().values().filter(|edge| {
-            if self.inbound {
-                edge.destination.fragment == self.fragment
-            } else {
-                edge.source.fragment == self.fragment
-            }
-        }) {
-            write!(
-                output,
-                "{separator}edge{}:{}",
-                edge.id.get(),
-                edge_kind(edge.kind)
-            )?;
-            separator = ", ";
-        }
-        Ok(())
-    }
-}
-
 fn render_cut_attachments(
     context: &RenderContext<'_>,
     fragment_id: FragmentId,
     lines: &mut ExplainRenderOutput,
 ) -> Result<(), SqlCompileError> {
+    let inbound = context
+        .inbound_edges
+        .get(&fragment_id)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let outbound = context
+        .outbound_edges
+        .get(&fragment_id)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     lines.push(format_args!(
         "  CUT ATTACHMENTS inbound=[{}], outbound=[{}]",
-        EdgeAttachments {
-            plan: context.plan,
-            fragment: fragment_id,
-            inbound: true
-        },
-        EdgeAttachments {
-            plan: context.plan,
-            fragment: fragment_id,
-            inbound: false
-        },
+        joined(
+            inbound,
+            ", ",
+            |edge: &&Edge, output: &mut fmt::Formatter<'_>| {
+                write!(output, "edge{}:{}", edge.id.get(), edge_kind(edge.kind))
+            }
+        ),
+        joined(
+            outbound,
+            ", ",
+            |edge: &&Edge, output: &mut fmt::Formatter<'_>| {
+                write!(output, "edge{}:{}", edge.id.get(), edge_kind(edge.kind))
+            }
+        )
     ))?;
-    let cuts = context.cuts.fragment(fragment_id).ok_or_else(|| {
+    let cuts = context.cuts.get(&fragment_id).ok_or_else(|| {
         invalid_request("completed physical plan omitted a derived fragment cut contract")
     })?;
-    for cut in cuts.inbound() {
+    for cut in &cuts.inbound {
         lines.push(format_args!(
-            "    inbound edge{} kind={} source=f{} destination=n{} imports=[{}] source-distribution={} source-multiplicity={} destination-distribution={} destination-multiplicity={} source-bindings=[{}] source-free={} change-stream-writer={} writer-result={}",
-            cut.edge.id.get(),
-            edge_kind(cut.edge.kind),
-            cut.edge.source.fragment.get(),
-            cut.edge.destination.node.get(),
-            joined_iter(|| cut.imports(), ",", |import: novarocks_physical_plan::CutImportRef<'_>, output: &mut fmt::Formatter<'_>| write!(output, "v{}:{}->v{}", import.source.value.get(), format_value_type(import.source.ty), import.destination.get())),
-            format_distribution_complete(context, cut.edge.source.fragment, &cut.edge.partitioning.source),
-            row_multiplicity(cut.edge.partitioning.source_multiplicity),
-            format_distribution_complete(context, fragment_id, &cut.edge.partitioning.destination),
-            row_multiplicity(cut.edge.partitioning.destination_multiplicity),
-            joined_iter(|| cut.source_bindings(), ";", |binding: novarocks_physical_plan::SourceBindingRef<'_>, output: &mut fmt::Formatter<'_>| ArtifactSourceDisplay(binding).fmt(output)),
-            cut.has_source_free_rows,
-            ChangeStreamWriterCutDisplay(cut.change_stream_writer),
-            WriterResultCutDisplay(cut.writer_result)
+            "    inbound edge{} kind={} source=f{} destination=n{} imports=[{}] source-distribution={} source-multiplicity={} destination-distribution={} destination-multiplicity={} change-stream-writer={} writer-result={}",
+            cut.edge.get(),
+            edge_kind(cut.kind),
+            cut.source_fragment.get(),
+            cut.destination_node.get(),
+            joined(&cut.imports, ",", |import: &novarocks_physical_plan::CutImport, output: &mut fmt::Formatter<'_>| write!(output, "v{}:{}->v{}", import.source.value.get(), format_value_type(&import.source.ty), import.destination.get())),
+            format_distribution_complete(context, cut.source_fragment, &cut.partitioning.source),
+            row_multiplicity(cut.partitioning.source_multiplicity),
+            format_distribution_complete(context, fragment_id, &cut.partitioning.destination),
+            row_multiplicity(cut.partitioning.destination_multiplicity),
+            ChangeStreamWriterCutDisplay(cut.change_stream_writer.as_ref()),
+            WriterResultCutDisplay(cut.writer_result.as_ref())
         ))?;
     }
-    for cut in cuts.outbound() {
+    for cut in &cuts.outbound {
         lines.push(format_args!(
-            "    outbound edge{} kind={} destination=f{} projection=[{}] destination-imports=[{}] source-distribution={} source-multiplicity={} destination-distribution={} destination-multiplicity={} source-bindings=[{}] source-free={} change-stream-writer={} writer-result={}",
-            cut.edge.id.get(),
-            edge_kind(cut.edge.kind),
-            cut.edge.destination.fragment.get(),
-            joined_iter(|| cut.projection(), ",", |value: novarocks_physical_plan::CutValueRef<'_>, output: &mut fmt::Formatter<'_>| write!(output, "v{}:{}", value.value.get(), format_value_type(value.ty))),
-            joined_iter(|| cut.imports(), ",", |import: novarocks_physical_plan::CutImportRef<'_>, output: &mut fmt::Formatter<'_>| write!(output, "v{}:{}->v{}", import.source.value.get(), format_value_type(import.source.ty), import.destination.get())),
-            format_distribution_complete(context, fragment_id, &cut.edge.partitioning.source),
-            row_multiplicity(cut.edge.partitioning.source_multiplicity),
-            format_distribution_complete(context, cut.edge.destination.fragment, &cut.edge.partitioning.destination),
-            row_multiplicity(cut.edge.partitioning.destination_multiplicity),
-            joined_iter(|| cut.source_bindings(), ";", |binding: novarocks_physical_plan::SourceBindingRef<'_>, output: &mut fmt::Formatter<'_>| ArtifactSourceDisplay(binding).fmt(output)),
-            cut.has_source_free_rows,
-            ChangeStreamWriterCutDisplay(cut.change_stream_writer),
-            WriterResultCutDisplay(cut.writer_result)
+            "    outbound edge{} kind={} destination=f{} projection=[{}] destination-imports=[{}] source-distribution={} source-multiplicity={} destination-distribution={} destination-multiplicity={} change-stream-writer={} writer-result={}",
+            cut.edge.get(),
+            edge_kind(cut.kind),
+            cut.destination_fragment.get(),
+            joined(&cut.projection, ",", |value: &novarocks_physical_plan::CutValue, output: &mut fmt::Formatter<'_>| write!(output, "v{}:{}", value.value.get(), format_value_type(&value.ty))),
+            joined(&cut.destination_imports, ",", |import: &novarocks_physical_plan::CutImport, output: &mut fmt::Formatter<'_>| write!(output, "v{}:{}->v{}", import.source.value.get(), format_value_type(&import.source.ty), import.destination.get())),
+            format_distribution_complete(context, fragment_id, &cut.partitioning.source),
+            row_multiplicity(cut.partitioning.source_multiplicity),
+            format_distribution_complete(context, cut.destination_fragment, &cut.partitioning.destination),
+            row_multiplicity(cut.partitioning.destination_multiplicity),
+            ChangeStreamWriterCutDisplay(cut.change_stream_writer.as_ref()),
+            WriterResultCutDisplay(cut.writer_result.as_ref())
         ))?;
     }
     Ok(())
 }
 
-struct ChangeStreamWriterCutDisplay<'a>(
-    Option<novarocks_physical_plan::ChangeStreamWriterCutRef<'a>>,
-);
+struct ChangeStreamWriterCutDisplay<'a>(Option<&'a novarocks_physical_plan::ChangeStreamWriterCut>);
 
 impl fmt::Display for ChangeStreamWriterCutDisplay<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1073,10 +1152,10 @@ impl fmt::Display for ChangeStreamWriterCutDisplay<'_> {
             "{{route={}, target={}, fields=[{}]}}",
             format_hex(&proof.route_id.to_bytes()),
             proof.write_target_ordinal.get(),
-            joined_iter(
-                || proof.fields(),
+            joined(
+                &proof.fields,
                 ",",
-                |field: novarocks_physical_plan::ChangeStreamWriterCutField,
+                |field: &novarocks_physical_plan::ChangeStreamWriterCutField,
                  output: &mut fmt::Formatter<'_>| write!(
                     output,
                     "{}:v{}->v{}",
@@ -1089,7 +1168,7 @@ impl fmt::Display for ChangeStreamWriterCutDisplay<'_> {
     }
 }
 
-struct WriterResultCutDisplay<'a>(Option<novarocks_physical_plan::WriterResultCutRef<'a>>);
+struct WriterResultCutDisplay<'a>(Option<&'a novarocks_physical_plan::WriterResultCut>);
 
 impl fmt::Display for WriterResultCutDisplay<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1101,17 +1180,17 @@ impl fmt::Display for WriterResultCutDisplay<'_> {
             "{{target={}, schema-revision={}, fields=[{}]}}",
             proof.write_target_ordinal.get(),
             proof.schema_revision,
-            joined_iter(
-                || proof.fields(),
+            joined(
+                &proof.fields,
                 ";",
-                |field: novarocks_physical_plan::WriterResultCutFieldRef<'_>,
+                |field: &novarocks_physical_plan::WriterResultCutField,
                  output: &mut fmt::Formatter<'_>| write!(
                     output,
                     "v{}->v{}:{}:{}:{}",
                     field.source.get(),
                     field.destination.get(),
-                    quote_text(field.name),
-                    format_value_type(field.ty),
+                    quote_text(&field.name),
+                    format_value_type(&field.ty),
                     writer_relation_field_role(field.role)
                 )
             )
@@ -1126,8 +1205,12 @@ fn render_sink(
     lines: &mut ExplainRenderOutput,
 ) -> Result<(), SqlCompileError> {
     match sink {
+        FragmentSink::RootResult(contract) => lines.push(format_args!(
+            "  SINK root-result {:?} profile={}",
+            contract.kind(),
+            contract.profile().get()
+        ))?,
         FragmentSink::Result => lines.push(format_args!("  SINK result"))?,
-        FragmentSink::RootResult(contract) => lines.push(format_args!("  SINK root-result {:?} profile={}", contract.kind(), contract.profile().get()))?,
         FragmentSink::Stream { edge } => {
             lines.push(format_args!("  SINK stream edge=edge{}", edge.get()))?
         }
@@ -1153,19 +1236,6 @@ fn render_sink(
                 ))?;
             }
         }
-        FragmentSink::SealedArtifact(spec) => lines.push(format_args!(
-            "  SINK sealed-artifact kind={} format={}@{} input=[{}] partition-by=[{}] order-by=[{}] group-boundaries=[{}] source={} coverage={} max-reference-bytes={}",
-            spec.kind.as_str(),
-            spec.format.id.as_str(),
-            spec.format.revision,
-            joined(&spec.input, ",", |field: &novarocks_physical_plan::ArtifactInputField, output: &mut fmt::Formatter<'_>| write!(output, "{}:{}", context.value_name(fragment_id, field.value), format_value_type(&field.ty))),
-            joined(&spec.partition_by, ",", |value: &ValueId, output: &mut fmt::Formatter<'_>| context.value_name(fragment_id, *value).fmt(output)),
-            joined(&spec.order_by, ",", |key: &novarocks_physical_plan::ArtifactSortKey, output: &mut fmt::Formatter<'_>| write!(output, "{} {} NULLS {}", context.value_name(fragment_id, key.value), sort_direction(key.direction), null_ordering(key.null_ordering))),
-            joined(&spec.group_boundaries, ",", |value: &ValueId, output: &mut fmt::Formatter<'_>| context.value_name(fragment_id, *value).fmt(output)),
-            format_artifact_source(&spec.source),
-            format_coverage_set(&spec.required_coverage),
-            spec.max_reference_bytes
-        ))?,
         FragmentSink::Noop => lines.push(format_args!("  SINK noop"))?,
     }
     Ok(())
@@ -1300,7 +1370,6 @@ fn writer_derived_kind(kind: novarocks_physical_plan::WriterDerivedKind) -> &'st
         WriterDerivedKind::AffectedRows => "affected-rows",
         WriterDerivedKind::CommitFragment => "commit-fragment",
         WriterDerivedKind::ChangeEvent => "change-event",
-        WriterDerivedKind::ArtifactReference => "artifact-reference",
         WriterDerivedKind::RelationAuxiliary => "relation-auxiliary",
         WriterDerivedKind::WriteTargetOrdinal => "write-target-ordinal",
         WriterDerivedKind::GroupingKey => "grouping-key",
@@ -1425,56 +1494,6 @@ fn format_distribution_complete<'a>(
     }
 }
 
-struct ArtifactSourceDisplay<'a>(novarocks_physical_plan::SourceBindingRef<'a>);
-
-impl fmt::Display for ArtifactSourceDisplay<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "{{read={}, selection-digest={}}}",
-            format_provider_read(self.0.source),
-            format_hex(self.0.selection_digest)
-        )
-    }
-}
-
-fn format_artifact_source(
-    source: &novarocks_physical_plan::ArtifactSourceBinding,
-) -> ArtifactSourceDisplay<'_> {
-    ArtifactSourceDisplay(source.into())
-}
-
-struct ArtifactRequirementDisplay<'a>(&'a novarocks_physical_plan::ArtifactInputRequirement);
-
-impl fmt::Display for ArtifactRequirementDisplay<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let requirement = self.0;
-        write!(
-            formatter,
-            "artifact{} kind={} format={}@{} schema=[{}] source={} coverage={}",
-            requirement.artifact.get(),
-            requirement.kind.as_str(),
-            requirement.format.id.as_str(),
-            requirement.format.revision,
-            joined(
-                &requirement.schema,
-                ",",
-                |ty: &novarocks_physical_plan::ValueType, output: &mut fmt::Formatter<'_>| {
-                    format_value_type(ty).fmt(output)
-                }
-            ),
-            format_artifact_source(&requirement.source),
-            format_coverage_set(&requirement.required_coverage)
-        )
-    }
-}
-
-fn format_artifact_requirement(
-    requirement: &novarocks_physical_plan::ArtifactInputRequirement,
-) -> ArtifactRequirementDisplay<'_> {
-    ArtifactRequirementDisplay(requirement)
-}
-
 macro_rules! format_connector_payload {
     ($payload:expr) => {{ ConnectorPayloadDisplay($payload) }};
 }
@@ -1525,42 +1544,6 @@ fn format_provider_read(
     read: &novarocks_physical_plan::ProviderReadReference,
 ) -> ProviderReadDisplay<'_> {
     ProviderReadDisplay(read)
-}
-
-struct CoverageDisplay<'a>(&'a novarocks_physical_plan::CoverageSet);
-
-impl fmt::Display for CoverageDisplay<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let coverage = self.0;
-        write!(
-            formatter,
-            "{{domain={}, selection-digest={}, complete={}, ranges=[{}]}}",
-            quote_text(&coverage.domain),
-            format_hex(&coverage.selection_digest),
-            coverage.complete_input,
-            joined(
-                &coverage.ranges,
-                ",",
-                |range: &novarocks_physical_plan::CoverageRange,
-                 output: &mut fmt::Formatter<'_>| write!(
-                    output,
-                    "{}..{}",
-                    CoverageBound {
-                        value: range.start.as_deref(),
-                        infinity: "-inf"
-                    },
-                    CoverageBound {
-                        value: range.end.as_deref(),
-                        infinity: "+inf"
-                    }
-                )
-            )
-        )
-    }
-}
-
-fn format_coverage_set(coverage: &novarocks_physical_plan::CoverageSet) -> CoverageDisplay<'_> {
-    CoverageDisplay(coverage)
 }
 
 fn connector_codec_category(
@@ -1661,6 +1644,12 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
                 )
             }
             ExprKind::Literal(value) => format_literal(value).fmt(formatter),
+            ExprKind::Constant(reference) => write!(
+                formatter,
+                "constant-reference(pool={}, ordinal={})",
+                reference.pool.get(),
+                reference.ordinal,
+            ),
             ExprKind::Unary { op, expr: inner } => write!(
                 formatter,
                 "({}e{})",
@@ -1675,28 +1664,18 @@ impl fmt::Display for ExprDefinitionDisplay<'_> {
             ExprKind::Conjunction { args } => write!(
                 formatter,
                 "({})",
-                joined(
-                    args,
-                    " AND ",
-                    |arg: &ExprId, output: &mut fmt::Formatter<'_>| write!(
-                        output,
-                        "e{}",
-                        expr(*arg)
-                    )
-                )
+                args.iter()
+                    .map(|arg| format!("e{}", expr(*arg)))
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
             ),
             ExprKind::Disjunction { args } => write!(
                 formatter,
                 "({})",
-                joined(
-                    args,
-                    " OR ",
-                    |arg: &ExprId, output: &mut fmt::Formatter<'_>| write!(
-                        output,
-                        "e{}",
-                        expr(*arg)
-                    )
-                )
+                args.iter()
+                    .map(|arg| format!("e{}", expr(*arg)))
+                    .collect::<Vec<_>>()
+                    .join(" OR ")
             ),
             ExprKind::Binary {
                 left, op, right, ..
@@ -2731,13 +2710,13 @@ fn render_operator_profile(
     }
 }
 
-struct NodeContractLines<'a> {
-    output: &'a mut ExplainRenderOutput,
+struct NodeContractLines<'a, 'control> {
+    output: &'a mut ExplainRenderOutput<'control>,
     error: Option<SqlCompileError>,
 }
 
-impl<'a> NodeContractLines<'a> {
-    fn new(output: &'a mut ExplainRenderOutput) -> Self {
+impl<'a, 'control> NodeContractLines<'a, 'control> {
+    fn new(output: &'a mut ExplainRenderOutput<'control>) -> Self {
         Self {
             output,
             error: None,
@@ -2766,7 +2745,7 @@ fn render_node_contract(
     fragment: &Fragment,
     node: &PhysicalNode,
     pad: &str,
-    lines: &mut NodeContractLines<'_>,
+    lines: &mut NodeContractLines<'_, '_>,
 ) {
     let plan = context.plan;
     let level = context.level;
@@ -2837,10 +2816,15 @@ fn render_node_contract(
             derived_values,
             ..
         } => {
+            let relation_kind = match relation.as_ref() {
+                novarocks_physical_plan::Relation::Data(_) => "data".to_string(),
+                novarocks_physical_plan::Relation::Metadata(metadata) => {
+                    format!("metadata({})", metadata.kind.as_str())
+                }
+            };
             lines.push(format_args!(
-                "{pad}  occurrence=pr{}, relation={}, work-source={}, schema-fields={}, read-budget={{rows={}, bytes={}}}",
+                "{pad}  occurrence=pr{}, relation={relation_kind}, work-source={}, schema-fields={}, read-budget={{rows={}, bytes={}}}",
                 occurrence.get(),
-                RelationKindDisplay(relation.as_ref()),
                 connector_read_work_source(relation.work_source()),
                 relation.schema().len(),
                 read_budget.max_batch_rows,
@@ -2852,16 +2836,14 @@ fn render_node_contract(
             ));
             match relation.as_ref() {
                 novarocks_physical_plan::Relation::Data(data) => lines.push(format_args!(
-                    "{pad}  selection-digest={}, artifact-inputs=[{}]",
-                    format_hex(&data.selection_digest),
-                    joined(&data.artifact_inputs, "; ", |requirement: &novarocks_physical_plan::ArtifactInputRequirement, output: &mut fmt::Formatter<'_>| format_artifact_requirement(requirement).fmt(output))
+                    "{pad}  selection-digest={}",
+                    format_hex(&data.selection_digest)
                 )),
                 novarocks_physical_plan::Relation::Metadata(metadata) => lines.push(format_args!(
-                    "{pad}  selection-digest={}, coverage-evidence={{bytes={}, digest={}}}, artifact-inputs=[{}]",
+                    "{pad}  selection-digest={}, coverage-evidence={{bytes={}, digest={}}}",
                     format_hex(&metadata.selection_digest),
                     metadata.coverage_evidence.len(),
-                    digest_bytes(&metadata.coverage_evidence),
-                    joined(&metadata.artifact_inputs, "; ", |requirement: &novarocks_physical_plan::ArtifactInputRequirement, output: &mut fmt::Formatter<'_>| format_artifact_requirement(requirement).fmt(output))
+                    digest_bytes(&metadata.coverage_evidence)
                 )),
             }
             for (ordinal, field) in relation.schema().iter().enumerate() {
@@ -3037,11 +3019,17 @@ fn render_node_contract(
             limit,
             offset,
             phase,
-        } => lines.push(format_args!(
-            "{pad}  phase={}, limit={limit}, offset={offset}, order-by=[{}]",
-            topn_phase(*phase),
-            format_sort_exprs(plan, fragment_id, fragment, order_by)
-        )),
+            reduction,
+        } => {
+            lines.push(format_args!(
+                "{pad}  phase={}, limit={limit}, offset={offset}, order-by=[{}]",
+                topn_phase(*phase),
+                format_sort_exprs(plan, fragment_id, fragment, order_by)
+            ));
+            if let novarocks_physical_plan::TopNReduction::GroupedStates { group_by, calls, comparator } = reduction {
+                lines.push(format_args!("{pad}  unit=group-key, keys={}, merged-states={}, comparator={}", group_by.len(), calls.len(), comparator.stable_name()));
+            }
+        },
         NodeKind::Limit { limit, offset } => match limit {
             Some(limit) => lines.push(format_args!("{pad}  limit={limit}, offset={offset}")),
             None => lines.push(format_args!("{pad}  limit=none, offset={offset}")),
@@ -3283,9 +3271,16 @@ impl fmt::Display for LiteralDisplay<'_> {
                 write!(formatter, "{}[bits=0x{value:016x}]", f64::from_bits(*value))
             }
             novarocks_physical_plan::LiteralValue::LargeInt(value)
-            | novarocks_physical_plan::LiteralValue::Decimal128(value)
-            | novarocks_physical_plan::LiteralValue::IntervalMonthDayNano(value) => {
-                value.fmt(formatter)
+            | novarocks_physical_plan::LiteralValue::Decimal128(value) => value.fmt(formatter),
+            novarocks_physical_plan::LiteralValue::IntervalMonthDayNano {
+                months,
+                days,
+                nanoseconds,
+            } => {
+                write!(
+                    formatter,
+                    "INTERVAL(months={months}, days={days}, nanoseconds={nanoseconds})"
+                )
             }
             novarocks_physical_plan::LiteralValue::Decimal256(value) => {
                 arrow::datatypes::i256::from_be_bytes(*value).fmt(formatter)
@@ -3303,19 +3298,6 @@ impl fmt::Display for LiteralDisplay<'_> {
 
 fn format_literal(value: &novarocks_physical_plan::LiteralValue) -> LiteralDisplay<'_> {
     LiteralDisplay(value)
-}
-
-struct RelationKindDisplay<'a>(&'a novarocks_physical_plan::Relation);
-
-impl fmt::Display for RelationKindDisplay<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            novarocks_physical_plan::Relation::Data(_) => formatter.write_str("data"),
-            novarocks_physical_plan::Relation::Metadata(metadata) => {
-                write!(formatter, "metadata({})", metadata.kind.as_str())
-            }
-        }
-    }
 }
 
 fn function_display_name(identity: &novarocks_physical_plan::FunctionId) -> &str {
@@ -3509,28 +3491,17 @@ impl fmt::Display for UnpivotConstantsDisplay<'_> {
                         format_expr(self.plan, self.fragment_id, self.fragment, *expression)
                             .fmt(output)
                     }
-                    novarocks_physical_plan::UnpivotConstant::Int32List(values) => write!(
+                    novarocks_physical_plan::UnpivotConstant::Int32List(reference) => write!(
                         output,
-                        "int32[{}]",
-                        joined(
-                            values,
-                            ",",
-                            |value: &i32, nested: &mut fmt::Formatter<'_>| value.fmt(nested)
-                        )
+                        "int32-constant-reference(pool={}, ordinal={})",
+                        reference.pool.get(),
+                        reference.ordinal,
                     ),
-                    novarocks_physical_plan::UnpivotConstant::Utf8Map(entries) => write!(
+                    novarocks_physical_plan::UnpivotConstant::Utf8Map(reference) => write!(
                         output,
-                        "utf8[{}]",
-                        joined(
-                            entries,
-                            ",",
-                            |entry: &(Box<str>, Box<str>), nested: &mut fmt::Formatter<'_>| write!(
-                                nested,
-                                "{}->{}",
-                                quote_text(&entry.0),
-                                quote_text(&entry.1)
-                            )
-                        )
+                        "utf8-map-constant-reference(pool={}, ordinal={})",
+                        reference.pool.get(),
+                        reference.ordinal,
                     ),
                 }
             },
@@ -3613,10 +3584,15 @@ fn render_annotations(
     pad: &str,
     lines: &mut ExplainRenderOutput,
 ) -> Result<(), SqlCompileError> {
-    for annotation in context.annotations.get(subject).filter(|annotation| {
-        !annotation_is_internal_display(&annotation.key)
-            && annotation_visible(context.level, &annotation.key)
-    }) {
+    for annotation in context
+        .annotations
+        .get(subject)
+        .iter()
+        .filter(|annotation| {
+            !annotation_is_internal_display(&annotation.key)
+                && annotation_visible(context.level, &annotation.key)
+        })
+    {
         if matches!(subject, AnnotationSubject::Node(_, _))
             && matches!(
                 annotation.key.as_ref(),
@@ -3781,6 +3757,19 @@ fn node_header<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn explicit_interval_literal_display_preserves_all_three_components() {
+        let literal = novarocks_physical_plan::LiteralValue::IntervalMonthDayNano {
+            months: -7,
+            days: 23,
+            nanoseconds: i64::MIN,
+        };
+        assert_eq!(
+            super::format_literal(&literal).to_string(),
+            "INTERVAL(months=-7, days=23, nanoseconds=-9223372036854775808)"
+        );
+    }
+
     use arrow::datatypes::DataType;
     use novarocks_physical_plan::{
         ExactInputVersion, PipelineDopDomain, PlanVersionId, PredicateGuaranteeKind,
@@ -3830,6 +3819,8 @@ mod tests {
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
             noop_constant_evaluator(),
+            crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             SqlCompileControl::unbounded(),
             PipelineDopDomain {
                 min: 1,
@@ -3853,7 +3844,8 @@ mod tests {
             .try_into_completion()
             .expect("completion request");
         let SqlCompileProgress::Complete(completed) =
-            SqlCompiler::start(request).expect("completed values plan")
+            SqlCompiler::start(request, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("completed values plan")
         else {
             panic!("VALUES must not require external facts");
         };
@@ -4111,8 +4103,6 @@ mod tests {
                 ProviderReadLimitFact::Exact,
             ),
             provided_properties: ProviderReadProperties::unconstrained(),
-            artifact_inputs: Box::default(),
-            artifact_refs: Box::default(),
             coverage_evidence: Box::default(),
         }
     }
@@ -4132,7 +4122,10 @@ mod tests {
         )
         .try_into_completion()
         .expect("completion request");
-        let catalog = incomplete(SqlCompiler::start(seed).expect("catalog need"));
+        let catalog = incomplete(
+            SqlCompiler::start(seed, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("catalog need"),
+        );
         let catalog_needs = match catalog.needs() {
             crate::compiler::SqlNeedBatch::CatalogRelations(needs) => needs,
             other => panic!("expected catalog needs, got {other:?}"),
@@ -4246,7 +4239,8 @@ mod tests {
         .expect("completion request");
 
         assert!(matches!(
-            SqlCompiler::start(request).expect("catalog need"),
+            SqlCompiler::start(request, &crate::compiler::SqlCompileControl::unbounded())
+                .expect("catalog need"),
             SqlCompileProgress::Incomplete(_)
         ));
     }
@@ -4459,10 +4453,6 @@ mod tests {
         assert!(rendered.contains("source={fragment=f"), "{rendered}");
         assert!(rendered.contains("mapping=["), "{rendered}");
         assert!(rendered.contains("CUT ATTACHMENTS"), "{rendered}");
-        assert!(
-            rendered.contains("source-bindings=[] source-free=true"),
-            "{rendered}"
-        );
         assert!(rendered.contains("change-stream-writer=none"), "{rendered}");
         assert!(rendered.contains("writer-result=none"), "{rendered}");
         assert!(rendered.contains("SINK stream edge=edge"), "{rendered}");
@@ -4673,94 +4663,6 @@ mod tests {
     }
 
     #[test]
-    fn bounded_writer_preflights_capacity_and_preserves_exact_text() {
-        let mut text = String::new();
-        let mut writer = BoundedStringWriter {
-            output: &mut text,
-            remaining: 1024,
-        };
-        for _ in 0..1024 {
-            writer.write_str("x").expect("exact byte bound");
-            assert!(writer.output.capacity() <= 1024);
-            assert!(writer.output.capacity() <= writer.output.len().saturating_mul(2));
-        }
-        let capacity = writer.output.capacity();
-        assert!(writer.write_str("x").is_err());
-        assert_eq!(writer.output.capacity(), capacity);
-        assert_eq!(writer.output.len(), 1024);
-        assert!(writer.output.bytes().all(|byte| byte == b'x'));
-
-        let budget = ExplainRenderBudget::try_new(5, 1024).unwrap();
-        let mut output = ExplainRenderOutput::new(budget);
-        for expected in ["a", "b", "c", "d", "e"] {
-            output.push(format_args!("{expected}")).unwrap();
-            assert!(output.lines.capacity() <= 5);
-            assert!(output.lines.iter().map(String::capacity).sum::<usize>() <= 2 * output.bytes);
-        }
-        assert!(output.push(format_args!("sixth")).is_err());
-        assert_eq!(output.finish(), ["a", "b", "c", "d", "e"]);
-        assert!(ExplainRenderBudget::try_new(65_537, 1).is_err());
-        assert!(ExplainRenderBudget::try_new(1, 8 * 1024 * 1024 + 1).is_err());
-    }
-
-    #[test]
-    fn wide_boolean_definitions_write_borrowed_arguments_under_the_line_bound() {
-        let completed = completed(
-            SqlCompileIntent::Explain {
-                level: ExplainLevel::Contract,
-                analyze: false,
-            },
-            79,
-        );
-        let context = RenderContext::new(completed.plan(), ExplainLevel::Contract, None).unwrap();
-        let mut expression = novarocks_physical_plan::ExprNode {
-            id: ExprId::new(0),
-            owner: NodeId::new(0),
-            lambda_scope: None,
-            ty: novarocks_physical_plan::ValueType::new(arrow::datatypes::DataType::Boolean, false),
-            kind: novarocks_physical_plan::ExprKind::Conjunction {
-                args: Box::from([ExprId::new(1), ExprId::new(2)]),
-            },
-        };
-        let mut output = ExplainRenderOutput::new(ExplainRenderBudget::try_new(1, 128).unwrap());
-        output
-            .push(format_args!(
-                "{}",
-                ExprDefinitionDisplay {
-                    context: &context,
-                    fragment: FragmentId::new(0),
-                    expression: &expression,
-                }
-            ))
-            .unwrap();
-        assert_eq!(output.finish(), ["(e1 AND e2)"]);
-        for conjunction in [true, false] {
-            let args = vec![ExprId::new(1); 32_768].into_boxed_slice();
-            expression.kind = if conjunction {
-                novarocks_physical_plan::ExprKind::Conjunction { args }
-            } else {
-                novarocks_physical_plan::ExprKind::Disjunction { args }
-            };
-            let mut output =
-                ExplainRenderOutput::new(ExplainRenderBudget::try_new(1, 128).unwrap());
-            assert!(
-                output
-                    .push(format_args!(
-                        "{}",
-                        ExprDefinitionDisplay {
-                            context: &context,
-                            fragment: FragmentId::new(0),
-                            expression: &expression,
-                        }
-                    ))
-                    .is_err()
-            );
-            assert!(output.lines.is_empty());
-            assert_eq!(output.bytes, 0);
-        }
-    }
-
-    #[test]
     fn wide_values_and_deep_join_chains_remain_budgeted_and_iterative() {
         let values = (0..256).map(|_| "1").collect::<Vec<_>>().join(",");
         let completed = completed_sql(
@@ -4946,8 +4848,18 @@ mod tests {
         assert!(pruning.contains("residual expr=e"), "{pruning}");
         assert!(pruning.contains("relation-field[0] column="), "{pruning}");
         assert!(pruning.contains("provider-output[0] column="), "{pruning}");
-        assert!(pruning.contains("source-bindings=[{read="), "{pruning}");
-        assert!(pruning.contains("source-free=false"), "{pruning}");
+        assert!(
+            pruning.contains("provider-read={provider=iceberg"),
+            "{pruning}"
+        );
+        assert!(
+            pruning.contains("input-version={bytes=1, digest="),
+            "{pruning}"
+        );
+        assert!(
+            pruning.contains(&format!("selection-digest={}", "08".repeat(32))),
+            "{pruning}"
+        );
     }
 
     #[test]

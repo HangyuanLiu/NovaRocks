@@ -28,7 +28,7 @@ use novarocks_execution::exec::expr::ExprArena;
 use novarocks_execution::exec::node::values::ValuesNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind, ExecPlan};
 use novarocks_local_program::{
-    LayoutError, LocalProgram, ProgramNodeKind, StaticLayout, StaticSinkProgram,
+    LayoutError, LocalProgramGraph, ProgramNodeKind, StaticLayout, StaticSinkProgram,
 };
 use novarocks_native_adapter::fragment_layout::decode_output_layout;
 use novarocks_native_adapter::fragment_plan_node::{NativeLoweredPlanNode, lower_project_node};
@@ -152,7 +152,7 @@ fn null_chunk(schema: ChunkSchemaRef) -> Chunk {
     Chunk::try_new_with_chunk_schema(batch, schema).unwrap()
 }
 
-fn production_program(plan: ExecPlan) -> LocalProgram {
+fn production_program(plan: ExecPlan) -> LocalProgramGraph {
     let profile = plan
         .local_compile_profile(NonZeroUsize::new(1).unwrap(), None)
         .unwrap();

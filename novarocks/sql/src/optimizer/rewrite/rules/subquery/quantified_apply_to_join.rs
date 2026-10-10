@@ -28,6 +28,7 @@ use super::predicate_apply_util::lift_correlated_inner_opt;
 use super::scalar_utils;
 use crate::common::ApplyKind;
 use crate::common::JoinKind;
+use crate::compiler::SqlCompileError;
 use crate::optimizer::operator::{ApplyOp, Operator};
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{OpKind, Pattern};
@@ -61,11 +62,21 @@ impl LogicalRewriteRule for QuantifiedApplyToJoin {
         matches_apply_fields(apply_payload_after_pattern_gate(expr))
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let function_catalog = ctx.function_catalog().snapshot();
         let arena = ctx.scalar_arena();
         let mut arena = arena.borrow_mut();
-        match apply_expr(expr, function_catalog.as_ref(), &mut arena)? {
+        match apply_expr(
+            expr,
+            function_catalog.as_ref(),
+            &mut arena,
+            ctx.decimal_overflow_policy(),
+            &ctx.control_view(),
+        )? {
             Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }
@@ -87,7 +98,9 @@ fn apply_expr(
     expr: OptExpr,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
-) -> Result<Option<OptExpr>, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<OptExpr>, SqlCompileError> {
     let OptExpr {
         op,
         mut children,
@@ -110,7 +123,8 @@ fn apply_expr(
     }
 
     let lhs = a.subquery_expr;
-    let inner_cols = scalar_utils::opt_output_columns(&apply_right, arena)?;
+    let inner_cols = scalar_utils::opt_output_columns(&apply_right, arena)
+        .map_err(SqlCompileError::Compilation)?;
     let available_output_ids = inner_cols
         .iter()
         .map(|c| c.column_id.to_string())
@@ -125,9 +139,9 @@ fn apply_expr(
                 a.inner_output_column_id, available_output_ids
             )
         })?;
-    let inner_col_ref = scalar_utils::column_ref(arena, inner_col_oc);
+    let inner_col_ref = scalar_utils::column_ref(arena, inner_col_oc, control)?;
 
-    let either_nullable = arena.nullable(lhs) || inner_col_oc.nullable;
+    let either_nullable = arena.nullable(lhs) || inner_col_oc.value_type.nullable;
     let join_type = if negated {
         if either_nullable {
             JoinKind::NullAwareLeftAnti
@@ -138,12 +152,13 @@ fn apply_expr(
         JoinKind::LeftSemi
     };
 
-    let in_key = scalar_utils::eq(arena, lhs, inner_col_ref);
+    let in_key = scalar_utils::eq(arena, lhs, inner_col_ref, control)?;
 
     let (right, condition) = if a.correlation_column_ids.is_empty() {
         (apply_right, in_key)
     } else {
-        let Some(lifted) = lift_correlated_inner_opt(apply_right, &a.correlation_column_ids, arena)
+        let Some(lifted) =
+            lift_correlated_inner_opt(apply_right, &a.correlation_column_ids, arena, control)?
         else {
             return Ok(None);
         };
@@ -151,11 +166,12 @@ fn apply_expr(
             return Ok(None);
         };
         let extra = if negated && arena.nullable(lifted_pred) {
-            scalar_utils::coalesce_false(function_catalog, arena, lifted_pred)?
+            scalar_utils::coalesce_false(function_catalog, arena, lifted_pred, policy, control)?
         } else {
             lifted_pred
         };
-        let Some(condition) = scalar_utils::combine_and(arena, vec![in_key, extra]) else {
+        let Some(condition) = scalar_utils::combine_and(arena, vec![in_key, extra], control)?
+        else {
             return Ok(None);
         };
         (lifted.right, condition)
@@ -201,7 +217,7 @@ mod tests {
     const INNER_K: ColumnId = ColumnId(4);
     const IN_OUT: ColumnId = ColumnId(5);
 
-    fn ctx_with_arena() -> RewriteContext {
+    fn ctx_with_arena() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
@@ -216,8 +232,8 @@ mod tests {
         OutputColumn {
             column_id: id,
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, nullable),
+
             is_internal: false,
         }
     }
@@ -277,8 +293,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, nullable),
         }
     }
 
@@ -286,8 +301,8 @@ mod tests {
         OutputColumn {
             column_id: IN_OUT,
             name: "in_result".to_string(),
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
+
             is_internal: true,
         }
     }
@@ -300,8 +315,10 @@ mod tests {
                 right: Box::new(col_ref(OUTER_K, "k", false)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::Boolean,
+                nullable,
+            ),
         }
     }
 
@@ -401,7 +418,13 @@ mod tests {
         );
 
         assert!(
-            bind_tree(&rule.pattern(), &expr).is_none(),
+            bind_tree(
+                &rule.pattern(),
+                &expr,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none(),
             "QuantifiedApplyToJoin pattern must only match Apply roots"
         );
     }
@@ -491,7 +514,7 @@ mod tests {
             args[1].kind,
             ExprKind::Literal(LiteralValue::Bool(false))
         ));
-        assert!(!condition.nullable);
+        assert!(!condition.value_type.nullable);
     }
 
     fn contains_apply(plan: &LogicalPlanNode) -> bool {
@@ -642,6 +665,9 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("missing inner output column id must error");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
 
         assert!(err.contains("c999"), "unexpected error: {err}");
         assert!(err.contains("c3"), "unexpected error: {err}");

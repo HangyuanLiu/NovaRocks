@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -123,7 +125,7 @@ impl ProcessorOperator for LocalExchangeSinkOperator {
         false
     }
 
-    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if self.is_finished() {
             return Ok(());
         }
@@ -140,14 +142,16 @@ impl ProcessorOperator for LocalExchangeSinkOperator {
                 chunk.len()
             );
         }
-        self.exchanger.accept(state, chunk, self.driver_id as usize)
+        Ok(self
+            .exchanger
+            .accept(state, chunk, self.driver_id as usize)?)
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         Ok(None)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }

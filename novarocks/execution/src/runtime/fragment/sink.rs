@@ -18,6 +18,7 @@
 use crate::exec::expr::{ExprArena, ExprId};
 use crate::exec::fragment::program::FragmentProgram;
 use crate::exec::fragment::sink::DataStreamSinkFactoryInput;
+use crate::exec::operators::CompiledPartitionKeys;
 use crate::exec::operators::{
     DataStreamSinkFactory, MultiCastDataStreamSinkFactory, NoopSinkFactory,
     ResultBufferSinkFactory, SplitDataStreamSinkFactory,
@@ -202,7 +203,7 @@ fn materialize_fragment_sink_components_impl(
                 fragment_instance_id,
                 *sender_id,
                 plan_node_id,
-                bound_sink_arena(arena, std::sync::Arc::clone(&runtime_error)),
+                bound_sink_arena(arena, std::sync::Arc::clone(&runtime_error))?,
                 std::sync::Arc::clone(&transmitter),
             );
             // Without the gates a push sink sends the moment it has rows, and
@@ -260,13 +261,153 @@ fn materialize_fragment_sink_components_impl(
     }
 }
 
+/// Materialize the root sink of one compiled LocalProgram (local-compiler
+/// output).
+///
+/// A compiled sink never thaws its sink arena into a legacy `ExprArena`, so
+/// only expression-free shapes are executable here: the caller's result sink
+/// for `Result`, `Noop`, and a single-branch stream whose partitioning
+/// evaluates no key. A shape that would need a compiled partition-key root
+/// is refused explicitly rather than routed through the legacy evaluator.
+pub(crate) fn materialize_compiled_sink(
+    program: &std::sync::Arc<novarocks_local_program::LocalProgram>,
+    assignment: &FragmentSinkAssignment,
+    fragment_instance_id: novarocks_types::UniqueId,
+    transmitter: std::sync::Arc<dyn ExchangeFrameTransmitter>,
+    result_sink: Option<Box<dyn OperatorFactory>>,
+    edge_gates: Option<std::sync::Arc<ExchangeEdgeGates>>,
+) -> Result<Box<dyn OperatorFactory>, FragmentLaunchError> {
+    let graph = program.graph();
+    let sink = graph
+        .sink()
+        .ok_or_else(|| materialization_error("compiled local program has no static sink"))?;
+    if !matches!(
+        sink,
+        StaticSinkProgram::Result | StaticSinkProgram::RootResult(_)
+    ) && result_sink.is_some()
+    {
+        return Err(materialization_error(format!(
+            "compiled {} sink cannot take a result sink",
+            sink_program_name(sink)
+        )));
+    }
+    match (sink, assignment) {
+        (
+            StaticSinkProgram::Result | StaticSinkProgram::RootResult(_),
+            FragmentSinkAssignment::None,
+        ) => result_sink
+            .ok_or_else(|| materialization_error("compiled RESULT_SINK requires a result sink")),
+        (StaticSinkProgram::Noop, FragmentSinkAssignment::None) => {
+            Ok(Box::new(NoopSinkFactory::new()))
+        }
+        (
+            StaticSinkProgram::DataStream { branch, .. },
+            FragmentSinkAssignment::StreamDestinations {
+                destinations,
+                sender_id,
+            },
+        ) => {
+            let partition_keys = compiled_partition_keys(program, branch)?;
+            if let Some(limit) = branch.limit() {
+                return Err(materialization_error(format!(
+                    "compiled stream sink limit {limit} is not executable yet"
+                )));
+            }
+            let plan_node_id = i32::try_from(graph.root().index())
+                .map_err(|_| materialization_error("compiled program root index exceeds i32"))?;
+            // Keys are compiled roots over the sink's input port, so the
+            // legacy partition expressions and arena stay empty; the compiled
+            // sink arena is never thawed.
+            let input = DataStreamSinkFactoryInput::try_from_static_program(
+                branch.dest_node_id(),
+                branch.partition_type(),
+                Vec::new(),
+                Vec::new(),
+                branch.output_columns().to_vec(),
+                destinations.clone(),
+            )
+            .map_err(materialization_error)?;
+            let factory = DataStreamSinkFactory::new(
+                input,
+                fragment_instance_id,
+                *sender_id,
+                plan_node_id,
+                ExprArena::default(),
+                transmitter,
+            );
+            let factory = match partition_keys {
+                Some(keys) => factory
+                    .with_compiled_partition_keys(keys)
+                    .map_err(materialization_error)?,
+                None => factory,
+            };
+            // Without the gates a push sink sends the moment it has rows, and
+            // the frozen edge's closed state means nothing.
+            let factory = match edge_gates {
+                Some(gates) => factory.with_edge_gates(gates),
+                None => factory,
+            };
+            Ok(Box::new(factory))
+        }
+        (
+            StaticSinkProgram::MultiCastDataStream { .. }
+            | StaticSinkProgram::SplitDataStream { .. },
+            _,
+        ) => Err(materialization_error(format!(
+            "compiled {} sink not executable yet",
+            sink_program_name(sink)
+        ))),
+        (static_program, dynamic_assignment) => Err(materialization_error(format!(
+            "compiled sink {} cannot be materialized with assignment {}",
+            sink_program_name(static_program),
+            sink_assignment_name(dynamic_assignment)
+        ))),
+    }
+}
+
+/// The compiled partition-key roots of the one DataStream branch, in key
+/// order. A partitioning that evaluates no key must carry none.
+fn compiled_partition_keys(
+    program: &std::sync::Arc<novarocks_local_program::LocalProgram>,
+    branch: &StaticStreamBranch,
+) -> Result<Option<CompiledPartitionKeys>, FragmentLaunchError> {
+    let keys = branch.partition_exprs().len();
+    if !branch.partition_type().requires_exprs() {
+        if keys != 0 {
+            return Err(materialization_error(format!(
+                "compiled {} stream sink cannot carry partition keys",
+                branch.partition_type().display_name()
+            )));
+        }
+        return Ok(None);
+    }
+    if keys == 0 {
+        return Err(materialization_error(format!(
+            "compiled {} stream sink has no partition key",
+            branch.partition_type().display_name()
+        )));
+    }
+    let mut sites = Vec::with_capacity(keys);
+    for key in 0..keys {
+        let key = u32::try_from(key)
+            .map_err(|_| materialization_error("compiled partition key count exceeds u32"))?;
+        sites.push(
+            novarocks_local_program::ProgramExpressionRootSite::SinkPartition { branch: 0, key },
+        );
+    }
+    Ok(Some(CompiledPartitionKeys::new(
+        std::sync::Arc::clone(program),
+        sites,
+    )))
+}
+
 fn bound_sink_arena(
     expressions: &novarocks_local_program::ImmutableExpressions,
     runtime_error: std::sync::Arc<crate::runtime::runtime_state::RuntimeErrorState>,
-) -> ExprArena {
-    let mut arena = ExprArena::from_immutable(expressions);
+) -> Result<ExprArena, FragmentLaunchError> {
+    let mut arena = ExprArena::from_immutable(expressions).map_err(materialization_error)?;
     arena.bind_runtime_error(runtime_error);
-    arena
+    Ok(arena)
 }
 
 fn materialize_multicast(
@@ -292,7 +433,7 @@ fn materialize_multicast(
         sinks,
         fragment_instance_id,
         sender_id,
-        bound_sink_arena(arena, std::sync::Arc::clone(&runtime_error)),
+        bound_sink_arena(arena, std::sync::Arc::clone(&runtime_error))?,
         plan_node_id,
         transmitter,
     );
@@ -324,7 +465,7 @@ fn materialize_split(
         .zip(groups)
         .map(|(stream, destinations)| branch_input(stream, destinations.clone()))
         .collect::<Result<Vec<_>, FragmentLaunchError>>()?;
-    let runtime_arena = bound_sink_arena(arena, std::sync::Arc::clone(&runtime_error));
+    let runtime_arena = bound_sink_arena(arena, std::sync::Arc::clone(&runtime_error))?;
     let factory = SplitDataStreamSinkFactory::new(
         sinks,
         fragment_instance_id,
@@ -412,11 +553,13 @@ mod runtime_arena_tests {
         let frozen = construction.into_immutable().unwrap();
         let stopped =
             std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default());
-        let runtime = bound_sink_arena(&frozen, std::sync::Arc::clone(&stopped));
+        let runtime = bound_sink_arena(&frozen, std::sync::Arc::clone(&stopped))
+            .expect("legacy sink fixture");
         let sibling = bound_sink_arena(
             &frozen,
             std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
-        );
+        )
+        .expect("legacy sink fixture");
         assert!(
             runtime
                 .wait_interruptibly(std::time::Duration::ZERO)

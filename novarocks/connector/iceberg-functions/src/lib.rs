@@ -39,6 +39,8 @@ pub fn supports_theta_input_type(data_type: &DataType) -> bool {
 pub use theta::{
     ICEBERG_THETA_AGGREGATE_NAME, ICEBERG_THETA_IMPLEMENTATION_IDENTITY,
     ICEBERG_THETA_MAX_COMPACT_BYTES, ICEBERG_THETA_STATE_FORMAT_IDENTITY, IcebergFunctionBundle,
-    IcebergThetaAggregateFamily, IcebergThetaError, estimate_compact_theta,
-    iceberg_theta_registration, union_compact_theta, validate_compact_theta,
+    IcebergThetaAggregateFamily, IcebergThetaError, PreparedThetaKernel,
+    THETA_EMISSION_LIBRARY_REQUEST_BYTES, ThetaOutputResourceFacts, estimate_compact_theta,
+    iceberg_theta_pure_definition, iceberg_theta_registration, theta_output_resource_facts,
+    union_compact_theta, validate_compact_theta,
 };

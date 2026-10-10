@@ -23,8 +23,9 @@ pub(crate) mod common;
 pub(crate) mod analysis;
 pub mod binding;
 pub(crate) mod catalog;
-pub(crate) mod column_id;
+mod column_id;
 pub mod compiler;
+pub(crate) mod constant;
 pub(crate) mod functions;
 pub mod literal;
 pub(crate) mod mv_refresh;
@@ -58,8 +59,8 @@ mod common_tests {
         let output = OutputColumn {
             column_id: ColumnId::new_for_test(1),
             name: "internal_col".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: true,
         };
         assert_eq!(output.column_id, ColumnId::new_for_test(1));
@@ -69,8 +70,7 @@ mod common_tests {
         let lambda = LambdaParam {
             name: "x".to_string(),
             slot_id: 3,
-            data_type: DataType::Utf8,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
         };
         assert_eq!(lambda.slot_id, 3);
 
@@ -89,24 +89,18 @@ mod common_tests {
             ApplyKind::In { negated: true }
         );
 
-        let variant = ScanVariantColumn {
-            source_column_id: ColumnId::new_for_test(4),
-            source_column: "v".to_string(),
-            synthetic_column_id: ColumnId::new_for_test(5),
-            synthetic_column: "v.a".to_string(),
-            canonical_path: "$.a".to_string(),
-            requested_type: DataType::Int32,
-            requested_type_literal: "int".to_string(),
-            strict: true,
-            binding: crate::analysis::test_function_binding(
-                "variant_get",
-                &[],
-                DataType::Int32,
-                true,
-                novarocks_functions::FunctionVolatility::Immutable,
-            ),
-        };
-        assert_eq!(variant.canonical_path, "$.a");
+        let variant = ScanVariantColumn::test_fixture(
+            ColumnId::new_for_test(4),
+            "v".to_string(),
+            ColumnId::new_for_test(5),
+            "v.a".to_string(),
+            "$.a".to_string(),
+            DataType::Int32,
+            "int".to_string(),
+            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::LargeBinary, true),
+        );
+        assert_eq!(variant.canonical_path(), "$.a");
 
         assert_eq!(ImvVersionRef::from_snapshot().role, ImvVersionRole::From);
         assert_eq!(ImvVersionRef::default().role, ImvVersionRole::To);

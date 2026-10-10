@@ -29,6 +29,8 @@ doctest = false
 
 [dependencies]
 arrow-array.workspace = true
+arrow-buffer.workspace = true
 arrow-schema.workspace = true
 datasketches = { workspace = true, features = ["theta"] }
 novarocks-functions.workspace = true
+novarocks-type-contract.workspace = true

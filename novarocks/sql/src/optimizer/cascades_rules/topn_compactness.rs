@@ -44,8 +44,15 @@ impl Rule for MergeConsecutiveTopN {
         matches!(op, Operator::LogicalTopN(_))
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
-        merge_consecutive_topn(expr, memo)
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
+        Ok(merge_consecutive_topn(expr, memo))
     }
 
     fn pattern(&self) -> Pattern {
@@ -58,17 +65,24 @@ impl Rule for MergeConsecutiveTopN {
         }
     }
 
-    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply_bound(
+        &self,
+        binding: &Binding,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         // interior 0 = outer TopN, interior 1 = inner TopN.
         let Operator::LogicalTopN(outer) = binding.op(memo, 0).clone() else {
-            return vec![];
+            return Ok(vec![]);
         };
         let Operator::LogicalTopN(inner) = binding.op(memo, 1).clone() else {
-            return vec![];
+            return Ok(vec![]);
         };
         // The inner TopN's child group (its only child).
         let inner_child_group_id = binding.children(1)[0];
-        merge_one_topn(&outer, &inner, inner_child_group_id, memo)
+        Ok(merge_one_topn(&outer, &inner, inner_child_group_id, memo))
     }
 }
 
@@ -87,8 +101,15 @@ impl Rule for RemoveRedundantSortUnderTopN {
         matches!(op, Operator::LogicalTopN(_))
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
-        remove_redundant_sort_under_topn(expr, memo)
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
+        Ok(remove_redundant_sort_under_topn(expr, memo))
     }
 
     fn pattern(&self) -> Pattern {
@@ -101,20 +122,33 @@ impl Rule for RemoveRedundantSortUnderTopN {
         }
     }
 
-    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply_bound(
+        &self,
+        binding: &Binding,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         // interior 0 = TopN, interior 1 = Sort.
         let Operator::LogicalTopN(topn) = binding.op(memo, 0).clone() else {
-            return vec![];
+            return Ok(vec![]);
         };
         let Operator::LogicalSort(sort) = binding.op(memo, 1).clone() else {
-            return vec![];
+            return Ok(vec![]);
         };
         // The Sort's group is the TopN's only child; its equivalence_classes
         // decide whether the Sort's ordering covers the TopN's.
         let sort_group_id = binding.children(0)[0];
         // The Sort's children become the rewritten TopN's children.
         let sort_children = binding.children(1).to_vec();
-        remove_one_sort(&topn, &sort, sort_group_id, &sort_children, memo)
+        Ok(remove_one_sort(
+            &topn,
+            &sort,
+            sort_group_id,
+            &sort_children,
+            memo,
+        ))
     }
 }
 
@@ -133,8 +167,15 @@ impl Rule for PushTopNThroughProject {
         matches!(op, Operator::LogicalTopN(_))
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
-        push_topn_through_project(expr, memo)
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
+        Ok(push_topn_through_project(expr, memo))
     }
 
     fn pattern(&self) -> Pattern {
@@ -147,17 +188,24 @@ impl Rule for PushTopNThroughProject {
         }
     }
 
-    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply_bound(
+        &self,
+        binding: &Binding,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         // interior 0 = TopN, interior 1 = Project.
         let Operator::LogicalTopN(topn) = binding.op(memo, 0).clone() else {
-            return vec![];
+            return Ok(vec![]);
         };
         let Operator::LogicalProject(project) = binding.op(memo, 1).clone() else {
-            return vec![];
+            return Ok(vec![]);
         };
         // The Project's child group (its only child).
         let project_children = binding.children(1).to_vec();
-        push_one_project(&topn, &project, &project_children, memo)
+        Ok(push_one_project(&topn, &project, &project_children, memo))
     }
 }
 
@@ -176,8 +224,15 @@ impl Rule for PushTopNIntoScan {
         matches!(op, Operator::LogicalTopN(_))
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
-        push_topn_into_scan(expr, memo)
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
+        Ok(push_topn_into_scan(expr, memo))
     }
 
     fn pattern(&self) -> Pattern {
@@ -190,16 +245,23 @@ impl Rule for PushTopNIntoScan {
         }
     }
 
-    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply_bound(
+        &self,
+        binding: &Binding,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         // interior 0 = TopN; interior 1 = Scan (a 0-child leaf op). The binder
         // yields one binding per Scan alternative in the child group; each
         // produces an IDENTICAL re-emit, absorbed by explore()'s dedup.
         let Operator::LogicalTopN(topn) = binding.op(memo, 0).clone() else {
-            return vec![];
+            return Ok(vec![]);
         };
         // Re-emit the TopN over its ORIGINAL child group (the scan group).
         let topn_children = binding.children(0).to_vec();
-        push_one_scan(&topn, &topn_children)
+        Ok(push_one_scan(&topn, &topn_children))
     }
 }
 
@@ -218,8 +280,15 @@ impl Rule for PushTopNThroughSetOp {
         matches!(op, Operator::LogicalTopN(_))
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
-        push_topn_through_setop(expr, memo)
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
+        push_topn_through_setop(expr, memo, control)
     }
 
     fn pattern(&self) -> Pattern {
@@ -232,17 +301,24 @@ impl Rule for PushTopNThroughSetOp {
         }
     }
 
-    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply_bound(
+        &self,
+        binding: &Binding,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         // interior 0 = TopN, interior 1 = Union. The Union's `MultiLeaf` tail
         // captures ALL branch groups.
         let Operator::LogicalTopN(topn) = binding.op(memo, 0).clone() else {
-            return vec![];
+            return Ok(vec![]);
         };
         let Operator::LogicalUnion(union) = binding.op(memo, 1).clone() else {
-            return vec![];
+            return Ok(vec![]);
         };
         let union_children = binding.children(1).to_vec();
-        push_one_setop(&topn, &union, &union_children, memo)
+        push_one_setop(&topn, &union, &union_children, memo, control)
     }
 }
 
@@ -524,25 +600,29 @@ fn push_one_scan(topn: &TopNOp, topn_children: &[GroupId]) -> Vec<NewExpr> {
     }
 }
 
-fn push_topn_through_setop(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+fn push_topn_through_setop(
+    expr: &MExpr,
+    memo: &mut Memo,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
     let Operator::LogicalTopN(topn) = &expr.op else {
-        return vec![];
+        return Ok(vec![]);
     };
     // Rule entry fast-fail guards (mirrored inside `push_one_setop` so
     // `apply_bound` is correct standalone). Phase/window/end_exclusive all
     // depend only on the outer TopN.
     if !matches!(topn.phase, TopNPhase::Final) || topn.is_split {
-        return vec![];
+        return Ok(vec![]);
     }
     match TopNWindow::from_limit_offset(topn.limit, topn.offset) {
         Some(window) if window.end_exclusive().is_some() => {}
-        _ => return vec![],
+        _ => return Ok(vec![]),
     }
     if expr.children.len() != 1 {
-        return vec![];
+        return Ok(vec![]);
     }
     let Some(union_group) = memo.groups.get(expr.children[0]).cloned() else {
-        return vec![];
+        return Ok(vec![]);
     };
 
     let mut results = Vec::new();
@@ -553,9 +633,15 @@ fn push_topn_through_setop(expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
         // Clone the Union op + its branch groups out before borrowing `&mut memo`.
         let union = union.clone();
         let union_children = union_expr.children.clone();
-        results.extend(push_one_setop(topn, &union, &union_children, memo));
+        results.extend(push_one_setop(
+            topn,
+            &union,
+            &union_children,
+            memo,
+            control,
+        )?);
     }
-    results
+    Ok(results)
 }
 
 /// Per-child core for `PushTopNThroughSetOp`: push one `LogicalTopN` below a
@@ -569,23 +655,24 @@ fn push_one_setop(
     union: &UnionOp,
     union_children: &[GroupId],
     memo: &mut Memo,
-) -> Vec<NewExpr> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
     if !matches!(topn.phase, TopNPhase::Final) || topn.is_split {
-        return vec![];
+        return Ok(vec![]);
     }
     let Some(window) = TopNWindow::from_limit_offset(topn.limit, topn.offset) else {
-        return vec![];
+        return Ok(vec![]);
     };
     let Some(branch_limit) = window.end_exclusive() else {
-        return vec![];
+        return Ok(vec![]);
     };
     if !union.all || union_children.is_empty() {
-        return vec![];
+        return Ok(vec![]);
     }
     let Some(branch_topn_ops) =
-        build_union_branch_topn_ops(topn, branch_limit, union, union_children, memo)
+        build_union_branch_topn_ops(topn, branch_limit, union, union_children, memo, control)?
     else {
-        return vec![];
+        return Ok(vec![]);
     };
     if union_children
         .iter()
@@ -594,7 +681,7 @@ fn push_one_setop(
             group_starts_with_logical_op(memo, *group, &Operator::LogicalTopN(op.clone()))
         })
     {
-        return vec![];
+        return Ok(vec![]);
     }
 
     let mut pushed_branch_groups = Vec::with_capacity(union_children.len());
@@ -625,10 +712,10 @@ fn push_one_setop(
                 })
             },
         );
-    vec![NewExpr {
+    Ok(vec![NewExpr {
         op: Operator::LogicalTopN(topn.clone()),
         children: vec![pushed_union_group],
-    }]
+    }])
 }
 
 fn build_union_branch_topn_ops(
@@ -637,22 +724,28 @@ fn build_union_branch_topn_ops(
     union: &crate::optimizer::operator::UnionOp,
     branch_groups: &[usize],
     memo: &mut Memo,
-) -> Option<Vec<TopNOp>> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<Vec<TopNOp>>, crate::compiler::SqlCompileError> {
     let mut branch_topn_ops = Vec::with_capacity(branch_groups.len());
     for branch_group in branch_groups {
-        let branch_outputs = memo
+        let Some(props) = memo
             .groups
-            .get(*branch_group)?
-            .logical_props
-            .as_ref()?
-            .output_columns
-            .clone();
-        let items = remap_sort_keys_through_union(
+            .get(*branch_group)
+            .and_then(|group| group.logical_props.as_ref())
+        else {
+            return Ok(None);
+        };
+        let branch_outputs = props.output_columns.clone();
+        let Some(items) = remap_sort_keys_through_union(
             &mut memo.scalars,
             &topn.items,
             &union.output_columns,
             &branch_outputs,
-        )?;
+            control,
+        )?
+        else {
+            return Ok(None);
+        };
         branch_topn_ops.push(TopNOp {
             items,
             limit: Some(branch_limit),
@@ -661,7 +754,7 @@ fn build_union_branch_topn_ops(
             is_split: topn.is_split,
         });
     }
-    Some(branch_topn_ops)
+    Ok(Some(branch_topn_ops))
 }
 
 fn remap_sort_keys_through_union(
@@ -669,30 +762,58 @@ fn remap_sort_keys_through_union(
     items: &[ScalarSortKey],
     union_outputs: &[OutputColumn],
     branch_outputs: &[OutputColumn],
-) -> Option<Vec<ScalarSortKey>> {
-    items
-        .iter()
-        .map(|item| {
-            let union_column_id = scalar_expr_to_column_id(scalars, item.expr)?;
-            let output_position = union_outputs
-                .iter()
-                .position(|column| column.column_id == union_column_id)?;
-            let union_output = union_outputs.get(output_position)?;
-            let branch_output = branch_outputs.get(output_position)?;
-            if scalars.data_type(item.expr) != &union_output.data_type
-                || scalars.nullable(item.expr) != union_output.nullable
-                || branch_output.data_type != union_output.data_type
-                || branch_output.nullable != union_output.nullable
-            {
-                return None;
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<Vec<ScalarSortKey>>, crate::compiler::SqlCompileError> {
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::Validate,
+    )?;
+    let result = (|| {
+        let mut remapped = Vec::with_capacity(items.len());
+        for item in items {
+            work.step()?;
+            let Some(union_column_id) = scalar_expr_to_column_id(scalars, item.expr) else {
+                return Ok(None);
+            };
+            let mut output_position = None;
+            for (position, column) in union_outputs.iter().enumerate() {
+                work.step()?;
+                if column.column_id == union_column_id {
+                    output_position = Some(position);
+                    break;
+                }
             }
-
-            let expr = scalars.intern(
+            let Some(output_position) = output_position else {
+                return Ok(None);
+            };
+            let Some(union_output) = union_outputs.get(output_position) else {
+                return Ok(None);
+            };
+            let Some(branch_output) = branch_outputs.get(output_position) else {
+                return Ok(None);
+            };
+            if !scalars
+                .value_type(item.expr)
+                .exactly_equals_observed::<novarocks_functions::ConstantError>(
+                    &union_output.value_type,
+                    || work.step().map_err(Into::into),
+                )?
+                || !branch_output
+                    .value_type
+                    .exactly_equals_observed::<novarocks_functions::ConstantError>(
+                        &union_output.value_type,
+                        || work.step().map_err(Into::into),
+                    )?
+            {
+                return Ok(None);
+            }
+            work.flush()?;
+            let expr = scalars.intern_observed(
                 ScalarNode::ColumnRef(branch_output.column_id),
-                branch_output.data_type.clone(),
-                branch_output.nullable,
-            );
-            Some(ScalarSortKey {
+                branch_output.value_type.clone(),
+                control,
+            )?;
+            remapped.push(ScalarSortKey {
                 expr,
                 asc: item.asc,
                 nulls_first: item.nulls_first,
@@ -700,9 +821,21 @@ fn remap_sort_keys_through_union(
                     qualifier: None,
                     column: branch_output.name.clone(),
                 }),
-            })
-        })
-        .collect()
+            });
+            work.step()?;
+        }
+        Ok(Some(remapped))
+    })();
+    if matches!(
+        result,
+        Err(crate::compiler::SqlCompileError::Cancelled
+            | crate::compiler::SqlCompileError::DeadlineExceeded
+            | crate::compiler::SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
 }
 
 fn group_starts_with_logical_op(memo: &Memo, group_id: usize, op: &Operator) -> bool {
@@ -731,6 +864,10 @@ fn topn_phase_can_merge(outer: &TopNOp, inner: &TopNOp) -> bool {
 }
 
 #[cfg(test)]
+#[path = "topn_compactness_exact_type_tests.rs"]
+mod exact_type_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::analysis::{ExprKind, LiteralValue, ProjectItem, SortItem, TypedExpr};
@@ -753,8 +890,7 @@ mod tests {
                 qualifier: None,
                 column: format!("c{id}"),
             },
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         }
     }
 
@@ -769,8 +905,7 @@ mod tests {
     fn literal_expr(value: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(value)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -818,8 +953,8 @@ mod tests {
         crate::analysis::OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             is_internal: false,
         }
     }
@@ -878,7 +1013,12 @@ mod tests {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalTopN(TopNOp {
-                items: intern_sort_items(&mut memo.scalars, &[item]),
+                items: intern_sort_items(
+                    &mut memo.scalars,
+                    &[item],
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
                 limit: Some(limit),
                 offset: Some(offset),
                 phase,
@@ -936,7 +1076,12 @@ mod tests {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalSort(SortOp {
-                items: intern_sort_items(&mut memo.scalars, &items),
+                items: intern_sort_items(
+                    &mut memo.scalars,
+                    &items,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
                 analytic_partition_exprs: Vec::new(),
                 partition_limit: None,
                 topn_type: None,
@@ -954,7 +1099,12 @@ mod tests {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalProject(ProjectOp {
-                items: intern_project_items(&mut memo.scalars, &items),
+                items: intern_project_items(
+                    &mut memo.scalars,
+                    &items,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
                 output_qualifier: None,
             }),
             children: vec![child_group],
@@ -1043,8 +1193,18 @@ mod tests {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalSort(SortOp {
-                items: intern_sort_items(&mut memo.scalars, &items),
-                analytic_partition_exprs: intern_exprs(&mut memo.scalars, &[col(2)]),
+                items: intern_sort_items(
+                    &mut memo.scalars,
+                    &items,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
+                analytic_partition_exprs: intern_exprs(
+                    &mut memo.scalars,
+                    &[col(2)],
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap(),
                 partition_limit: None,
                 topn_type: None,
             }),
@@ -1065,8 +1225,18 @@ mod tests {
         MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalSort(SortOp {
-                items: intern_sort_items(&mut memo.scalars, &items),
-                analytic_partition_exprs: intern_exprs(&mut memo.scalars, &[col(2)]),
+                items: intern_sort_items(
+                    &mut memo.scalars,
+                    &items,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
+                analytic_partition_exprs: intern_exprs(
+                    &mut memo.scalars,
+                    &[col(2)],
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap(),
                 partition_limit: Some(2),
                 topn_type: Some(crate::common::SqlTopNType::Rank),
             }),
@@ -1090,7 +1260,13 @@ mod tests {
         let inner_group = topn_group(&mut memo, 20, 0, TopNPhase::Final, false, scan_group);
         let outer = topn(&mut memo, 5, 10, TopNPhase::Final, false, inner_group);
 
-        let out = MergeConsecutiveTopN.apply(&outer, &mut memo);
+        let out = MergeConsecutiveTopN
+            .apply(
+                &outer,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(out.len(), 1, "expected one merged TopN alternative");
         match &out[0].op {
@@ -1116,7 +1292,13 @@ mod tests {
         let inner_group = topn_group(&mut memo, 12, 0, TopNPhase::Final, false, scan_group);
         let outer = topn(&mut memo, 5, 10, TopNPhase::Final, false, inner_group);
 
-        let out = MergeConsecutiveTopN.apply(&outer, &mut memo);
+        let out = MergeConsecutiveTopN
+            .apply(
+                &outer,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1131,7 +1313,13 @@ mod tests {
         let inner_group = topn_group(&mut memo, 20, 3, TopNPhase::Final, false, scan_group);
         let outer = topn(&mut memo, 5, 10, TopNPhase::Final, false, inner_group);
 
-        let out = MergeConsecutiveTopN.apply(&outer, &mut memo);
+        let out = MergeConsecutiveTopN
+            .apply(
+                &outer,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1146,7 +1334,13 @@ mod tests {
         let inner_group = topn_group(&mut memo, 20, 0, TopNPhase::Partial, false, scan_group);
         let outer = topn(&mut memo, 5, 0, TopNPhase::Final, true, inner_group);
 
-        let out = MergeConsecutiveTopN.apply(&outer, &mut memo);
+        let out = MergeConsecutiveTopN
+            .apply(
+                &outer,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1161,7 +1355,13 @@ mod tests {
         let inner_group = topn_group(&mut memo, 20, 0, TopNPhase::Partial, false, scan_group);
         let outer = topn(&mut memo, 5, 0, TopNPhase::Final, false, inner_group);
 
-        let out = MergeConsecutiveTopN.apply(&outer, &mut memo);
+        let out = MergeConsecutiveTopN
+            .apply(
+                &outer,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1189,7 +1389,13 @@ mod tests {
         );
         let outer = topn(&mut memo, 5, 0, TopNPhase::Final, false, inner_group);
 
-        let out = MergeConsecutiveTopN.apply(&outer, &mut memo);
+        let out = MergeConsecutiveTopN
+            .apply(
+                &outer,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(out.len(), 1, "equivalent sort keys should allow merge");
         assert_eq!(out[0].children, vec![scan_group]);
@@ -1202,7 +1408,13 @@ mod tests {
         let sort_group = sort_group_with_items(&mut memo, vec![sort_item(1)], scan_group);
         let topn = topn(&mut memo, 10, 0, TopNPhase::Final, false, sort_group);
 
-        let out = RemoveRedundantSortUnderTopN.apply(&topn, &mut memo);
+        let out = RemoveRedundantSortUnderTopN
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(out.len(), 1, "matching plain Sort should be elided");
         match &out[0].op {
@@ -1228,7 +1440,13 @@ mod tests {
         let sort_group = analytic_sort_group_with_items(&mut memo, vec![sort_item(1)], scan_group);
         let topn = topn(&mut memo, 10, 0, TopNPhase::Final, false, sort_group);
 
-        let out = RemoveRedundantSortUnderTopN.apply(&topn, &mut memo);
+        let out = RemoveRedundantSortUnderTopN
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1250,7 +1468,13 @@ mod tests {
         let sort_group = partition_topn_sort_group(&mut memo, vec![sort_item(1)], scan_group);
         let topn = topn(&mut memo, 10, 0, TopNPhase::Final, false, sort_group);
 
-        let out = RemoveRedundantSortUnderTopN.apply(&topn, &mut memo);
+        let out = RemoveRedundantSortUnderTopN
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1278,7 +1502,13 @@ mod tests {
         let sort_group = sort_group_with_items(&mut memo, vec![sort_item(2)], scan_group);
         let topn = topn(&mut memo, 10, 0, TopNPhase::Final, false, sort_group);
 
-        let out = RemoveRedundantSortUnderTopN.apply(&topn, &mut memo);
+        let out = RemoveRedundantSortUnderTopN
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1305,7 +1535,13 @@ mod tests {
             project_group,
         );
 
-        let out = project_pushdown_rule().apply(&topn, &mut memo);
+        let out = project_pushdown_rule()
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(out.len(), 1, "project alias should allow TopN pushdown");
         match &out[0].op {
@@ -1364,12 +1600,24 @@ mod tests {
         );
         let rule = project_pushdown_rule();
 
-        let first = rule.apply(&topn, &mut memo);
+        let first = rule
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(first.len(), 1, "first apply should push TopN");
         let first_pushed_group = first[0].children[0];
         let group_count_after_first = memo.groups.len();
 
-        let second = rule.apply(&topn, &mut memo);
+        let second = rule
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(
             second.len(),
@@ -1409,7 +1657,13 @@ mod tests {
         );
 
         let outer_expr = memo.groups[outer_group].logical_exprs[0].clone();
-        let pushed = project_pushdown_rule().apply(&outer_expr, &mut memo);
+        let pushed = project_pushdown_rule()
+            .apply(
+                &outer_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(
             pushed.len(),
             1,
@@ -1419,7 +1673,13 @@ mod tests {
         add_new_expr_to_group(&mut memo, outer_group, pushed.into_iter().next().unwrap());
 
         let pushed_expr = memo.groups[pushed_group].logical_exprs[0].clone();
-        let merged = MergeConsecutiveTopN.apply(&pushed_expr, &mut memo);
+        let merged = MergeConsecutiveTopN
+            .apply(
+                &pushed_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(merged.len(), 1, "exposed adjacent TopNs should merge");
         add_new_expr_to_group(&mut memo, pushed_group, merged.into_iter().next().unwrap());
 
@@ -1427,7 +1687,9 @@ mod tests {
             &mut memo,
             &crate::optimizer::cascades_rules::all_implementation_rules(),
             &crate::optimizer::options::OptimizerOptions::default_settings(),
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("implementation should finish");
 
         assert!(
             memo.groups[pushed_group]
@@ -1458,7 +1720,13 @@ mod tests {
             project_group,
         );
 
-        let out = project_pushdown_rule().apply(&topn, &mut memo);
+        let out = project_pushdown_rule()
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1485,7 +1753,13 @@ mod tests {
             project_group,
         );
 
-        let out = project_pushdown_rule().apply(&topn, &mut memo);
+        let out = project_pushdown_rule()
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1512,7 +1786,13 @@ mod tests {
             project_group,
         );
 
-        let out = project_pushdown_rule().apply(&topn, &mut memo);
+        let out = project_pushdown_rule()
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1539,7 +1819,13 @@ mod tests {
             project_group,
         );
 
-        let out = project_pushdown_rule().apply(&topn, &mut memo);
+        let out = project_pushdown_rule()
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1553,7 +1839,13 @@ mod tests {
         let scan_group = scan_group(&mut memo);
         let topn = topn(&mut memo, 10, 0, TopNPhase::Final, false, scan_group);
 
-        let out = PushTopNIntoScan.apply(&topn, &mut memo);
+        let out = PushTopNIntoScan
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1569,7 +1861,13 @@ mod tests {
         let union_group = union_group(&mut memo, false, vec![left_group, right_group]);
         let topn = topn(&mut memo, 10, 0, TopNPhase::Final, false, union_group);
 
-        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+        let out = rule_by_name("PushTopNThroughSetOp")
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1586,7 +1884,13 @@ mod tests {
         let topn = topn(&mut memo, 10, 0, TopNPhase::Final, false, union_group);
         let rule = rule_by_name("PushTopNThroughSetOp");
 
-        let first = rule.apply(&topn, &mut memo);
+        let first = rule
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(first.len(), 1, "UNION ALL should allow branch pruning");
         match &first[0].op {
@@ -1625,7 +1929,13 @@ mod tests {
         assert_single_branch_topn(&memo, pushed_union_expr.children[1], right_group, 10, 0, 1);
 
         let group_count_after_first = memo.groups.len();
-        let second = rule.apply(&topn, &mut memo);
+        let second = rule
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(
             second.len(),
@@ -1651,7 +1961,13 @@ mod tests {
         let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
         let topn = topn(&mut memo, 2, 3, TopNPhase::Final, false, union_group);
 
-        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+        let out = rule_by_name("PushTopNThroughSetOp")
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(out.len(), 1, "UNION ALL should allow offset-safe pruning");
         match &out[0].op {
@@ -1699,7 +2015,13 @@ mod tests {
             union_group,
         );
 
-        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+        let out = rule_by_name("PushTopNThroughSetOp")
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(
             out.len(),
@@ -1735,7 +2057,13 @@ mod tests {
             union_group,
         );
 
-        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+        let out = rule_by_name("PushTopNThroughSetOp")
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1764,7 +2092,13 @@ mod tests {
             union_group,
         );
 
-        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+        let out = rule_by_name("PushTopNThroughSetOp")
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1793,7 +2127,13 @@ mod tests {
             union_group,
         );
 
-        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+        let out = rule_by_name("PushTopNThroughSetOp")
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1826,7 +2166,13 @@ mod tests {
             union_group,
         );
 
-        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+        let out = rule_by_name("PushTopNThroughSetOp")
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1859,7 +2205,13 @@ mod tests {
             union_group,
         );
 
-        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+        let out = rule_by_name("PushTopNThroughSetOp")
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1877,7 +2229,13 @@ mod tests {
         let topn_expr = memo.groups[topn_group].logical_exprs[0].clone();
         let rule = rule_by_name("PushTopNThroughSetOp");
 
-        let mut first = rule.apply(&topn_expr, &mut memo);
+        let mut first = rule
+            .apply(
+                &topn_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(first.len(), 1, "first apply should produce branch pruning");
         add_new_expr_to_group(&mut memo, topn_group, first.pop().unwrap());
         let pushed_expr = memo.groups[topn_group]
@@ -1887,7 +2245,13 @@ mod tests {
             .clone();
         let group_count_after_add = memo.groups.len();
 
-        let second = rule.apply(&pushed_expr, &mut memo);
+        let second = rule
+            .apply(
+                &pushed_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             second.is_empty(),
@@ -1908,7 +2272,13 @@ mod tests {
         let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
         let topn = topn(&mut memo, 10, 0, TopNPhase::Partial, false, union_group);
 
-        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+        let out = rule_by_name("PushTopNThroughSetOp")
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1924,7 +2294,13 @@ mod tests {
         let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
         let topn = topn(&mut memo, 10, 0, TopNPhase::Final, true, union_group);
 
-        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+        let out = rule_by_name("PushTopNThroughSetOp")
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -1940,7 +2316,13 @@ mod tests {
         let union_group = union_group(&mut memo, true, vec![left_group, right_group]);
         let topn = topn(&mut memo, 1, i64::MAX, TopNPhase::Final, false, union_group);
 
-        let out = rule_by_name("PushTopNThroughSetOp").apply(&topn, &mut memo);
+        let out = rule_by_name("PushTopNThroughSetOp")
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),

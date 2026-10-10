@@ -16,8 +16,8 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, BinaryBuilder, StringArray};
-use std::sync::Arc;
+use arrow::array::{Array, ArrayRef, StringArray};
+use novarocks_functions::builtin::string_extended::{StringOperation, evaluate_legacy};
 
 pub fn eval_unhex(
     arena: &ExprArena,
@@ -31,15 +31,6 @@ pub fn eval_unhex(
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| "unhex expects string".to_string())?;
-    let mut builder = BinaryBuilder::new();
-    for i in 0..s_arr.len() {
-        if s_arr.is_null(i) {
-            builder.append_null();
-            continue;
-        }
-        let s = s_arr.value(i);
-        let value = hex::decode(s).unwrap_or_default();
-        builder.append_value(value);
-    }
-    Ok(Arc::new(builder.finish()) as ArrayRef)
+    let rows = s_arr.len();
+    evaluate_legacy(StringOperation::Unhex, &[str_arr], rows)
 }

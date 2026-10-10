@@ -19,6 +19,8 @@
 //! Its immutable plan facts remain with preparation's owner; every new batch
 //! backing is preflighted before growth under the original last-edge permit.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -53,8 +55,47 @@ const BATCH_ROWS: usize = 32;
 const BYTE_QUANTUM: usize = RootProfileV1::EMIT_BYTES_PER_TURN;
 const WORK_QUANTUM: usize = RootProfileV1::CELLS_PER_TURN;
 
+enum StatisticsLiteralSource {
+    Legacy(Arc<ExprArena>),
+    Compiled(Arc<novarocks_local_program::LocalProgram>),
+}
+impl StatisticsLiteralSource {
+    fn blob(&self, expr: crate::exec::expr::ExprId) -> Option<&str> {
+        match self {
+            Self::Legacy(arena) => match arena.node(expr) {
+                Some(ExprNode::Literal(LiteralValue::Utf8(value))) => Some(value),
+                _ => None,
+            },
+            Self::Compiled(program) => {
+                let id = novarocks_local_program::ProgramExprId::new(expr.0);
+                match program.graph().expressions().node(id)?.kind() {
+                    novarocks_local_program::StaticExprKind::Literal(
+                        novarocks_local_program::StaticLiteral::Utf8(value),
+                    ) => Some(value),
+                    novarocks_local_program::StaticExprKind::Constant(value)
+                        if value.pool().array().data_type() == &DataType::Utf8 =>
+                    {
+                        // The real LocalCompiler freezes both checked Physical
+                        // Literal and Constant sources to CVal. Borrow its exact
+                        // ordinal through the ONE constant reader; do not thaw
+                        // an arena, evaluate an expression or widen the carrier.
+                        value.try_utf8().ok().flatten()
+                    }
+                    _ => None,
+                }
+            }
+        }
+    }
+    #[cfg(test)]
+    fn original_arena(&self) -> &ExprArena {
+        match self {
+            Self::Legacy(arena) => arena,
+            Self::Compiled(_) => panic!("legacy fixture requires its original arena"),
+        }
+    }
+}
 struct Definition {
-    arena: Arc<ExprArena>,
+    source: StatisticsLiteralSource,
     mappings: Vec<UnpivotValueMapping>,
     input_slots: Vec<SlotId>,
     input_ordinals: Vec<usize>,
@@ -71,6 +112,52 @@ impl StatisticsMaterializerFactory {
     )]
     pub(crate) fn try_new(
         arena: Arc<ExprArena>,
+        value_slot: SlotId,
+        literal_slots: Vec<SlotId>,
+        mappings: Vec<UnpivotValueMapping>,
+        input_slots: &[SlotId],
+        schema: ChunkSchemaRef,
+        passthrough_count: usize,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Self, String> {
+        Self::try_new_from_source(
+            StatisticsLiteralSource::Legacy(arena),
+            value_slot,
+            literal_slots,
+            mappings,
+            input_slots,
+            schema,
+            passthrough_count,
+            max_rows,
+            max_bytes,
+        )
+    }
+    pub(crate) fn try_new_compiled(
+        program: Arc<novarocks_local_program::LocalProgram>,
+        value_slot: SlotId,
+        literal_slots: Vec<SlotId>,
+        mappings: Vec<UnpivotValueMapping>,
+        input_slots: &[SlotId],
+        schema: ChunkSchemaRef,
+        passthrough_count: usize,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Self, String> {
+        Self::try_new_from_source(
+            StatisticsLiteralSource::Compiled(program),
+            value_slot,
+            literal_slots,
+            mappings,
+            input_slots,
+            schema,
+            passthrough_count,
+            max_rows,
+            max_bytes,
+        )
+    }
+    fn try_new_from_source(
+        source: StatisticsLiteralSource,
         value_slot: SlotId,
         literal_slots: Vec<SlotId>,
         mappings: Vec<UnpivotValueMapping>,
@@ -155,7 +242,7 @@ impl StatisticsMaterializerFactory {
             else {
                 return Err("statistics constants differ from the frozen roles".into());
             };
-            let Some(ExprNode::Literal(LiteralValue::Utf8(blob))) = arena.node(*expr_id) else {
+            let Some(blob) = source.blob(*expr_id) else {
                 return Err("statistics blob_type must be an exact UTF8 literal".into());
             };
             if ids.is_empty()
@@ -221,7 +308,7 @@ impl StatisticsMaterializerFactory {
             .filter(|&n| n < MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES)
             .ok_or("statistics fixed backing exceeds its batch profile")?;
         Ok(Self(Arc::new(Definition {
-            arena,
+            source,
             mappings,
             input_slots: input_slots.to_vec(),
             input_ordinals,
@@ -278,9 +365,12 @@ impl Operator for StatisticsMaterializer {
         drop(self.input.take());
         self.finished = true;
     }
-    fn close(&mut self) -> Result<(), String> {
-        self.cancel();
-        Ok(())
+    fn close(&mut self) -> ExecutionResult<()> {
+        (|| -> Result<(), String> {
+            self.cancel();
+            Ok(())
+        })()
+        .map_err(Into::into)
     }
 }
 impl ProcessorOperator for StatisticsMaterializer {
@@ -290,129 +380,143 @@ impl ProcessorOperator for StatisticsMaterializer {
     fn has_output(&self) -> bool {
         self.input.is_some() && !self.finished
     }
-    fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> Result<(), String> {
-        if !self.need_input() {
-            return Err("statistics input position is full".into());
-        }
-        let expanded = chunk
-            .len()
-            .checked_mul(self.definition.mappings.len())
-            .ok_or("statistics expanded row count overflow")?;
-        if self
-            .rows
-            .checked_add(expanded)
-            .is_none_or(|n| n > MAX_CONNECTOR_STATISTICS_ARTIFACTS)
-        {
-            return Err("statistics expanded row count exceeds its domain".into());
-        }
-        if chunk.chunk_schema_ref().slot_ids() != self.definition.input_slots {
-            return Err("statistics input order differs from its frozen port".into());
-        }
-        for &ordinal in &self.definition.input_ordinals {
-            let array = body_array(&chunk, ordinal)?;
-            if array.len() != chunk.len() {
-                return Err("statistics body row count differs from input".into());
+    fn push_chunk(&mut self, _: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+        (|| -> Result<(), String> {
+            if !self.need_input() {
+                return Err("statistics input position is full".into());
             }
-        }
-        self.cursor = 0;
-        if !chunk.is_empty() {
-            self.input = Some(chunk);
-        }
-        Ok(())
+            let expanded = chunk
+                .len()
+                .checked_mul(self.definition.mappings.len())
+                .ok_or("statistics expanded row count overflow")?;
+            if self
+                .rows
+                .checked_add(expanded)
+                .is_none_or(|n| n > MAX_CONNECTOR_STATISTICS_ARTIFACTS)
+            {
+                return Err("statistics expanded row count exceeds its domain".into());
+            }
+            if chunk.chunk_schema_ref().slot_ids() != self.definition.input_slots {
+                return Err("statistics input order differs from its frozen port".into());
+            }
+            for &ordinal in &self.definition.input_ordinals {
+                let array = body_array(&chunk, ordinal)?;
+                if array.len() != chunk.len() {
+                    return Err("statistics body row count differs from input".into());
+                }
+            }
+            self.cursor = 0;
+            if !chunk.is_empty() {
+                self.input = Some(chunk);
+            }
+            Ok(())
+        })()
+        .map_err(Into::into)
     }
-    fn pull_chunk(&mut self, _: &RuntimeState) -> Result<Option<Chunk>, String> {
-        Err("statistics materialization requires the original root input grant".into())
+    fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
+        (|| -> Result<Option<Chunk>, String> {
+            Err("statistics materialization requires the original root input grant".into())
+        })()
+        .map_err(Into::into)
     }
     fn pull_chunk_with_root_input(
         &mut self,
         _: &RuntimeState,
         permit: &RootInputPermit,
-    ) -> Result<RootPreparedPull, String> {
-        let Some(input) = self.input.as_ref() else {
-            return Ok(RootPreparedPull::Empty);
-        };
-        if self.workspace.is_none() {
-            let total = input.len() * self.definition.mappings.len();
-            let mut sizes = Sizes::default();
-            let mut rows = 0;
-            for flat in self.cursor..total.min(self.cursor + self.definition.batch_rows) {
-                let (ids, blob, body) = record(input, &self.definition, flat)?;
-                if body.len() > MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES {
-                    return Err("statistics body exceeds its artifact limit".into());
-                }
-                let next = sizes.add(ids.len(), blob.len(), body.len())?;
-                if self
-                    .body_bytes
-                    .checked_add(next.body)
-                    .is_none_or(|n| n > MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES)
-                {
-                    return Err("statistics aggregate body exceeds its domain".into());
-                }
-                if self
-                    .metadata_bytes
-                    .checked_add(next.metadata(rows + 1)?)
-                    .is_none_or(|n| n > 16 * 1024 * 1024)
-                {
-                    return Err("statistics aggregate metadata exceeds its domain".into());
-                }
-                let backing = next.capacity(rows + 1, self.definition.fixed_capacity)?;
-                if backing > MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES
-                    || backing > permit.retained_bytes()
-                {
-                    if rows == 0 {
-                        return Err("one statistics record exceeds its pregranted backing".into());
+    ) -> ExecutionResult<RootPreparedPull> {
+        (|| -> Result<RootPreparedPull, String> {
+            let Some(input) = self.input.as_ref() else {
+                return Ok(RootPreparedPull::Empty);
+            };
+            if self.workspace.is_none() {
+                let total = input.len() * self.definition.mappings.len();
+                let mut sizes = Sizes::default();
+                let mut rows = 0;
+                for flat in self.cursor..total.min(self.cursor + self.definition.batch_rows) {
+                    let (ids, blob, body) = record(input, &self.definition, flat)?;
+                    if body.len() > MAX_CONNECTOR_STATISTICS_ARTIFACT_BODY_BYTES {
+                        return Err("statistics body exceeds its artifact limit".into());
                     }
-                    break;
+                    let next = sizes.add(ids.len(), blob.len(), body.len())?;
+                    if self
+                        .body_bytes
+                        .checked_add(next.body)
+                        .is_none_or(|n| n > MAX_CONNECTOR_STATISTICS_RESULT_BODY_BYTES)
+                    {
+                        return Err("statistics aggregate body exceeds its domain".into());
+                    }
+                    if self
+                        .metadata_bytes
+                        .checked_add(next.metadata(rows + 1)?)
+                        .is_none_or(|n| n > 16 * 1024 * 1024)
+                    {
+                        return Err("statistics aggregate metadata exceeds its domain".into());
+                    }
+                    let backing = next.capacity(rows + 1, self.definition.fixed_capacity)?;
+                    if backing > MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES
+                        || backing > permit.retained_bytes()
+                    {
+                        if rows == 0 {
+                            return Err(
+                                "one statistics record exceeds its pregranted backing".into()
+                            );
+                        }
+                        break;
+                    }
+                    sizes = next;
+                    rows += 1;
                 }
-                sizes = next;
-                rows += 1;
+                // Every capacity, fixed owner and simultaneous temporary is known
+                // before any MutableBuffer can grow. No candidate/probe batch.
+                self.workspace = Some(Workspace::new(
+                    self.cursor,
+                    rows,
+                    sizes,
+                    permit.generation(),
+                ));
+                return Ok(RootPreparedPull::Yielded);
             }
-            // Every capacity, fixed owner and simultaneous temporary is known
-            // before any MutableBuffer can grow. No candidate/probe batch.
-            self.workspace = Some(Workspace::new(
-                self.cursor,
-                rows,
-                sizes,
-                permit.generation(),
-            ));
-            return Ok(RootPreparedPull::Yielded);
-        }
-        let workspace = self.workspace.as_mut().unwrap();
-        if workspace.generation != permit.generation() {
-            return Err("statistics continuation changed its original grant".into());
-        }
-        if workspace.row < workspace.rows {
-            let (examined, work) = workspace.advance(input, &self.definition)?;
-            debug_assert!(examined <= BYTE_QUANTUM && work <= WORK_QUANTUM);
-            // Final offset/array validation gets its own finite turn, even
-            // when this copy used the entire byte quantum.
-            return Ok(RootPreparedPull::Yielded);
-        }
-        let workspace = self.workspace.take().unwrap();
-        let rows = workspace.rows;
-        let body = workspace.sizes.body;
-        let metadata = workspace.sizes.metadata(rows)?;
-        let chunk = workspace.finish(&self.definition.schema)?;
-        self.cursor += rows;
-        self.rows += rows;
-        self.body_bytes += body;
-        self.metadata_bytes += metadata;
-        if self.cursor == input.len() * self.definition.mappings.len() {
-            drop(self.input.take());
-            self.cursor = 0;
-            if self.finishing {
-                self.finished = true;
+            let workspace = self.workspace.as_mut().unwrap();
+            if workspace.generation != permit.generation() {
+                return Err("statistics continuation changed its original grant".into());
             }
-        }
-        Ok(RootPreparedPull::Chunk(chunk))
+            if workspace.row < workspace.rows {
+                let (examined, work) = workspace.advance(input, &self.definition)?;
+                debug_assert!(examined <= BYTE_QUANTUM && work <= WORK_QUANTUM);
+                // Final offset/array validation gets its own finite turn, even
+                // when this copy used the entire byte quantum.
+                return Ok(RootPreparedPull::Yielded);
+            }
+            let workspace = self.workspace.take().unwrap();
+            let rows = workspace.rows;
+            let body = workspace.sizes.body;
+            let metadata = workspace.sizes.metadata(rows)?;
+            let chunk = workspace.finish(&self.definition.schema)?;
+            self.cursor += rows;
+            self.rows += rows;
+            self.body_bytes += body;
+            self.metadata_bytes += metadata;
+            if self.cursor == input.len() * self.definition.mappings.len() {
+                drop(self.input.take());
+                self.cursor = 0;
+                if self.finishing {
+                    self.finished = true;
+                }
+            }
+            Ok(RootPreparedPull::Chunk(chunk))
+        })()
+        .map_err(Into::into)
     }
     fn release_root_pull_workspace(&mut self) {
         drop(self.workspace.take());
     }
-    fn set_finishing(&mut self, _: &RuntimeState) -> Result<(), String> {
-        self.finishing = true;
-        self.finished = self.input.is_none();
-        Ok(())
+    fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
+        (|| -> Result<(), String> {
+            self.finishing = true;
+            self.finished = self.input.is_none();
+            Ok(())
+        })()
+        .map_err(Into::into)
     }
 }
 fn body_array(input: &Chunk, index: usize) -> Result<&BinaryArray, String> {
@@ -442,7 +546,7 @@ fn record<'a>(
     let UnpivotConstant::Scalar { expr_id, .. } = mapping.constants[1] else {
         unreachable!()
     };
-    let Some(ExprNode::Literal(LiteralValue::Utf8(blob))) = definition.arena.node(expr_id) else {
+    let Some(blob) = definition.source.blob(expr_id) else {
         unreachable!()
     };
     Ok((ids, blob, array.value(row)))
@@ -677,9 +781,7 @@ mod tests {
     use novarocks_types::arrow_metadata_owner::{
         ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnedField, MetadataOwnerLimits,
     };
-    use novarocks_types::{
-        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
-    };
+    use novarocks_types::{AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId};
 
     fn metadata() -> ArrowMetadataOwner {
         ArrowMetadataOwner::try_new(
@@ -907,7 +1009,7 @@ mod tests {
             let definition = factory(vec![1], "theta".into(), 4096, 1).unwrap().0;
             let (chunk, _) = input(&[b"actual decoded aggregate"]);
             let plan = ExecPlan {
-                arena: definition.arena.as_ref().clone(),
+                arena: definition.source.original_arena().clone(),
                 root: ExecNode {
                     kind: ExecNodeKind::Unpivot(UnpivotNode {
                         input: Box::new(ExecNode {
@@ -1132,6 +1234,7 @@ mod tests {
                 .pull_chunk_with_root_input(&state, &permit())
                 .err()
                 .unwrap()
+                .to_string()
                 .contains("metadata")
         );
         assert!(source.workspace.is_none());

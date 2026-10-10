@@ -12,6 +12,7 @@ test-support = []
 mem-1-m07-exact-mysql-write = []
 
 [dependencies]
+novarocks-type-contract.workspace = true
 arrow.workspace = true
 async-trait.workspace = true
 novarocks-execution-contract.workspace = true

@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -193,7 +195,10 @@ impl FilterEncodingPolicy {
 }
 
 fn is_supported_literal_expr(arena: &ExprArena, expr: ExprId) -> bool {
-    matches!(arena.node(expr), Some(ExprNode::Literal(_)))
+    matches!(
+        arena.node(expr),
+        Some(ExprNode::Constant(_) | ExprNode::Literal(_))
+    )
 }
 
 fn is_low_cardinality_string_dictionary(data_type: &DataType) -> bool {
@@ -223,7 +228,7 @@ fn collect_slot_ids(arena: &ExprArena, expr: ExprId, out: &mut HashSet<SlotId>) 
         return;
     };
     match node {
-        ExprNode::Literal(_) => {}
+        ExprNode::Constant(_) | ExprNode::Literal(_) => {}
         ExprNode::SlotId(slot_id) => {
             out.insert(*slot_id);
         }
@@ -328,12 +333,14 @@ impl ProcessorOperator for FilterProcessorOperator {
         self.pending_output.is_some()
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }
         if self.pending_output.is_some() {
-            return Err("filter received input while output buffer is full".to_string());
+            return Err("filter received input while output buffer is full"
+                .to_string()
+                .into());
         }
         if chunk.is_empty() {
             self.pending_output = Some(Chunk::default());
@@ -360,7 +367,7 @@ impl ProcessorOperator for FilterProcessorOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         let out = self.pending_output.take();
         if out.is_some() && self.finishing && self.pending_output.is_none() {
             self.finished = true;
@@ -368,7 +375,7 @@ impl ProcessorOperator for FilterProcessorOperator {
         Ok(out)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         self.finishing = true;
         if self.pending_output.is_none() {
             self.finished = true;
@@ -587,5 +594,84 @@ mod tests {
             let key = status.keys().value(row) as usize;
             assert_eq!(values.value(key), "PAID");
         }
+    }
+
+    #[test]
+    fn filter_processor_uses_selected_constant_ordinal_and_retains_dictionary_output() {
+        struct ConstantLeafTestControl;
+        impl novarocks_type_contract::PureCompileControl for ConstantLeafTestControl {
+            fn checkpoint(
+                &self,
+                _phase: novarocks_type_contract::CompilePhase,
+                _work_units: u32,
+            ) -> Result<(), novarocks_type_contract::CompileControlError> {
+                Ok(())
+            }
+        }
+        let value_type = novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false);
+        // Row zero would select a different input row. The unused third row
+        // must not participate in broadcasting the selected scalar value.
+        let constants = novarocks_functions::ConstantPool::try_new(
+            Arc::new(Field::new("constant", DataType::Utf8, false)),
+            value_type,
+            StringArray::from(vec!["PENDING", "PAID", "unused"]).to_data(),
+            novarocks_functions::ConstantPolicy {
+                max_rows: 4,
+                max_array_nodes: 16,
+                max_logical_elements: 64,
+                max_retained_buffer_bytes: 65536,
+                max_type_depth: 8,
+                max_type_nodes: 16,
+                max_dictionary_depth: 4,
+                max_metadata_bytes: 4096,
+                max_library_validation_work: 65536,
+                max_library_validation_bytes: 1024 * 1024,
+            },
+            novarocks_type_contract::CompilePhase::Validate,
+            &ConstantLeafTestControl,
+        )
+        .expect("admitted test constant pool");
+        let mut arena = ExprArena::default();
+        let status = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let paid = arena.push_typed(
+            ExprNode::Constant(constants.value(1).expect("selected nonzero ordinal")),
+            DataType::Utf8,
+        );
+        let predicate = arena.push_typed(ExprNode::Eq(status, paid), DataType::Boolean);
+        let factory = FilterProcessorFactory::new(8, Arc::new(arena), predicate);
+        let mut op = factory.create(1, 0);
+        let processor = op.as_processor_mut().expect("processor");
+        let state = RuntimeState::default();
+        processor
+            .push_chunk(&state, filter_test_chunk())
+            .expect("evaluate constant against dictionary column");
+        let output = processor.pull_chunk(&state).expect("pull").expect("output");
+
+        assert_eq!(output.len(), 2);
+        assert_int32_utf8_dictionary(&output.columns()[0]);
+        assert_int32_utf8_dictionary(&output.columns()[1]);
+        for (ordinal, expected) in [(0, "PAID"), (1, "web")] {
+            let dictionary = output.columns()[ordinal]
+                .as_any()
+                .downcast_ref::<DictionaryArray<Int32Type>>()
+                .expect("retained dictionary output");
+            let values = dictionary
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("dictionary strings");
+            for row in 0..dictionary.len() {
+                assert!(dictionary.is_valid(row));
+                assert_eq!(
+                    values.value(dictionary.keys().value(row) as usize),
+                    expected
+                );
+            }
+        }
+        let amounts = output.columns()[2]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("selected original amount rows");
+        assert_eq!(amounts.values().as_ref(), &[10, 40]);
     }
 }

@@ -222,6 +222,19 @@ http_port = 8040
 deployment_id = "analytics-prod"
 shared_secret = "${ENV:NOVAROCKS_NATIVE_SHARED_SECRET}"
 
+[runtime.frontend_constant_policy]
+# Explicit author limits; these are not allocation grants or inferred defaults.
+max_rows = 1048576
+max_array_nodes = 1048576
+max_logical_elements = 16777216
+max_retained_buffer_bytes = 1073741824
+max_type_depth = 64
+max_type_nodes = 4096
+max_dictionary_depth = 64
+max_metadata_bytes = 1048576
+max_library_validation_work = 1073741824
+max_library_validation_bytes = 4294967296
+
 [runtime.native_ingress]
 worker_threads = 8
 max_blocking_threads = 64
@@ -242,6 +255,8 @@ heartbeat_interval_ms = 1000
 heartbeat_timeout_retries = 3
 backend_announce_lease_ttl_ms = 5000
 ```
+
+FE 必须显式填写 `[runtime.frontend_constant_policy]` 的全部十项限额。示例值是可调整的部署配置；这些维度分别限制常量行数、数组结构、逻辑元素、保留字节、类型、字典、metadata 和库验证工作，不代表内存 grant。BE 不需要此 FE 作者配置。
 
 FE 的 `[runtime.native_ingress]` 只设置本角色 Native report listener 的 async worker
 与 blocking pool 大小；Task ordinary/control 资格和消息界只装配在 BE listener。

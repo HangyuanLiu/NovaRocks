@@ -110,12 +110,14 @@ impl PreparedDistributedRewriteCohort {
     pub fn finish(
         self,
     ) -> Result<crate::query_execution::outcome::ConnectorWriteSessionCompletion, String> {
+        let options =
+            crate::query_execution::contract::synthetic_statement_query_options(&self.execution);
         let request = crate::query_execution::contract::build_request_from_finalized_execution(
             crate::query_execution::post_compile::FinalizedDistributedExecution::for_completed_plan(
                 self.description,
                 self.template,
             ),
-            None,
+            Some(options),
             crate::query_execution::contract::DistributedQueryIntent::Write,
             &self.execution,
             None,
@@ -521,8 +523,8 @@ pub trait TableMaintenanceEngine: Send + Sync {
         &self,
         _session: &DistributedRewriteMaintenanceSession,
         _cohort_id: ConnectorWriteCohortId,
-    ) -> Result<PreparedDistributedRewriteCohort, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    ) -> Result<PreparedDistributedRewriteCohort, novarocks_sql::compiler::SqlCompileError> {
+        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string().into())
     }
 
     fn accumulate_distributed_rewrite_group(
@@ -569,8 +571,10 @@ pub trait TableMaintenanceService: Send + Sync {
         _statement: crate::table_maintenance::ParsedMaintenanceStatement,
         _spark_procedure: bool,
         _context: MaintenanceRequestContext<'_>,
-    ) -> Result<MaintenanceStatementResult, String> {
-        Err(TABLE_MAINTENANCE_SERVICE_UNAVAILABLE.to_string())
+    ) -> Result<MaintenanceStatementResult, TerminalError> {
+        Err(TerminalError::pre_dispatch_failed(
+            TABLE_MAINTENANCE_SERVICE_UNAVAILABLE,
+        ))
     }
 
     /// Executes the read-only typed `SHOW ALTER TABLE OPTIMIZE` presentation
@@ -591,14 +595,14 @@ pub trait TableMaintenanceService: Send + Sync {
         &self,
         engine: &dyn TableMaintenanceEngine,
         request: MaintenanceActionRequest,
-    ) -> Result<MaintenanceActionOutcome, String>;
+    ) -> Result<MaintenanceActionOutcome, TerminalError>;
 
     async fn execute_automatic_action_with_context(
         &self,
         engine: &dyn TableMaintenanceEngine,
         request: MaintenanceActionRequest,
         context: &AutomaticMaintenanceContext,
-    ) -> Result<MaintenanceActionOutcome, String> {
+    ) -> Result<MaintenanceActionOutcome, TerminalError> {
         context.ensure_active()?;
         self.execute_automatic_action(engine, request).await
     }
@@ -1298,16 +1302,21 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         &self,
         session: &DistributedRewriteMaintenanceSession,
         cohort_id: ConnectorWriteCohortId,
-    ) -> Result<PreparedDistributedRewriteCohort, String> {
+    ) -> Result<PreparedDistributedRewriteCohort, novarocks_sql::compiler::SqlCompileError> {
         prepare_frozen_rewrite_cohort_with_ports(
             self.kernel.connector_control().as_ref(),
             self.kernel.typed_connector_control(),
-            self.kernel.function_catalog().as_ref(),
+            Arc::clone(self.kernel.function_catalog()),
+            self.kernel.static_plan_carrier(),
             self.kernel.query_execution(),
             session.session(),
             cohort_id,
             session.execution(),
             session.context(),
+            self.kernel.constant_policy(),
+            &crate::query_execution::planning::sql_compile_control_from_execution(
+                session.execution(),
+            ),
         )
     }
 
@@ -1611,7 +1620,7 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
         &self,
         session: &DistributedRewriteMaintenanceSession,
         cohort_id: ConnectorWriteCohortId,
-    ) -> Result<PreparedDistributedRewriteCohort, String> {
+    ) -> Result<PreparedDistributedRewriteCohort, novarocks_sql::compiler::SqlCompileError> {
         self.request_engine()?
             .prepare_distributed_rewrite_cohort(session, cohort_id)
     }
@@ -1655,13 +1664,16 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
 fn prepare_frozen_rewrite_cohort_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
-    function_catalog: &novarocks_functions::EngineFunctionCatalog,
+    function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+    static_plan_carrier: &crate::query_execution::package_freeze::StaticPlanCarrier,
     query_execution: &crate::query_execution::service::QueryExecutionService,
     session: &crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
     cohort_id: ConnectorWriteCohortId,
     execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PreparedDistributedRewriteCohort, String> {
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &novarocks_sql::compiler::SqlCompileControl,
+) -> Result<PreparedDistributedRewriteCohort, novarocks_sql::compiler::SqlCompileError> {
     let cohort = session
         .plan()
         .cohorts()
@@ -1687,6 +1699,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             let read = crate::query_execution::cohort_read::QueryPinnedFileSetRead {
                 pinned: pinned.clone(),
                 owner: owner.clone(),
+                frozen_source: None,
                 planning_lease: session.lease().planning_lease(),
                 original: None,
             };
@@ -1813,6 +1826,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
                 })
                 .collect(),
         )]),
+        session: write_session.as_ref(),
     };
 
     let plan = novarocks_sql::planning::dml::build_final_frozen_connector_write_plan(
@@ -1820,7 +1834,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         sink,
         write_target.ordinal(),
         write_target.statistics().requirements(),
-        function_catalog,
+        function_catalog.clone(),
         &optimizer_settings,
         novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
             novarocks_sql::planning::dml::DmlFinalPlanContext::new(
@@ -1832,6 +1846,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
                         read_budget: rewrite_cohort_scan_read_budget(),
                     },
                 ])?,
+                static_plan_carrier.sql_emission_mode(),
             ),
             novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet::try_new([
                 novarocks_sql::planning::dml::DmlFinalizedWriteTarget {
@@ -1840,27 +1855,41 @@ fn prepare_frozen_rewrite_cohort_with_ports(
                 },
             ])?,
         ),
+        execution
+            .sql_semantics()
+            .sql_mode()
+            .decimal_overflow_policy(),
+        execution.sql_semantics().sql_mode().allow_throw_exception(),
+        constant_policy,
+        control,
     )?;
-    let version = plan.version();
+    let version = plan.plan().version();
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
-            .and_then(|candidate| {
-                candidate.freeze_root_output(
-                    novarocks_result_contract::FrozenRootOutput::InternalFacts(
-                        novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
-                    ),
-                )
-            })
-            .map_err(|error| error.to_string())?;
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
+            plan, control,
+        )
+        .and_then(|candidate| {
+            candidate.freeze_root_output(
+                novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                    novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+                ),
+            )
+        })
+        .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
     )
     .map_err(|(error, _returned)| error.to_string())?;
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
-        function_catalog,
+        function_catalog.as_ref(),
+        static_plan_carrier,
+        constant_policy,
         Some(&write_target_facts),
-    )?;
+        execution.sql_semantics().sql_mode().allow_throw_exception(),
+        control,
+    )
+    .map_err(crate::query_execution::mv_native_write::encode_compile_error)?;
     PreparedDistributedRewriteCohort::new(
         encoded,
         version,
@@ -1868,6 +1897,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         execution.clone(),
         write_session.clone(),
     )
+    .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
 }
 
 /// How much one rewrite cohort's scan may return in a batch.

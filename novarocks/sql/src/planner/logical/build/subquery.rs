@@ -19,7 +19,9 @@ use crate::analysis::cte::CTERegistry;
 use crate::analysis::*;
 use crate::column_id::ColumnRefFactory;
 use crate::common::ApplyKind;
+use crate::compiler::SqlCompileError;
 use crate::planner::logical::*;
+use novarocks_type_contract::PureCompileControl;
 
 use super::output::plan_output_columns;
 use super::query::plan_scoped_query;
@@ -38,7 +40,8 @@ pub(super) fn wrap_scalar_applies(
     clause: ApplyClause,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlanNode, String> {
+    control: &dyn PureCompileControl,
+) -> Result<LogicalPlanNode, SqlCompileError> {
     let mut current = input;
     let mut remaining = Vec::new();
     for spec in specs.drain(..) {
@@ -46,7 +49,7 @@ pub(super) fn wrap_scalar_applies(
             remaining.push(spec);
             continue;
         }
-        let right = plan_scoped_query(spec.inner, cte_registry, factory)?;
+        let right = plan_scoped_query(spec.inner, cte_registry, factory, control)?;
         // Capture the inner's single scalar output column id before right is
         // moved into the LogicalApplyNode. This id is stable across M1b pushdown rules
         // (which may add group-by keys), so it is the reliable way to find the
@@ -58,7 +61,7 @@ pub(super) fn wrap_scalar_applies(
         // Copy output-column fields before spec.output_column is moved into the LogicalApplyNode.
         let col_id = spec.output_column.column_id;
         let col_name = spec.output_column.name.clone();
-        let col_type = spec.output_column.data_type.clone();
+        let col_type = spec.output_column.value_type.data_type.clone();
         current = LogicalPlanNode::new(
             LogicalPlanKind::Apply(LogicalApplyNode {
                 kind: ApplyKind::Scalar,
@@ -69,8 +72,7 @@ pub(super) fn wrap_scalar_applies(
                         qualifier: None,
                         column: col_name,
                     },
-                    data_type: col_type,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(col_type, true),
                 },
                 output_column: spec.output_column,
                 correlation_column_ids: spec.correlation_column_ids,
@@ -100,7 +102,8 @@ pub(super) fn wrap_predicate_applies(
     clause: ApplyClause,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
-) -> Result<LogicalPlanNode, String> {
+    control: &dyn PureCompileControl,
+) -> Result<LogicalPlanNode, SqlCompileError> {
     use crate::analysis::SubqueryKind;
 
     let mut current = input;
@@ -110,7 +113,7 @@ pub(super) fn wrap_predicate_applies(
             remaining.push(spec);
             continue;
         }
-        let right = plan_scoped_query(spec.inner, cte_registry, factory)?;
+        let right = plan_scoped_query(spec.inner, cte_registry, factory, control)?;
         let inner_output_column_id = plan_output_columns(&right)?
             .first()
             .map(|c| c.column_id)
@@ -120,14 +123,18 @@ pub(super) fn wrap_predicate_applies(
             SubqueryKind::Exists { negated } => ApplyKind::Exists { negated },
             SubqueryKind::InSubquery { negated } => ApplyKind::In { negated },
             SubqueryKind::Scalar => {
-                return Err("scalar spec routed to wrap_predicate_applies".to_string());
+                return Err(SqlCompileError::Compilation(
+                    "scalar spec routed to wrap_predicate_applies".to_string(),
+                ));
             }
         };
 
         let subquery_expr = match (&kind, spec.in_lhs.clone()) {
             (ApplyKind::In { .. }, Some(lhs)) => lhs,
             (ApplyKind::In { .. }, None) => {
-                return Err("IN spec missing analyzed LHS".to_string());
+                return Err(SqlCompileError::Compilation(
+                    "IN spec missing analyzed LHS".to_string(),
+                ));
             }
             _ => TypedExpr {
                 kind: ExprKind::ColumnRef {
@@ -135,8 +142,7 @@ pub(super) fn wrap_predicate_applies(
                     qualifier: None,
                     column: spec.output_column.name.clone(),
                 },
-                data_type: spec.output_column.data_type.clone(),
-                nullable: spec.output_column.nullable,
+                value_type: spec.output_column.value_type.clone(),
             },
         };
 

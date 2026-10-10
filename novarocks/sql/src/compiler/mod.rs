@@ -23,6 +23,7 @@
 // Design: ADR-0073 (docs/adr/ADR-0073-sql-compilation-freezes-statistics-after-analysis.md)
 // Design: ADR-0040 (docs/adr/ADR-0040-sql-compiler-dependency-inversion.md)
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,6 +34,21 @@ pub use crate::functions::{
     builtin_sql_function_catalog, contribute_builtin_functions,
 };
 pub use crate::optimizer::options::SessionOptimizerSettings;
+mod emission_mode;
+mod scalar_presence_catalog;
+pub use crate::planner::distributed::build::{
+    AggregateRuntimeDemand, CheckedSqlResultDeclaration, ResultDeclarationError,
+    SqlAuthoredPhysicalPlan, SqlCallDependencyLoan, SqlCallDependencyProvenance,
+    SqlCallDependencySite, SqlCanonicalDependencyLoan, SqlExpressionCallKind,
+    SqlSourceJournalError,
+};
+pub use crate::planner::distributed::build::{
+    FragmentPackageSemantics, PackageSemanticsError, author_fragment_package_semantics,
+    check_pure_call_definitions_observed,
+};
+#[cfg(test)]
+pub(crate) use completion_driver::compile_authored_aggregate_for_test;
+pub use emission_mode::SqlPhysicalEmissionMode;
 pub use mv_rewrite::{
     MvRewriteDefinitionIndex, SqlImvAggregateContractFacts, SqlImvAggregateExecutionFacts,
     SqlImvAggregateExecutionStateColumnFacts, SqlImvAggregateStateColumnFacts,
@@ -48,6 +64,10 @@ pub use mv_rewrite::{
     SqlMvRewriteDefinitionFacts, SqlMvRewritePublicationInput, SqlMvRewritePublicationRelation,
     SqlMvRewriteSelectionFacts, SqlMvRewriteSourceOccurrenceFacts,
 };
+
+// The request profile has one owner; application test fixtures may author
+// their explicit ceiling without a second default or translation vocabulary.
+pub use novarocks_functions::ConstantPolicy;
 
 /// SQL's read-only observation of statement cancellation.
 ///
@@ -191,17 +211,144 @@ impl SqlImvPlanningInput {
 
 /// Immutable SQL function semantics used by analysis and optimization.
 ///
-/// The function implementation and its execution kernels are explicitly out
-/// of scope for this compiler-facing contract.
+/// Selected pure preparation borrows the same installed owner as analysis.
+/// Mutable runtime instances remain outside this compiler-facing contract.
 pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
     /// Freeze an owned handle to exactly the immutable catalog used for
     /// analysis so optimizer rewrites cannot consult ambient state.
     fn snapshot(&self) -> Arc<dyn SqlFunctionCatalog>;
 
+    /// Candidate-only admission of the original selected call and its actual
+    /// invocation lifecycle. Original catalogues perform no lookup or work.
+    /// This does not prepare data or supply absent environment/source facts.
+    fn admit_bound_lifecycle_observed(
+        &self,
+        _binding: &novarocks_functions::ResolvedFunctionBinding,
+        _lifecycle: novarocks_functions::PureCallLifecycle,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), novarocks_functions::FunctionBindingError> {
+        Ok(())
+    }
+
+    /// Actual same-source frozen environment admission. Original catalogues
+    /// retain their original path without lookup, preparation or added work.
+    fn admit_bound_environment_observed(
+        &self,
+        _binding: &novarocks_functions::ResolvedFunctionBinding,
+        _environment: &[novarocks_type_contract::SemanticParameterRef],
+        _parameters: &novarocks_type_contract::SemanticParameters,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), novarocks_functions::FunctionBindingError> {
+        Ok(())
+    }
+
+    /// Borrow the original lexical call facts at the existing fold-parent frontier.
+    /// Original catalogues do no work and construct no semantic table here.
+    fn admit_authored_environment_observed(
+        &self,
+        _binding: &crate::binding::SqlFunctionBinding,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), novarocks_functions::FunctionBindingError> {
+        Ok(())
+    }
+
+    /// Original catalogues retain the original intrinsic input domain. Only
+    /// the explicit Exact request scope installs this source-shape admission.
+    /// No query mode is inferred from a runtime value or constant payload.
+    fn admit_native_bitnot_source_observed(
+        &self,
+        _source: &novarocks_functions::FunctionValueType,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), novarocks_functions::FunctionBindingError> {
+        Ok(())
+    }
+
+    /// Retain this same immutable catalogue with candidate-only scalar presence
+    /// admission. No preparation, data evaluation or supported-profile seal is
+    /// granted. An already scoped snapshot preserves its one projection.
+    fn snapshot_for_scalar_presence(&self) -> Arc<dyn SqlFunctionCatalog> {
+        scalar_presence_catalog::scope(self.snapshot())
+    }
+
+    /// Instantiate only this exact installed identity and overload. This does
+    /// not publish a final physical snapshot or grant call effects/capability.
+    fn select_exact_overload_observed(
+        &self,
+        _function: &novarocks_functions::FunctionId,
+        _kind: novarocks_functions::FunctionKind,
+        _overload: &novarocks_functions::FunctionOverloadId,
+        _request: novarocks_functions::FunctionBindingRequest<'_>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        Arc<novarocks_functions::FunctionBindingSelection>,
+        novarocks_functions::FunctionBindingError,
+    > {
+        let work = novarocks_type_contract::CompileCheckpoints::try_new(
+            control,
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+        )?;
+        work.finish()?;
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
+    /// Borrow the installed exact overload's base to author control domains.
+    /// Full selected preparation must still validate/refine types, constants,
+    /// environment and the actual implementation. Metadata-only snapshots
+    /// refuse rather than substituting a declaration from a name lookup.
+    fn pure_overload_declaration_observed<'a>(
+        &'a self,
+        _function_id: &novarocks_functions::FunctionId,
+        _kind: novarocks_functions::FunctionKind,
+        _overload: &novarocks_functions::FunctionOverloadId,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::PureOverloadDeclaration<'a>,
+        novarocks_functions::FunctionSpecializationFailure,
+    > {
+        control
+            .checkpoint(
+                novarocks_type_contract::CompilePhase::FunctionSpecialization,
+                0,
+            )
+            .map_err(novarocks_functions::FunctionSpecializationFailure::Control)?;
+        Err(
+            novarocks_functions::FunctionSpecializationFailure::InvalidInput(
+                "SQL function snapshot has no installed pure overload declaration owner",
+            ),
+        )
+    }
+
+    /// Prepare the exact selected implementation from this immutable snapshot.
+    /// There is no SQL name to resolve again and no declaration-only effect
+    /// fallback. An adapter without an installed owner refuses the capability.
+    fn prepare_fresh_selected(
+        &self,
+        _input: novarocks_functions::CallEffectInput<'_>,
+        _selected: Arc<novarocks_functions::FunctionBindingSelection>,
+        _options: novarocks_functions::PureCallPreparation,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::PureCallSpecialization,
+        novarocks_functions::FunctionSpecializationFailure,
+    > {
+        control
+            .checkpoint(
+                novarocks_type_contract::CompilePhase::FunctionSpecialization,
+                0,
+            )
+            .map_err(novarocks_functions::FunctionSpecializationFailure::Control)?;
+        Err(
+            novarocks_functions::FunctionSpecializationFailure::InvalidInput(
+                "SQL function snapshot has no installed selected preparation owner",
+            ),
+        )
+    }
+
     fn resolve_scalar_signature(
         &self,
         name: &str,
         arg_types: &[arrow::datatypes::DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedFunctionSignature,
         novarocks_functions::FunctionResolutionError,
@@ -211,10 +358,49 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         &self,
         _name: &str,
         _arguments: &[novarocks_functions::FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedFunctionBinding,
         novarocks_functions::FunctionBindingError,
     > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
+    /// Explicit result syntax requires a declaring binder capability.
+    fn resolve_scalar_binding_with_expected_result(
+        &self,
+        _name: &str,
+        _arguments: &[novarocks_functions::FunctionArgument],
+        _expected: &novarocks_functions::FunctionValueType,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
+    fn resolve_value_conversion_binding(
+        &self,
+        _argument: &novarocks_functions::FunctionArgument,
+        _target: &novarocks_functions::FunctionValueType,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
@@ -222,10 +408,15 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         &self,
         _name: &str,
         _arguments: &[novarocks_functions::FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedFunctionBinding,
         novarocks_functions::FunctionBindingError,
     > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
@@ -233,10 +424,15 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         &self,
         _name: &str,
         _arguments: &[novarocks_functions::FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedFunctionBinding,
         novarocks_functions::FunctionBindingError,
     > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
@@ -247,10 +443,15 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         _name: &str,
         _logical_argument_count: usize,
         _arguments: &[novarocks_functions::FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedFunctionBinding,
         novarocks_functions::FunctionBindingError,
     > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
         Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
     }
 
@@ -259,17 +460,19 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         name: &str,
         logical_argument_count: usize,
         arguments: &[novarocks_functions::FunctionArgument],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedFunctionBinding,
         novarocks_functions::FunctionBindingError,
     > {
-        self.resolve_aggregate_binding(name, logical_argument_count, arguments)
+        self.resolve_aggregate_binding(name, logical_argument_count, arguments, control)
     }
 
     fn resolve_aggregate_signature(
         &self,
         name: &str,
         arg_types: &[arrow::datatypes::DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedAggregateSignature,
         novarocks_functions::FunctionResolutionError,
@@ -283,22 +486,28 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         name: &str,
         logical_arg_types: &[arrow::datatypes::DataType],
         update_arg_types: &[arrow::datatypes::DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedAggregateSignature,
         novarocks_functions::FunctionResolutionError,
     > {
+        control.checkpoint(
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+            0,
+        )?;
         if logical_arg_types != update_arg_types {
             return Err(novarocks_functions::FunctionResolutionError::BadSignature(
                 "function catalog does not support ordered aggregate update signatures".into(),
             ));
         }
-        self.resolve_aggregate_signature(name, logical_arg_types)
+        self.resolve_aggregate_signature(name, logical_arg_types, control)
     }
 
     fn resolve_aggregate_trusted(
         &self,
         name: &str,
         arg_types: &[arrow::datatypes::DataType],
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<
         novarocks_functions::ResolvedAggregateSignature,
         novarocks_functions::FunctionResolutionError,
@@ -308,6 +517,12 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
 }
 
 pub use crate::common::expr::{BinOp, LiteralValue, UnOp};
+mod fold_observation;
+pub use fold_observation::{
+    SqlFoldDependencyInput, SqlFoldDependencyObserver, SqlFoldDependencySource,
+    SqlFoldEvaluationOutcome,
+};
+pub(crate) use fold_observation::{SqlFoldEvaluatorLoan, evaluate_fold_dependency_observed};
 
 /// One scalar node shape the optimizer may ask a constant evaluator to fold.
 ///
@@ -323,11 +538,12 @@ pub enum FoldNodeKind {
 }
 
 /// One already-folded argument of a fold request.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct FoldArg {
-    pub value: LiteralValue,
-    pub data_type: arrow::datatypes::DataType,
-    pub nullable: bool,
+    pub value: novarocks_functions::ConstantValue,
+    /// The authored logical domain and exact Arrow field vocabulary travel
+    /// together; a carrier alone cannot authorize a logical reinterpretation.
+    pub value_type: novarocks_type_contract::FunctionValueType,
 }
 
 /// A single-node constant evaluation request.
@@ -335,12 +551,13 @@ pub struct FoldArg {
 /// Every argument is already a literal: recursion, volatility gating and the
 /// foldable-shape policy stay on the SQL side, so an evaluator is a pure
 /// per-node calculator with no traversal knowledge.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct FoldRequest {
     pub kind: FoldNodeKind,
     pub args: Vec<FoldArg>,
-    pub out_type: arrow::datatypes::DataType,
-    pub out_nullable: bool,
+    /// Explicit host-admitted policy for the newly evaluated backing.
+    pub constant_policy: novarocks_functions::ConstantPolicy,
+    pub result_type: novarocks_type_contract::FunctionValueType,
 }
 
 /// Evaluates one constant scalar node on behalf of the optimizer.
@@ -352,15 +569,125 @@ pub struct FoldRequest {
 /// analyze request.
 ///
 /// Fail-open contract:
-/// - `Ok(Some(literal))` — folded; the literal has type `request.out_type`.
+/// - `Ok(Some(literal))` — folded; the literal has the complete type `request.result_type`.
 /// - `Ok(None)` — evaluator declines (unmapped node shape or literal type).
-/// - `Err(_)` — evaluation failed. Callers keep the original expression and
+/// - `Err(Evaluation(_))` — evaluation failed. Callers keep the original expression and
 ///   must never surface this as a planning error, because the runtime is
 ///   still allowed to produce a value or its own error for that expression.
+/// - `Err(InvalidType(_))` — invalid frozen type facts; compilation stops.
+/// - `Err(Preparation(_))` — a pure preparation failure; compilation stops.
+///   Resource, internal and static failures cannot become optional row errors.
+/// - `Err(Control(_))` — request cancellation, deadline or resource exhaustion;
+///   compilation stops with that exact category, never an optimization decline.
 // Design: ADR-0100 (docs/adr/ADR-0100-constant-folding-reuses-execution-kernels-through-an-injected-port.md)
 pub trait SqlConstantEvaluator: Send + Sync {
-    fn eval_scalar(&self, request: &FoldRequest) -> Result<Option<LiteralValue>, String>;
+    fn eval_scalar(
+        &self,
+        request: &FoldRequest,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>;
+
+    /// Static selected-call admission at the original parent node, before any
+    /// child is folded. The request loan supplies the actual immutable catalog;
+    /// legacy calculators retain their original behavior by default.
+    fn admit_fold_parent_observed(
+        &self,
+        _binding: &crate::binding::SqlFunctionBinding,
+        _lifecycle: novarocks_functions::PureCallLifecycle,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), novarocks_functions::FunctionBindingError> {
+        Ok(())
+    }
+
+    /// Optional observation before the original evaluator performs any work.
+    /// An observer must admit and reserve its complete receipt storage here.
+    /// A refusal aborts compilation with this exact control cause, without eval.
+    /// Existing evaluators observe nothing and introduce no extra checkpoints.
+    fn before_fold_dependency_observed(
+        &self,
+        _input: SqlFoldDependencyInput<'_>,
+        _control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        Ok(())
+    }
+
+    /// Complete only the receipt admitted by the corresponding start callback.
+    /// No allocation/admission, failure, binding, evaluation, or retry is allowed.
+    /// Borrowed error text is complete; this hook cannot replace the primary cause.
+    fn after_fold_dependency_observed(
+        &self,
+        _input: SqlFoldDependencyInput<'_>,
+        _outcome: SqlFoldEvaluationOutcome<'_>,
+    ) {
+    }
 }
+
+/// Request failures stay distinct from a failed optional legacy evaluation.
+/// Kernel strings are not interpreted to infer a control category.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SqlConstantEvaluationError {
+    Control(novarocks_type_contract::CompileControlError),
+    Constant(novarocks_functions::ConstantError),
+    InvalidType(novarocks_type_contract::ValueTypeError),
+    Preparation(novarocks_functions::KernelFailure),
+    Evaluation(String),
+}
+
+impl From<novarocks_type_contract::CompileControlError> for SqlConstantEvaluationError {
+    fn from(error: novarocks_type_contract::CompileControlError) -> Self {
+        Self::Control(error)
+    }
+}
+
+impl From<novarocks_functions::ConstantError> for SqlConstantEvaluationError {
+    fn from(error: novarocks_functions::ConstantError) -> Self {
+        match error {
+            novarocks_functions::ConstantError::Control(error) => Self::Control(error),
+            error => Self::Constant(error),
+        }
+    }
+}
+
+impl From<novarocks_type_contract::ValueTypeError> for SqlConstantEvaluationError {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::InvalidType(error)
+    }
+}
+
+impl From<novarocks_functions::KernelFailure> for SqlConstantEvaluationError {
+    fn from(error: novarocks_functions::KernelFailure) -> Self {
+        use novarocks_functions::KernelFailure;
+        use novarocks_type_contract::CompileControlError;
+        match error {
+            KernelFailure::Cancelled => Self::Control(CompileControlError::Cancelled),
+            KernelFailure::DeadlineExceeded => Self::Control(CompileControlError::DeadlineExceeded),
+            KernelFailure::ResourceExhausted => {
+                Self::Control(CompileControlError::ResourceExhausted)
+            }
+            other => Self::Preparation(other),
+        }
+    }
+}
+
+impl From<String> for SqlConstantEvaluationError {
+    fn from(error: String) -> Self {
+        Self::Evaluation(error)
+    }
+}
+
+impl fmt::Display for SqlConstantEvaluationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Control(error) => error.fmt(f),
+            Self::Constant(error) => error.fmt(f),
+            Self::InvalidType(error) => error.fmt(f),
+            Self::Preparation(error) => error.fmt(f),
+            Self::Evaluation(error) => f.write_str(error),
+        }
+    }
+}
+
+impl std::error::Error for SqlConstantEvaluationError {}
 
 /// A constant evaluator that never folds.
 ///
@@ -370,7 +697,16 @@ pub trait SqlConstantEvaluator: Send + Sync {
 struct NoopConstantEvaluator;
 
 impl SqlConstantEvaluator for NoopConstantEvaluator {
-    fn eval_scalar(&self, _request: &FoldRequest) -> Result<Option<LiteralValue>, String> {
+    fn eval_scalar(
+        &self,
+        _request: &FoldRequest,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError> {
+        let work = novarocks_type_contract::CompileCheckpoints::try_new(
+            control,
+            novarocks_type_contract::CompilePhase::FunctionSpecialization,
+        )?;
+        work.finish()?;
         Ok(None)
     }
 }
@@ -481,6 +817,7 @@ pub enum SqlPlanningEnvironment {
 pub struct SqlCompileControl {
     deadline: Option<Instant>,
     cancellation: Arc<dyn SqlCancellationObservation>,
+    fold_dependency_observer: Option<Arc<dyn SqlFoldDependencyObserver>>,
 }
 
 struct SqlNeverCancelled;
@@ -499,6 +836,7 @@ impl SqlCompileControl {
         Self {
             deadline,
             cancellation,
+            fold_dependency_observer: None,
         }
     }
 
@@ -509,24 +847,68 @@ impl SqlCompileControl {
         Self {
             deadline: None,
             cancellation: Arc::new(SqlNeverCancelled),
+            fold_dependency_observer: None,
         }
     }
 
+    /// Attach this request's observer; preserve its original control sources.
+    /// The host owns admission. This attachment grants no capacity.
+    pub fn with_fold_dependency_observer(
+        mut self,
+        observer: Arc<dyn SqlFoldDependencyObserver>,
+    ) -> Self {
+        self.fold_dependency_observer = Some(observer);
+        self
+    }
+    pub(crate) fn fold_dependency_observer(&self) -> Option<&Arc<dyn SqlFoldDependencyObserver>> {
+        self.fold_dependency_observer.as_ref()
+    }
     pub(crate) fn check(&self) -> Result<(), SqlCompileError> {
+        novarocks_type_contract::PureCompileControl::checkpoint(
+            self,
+            novarocks_type_contract::CompilePhase::Validate,
+            0,
+        )
+        .map_err(Self::compile_error)
+    }
+
+    pub const fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    fn compile_error(error: novarocks_type_contract::CompileControlError) -> SqlCompileError {
+        match error {
+            novarocks_type_contract::CompileControlError::Cancelled => SqlCompileError::Cancelled,
+            novarocks_type_contract::CompileControlError::DeadlineExceeded => {
+                SqlCompileError::DeadlineExceeded
+            }
+            novarocks_type_contract::CompileControlError::ResourceExhausted => {
+                SqlCompileError::ResourceExhausted
+            }
+        }
+    }
+}
+
+impl novarocks_type_contract::PureCompileControl for SqlCompileControl {
+    fn checkpoint(
+        &self,
+        _phase: novarocks_type_contract::CompilePhase,
+        _work_units: u32,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        use novarocks_type_contract::CompileControlError;
+        // Request control observes the existing cancellation/deadline source.
+        // Structural/work admission remains with the operation's policy; no
+        // independent optimizer or constant-factory wallet is created here.
         if self.cancellation.is_cancelled() {
-            return Err(SqlCompileError::Cancelled);
+            return Err(CompileControlError::Cancelled);
         }
         if self
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            return Err(SqlCompileError::DeadlineExceeded);
+            return Err(CompileControlError::DeadlineExceeded);
         }
         Ok(())
-    }
-
-    pub const fn deadline(&self) -> Option<Instant> {
-        self.deadline
     }
 }
 
@@ -538,10 +920,12 @@ pub struct SqlAnalyzeRequest<'a> {
     pub(crate) intent: SqlCompileIntent,
     pub(crate) session: SqlSessionContext,
     pub(crate) environment: SqlPlanningEnvironment,
+    pub(crate) emission_mode: SqlPhysicalEmissionMode,
     pub(crate) catalog: Option<&'a dyn SqlCatalogSnapshot>,
     pub(crate) functions: Option<&'a dyn SqlFunctionCatalog>,
     pub(crate) owned_functions: Option<Arc<dyn SqlFunctionCatalog>>,
     pub(crate) constant_evaluator: Option<&'static dyn SqlConstantEvaluator>,
+    pub(crate) constant_policy: novarocks_functions::ConstantPolicy,
     pub(crate) mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
     pub(crate) imv_rewrite: Option<&'a SqlImvPlanningInput>,
     pub(crate) control: SqlCompileControl,
@@ -558,6 +942,8 @@ impl<'a> SqlAnalyzeRequest<'a> {
         functions: &'a dyn SqlFunctionCatalog,
         constant_evaluator: &'static dyn SqlConstantEvaluator,
         mv_rewrite: Option<&'a MvRewriteDefinitionIndex>,
+        constant_policy: novarocks_functions::ConstantPolicy,
+        emission_mode: SqlPhysicalEmissionMode,
         control: SqlCompileControl,
     ) -> Self {
         Self {
@@ -565,10 +951,12 @@ impl<'a> SqlAnalyzeRequest<'a> {
             intent,
             session,
             environment,
+            emission_mode,
             catalog: Some(catalog),
             functions: Some(functions),
             owned_functions: None,
             constant_evaluator: Some(constant_evaluator),
+            constant_policy,
             mv_rewrite,
             imv_rewrite: None,
             control,
@@ -590,6 +978,8 @@ impl<'a> SqlAnalyzeRequest<'a> {
         session: SqlSessionContext,
         environment: SqlPlanningEnvironment,
         constant_evaluator: Option<&'static dyn SqlConstantEvaluator>,
+        constant_policy: novarocks_functions::ConstantPolicy,
+        emission_mode: SqlPhysicalEmissionMode,
         control: SqlCompileControl,
     ) -> Self {
         Self {
@@ -597,18 +987,36 @@ impl<'a> SqlAnalyzeRequest<'a> {
             intent,
             session,
             environment,
+            emission_mode,
             catalog: None,
             functions: None,
             owned_functions: None,
             constant_evaluator,
+            constant_policy,
             mv_rewrite: None,
             imv_rewrite: None,
             control,
         }
     }
 
+    fn freeze_scalar_presence_scope(&mut self) {
+        if self.emission_mode == SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration {
+            // Retain the same original catalogue after the original entry control check.
+            let scoped = self
+                .function_catalog()
+                .map(|functions| functions.snapshot_for_scalar_presence());
+            self.functions = None;
+            self.owned_functions = scoped;
+        }
+    }
+
     pub(crate) fn check_control(&self) -> Result<(), SqlCompileError> {
         self.control.check()
+    }
+
+    /// Borrow the original request control for subsequent diagnostics.
+    pub fn control(&self) -> &SqlCompileControl {
+        &self.control
     }
 
     pub(crate) fn with_function_catalog(mut self, functions: Arc<dyn SqlFunctionCatalog>) -> Self {
@@ -618,10 +1026,6 @@ impl<'a> SqlAnalyzeRequest<'a> {
 
     fn function_catalog(&self) -> Option<&dyn SqlFunctionCatalog> {
         self.functions.or(self.owned_functions.as_deref())
-    }
-
-    fn deadline(&self) -> Option<Instant> {
-        self.control.deadline()
     }
 
     pub(crate) fn with_imv_rewrite(mut self, input: &'a SqlImvPlanningInput) -> Self {
@@ -637,12 +1041,31 @@ pub struct SqlAnalyzedQuery {
     factory: crate::column_id::ColumnRefFactory,
     intent: SqlCompileIntent,
     settings: SessionOptimizerSettings,
+    /// Policy of the admitted root scope for calls synthesized after analysis.
+    /// Existing calls retain their own scope policy in `SqlFunctionBinding`.
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    /// The admitted root option, independent of lexical decimal policies.
+    root_allow_throw_exception: bool,
     change_stream: crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     mv_rewrite: mv_rewrite::SqlMvRewriteAnalysis,
     function_catalog: Arc<dyn SqlFunctionCatalog>,
     /// Carried from the analyze request because folding runs in the optimize
     /// phase, which outlives the analyze request borrow.
     constant_evaluator: Option<&'static dyn SqlConstantEvaluator>,
+    constant_policy: novarocks_functions::ConstantPolicy,
+}
+
+impl SqlAnalyzedQuery {
+    pub(crate) fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
+    }
+    pub(crate) fn root_allow_throw_exception(&self) -> bool {
+        self.root_allow_throw_exception
+    }
+
+    pub(crate) fn decimal_overflow_policy(&self) -> novarocks_type_contract::DecimalOverflowPolicy {
+        self.decimal_overflow_policy
+    }
 }
 
 /// Typed phase-one outcome. Analyze-only and logical-only requests terminate
@@ -682,6 +1105,22 @@ pub struct SqlOptimizeRequest<'a> {
 }
 
 impl<'a> SqlOptimizeRequest<'a> {
+    pub fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.analyzed.constant_policy
+    }
+
+    pub fn root_allow_throw_exception(&self) -> bool {
+        self.analyzed.root_allow_throw_exception()
+    }
+
+    pub fn decimal_overflow_policy(&self) -> novarocks_type_contract::DecimalOverflowPolicy {
+        self.analyzed.decimal_overflow_policy()
+    }
+
+    pub(crate) fn control(&self) -> &SqlCompileControl {
+        &self.control
+    }
+
     pub fn new(
         analyzed: SqlAnalyzedQuery,
         statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
@@ -705,6 +1144,7 @@ pub(crate) struct SqlAnalysisOutput {
     reason = "Optimizer metadata remains part of the compiler terminal until the lifecycle handoff consumes it."
 )]
 pub(crate) struct SqlOptimizedOutput {
+    pub(crate) root_allow_throw_exception: bool,
     pub(crate) root_semantics: root_output::RootOutputSemantics,
     pub(crate) optimized_tree: crate::optimizer::OptimizedOperatorNode,
     pub(crate) function_catalog: Arc<dyn SqlFunctionCatalog>,
@@ -741,6 +1181,7 @@ enum SqlCompileOutputKind {
 /// SQL consumes the opaque rewrite snapshot and keeps logical-plan ownership
 /// internal; Core receives only the rendered lines.
 pub struct SqlImvRefreshExplainContext<'a> {
+    pub emission_mode: SqlPhysicalEmissionMode,
     pub canonical_query: Box<novarocks_parser::ast::Query>,
     pub imv_rewrite: SqlImvPlanningInput,
     pub current_catalog: Option<String>,
@@ -750,6 +1191,7 @@ pub struct SqlImvRefreshExplainContext<'a> {
     pub catalog: &'a dyn SqlCatalogSnapshot,
     pub functions: &'a dyn SqlFunctionCatalog,
     pub constant_evaluator: &'static dyn SqlConstantEvaluator,
+    pub constant_policy: novarocks_functions::ConstantPolicy,
     pub control: SqlCompileControl,
     pub level: ExplainLevel,
 }
@@ -758,40 +1200,56 @@ pub struct SqlImvRefreshExplainContext<'a> {
 /// parsed syntax and its frozen catalog snapshot in, but receives only the
 /// opaque analyzed-MV carrier back.
 pub struct SqlMvRefreshAnalysisContext<'a> {
+    pub emission_mode: SqlPhysicalEmissionMode,
     pub query: Box<novarocks_parser::ast::Query>,
     pub current_database: String,
     pub catalog: &'a dyn SqlCatalogSnapshot,
     pub functions: &'a dyn SqlFunctionCatalog,
+    pub constant_policy: novarocks_functions::ConstantPolicy,
+    pub control: SqlCompileControl,
 }
 
 /// Analyze a prepared MV query without exposing analyzer nodes, CTE state, or
 /// the column-id factory to application code.
 pub fn analyze_mv_refresh_input(
     context: SqlMvRefreshAnalysisContext<'_>,
-) -> Result<crate::planning::mv::SqlResolvedMvRefreshInput, String> {
+) -> Result<crate::planning::mv::SqlResolvedMvRefreshInput, SqlCompileError> {
     let SqlMvRefreshAnalysisContext {
+        emission_mode,
         query,
         current_database,
         catalog,
         functions,
+        constant_policy,
+        control,
     } = context;
-    // The public MV-refresh facade still returns String while its frontend
-    // owner is outside SQLP-7. Keep the typed parser rejection intact until
-    // that boundary; no category is inferred from this message.
+    control.check()?;
+    // Keep typed analysis/control failures intact at the compiler boundary.
     crate::sql_mode::validate_persisted_query_semantics(
         &query,
         &crate::sql_mode::SqlSemanticSettings::default(),
-    )?;
+    )
+    .map_err(SqlCompileError::Compilation)?;
     crate::planning::mv::validate_imv_aggregate_star_arguments(&query)
-        .map_err(|error| error.to_string())?;
+        .map_err(SqlCompileError::from)?;
+    let scoped_functions = match emission_mode {
+        SqlPhysicalEmissionMode::OriginalNativeV1 => None,
+        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration => {
+            Some(functions.snapshot_for_scalar_presence())
+        }
+    };
+    let functions = scoped_functions.as_deref().unwrap_or(functions);
     let (resolved, _, factory) = crate::analyzer::analyze_with_function_catalog(
         &query,
         catalog.planner_table_provider(),
         &current_database,
         functions,
+        constant_policy,
+        &control,
     )
-    .map_err(|error| error.to_string())?;
-    crate::planning::mv::validate_persistable_output(&resolved, &factory)?;
+    .map_err(SqlCompileError::from)?;
+    crate::planning::mv::validate_persistable_output(&resolved, &factory)
+        .map_err(SqlCompileError::Compilation)?;
     Ok(crate::planning::mv::SqlResolvedMvRefreshInput::from_analysis(resolved))
 }
 
@@ -801,6 +1259,7 @@ pub fn compile_imv_refresh_explain_lines(
     context: SqlImvRefreshExplainContext<'_>,
 ) -> Result<Vec<String>, SqlCompileError> {
     let SqlImvRefreshExplainContext {
+        emission_mode,
         canonical_query,
         imv_rewrite,
         current_catalog,
@@ -810,6 +1269,7 @@ pub fn compile_imv_refresh_explain_lines(
         catalog,
         functions,
         constant_evaluator,
+        constant_policy,
         control,
         level,
     } = context;
@@ -825,10 +1285,13 @@ pub fn compile_imv_refresh_explain_lines(
         catalog,
         functions,
         constant_evaluator,
+        constant_policy,
+        emission_mode,
         control,
     );
+    let explain_control = request.control().clone();
     let output = SqlCompiler::analyze(request)?.into_complete()?;
-    output.into_explain_lines(level, true)
+    output.into_explain_lines(level, true, &explain_control)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -842,6 +1305,8 @@ fn imv_refresh_explain_request<'a>(
     catalog: &'a dyn SqlCatalogSnapshot,
     functions: &'a dyn SqlFunctionCatalog,
     constant_evaluator: &'static dyn SqlConstantEvaluator,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    emission_mode: SqlPhysicalEmissionMode,
     control: SqlCompileControl,
 ) -> SqlAnalyzeRequest<'a> {
     SqlAnalyzeRequest::new(
@@ -858,6 +1323,8 @@ fn imv_refresh_explain_request<'a>(
         functions,
         constant_evaluator,
         None,
+        constant_policy,
+        emission_mode,
         control,
     )
     .with_imv_rewrite(imv_rewrite)
@@ -911,16 +1378,35 @@ impl SqlCompileOutput {
         self,
         level: ExplainLevel,
         logical: bool,
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Vec<String>, SqlCompileError> {
-        match self.kind {
+        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+            control,
+            novarocks_type_contract::CompilePhase::LowerProgram,
+        )?;
+        let result = match self.kind {
             SqlCompileOutputKind::Logical(output) if logical => {
-                crate::explain::explain_plan_checked(&output.logical_plan, level)
-                    .map_err(SqlCompileError::Compilation)
+                work.step()?;
+                work.flush()?;
+                crate::explain::explain_plan_checked(&output.logical_plan, level, control)
             }
-            _ => Err(SqlCompileError::InvalidRequest(
-                "EXPLAIN intent produced unexpected SQL facts".to_string(),
-            )),
+            _ => {
+                work.step()?;
+                Err(SqlCompileError::InvalidRequest(
+                    "EXPLAIN intent produced unexpected SQL facts".to_string(),
+                ))
+            }
+        };
+        if matches!(
+            &result,
+            Err(SqlCompileError::Cancelled
+                | SqlCompileError::DeadlineExceeded
+                | SqlCompileError::ResourceExhausted)
+        ) {
+            return result;
         }
+        work.finish()?;
+        result
     }
 }
 
@@ -928,9 +1414,56 @@ impl SqlCompileOutput {
 pub enum SqlCompileError {
     Cancelled,
     DeadlineExceeded,
+    ResourceExhausted,
     InvalidRequest(String),
     Analyze(AnalyzeError),
     Compilation(String),
+}
+
+impl From<String> for SqlCompileError {
+    fn from(error: String) -> Self {
+        Self::Compilation(error)
+    }
+}
+
+impl From<novarocks_functions::FunctionBindingError> for SqlCompileError {
+    fn from(error: novarocks_functions::FunctionBindingError) -> Self {
+        match error {
+            novarocks_functions::FunctionBindingError::Control(error) => error.into(),
+            error @ novarocks_functions::FunctionBindingError::UnavailableImplementation(_) => {
+                Self::Analyze(AnalyzeError::function_binding(error))
+            }
+            other => Self::Compilation(other.to_string()),
+        }
+    }
+}
+
+impl From<novarocks_functions::ConstantError> for SqlCompileError {
+    fn from(error: novarocks_functions::ConstantError) -> Self {
+        match error {
+            novarocks_functions::ConstantError::Control(error) => error.into(),
+            novarocks_functions::ConstantError::Limit(_) => Self::ResourceExhausted,
+            novarocks_functions::ConstantError::Type(error) => {
+                Self::InvalidRequest(error.to_string())
+            }
+            error => Self::Compilation(error.to_string()),
+        }
+    }
+}
+
+impl From<novarocks_type_contract::CompileControlError> for SqlCompileError {
+    fn from(error: novarocks_type_contract::CompileControlError) -> Self {
+        SqlCompileControl::compile_error(error)
+    }
+}
+
+impl From<AnalyzeError> for SqlCompileError {
+    fn from(error: AnalyzeError) -> Self {
+        match error.control_error() {
+            Some(error) => SqlCompileControl::compile_error(error),
+            None => Self::Analyze(error),
+        }
+    }
 }
 
 impl std::fmt::Display for SqlCompileError {
@@ -938,6 +1471,7 @@ impl std::fmt::Display for SqlCompileError {
         match self {
             Self::Cancelled => f.write_str("SQL compilation was cancelled"),
             Self::DeadlineExceeded => f.write_str("SQL compilation deadline exceeded"),
+            Self::ResourceExhausted => f.write_str("SQL compilation resource budget was exhausted"),
             Self::InvalidRequest(error) | Self::Compilation(error) => f.write_str(error),
             Self::Analyze(error) => error.fmt(f),
         }
@@ -983,14 +1517,18 @@ use completion_driver::{
 };
 
 impl SqlCompiler {
-    pub fn analyze(request: SqlAnalyzeRequest<'_>) -> Result<SqlAnalyzeOutput, SqlCompileError> {
+    pub fn analyze(
+        mut request: SqlAnalyzeRequest<'_>,
+    ) -> Result<SqlAnalyzeOutput, SqlCompileError> {
         request.check_control()?;
+        request.freeze_scalar_presence_scope();
         let (
             mut logical_plan,
             mut factory,
             logical_input,
             consumer_requires_semantic_snapshot,
             legacy_allow_throw_exception,
+            decimal_overflow_policy,
         ) = match &request.statement.kind {
             SqlStatementInputKind::LogicalPlan { plan, factory } => (
                 plan.clone(),
@@ -1008,6 +1546,11 @@ impl SqlCompiler {
                     .sql_semantics
                     .sql_mode()
                     .allow_throw_exception(),
+                request
+                    .session
+                    .sql_semantics
+                    .sql_mode()
+                    .decimal_overflow_policy(),
             ),
             _ => {
                 let query = parse_query(&request.statement)?;
@@ -1031,36 +1574,42 @@ impl SqlCompiler {
                         &request.session.current_database,
                         functions,
                         &request.session.sql_semantics,
+                        request.constant_policy,
+                        &request.control,
                     )
-                    .map_err(SqlCompileError::Analyze)?;
+                    .map_err(SqlCompileError::from)?;
                 request.check_control()?;
-                let logical_plan = crate::planner::plan_query(resolved, ctes, &mut factory)
-                    .map_err(SqlCompileError::Compilation)?;
+                let logical_plan =
+                    crate::planner::plan_query(resolved, ctes, &mut factory, &request.control)?;
                 let consumer_requires_semantic_snapshot =
                     crate::sql_mode::query_uses_group_concat_legacy(
                         &request.session.sql_semantics,
                         &query,
                     )
-                    .map_err(SqlCompileError::Analyze)?
+                    .map_err(SqlCompileError::from)?
                         || crate::sql_mode::query_uses_decimal_overflow_to_double(
                             &request.session.sql_semantics,
                             &query,
                         )
-                        .map_err(SqlCompileError::Analyze)?
+                        .map_err(SqlCompileError::from)?
                         || crate::sql_mode::query_uses_error_if_overflow(
                             &request.session.sql_semantics,
                             &query,
                         )
-                        .map_err(SqlCompileError::Analyze)?;
+                        .map_err(SqlCompileError::from)?;
                 (
                     logical_plan,
                     factory,
                     false,
                     consumer_requires_semantic_snapshot,
                     crate::sql_mode::query_sql_semantics(&request.session.sql_semantics, &query)
-                        .map_err(SqlCompileError::Analyze)?
+                        .map_err(SqlCompileError::from)?
                         .sql_mode()
                         .allow_throw_exception(),
+                    crate::sql_mode::query_sql_semantics(&request.session.sql_semantics, &query)
+                        .map_err(SqlCompileError::from)?
+                        .sql_mode()
+                        .decimal_overflow_policy(),
                 )
             }
         };
@@ -1120,7 +1669,9 @@ impl SqlCompiler {
                         ),
                     snapshot: Arc::clone(input.snapshot()),
                     disabled_rules: settings.disabled_rules.clone(),
-                    deadline: request.deadline(),
+                    decimal_overflow_policy,
+                    constant_policy: request.constant_policy,
+                    control: &request.control,
                     column_ref_factory: std::rc::Rc::clone(&factory_cell),
                     #[cfg(not(test))]
                     function_catalog: request
@@ -1132,8 +1683,7 @@ impl SqlCompiler {
                         })?
                         .snapshot(),
                 },
-            )
-            .map_err(|error| SqlCompileError::Compilation(format!("imv rewrite: {error}")))?;
+            )?;
             validate_imv_rewrite_outcome(input, &outcome)?;
             logical_plan = outcome.plan;
             change_stream = outcome.annotation.change_stream;
@@ -1177,11 +1727,12 @@ impl SqlCompiler {
                 &factory,
                 functions,
                 &settings,
+                request.constant_policy,
                 &request.control,
                 consumer_requires_semantic_snapshot,
             )?
         } else {
-            mv_rewrite::SqlMvRewriteAnalysis::empty()
+            mv_rewrite::SqlMvRewriteAnalysis::empty(request.constant_policy)
         };
         request.check_control()?;
         let function_catalog = request
@@ -1198,9 +1749,12 @@ impl SqlCompiler {
             factory,
             intent: request.intent,
             settings,
+            decimal_overflow_policy,
+            root_allow_throw_exception: legacy_allow_throw_exception,
             change_stream,
             mv_rewrite,
             function_catalog,
+            constant_policy: request.constant_policy,
             constant_evaluator: constant_evaluator_for_legacy_mode(
                 request.constant_evaluator,
                 legacy_allow_throw_exception,
@@ -1214,10 +1768,13 @@ impl SqlCompiler {
             factory,
             intent,
             settings,
+            decimal_overflow_policy,
+            root_allow_throw_exception,
             change_stream,
             mv_rewrite,
             function_catalog,
             constant_evaluator,
+            constant_policy,
         } = request.analyzed;
         let control = request.control;
         control.check()?;
@@ -1227,12 +1784,13 @@ impl SqlCompiler {
             &factory,
         )
         .map_err(SqlCompileError::Compilation)?;
-        let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
+        let mut scalar_arena =
+            crate::optimizer::scalar::ScalarArena::with_constant_policy(constant_policy);
         let mut optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             &logical_plan,
             &mut scalar_arena,
-        )
-        .map_err(SqlCompileError::Compilation)?;
+            &control,
+        )?;
         let mut statistics = collect_statistics(request.statistics, &mut optimizer_expr)?;
         control.check()?;
         let (mv_rewrite, factory) = mv_rewrite::attach_candidate_statistics(
@@ -1244,7 +1802,13 @@ impl SqlCompiler {
         let mv_rewrite::SqlMvRewritePreparation {
             candidates: mv_candidates,
             diagnostics: mv_rewrite_diagnostics,
+            constant_policy: mv_constant_policy,
         } = mv_rewrite;
+        if mv_constant_policy != constant_policy {
+            return Err(SqlCompileError::InvalidRequest(
+                "MV constant policy differs from its analyzed request".into(),
+            ));
+        }
         control.check()?;
         let root_distribution = match &intent {
             SqlCompileIntent::IcebergWrite { root_distribution } => {
@@ -1263,7 +1827,10 @@ impl SqlCompiler {
                     &settings,
                     constant_evaluator,
                     Arc::clone(&function_catalog),
-                ),
+                    decimal_overflow_policy,
+                    &control,
+                )
+                .with_fold_dependency_observer(control.fold_dependency_observer().cloned()),
             ),
             None => crate::optimizer::optimize(
                 optimizer_expr,
@@ -1275,16 +1842,19 @@ impl SqlCompiler {
                     &settings,
                     constant_evaluator,
                     Arc::clone(&function_catalog),
-                ),
+                    decimal_overflow_policy,
+                    &control,
+                )
+                .with_fold_dependency_observer(control.fold_dependency_observer().cloned()),
             ),
-        }
-        .map_err(SqlCompileError::Compilation)?;
+        }?;
         control.check()?;
 
         root_semantics
             .domains(&optimized_tree.output_columns)
             .map_err(SqlCompileError::Compilation)?;
         Ok(SqlCompileOutput::optimized(SqlOptimizedOutput {
+            root_allow_throw_exception,
             root_semantics,
             optimized_tree,
             function_catalog,
@@ -1497,6 +2067,7 @@ mod tests {
             &self,
             _name: &str,
             _arg_types: &[arrow::datatypes::DataType],
+            _control: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<crate::functions::ResolvedScalarFunction, crate::functions::ResolveError>
         {
             Err(crate::functions::ResolveError::UnknownFunction)
@@ -1510,6 +2081,7 @@ mod tests {
             &self,
             _name: &str,
             _arg_types: &[arrow::datatypes::DataType],
+            _control: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<novarocks_functions::ResolvedAggregateSignature, crate::functions::ResolveError>
         {
             Err(crate::functions::ResolveError::UnknownFunction)
@@ -1519,6 +2091,7 @@ mod tests {
             &self,
             _name: &str,
             _arg_types: &[arrow::datatypes::DataType],
+            _control: &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<novarocks_functions::ResolvedAggregateSignature, crate::functions::ResolveError>
         {
             Err(crate::functions::ResolveError::UnknownFunction)
@@ -1610,6 +2183,58 @@ mod tests {
         )
     }
 
+    #[test]
+    fn sql_request_control_is_the_pure_control_observation() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        let cancellation = Arc::new(Cancellation::default());
+        let request_control = control(None, &cancellation);
+        for units in [0, 256] {
+            request_control
+                .checkpoint(CompilePhase::FunctionSpecialization, units)
+                .unwrap();
+        }
+        cancellation.request();
+        assert_eq!(
+            request_control.checkpoint(CompilePhase::Validate, 256),
+            Err(CompileControlError::Cancelled)
+        );
+        assert_eq!(request_control.check(), Err(SqlCompileError::Cancelled));
+        let active = Arc::new(Cancellation::default());
+        let expired = control(Some(Instant::now() - Duration::from_secs(1)), &active);
+        assert_eq!(
+            expired.checkpoint(CompilePhase::Validate, 0),
+            Err(CompileControlError::DeadlineExceeded)
+        );
+        assert_eq!(expired.check(), Err(SqlCompileError::DeadlineExceeded));
+    }
+
+    #[test]
+    fn analyzer_control_keeps_all_outer_categories_and_semantic_errors() {
+        use novarocks_type_contract::CompileControlError;
+        for (cause, expected) in [
+            (CompileControlError::Cancelled, SqlCompileError::Cancelled),
+            (
+                CompileControlError::DeadlineExceeded,
+                SqlCompileError::DeadlineExceeded,
+            ),
+            (
+                CompileControlError::ResourceExhausted,
+                SqlCompileError::ResourceExhausted,
+            ),
+        ] {
+            let error = AnalyzeError::control(cause);
+            assert_eq!(error.control_error(), Some(cause));
+            assert!(error.span().is_none());
+            assert_eq!(SqlCompileError::from(error), expected);
+        }
+        let error = AnalyzeError::internal("ordinary analysis invariant");
+        assert_eq!(error.control_error(), None);
+        assert_eq!(
+            SqlCompileError::from(error.clone()),
+            SqlCompileError::Analyze(error)
+        );
+    }
+
     fn request(control: SqlCompileControl) -> SqlAnalyzeRequest<'static> {
         SqlAnalyzeRequest::new(
             SqlStatementInput::sql("select 1"),
@@ -1625,6 +2250,8 @@ mod tests {
             &FUNCTIONS,
             noop_constant_evaluator(),
             None,
+            crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control,
         )
     }
@@ -1655,6 +2282,8 @@ mod tests {
             &FUNCTIONS,
             noop_constant_evaluator(),
             None,
+            crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control,
         )
     }
@@ -1939,8 +2568,12 @@ mod tests {
         };
         let output = analyze_then_optimize(request).expect("compile ordinary EXPLAIN");
         assert!(output.is_optimized());
-        let _: fn(SqlCompileOutput, ExplainLevel, bool) -> Result<Vec<String>, SqlCompileError> =
-            SqlCompileOutput::into_explain_lines;
+        let _: fn(
+            SqlCompileOutput,
+            ExplainLevel,
+            bool,
+            &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<Vec<String>, SqlCompileError> = SqlCompileOutput::into_explain_lines;
     }
 
     #[test]
@@ -1961,6 +2594,8 @@ mod tests {
             &CATALOG,
             &FUNCTIONS,
             noop_constant_evaluator(),
+            crate::constant::test_constant_policy(),
+            SqlPhysicalEmissionMode::OriginalNativeV1,
             control(None, &cancellation),
         );
 
@@ -1988,19 +2623,22 @@ mod tests {
         let catalog = SqlPlannerTableSnapshot::new(&catalog);
         let functions = crate::functions::build_builtin_engine_function_catalog().unwrap();
         let error = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
+            emission_mode: SqlPhysicalEmissionMode::OriginalNativeV1,
+            constant_policy: crate::constant::test_constant_policy(),
             query: mv_analysis_query(
                 "SELECT /*+ SET_VAR(sql_mode='GROUP_CONCAT_LEGACY') */ k FROM missing_table",
             ),
             current_database: "db".to_string(),
             catalog: &catalog,
             functions: &functions,
+            control: SqlCompileControl::unbounded(),
         })
         .err()
         .expect("unsupported persisted semantics");
-        assert!(error.starts_with("Unsupported:"));
-        assert!(error.contains("GROUP_CONCAT_LEGACY"));
+        assert!(error.to_string().starts_with("Unsupported:"));
+        assert!(error.to_string().contains("GROUP_CONCAT_LEGACY"));
         assert!(
-            !error.contains("missing_table"),
+            !error.to_string().contains("missing_table"),
             "guard precedes analyzer table materialization"
         );
     }
@@ -2034,10 +2672,13 @@ mod tests {
         let functions = crate::functions::build_builtin_engine_function_catalog()
             .expect("builtin function catalog");
         let input = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
+            emission_mode: SqlPhysicalEmissionMode::OriginalNativeV1,
+            constant_policy: crate::constant::test_constant_policy(),
             query: mv_analysis_query("SELECT order_id FROM orders"),
             current_database: "db".to_string(),
             catalog: &catalog,
             functions: &functions,
+            control: SqlCompileControl::unbounded(),
         })
         .expect("analyze MV query through opaque terminal");
 
@@ -2046,7 +2687,8 @@ mod tests {
         assert_eq!(facts.output_columns[0].name, "order_id");
         let _: fn(
             SqlMvRefreshAnalysisContext<'_>,
-        ) -> Result<crate::planning::mv::SqlResolvedMvRefreshInput, String> =
+        )
+            -> Result<crate::planning::mv::SqlResolvedMvRefreshInput, SqlCompileError> =
             analyze_mv_refresh_input;
     }
 
@@ -2060,14 +2702,17 @@ mod tests {
         let functions = crate::functions::build_builtin_engine_function_catalog()
             .expect("builtin function catalog");
         let error = analyze_mv_refresh_input(SqlMvRefreshAnalysisContext {
+            emission_mode: SqlPhysicalEmissionMode::OriginalNativeV1,
+            constant_policy: crate::constant::test_constant_policy(),
             query: mv_analysis_query("SELECT order_id FROM missing_orders"),
             current_database: "db".to_string(),
             catalog: &catalog,
             functions: &functions,
+            control: SqlCompileControl::unbounded(),
         })
         .expect_err("unregistered MV table must not analyze");
         assert!(
-            error.contains("missing_orders"),
+            error.to_string().contains("missing_orders"),
             "missing-table error must retain SQL analyzer context: {error}"
         );
     }
@@ -2099,6 +2744,8 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog(),
                 noop_constant_evaluator(),
                 None,
+                crate::constant::test_constant_policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 control(None, &cancellation),
             );
             let optimized = analyze_then_optimize(request)
@@ -2116,11 +2763,16 @@ mod tests {
                     max: 8,
                     requires_power_of_two: true,
                 },
+                optimized.function_catalog,
+                optimized.root_allow_throw_exception,
+                crate::constant::test_constant_policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap()
-            .finish()
+            .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
             .unwrap();
-            let result = plan.result_port().unwrap();
+            let result = plan.plan().result_port().unwrap();
             assert_eq!(result.fields.len(), 2);
             let DataType::List(json_item) = &result.fields[0].ty.data_type else {
                 panic!("expected JSON List");
@@ -2142,7 +2794,7 @@ mod tests {
                     .is_json_value()
             );
             let mut aggregate_count = 0;
-            for fragment in plan.fragments().values() {
+            for fragment in plan.plan().fragments().values() {
                 for node in fragment.nodes().values() {
                     if let novarocks_physical_plan::NodeKind::Aggregate { calls, .. } = &node.kind {
                         for call in calls {
@@ -2155,7 +2807,15 @@ mod tests {
                             else {
                                 panic!("expected physical aggregate List");
                             };
-                            assert_eq!(logical_type_of_field(item), None);
+                            let novarocks_functions::FunctionArgumentType::Value(input) =
+                                &call.binding.function.argument_types[0]
+                            else {
+                                panic!("aggregate input must be a value");
+                            };
+                            let expected = (input.logical_type
+                                == novarocks_type_contract::ValueLogicalType::Json)
+                                .then_some(LogicalType::Json);
+                            assert_eq!(logical_type_of_field(item), expected);
                             let DataType::List(item) = &call.binding.intermediate_type.data_type
                             else {
                                 panic!("expected physical state List");
@@ -2190,6 +2850,8 @@ mod tests {
             crate::functions::builtin_sql_function_catalog(),
             noop_constant_evaluator(),
             None,
+            crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control(None, &cancellation),
         );
 
@@ -2219,6 +2881,8 @@ mod tests {
             crate::functions::builtin_sql_function_catalog(),
             noop_constant_evaluator(),
             None,
+            crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control(None, &cancellation),
         );
 
@@ -2267,6 +2931,8 @@ mod tests {
             crate::functions::builtin_sql_function_catalog(),
             noop_constant_evaluator(),
             None,
+            crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control(None, &cancellation),
         );
         assert!(matches!(
@@ -2296,6 +2962,8 @@ mod tests {
             crate::functions::builtin_sql_function_catalog(),
             noop_constant_evaluator(),
             None,
+            crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control(None, &cancellation),
         );
         let optimized = analyze_then_optimize(request)
@@ -2484,6 +3152,8 @@ mod tests {
             crate::functions::builtin_sql_function_catalog(),
             noop_constant_evaluator(),
             None,
+            crate::constant::test_constant_policy(),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             SqlCompileControl::unbounded(),
         );
         let optimized = analyze_then_optimize(request)
@@ -2497,11 +3167,14 @@ mod tests {
         let ExprKind::FunctionCall { args, binding, .. } = &field.kind else {
             unreachable!()
         };
-        assert!(args.iter().all(|arg| arg.data_type == DataType::Float64));
+        assert!(
+            args.iter()
+                .all(|arg| arg.value_type.data_type == DataType::Float64)
+        );
         assert!(binding.selected.argument_types.iter().all(|arg| matches!(arg,
             novarocks_functions::FunctionArgumentType::Value(value) if value.data_type == DataType::Float64)));
-        assert_eq!(field.data_type, DataType::Int32);
-        assert!(!field.nullable);
+        assert_eq!(field.value_type.data_type, DataType::Int32);
+        assert!(!field.value_type.nullable);
     }
 
     #[test]
@@ -2542,6 +3215,8 @@ mod tests {
                 crate::functions::builtin_sql_function_catalog(),
                 noop_constant_evaluator(),
                 None,
+                crate::constant::test_constant_policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
                 control(None, &cancellation),
             );
             let optimized = analyze_then_optimize(request)
@@ -2559,11 +3234,16 @@ mod tests {
                     max: 8,
                     requires_power_of_two: true,
                 },
+                optimized.function_catalog,
+                optimized.root_allow_throw_exception,
+                crate::constant::test_constant_policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap()
-            .finish()
+            .finish_observed(&crate::compiler::SqlCompileControl::unbounded())
             .unwrap();
-            let result = plan.result_port().unwrap();
+            let result = plan.plan().result_port().unwrap();
             assert_eq!(result.fields.len(), 1);
             assert_eq!(result.fields[0].ty.data_type, expected);
             assert!(result.fields[0].ty.nullable);
@@ -2571,11 +3251,223 @@ mod tests {
     }
 
     #[test]
+    fn noop_constant_evaluator_observes_request_entry_and_decline_completion() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Owner {
+            checks: std::sync::Mutex<Vec<u32>>,
+            failure: Option<(usize, CompileControlError)>,
+        }
+        impl PureCompileControl for Owner {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                assert_eq!(phase, CompilePhase::FunctionSpecialization);
+                let mut checks = self.checks.lock().unwrap();
+                checks.push(units);
+                if let Some((at, error)) = self.failure
+                    && checks.len() == at
+                {
+                    return Err(error);
+                }
+                Ok(())
+            }
+        }
+        let request = FoldRequest {
+            constant_policy: crate::constant::test_constant_policy(),
+            kind: FoldNodeKind::Function {
+                name: "fixture/no-op".into(),
+            },
+            args: Vec::new(),
+            result_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                true,
+            ),
+        };
+        let owner = Owner {
+            checks: Default::default(),
+            failure: None,
+        };
+        assert!(
+            noop_constant_evaluator()
+                .eval_scalar(&request, &owner)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(*owner.checks.lock().unwrap(), [0, 0]);
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for at in [1, 2] {
+                let owner = Owner {
+                    checks: Default::default(),
+                    failure: Some((at, error)),
+                };
+                assert!(
+                    matches!(noop_constant_evaluator().eval_scalar(&request, &owner), Err(SqlConstantEvaluationError::Control(actual)) if actual == error)
+                );
+                assert_eq!(owner.checks.lock().unwrap().len(), at);
+            }
+        }
+    }
+
+    #[test]
+    fn analyzed_root_policy_keeps_admitted_hint_across_optimize_handoff() {
+        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+        for (session, sql, expected) in [
+            ("32", "SELECT 1", OutputNull),
+            (
+                "32",
+                "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1",
+                ReportError,
+            ),
+            (
+                "ERROR_IF_OVERFLOW",
+                "SELECT /*+ SET_VAR(sql_mode=32) */ 1",
+                OutputNull,
+            ),
+            ("ERROR_IF_OVERFLOW", "SELECT 1", ReportError),
+            (
+                "32",
+                "SELECT x FROM (SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1 AS x) s",
+                OutputNull,
+            ),
+        ] {
+            let cancellation = Arc::new(Cancellation::default());
+            let mut input = request(control(None, &cancellation));
+            input.statement = SqlStatementInput::sql(sql);
+            input.session.sql_semantics = input
+                .session
+                .sql_semantics
+                .clone()
+                .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session));
+            let analyzed = SqlCompiler::analyze(input).unwrap().into_pending().unwrap();
+            assert_eq!(analyzed.decimal_overflow_policy(), expected);
+            let statistics = crate::planning::dml::DmlStatisticsSnapshot::default();
+            let optimize =
+                SqlOptimizeRequest::new(analyzed, &statistics, control(None, &cancellation));
+            assert_eq!(optimize.decimal_overflow_policy(), expected);
+        }
+    }
+
+    #[test]
+    fn analyzed_root_allow_mode_survives_optimization_independently_of_decimal_policy() {
+        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+        for (session_mode, sql, expected_allow, expected_policy) in [
+            ("32", "SELECT 1", false, OutputNull),
+            ("ALLOW_THROW_EXCEPTION", "SELECT 1", true, OutputNull),
+            ("ERROR_IF_OVERFLOW", "SELECT 1", false, ReportError),
+            (
+                "ALLOW_THROW_EXCEPTION,ERROR_IF_OVERFLOW",
+                "SELECT 1",
+                true,
+                ReportError,
+            ),
+            (
+                "ERROR_IF_OVERFLOW",
+                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ 1",
+                true,
+                OutputNull,
+            ),
+            (
+                "ALLOW_THROW_EXCEPTION",
+                "SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ 1",
+                false,
+                ReportError,
+            ),
+        ] {
+            let cancellation = Arc::new(Cancellation::default());
+            let request_control = control(None, &cancellation);
+            let mut input = request(request_control.clone());
+            input.statement = SqlStatementInput::sql(sql);
+            input.session.sql_semantics = input
+                .session
+                .sql_semantics
+                .clone()
+                .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode));
+            let analyzed = SqlCompiler::analyze(input).unwrap().into_pending().unwrap();
+            assert_eq!(analyzed.root_allow_throw_exception(), expected_allow);
+            assert_eq!(analyzed.decimal_overflow_policy(), expected_policy);
+            let optimize = SqlOptimizeRequest::new(analyzed, &STATISTICS, request_control);
+            assert_eq!(optimize.root_allow_throw_exception(), expected_allow);
+            assert_eq!(optimize.decimal_overflow_policy(), expected_policy);
+            let optimized = SqlCompiler::optimize(optimize)
+                .unwrap()
+                .into_optimized_output()
+                .unwrap();
+            assert_eq!(optimized.root_allow_throw_exception, expected_allow);
+        }
+    }
+
+    #[test]
+    fn nested_decimal_policy_does_not_replace_the_admitted_root_allow_mode() {
+        use crate::analysis::ExprKind;
+        use crate::planner::logical::{LogicalPlanKind, LogicalPlanNode};
+        use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
+        fn cast_policies(
+            node: &LogicalPlanNode,
+            out: &mut Vec<novarocks_type_contract::DecimalOverflowPolicy>,
+        ) {
+            if let LogicalPlanKind::Project(project) = &node.kind {
+                for item in &project.items {
+                    if let ExprKind::Cast {
+                        decimal_overflow_policy,
+                        ..
+                    } = &item.expr.kind
+                    {
+                        out.push(*decimal_overflow_policy);
+                    }
+                }
+            }
+            for child in &node.children {
+                cast_policies(child, out);
+            }
+        }
+        let cancellation = Arc::new(Cancellation::default());
+        let request_control = control(None, &cancellation);
+        let mut input = request(request_control.clone());
+        input.statement = SqlStatementInput::sql(
+            "SELECT x FROM (SELECT /*+ SET_VAR(sql_mode='ERROR_IF_OVERFLOW') */ CAST(1 AS DECIMAL(18,6)) AS x) s",
+        );
+        input.session.sql_semantics = input.session.sql_semantics.clone().with_sql_mode(
+            crate::sql_mode::SqlMode::from_assignment("ALLOW_THROW_EXCEPTION"),
+        );
+        let analyzed = SqlCompiler::analyze(input).unwrap().into_pending().unwrap();
+        assert!(analyzed.root_allow_throw_exception());
+        assert_eq!(analyzed.decimal_overflow_policy(), OutputNull);
+        let mut policies = Vec::new();
+        cast_policies(&analyzed.logical_plan, &mut policies);
+        assert_eq!(policies, [ReportError]);
+        let optimized = SqlCompiler::optimize(SqlOptimizeRequest::new(
+            analyzed,
+            &STATISTICS,
+            request_control,
+        ))
+        .unwrap()
+        .into_optimized_output()
+        .unwrap();
+        assert!(optimized.root_allow_throw_exception);
+    }
+
+    #[test]
     fn analyzed_root_allow_mode_freezes_only_the_numeric_fold_eligibility() {
         struct NullableEvaluator;
         impl SqlConstantEvaluator for NullableEvaluator {
-            fn eval_scalar(&self, _: &FoldRequest) -> Result<Option<LiteralValue>, String> {
-                Ok(Some(LiteralValue::Null))
+            fn eval_scalar(
+                &self,
+                request: &FoldRequest,
+                control: &dyn novarocks_type_contract::PureCompileControl,
+            ) -> Result<Option<novarocks_functions::ConstantValue>, SqlConstantEvaluationError>
+            {
+                Ok(Some(crate::constant::admit_syntax_constant(
+                    &LiteralValue::Null,
+                    &request.result_type,
+                    request.constant_policy,
+                    control,
+                )?))
             }
         }
         static EVALUATOR: NullableEvaluator = NullableEvaluator;
@@ -2598,7 +3490,8 @@ mod tests {
             ),
         ] {
             let cancellation = Arc::new(Cancellation::default());
-            let mut input = request(control(None, &cancellation));
+            let request_control = control(None, &cancellation);
+            let mut input = request(request_control.clone());
             input.statement = SqlStatementInput::sql(sql);
             input.constant_evaluator = Some(&EVALUATOR);
             input.session.sql_semantics = input
@@ -2607,17 +3500,24 @@ mod tests {
                 .clone()
                 .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode));
             let pending = SqlCompiler::analyze(input).unwrap().into_pending().unwrap();
+            assert_eq!(pending.root_allow_throw_exception(), disabled);
             let result = pending
                 .constant_evaluator
                 .unwrap()
-                .eval_scalar(&FoldRequest {
-                    kind: FoldNodeKind::Cast(
-                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    ),
-                    args: Vec::new(),
-                    out_type: arrow::datatypes::DataType::Decimal128(3, 0),
-                    out_nullable: true,
-                })
+                .eval_scalar(
+                    &FoldRequest {
+                        constant_policy: crate::constant::test_constant_policy(),
+                        kind: FoldNodeKind::Cast(
+                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                        ),
+                        args: Vec::new(),
+                        result_type: novarocks_type_contract::FunctionValueType::new(
+                            arrow::datatypes::DataType::Decimal128(3, 0),
+                            true,
+                        ),
+                    },
+                    &request_control,
+                )
                 .unwrap();
             assert_eq!(result.is_none(), disabled);
         }
@@ -2631,5 +3531,29 @@ pub(crate) mod root_output;
 mod root_render_type;
 mod root_scalar_type;
 pub use completion::*;
-pub use root_render_type::client_render_schema;
+pub use root_render_type::{client_render_schema, client_render_schema_from_port};
 pub(crate) mod mv_rewrite;
+
+impl From<&str> for SqlCompileError {
+    fn from(error: &str) -> Self {
+        Self::Compilation(error.into())
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub use crate::planner::distributed::build::state_source_fixture::ordinary_union_source as ordinary_union_source_for_test;
+
+#[cfg(feature = "test-support")]
+pub use crate::planner::distributed::build::state_author_fixture::{
+    OrdinaryStateObservation, ordinary_state_observe_for_test,
+};
+#[cfg(feature = "test-support")]
+pub use crate::planner::distributed::build::writer_state_fixture::{
+    WriterStateSourceObservation, writer_state_observe_for_test, writer_state_source_for_test,
+};
+
+#[cfg(feature = "test-support")]
+pub use crate::planner::distributed::build::state_source_fixture::ordinary_extrema_constant_state_source_for_test;
+
+#[cfg(feature = "test-support")]
+pub use crate::planner::distributed::build::state_source_fixture::ordered_array_state_source_for_test;

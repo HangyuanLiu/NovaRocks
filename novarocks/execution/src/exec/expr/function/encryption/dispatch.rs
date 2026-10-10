@@ -73,24 +73,7 @@ pub fn eval_encryption_function(
     }
 }
 
-static ENCRYPTION_FUNCTIONS: &[(&str, &str)] = &[
-    ("aes_decrypt", "aes_decrypt"),
-    ("aes_encrypt", "aes_encrypt"),
-    ("encode_fingerprint_sha256", "encode_fingerprint_sha256"),
-    ("encode_row_id", "encode_fingerprint_sha256"),
-    ("encode_sort_key", "encode_sort_key"),
-    ("base64_decode_binary", "from_base64"),
-    ("base64_decode_string", "from_base64"),
-    ("from_base64", "from_base64"),
-    ("from_binary", "from_binary"),
-    ("md5", "md5"),
-    ("md5sum", "md5sum"),
-    ("md5sum_numeric", "md5sum_numeric"),
-    ("sha2", "sha2"),
-    ("sm3", "sm3"),
-    ("to_base64", "to_base64"),
-    ("to_binary", "to_binary"),
-];
+use novarocks_type_contract::NATIVE_V1_ENCRYPTION_FUNCTIONS as ENCRYPTION_FUNCTIONS;
 
 static ENCRYPTION_METADATA: &[FunctionMeta] = &[
     FunctionMeta {

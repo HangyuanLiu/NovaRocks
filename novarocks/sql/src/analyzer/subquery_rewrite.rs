@@ -60,8 +60,7 @@ fn take_from_or_synthesize_single_row(
         let output_column_id = scope.factory().borrow_mut().create(
             Some("generate_series".to_string()),
             column_name.clone(),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         );
         Relation::GenerateSeries(GenerateSeriesRelation {
             start: 1,
@@ -77,23 +76,21 @@ fn take_from_or_synthesize_single_row(
 fn bool_literal(value: bool) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Bool(value)),
-        data_type: DataType::Boolean,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     }
 }
 
 fn null_bool_literal() -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Null),
-        data_type: DataType::Boolean,
-        nullable: true,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
     }
 }
 
 fn is_null_expr(expr: TypedExpr, negated: bool) -> TypedExpr {
     TypedExpr {
-        data_type: DataType::Boolean,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
         kind: ExprKind::IsNull {
             expr: Box::new(expr),
             negated,
@@ -113,8 +110,8 @@ fn value_form_marker_query(
     let marker_output = OutputColumn {
         column_id: marker_col_id,
         name: marker_col_name.clone(),
-        data_type: marker_dtype.clone(),
-        nullable: true,
+        value_type: novarocks_type_contract::FunctionValueType::new(marker_dtype.clone(), true),
+
         is_internal: false,
     };
     let source_outputs = source.output_columns.clone();
@@ -134,15 +131,19 @@ fn value_form_marker_query(
                         name: "max".to_string(),
                         args: vec![TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Int(1)),
-                            data_type: marker_dtype.clone(),
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                marker_dtype.clone(),
+                                false,
+                            ),
                         }],
                         distinct: false,
                         order_by: vec![],
                         resolved,
                     },
-                    data_type: marker_dtype.clone(),
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        marker_dtype.clone(),
+                        true,
+                    ),
                 },
                 output_name: marker_col_name.clone(),
                 output_column_id: marker_col_id,
@@ -193,8 +194,7 @@ fn value_form_null_marker_query(
                 qualifier: Some(source_alias.clone()),
                 column: source_col.name.clone(),
             },
-            data_type: source_col.data_type.clone(),
-            nullable: source_col.nullable,
+            value_type: source_col.value_type.clone(),
         },
         false,
     );
@@ -228,6 +228,7 @@ impl<'a> AnalyzerContext<'a> {
         }
 
         for sq_info in subqueries {
+            self.check_control()?;
             // Subqueries can appear in three locations:
             //   1. WHERE / HAVING / projection clauses that can be represented
             //      as Apply specs.
@@ -355,13 +356,19 @@ impl<'a> AnalyzerContext<'a> {
         //    for non-matching rows).
         let inner_out = &resolved_sub.output_columns[0];
         let output_name = format!("__scalar_sq_{}", sq_info.id);
-        let output_id =
-            self.alloc_column_id(None, output_name.clone(), inner_out.data_type.clone(), true);
+        let output_id = self.alloc_column_id(
+            None,
+            output_name.clone(),
+            super::helpers::with_nullability(inner_out.value_type.clone(), true),
+        );
         let output_column = OutputColumn {
             column_id: output_id,
             name: output_name.clone(),
-            data_type: inner_out.data_type.clone(),
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType {
+                nullable: true,
+                ..inner_out.value_type.clone()
+            },
+
             is_internal: true,
         };
 
@@ -375,8 +382,10 @@ impl<'a> AnalyzerContext<'a> {
                 qualifier: None,
                 column: output_name.clone(),
             },
-            data_type: inner_out.data_type.clone(),
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType {
+                nullable: true,
+                ..inner_out.value_type.clone()
+            },
         };
         Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &replacement);
         Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &replacement);
@@ -469,8 +478,8 @@ impl<'a> AnalyzerContext<'a> {
                 let lhs = self.analyze_expr(in_expr, scope)?;
                 let inner_col = &resolved_sub.output_columns[0];
                 if let Some(reason) = super::resolve_expr::incompatible_complex_compare_pub(
-                    &lhs.data_type,
-                    &inner_col.data_type,
+                    &lhs.value_type.data_type,
+                    &inner_col.value_type.data_type,
                 ) {
                     let op_sym = match &sq_info.kind {
                         SubqueryKind::InSubquery { negated: true } => "NOT IN",
@@ -500,12 +509,16 @@ impl<'a> AnalyzerContext<'a> {
         }
 
         let output_name = format!("__pred_sq_{}", sq_info.id);
-        let output_id = self.alloc_column_id(None, output_name.clone(), DataType::Boolean, false);
+        let output_id = self.alloc_column_id(
+            None,
+            output_name.clone(),
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+        );
         let output_column = OutputColumn {
             column_id: output_id,
             name: output_name,
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             is_internal: true,
         };
 
@@ -556,19 +569,20 @@ impl<'a> AnalyzerContext<'a> {
         let marker_col_id = self.alloc_column_id(
             Some(relation_alias.clone()),
             marker_col_name.clone(),
-            DataType::Int32,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
         );
         let marker_argument = TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(1)),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         };
         let resolved = super::resolve_expr::resolve_aggregate_function_call(
             self.function_catalog,
             "max",
             std::slice::from_ref(&marker_argument),
             novarocks_parser::Span::new(0, 0),
+            self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
+            self.control,
         )?;
         let marker_query = match null_source_col {
             Some(source_col) => value_form_null_marker_query(
@@ -591,8 +605,7 @@ impl<'a> AnalyzerContext<'a> {
             Some(&relation_alias),
             &marker_col_name,
             marker_col_id,
-            DataType::Int32,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
         );
         let exists = is_null_expr(
             TypedExpr {
@@ -601,8 +614,7 @@ impl<'a> AnalyzerContext<'a> {
                     qualifier: Some(relation_alias.clone()),
                     column: marker_col_name.clone(),
                 },
-                data_type: DataType::Int32,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
             },
             true,
         );
@@ -612,8 +624,8 @@ impl<'a> AnalyzerContext<'a> {
             output_columns: vec![OutputColumn {
                 column_id: marker_col_id,
                 name: marker_col_name,
-                data_type: DataType::Int32,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+
                 is_internal: false,
             }],
         };
@@ -783,8 +795,8 @@ impl<'a> AnalyzerContext<'a> {
 
         // Build the equality condition plus the lifted WHERE.
         let eq_cond = TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(lhs_typed.clone()),
                 op: BinOp::Eq,
@@ -794,16 +806,18 @@ impl<'a> AnalyzerContext<'a> {
                         qualifier: None,
                         column: sub_first_col.name.clone(),
                     },
-                    data_type: sub_first_col.data_type.clone(),
-                    nullable: sub_first_col.nullable,
+                    value_type: sub_first_col.value_type.clone(),
                 }),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         };
         let join_cond = match sub_filter.clone() {
             Some(f) => Some(TypedExpr {
-                data_type: DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    false,
+                ),
+
                 kind: ExprKind::BinaryOp {
                     left: Box::new(eq_cond),
                     op: BinOp::And,
@@ -827,8 +841,8 @@ impl<'a> AnalyzerContext<'a> {
         // The placeholder evaluates by checking the subquery's first column
         // (now exposed on the auxiliary join's output via LEFT OUTER JOIN).
         let replacement = TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::IsNull {
                 expr: Box::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
@@ -836,8 +850,10 @@ impl<'a> AnalyzerContext<'a> {
                         qualifier: None,
                         column: sub_first_col.name.clone(),
                     },
-                    data_type: sub_first_col.data_type.clone(),
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType {
+                        nullable: true,
+                        ..sub_first_col.value_type.clone()
+                    },
                 }),
                 negated: !negated,
             },
@@ -859,7 +875,7 @@ impl<'a> AnalyzerContext<'a> {
     fn rewrite_join_on_exists_correlated(
         &self,
         join: &mut JoinRelation,
-        _scope: &mut AnalyzerScope,
+        scope: &mut AnalyzerScope,
         sq_info: &SubqueryInfo,
         resolved_sub: ResolvedQuery,
         sq_alias: String,
@@ -896,7 +912,7 @@ impl<'a> AnalyzerContext<'a> {
         // column IS in the plan (it is attached via `attach_aux_join`) and its
         // value is non-NULL whenever the correlated subquery matches a row,
         // which is exactly the semantics we need for the EXISTS IS NOT NULL check.
-        let indicator = relation_first_output_column(&sub_rel).ok_or_else(|| {
+        let indicator = relation_first_output_column(&sub_rel, scope).ok_or_else(|| {
             AnalyzeError::internal(
                 "correlated EXISTS subquery: FROM relation has no output column for indicator",
             )
@@ -909,8 +925,8 @@ impl<'a> AnalyzerContext<'a> {
         attach_aux_join(join, side, sub_rel, sub_filter);
 
         let replacement = TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::IsNull {
                 expr: Box::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
@@ -918,8 +934,10 @@ impl<'a> AnalyzerContext<'a> {
                         qualifier: None,
                         column: indicator.name.clone(),
                     },
-                    data_type: indicator.data_type.clone(),
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType {
+                        nullable: true,
+                        ..indicator.value_type.clone()
+                    },
                 }),
                 negated: !negated,
             },
@@ -1002,8 +1020,7 @@ impl<'a> AnalyzerContext<'a> {
             Some(&sq_alias),
             &scalar_output.name,
             scalar_output.column_id,
-            scalar_output.data_type.clone(),
-            true,
+            super::helpers::with_nullability(scalar_output.value_type.clone(), true),
         );
 
         let side = choose_aux_join_side(join, &outer_corr_exprs);
@@ -1015,8 +1032,7 @@ impl<'a> AnalyzerContext<'a> {
                 qualifier: Some(sq_alias),
                 column: scalar_output.name,
             },
-            data_type: scalar_output.data_type,
-            nullable: true,
+            value_type: super::helpers::with_nullability(scalar_output.value_type, true),
         };
         if let Some(cond) = join.condition.as_ref() {
             join.condition = Some(replace_placeholder_in_expr(cond, sq_info.id, &replacement));
@@ -1064,16 +1080,17 @@ impl<'a> AnalyzerContext<'a> {
         let match_col_id = self.alloc_column_id(
             Some(sq_alias.clone()),
             match_col.clone(),
-            indicator_dtype.clone(),
-            true,
+            novarocks_type_contract::FunctionValueType::new(indicator_dtype.clone(), true),
         );
         if let QueryBody::Select(ref mut sel) = modified_sub.body {
             sel.distinct = true;
             sel.projection.push(ProjectItem {
                 expr: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(1)),
-                    data_type: indicator_dtype.clone(),
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        indicator_dtype.clone(),
+                        false,
+                    ),
                 },
                 output_name: match_col.clone(),
                 output_column_id: match_col_id,
@@ -1082,8 +1099,11 @@ impl<'a> AnalyzerContext<'a> {
         modified_sub.output_columns.push(OutputColumn {
             column_id: match_col_id,
             name: match_col.clone(),
-            data_type: indicator_dtype.clone(),
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                indicator_dtype.clone(),
+                true,
+            ),
+
             is_internal: false,
         });
         let output_columns = modified_sub.output_columns.clone();
@@ -1099,17 +1119,15 @@ impl<'a> AnalyzerContext<'a> {
             Some(&sq_alias),
             &sub_col.name,
             sub_col.column_id,
-            sub_col.data_type.clone(),
-            true,
+            super::helpers::with_nullability(sub_col.value_type.clone(), true),
         );
         scope.add_column_with_id(
             Some(&sq_alias),
             &match_col,
             match_col_id,
-            indicator_dtype.clone(),
-            true,
+            novarocks_type_contract::FunctionValueType::new(indicator_dtype.clone(), true),
         );
-        let null_marker = if sub_col.nullable {
+        let null_marker = if sub_col.value_type.nullable {
             Some(self.build_value_form_marker_relation(
                 scope,
                 source_sub.clone(),
@@ -1121,7 +1139,7 @@ impl<'a> AnalyzerContext<'a> {
         } else {
             None
         };
-        let nonempty_marker = if lhs_typed.nullable {
+        let nonempty_marker = if lhs_typed.value_type.nullable {
             Some(self.build_value_form_marker_relation(
                 scope,
                 source_sub,
@@ -1135,8 +1153,8 @@ impl<'a> AnalyzerContext<'a> {
         };
 
         let eq_cond = TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(lhs_typed.clone()),
                 op: BinOp::Eq,
@@ -1146,8 +1164,10 @@ impl<'a> AnalyzerContext<'a> {
                         qualifier: Some(sq_alias.clone()),
                         column: sub_col.name.clone(),
                     },
-                    data_type: sub_col.data_type.clone(),
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType {
+                        nullable: true,
+                        ..sub_col.value_type.clone()
+                    },
                 }),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
@@ -1171,8 +1191,7 @@ impl<'a> AnalyzerContext<'a> {
                     qualifier: Some(sq_alias),
                     column: match_col,
                 },
-                data_type: indicator_dtype,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(indicator_dtype, true),
             },
             true,
         );
@@ -1181,11 +1200,14 @@ impl<'a> AnalyzerContext<'a> {
         let nullable_result = null_exists.is_some() || nonempty_exists.is_some();
         let mut when_then = Vec::new();
         when_then.push((match_exists, bool_literal(!negated)));
-        if lhs_typed.nullable {
+        if lhs_typed.value_type.nullable {
             let lhs_null_unknown = match nonempty_exists {
                 Some(any_exists) => TypedExpr {
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
+
                     kind: ExprKind::BinaryOp {
                         left: Box::new(is_null_expr(lhs_typed.clone(), false)),
                         op: BinOp::And,
@@ -1202,8 +1224,11 @@ impl<'a> AnalyzerContext<'a> {
             when_then.push((null_exists, null_bool_literal()));
         }
         let replacement = TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: nullable_result,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::Boolean,
+                nullable_result,
+            ),
+
             kind: ExprKind::Case {
                 operand: None,
                 when_then,
@@ -1233,8 +1258,7 @@ impl<'a> AnalyzerContext<'a> {
         let exists_col_id = self.alloc_column_id(
             Some(sq_alias.clone()),
             match_col.clone(),
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         if let QueryBody::Select(ref mut sel) = modified_sub.body {
             sel.distinct = false;
@@ -1242,8 +1266,10 @@ impl<'a> AnalyzerContext<'a> {
             sel.projection.push(ProjectItem {
                 expr: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(1)),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 },
                 output_name: match_col.clone(),
                 output_column_id: exists_col_id,
@@ -1253,8 +1279,8 @@ impl<'a> AnalyzerContext<'a> {
         modified_sub.output_columns = vec![OutputColumn {
             column_id: exists_col_id,
             name: match_col.clone(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }];
         modified_sub.limit = Some(1);
@@ -1269,8 +1295,7 @@ impl<'a> AnalyzerContext<'a> {
             Some(&sq_alias),
             &match_col,
             exists_col_id,
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
 
         let placeholder = std::mem::replace(&mut join.left, dummy_relation());
@@ -1280,14 +1305,16 @@ impl<'a> AnalyzerContext<'a> {
             join_type: JoinKind::LeftOuter,
             condition: Some(TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                data_type: DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    false,
+                ),
             }),
         }));
 
         let replacement = TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::IsNull {
                 expr: Box::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
@@ -1295,8 +1322,10 @@ impl<'a> AnalyzerContext<'a> {
                         qualifier: Some(sq_alias),
                         column: match_col,
                     },
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                 }),
                 negated: !negated, // EXISTS → IS NOT NULL; NOT EXISTS → IS NULL
             },
@@ -1332,8 +1361,7 @@ impl<'a> AnalyzerContext<'a> {
             Some(&sq_alias),
             &scalar_col.name,
             scalar_col.column_id,
-            scalar_col.data_type.clone(),
-            true,
+            super::helpers::with_nullability(scalar_col.value_type.clone(), true),
         );
 
         let placeholder = std::mem::replace(&mut join.left, dummy_relation());
@@ -1350,8 +1378,7 @@ impl<'a> AnalyzerContext<'a> {
                 qualifier: Some(sq_alias),
                 column: scalar_col.name,
             },
-            data_type: scalar_col.data_type,
-            nullable: true,
+            value_type: super::helpers::with_nullability(scalar_col.value_type, true),
         };
         if let Some(cond) = join.condition.as_ref() {
             join.condition = Some(replace_placeholder_in_expr(cond, sq_info.id, &replacement));
@@ -1507,8 +1534,7 @@ impl<'a> AnalyzerContext<'a> {
                                 qualifier: None,
                                 column: column.clone(),
                             },
-                            data_type: col.data_type.clone(),
-                            nullable: col.nullable,
+                            value_type: col.value_type.clone(),
                         }
                     } else {
                         col.clone()
@@ -1536,21 +1562,26 @@ impl<'a> AnalyzerContext<'a> {
                         _ => false,
                     };
                     let mut outer_expr = maybe_unqualify_col(&pred.outer_col, same_bare_name);
-                    if original_left_is_inner && outer_expr.data_type != pred.inner_col.data_type {
+                    if original_left_is_inner
+                        && outer_expr.value_type.data_type != pred.inner_col.value_type.data_type
+                    {
                         outer_expr = TypedExpr {
-                            data_type: pred.inner_col.data_type.clone(),
-                            nullable: outer_expr.nullable,
+                            value_type: novarocks_type_contract::FunctionValueType {
+                                nullable: outer_expr.value_type.nullable,
+                                ..pred.inner_col.value_type.clone()
+                            },
+
                             kind: ExprKind::Cast {
                                 expr: Box::new(outer_expr),
-                                target: pred.inner_col.data_type.clone(),
+                                target: pred.inner_col.value_type.data_type.clone(),
                                 decimal_overflow_policy:
                                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             },
                         };
                     }
                     TypedExpr {
-                        data_type: pred.full_expr.data_type.clone(),
-                        nullable: pred.full_expr.nullable,
+                        value_type: pred.full_expr.value_type.clone(),
+
                         kind: ExprKind::BinaryOp {
                             left: Box::new(outer_expr),
                             op: pred.op,
@@ -1563,9 +1594,13 @@ impl<'a> AnalyzerContext<'a> {
                 let corr_cond = {
                     let mut c = build_corr_cond(&corr_preds[0]);
                     for pred in &corr_preds[1..] {
+                        self.check_control()?;
                         c = TypedExpr {
-                            data_type: DataType::Boolean,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Boolean,
+                                false,
+                            ),
+
                             kind: ExprKind::BinaryOp {
                                 left: Box::new(c),
                                 op: BinOp::And,
@@ -1583,8 +1618,11 @@ impl<'a> AnalyzerContext<'a> {
                     .and_then(|f| remove_correlation_preds_from_expr(f, &corr_preds));
                 match remaining {
                     Some(rem) => Some(TypedExpr {
-                        data_type: DataType::Boolean,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Boolean,
+                            false,
+                        ),
+
                         kind: ExprKind::BinaryOp {
                             left: Box::new(corr_cond),
                             op: BinOp::And,
@@ -1628,8 +1666,7 @@ impl<'a> AnalyzerContext<'a> {
         let exists_col_id = self.alloc_column_id(
             Some(sq_alias.clone()),
             match_col.clone(),
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
 
         if let QueryBody::Select(ref mut sel) = resolved_sub.body {
@@ -1638,8 +1675,10 @@ impl<'a> AnalyzerContext<'a> {
             sel.projection.push(ProjectItem {
                 expr: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(1)),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 },
                 output_name: match_col.clone(),
                 output_column_id: exists_col_id,
@@ -1649,8 +1688,8 @@ impl<'a> AnalyzerContext<'a> {
         resolved_sub.output_columns = vec![OutputColumn {
             column_id: exists_col_id,
             name: match_col.clone(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }];
         resolved_sub.limit = Some(1);
@@ -1661,8 +1700,8 @@ impl<'a> AnalyzerContext<'a> {
             output_columns: vec![OutputColumn {
                 column_id: exists_col_id,
                 name: match_col.clone(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: false,
             }],
         };
@@ -1671,8 +1710,7 @@ impl<'a> AnalyzerContext<'a> {
             Some(&sq_alias),
             &match_col,
             exists_col_id,
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
         select.from = Some(Relation::Join(Box::new(JoinRelation {
@@ -1681,14 +1719,16 @@ impl<'a> AnalyzerContext<'a> {
             join_type: JoinKind::LeftOuter,
             condition: Some(TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                data_type: DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    false,
+                ),
             }),
         })));
 
         let replacement = TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::IsNull {
                 expr: Box::new(TypedExpr {
                     kind: ExprKind::ColumnRef {
@@ -1696,8 +1736,10 @@ impl<'a> AnalyzerContext<'a> {
                         qualifier: Some(sq_alias),
                         column: match_col,
                     },
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                 }),
                 negated: !negated,
             },
@@ -1769,9 +1811,10 @@ impl<'a> AnalyzerContext<'a> {
             .iter()
             .zip(resolved_sub.output_columns.iter())
         {
+            self.check_control()?;
             if let Some(reason) = super::resolve_expr::incompatible_complex_compare_pub(
-                &lhs_i.data_type,
-                &sub_col.data_type,
+                &lhs_i.value_type.data_type,
+                &sub_col.value_type.data_type,
             ) {
                 let op_sym = if negated { "NOT IN" } else { "IN" };
                 return Err(AnalyzeError::type_mismatch(
@@ -1845,7 +1888,7 @@ impl<'a> AnalyzerContext<'a> {
 
         if value_form
             && matches!(
-                lhs_typed.data_type,
+                lhs_typed.value_type.data_type,
                 DataType::List(_) | DataType::Struct(_) | DataType::Map(_, _)
             )
         {
@@ -1864,6 +1907,7 @@ impl<'a> AnalyzerContext<'a> {
         // NOT IN).
         let mut eq_conjuncts: Vec<TypedExpr> = Vec::with_capacity(lhs_typed_list.len());
         for (idx, lhs_i) in lhs_typed_list.iter().enumerate() {
+            self.check_control()?;
             let sub_col = &resolved_sub.output_columns[idx];
             let lhs_name_lower = match &lhs_i.kind {
                 ExprKind::ColumnRef { column, .. } => Some(column.to_lowercase()),
@@ -1881,8 +1925,7 @@ impl<'a> AnalyzerContext<'a> {
                     },
                     column: sub_col.name.clone(),
                 },
-                data_type: sub_col.data_type.clone(),
-                nullable: sub_col.nullable,
+                value_type: sub_col.value_type.clone(),
             };
             // Always emit plain `Eq` as the join condition. For NOT IN, SQL's
             // "any NULL anywhere → UNKNOWN" semantics is encoded by selecting
@@ -1893,8 +1936,11 @@ impl<'a> AnalyzerContext<'a> {
             // that, `c0 NOT IN (subq)` on nullable columns degraded to a
             // NestLoopJoin and timed out on 60K×40K-scale inputs.
             let eq = TypedExpr {
-                data_type: DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    false,
+                ),
+
                 kind: ExprKind::BinaryOp {
                     left: Box::new(lhs_i.clone()),
                     op: BinOp::Eq,
@@ -1909,9 +1955,13 @@ impl<'a> AnalyzerContext<'a> {
             let mut iter = eq_conjuncts.into_iter();
             let mut acc = iter.next().expect("at least one IN column");
             for next in iter {
+                self.check_control()?;
                 acc = TypedExpr {
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
+
                     kind: ExprKind::BinaryOp {
                         left: Box::new(acc),
                         op: BinOp::And,
@@ -1928,12 +1978,12 @@ impl<'a> AnalyzerContext<'a> {
         // explicit references (e.g. in IN-inside-OR's match-indicator
         // wrapping below) can resolve.
         for sub_col in &resolved_sub.output_columns {
+            self.check_control()?;
             scope.add_column_with_id(
                 Some(&sq_alias),
                 &sub_col.name,
                 sub_col.column_id,
-                sub_col.data_type.clone(),
-                true, // nullable for LEFT OUTER JOIN
+                super::helpers::with_nullability(sub_col.value_type.clone(), true), // nullable for LEFT OUTER JOIN
             );
         }
 
@@ -1949,18 +1999,16 @@ impl<'a> AnalyzerContext<'a> {
             let in_match_col_id = self.alloc_column_id(
                 Some(sq_alias.clone()),
                 match_col_name.clone(),
-                sub_output_col.data_type.clone(),
-                true,
+                super::helpers::with_nullability(sub_output_col.value_type.clone(), true),
             );
             scope.add_column_with_id(
                 Some(&sq_alias),
                 &match_col_name,
                 in_match_col_id,
-                sub_output_col.data_type.clone(),
-                true,
+                super::helpers::with_nullability(sub_output_col.value_type.clone(), true),
             );
 
-            let null_marker = if sub_output_col.nullable {
+            let null_marker = if sub_output_col.value_type.nullable {
                 Some(self.build_value_form_marker_relation(
                     scope,
                     resolved_sub.clone(),
@@ -1972,7 +2020,7 @@ impl<'a> AnalyzerContext<'a> {
             } else {
                 None
             };
-            let nonempty_marker = if lhs_typed.nullable {
+            let nonempty_marker = if lhs_typed.value_type.nullable {
                 Some(self.build_value_form_marker_relation(
                     scope,
                     resolved_sub.clone(),
@@ -1995,8 +2043,11 @@ impl<'a> AnalyzerContext<'a> {
             modified_sub.output_columns.push(OutputColumn {
                 column_id: in_match_col_id,
                 name: match_col_name.clone(),
-                data_type: sub_output_col.data_type.clone(),
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType {
+                    nullable: true,
+                    ..sub_output_col.value_type.clone()
+                },
+
                 is_internal: false,
             });
             if let QueryBody::Select(ref mut sel) = modified_sub.body {
@@ -2007,8 +2058,7 @@ impl<'a> AnalyzerContext<'a> {
                             qualifier: None,
                             column: sub_output_col.name.clone(),
                         },
-                        data_type: sub_output_col.data_type.clone(),
-                        nullable: sub_output_col.nullable,
+                        value_type: sub_output_col.value_type.clone(),
                     },
                     output_name: match_col_name.clone(),
                     output_column_id: in_match_col_id,
@@ -2061,19 +2111,24 @@ impl<'a> AnalyzerContext<'a> {
                         qualifier: None,
                         column: match_col_name,
                     },
-                    data_type: sub_output_col.data_type.clone(),
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType {
+                        nullable: true,
+                        ..sub_output_col.value_type.clone()
+                    },
                 },
                 true,
             );
             let nullable_result = null_exists.is_some() || nonempty_exists.is_some();
             let mut when_then = Vec::new();
             when_then.push((match_exists, bool_literal(!negated)));
-            if lhs_typed.nullable {
+            if lhs_typed.value_type.nullable {
                 let lhs_null_unknown = match nonempty_exists {
                     Some(any_exists) => TypedExpr {
-                        data_type: DataType::Boolean,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Boolean,
+                            false,
+                        ),
+
                         kind: ExprKind::BinaryOp {
                             left: Box::new(is_null_expr(lhs_typed.clone(), false)),
                             op: BinOp::And,
@@ -2090,8 +2145,11 @@ impl<'a> AnalyzerContext<'a> {
                 when_then.push((null_exists, null_bool_literal()));
             }
             let replacement = TypedExpr {
-                data_type: DataType::Boolean,
-                nullable: nullable_result,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    nullable_result,
+                ),
+
                 kind: ExprKind::Case {
                     operand: None,
                     when_then,
@@ -2116,7 +2174,7 @@ impl<'a> AnalyzerContext<'a> {
             let either_nullable = lhs_typed_list
                 .iter()
                 .zip(resolved_sub.output_columns.iter())
-                .any(|(lhs_i, sub_col)| lhs_i.nullable || sub_col.nullable);
+                .any(|(lhs_i, sub_col)| lhs_i.value_type.nullable || sub_col.value_type.nullable);
             let join_type = if negated {
                 if either_nullable {
                     JoinKind::NullAwareLeftAnti
@@ -2179,25 +2237,34 @@ impl<'a> AnalyzerContext<'a> {
                 qualifier: None,
                 column: output.name.clone(),
             },
-            data_type: output.data_type.clone(),
-            nullable: output.nullable,
+            value_type: output.value_type.clone(),
         };
         let resolved = super::resolve_expr::resolve_aggregate_function_call(
             self.function_catalog,
             "array_agg",
             std::slice::from_ref(&argument),
             span,
+            self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
+            self.control,
         )?;
         let FunctionResultType::Scalar(result) = &resolved.selected.result_type else {
             unreachable!("array_agg has a scalar result");
         };
         let result = result.clone();
-        let column_id = self.alloc_column_id(None, name.clone(), result.data_type.clone(), true);
+        let column_id = self.alloc_column_id(
+            None,
+            name.clone(),
+            super::helpers::with_nullability(result.clone(), true),
+        );
         let collection_output = OutputColumn {
             column_id,
             name: name.clone(),
-            data_type: result.data_type.clone(),
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType {
+                nullable: true,
+                ..result.clone()
+            },
+
             is_internal: true,
         };
         // ARRAY_REPEAT evaluates the probe once in its owning clause's row
@@ -2207,49 +2274,39 @@ impl<'a> AnalyzerContext<'a> {
         let probe_param = LambdaParam {
             name: format!("__in_probe_{sq_id}"),
             slot_id: self.alloc_lambda_slot_id(),
-            data_type: lhs.data_type.clone(),
-            nullable: lhs.nullable,
+            value_type: lhs.value_type.clone(),
         };
         let probe = TypedExpr {
             kind: ExprKind::LambdaParamRef {
                 name: probe_param.name.clone(),
                 slot_id: probe_param.slot_id,
             },
-            data_type: lhs.data_type.clone(),
-            nullable: lhs.nullable,
+            value_type: lhs.value_type.clone(),
         };
         let param = LambdaParam {
             name: format!("__in_item_{sq_id}"),
             slot_id: self.alloc_lambda_slot_id(),
-            data_type: output.data_type.clone(),
-            nullable: output.nullable,
+            value_type: output.value_type.clone(),
         };
         let item = TypedExpr {
             kind: ExprKind::LambdaParamRef {
                 name: param.name.clone(),
                 slot_id: param.slot_id,
             },
-            data_type: param.data_type.clone(),
-            nullable: param.nullable,
+            value_type: param.value_type.clone(),
         };
-        let (probe, item) =
-            match novarocks_types::comparison_common_type(&probe.data_type, &item.data_type)
-                .map_err(|message| AnalyzeError::type_mismatch(message, span))?
-            {
-                Some(common) => (
-                    cast_null_preserving_target_type(
-                        probe,
-                        &common,
-                        DecimalOverflowPolicy::OutputNull,
-                    ),
-                    cast_null_preserving_target_type(
-                        item,
-                        &common,
-                        DecimalOverflowPolicy::OutputNull,
-                    ),
-                ),
-                None => (probe, item),
-            };
+        let (probe, item) = match novarocks_types::comparison_common_type(
+            &probe.value_type.data_type,
+            &item.value_type.data_type,
+        )
+        .map_err(|message| AnalyzeError::type_mismatch(message, span))?
+        {
+            Some(common) => (
+                cast_null_preserving_target_type(probe, &common, DecimalOverflowPolicy::OutputNull),
+                cast_null_preserving_target_type(item, &common, DecimalOverflowPolicy::OutputNull),
+            ),
+            None => (probe, item),
+        };
         let comparison = TypedExpr {
             kind: ExprKind::BinaryOp {
                 left: Box::new(probe),
@@ -2257,16 +2314,14 @@ impl<'a> AnalyzerContext<'a> {
                 right: Box::new(item),
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         };
         let lambda = TypedExpr {
             kind: ExprKind::LambdaFunction {
                 params: vec![probe_param, param],
                 body: Box::new(comparison),
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         };
         let values = TypedExpr {
             kind: ExprKind::ColumnRef {
@@ -2274,50 +2329,65 @@ impl<'a> AnalyzerContext<'a> {
                 qualifier: None,
                 column: name.clone(),
             },
-            data_type: result.data_type.clone(),
-            nullable: collection_output.nullable,
+            value_type: novarocks_type_contract::FunctionValueType {
+                nullable: collection_output.value_type.nullable,
+                ..result.clone()
+            },
         };
         let length = resolved_scalar_call_at(
             self.function_catalog,
             "cardinality",
             vec![values.clone()],
             span,
+            self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
+            self.control,
         )?;
         let probes = resolved_scalar_call_at(
             self.function_catalog,
             "array_repeat",
             vec![lhs, length],
             span,
+            self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
+            self.control,
         )?;
         let mapped = resolved_scalar_call_at(
             self.function_catalog,
             "array_map",
             vec![lambda, probes, values],
             span,
+            self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
+            self.control,
         )?;
         // ARRAY_AGG emits a non-null empty list for zero input rows;
         // ANY_MATCH reduces that list to FALSE even for a NULL probe.
-        let mut replacement =
-            resolved_scalar_call_at(self.function_catalog, "any_match", vec![mapped], span)?;
+        let mut replacement = resolved_scalar_call_at(
+            self.function_catalog,
+            "any_match",
+            vec![mapped],
+            span,
+            self.sql_semantics.sql_mode().decimal_overflow_policy(),
+            self.constant_policy,
+            self.control,
+        )?;
         if negated {
             replacement = TypedExpr {
                 kind: ExprKind::UnaryOp {
                     op: UnOp::Not,
                     expr: Box::new(replacement),
                 },
-                data_type: DataType::Boolean,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    true,
+                ),
             };
         }
         let source_outputs = source.output_columns.clone();
         let mut inner_output = collection_output.clone();
-        inner_output.column_id = self.alloc_column_id(
-            Some(alias),
-            name.clone(),
-            result.data_type.clone(),
-            result.nullable,
-        );
-        inner_output.nullable = result.nullable;
+        inner_output.column_id = self.alloc_column_id(Some(alias), name.clone(), result.clone());
+        inner_output.value_type.nullable = result.nullable;
         let query = ResolvedQuery {
             body: QueryBody::Select(ResolvedSelect {
                 from: Some(Relation::Subquery {
@@ -2337,8 +2407,7 @@ impl<'a> AnalyzerContext<'a> {
                             order_by: vec![],
                             resolved,
                         },
-                        data_type: result.data_type,
-                        nullable: result.nullable,
+                        value_type: result,
                     },
                     output_name: name,
                     output_column_id: inner_output.column_id,
@@ -2424,10 +2493,10 @@ impl<'a> AnalyzerContext<'a> {
         // the join type carries the null-aware anti behavior and evaluates
         // residual correlation predicates against matching/null-key build
         // rows.
-        let either_nullable = lhs_typed.nullable || rhs_expr.nullable;
+        let either_nullable = lhs_typed.value_type.nullable || rhs_expr.value_type.nullable;
         let key_cond = TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(lhs_typed),
                 op: BinOp::Eq,
@@ -2437,13 +2506,15 @@ impl<'a> AnalyzerContext<'a> {
         };
         let sub_filter = sub_filter
             .map(|filter| -> Result<TypedExpr, AnalyzeError> {
-                if negated && either_nullable && filter.nullable {
+                if negated && either_nullable && filter.value_type.nullable {
                     let args = vec![
                         filter,
                         TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Bool(false)),
-                            data_type: DataType::Boolean,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Boolean,
+                                false,
+                            ),
                         },
                     ];
                     let binding = super::resolve_expr::resolve_scalar_binding_at(
@@ -2451,10 +2522,16 @@ impl<'a> AnalyzerContext<'a> {
                         "coalesce",
                         &args,
                         subquery_span,
+                        self.sql_semantics.sql_mode().decimal_overflow_policy(),
+                        self.constant_policy,
+                        self.control,
                     )?;
                     Ok(TypedExpr {
-                        data_type: DataType::Boolean,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Boolean,
+                            false,
+                        ),
+
                         kind: ExprKind::FunctionCall {
                             volatility: crate::functions::builtin_function_volatility("coalesce"),
                             name: "coalesce".to_string(),
@@ -2471,8 +2548,11 @@ impl<'a> AnalyzerContext<'a> {
 
         let join_cond = match sub_filter {
             Some(f) => Some(TypedExpr {
-                data_type: DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    false,
+                ),
+
                 kind: ExprKind::BinaryOp {
                     left: Box::new(key_cond),
                     op: BinOp::And,
@@ -2574,7 +2654,7 @@ impl<'a> AnalyzerContext<'a> {
 
             let scalar_output_id = modified_sub.output_columns[0].column_id;
             let scalar_output_name = modified_sub.output_columns[0].name.clone();
-            let scalar_data_type = modified_sub.output_columns[0].data_type.clone();
+            let scalar_data_type = modified_sub.output_columns[0].value_type.data_type.clone();
             let scalar_nullable = true;
 
             let output_columns = modified_sub.output_columns.clone();
@@ -2588,8 +2668,10 @@ impl<'a> AnalyzerContext<'a> {
                 Some(&sq_alias),
                 &scalar_output_name,
                 scalar_output_id,
-                scalar_data_type.clone(),
-                scalar_nullable,
+                novarocks_type_contract::FunctionValueType::new(
+                    scalar_data_type.clone(),
+                    scalar_nullable,
+                ),
             );
 
             let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
@@ -2609,8 +2691,10 @@ impl<'a> AnalyzerContext<'a> {
                     qualifier: Some(sq_alias.clone()),
                     column: scalar_output_name,
                 },
-                data_type: scalar_data_type,
-                nullable: scalar_nullable,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    scalar_data_type,
+                    scalar_nullable,
+                ),
             };
             Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &replacement);
             Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &replacement);
@@ -2632,8 +2716,7 @@ impl<'a> AnalyzerContext<'a> {
                 Some(&sq_alias),
                 &scalar_col.name,
                 scalar_col.column_id,
-                scalar_col.data_type.clone(),
-                scalar_col.nullable,
+                scalar_col.value_type.clone(),
             );
 
             let current_from = take_from_or_synthesize_single_row(&mut select.from, scope);
@@ -2653,8 +2736,7 @@ impl<'a> AnalyzerContext<'a> {
                     qualifier: Some(sq_alias.clone()),
                     column: scalar_col.name.clone(),
                 },
-                data_type: scalar_col.data_type.clone(),
-                nullable: scalar_col.nullable,
+                value_type: scalar_col.value_type.clone(),
             };
             Self::replace_placeholder_in_filter(&mut select.filter, sq_info.id, &replacement);
             Self::replace_placeholder_in_filter(&mut select.having, sq_info.id, &replacement);
@@ -2679,6 +2761,8 @@ impl<'a> AnalyzerContext<'a> {
         outer_scope: &AnalyzerScope,
     ) -> Result<(ResolvedQuery, AnalyzerScope), AnalyzeError> {
         let child_ctx = AnalyzerContext {
+            control: self.control,
+            constant_policy: self.constant_policy,
             catalog: self.catalog,
             current_database: self.current_database,
             function_catalog: self.function_catalog,
@@ -2820,6 +2904,7 @@ impl<'a> AnalyzerContext<'a> {
             let first = iter.next().unwrap();
             let (mut current_rel, mut current_scope) = self.analyze_from(first)?;
             for twj in iter {
+                self.check_control()?;
                 // Comma-separated FROM entries are implicit CROSS JOINs.
                 // Expose the accumulated left-hand scope so that table-valued
                 // functions like `unnest(...)` can reference earlier sibling
@@ -2862,6 +2947,7 @@ impl<'a> AnalyzerContext<'a> {
             &inner_scope,
         )?;
         for item in &mut projection {
+            self.check_control()?;
             item.expr =
                 qualify_inner_shadowing_column_refs(item.expr.clone(), &inner_scope, outer_scope);
         }
@@ -2881,21 +2967,23 @@ impl<'a> AnalyzerContext<'a> {
         };
         let mut group_by = Vec::with_capacity(group_by_exprs.len());
         for gb_expr in &group_by_exprs {
+            self.check_control()?;
             match self.analyze_expr(gb_expr, &merged_scope) {
                 Ok(typed) => group_by.push(qualify_inner_shadowing_column_refs(
                     typed,
                     &inner_scope,
                     outer_scope,
                 )),
+                Err(error) if error.control_error().is_some() => return Err(error),
                 Err(_) => {
                     let mut alias_scope = merged_scope.clone();
                     for item in &projection {
+                        self.check_control()?;
                         alias_scope.add_column_with_id(
                             None,
                             &item.output_name,
                             item.output_column_id,
-                            item.expr.data_type.clone(),
-                            item.expr.nullable,
+                            item.expr.value_type.clone(),
                         );
                     }
                     let typed = self.analyze_expr(gb_expr, &alias_scope)?;
@@ -2922,15 +3010,16 @@ impl<'a> AnalyzerContext<'a> {
                         &inner_scope,
                         outer_scope,
                     )),
+                    Err(error) if error.control_error().is_some() => return Err(error),
                     Err(_) => {
                         let mut alias_scope = merged_scope.clone();
                         for item in &projection {
+                            self.check_control()?;
                             alias_scope.add_column_with_id(
                                 None,
                                 &item.output_name,
                                 item.output_column_id,
-                                item.expr.data_type.clone(),
-                                item.expr.nullable,
+                                item.expr.value_type.clone(),
                             );
                         }
                         let h = self.analyze_expr(expr, &alias_scope)?;
@@ -2966,6 +3055,7 @@ impl<'a> AnalyzerContext<'a> {
         if !nested_sqs.is_empty() {
             let mut mutable_inner = inner_scope.clone();
             for sq_info in nested_sqs {
+                self.check_control()?;
                 self.rewrite_single_subquery(&mut resolved_select, &mut mutable_inner, sq_info)?;
             }
         }
@@ -2989,6 +3079,7 @@ impl<'a> AnalyzerContext<'a> {
         let mut extra_projection: Vec<ProjectItem> = Vec::new();
 
         for (idx, pred) in correlated_cols.iter().enumerate() {
+            self.check_control()?;
             let inner_col = &pred.inner_col;
             let outer_col = &pred.outer_col;
 
@@ -3000,18 +3091,13 @@ impl<'a> AnalyzerContext<'a> {
             };
             let corr_col_id = match &inner_col.kind {
                 ExprKind::ColumnRef { column_id, .. } => *column_id,
-                _ => self.alloc_column_id(
-                    None,
-                    col_name.clone(),
-                    inner_col.data_type.clone(),
-                    inner_col.nullable,
-                ),
+                _ => self.alloc_column_id(None, col_name.clone(), inner_col.value_type.clone()),
             };
             extra_output.push(OutputColumn {
                 column_id: corr_col_id,
                 name: col_name.clone(),
-                data_type: inner_col.data_type.clone(),
-                nullable: inner_col.nullable,
+                value_type: inner_col.value_type.clone(),
+
                 is_internal: false,
             });
             extra_projection.push(ProjectItem {
@@ -3024,8 +3110,11 @@ impl<'a> AnalyzerContext<'a> {
             // The physical planner resolves the right side against the subquery's
             // own scope, which uses the original table names, not __sq_N.
             join_conds.push(TypedExpr {
-                data_type: DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    false,
+                ),
+
                 kind: ExprKind::BinaryOp {
                     left: Box::new(outer_col.clone()),
                     op: pred.op,
@@ -3035,8 +3124,7 @@ impl<'a> AnalyzerContext<'a> {
                             qualifier: None,
                             column: col_name,
                         },
-                        data_type: inner_col.data_type.clone(),
-                        nullable: inner_col.nullable,
+                        value_type: inner_col.value_type.clone(),
                     }),
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
@@ -3047,11 +3135,13 @@ impl<'a> AnalyzerContext<'a> {
         let mut modified = resolved;
         if let QueryBody::Select(ref mut sel) = modified.body {
             for gb in &extra_group_by {
+                self.check_control()?;
                 sel.group_by.push(gb.clone());
             }
             sel.has_aggregation = true;
 
             for proj in &extra_projection {
+                self.check_control()?;
                 sel.projection.push(proj.clone());
             }
 
@@ -3061,6 +3151,7 @@ impl<'a> AnalyzerContext<'a> {
             }
         }
         for out_col in &extra_output {
+            self.check_control()?;
             modified.output_columns.push(out_col.clone());
         }
 
@@ -3088,6 +3179,7 @@ impl<'a> AnalyzerContext<'a> {
             scope.merge(outer_scope);
 
             for sq_info in nested_sqs {
+                self.check_control()?;
                 self.rewrite_single_subquery(sel, &mut scope, sq_info)?;
             }
         }
@@ -3169,14 +3261,17 @@ pub(super) struct CorrelationPred {
 /// boolean cast so values like `"true"` keep their predicate meaning.
 pub(crate) fn coerce_where_to_bool(expr: TypedExpr) -> TypedExpr {
     use arrow::datatypes::DataType;
-    if matches!(expr.data_type, DataType::Boolean) {
+    if matches!(expr.value_type.data_type, DataType::Boolean) {
         return expr;
     }
-    let nullable = expr.nullable;
-    if matches!(expr.data_type, DataType::Utf8) {
+    let nullable = expr.value_type.nullable;
+    if matches!(expr.value_type.data_type, DataType::Utf8) {
         return TypedExpr {
-            data_type: DataType::Boolean,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::Boolean,
+                nullable,
+            ),
+
             kind: ExprKind::Cast {
                 expr: Box::new(expr),
                 target: DataType::Boolean,
@@ -3186,12 +3281,11 @@ pub(crate) fn coerce_where_to_bool(expr: TypedExpr) -> TypedExpr {
     }
     let zero = TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Int(0)),
-        data_type: DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
     };
     TypedExpr {
-        data_type: DataType::Boolean,
-        nullable,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
+
         kind: ExprKind::BinaryOp {
             left: Box::new(expr),
             op: BinOp::Ne,
@@ -3206,8 +3300,8 @@ fn qualify_inner_shadowing_column_refs(
     inner_scope: &AnalyzerScope,
     outer_scope: &AnalyzerScope,
 ) -> TypedExpr {
-    let data_type = expr.data_type.clone();
-    let nullable = expr.nullable;
+    let data_type = expr.value_type.data_type.clone();
+    let nullable = expr.value_type.nullable;
     match expr.kind {
         ExprKind::ColumnRef {
             column_id,
@@ -3221,8 +3315,8 @@ fn qualify_inner_shadowing_column_refs(
                 .filter(|_| outer_scope.resolve(None, &column).is_ok())
                 .and_then(|_| inner_scope.qualifier_for_binding(&column, column_id));
             TypedExpr {
-                data_type,
-                nullable,
+                value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
                 kind: ExprKind::ColumnRef {
                     column_id,
                     qualifier,
@@ -3236,8 +3330,8 @@ fn qualify_inner_shadowing_column_refs(
             right,
             decimal_overflow_policy,
         } => TypedExpr {
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(qualify_inner_shadowing_column_refs(
                     *left,
@@ -3254,8 +3348,8 @@ fn qualify_inner_shadowing_column_refs(
             },
         },
         ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             kind: ExprKind::UnaryOp {
                 op,
                 expr: Box::new(qualify_inner_shadowing_column_refs(
@@ -3272,8 +3366,8 @@ fn qualify_inner_shadowing_column_refs(
             binding,
             volatility,
         } => TypedExpr {
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             kind: ExprKind::FunctionCall {
                 name,
                 args: args
@@ -3286,8 +3380,8 @@ fn qualify_inner_shadowing_column_refs(
             },
         },
         ExprKind::LambdaFunction { params, body } => TypedExpr {
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             kind: ExprKind::LambdaFunction {
                 params,
                 body: Box::new(qualify_inner_shadowing_column_refs(
@@ -3304,8 +3398,8 @@ fn qualify_inner_shadowing_column_refs(
             order_by,
             resolved,
         } => TypedExpr {
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             kind: ExprKind::AggregateCall {
                 name,
                 args: args
@@ -3322,8 +3416,8 @@ fn qualify_inner_shadowing_column_refs(
             target,
             decimal_overflow_policy,
         } => TypedExpr {
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             kind: ExprKind::Cast {
                 expr: Box::new(qualify_inner_shadowing_column_refs(
                     *inner,
@@ -3338,8 +3432,8 @@ fn qualify_inner_shadowing_column_refs(
             expr: inner,
             negated,
         } => TypedExpr {
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             kind: ExprKind::IsNull {
                 expr: Box::new(qualify_inner_shadowing_column_refs(
                     *inner,
@@ -3354,8 +3448,8 @@ fn qualify_inner_shadowing_column_refs(
             list,
             negated,
         } => TypedExpr {
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             kind: ExprKind::InList {
                 expr: Box::new(qualify_inner_shadowing_column_refs(
                     *inner,
@@ -3375,8 +3469,8 @@ fn qualify_inner_shadowing_column_refs(
             high,
             negated,
         } => TypedExpr {
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             kind: ExprKind::Between {
                 expr: Box::new(qualify_inner_shadowing_column_refs(
                     *inner,
@@ -3401,8 +3495,8 @@ fn qualify_inner_shadowing_column_refs(
             pattern,
             negated,
         } => TypedExpr {
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             kind: ExprKind::Like {
                 expr: Box::new(qualify_inner_shadowing_column_refs(
                     *inner,
@@ -3422,8 +3516,8 @@ fn qualify_inner_shadowing_column_refs(
             when_then,
             else_expr,
         } => TypedExpr {
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             kind: ExprKind::Case {
                 operand: operand.map(|operand| {
                     Box::new(qualify_inner_shadowing_column_refs(
@@ -3455,8 +3549,8 @@ fn qualify_inner_shadowing_column_refs(
             value,
             negated,
         } => TypedExpr {
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             kind: ExprKind::IsTruthValue {
                 expr: Box::new(qualify_inner_shadowing_column_refs(
                     *inner,
@@ -3468,8 +3562,8 @@ fn qualify_inner_shadowing_column_refs(
             },
         },
         ExprKind::Nested(inner) => TypedExpr {
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             kind: ExprKind::Nested(Box::new(qualify_inner_shadowing_column_refs(
                 *inner,
                 inner_scope,
@@ -3488,8 +3582,8 @@ fn qualify_inner_shadowing_column_refs(
             window_frame,
             ignore_nulls,
         } => TypedExpr {
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             kind: ExprKind::WindowCall {
                 name,
                 args: args
@@ -3514,8 +3608,8 @@ fn qualify_inner_shadowing_column_refs(
             },
         },
         ExprKind::Lambda { params, body } => TypedExpr {
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             kind: ExprKind::Lambda {
                 params,
                 body: Box::new(qualify_inner_shadowing_column_refs(
@@ -3525,12 +3619,16 @@ fn qualify_inner_shadowing_column_refs(
                 )),
             },
         },
+        ExprKind::Constant(value) => TypedExpr {
+            value_type: expr.value_type,
+            kind: ExprKind::Constant(value),
+        },
         kind @ (ExprKind::ColumnRef { .. }
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
         | ExprKind::SubqueryPlaceholder { .. }) => TypedExpr {
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             kind,
         },
     }
@@ -3667,6 +3765,7 @@ fn collect_outer_ref_column_ids(
             }
         }
         ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. }
         | ExprKind::LambdaParamRef { .. } => {}
     }
@@ -4205,7 +4304,7 @@ fn dummy_relation() -> Relation {
 /// with its analyzer-allocated ColumnId.  For `Join` we recurse left.  If no
 /// column can be determined, return `None` so the caller can raise a clear
 /// shape-specific error.
-fn relation_first_output_column(rel: &Relation) -> Option<OutputColumn> {
+fn relation_first_output_column(rel: &Relation, scope: &AnalyzerScope) -> Option<OutputColumn> {
     match rel {
         Relation::CTEConsume { output_columns, .. } => output_columns.first().cloned(),
         Relation::Subquery { output_columns, .. } => output_columns.first().cloned(),
@@ -4217,8 +4316,8 @@ fn relation_first_output_column(rel: &Relation) -> Option<OutputColumn> {
             Some(OutputColumn {
                 column_id: col_id,
                 name: col_def.name.clone(),
-                data_type: col_def.data_type.clone(),
-                nullable: col_def.nullable,
+                value_type: scope.factory().borrow().value_type(col_id)?.clone(),
+
                 is_internal: false,
             })
         }
@@ -4228,8 +4327,8 @@ fn relation_first_output_column(rel: &Relation) -> Option<OutputColumn> {
             Some(OutputColumn {
                 column_id: col_id,
                 name: col_def.name.clone(),
-                data_type: col_def.data_type.clone(),
-                nullable: col_def.nullable,
+                value_type: scope.factory().borrow().value_type(col_id)?.clone(),
+
                 is_internal: false,
             })
         }
@@ -4239,12 +4338,12 @@ fn relation_first_output_column(rel: &Relation) -> Option<OutputColumn> {
             Some(OutputColumn {
                 column_id: col_id,
                 name: col_def.name.clone(),
-                data_type: col_def.data_type.clone(),
-                nullable: col_def.nullable,
+                value_type: scope.factory().borrow().value_type(col_id)?.clone(),
+
                 is_internal: false,
             })
         }
-        Relation::Join(j) => relation_first_output_column(&j.left),
+        Relation::Join(j) => relation_first_output_column(&j.left, scope),
         Relation::GenerateSeries(g) => {
             if g.output_column_id == crate::column_id::ColumnId::UNSET {
                 None
@@ -4252,8 +4351,11 @@ fn relation_first_output_column(rel: &Relation) -> Option<OutputColumn> {
                 Some(OutputColumn {
                     column_id: g.output_column_id,
                     name: g.column_name.clone(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 })
             }
@@ -4417,6 +4519,7 @@ fn placeholder_is_aggregate_input(expr: &TypedExpr, placeholder_id: usize) -> bo
         ExprKind::ColumnRef { .. }
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. } => false,
     }
 }
@@ -4826,8 +4929,10 @@ fn remove_placeholder_from_expr(expr: &TypedExpr, placeholder_id: usize) -> Type
             if left_is && right_is {
                 TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(identity)),
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 }
             } else if left_is {
                 remove_placeholder_from_expr(right, placeholder_id)
@@ -4837,8 +4942,11 @@ fn remove_placeholder_from_expr(expr: &TypedExpr, placeholder_id: usize) -> Type
                 let new_left = remove_placeholder_from_expr(left, placeholder_id);
                 let new_right = remove_placeholder_from_expr(right, placeholder_id);
                 TypedExpr {
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
+
                     kind: ExprKind::BinaryOp {
                         left: Box::new(new_left),
                         op: *op,
@@ -4852,14 +4960,16 @@ fn remove_placeholder_from_expr(expr: &TypedExpr, placeholder_id: usize) -> Type
             if is_placeholder(inner, placeholder_id) {
                 TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 }
             } else {
                 let new_inner = remove_placeholder_from_expr(inner, placeholder_id);
                 TypedExpr {
-                    data_type: expr.data_type.clone(),
-                    nullable: expr.nullable,
+                    value_type: expr.value_type.clone(),
+
                     kind: ExprKind::Nested(Box::new(new_inner)),
                 }
             }
@@ -4875,16 +4985,17 @@ fn recompute_case_result_type(
     let mut result_type = DataType::Null;
     for (_, then_expr) in when_then {
         if result_type == DataType::Null {
-            result_type = then_expr.data_type.clone();
+            result_type = then_expr.value_type.data_type.clone();
         } else {
-            result_type = novarocks_types::wider_type(&result_type, &then_expr.data_type);
+            result_type =
+                novarocks_types::wider_type(&result_type, &then_expr.value_type.data_type);
         }
     }
     if let Some(expr) = else_expr {
         if result_type == DataType::Null {
-            result_type = expr.data_type.clone();
+            result_type = expr.value_type.data_type.clone();
         } else {
-            result_type = novarocks_types::wider_type(&result_type, &expr.data_type);
+            result_type = novarocks_types::wider_type(&result_type, &expr.value_type.data_type);
         }
     }
     if result_type == DataType::Null {
@@ -4895,15 +5006,14 @@ fn recompute_case_result_type(
 }
 
 fn cast_case_branch_if_needed(expr: TypedExpr, target: &DataType) -> TypedExpr {
-    if &expr.data_type != target && expr.data_type != DataType::Null {
+    if &expr.value_type.data_type != target && expr.value_type.data_type != DataType::Null {
         TypedExpr {
             kind: ExprKind::Cast {
                 expr: Box::new(expr),
                 target: target.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: target.clone(),
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(target.clone(), true),
         }
     } else {
         expr
@@ -4926,8 +5036,8 @@ fn replace_placeholder_in_expr(
             right,
             decimal_overflow_policy,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(replace_placeholder_in_expr(
                     left,
@@ -4944,8 +5054,8 @@ fn replace_placeholder_in_expr(
             },
         },
         ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::UnaryOp {
                 op: *op,
                 expr: Box::new(replace_placeholder_in_expr(
@@ -4956,8 +5066,8 @@ fn replace_placeholder_in_expr(
             },
         },
         ExprKind::Nested(inner) => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::Nested(Box::new(replace_placeholder_in_expr(
                 inner,
                 placeholder_id,
@@ -4971,8 +5081,8 @@ fn replace_placeholder_in_expr(
             binding,
             volatility,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::FunctionCall {
                 name: name.clone(),
                 args: args
@@ -4991,8 +5101,8 @@ fn replace_placeholder_in_expr(
             order_by,
             resolved,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::AggregateCall {
                 name: name.clone(),
                 args: args
@@ -5009,8 +5119,8 @@ fn replace_placeholder_in_expr(
             target,
             decimal_overflow_policy,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::Cast {
                 expr: Box::new(replace_placeholder_in_expr(
                     inner,
@@ -5025,8 +5135,8 @@ fn replace_placeholder_in_expr(
             expr: inner,
             negated,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::IsNull {
                 expr: Box::new(replace_placeholder_in_expr(
                     inner,
@@ -5067,8 +5177,8 @@ fn replace_placeholder_in_expr(
             }
 
             TypedExpr {
-                data_type: result_type,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(result_type, true),
+
                 kind: ExprKind::Case {
                     operand,
                     when_then: rewritten_when_then,
@@ -5082,8 +5192,8 @@ fn replace_placeholder_in_expr(
             high,
             negated,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::Between {
                 expr: Box::new(replace_placeholder_in_expr(
                     inner,
@@ -5108,8 +5218,8 @@ fn replace_placeholder_in_expr(
             pattern,
             negated,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::Like {
                 expr: Box::new(replace_placeholder_in_expr(
                     inner,
@@ -5129,8 +5239,8 @@ fn replace_placeholder_in_expr(
             list,
             negated,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::InList {
                 expr: Box::new(replace_placeholder_in_expr(
                     inner,
@@ -5149,8 +5259,8 @@ fn replace_placeholder_in_expr(
             value,
             negated,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::IsTruthValue {
                 expr: Box::new(replace_placeholder_in_expr(
                     inner,
@@ -5173,8 +5283,8 @@ fn replace_placeholder_in_expr(
             window_frame,
             ignore_nulls,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::WindowCall {
                 name: name.clone(),
                 args: args
@@ -5227,8 +5337,11 @@ fn remove_correlation_preds_from_expr(
             let right_remaining = remove_correlation_preds_from_expr(right, corr_preds);
             match (left_remaining, right_remaining) {
                 (Some(l), Some(r)) => Some(TypedExpr {
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
+
                     kind: ExprKind::BinaryOp {
                         left: Box::new(l),
                         op: BinOp::And,
@@ -5334,8 +5447,11 @@ fn factor_common_correlation_from_or(
         if remaining.is_empty() {
             // Branch was only the correlation pred — becomes TRUE
             new_branches.push(TypedExpr {
-                data_type: DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    false,
+                ),
+
                 kind: ExprKind::Literal(crate::analysis::LiteralValue::Bool(true)),
             });
         } else {
@@ -5414,8 +5530,8 @@ fn disjoin(mut exprs: Vec<TypedExpr>) -> TypedExpr {
     }
     let first = exprs.remove(0);
     exprs.into_iter().fold(first, |acc, e| TypedExpr {
-        data_type: DataType::Boolean,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
         kind: ExprKind::BinaryOp {
             left: Box::new(acc),
             op: BinOp::Or,
@@ -5432,8 +5548,8 @@ fn conjoin(mut exprs: Vec<TypedExpr>) -> TypedExpr {
     }
     let first = exprs.remove(0);
     exprs.into_iter().fold(first, |acc, e| TypedExpr {
-        data_type: DataType::Boolean,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
         kind: ExprKind::BinaryOp {
             left: Box::new(acc),
             op: BinOp::And,
@@ -5459,6 +5575,8 @@ mod tests {
             &catalog,
             "default",
             crate::functions::builtin_sql_function_catalog(),
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();
         let QueryBody::Select(select) = resolved.body else {
@@ -5518,6 +5636,8 @@ mod tests {
                 &catalog,
                 "default",
                 crate::functions::builtin_sql_function_catalog(),
+                crate::constant::test_constant_policy(),
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();
             let QueryBody::Select(select) = resolved.body else {
@@ -5545,8 +5665,7 @@ mod tests {
                 qualifier: None,
                 column: "flag".to_string(),
             },
-            data_type: DataType::Int32,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
         };
 
         let coerced = coerce_where_to_bool(expr);
@@ -5555,8 +5674,8 @@ mod tests {
             coerced.kind,
             ExprKind::BinaryOp { op: BinOp::Ne, .. }
         ));
-        assert_eq!(coerced.data_type, DataType::Boolean);
-        assert!(coerced.nullable);
+        assert_eq!(coerced.value_type.data_type, DataType::Boolean);
+        assert!(coerced.value_type.nullable);
     }
 
     #[test]
@@ -5567,8 +5686,7 @@ mod tests {
                 qualifier: None,
                 column: "flag".to_string(),
             },
-            data_type: DataType::Utf8,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
         };
 
         let coerced = coerce_where_to_bool(expr);
@@ -5580,8 +5698,8 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(coerced.data_type, DataType::Boolean);
-        assert!(coerced.nullable);
+        assert_eq!(coerced.value_type.data_type, DataType::Boolean);
+        assert!(coerced.value_type.nullable);
     }
 
     #[test]
@@ -5595,8 +5713,10 @@ mod tests {
                 projection: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),
-                        data_type: DataType::Int32,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int32,
+                            false,
+                        ),
                     },
                     output_name: "x".to_string(),
                     output_column_id: crate::column_id::ColumnId(1),
@@ -5613,8 +5733,8 @@ mod tests {
             output_columns: vec![OutputColumn {
                 column_id: crate::column_id::ColumnId(1),
                 name: "x".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
                 is_internal: false,
             }],
             local_cte_ids: Vec::new(),
@@ -5629,13 +5749,13 @@ mod tests {
         );
 
         assert!(marker.limit.is_none());
-        assert!(marker.output_columns[0].nullable);
+        assert!(marker.output_columns[0].value_type.nullable);
         let QueryBody::Select(select) = marker.body else {
             panic!("expected marker SELECT");
         };
         assert!(select.has_aggregation);
         assert_eq!(select.group_by.len(), 0);
-        assert!(select.projection[0].expr.nullable);
+        assert!(select.projection[0].expr.value_type.nullable);
         let ExprKind::AggregateCall { name, args, .. } = &select.projection[0].expr.kind else {
             panic!("expected aggregate marker expression");
         };

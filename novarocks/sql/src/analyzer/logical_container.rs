@@ -41,6 +41,14 @@ pub(super) fn argument_source(source: Option<&ast::Expr>, index: usize) -> Optio
     }
 }
 
+fn string_value(expression: &TypedExpr) -> Option<&str> {
+    match &expression.kind {
+        ExprKind::Literal(LiteralValue::String(value)) => Some(value),
+        ExprKind::Constant(value) => value.try_utf8().ok().flatten(),
+        _ => None,
+    }
+}
+
 fn call(expression: &TypedExpr) -> Option<(&ResolvedFunctionBinding, &[TypedExpr])> {
     match &expression.kind {
         ExprKind::FunctionCall { binding, args, .. } if binding.kind == FunctionKind::Scalar => {
@@ -137,38 +145,37 @@ fn transform_binding_matches(expression: &TypedExpr) -> bool {
     else {
         return false;
     };
-    if result.data_type != original.data_type
-        || result.nullable != original.nullable
+    if result != &original.value_type
         || !args
             .iter()
             .zip(&binding.selected.argument_types)
             .all(|(arg, selected)| {
                 matches!(selected, novarocks_functions::FunctionArgumentType::Value(value)
-                if value.data_type == arg.data_type && value.nullable == arg.nullable)
+                if value == &arg.value_type)
             })
     {
         return false;
     }
-    let DataType::List(output) = &original.data_type else {
+    let DataType::List(output) = &original.value_type.data_type else {
         return false;
     };
     match id {
         "builtin.scalar/array_flatten/v1" => {
             args.len() == 1
-                && matches!(&args[0].data_type, DataType::List(outer) if matches!(outer.data_type(), DataType::List(_)))
+                && matches!(&args[0].value_type.data_type, DataType::List(outer) if matches!(outer.data_type(), DataType::List(_)))
         }
         "builtin.scalar/array_repeat/v1" => args.len() == 2,
         "builtin.scalar/arrays_zip/v1" => {
             !args.is_empty()
-                && args
-                    .iter()
-                    .all(|arg| matches!(arg.data_type, DataType::List(_) | DataType::Null))
+                && args.iter().all(|arg| {
+                    matches!(arg.value_type.data_type, DataType::List(_) | DataType::Null)
+                })
                 && matches!(output.data_type(), DataType::Struct(fields) if fields.len() == args.len())
         }
         "builtin.scalar/__array_struct_subfield/v1" => {
             args.len() == 2
-                && matches!(&args[1].kind, ExprKind::Literal(LiteralValue::String(_)))
-                && matches!(&args[0].data_type, DataType::List(item) if matches!(item.data_type(), DataType::Struct(_)))
+                && string_value(&args[1]).is_some()
+                && matches!(&args[0].value_type.data_type, DataType::List(item) if matches!(item.data_type(), DataType::Struct(_)))
         }
         _ => false,
     }
@@ -395,7 +402,7 @@ fn window_value_binding(
         && binding.selected.argument_types.len() == args.len()
         && matches!(&binding.selected.result_type,
             novarocks_functions::FunctionResultType::Scalar(result)
-                if result.data_type == expression.data_type)
+                if result.data_type == expression.value_type.data_type)
 }
 
 // Equal leaves retain their original identity. Different value suppliers are
@@ -479,7 +486,7 @@ impl AnalyzerContext<'_> {
         scope: &AnalyzerScope,
     ) -> Option<SqlType> {
         self.logical_output_type(source, value, scope)
-            .or_else(|| ordinary_type(&value.data_type, false))
+            .or_else(|| ordinary_type(&value.value_type.data_type, false))
     }
 
     pub(super) fn window_value_output_type(
@@ -510,11 +517,13 @@ impl AnalyzerContext<'_> {
             }
             let current = self.wrapper_input_type(source, value, scope)?;
             logical = Some(match logical {
-                Some(previous) => merge_window_logical(previous, current, &expression.data_type)?,
+                Some(previous) => {
+                    merge_window_logical(previous, current, &expression.value_type.data_type)?
+                }
                 None => current,
             });
         }
-        logical.filter(|logical| logical_carrier_matches(logical, &expression.data_type))
+        logical.filter(|logical| logical_carrier_matches(logical, &expression.value_type.data_type))
     }
 
     // SqlType intentionally has no Null leaf. For a value such as row(NULL,
@@ -542,10 +551,12 @@ impl AnalyzerContext<'_> {
                 continue;
             }
             let current = match self.wrapper_input_type(source, value, scope) {
-                Some(logical) => project_type(&expression.data_type, &logical),
+                Some(logical) => project_type(&expression.value_type.data_type, &logical),
                 None => {
-                    let mut projected =
-                        copy_window_markers(&expression.data_type, &value.data_type)?;
+                    let mut projected = copy_window_markers(
+                        &expression.value_type.data_type,
+                        &value.value_type.data_type,
+                    )?;
                     if !matches!(source, Some(ast::Expr::Cast(_))) {
                         let mut candidate = value;
                         while let ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) =
@@ -553,9 +564,9 @@ impl AnalyzerContext<'_> {
                         {
                             candidate = expr;
                             projected = window_marker_shape(
-                                &expression.data_type,
+                                &expression.value_type.data_type,
                                 &projected,
-                                Some(&candidate.data_type),
+                                Some(&candidate.value_type.data_type),
                                 true,
                             )?;
                         }
@@ -565,7 +576,9 @@ impl AnalyzerContext<'_> {
             };
             target = Some(match target {
                 None => current,
-                Some(previous) => merge_window_markers(&expression.data_type, &previous, &current)?,
+                Some(previous) => {
+                    merge_window_markers(&expression.value_type.data_type, &previous, &current)?
+                }
             });
         }
         target
@@ -595,7 +608,7 @@ impl AnalyzerContext<'_> {
             return if self.json_list_provenance(source, expression, scope) {
                 Some(SqlType::Array(Box::new(SqlType::Json)))
             } else {
-                ordinary_type(&expression.data_type, false)
+                ordinary_type(&expression.value_type.data_type, false)
             };
         }
         let input =
@@ -627,7 +640,7 @@ impl AnalyzerContext<'_> {
             "builtin.scalar/__array_literal/v1"
             | "builtin.aggregate/array_agg/v1"
             | "builtin.aggregate/array_agg_distinct/v1" => {
-                let DataType::List(field) = &expression.data_type else {
+                let DataType::List(field) = &expression.value_type.data_type else {
                     return None;
                 };
                 let indices = if id == "builtin.scalar/__array_literal/v1" {
@@ -638,7 +651,7 @@ impl AnalyzerContext<'_> {
                 merged(&indices, field.data_type()).map(|item| SqlType::Array(Box::new(item)))
             }
             "builtin.scalar/map/v1" | "builtin.aggregate/map_agg/v1" => {
-                let DataType::Map(entries, _) = &expression.data_type else {
+                let DataType::Map(entries, _) = &expression.value_type.data_type else {
                     return None;
                 };
                 let DataType::Struct(fields) = entries.data_type() else {
@@ -660,7 +673,7 @@ impl AnalyzerContext<'_> {
             "builtin.scalar/row/v1"
             | "builtin.scalar/struct/v1"
             | "builtin.scalar/named_struct/v1" => {
-                let DataType::Struct(fields) = &expression.data_type else {
+                let DataType::Struct(fields) = &expression.value_type.data_type else {
                     return None;
                 };
                 let named = id == "builtin.scalar/named_struct/v1";
@@ -678,7 +691,7 @@ impl AnalyzerContext<'_> {
                 Some(SqlType::Struct(fields))
             }
             "builtin.scalar/__struct_subfield/v1" => {
-                let ExprKind::Literal(LiteralValue::String(name)) = &args.get(1)?.kind else {
+                let Some(name) = string_value(args.get(1)?) else {
                     return None;
                 };
                 if let Some(SqlType::Struct(fields)) = input(0) {
@@ -687,7 +700,7 @@ impl AnalyzerContext<'_> {
                         .find(|(field, _)| field.eq_ignore_ascii_case(name))
                         .map(|(_, ty)| ty)
                 } else {
-                    let DataType::Struct(fields) = &args.first()?.data_type else {
+                    let DataType::Struct(fields) = &args.first()?.value_type.data_type else {
                         return None;
                     };
                     fields
@@ -699,7 +712,7 @@ impl AnalyzerContext<'_> {
             "builtin.scalar/__array_element_at/v1"
             | "builtin.scalar/array_min/v1"
             | "builtin.scalar/array_max/v1" => item(0).or_else(|| {
-                let DataType::List(field) = &args.first()?.data_type else {
+                let DataType::List(field) = &args.first()?.value_type.data_type else {
                     return None;
                 };
                 field_type(field)
@@ -711,7 +724,7 @@ impl AnalyzerContext<'_> {
                 let logical = map(0)
                     .map(|(key, value)| if index == 0 { key } else { value })
                     .or_else(|| {
-                        let DataType::Map(entries, _) = &args.first()?.data_type else {
+                        let DataType::Map(entries, _) = &args.first()?.value_type.data_type else {
                             return None;
                         };
                         let DataType::Struct(fields) = entries.data_type() else {
@@ -731,7 +744,7 @@ impl AnalyzerContext<'_> {
             },
             "builtin.scalar/array_repeat/v1" => Some(SqlType::Array(Box::new(input(0)?))),
             "builtin.scalar/arrays_zip/v1" => {
-                let DataType::List(output) = &expression.data_type else {
+                let DataType::List(output) = &expression.value_type.data_type else {
                     return None;
                 };
                 let DataType::Struct(fields) = output.data_type() else {
@@ -745,7 +758,7 @@ impl AnalyzerContext<'_> {
                 Some(SqlType::Array(Box::new(SqlType::Struct(fields))))
             }
             "builtin.scalar/__array_struct_subfield/v1" => {
-                let ExprKind::Literal(LiteralValue::String(name)) = &args.get(1)?.kind else {
+                let Some(name) = string_value(args.get(1)?) else {
                     return None;
                 };
                 let selected = match item(0) {
@@ -754,7 +767,7 @@ impl AnalyzerContext<'_> {
                         .find(|(field, _)| field.eq_ignore_ascii_case(name))
                         .map(|(_, ty)| ty),
                     _ => {
-                        let DataType::List(item) = &args[0].data_type else {
+                        let DataType::List(item) = &args[0].value_type.data_type else {
                             return None;
                         };
                         let DataType::Struct(fields) = item.data_type() else {
@@ -774,7 +787,7 @@ impl AnalyzerContext<'_> {
             | "builtin.scalar/array_slice/v1" => input(0),
             _ => None,
         }
-        .filter(|logical| logical_carrier_matches(logical, &expression.data_type))
+        .filter(|logical| logical_carrier_matches(logical, &expression.value_type.data_type))
     }
 
     pub(in crate::analyzer) fn adapt_bound_output_domains(
@@ -806,7 +819,7 @@ impl AnalyzerContext<'_> {
             {
                 let mut original = value;
                 loop {
-                    validate_markers(&original.data_type)
+                    validate_markers(&original.value_type.data_type)
                         .map_err(|message| AnalyzeError::type_mismatch(message, span))?;
                     match &original.kind {
                         ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) => original = expr,
@@ -814,7 +827,7 @@ impl AnalyzerContext<'_> {
                     }
                 }
             }
-            validate_markers(&value.data_type)
+            validate_markers(&value.value_type.data_type)
                 .map_err(|message| AnalyzeError::type_mismatch(message, span))?;
             let logical = self.logical_output_type(argument_source(source, i), value, scope);
             // A returned NULL literal (possibly materialized as a typed
@@ -828,7 +841,7 @@ impl AnalyzerContext<'_> {
                 || (is_container_transform(binding.function_id.as_str())
                     && (binding.function_id.as_str() == "builtin.scalar/arrays_zip/v1" || i == 0)))
                 && is_null_value(argument_source(source, i), value);
-            if value.data_type == DataType::LargeBinary
+            if value.value_type.data_type == DataType::LargeBinary
                 && logical.is_none()
                 && !neutral_null_supplier
             {
@@ -848,8 +861,9 @@ impl AnalyzerContext<'_> {
                 }
                 let mut candidate = value;
                 loop {
-                    if nested_source_matches(&logical, &candidate.data_type)
-                        || (json_list_witness && witnessed_json_list_fields(&candidate.data_type))
+                    if nested_source_matches(&logical, &candidate.value_type.data_type)
+                        || (json_list_witness
+                            && witnessed_json_list_fields(&candidate.value_type.data_type))
                     {
                         break;
                     }
@@ -865,31 +879,31 @@ impl AnalyzerContext<'_> {
                 }
             }
         }
-        validate_markers(&expression.data_type)
+        validate_markers(&expression.value_type.data_type)
             .map_err(|message| AnalyzeError::type_mismatch(message, span))?;
         let target = if let Some(logical) = self.logical_output_type(source, &expression, scope) {
-            if nested_source_matches(&logical, &expression.data_type) {
+            if nested_source_matches(&logical, &expression.value_type.data_type) {
                 return Ok(expression);
             }
-            project_type(&expression.data_type, &logical)
+            project_type(&expression.value_type.data_type, &logical)
         } else if let Some(target) = self.partial_wrapper_type(source, &expression, scope) {
             target
         } else {
             return Ok(expression);
         };
         validate_markers(&target).map_err(|message| AnalyzeError::type_mismatch(message, span))?;
-        if target == expression.data_type {
+        if target == expression.value_type.data_type {
             return Ok(expression);
         }
-        let nullable = expression.nullable;
+        let mut value_type = expression.value_type.clone();
+        value_type.data_type = target.clone();
         Ok(TypedExpr {
             kind: ExprKind::Cast {
                 expr: Box::new(expression),
                 target: target.clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: target,
-            nullable,
+            value_type,
         })
     }
 
@@ -905,24 +919,24 @@ impl AnalyzerContext<'_> {
             return None;
         }
         let (binding, args) = call(expression)?;
-        let DataType::List(output) = &expression.data_type else {
+        let DataType::List(output) = &expression.value_type.data_type else {
             return None;
         };
         let input_shape = |i: usize| {
             let value = args.get(i)?;
             let source = argument_source(source, i);
             if let Some(logical) = self.wrapper_input_type(source, value, scope) {
-                return Some(project_type(&value.data_type, &logical));
+                return Some(project_type(&value.value_type.data_type, &logical));
             }
-            let mut shape = value.data_type.clone();
+            let mut shape = value.value_type.data_type.clone();
             if !matches!(source, Some(ast::Expr::Cast(_))) {
                 let mut original = value;
                 while let ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) = &original.kind {
                     original = expr;
                     shape = window_marker_shape(
-                        &value.data_type,
+                        &value.value_type.data_type,
                         &shape,
-                        Some(&original.data_type),
+                        Some(&original.value_type.data_type),
                         true,
                     )?;
                 }
@@ -968,7 +982,7 @@ impl AnalyzerContext<'_> {
                 )
             }
             "builtin.scalar/__array_struct_subfield/v1" => {
-                let ExprKind::Literal(LiteralValue::String(name)) = &args[1].kind else {
+                let Some(name) = string_value(&args[1]) else {
                     return None;
                 };
                 let DataType::List(item) = input_shape(0)? else {
@@ -1040,7 +1054,7 @@ impl AnalyzerContext<'_> {
                 Arc::new(field.clone())
             }
         };
-        match (id, &expression.data_type) {
+        match (id, &expression.value_type.data_type) {
             (
                 "builtin.scalar/__array_literal/v1"
                 | "builtin.aggregate/array_agg/v1"
@@ -1102,7 +1116,7 @@ impl AnalyzerContext<'_> {
                 }
                 let mut projected = Vec::with_capacity(2);
                 for (field, arg) in fields.iter().zip(args) {
-                    let DataType::List(item) = &arg.data_type else {
+                    let DataType::List(item) = &arg.value_type.data_type else {
                         return None;
                     };
                     projected.push(match field_type(item) {
@@ -1223,8 +1237,8 @@ fn ordinary_type(data_type: &DataType, nested: bool) -> Option<SqlType> {
 // not provenance inferred from storage. Binding coercions and trusted catalog
 // declarations may omit the item's marker; a present different marker refuses.
 fn witnessed_json_list_source(value: &TypedExpr) -> bool {
-    let compatible = witnessed_json_list_fields(&value.data_type)
-        || matches!((&value.kind, &value.data_type),
+    let compatible = witnessed_json_list_fields(&value.value_type.data_type)
+        || matches!((&value.kind, &value.value_type.data_type),
             (ExprKind::FunctionCall { binding, args, .. }, DataType::List(item))
                 if binding.function_id.as_str() == "builtin.scalar/__array_literal/v1"
                     && args.is_empty() && item.data_type() == &DataType::Null

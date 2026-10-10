@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -149,7 +151,7 @@ impl ProcessorOperator for ResultBufferSinkOperator {
         }
     }
 
-    fn can_accept_input(&self, chunk: &Chunk) -> Result<bool, String> {
+    fn can_accept_input(&self, chunk: &Chunk) -> ExecutionResult<bool> {
         if self.finished || chunk.is_empty() {
             return Ok(!self.finished);
         }
@@ -163,7 +165,8 @@ impl ProcessorOperator for ResultBufferSinkOperator {
                 return Err(format!(
                     "RESULT_SINK retained credit for {} bytes but next chunk requires {bytes}",
                     credit.bytes()
-                ));
+                )
+                .into());
             }
             return Ok(true);
         }
@@ -182,7 +185,9 @@ impl ProcessorOperator for ResultBufferSinkOperator {
             })?;
             if !Arc::ptr_eq(blocked, current) {
                 return Err(
-                    "RESULT_SINK blocked credit changed its readiness observable".to_string(),
+                    "RESULT_SINK blocked credit changed its readiness observable"
+                        .to_string()
+                        .into(),
                 );
             }
             if bytes == *blocked_bytes && current.generation() == *generation {
@@ -200,7 +205,8 @@ impl ProcessorOperator for ResultBufferSinkOperator {
                     return Err(format!(
                         "RESULT_SINK received credit for {} bytes but chunk requires {bytes}",
                         credit.bytes()
-                    ));
+                    )
+                    .into());
                 }
                 *state = ResultSinkCreditState::Reserved(credit);
                 Ok(true)
@@ -214,7 +220,9 @@ impl ProcessorOperator for ResultBufferSinkOperator {
                 })?;
                 if !Arc::ptr_eq(&observable, &current) {
                     return Err(
-                        "RESULT_SINK blocked credit changed its readiness observable".to_string(),
+                        "RESULT_SINK blocked credit changed its readiness observable"
+                            .to_string()
+                            .into(),
                     );
                 }
                 *state = ResultSinkCreditState::Blocked {
@@ -231,7 +239,7 @@ impl ProcessorOperator for ResultBufferSinkOperator {
         false
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if self.finished || chunk.is_empty() {
             return Ok(());
         }
@@ -248,7 +256,7 @@ impl ProcessorOperator for ResultBufferSinkOperator {
                     return Err(format!(
                         "RESULT_SINK retained credit for {} bytes but pushed chunk requires {bytes}",
                         credit.bytes()
-                    ));
+                    ).into());
                 }
                 ResultSinkCreditState::Ready | ResultSinkCreditState::Blocked { .. } => {
                     drop(state);
@@ -262,28 +270,29 @@ impl ProcessorOperator for ResultBufferSinkOperator {
                             return Err(format!(
                                 "RESULT_SINK received credit for {} bytes but chunk requires {bytes}",
                                 credit.bytes()
-                            ));
+                            ).into());
                         }
                         ResultWriteAdmission::Blocked => {
                             return Err(
                                 "RESULT_SINK push reached a result session without reserved byte credit"
-                                    .to_string(),
+                                    .to_string().into(),
                             );
                         }
                     }
                 }
             }
         };
-        self.session
+        Ok(self
+            .session
             .write_with_credit(chunk, credit)
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?)
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         Ok(None)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }
@@ -292,7 +301,7 @@ impl ProcessorOperator for ResultBufferSinkOperator {
 
         let prev = self.shared.remaining_drivers.fetch_sub(1, Ordering::AcqRel);
         if prev <= 0 {
-            return Err("RESULT_SINK driver count underflow".to_string());
+            return Err("RESULT_SINK driver count underflow".to_string().into());
         }
         if prev == 1 {
             self.session.finish().map_err(|error| error.to_string())?;
@@ -613,13 +622,13 @@ mod tests {
         fn has_output(&self) -> bool {
             self.0.is_some()
         }
-        fn push_chunk(&mut self, _: &RuntimeState, _: Chunk) -> Result<(), String> {
-            Err("source cannot accept input".to_string())
+        fn push_chunk(&mut self, _: &RuntimeState, _: Chunk) -> ExecutionResult<()> {
+            Err("source cannot accept input".to_string().into())
         }
-        fn pull_chunk(&mut self, _: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(self.0.take())
         }
-        fn set_finishing(&mut self, _: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
     }

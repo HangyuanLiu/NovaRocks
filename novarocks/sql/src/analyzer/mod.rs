@@ -20,8 +20,19 @@
 //! This module performs name resolution, type inference, and scope management
 //! without producing any physical plan concepts (tuple_id, slot_id, etc.).
 
+#[cfg(test)]
+mod canonical_call_tests;
+#[cfg(test)]
+mod column_type_control_tests;
+#[cfg(test)]
+mod element_at_control_tests;
+#[cfg(test)]
+mod extract_binding_tests;
+#[cfg(test)]
+mod full_value_type_tests;
 pub(crate) mod functions;
 mod helpers;
+pub(crate) use helpers::sql_logical_projection;
 mod literal_coercion;
 #[cfg(test)]
 mod load_op_column;
@@ -32,6 +43,11 @@ mod logical_output;
 )]
 pub(crate) mod query_prepass;
 mod resolve_expr;
+#[cfg(test)]
+mod scalar_rebind_contract_tests;
+mod value_conversion;
+#[cfg(test)]
+mod window_canonical_tests;
 /// The analyzer owns this bound and enforces it; it is named outside the
 /// analyzer only where a test has to build a chain that crosses it.
 #[cfg(test)]
@@ -57,7 +73,6 @@ use crate::analysis::{
     ResolvedQuery, ResolvedSelect, ResolvedSetOp, ResolvedValues, SetOpKind, SortItem,
     SubqueryInfo, TypedExpr,
 };
-use novarocks_types::wider_type;
 
 use helpers::{expr_display_name, extract_limit, extract_offset};
 use scope::AnalyzerScope;
@@ -97,6 +112,8 @@ pub(crate) fn analyze(
         catalog,
         current_database,
         crate::functions::builtin_sql_function_catalog(),
+        crate::constant::test_constant_policy(),
+        &crate::compiler::SqlCompileControl::unbounded(),
     )
 }
 
@@ -107,6 +124,8 @@ pub(crate) fn analyze_with_function_catalog(
     catalog: &dyn PlannerTableProvider,
     current_database: &str,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
         ResolvedQuery,
@@ -121,6 +140,8 @@ pub(crate) fn analyze_with_function_catalog(
         current_database,
         crate::column_id::ColumnRefFactory::new(),
         function_catalog,
+        constant_policy,
+        control,
     )
 }
 
@@ -131,6 +152,8 @@ pub(crate) fn analyze_with_function_catalog_and_sql_semantics(
     current_database: &str,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     sql_semantics: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
         ResolvedQuery,
@@ -146,6 +169,8 @@ pub(crate) fn analyze_with_function_catalog_and_sql_semantics(
         crate::column_id::ColumnRefFactory::new(),
         function_catalog,
         sql_semantics,
+        constant_policy,
+        control,
     )
 }
 
@@ -163,6 +188,8 @@ pub(crate) fn analyze_with_factory(
     catalog: &dyn PlannerTableProvider,
     current_database: &str,
     factory: crate::column_id::ColumnRefFactory,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
         ResolvedQuery,
@@ -177,6 +204,8 @@ pub(crate) fn analyze_with_factory(
         current_database,
         factory,
         crate::functions::builtin_sql_function_catalog(),
+        constant_policy,
+        control,
     )
 }
 
@@ -188,6 +217,8 @@ pub(crate) fn analyze_with_factory_and_function_catalog(
     current_database: &str,
     factory: crate::column_id::ColumnRefFactory,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
         ResolvedQuery,
@@ -203,6 +234,8 @@ pub(crate) fn analyze_with_factory_and_function_catalog(
         factory,
         function_catalog,
         &crate::sql_mode::SqlSemanticSettings::default(),
+        constant_policy,
+        control,
     )
 }
 
@@ -213,6 +246,8 @@ fn analyze_with_factory_and_function_catalog_inner(
     factory: crate::column_id::ColumnRefFactory,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     sql_semantics: &crate::sql_mode::SqlSemanticSettings,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
         ResolvedQuery,
@@ -221,6 +256,12 @@ fn analyze_with_factory_and_function_catalog_inner(
     ),
     AnalyzeError,
 > {
+    novarocks_type_contract::PureCompileControl::checkpoint(
+        control,
+        novarocks_type_contract::CompilePhase::Validate,
+        0,
+    )
+    .map_err(AnalyzeError::control)?;
     let query = crate::sql_mode::normalize_concat_query(query.clone(), sql_semantics)?;
     let query = query_prepass::preanalyze(query)?;
     let factory = std::rc::Rc::new(std::cell::RefCell::new(factory));
@@ -228,6 +269,8 @@ fn analyze_with_factory_and_function_catalog_inner(
         catalog,
         current_database,
         function_catalog,
+        constant_policy,
+        control,
         sql_semantics: sql_semantics.clone(),
         factory: factory.clone(),
         ctes: std::collections::HashMap::new(),
@@ -238,6 +281,7 @@ fn analyze_with_factory_and_function_catalog_inner(
         cte_registry: std::cell::RefCell::new(crate::analysis::cte::CTERegistry::new()),
     };
     let resolved = ctx.analyze_query(&query)?;
+    ctx.check_control()?;
     let registry = ctx.cte_registry.into_inner();
     let col_factory = std::rc::Rc::try_unwrap(factory)
         .map(|cell| cell.into_inner())
@@ -250,6 +294,8 @@ fn analyze_with_factory_and_function_catalog_inner(
 // ---------------------------------------------------------------------------
 
 pub(super) struct AnalyzerContext<'a> {
+    pub(super) control: &'a crate::compiler::SqlCompileControl,
+    pub(super) constant_policy: novarocks_functions::ConstantPolicy,
     pub(super) catalog: &'a dyn PlannerTableProvider,
     pub(super) current_database: &'a str,
     pub(super) function_catalog: &'a dyn crate::compiler::SqlFunctionCatalog,
@@ -274,6 +320,15 @@ pub(super) struct AnalyzerContext<'a> {
 }
 
 impl<'a> AnalyzerContext<'a> {
+    pub(super) fn check_control(&self) -> Result<(), AnalyzeError> {
+        novarocks_type_contract::PureCompileControl::checkpoint(
+            self.control,
+            novarocks_type_contract::CompilePhase::Validate,
+            0,
+        )
+        .map_err(AnalyzeError::control)
+    }
+
     fn with_sql_semantics_scope<T>(
         &self,
         settings: crate::sql_mode::SqlSemanticSettings,
@@ -283,6 +338,8 @@ impl<'a> AnalyzerContext<'a> {
             return analyze(self);
         }
         let child = AnalyzerContext {
+            control: self.control,
+            constant_policy: self.constant_policy,
             catalog: self.catalog,
             current_database: self.current_database,
             function_catalog: self.function_catalog,
@@ -324,12 +381,11 @@ impl<'a> AnalyzerContext<'a> {
         &self,
         qualifier: Option<String>,
         name: String,
-        data_type: arrow::datatypes::DataType,
-        nullable: bool,
+        value_type: novarocks_type_contract::FunctionValueType,
     ) -> crate::column_id::ColumnId {
         self.factory
             .borrow_mut()
-            .create(qualifier, name, data_type, nullable)
+            .create(qualifier, name, value_type)
     }
 
     /// Allocate a unique subquery placeholder ID.
@@ -351,14 +407,14 @@ impl<'a> AnalyzerContext<'a> {
         with_clause: &ast::With,
     ) -> Result<(AnalyzerContext<'a>, Vec<crate::analysis::cte::CteId>), AnalyzeError> {
         let mut pending_ctes = self.pending_ctes.clone();
-        pending_ctes.extend(
-            with_clause
-                .ctes
-                .iter()
-                .map(|cte| cte.name.value.to_lowercase()),
-        );
+        for cte in &with_clause.ctes {
+            self.check_control()?;
+            pending_ctes.insert(cte.name.value.to_lowercase());
+        }
 
         let mut child_ctx = AnalyzerContext {
+            control: self.control,
+            constant_policy: self.constant_policy,
             catalog: self.catalog,
             current_database: self.current_database,
             function_catalog: self.function_catalog,
@@ -374,6 +430,7 @@ impl<'a> AnalyzerContext<'a> {
         let mut local_cte_ids = Vec::with_capacity(with_clause.ctes.len());
 
         for cte in &with_clause.ctes {
+            self.check_control()?;
             let name = cte.name.value.to_lowercase();
             pending_ctes.remove(&name);
             child_ctx.pending_ctes = pending_ctes.clone();
@@ -381,12 +438,16 @@ impl<'a> AnalyzerContext<'a> {
             let col_aliases: Vec<String> = cte
                 .columns
                 .iter()
-                .map(|ident| ident.value.clone())
-                .collect();
+                .map(|ident| {
+                    self.check_control()?;
+                    Ok(ident.value.clone())
+                })
+                .collect::<Result<Vec<_>, AnalyzeError>>()?;
 
             let mut resolved_cte = child_ctx.analyze_query(&cte.query)?;
             if !col_aliases.is_empty() {
                 for (idx, alias_name) in col_aliases.iter().enumerate() {
+                    self.check_control()?;
                     if let Some(col) = resolved_cte.output_columns.get_mut(idx) {
                         col.name = alias_name.clone();
                     }
@@ -409,6 +470,7 @@ impl<'a> AnalyzerContext<'a> {
 
     /// Top-level query analysis.
     fn analyze_query(&self, query: &ast::Query) -> Result<ResolvedQuery, AnalyzeError> {
+        self.check_control()?;
         let settings = crate::sql_mode::query_sql_semantics(&self.sql_semantics, query)?;
         self.with_sql_semantics_scope(settings, |ctx| ctx.analyze_query_in_semantic_scope(query))
     }
@@ -493,6 +555,7 @@ impl<'a> AnalyzerContext<'a> {
             let mut pending = vec![set_expr];
             let mut operands = Vec::new();
             while let Some(current) = pending.pop() {
+                self.check_control()?;
                 match current {
                     ast::SetExpr::SetOperation(operation)
                         if operation.operator == ast::SetOperator::Union
@@ -508,19 +571,21 @@ impl<'a> AnalyzerContext<'a> {
             let operations = operands
                 .into_iter()
                 .map(|right| {
-                    (
+                    self.check_control()?;
+                    Ok((
                         ast::SetOperator::Union,
                         ast::SetQuantifier::All,
                         right,
                         set_expr.span(),
-                    )
+                    ))
                 })
-                .collect();
+                .collect::<Result<Vec<_>, AnalyzeError>>()?;
             (first, operations)
         } else {
             let mut operations = Vec::new();
             let mut leftmost = set_expr;
             while let ast::SetExpr::SetOperation(operation) = leftmost {
+                self.check_control()?;
                 operations.push((
                     operation.operator,
                     operation.quantifier,
@@ -534,6 +599,7 @@ impl<'a> AnalyzerContext<'a> {
         };
         let mut left_query = self.analyze_set_operand(leftmost)?;
         for (operator, quantifier, right, span) in operations {
+            self.check_control()?;
             let right_query = self.analyze_set_operand(right)?;
             let left_cols = &left_query.output_columns;
             let right_cols = &right_query.output_columns;
@@ -549,41 +615,17 @@ impl<'a> AnalyzerContext<'a> {
             }
             let mut output_cols = Vec::with_capacity(left_cols.len());
             for (lc, rc) in left_cols.iter().zip(right_cols) {
-                let dt = wider_type(&lc.data_type, &rc.data_type);
-                let column_id = self.alloc_column_id(
-                    None,
-                    lc.name.clone(),
-                    dt.clone(),
-                    lc.nullable || rc.nullable,
-                );
-                let left_logical = self.factory.borrow().logical_type(lc.column_id);
-                let right_logical = self.factory.borrow().logical_type(rc.column_id);
-                // Only homogeneous semantic domains survive a set-operation output.
-                let logical = if left_logical == right_logical {
-                    left_logical
-                } else if lc.data_type == DataType::Null {
-                    right_logical
-                } else if rc.data_type == DataType::Null {
-                    left_logical
-                } else {
-                    None
-                };
-                self.factory
-                    .borrow_mut()
-                    .set_logical_type(column_id, logical);
-                let left_json_list = self.factory.borrow().has_json_list_provenance(lc.column_id);
-                let right_json_list = self.factory.borrow().has_json_list_provenance(rc.column_id);
-                let json_list = (left_json_list && right_json_list)
-                    || (lc.data_type == DataType::Null && right_json_list)
-                    || (rc.data_type == DataType::Null && left_json_list);
-                self.factory
-                    .borrow_mut()
-                    .set_json_list_provenance(column_id, json_list);
+                self.check_control()?;
+                let value_type = helpers::assignment_common_value_type(
+                    &lc.value_type,
+                    &rc.value_type,
+                    self.control,
+                )?;
+                let column_id = self.alloc_column_id(None, lc.name.clone(), value_type.clone());
                 output_cols.push(OutputColumn {
                     column_id,
                     name: lc.name.clone(),
-                    data_type: dt,
-                    nullable: lc.nullable || rc.nullable,
+                    value_type,
                     is_internal: false,
                 });
             }
@@ -634,16 +676,21 @@ impl<'a> AnalyzerContext<'a> {
     ) -> Result<(ResolvedValues, Vec<OutputColumn>), AnalyzeError> {
         let scope = self.new_scope(); // VALUES has no table scope
         let mut resolved_rows = Vec::with_capacity(values.rows.len());
-        let mut column_types: Vec<DataType> = Vec::new();
+        let mut column_types: Vec<novarocks_type_contract::FunctionValueType> = Vec::new();
 
         for row in &values.rows {
+            self.check_control()?;
             let mut resolved_row = Vec::with_capacity(row.len());
             for (col_idx, expr) in row.iter().enumerate() {
                 let typed = self.analyze_expr(expr, &scope)?;
                 if col_idx < column_types.len() {
-                    column_types[col_idx] = wider_type(&column_types[col_idx], &typed.data_type);
+                    column_types[col_idx] = helpers::assignment_common_value_type(
+                        &column_types[col_idx],
+                        &typed.value_type,
+                        self.control,
+                    )?;
                 } else {
-                    column_types.push(typed.data_type.clone());
+                    column_types.push(typed.value_type.clone());
                 }
                 resolved_row.push(typed);
             }
@@ -653,53 +700,19 @@ impl<'a> AnalyzerContext<'a> {
         let output_cols: Vec<OutputColumn> = column_types
             .iter()
             .enumerate()
-            .map(|(i, dt)| {
+            .map(|(i, ty)| {
+                self.check_control()?;
                 let name = format!("column_{i}");
-                let column_id = self.alloc_column_id(None, name.clone(), dt.clone(), true);
-                let mut all_json = true;
-                let mut saw_json = false;
-                let mut all_json_list = true;
-                let mut saw_json_list = false;
-                for (source_row, typed_row) in values.rows.iter().zip(&resolved_rows) {
-                    let (Some(source), Some(typed)) = (source_row.get(i), typed_row.get(i)) else {
-                        all_json = false;
-                        all_json_list = false;
-                        break;
-                    };
-                    if matches!(
-                        source,
-                        ast::Expr::Literal(ast::Literal {
-                            kind: ast::LiteralKind::Null,
-                            ..
-                        })
-                    ) {
-                        continue;
-                    }
-                    let json = self.logical_output_type(Some(source), typed, &scope)
-                        == Some(novarocks_types::schema::SqlType::Json);
-                    all_json &= json;
-                    saw_json |= json;
-                    let json_list = self.json_list_provenance(Some(source), typed, &scope);
-                    all_json_list &= json_list;
-                    saw_json_list |= json_list;
-                }
-                if all_json && saw_json {
-                    self.factory
-                        .borrow_mut()
-                        .set_logical_type(column_id, Some(novarocks_types::schema::SqlType::Json));
-                }
-                self.factory
-                    .borrow_mut()
-                    .set_json_list_provenance(column_id, all_json_list && saw_json_list);
-                OutputColumn {
+                let value_type = helpers::with_nullability(ty.clone(), true);
+                let column_id = self.alloc_column_id(None, name.clone(), value_type.clone());
+                Ok(OutputColumn {
                     column_id,
                     name,
-                    data_type: dt.clone(),
-                    nullable: true,
+                    value_type,
                     is_internal: false,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, AnalyzeError>>()?;
 
         Ok((
             ResolvedValues {
@@ -758,6 +771,7 @@ impl<'a> AnalyzerContext<'a> {
         self.analyze_select_after_from(select, from, scope)
     }
 
+    #[inline(never)]
     fn analyze_select_after_from(
         &self,
         select: &ast::Select,
@@ -851,6 +865,7 @@ impl<'a> AnalyzerContext<'a> {
                     }
                     group_by.push(typed);
                 }
+                Err(error) if error.control_error().is_some() => return Err(error),
                 Err(_) => {
                     // Try SELECT aliases: GROUP BY alias_name
                     let mut alias_scope = scope.clone();
@@ -858,8 +873,7 @@ impl<'a> AnalyzerContext<'a> {
                         alias_scope.add_column(
                             None,
                             &item.output_name,
-                            item.expr.data_type.clone(),
-                            item.expr.nullable,
+                            item.expr.value_type.clone(),
                         );
                     }
                     let typed = self.analyze_expr(gb_expr, &alias_scope)?;
@@ -903,15 +917,16 @@ impl<'a> AnalyzerContext<'a> {
                 let analyzed = self.analyze_expr(expr, &scope);
                 match analyzed {
                     Ok(h) => Some(h),
+                    Err(error) if error.control_error().is_some() => return Err(error),
                     Err(_) => {
                         // Maybe references a SELECT alias — build alias scope
                         let mut alias_scope = scope.clone();
                         for item in &projection {
+                            self.check_control()?;
                             alias_scope.add_column(
                                 None,
                                 &item.output_name,
-                                item.expr.data_type.clone(),
-                                item.expr.nullable,
+                                item.expr.value_type.clone(),
                             );
                         }
                         let h = self.analyze_expr(expr, &alias_scope)?;
@@ -1004,8 +1019,8 @@ impl<'a> AnalyzerContext<'a> {
                 right,
                 decimal_overflow_policy,
             } => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::BinaryOp {
                     left: Box::new(self.substitute_select_aliases_for_select_inner(
                         *left, projection, from_scope, inside_agg,
@@ -1018,8 +1033,8 @@ impl<'a> AnalyzerContext<'a> {
                 },
             },
             ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::UnaryOp {
                     op,
                     expr: Box::new(self.substitute_select_aliases_for_select_inner(
@@ -1037,8 +1052,8 @@ impl<'a> AnalyzerContext<'a> {
                 let is_agg =
                     crate::analyzer::functions::is_aggregate_function(self.function_catalog, &name);
                 TypedExpr {
-                    data_type: expr.data_type,
-                    nullable: expr.nullable,
+                    value_type: expr.value_type.clone(),
+
                     kind: ExprKind::FunctionCall {
                         name,
                         args: args
@@ -1059,8 +1074,8 @@ impl<'a> AnalyzerContext<'a> {
                 }
             }
             ExprKind::LambdaFunction { params, body } => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::LambdaFunction {
                     params,
                     body: Box::new(self.substitute_select_aliases_for_select_inner(
@@ -1075,8 +1090,8 @@ impl<'a> AnalyzerContext<'a> {
                 order_by,
                 resolved,
             } => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::AggregateCall {
                     name,
                     args: args
@@ -1105,8 +1120,8 @@ impl<'a> AnalyzerContext<'a> {
                 target,
                 decimal_overflow_policy,
             } => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::Cast {
                     expr: Box::new(self.substitute_select_aliases_for_select_inner(
                         *inner, projection, from_scope, inside_agg,
@@ -1116,8 +1131,8 @@ impl<'a> AnalyzerContext<'a> {
                 },
             },
             ExprKind::Nested(inner) => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::Nested(Box::new(self.substitute_select_aliases_for_select_inner(
                     *inner, projection, from_scope, inside_agg,
                 ))),
@@ -1126,8 +1141,8 @@ impl<'a> AnalyzerContext<'a> {
                 expr: inner,
                 negated,
             } => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::IsNull {
                     expr: Box::new(self.substitute_select_aliases_for_select_inner(
                         *inner, projection, from_scope, inside_agg,
@@ -1140,8 +1155,8 @@ impl<'a> AnalyzerContext<'a> {
                 value,
                 negated,
             } => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::IsTruthValue {
                     expr: Box::new(self.substitute_select_aliases_for_select_inner(
                         *inner, projection, from_scope, inside_agg,
@@ -1155,8 +1170,8 @@ impl<'a> AnalyzerContext<'a> {
                 when_then,
                 else_expr,
             } => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::Case {
                     operand: operand.map(|expr| {
                         Box::new(self.substitute_select_aliases_for_select_inner(
@@ -1214,8 +1229,8 @@ impl<'a> AnalyzerContext<'a> {
                 right,
                 decimal_overflow_policy,
             } => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::BinaryOp {
                     left: Box::new(
                         self.substitute_select_aliases_inner(*left, projection, inside_agg),
@@ -1228,8 +1243,8 @@ impl<'a> AnalyzerContext<'a> {
                 },
             },
             ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::UnaryOp {
                     op,
                     expr: Box::new(
@@ -1244,8 +1259,8 @@ impl<'a> AnalyzerContext<'a> {
                 binding,
                 volatility,
             } => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::FunctionCall {
                     name,
                     args: args
@@ -1260,8 +1275,8 @@ impl<'a> AnalyzerContext<'a> {
                 },
             },
             ExprKind::LambdaFunction { params, body } => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::LambdaFunction {
                     params,
                     body: Box::new(
@@ -1276,8 +1291,8 @@ impl<'a> AnalyzerContext<'a> {
                 order_by,
                 resolved,
             } => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::AggregateCall {
                     name,
                     args: args
@@ -1300,8 +1315,8 @@ impl<'a> AnalyzerContext<'a> {
                 target,
                 decimal_overflow_policy,
             } => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::Cast {
                     expr: Box::new(
                         self.substitute_select_aliases_inner(*inner, projection, inside_agg),
@@ -1311,8 +1326,8 @@ impl<'a> AnalyzerContext<'a> {
                 },
             },
             ExprKind::Nested(inner) => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::Nested(Box::new(
                     self.substitute_select_aliases_inner(*inner, projection, inside_agg),
                 )),
@@ -1321,8 +1336,8 @@ impl<'a> AnalyzerContext<'a> {
                 expr: inner,
                 negated,
             } => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::IsNull {
                     expr: Box::new(
                         self.substitute_select_aliases_inner(*inner, projection, inside_agg),
@@ -1335,8 +1350,8 @@ impl<'a> AnalyzerContext<'a> {
                 value,
                 negated,
             } => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::IsTruthValue {
                     expr: Box::new(
                         self.substitute_select_aliases_inner(*inner, projection, inside_agg),
@@ -1350,8 +1365,8 @@ impl<'a> AnalyzerContext<'a> {
                 when_then,
                 else_expr,
             } => TypedExpr {
-                data_type: expr.data_type,
-                nullable: expr.nullable,
+                value_type: expr.value_type.clone(),
+
                 kind: ExprKind::Case {
                     operand: operand.map(|expr| {
                         Box::new(
@@ -1526,7 +1541,11 @@ impl<'a> AnalyzerContext<'a> {
         let mut grouping_fn_ids: Vec<(String, ColumnId)> =
             Vec::with_capacity(grouping_fn_args.len());
         for (fn_name, _) in &grouping_fn_args {
-            let column_id = self.alloc_column_id(None, fn_name.clone(), DataType::Int64, false);
+            let column_id = self.alloc_column_id(
+                None,
+                fn_name.clone(),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            );
             grouping_fn_ids.push((fn_name.clone(), column_id));
             sel.group_by.push(TypedExpr {
                 kind: ExprKind::ColumnRef {
@@ -1534,8 +1553,7 @@ impl<'a> AnalyzerContext<'a> {
                     qualifier: None,
                     column: fn_name.clone(),
                 },
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             });
         }
 
@@ -1604,7 +1622,7 @@ impl<'a> AnalyzerContext<'a> {
                 if let ExprKind::ColumnRef { column_id, .. } = &key.kind
                     && nulled_keys.contains(column_id)
                 {
-                    key.nullable = true;
+                    key.value_type.nullable = true;
                 }
             }
             let mut nulled_outputs = std::collections::HashSet::new();
@@ -1612,13 +1630,13 @@ impl<'a> AnalyzerContext<'a> {
                 if let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind
                     && nulled_keys.contains(column_id)
                 {
-                    item.expr.nullable = true;
+                    item.expr.value_type.nullable = true;
                     nulled_outputs.insert(item.output_column_id);
                 }
             }
             for column in &mut cols {
                 if nulled_outputs.contains(&column.column_id) {
-                    column.nullable = true;
+                    column.value_type.nullable = true;
                 }
             }
         }
@@ -1655,6 +1673,7 @@ impl<'a> AnalyzerContext<'a> {
         let mut effective_scope = scope.clone();
 
         for item in items {
+            self.check_control()?;
             match item {
                 ast::SelectItem::UnnamedExpr(expr) => {
                     let typed = self.analyze_expr(expr, &effective_scope)?;
@@ -1666,29 +1685,16 @@ impl<'a> AnalyzerContext<'a> {
                         } => (column.clone(), *column_id),
                         _ => {
                             let n = expr_display_name(expr);
-                            let id = self.alloc_column_id(
-                                None,
-                                n.clone(),
-                                typed.data_type.clone(),
-                                typed.nullable,
-                            );
+                            let id =
+                                self.alloc_column_id(None, n.clone(), typed.value_type.clone());
                             (n, id)
                         }
                     };
-                    let logical_type =
-                        self.logical_output_type(Some(expr), &typed, &effective_scope);
-                    let json_list = self.json_list_provenance(Some(expr), &typed, &effective_scope);
-                    self.factory
-                        .borrow_mut()
-                        .set_logical_type(column_id, logical_type);
-                    self.factory
-                        .borrow_mut()
-                        .set_json_list_provenance(column_id, json_list);
                     output_columns.push(OutputColumn {
                         column_id,
                         name: name.clone(),
-                        data_type: typed.data_type.clone(),
-                        nullable: typed.nullable,
+                        value_type: typed.value_type.clone(),
+
                         is_internal: false,
                     });
                     projection.push(ProjectItem {
@@ -1704,27 +1710,13 @@ impl<'a> AnalyzerContext<'a> {
                     let name = alias.value.clone();
                     let column_id = match &typed.kind {
                         ExprKind::ColumnRef { column_id, .. } => *column_id,
-                        _ => self.alloc_column_id(
-                            None,
-                            name.clone(),
-                            typed.data_type.clone(),
-                            typed.nullable,
-                        ),
+                        _ => self.alloc_column_id(None, name.clone(), typed.value_type.clone()),
                     };
-                    let logical_type =
-                        self.logical_output_type(Some(expr), &typed, &effective_scope);
-                    let json_list = self.json_list_provenance(Some(expr), &typed, &effective_scope);
-                    self.factory
-                        .borrow_mut()
-                        .set_logical_type(column_id, logical_type);
-                    self.factory
-                        .borrow_mut()
-                        .set_json_list_provenance(column_id, json_list);
                     output_columns.push(OutputColumn {
                         column_id,
                         name: name.clone(),
-                        data_type: typed.data_type.clone(),
-                        nullable: typed.nullable,
+                        value_type: typed.value_type.clone(),
+
                         is_internal: false,
                     });
                     // Make the alias visible to later items in the same
@@ -1738,8 +1730,7 @@ impl<'a> AnalyzerContext<'a> {
                             None,
                             &name,
                             column_id,
-                            typed.data_type.clone(),
-                            typed.nullable,
+                            typed.value_type.clone(),
                         );
                     }
                     projection.push(ProjectItem {
@@ -1749,7 +1740,8 @@ impl<'a> AnalyzerContext<'a> {
                     });
                 }
                 ast::SelectItem::Wildcard { .. } => {
-                    for (qualifier, col_name, col_id, data_type, nullable) in scope.iter_columns() {
+                    for (qualifier, col_name, col_id, value_type) in scope.iter_columns() {
+                        self.check_control()?;
                         // FULL OUTER USING columns are exposed as a synthetic
                         // `COALESCE(left.col, right.col)` expression. SELECT *
                         // expansion must use that expression instead of the
@@ -1764,15 +1756,14 @@ impl<'a> AnalyzerContext<'a> {
                                     qualifier: qualifier.clone(),
                                     column: col_name.clone(),
                                 },
-                                data_type: data_type.clone(),
-                                nullable: *nullable,
+                                value_type: value_type.clone(),
                             }
                         };
                         output_columns.push(OutputColumn {
                             column_id: *col_id,
                             name: col_name.clone(),
-                            data_type: data_type.clone(),
-                            nullable: *nullable,
+                            value_type: value_type.clone(),
+
                             is_internal: false,
                         });
                         projection.push(ProjectItem {
@@ -1800,7 +1791,7 @@ impl<'a> AnalyzerContext<'a> {
                         .unwrap_or(&qualifier_str)
                         .to_string();
                     let mut found = false;
-                    for (qualifier, col_name, col_id, data_type, nullable) in
+                    for (qualifier, col_name, col_id, value_type) in
                         scope.iter_qualified_columns(&qualifier_str).chain(
                             if fallback_qualifier != qualifier_str {
                                 Some(scope.iter_qualified_columns(&fallback_qualifier))
@@ -1811,6 +1802,7 @@ impl<'a> AnalyzerContext<'a> {
                             .flatten(),
                         )
                     {
+                        self.check_control()?;
                         found = true;
                         let typed = TypedExpr {
                             kind: ExprKind::ColumnRef {
@@ -1818,14 +1810,13 @@ impl<'a> AnalyzerContext<'a> {
                                 qualifier: qualifier.clone(),
                                 column: col_name.clone(),
                             },
-                            data_type: data_type.clone(),
-                            nullable: *nullable,
+                            value_type: value_type.clone(),
                         };
                         output_columns.push(OutputColumn {
                             column_id: *col_id,
                             name: col_name.clone(),
-                            data_type: data_type.clone(),
-                            nullable: *nullable,
+                            value_type: value_type.clone(),
+
                             is_internal: false,
                         });
                         projection.push(ProjectItem {
@@ -1861,25 +1852,24 @@ impl<'a> AnalyzerContext<'a> {
         let mut output_columns = Vec::new();
 
         for item in items {
+            self.check_control()?;
             match item {
                 ast::SelectItem::Wildcard { .. } => {
-                    for (qualifier, col_name, col_id, data_type, nullable) in
-                        wildcard_scope.iter_columns()
-                    {
+                    for (qualifier, col_name, col_id, value_type) in wildcard_scope.iter_columns() {
+                        self.check_control()?;
                         let typed = TypedExpr {
                             kind: ExprKind::ColumnRef {
                                 column_id: *col_id,
                                 qualifier: qualifier.clone(),
                                 column: col_name.clone(),
                             },
-                            data_type: data_type.clone(),
-                            nullable: *nullable,
+                            value_type: value_type.clone(),
                         };
                         output_columns.push(OutputColumn {
                             column_id: *col_id,
                             name: col_name.clone(),
-                            data_type: data_type.clone(),
-                            nullable: *nullable,
+                            value_type: value_type.clone(),
+
                             is_internal: false,
                         });
                         projection.push(ProjectItem {
@@ -1925,9 +1915,10 @@ impl<'a> AnalyzerContext<'a> {
                         Some(qualifier),
                         &scan.table.columns,
                         &scan.column_ids[..base_len],
-                    );
+                        self.control,
+                    )?;
                 } else {
-                    scope.add_table(Some(qualifier), &scan.table.columns);
+                    scope.add_table(Some(qualifier), &scan.table.columns, self.control)?;
                 }
                 if !scan.table.iceberg_row_lineage_metadata_columns.is_empty() {
                     if scan.column_ids.len() == base_len + meta_len {
@@ -1935,12 +1926,14 @@ impl<'a> AnalyzerContext<'a> {
                             qualifier,
                             &scan.table.iceberg_row_lineage_metadata_columns,
                             &scan.column_ids[base_len..],
-                        );
+                            self.control,
+                        )?;
                     } else {
                         scope.add_iceberg_metadata_columns(
                             qualifier,
                             &scan.table.iceberg_row_lineage_metadata_columns,
-                        );
+                            self.control,
+                        )?;
                     }
                 }
                 Ok(())
@@ -1955,8 +1948,7 @@ impl<'a> AnalyzerContext<'a> {
                         Some(alias.as_str()),
                         &col.name,
                         col.column_id,
-                        col.data_type.clone(),
-                        col.nullable,
+                        col.value_type.clone(),
                     );
                 }
                 Ok(())
@@ -1972,20 +1964,14 @@ impl<'a> AnalyzerContext<'a> {
                     Some(qualifier),
                     &gs.column_name,
                     gs.output_column_id,
-                    DataType::Int64,
-                    false,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
                 );
                 Ok(())
             }
             Relation::Unnest(unnest) => {
                 let qualifier = unnest.alias.as_deref().unwrap_or("unnest");
                 for col in &unnest.output_columns {
-                    scope.add_column(
-                        Some(qualifier),
-                        &col.name,
-                        col.data_type.clone(),
-                        col.nullable,
-                    );
+                    scope.add_column(Some(qualifier), &col.name, col.value_type.clone());
                 }
                 Ok(())
             }
@@ -1999,8 +1985,7 @@ impl<'a> AnalyzerContext<'a> {
                         Some(alias.as_str()),
                         &col.name,
                         col.column_id,
-                        col.data_type.clone(),
-                        col.nullable,
+                        col.value_type.clone(),
                     );
                 }
                 Ok(())
@@ -2014,7 +1999,12 @@ impl<'a> AnalyzerContext<'a> {
                 let qualifier = rel.alias.as_deref().unwrap_or(&rel.table.name);
                 // ORDER BY-only columns must reference the original scan
                 // bindings, just as ordinary Scan columns do above.
-                scope.add_table_with_ids(Some(qualifier), &rel.table.columns, &rel.column_ids);
+                scope.add_table_with_ids(
+                    Some(qualifier),
+                    &rel.table.columns,
+                    &rel.column_ids,
+                    self.control,
+                )?;
                 Ok(())
             }
             Relation::IcebergDeltaScan(rel) => {
@@ -2028,21 +2018,24 @@ impl<'a> AnalyzerContext<'a> {
                         Some(qualifier),
                         &rel.table.columns,
                         &rel.column_ids[..base_len],
-                    );
+                        self.control,
+                    )?;
                 } else {
-                    scope.add_table(Some(qualifier), &rel.table.columns);
+                    scope.add_table(Some(qualifier), &rel.table.columns, self.control)?;
                 }
                 if rel.column_ids.len() == base_len + meta_len {
                     scope.add_iceberg_metadata_columns_with_ids(
                         qualifier,
                         &rel.table.iceberg_row_lineage_metadata_columns,
                         &rel.column_ids[base_len..],
-                    );
+                        self.control,
+                    )?;
                 } else {
                     scope.add_iceberg_metadata_columns(
                         qualifier,
                         &rel.table.iceberg_row_lineage_metadata_columns,
-                    );
+                        self.control,
+                    )?;
                 }
                 Ok(())
             }
@@ -2068,8 +2061,7 @@ impl<'a> AnalyzerContext<'a> {
                 None,
                 &col.name,
                 col.column_id,
-                col.data_type.clone(),
-                col.nullable,
+                col.value_type.clone(),
             );
         }
         // Also register qualified column refs from projection items
@@ -2086,8 +2078,7 @@ impl<'a> AnalyzerContext<'a> {
                         Some(q),
                         column,
                         column_id,
-                        item.expr.data_type.clone(),
-                        item.expr.nullable,
+                        item.expr.value_type.clone(),
                     );
                 }
             }
@@ -2099,10 +2090,16 @@ impl<'a> AnalyzerContext<'a> {
         // from base-table scans reuses their ColumnIds (no minting), so it has
         // no effect on non-aggregate ORDER BY items.
         let order_by_from_scope: Option<AnalyzerScope> = match body {
-            QueryBody::Select(sel) => sel
+            QueryBody::Select(sel) => match sel
                 .from
                 .as_ref()
-                .and_then(|rel| self.rebuild_from_scope(rel).ok().map(|(_, scope)| scope)),
+                .map(|rel| self.rebuild_from_scope(rel))
+                .transpose()
+            {
+                Ok(scope) => scope.map(|(_, scope)| scope),
+                Err(error) if error.control_error().is_some() => return Err(error),
+                Err(_) => None,
+            },
             _ => None,
         };
 
@@ -2138,8 +2135,7 @@ impl<'a> AnalyzerContext<'a> {
                             qualifier: None,
                             column: col.name.clone(),
                         },
-                        data_type: col.data_type.clone(),
-                        nullable: col.nullable,
+                        value_type: col.value_type.clone(),
                     }
                 }
                 _ => {
@@ -2182,8 +2178,7 @@ impl<'a> AnalyzerContext<'a> {
                                         qualifier: None,
                                         column: ir_item.output_name.clone(),
                                     },
-                                    data_type: ir_item.expr.data_type.clone(),
-                                    nullable: ir_item.expr.nullable,
+                                    value_type: ir_item.expr.value_type.clone(),
                                 });
                                 break;
                             }
@@ -2222,8 +2217,7 @@ impl<'a> AnalyzerContext<'a> {
                                         qualifier: None,
                                         column: ir_item.output_name.clone(),
                                     },
-                                    data_type: ir_item.expr.data_type.clone(),
-                                    nullable: ir_item.expr.nullable,
+                                    value_type: ir_item.expr.value_type.clone(),
                                 });
                                 break;
                             }
@@ -2241,6 +2235,7 @@ impl<'a> AnalyzerContext<'a> {
                                     typed
                                 }
                             }
+                            Err(error) if error.control_error().is_some() => return Err(error),
                             Err(proj_err) => {
                                 if let QueryBody::Select(sel) = body {
                                     if let Some(ref from_rel) = sel.from {
@@ -2248,6 +2243,9 @@ impl<'a> AnalyzerContext<'a> {
                                         match self.analyze_expr(&ob.expr, &from_scope) {
                                             Ok(typed) => self
                                                 .substitute_select_aliases(typed, &sel.projection),
+                                            Err(error) if error.control_error().is_some() => {
+                                                return Err(error);
+                                            }
                                             Err(_) => {
                                                 let mut alias_scope = from_scope.clone();
                                                 for item in &sel.projection {
@@ -2260,8 +2258,7 @@ impl<'a> AnalyzerContext<'a> {
                                                         None,
                                                         &item.output_name,
                                                         col_id,
-                                                        item.expr.data_type.clone(),
-                                                        item.expr.nullable,
+                                                        item.expr.value_type.clone(),
                                                     );
                                                 }
                                                 match self.analyze_expr(&ob.expr, &alias_scope) {
@@ -2269,6 +2266,11 @@ impl<'a> AnalyzerContext<'a> {
                                                         typed,
                                                         &sel.projection,
                                                     ),
+                                                    Err(error)
+                                                        if error.control_error().is_some() =>
+                                                    {
+                                                        return Err(error);
+                                                    }
                                                     Err(_) => return Err(proj_err),
                                                 }
                                             }
@@ -2316,9 +2318,16 @@ impl<'a> AnalyzerContext<'a> {
         // are opaque blobs with no ordering. Check the projection scope for
         // alias references, then the FROM scope for direct column refs.
         let from_scope_for_check: Option<AnalyzerScope> = if let QueryBody::Select(sel) = body {
-            sel.from
+            match sel
+                .from
                 .as_ref()
-                .and_then(|rel| self.rebuild_from_scope(rel).ok().map(|(_, s)| s))
+                .map(|rel| self.rebuild_from_scope(rel))
+                .transpose()
+            {
+                Ok(scope) => scope.map(|(_, scope)| scope),
+                Err(error) if error.control_error().is_some() => return Err(error),
+                Err(_) => None,
+            }
         } else {
             None
         };
@@ -2362,8 +2371,7 @@ impl<'a> AnalyzerContext<'a> {
     ) -> TypedExpr {
         let TypedExpr {
             kind,
-            data_type,
-            nullable,
+            mut value_type,
         } = expr;
         let kind = match kind {
             ExprKind::ColumnRef {
@@ -2372,8 +2380,11 @@ impl<'a> AnalyzerContext<'a> {
                 column,
             } => {
                 let column_id = if inside_agg {
-                    match from_scope.resolve(qualifier.as_deref(), &column) {
-                        Ok((base_id, _, _)) => base_id,
+                    match from_scope.resolve_value_type(qualifier.as_deref(), &column) {
+                        Ok((base_id, base_type)) => {
+                            value_type = base_type;
+                            base_id
+                        }
                         Err(_) => column_id,
                     }
                 } else {
@@ -2526,8 +2537,7 @@ impl<'a> AnalyzerContext<'a> {
         };
         TypedExpr {
             kind,
-            data_type,
-            nullable,
+            value_type: value_type,
         }
     }
 }
@@ -2593,9 +2603,10 @@ fn contains_subquery_placeholder(expr: &TypedExpr) -> bool {
                     .iter()
                     .any(|item| contains_subquery_placeholder(&item.expr))
         }
-        ExprKind::ColumnRef { .. } | ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => {
-            false
-        }
+        ExprKind::ColumnRef { .. }
+        | ExprKind::LambdaParamRef { .. }
+        | ExprKind::Literal(_)
+        | ExprKind::Constant(_) => false,
     }
 }
 
@@ -2612,8 +2623,7 @@ fn select_item_output_column_id(
         _ => ctx.alloc_column_id(
             None,
             fallback_name.to_string(),
-            item.expr.data_type.clone(),
-            item.expr.nullable,
+            item.expr.value_type.clone(),
         ),
     }
 }
@@ -2765,8 +2775,10 @@ fn replace_grouping_markers_in_typed_expr(
                         qualifier: None,
                         column: fn_name.clone(),
                     },
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 };
             }
             expr.clone()
@@ -2777,8 +2789,8 @@ fn replace_grouping_markers_in_typed_expr(
             right,
             decimal_overflow_policy,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(replace_grouping_markers_in_typed_expr(
                     left,
@@ -2797,8 +2809,8 @@ fn replace_grouping_markers_in_typed_expr(
             },
         },
         ExprKind::UnaryOp { op, expr: inner } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::UnaryOp {
                 op: *op,
                 expr: Box::new(replace_grouping_markers_in_typed_expr(
@@ -2816,8 +2828,8 @@ fn replace_grouping_markers_in_typed_expr(
             binding,
             volatility,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::FunctionCall {
                 name: name.clone(),
                 args: args
@@ -2837,8 +2849,8 @@ fn replace_grouping_markers_in_typed_expr(
             },
         },
         ExprKind::LambdaFunction { params, body } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::LambdaFunction {
                 params: params.clone(),
                 body: Box::new(replace_grouping_markers_in_typed_expr(
@@ -2856,8 +2868,8 @@ fn replace_grouping_markers_in_typed_expr(
             order_by,
             resolved,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::AggregateCall {
                 name: name.clone(),
                 args: args
@@ -2891,8 +2903,8 @@ fn replace_grouping_markers_in_typed_expr(
             target,
             decimal_overflow_policy,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::Cast {
                 expr: Box::new(replace_grouping_markers_in_typed_expr(
                     inner,
@@ -2908,8 +2920,8 @@ fn replace_grouping_markers_in_typed_expr(
             expr: inner,
             negated,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::IsNull {
                 expr: Box::new(replace_grouping_markers_in_typed_expr(
                     inner,
@@ -2925,8 +2937,8 @@ fn replace_grouping_markers_in_typed_expr(
             list,
             negated,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::InList {
                 expr: Box::new(replace_grouping_markers_in_typed_expr(
                     inner,
@@ -2954,8 +2966,8 @@ fn replace_grouping_markers_in_typed_expr(
             high,
             negated,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::Between {
                 expr: Box::new(replace_grouping_markers_in_typed_expr(
                     inner,
@@ -2983,8 +2995,8 @@ fn replace_grouping_markers_in_typed_expr(
             pattern,
             negated,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::Like {
                 expr: Box::new(replace_grouping_markers_in_typed_expr(
                     inner,
@@ -3002,8 +3014,8 @@ fn replace_grouping_markers_in_typed_expr(
             },
         },
         ExprKind::Nested(inner) => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::Nested(Box::new(replace_grouping_markers_in_typed_expr(
                 inner,
                 grouping_fn_args,
@@ -3023,8 +3035,8 @@ fn replace_grouping_markers_in_typed_expr(
             window_frame,
             ignore_nulls,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::WindowCall {
                 name: name.clone(),
                 args: args
@@ -3083,8 +3095,8 @@ fn replace_grouping_markers_in_typed_expr(
             when_then,
             else_expr,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::Case {
                 operand: operand.as_ref().map(|o| {
                     Box::new(replace_grouping_markers_in_typed_expr(
@@ -3128,8 +3140,8 @@ fn replace_grouping_markers_in_typed_expr(
             value,
             negated,
         } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::IsTruthValue {
                 expr: Box::new(replace_grouping_markers_in_typed_expr(
                     inner,
@@ -3142,8 +3154,8 @@ fn replace_grouping_markers_in_typed_expr(
             },
         },
         ExprKind::Lambda { params, body } => TypedExpr {
-            data_type: expr.data_type.clone(),
-            nullable: expr.nullable,
+            value_type: expr.value_type.clone(),
+
             kind: ExprKind::Lambda {
                 params: params.clone(),
                 body: Box::new(replace_grouping_markers_in_typed_expr(
@@ -3157,6 +3169,7 @@ fn replace_grouping_markers_in_typed_expr(
         ExprKind::ColumnRef { .. }
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. } => expr.clone(),
     }
 }
@@ -3221,8 +3234,7 @@ fn sync_output_columns_from_projection(
     projection: &[crate::analysis::ProjectItem],
 ) {
     for (output, item) in output_columns.iter_mut().zip(projection.iter()) {
-        output.data_type = item.expr.data_type.clone();
-        output.nullable = item.expr.nullable;
+        output.value_type = item.expr.value_type.clone();
     }
 }
 
@@ -3243,6 +3255,184 @@ mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
 
     struct TestCatalog;
+
+    struct AnalysisObservation {
+        checks: std::sync::atomic::AtomicUsize,
+        cancel_at: usize,
+    }
+    impl crate::compiler::SqlCancellationObservation for AnalysisObservation {
+        fn is_cancelled(&self) -> bool {
+            self.checks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                >= self.cancel_at
+        }
+    }
+
+    #[test]
+    fn request_control_is_observed_inside_cte_subquery_and_lambda_analysis() {
+        for sql in [
+            "WITH c AS (SELECT 1 AS k) SELECT k + 2 FROM c",
+            "SELECT (SELECT 1) + 2",
+            "SELECT array_map(x -> x + 1, [1, 2])",
+        ] {
+            let query = parse_native_query(sql).unwrap();
+            let active = std::sync::Arc::new(AnalysisObservation {
+                checks: std::sync::atomic::AtomicUsize::new(0),
+                cancel_at: usize::MAX,
+            });
+            let control = crate::compiler::SqlCompileControl::new(None, active.clone());
+            analyze_with_function_catalog(
+                &query,
+                &TestCatalog,
+                "default",
+                crate::functions::builtin_sql_function_catalog(),
+                crate::constant::test_constant_policy(),
+                &control,
+            )
+            .unwrap();
+            let checks = active.checks.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                checks > 4,
+                "actual nested expression work must observe request control: {sql}"
+            );
+            let cancel = std::sync::Arc::new(AnalysisObservation {
+                checks: std::sync::atomic::AtomicUsize::new(0),
+                cancel_at: checks / 2,
+            });
+            let control = crate::compiler::SqlCompileControl::new(None, cancel.clone());
+            let error = analyze_with_function_catalog(
+                &query,
+                &TestCatalog,
+                "default",
+                crate::functions::builtin_sql_function_catalog(),
+                crate::constant::test_constant_policy(),
+                &control,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.control_error(),
+                Some(novarocks_type_contract::CompileControlError::Cancelled)
+            );
+            assert_eq!(
+                crate::compiler::SqlCompileError::from(error),
+                crate::compiler::SqlCompileError::Cancelled
+            );
+            assert_eq!(
+                cancel.checks.load(std::sync::atomic::Ordering::SeqCst),
+                checks / 2 + 1,
+                "control failure must not retry lexical scopes"
+            );
+        }
+    }
+
+    fn successful_analysis_checks(sql: &str) -> usize {
+        let query = parse_native_query(sql).unwrap();
+        let observation = std::sync::Arc::new(AnalysisObservation {
+            checks: std::sync::atomic::AtomicUsize::new(0),
+            cancel_at: usize::MAX,
+        });
+        let control = crate::compiler::SqlCompileControl::new(None, observation.clone());
+        analyze_with_function_catalog(
+            &query,
+            &TestCatalog,
+            "default",
+            crate::functions::builtin_sql_function_catalog(),
+            crate::constant::test_constant_policy(),
+            &control,
+        )
+        .unwrap();
+        observation.checks.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn assert_analysis_stops_at_cancel(sql: &str, cancel_at: usize) {
+        let query = parse_native_query(sql).unwrap();
+        let observation = std::sync::Arc::new(AnalysisObservation {
+            checks: std::sync::atomic::AtomicUsize::new(0),
+            cancel_at,
+        });
+        let control = crate::compiler::SqlCompileControl::new(None, observation.clone());
+        let error = analyze_with_function_catalog(
+            &query,
+            &TestCatalog,
+            "default",
+            crate::functions::builtin_sql_function_catalog(),
+            crate::constant::test_constant_policy(),
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.control_error(),
+            Some(novarocks_type_contract::CompileControlError::Cancelled)
+        );
+        assert_eq!(
+            observation.checks.load(std::sync::atomic::Ordering::SeqCst),
+            cancel_at + 1,
+            "typed cancellation must leave analysis without another observation"
+        );
+    }
+
+    #[test]
+    fn having_control_failure_does_not_retry_the_select_alias_scope() {
+        let prefix_checks = successful_analysis_checks("SELECT 1 AS total");
+        let sql = "SELECT 1 AS total HAVING total > 0";
+        assert!(successful_analysis_checks(sql) > prefix_checks);
+        // The prefix's final checkpoint is replaced by the first HAVING
+        // expression checkpoint. This reaches HAVING itself, before its
+        // legitimate name-resolution failure can trigger alias substitution.
+        assert_analysis_stops_at_cancel(sql, prefix_checks - 1);
+    }
+
+    #[test]
+    fn wide_qualified_wildcard_observes_control_during_column_expansion() {
+        let columns = (0..320)
+            .map(|index| format!("1 AS c{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let from = format!("FROM (SELECT {columns}) AS w");
+        let narrow_checks = successful_analysis_checks(&format!("SELECT 1 {from}"));
+        let sql = format!("SELECT w.* {from}");
+        let checks = successful_analysis_checks(&sql);
+        assert!(checks >= narrow_checks + 256);
+        // All derived-column expressions have completed; the remaining tail
+        // is the actual qualified wildcard expansion and final checkpoints.
+        assert_analysis_stops_at_cancel(&sql, checks - 128);
+    }
+
+    #[test]
+    fn values_rectangular_provenance_pass_observes_control_between_cells() {
+        let row = format!("({})", vec!["1"; 16].join(", "));
+        let sql = format!("VALUES {}", vec![row; 40].join(", "));
+        let checks = successful_analysis_checks(&sql);
+        assert!(checks > 16 * 40);
+        // After expression analysis, the provenance pass examines the full
+        // rectangle again. Cancellation here exercises that pass's own
+        // observation rather than a literal-expression checkpoint.
+        assert_analysis_stops_at_cancel(&sql, checks - 128);
+    }
+
+    #[test]
+    fn analyzed_products_do_not_retain_the_borrowed_request_control() {
+        let observation = std::sync::Arc::new(AnalysisObservation {
+            checks: std::sync::atomic::AtomicUsize::new(0),
+            cancel_at: usize::MAX,
+        });
+        let weak = std::sync::Arc::downgrade(&observation);
+        let control = crate::compiler::SqlCompileControl::new(None, observation.clone());
+        let query = parse_native_query("SELECT 1").unwrap();
+        let products = analyze_with_function_catalog(
+            &query,
+            &TestCatalog,
+            "default",
+            crate::functions::builtin_sql_function_catalog(),
+            crate::constant::test_constant_policy(),
+            &control,
+        )
+        .unwrap();
+        drop(control);
+        drop(observation);
+        assert!(weak.upgrade().is_none());
+        assert_eq!(products.0.output_columns.len(), 1);
+    }
 
     fn sql_test_scan_source(
         catalog: &str,
@@ -3838,14 +4028,14 @@ mod tests {
                 .expect("wide decimal literal should analyze");
 
         assert_eq!(
-            resolved.output_columns[0].data_type,
+            resolved.output_columns[0].value_type.data_type,
             DataType::Decimal256(39, 9)
         );
         let QueryBody::Select(select) = &resolved.body else {
             panic!("expected select body");
         };
         assert_eq!(
-            select.projection[0].expr.data_type,
+            select.projection[0].expr.value_type.data_type,
             DataType::Decimal256(39, 9)
         );
     }
@@ -3876,13 +4066,16 @@ mod tests {
             DataType::Decimal256(39, 9),
             true,
         )));
-        assert_eq!(resolved.output_columns[0].data_type, expected);
+        assert_eq!(resolved.output_columns[0].value_type.data_type, expected);
     }
 
     #[test]
     fn hex_string_literal_analyzes_as_binary() {
         let resolved = parse_raw_and_analyze("SELECT X'AB01'").expect("analysis should succeed");
-        assert_eq!(resolved.output_columns[0].data_type, DataType::Binary);
+        assert_eq!(
+            resolved.output_columns[0].value_type.data_type,
+            DataType::Binary
+        );
         let QueryBody::Select(select) = &resolved.body else {
             panic!("expected select body");
         };
@@ -4128,7 +4321,8 @@ mod tests {
         let spec = only_predicate_spec(sel);
         assert!(matches!(spec.kind, SubqueryKind::Exists { negated: false }));
         assert!(
-            apply_inner_filter(&spec.inner).data_type == arrow::datatypes::DataType::Boolean,
+            apply_inner_filter(&spec.inner).value_type.data_type
+                == arrow::datatypes::DataType::Boolean,
             "inner EXISTS filter should retain correlation and residual predicates"
         );
     }
@@ -4186,7 +4380,11 @@ mod tests {
             matches!(spec.kind, SubqueryKind::InSubquery { negated: true }),
             "correlated nullable NOT IN should be routed as a negated IN Apply spec"
         );
-        assert!(spec.in_lhs.as_ref().is_some_and(|lhs| lhs.nullable));
+        assert!(
+            spec.in_lhs
+                .as_ref()
+                .is_some_and(|lhs| lhs.value_type.nullable)
+        );
     }
 
     #[test]
@@ -4713,7 +4911,7 @@ mod tests {
             parse_and_analyze(sql).expect("CASE with scalar subqueries in projection should work");
         assert!(!resolved.output_columns.is_empty());
         assert_eq!(
-            resolved.output_columns[0].data_type,
+            resolved.output_columns[0].value_type.data_type,
             arrow::datatypes::DataType::Float64,
             "rewritten CASE scalar-subquery projection should expose the final branch type"
         );
@@ -4721,7 +4919,7 @@ mod tests {
         if let QueryBody::Select(sel) = &resolved.body {
             for item in &sel.projection {
                 assert_eq!(
-                    item.expr.data_type,
+                    item.expr.value_type.data_type,
                     arrow::datatypes::DataType::Float64,
                     "projection expression type should be recomputed after placeholder replacement"
                 );
@@ -4742,7 +4940,7 @@ mod tests {
         .expect("analysis should succeed");
         assert_eq!(resolved.output_columns.len(), 1);
         assert!(matches!(
-            resolved.output_columns[0].data_type,
+            resolved.output_columns[0].value_type.data_type,
             arrow::datatypes::DataType::List(_)
         ));
     }
@@ -4841,7 +5039,7 @@ mod tests {
         )
         .expect("array_map lambda parameter should resolve in lambda scope");
         assert_eq!(resolved.output_columns.len(), 1);
-        match &resolved.output_columns[0].data_type {
+        match &resolved.output_columns[0].value_type.data_type {
             arrow::datatypes::DataType::List(item) => {
                 assert!(matches!(item.data_type(), arrow::datatypes::DataType::Utf8));
             }
@@ -4854,7 +5052,7 @@ mod tests {
         let resolved = parse_raw_and_analyze("SELECT array_map((x, y) -> x + y, [1,2], [3,4])")
             .expect("array_map should analyze multi-parameter lambda");
         assert_eq!(resolved.output_columns.len(), 1);
-        match &resolved.output_columns[0].data_type {
+        match &resolved.output_columns[0].value_type.data_type {
             arrow::datatypes::DataType::List(item) => {
                 // StarRocks narrows array literal element types to the
                 // smallest signed integer width (TINYINT for `[1, 2]`),
@@ -4913,7 +5111,7 @@ mod tests {
             .expect("any_match should analyze lambda predicate");
         assert_eq!(resolved.output_columns.len(), 1);
         assert!(matches!(
-            resolved.output_columns[0].data_type,
+            resolved.output_columns[0].value_type.data_type,
             arrow::datatypes::DataType::Boolean
         ));
     }
@@ -5221,6 +5419,7 @@ mod tests {
             ExprKind::ColumnRef { .. }
             | ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::SubqueryPlaceholder { .. } => None,
         }
     }
@@ -5295,6 +5494,7 @@ mod tests {
             }
             ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::SubqueryPlaceholder { .. } => false,
         }
     }
@@ -5366,6 +5566,7 @@ mod tests {
             ExprKind::ColumnRef { .. }
             | ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::SubqueryPlaceholder { .. } => false,
         }
     }
@@ -5622,8 +5823,7 @@ mod tests {
     fn p1_typed_marker_replacement_ignores_synthetic_grouping_entry() {
         let expr = TypedExpr {
             kind: ExprKind::Literal(crate::analysis::LiteralValue::Int(-9000)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         };
         let grouping_fn_args = vec![("__grouping_fn_0".to_string(), vec!["k1".to_string()])];
         let grouping_fn_ids = vec![(
@@ -5743,7 +5943,10 @@ mod tests {
             panic!("expected Select body");
         };
         let expr = &sel.projection[0].expr;
-        assert_eq!(expr.data_type, arrow::datatypes::DataType::Boolean);
+        assert_eq!(
+            expr.value_type.data_type,
+            arrow::datatypes::DataType::Boolean
+        );
         let ExprKind::WindowCall { name, args, .. } = &expr.kind else {
             panic!("expected WindowCall, got {:?}", expr.kind);
         };
@@ -5756,7 +5959,10 @@ mod tests {
             );
         };
         assert_eq!(target, &arrow::datatypes::DataType::Boolean);
-        assert_eq!(args[0].data_type, arrow::datatypes::DataType::Boolean);
+        assert_eq!(
+            args[0].value_type.data_type,
+            arrow::datatypes::DataType::Boolean
+        );
     }
 
     #[test]
@@ -5769,7 +5975,10 @@ mod tests {
         };
 
         for expr in [&sel.projection[0].expr, &sel.projection[1].expr] {
-            assert_eq!(expr.data_type, arrow::datatypes::DataType::Float64);
+            assert_eq!(
+                expr.value_type.data_type,
+                arrow::datatypes::DataType::Float64
+            );
             let ExprKind::AggregateCall { name, args, .. } = &expr.kind else {
                 panic!("expected AggregateCall, got {:?}", expr.kind);
             };
@@ -5784,8 +5993,11 @@ mod tests {
                 panic!("expected aggregate argument cast, got {:?}", args[0].kind);
             };
             assert_eq!(target, &arrow::datatypes::DataType::Float64);
-            assert_eq!(args[0].data_type, arrow::datatypes::DataType::Float64);
-            assert_eq!(inner.data_type, arrow::datatypes::DataType::Utf8);
+            assert_eq!(
+                args[0].value_type.data_type,
+                arrow::datatypes::DataType::Float64
+            );
+            assert_eq!(inner.value_type.data_type, arrow::datatypes::DataType::Utf8);
         }
     }
 
@@ -5807,8 +6019,11 @@ mod tests {
             panic!("expected length argument cast, got {:?}", args[0].kind);
         };
         assert_eq!(target, &arrow::datatypes::DataType::Utf8);
-        assert_eq!(args[0].data_type, arrow::datatypes::DataType::Utf8);
-        assert_eq!(expr.data_type, arrow::datatypes::DataType::Int64);
+        assert_eq!(
+            args[0].value_type.data_type,
+            arrow::datatypes::DataType::Utf8
+        );
+        assert_eq!(expr.value_type.data_type, arrow::datatypes::DataType::Int64);
     }
 
     #[test]
@@ -5829,8 +6044,14 @@ mod tests {
             panic!("expected left value argument cast, got {:?}", args[0].kind);
         };
         assert_eq!(target, &arrow::datatypes::DataType::Utf8);
-        assert_eq!(expr.data_type, arrow::datatypes::DataType::Float64);
-        assert_eq!(args[1].data_type, arrow::datatypes::DataType::Int64);
+        assert_eq!(
+            expr.value_type.data_type,
+            arrow::datatypes::DataType::Float64
+        );
+        assert_eq!(
+            args[1].value_type.data_type,
+            arrow::datatypes::DataType::Int64
+        );
     }
 
     #[test]
@@ -5843,11 +6064,11 @@ mod tests {
             panic!("expected Select body");
         };
         assert_eq!(
-            sel.projection[0].expr.data_type,
+            sel.projection[0].expr.value_type.data_type,
             arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
         );
         assert_eq!(
-            sel.projection[1].expr.data_type,
+            sel.projection[1].expr.value_type.data_type,
             arrow::datatypes::DataType::Date32
         );
     }
@@ -5875,7 +6096,7 @@ mod tests {
             target,
             &arrow::datatypes::DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None)
         );
-        assert_eq!(expr.data_type, arrow::datatypes::DataType::Int64);
+        assert_eq!(expr.value_type.data_type, arrow::datatypes::DataType::Int64);
     }
 
     #[test]
@@ -5885,7 +6106,8 @@ mod tests {
         let QueryBody::Select(sel) = &resolved.body else {
             panic!("expected Select body");
         };
-        let arrow::datatypes::DataType::List(item) = &sel.projection[0].expr.data_type else {
+        let arrow::datatypes::DataType::List(item) = &sel.projection[0].expr.value_type.data_type
+        else {
             panic!("expected ARRAY return type");
         };
         assert_eq!(item.data_type(), &arrow::datatypes::DataType::Utf8);
@@ -5897,8 +6119,14 @@ mod tests {
         };
         assert!(matches!(args[0].kind, ExprKind::Cast { .. }));
         assert!(matches!(args[1].kind, ExprKind::Cast { .. }));
-        assert_eq!(args[0].data_type, arrow::datatypes::DataType::Utf8);
-        assert_eq!(args[1].data_type, arrow::datatypes::DataType::Utf8);
+        assert_eq!(
+            args[0].value_type.data_type,
+            arrow::datatypes::DataType::Utf8
+        );
+        assert_eq!(
+            args[1].value_type.data_type,
+            arrow::datatypes::DataType::Utf8
+        );
     }
 
     #[test]
@@ -6160,8 +6388,8 @@ mod tests {
         assert_eq!(resolved.output_columns.len(), 1);
         let col = &resolved.output_columns[0];
         assert_eq!(col.name, "snapshot_id");
-        assert_eq!(col.data_type, arrow::datatypes::DataType::Int64);
-        assert!(!col.nullable);
+        assert_eq!(col.value_type.data_type, arrow::datatypes::DataType::Int64);
+        assert!(!col.value_type.nullable);
     }
 
     #[test]
@@ -6204,13 +6432,18 @@ mod tests {
             let query = parse_native_query(sql).expect("parse metadata ORDER BY");
             let (resolved, registry, mut factory) =
                 analyze(&query, &TestCatalog, "default").expect("analyze metadata ORDER BY");
-            let logical_plan =
-                crate::planner::logical::build::plan_query(resolved, registry, &mut factory)
-                    .expect("plan metadata ORDER BY");
+            let logical_plan = crate::planner::logical::build::plan_query(
+                resolved,
+                registry,
+                &mut factory,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .expect("plan metadata ORDER BY");
             let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
             let optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
                 &logical_plan,
                 &mut scalar_arena,
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .expect("logical to optimizer expression");
             let optimized_tree = crate::optimizer::optimize_with_test_table_statistics(
@@ -6279,7 +6512,7 @@ mod tests {
         assert_eq!(resolved.output_columns.len(), 1);
         assert_eq!(resolved.output_columns[0].name, "_row_id");
         assert_eq!(
-            resolved.output_columns[0].data_type,
+            resolved.output_columns[0].value_type.data_type,
             arrow::datatypes::DataType::Int64
         );
     }
@@ -6480,15 +6713,24 @@ mod tests {
             factory.create(
                 None,
                 format!("seed{i}"),
-                arrow::datatypes::DataType::Int64,
-                false,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
             );
         }
         assert_eq!(factory.peek_next_id(), 4);
 
         let query = parse_native_query("SELECT 1 + 1 AS x").expect("parse");
-        let (_resolved, _ctes, out_factory) =
-            analyze_with_factory(&query, &TestCatalog, "db", factory).expect("analyze");
+        let (_resolved, _ctes, out_factory) = analyze_with_factory(
+            &query,
+            &TestCatalog,
+            "db",
+            factory,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("analyze");
         // The analysis must have allocated its ids on top of the seeded ones.
         assert!(out_factory.peek_next_id() > 4);
         assert_eq!(out_factory.get(crate::column_id::ColumnId(1)).name, "seed0");
@@ -6609,7 +6851,7 @@ mod tests {
         assert_eq!(select.apply_specs.len(), 1);
         let spec = &select.apply_specs[0];
         assert_eq!(
-            spec.output_column.data_type,
+            spec.output_column.value_type.data_type,
             DataType::Float64,
             "AVG scalar subquery output must remain Float64"
         );
@@ -6626,12 +6868,12 @@ mod tests {
         };
 
         assert_eq!(
-            left.data_type,
+            left.value_type.data_type,
             DataType::Float64,
             "left INT operand should be widened to Float64 for AVG comparison"
         );
         assert_eq!(
-            right.data_type,
+            right.value_type.data_type,
             DataType::Float64,
             "scalar subquery RHS should stay Float64, not cast back to INT"
         );
@@ -6850,7 +7092,7 @@ mod tests {
                     if alias.starts_with("__sq_null_") || alias.starts_with("__sq_any_") {
                         for column in output_columns {
                             if column.name.starts_with("__has_") {
-                                out.push((column.name.clone(), column.nullable));
+                                out.push((column.name.clone(), column.value_type.nullable));
                             }
                         }
                     }

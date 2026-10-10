@@ -27,6 +27,7 @@
 //! Kept for architectural symmetry and to allow per-operator
 //! `disable_optimizer_rules` control in the future.
 
+use crate::compiler::SqlCompileError;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{OpKind, Pattern};
 use crate::optimizer::rewrite::context::RewriteContext;
@@ -56,7 +57,11 @@ impl LogicalRewriteRule for PruneCTEAnchorColumns {
         true
     }
 
-    fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        _expr: OptExpr,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         // No-op: CTEAnchor is a scope wrapper with no own output metadata to
         // prune; column needs were propagated to the produce/consumer children
         // by the Phase-1 tagging pass. Kept for architectural symmetry +
@@ -72,10 +77,12 @@ mod tests {
     use crate::optimizer::opt_expr::OptExpr;
     use crate::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
 
-    fn ctx() -> RewriteContext {
+    fn ctx() -> RewriteContext<'static> {
         RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         )
     }
 
@@ -97,7 +104,13 @@ mod tests {
 
         // pattern gates the structural operator kind.
         assert!(
-            crate::optimizer::rewrite::tree_binder::bind_tree(&rule.pattern(), &expr).is_some()
+            crate::optimizer::rewrite::tree_binder::bind_tree(
+                &rule.pattern(),
+                &expr,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
         );
 
         // apply always returns Unchanged

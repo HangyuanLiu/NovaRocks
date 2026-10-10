@@ -52,7 +52,7 @@ fn collect_scalar_column_id_refs_strict_inner(
             }
             out.insert(*column_id);
         }
-        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {}
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {}
         ScalarNode::BinaryOp { left, right, .. } => {
             collect_scalar_column_id_refs_strict_inner(arena, *left, out)?;
             collect_scalar_column_id_refs_strict_inner(arena, *right, out)?;
@@ -426,14 +426,20 @@ pub(crate) fn wrap_remaining_filter_opt_scalar(
     plan: OptExpr,
     remaining: Vec<ScalarId>,
     arena: &mut ScalarArena,
-) -> OptExpr {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<OptExpr, crate::compiler::SqlCompileError> {
     if remaining.is_empty() {
-        return plan;
+        return Ok(plan);
     }
-    let Some(predicate) = crate::optimizer::scalar_expr::combine_conjuncts(arena, remaining) else {
-        return plan;
+    let Some(predicate) =
+        crate::optimizer::scalar_expr::combine_conjuncts(arena, remaining, control)?
+    else {
+        return Ok(plan);
     };
-    OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![plan])
+    Ok(OptExpr::new(
+        Operator::LogicalFilter(FilterOp { predicate }),
+        vec![plan],
+    ))
 }
 
 /// Extract equi-join key pairs from an `OptExpr` join.
@@ -512,8 +518,11 @@ mod typed_legacy {
         let mut result = exprs.pop().unwrap();
         while let Some(left) = exprs.pop() {
             result = TypedExpr {
-                data_type: DataType::Boolean,
-                nullable: left.nullable || result.nullable,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    left.value_type.nullable || result.value_type.nullable,
+                ),
+
                 kind: ExprKind::BinaryOp {
                     left: Box::new(left),
                     op: BinOp::And,
@@ -539,7 +548,7 @@ mod typed_legacy {
                     out.insert(*column_id);
                 }
             }
-            ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => {}
+            ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) | ExprKind::Constant(_) => {}
             ExprKind::BinaryOp { left, right, .. } => {
                 collect_column_id_refs_inner(left, out);
                 collect_column_id_refs_inner(right, out);
@@ -875,8 +884,7 @@ mod column_id_helper_tests {
                 qualifier: None,
                 column: format!("c{}", id.0),
             },
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         }
     }
 
@@ -900,8 +908,7 @@ mod column_id_helper_tests {
                 right: Box::new(col_ref_expr(id_right)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let result = collect_column_id_refs(&expr);
         assert_eq!(result.len(), 2);
@@ -920,7 +927,10 @@ mod column_id_helper_tests {
     fn scalar_column_ref_strict_collects_its_id() {
         let id = ColumnId::new_for_test(42);
         let mut arena = ScalarArena::new();
-        let expr = arena.intern(ScalarNode::ColumnRef(id), DataType::Int32, false);
+        let expr = arena.intern(
+            ScalarNode::ColumnRef(id),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+        );
 
         let result = collect_scalar_column_id_refs_strict(&arena, expr)
             .expect("resolved scalar column refs should be collected");
@@ -934,8 +944,7 @@ mod column_id_helper_tests {
         let mut arena = ScalarArena::new();
         let expr = arena.intern(
             ScalarNode::ColumnRef(ColumnId::UNSET),
-            DataType::Int32,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         );
 
         assert!(collect_scalar_column_id_refs_strict(&arena, expr).is_none());
@@ -949,8 +958,8 @@ mod column_id_helper_tests {
         OutputColumn {
             column_id: id,
             name: name.to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
             is_internal: false,
         }
     }
@@ -1092,8 +1101,7 @@ mod column_id_helper_tests {
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
-                data_type: DataType::Int32,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
             },
             output_name: "computed".to_string(),
             output_column_id: comp_id,
@@ -1202,8 +1210,8 @@ mod column_id_helper_tests {
             .map(|(name, id)| OutputColumn {
                 column_id: ColumnId::new_for_test(*id),
                 name: name.to_string(),
-                data_type: DataType::Int32,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+
                 is_internal: false,
             })
             .collect();
@@ -1237,8 +1245,7 @@ mod column_id_helper_tests {
                 qualifier: Some(qualifier.to_string()),
                 column: name.to_string(),
             },
-            data_type: DataType::Int32,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
         }
     }
 
@@ -1250,8 +1257,7 @@ mod column_id_helper_tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -1263,8 +1269,7 @@ mod column_id_helper_tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -1353,8 +1358,7 @@ mod column_id_helper_tests {
                 right: Box::new(qcol("r", "b", 2)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         };
         assert!(test_join_equi_keys(&two_table_join(Some(gt))).is_empty());
     }
@@ -1367,8 +1371,7 @@ mod column_id_helper_tests {
                 target: DataType::Int64,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         };
         let join = two_table_join(Some(eq_expr(cast_col, qcol("r", "b", 2))));
         let keys = test_join_equi_keys(&join);
@@ -1385,8 +1388,7 @@ mod column_id_helper_tests {
                 right: Box::new(qcol("r", "b", 2)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         assert!(test_join_equi_keys(&two_table_join(Some(cond))).is_empty());
     }
@@ -1400,8 +1402,7 @@ mod column_id_helper_tests {
                 right: Box::new(qcol("r", "b", 2)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         assert!(
             test_join_equi_keys_opt(&two_table_join(Some(cond)))
@@ -1473,8 +1474,10 @@ mod column_id_helper_tests {
                             qualifier: None,
                             column: format!("{name}_source"),
                         },
-                        data_type: DataType::Int32,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int32,
+                            true,
+                        ),
                     },
                     output_name: "k".to_string(),
                     output_column_id: ColumnId::new_for_test(output_id),
@@ -1487,8 +1490,11 @@ mod column_id_helper_tests {
                     columns: vec![OutputColumn {
                         column_id: ColumnId::new_for_test(source_id),
                         name: format!("{name}_source"),
-                        data_type: DataType::Int32,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int32,
+                            true,
+                        ),
+
                         is_internal: false,
                     }],
                 }),

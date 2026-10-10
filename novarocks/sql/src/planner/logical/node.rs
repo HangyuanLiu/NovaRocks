@@ -351,8 +351,8 @@ mod plan_tests {
         let cols = vec![OutputColumn {
             column_id: ColumnId::UNSET,
             name: "x".to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
             is_internal: false,
         }];
         let node = LogicalUnionNode {
@@ -361,8 +361,8 @@ mod plan_tests {
         };
         assert_eq!(node.output_columns.len(), 1);
         assert_eq!(node.output_columns[0].name, "x");
-        assert_eq!(node.output_columns[0].data_type, DataType::Int32);
-        assert!(!node.output_columns[0].nullable);
+        assert_eq!(node.output_columns[0].value_type.data_type, DataType::Int32);
+        assert!(!node.output_columns[0].value_type.nullable);
     }
 
     #[test]
@@ -372,8 +372,8 @@ mod plan_tests {
         let cols = vec![OutputColumn {
             column_id: ColumnId::UNSET,
             name: "y".to_string(),
-            data_type: DataType::Utf8,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+
             is_internal: false,
         }];
         let node = LogicalIntersectNode {
@@ -390,8 +390,8 @@ mod plan_tests {
         let cols = vec![OutputColumn {
             column_id: ColumnId::UNSET,
             name: "z".to_string(),
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             is_internal: false,
         }];
         let node = LogicalExceptNode {

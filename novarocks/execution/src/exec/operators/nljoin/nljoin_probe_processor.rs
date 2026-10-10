@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::sync::Arc;
 
 use arrow::array::Array;
@@ -247,9 +249,11 @@ impl ProcessorOperator for NlJoinProbeProcessorOperator {
         false
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if !self.need_input() {
-            return Err("nljoin probe received input when it does not need input".to_string());
+            return Err("nljoin probe received input when it does not need input"
+                .to_string()
+                .into());
         }
         if !self.build_loaded {
             self.ensure_build_loaded()?;
@@ -275,7 +279,7 @@ impl ProcessorOperator for NlJoinProbeProcessorOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         if self.finished {
             return Ok(None);
         }
@@ -327,7 +331,7 @@ impl ProcessorOperator for NlJoinProbeProcessorOperator {
         Ok(None)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         self.input_finished = true;
         Ok(())
     }

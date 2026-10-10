@@ -929,22 +929,21 @@ pub struct StatisticsReadRequest {
 /// It therefore cannot ask Core to resolve the table name or schema again when
 /// the worker eventually runs.  This compact layout supplies exactly the
 /// scan-facing schema needed to compile the already-pinned projection.  It is
-/// not catalog metadata: defaults, field metadata and connector credentials
-/// are deliberately excluded.
+/// not catalog metadata: defaults and connector credentials are excluded.
+/// The complete admitted value domain and nested Arrow field facts are kept;
+/// a carrier alone cannot declare numeric or opaque logical identity.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StatisticsScanColumn {
     ordinal: usize,
     name: Arc<str>,
-    data_type: DataType,
-    nullable: bool,
+    value_type: novarocks_type_contract::FunctionValueType,
 }
 
 impl StatisticsScanColumn {
     pub fn try_new(
         ordinal: usize,
         name: impl Into<Arc<str>>,
-        data_type: DataType,
-        nullable: bool,
+        value_type: novarocks_type_contract::FunctionValueType,
     ) -> Result<Self, ConnectorError> {
         let name = name.into();
         if name.is_empty() || name.len() > MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES {
@@ -953,11 +952,16 @@ impl StatisticsScanColumn {
                 "statistics scan column name is empty or exceeds the payload limit",
             ));
         }
+        value_type.validate().map_err(|error| {
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                format!("statistics scan column has invalid complete value type: {error}"),
+            )
+        })?;
         Ok(Self {
             ordinal,
             name,
-            data_type,
-            nullable,
+            value_type,
         })
     }
 
@@ -969,12 +973,16 @@ impl StatisticsScanColumn {
         &self.name
     }
 
+    pub const fn value_type(&self) -> &novarocks_type_contract::FunctionValueType {
+        &self.value_type
+    }
+
     pub fn data_type(&self) -> &DataType {
-        &self.data_type
+        &self.value_type.data_type
     }
 
     pub const fn nullable(&self) -> bool {
-        self.nullable
+        self.value_type.nullable
     }
 }
 
@@ -1350,12 +1358,132 @@ mod tests {
 
     fn requirement(field_id: i32, ordinal: usize) -> StatisticsRequiredAggregation {
         StatisticsRequiredAggregation::try_new(
-            StatisticsScanColumn::try_new(ordinal, format!("c{field_id}"), DataType::Int64, true)
-                .unwrap(),
+            StatisticsScanColumn::try_new(
+                ordinal,
+                format!("c{field_id}"),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            )
+            .unwrap(),
             "$test_stat",
             StatisticsArtifactIdentity::try_new(vec![field_id], "test/blob").unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn scan_columns_preserve_every_explicit_root_value_domain() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        for (logical_type, data_type) in [
+            (ValueLogicalType::Physical, DataType::Int64),
+            (ValueLogicalType::Json, DataType::Utf8),
+            (ValueLogicalType::Variant, DataType::LargeBinary),
+            (ValueLogicalType::Hll, DataType::Binary),
+            (ValueLogicalType::Bitmap, DataType::LargeBinary),
+            (ValueLogicalType::Object, DataType::Binary),
+            (ValueLogicalType::Percentile, DataType::LargeBinary),
+            (ValueLogicalType::LargeInt, DataType::FixedSizeBinary(16)),
+            (ValueLogicalType::Uuid, DataType::FixedSizeBinary(16)),
+        ] {
+            for nullable in [false, true] {
+                let expected = FunctionValueType::try_with_logical_type(
+                    data_type.clone(),
+                    nullable,
+                    logical_type,
+                )
+                .unwrap();
+                let column = StatisticsScanColumn::try_new(7, "actual", expected.clone()).unwrap();
+                assert_eq!(column.ordinal(), 7);
+                assert_eq!(column.name(), "actual");
+                assert_eq!(column.value_type(), &expected);
+                assert_eq!(column.data_type(), &expected.data_type);
+                assert_eq!(column.nullable(), nullable);
+            }
+        }
+        // Equal physical widths do not erase distinct authored domains.
+        let plain = StatisticsScanColumn::try_new(
+            0,
+            "x",
+            FunctionValueType::new(DataType::FixedSizeBinary(16), false),
+        )
+        .unwrap();
+        let integer = StatisticsScanColumn::try_new(
+            0,
+            "x",
+            FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                false,
+                ValueLogicalType::LargeInt,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_ne!(plain, integer);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn scan_columns_preserve_nested_field_metadata_and_dictionary_identity() {
+        use arrow::datatypes::Field;
+        use novarocks_type_contract::{FunctionValueType, NR_LOGICAL_TYPE_KEY};
+        let json = Field::new("payload", DataType::Utf8, false).with_metadata(
+            [
+                (NR_LOGICAL_TYPE_KEY.into(), "json".into()),
+                ("provider.field-id".into(), "71".into()),
+            ]
+            .into(),
+        );
+        let dictionary = Field::new_dict(
+            "codes",
+            DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+            true,
+            91,
+            true,
+        );
+        let expected =
+            FunctionValueType::new(DataType::Struct(vec![json, dictionary].into()), true);
+        let column = StatisticsScanColumn::try_new(3, "nested", expected.clone()).unwrap();
+        assert_eq!(column.value_type(), &expected);
+        assert!(novarocks_type_contract::arrow_data_types_exact(
+            column.data_type(),
+            &expected.data_type
+        ));
+    }
+
+    #[test]
+    fn scan_columns_reject_invalid_authored_domains_and_nested_carriers() {
+        use arrow::datatypes::Field;
+        use novarocks_type_contract::{FunctionValueType, NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+        for logical_type in [
+            ValueLogicalType::Json,
+            ValueLogicalType::Variant,
+            ValueLogicalType::Hll,
+            ValueLogicalType::Bitmap,
+            ValueLogicalType::Object,
+            ValueLogicalType::Percentile,
+            ValueLogicalType::LargeInt,
+            ValueLogicalType::Uuid,
+        ] {
+            let invalid = FunctionValueType {
+                data_type: DataType::Int64,
+                nullable: true,
+                logical_type,
+            };
+            assert_eq!(
+                StatisticsScanColumn::try_new(0, "invalid", invalid)
+                    .unwrap_err()
+                    .kind(),
+                ConnectorErrorKind::InvalidRequest
+            );
+        }
+        let invalid_child = Field::new("child", DataType::Int64, true)
+            .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "json".into())].into());
+        let invalid = FunctionValueType::new(DataType::List(Arc::new(invalid_child)), true);
+        assert_eq!(
+            StatisticsScanColumn::try_new(0, "nested", invalid)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
     }
 
     fn test_session(expectations: Vec<StatisticsArtifactIdentity>) -> Box<TestSession> {

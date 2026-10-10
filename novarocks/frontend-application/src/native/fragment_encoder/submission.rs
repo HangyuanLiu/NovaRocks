@@ -18,9 +18,10 @@
 //! Frontend-owned native submission mapping.
 //!
 //! A fragment's static plan is a property of the plan alone, so it is frozen
-//! once per completed plan, by [`freeze_completed_fragments`], before anything
-//! is placed: every placement of every attempt of that plan -- a recovery
-//! included -- is created from those same bytes.
+//! once per completed plan, by [`freeze_completed_fragments`] or, for the
+//! compiled carrier, [`freeze_completed_packages`], before anything is placed:
+//! every placement of every attempt of that plan -- a recovery included -- is
+//! created from those same bytes.
 //!
 //! Placement and per-instance facts become available only after Init,
 //! ControlReady and connector-install acknowledgement. The per-attempt mapper
@@ -32,7 +33,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
+use novarocks_physical_plan::{FragmentPackage, PhysicalPlan};
+use novarocks_plan_codec::PhysicalEncodeError;
+use novarocks_plan_codec::physical_package_v2::PackageEncodeLimits;
 use novarocks_proto_models::plan;
+use novarocks_type_contract::PureCompileControl;
 
 use crate::query_execution::artifact::FragmentId;
 use crate::query_execution::artifact::native_submission::SubmissionPlanFacts;
@@ -128,6 +133,66 @@ pub(crate) fn freeze_completed_fragments(
             "completed plan froze fragments {actual:?} for plan fragments {expected:?}: \
              missing={missing:?} unknown={unknown:?}"
         ));
+    }
+    Ok(frozen)
+}
+
+/// Freezes every fragment of one completed plan, once, as a compiled package
+/// carrier.
+///
+/// A package states its own sink: a stream sink addresses its consumer by the
+/// plan edge it feeds, so nothing is patched into it. The packages are the
+/// plan's own, keyed by the fragment each was extracted from, and the same
+/// output-kind and static-sink rules as the plan-tree freeze apply.
+pub(crate) fn freeze_completed_packages(
+    packages: BTreeMap<novarocks_physical_plan::FragmentId, FragmentPackage>,
+    physical: &PhysicalPlan,
+    plan: &SubmissionPlanFacts,
+    root_fragment_id: FragmentId,
+    limits: &PackageEncodeLimits,
+    control: &dyn PureCompileControl,
+) -> Result<BTreeMap<FragmentId, Arc<FragmentArtifact>>, PhysicalEncodeError> {
+    let mut frozen = BTreeMap::new();
+    for (packaged_id, package) in &packages {
+        let fragment_id = u32::from(packaged_id.get());
+        if package.fragment().id() != *packaged_id {
+            return Err(format!(
+                "package filed under fragment {fragment_id} packages fragment {}",
+                package.fragment().id().get()
+            )
+            .into());
+        }
+        let facts = plan
+            .fragment(fragment_id)
+            .ok_or_else(|| format!("packaged fragment {fragment_id} is absent from the plan"))?;
+        let is_root = fragment_id == root_fragment_id;
+        let has_stream_edge = plan.has_stream_edge_from(fragment_id);
+        validate_fragment_output_kind(fragment_id, is_root, has_stream_edge, facts.role())?;
+        assembly::ensure_native_fragment_sink_supported(
+            fragment_id,
+            is_root,
+            has_stream_edge,
+            false,
+            false,
+        )?;
+        let artifact =
+            FragmentArtifact::freeze_package(package, physical.edges(), limits, control)?;
+        if frozen.insert(fragment_id, artifact).is_some() {
+            return Err(
+                format!("completed plan packaged duplicate fragment id={fragment_id}").into(),
+            );
+        }
+    }
+    let expected = plan.fragment_ids();
+    let actual = frozen.keys().copied().collect::<BTreeSet<_>>();
+    if actual != expected {
+        let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
+        let unknown = actual.difference(&expected).copied().collect::<Vec<_>>();
+        return Err(format!(
+            "completed plan packaged fragments {actual:?} for plan fragments {expected:?}: \
+             missing={missing:?} unknown={unknown:?}"
+        )
+        .into());
     }
     Ok(frozen)
 }

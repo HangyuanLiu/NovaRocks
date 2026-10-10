@@ -752,19 +752,28 @@ pub fn analyze_view_query(
     provider: &dyn PlannerTableProvider,
     database: &str,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<Vec<ViewOutputColumn>, String> {
-    let (resolved, _ctes, factory) =
-        crate::analyzer::analyze_with_function_catalog(query, provider, database, functions)
-            .map_err(|error| format!("analyze view definition failed: {error}"))?;
-    super::mv::validate_persistable_output(&resolved, &factory)?;
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<Vec<ViewOutputColumn>, crate::compiler::SqlCompileError> {
+    let (resolved, _ctes, factory) = crate::analyzer::analyze_with_function_catalog(
+        query,
+        provider,
+        database,
+        functions,
+        constant_policy,
+        control,
+    )
+    .map_err(crate::compiler::SqlCompileError::from)?;
+    super::mv::validate_persistable_output(&resolved, &factory)
+        .map_err(crate::compiler::SqlCompileError::Compilation)?;
     Ok(resolved
         .output_columns
         .into_iter()
         .filter(|column| !column.is_internal)
         .map(|column| ViewOutputColumn {
             name: column.name,
-            data_type: column.data_type,
-            nullable: column.nullable,
+            data_type: column.value_type.data_type,
+            nullable: column.value_type.nullable,
         })
         .collect())
 }
@@ -789,7 +798,7 @@ mod tests {
             let [Statement::Query(query)] = statements.as_slice() else {
                 panic!("expected query")
             };
-            let error = analyze_view_query(query, &catalog, "default", functions)
+            let error = analyze_view_query(query, &catalog, "default", functions, crate::constant::test_constant_policy(), &crate::compiler::SqlCompileControl::unbounded()).map_err(|error| error.to_string())
                 .expect_err("private producer must not become VARBINARY");
             assert_eq!(
                 error,
@@ -801,7 +810,7 @@ mod tests {
         let [Statement::Query(query)] = statements.as_slice() else {
             panic!("expected query")
         };
-        let columns = analyze_view_query(query, &catalog, "default", functions)
+        let columns = analyze_view_query(query, &catalog, "default", functions, crate::constant::test_constant_policy(), &crate::compiler::SqlCompileControl::unbounded()).map_err(|error| error.to_string())
             .expect("ordinary Binary view remains admitted");
         assert_eq!(columns[0].data_type, arrow::datatypes::DataType::Binary);
     }
@@ -835,7 +844,7 @@ mod tests {
         };
         let functions = crate::functions::builtin_sql_function_catalog();
         assert_eq!(
-            analyze_view_query(query, &catalog, "default", functions),
+            analyze_view_query(query, &catalog, "default", functions, crate::constant::test_constant_policy(), &crate::compiler::SqlCompileControl::unbounded()).map_err(|error| error.to_string()),
             Err(
                 "Object and Percentile result domains are unsupported for persisted schemas".into()
             )

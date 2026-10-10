@@ -426,12 +426,8 @@ fn compile_dml_change_stream_write(
         );
     }
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
-    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-        execution.deadline(),
-        crate::query_execution::planning::sql_cancellation_observation(
-            execution.cancellation().clone(),
-        ),
-    );
+    let compile_control =
+        crate::query_execution::planning::sql_compile_control_from_execution(execution);
     let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
@@ -446,6 +442,8 @@ fn compile_dml_change_stream_write(
         state.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
+        state.constant_policy(),
+        state.static_plan_carrier().sql_emission_mode(),
         compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
@@ -457,13 +455,13 @@ fn compile_dml_change_stream_write(
         Arc::clone(&table_bindings),
         connector_context,
     )?;
+    let completion_control = compile_control.clone();
+    let optimize_request =
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control);
+    let decimal_overflow_policy = optimize_request.decimal_overflow_policy();
     let (completion, needs) = novarocks_sql::planning::dml::begin_final_dml_change_stream(
         DmlChangeStreamCompileRequest {
-            optimize_request: novarocks_sql::compiler::SqlOptimizeRequest::new(
-                analyzed,
-                &statistics,
-                compile_control,
-            ),
+            optimize_request,
             kind,
             routes,
             statistics_targets,
@@ -473,6 +471,8 @@ fn compile_dml_change_stream_write(
             // the commit.
             shape: novarocks_sql::planning::dml::DmlWritePlanShape::Dataflow,
         },
+        decimal_overflow_policy,
+        state.static_plan_carrier().sql_emission_mode(),
     )?;
     let connector_session = crate::query_execution::compiler::typed_connector_session()?;
     let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
@@ -518,22 +518,32 @@ fn compile_dml_change_stream_write(
         ))?;
     let version = crate::query_execution::physical_encoding::mint_plan_version();
     let dop_domain = crate::query_execution::contract::completed_plan_dop_domain(None)?;
-    let finalized =
-        completion.finish(novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
-            novarocks_sql::planning::dml::DmlFinalPlanContext::new(version, dop_domain, reads),
+    let finalized = completion.finish(
+        novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
+            novarocks_sql::planning::dml::DmlFinalPlanContext::new(
+                version,
+                dop_domain,
+                reads,
+                state.static_plan_carrier().sql_emission_mode(),
+            ),
             targets,
-        ))?;
+        ),
+        &completion_control,
+    )?;
     let (plan, writer_routes) = finalized.into_parts();
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
-            .and_then(|candidate| {
-                candidate.freeze_root_output(
-                    novarocks_result_contract::FrozenRootOutput::InternalFacts(
-                        novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
-                    ),
-                )
-            })
-            .map_err(|error| error.to_string())?;
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
+            plan,
+            &completion_control,
+        )
+        .and_then(|candidate| {
+            candidate.freeze_root_output(
+                novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                    novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+                ),
+            )
+        })
+        .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
     )
@@ -541,19 +551,26 @@ fn compile_dml_change_stream_write(
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
         state.function_catalog().as_ref(),
+        state.static_plan_carrier(),
+        state.constant_policy(),
         Some(
             &crate::query_execution::physical_encoding::WriteTargetFacts {
                 sealed: &sealed_write_targets,
                 field_names,
+                session: write_session.as_ref(),
             },
         ),
+        execution.sql_semantics().sql_mode().allow_throw_exception(),
+        &completion_control,
     )?;
     Ok(
         crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
             assembly: crate::query_execution::compiler::PreparedDmlWriteAssembly::new(
                 encoded,
                 version,
-                None,
+                Some(
+                    crate::query_execution::contract::synthetic_statement_query_options(execution),
+                ),
                 execution.clone(),
                 state.query_execution().clone(),
                 Arc::clone(write_session),
@@ -1347,7 +1364,10 @@ pub(crate) fn stage_prepared_update_mutation(
             });
             let staged = match execution_handle.run_stage() {
                 Ok(staged) => staged,
-                Err(error @ crate::dml::error::DmlExecutionError::Analyze(_)) => {
+                Err(
+                    error @ (crate::dml::error::DmlExecutionError::Analyze(_)
+                    | crate::dml::error::DmlExecutionError::Control(_)),
+                ) => {
                     return Err(error);
                 }
                 Err(error) => {
@@ -2272,6 +2292,11 @@ fn build_cow_update_distributed_write(
                 let read = crate::query_execution::cohort_read::QueryPinnedFileSetRead {
                     pinned: source.pinned_source().clone(),
                     owner: source.source().owner().clone(),
+                    frozen_source: Some(source.frozen_read_source().cloned().ok_or_else(|| {
+                        fail(closed::BuildError::InvalidSource(
+                            "copy-on-write source lost its original provider read receipt",
+                        ))
+                    })?),
                     planning_lease: planning_lease.clone(),
                     original: Some(original.clone()),
                 };
@@ -3255,12 +3280,8 @@ fn execute_exact_cow_match_query(
             state.catalog_application().map(Arc::as_ref),
         );
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
-    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-        execution.deadline(),
-        crate::query_execution::planning::sql_cancellation_observation(
-            execution.cancellation().clone(),
-        ),
-    );
+    let compile_control =
+        crate::query_execution::planning::sql_compile_control_from_execution(execution);
     let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
         novarocks_sql::compiler::SqlCompileIntent::DmlInternalRead,
@@ -3275,6 +3296,8 @@ fn execute_exact_cow_match_query(
         state.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
+        state.constant_policy(),
+        state.static_plan_carrier().sql_emission_mode(),
         compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
@@ -3287,9 +3310,13 @@ fn execute_exact_cow_match_query(
             Arc::clone(&table_bindings),
             connector_context,
         )?;
+    let completion_control = compile_control.clone();
+    let optimize_request =
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control);
     let (completion, needs) = novarocks_sql::planning::dml::begin_final_dml_read_plan(
-        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control),
+        optimize_request,
         execution.optimizer_settings(),
+        state.static_plan_carrier().sql_emission_mode(),
     )?;
     let connector_session = crate::query_execution::compiler::typed_connector_session()?;
     let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
@@ -3324,21 +3351,26 @@ fn execute_exact_cow_match_query(
         version,
         crate::query_execution::contract::completed_plan_dop_domain(None)?,
         reads,
+        &completion_control,
     )?;
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
-            .and_then(|candidate| {
-                candidate.freeze_root_output(
-                    novarocks_result_contract::FrozenRootOutput::InternalFacts(
-                        novarocks_result_contract::InternalResultDomain::CowSelectionArrowV1,
-                    ),
-                )
-            })
-            .map_err(|error| error.to_string())?;
-    let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
-        novarocks_query_application::api::QueryExecutionKind::Read,
-        candidate.plan(),
-    )?;
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
+            plan,
+            &completion_control,
+        )
+        .and_then(|candidate| {
+            candidate.freeze_root_output(
+                novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                    novarocks_result_contract::InternalResultDomain::CowSelectionArrowV1,
+                ),
+            )
+        })
+        .map_err(|error| error.to_string())?;
+    let output =
+        novarocks_query_application::preparation::OutputContract::from_completed_candidate(
+            novarocks_query_application::api::QueryExecutionKind::Read,
+            &candidate,
+        )?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
     )
@@ -3346,7 +3378,11 @@ fn execute_exact_cow_match_query(
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
         state.function_catalog().as_ref(),
+        state.static_plan_carrier(),
+        state.constant_policy(),
         None,
+        execution.sql_semantics().sql_mode().allow_throw_exception(),
+        &completion_control,
     )?;
     let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
     let description =
@@ -3935,7 +3971,10 @@ pub(crate) fn stage_prepared_merge_mutation(
     });
     let staged = match execution_handle.run_stage() {
         Ok(staged) => staged,
-        Err(error @ crate::dml::error::DmlExecutionError::Analyze(_)) => {
+        Err(
+            error @ (crate::dml::error::DmlExecutionError::Analyze(_)
+            | crate::dml::error::DmlExecutionError::Control(_)),
+        ) => {
             return Err(error);
         }
         Err(error) => {
@@ -4839,6 +4878,8 @@ mod tests {
                         .expect("builtin function catalog"),
                 ),
                 Arc::new(crate::catalog_application::query_catalog::new_query_catalog_service()),
+                crate::application::test_constant_policy(),
+                crate::query_execution::package_freeze::StaticPlanCarrier::PlanTree,
             ),
             None,
             Arc::clone(&connector_control),

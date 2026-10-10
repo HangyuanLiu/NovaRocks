@@ -18,7 +18,9 @@ novarocks-type-contract.workspace = true
 novarocks-native-trust.workspace = true
 novarocks-execution.workspace = true
 novarocks-execution-contract.workspace = true
+novarocks-local-compiler.workspace = true
 novarocks-local-program.workspace = true
+novarocks-physical-plan.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-functions.workspace = true
 novarocks-memory.workspace = true
@@ -56,8 +58,8 @@ protoc-bin-vendored.workspace = true
 tonic-build.workspace = true
 
 [dev-dependencies]
+novarocks-plan-codec = { workspace = true, features = ["test-support"] }
 h2.workspace = true
-novarocks-physical-plan.workspace = true
 novarocks-sql.workspace = true
 novarocks-worker = { workspace = true, features = ["test-support"] }
 novarocks-secret.workspace = true

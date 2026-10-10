@@ -21,6 +21,7 @@
 //! pushed to the scan by the existing PredicatePushdownPostJoin pushdown rules
 //! running in the same fixed-point loop.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
@@ -77,7 +78,11 @@ impl LogicalRewriteRule for DeriveJoinNotNullPredicate {
         true
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             mut children,
@@ -119,8 +124,18 @@ impl LogicalRewriteRule for DeriveJoinNotNullPredicate {
             return Ok(RewriteResult::Unchanged);
         }
 
-        let new_left = wrap_not_null(left, left_preds, &mut arena_rc.borrow_mut());
-        let new_right = wrap_not_null(right, right_preds, &mut arena_rc.borrow_mut());
+        let new_left = wrap_not_null(
+            left,
+            left_preds,
+            &mut arena_rc.borrow_mut(),
+            &ctx.control_view(),
+        )?;
+        let new_right = wrap_not_null(
+            right,
+            right_preds,
+            &mut arena_rc.borrow_mut(),
+            &ctx.control_view(),
+        )?;
 
         let result = OptExpr {
             op: Operator::LogicalJoin(join),
@@ -165,46 +180,62 @@ fn eligible_not_null(
     preds
 }
 
-fn is_not_null(arena: &mut ScalarArena, operand: ScalarId) -> ScalarId {
-    arena.intern(
+fn is_not_null(
+    arena: &mut ScalarArena,
+    operand: ScalarId,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, SqlCompileError> {
+    arena.intern_observed(
         ScalarNode::IsNull {
             child: operand,
             negated: true,
         },
-        DataType::Boolean,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+        control,
     )
 }
 
-fn combine_and_scalar(arena: &mut ScalarArena, mut exprs: Vec<ScalarId>) -> ScalarId {
+fn combine_and_scalar(
+    arena: &mut ScalarArena,
+    mut exprs: Vec<ScalarId>,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, SqlCompileError> {
     assert!(!exprs.is_empty());
     let mut result = exprs.pop().unwrap();
     while let Some(left) = exprs.pop() {
         let nullable = arena.nullable(left) || arena.nullable(result);
-        result = arena.intern(
+        result = arena.intern_observed(
             ScalarNode::BinaryOp {
                 left,
                 op: BinOp::And,
                 right: result,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            nullable,
-        );
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, nullable),
+            control,
+        )?;
     }
-    result
+    Ok(result)
 }
 
-fn wrap_not_null(child: OptExpr, operands: Vec<ScalarId>, arena: &mut ScalarArena) -> OptExpr {
+fn wrap_not_null(
+    child: OptExpr,
+    operands: Vec<ScalarId>,
+    arena: &mut ScalarArena,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<OptExpr, SqlCompileError> {
     if operands.is_empty() {
-        return child;
+        return Ok(child);
     }
     let preds = operands
         .into_iter()
-        .map(|operand| is_not_null(arena, operand))
-        .collect();
-    let predicate = combine_and_scalar(arena, preds);
-    OptExpr::new(Operator::LogicalFilter(FilterOp { predicate }), vec![child])
+        .map(|operand| is_not_null(arena, operand, control))
+        .collect::<Result<Vec<_>, _>>()?;
+    let predicate = combine_and_scalar(arena, preds, control)?;
+    Ok(OptExpr::new(
+        Operator::LogicalFilter(FilterOp { predicate }),
+        vec![child],
+    ))
 }
 
 /// Walk `plan`'s predicate spine (passthrough single-input nodes down to the
@@ -277,7 +308,7 @@ mod tests {
     use crate::planner::table::TableDef;
     use novarocks_types::schema::ColumnDef;
 
-    fn make_ctx(arena: ScalarArena) -> RewriteContext {
+    fn make_ctx(arena: ScalarArena) -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(std::iter::empty::<String>());
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         ctx
@@ -310,8 +341,11 @@ mod tests {
                 .map(|(name, id, nullable)| OutputColumn {
                     column_id: ColumnId::new_for_test(*id),
                     name: name.to_string(),
-                    data_type: DataType::Int32,
-                    nullable: *nullable,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        *nullable,
+                    ),
+
                     is_internal: false,
                 })
                 .collect(),
@@ -330,8 +364,7 @@ mod tests {
                 qualifier: Some(qualifier.to_string()),
                 column: name.to_string(),
             },
-            data_type: DataType::Int32,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, nullable),
         }
     }
 
@@ -343,8 +376,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -356,8 +388,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -368,8 +399,14 @@ mod tests {
         right: OptExpr,
         cond: Option<TypedExpr>,
     ) -> OptExpr {
-        let condition =
-            cond.map(|c| crate::planner::optimizer_bridge::scalar::intern_typed(arena, &c));
+        let condition = cond.map(|c| {
+            crate::planner::optimizer_bridge::scalar::intern_typed(
+                arena,
+                &c,
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            )
+            .unwrap()
+        });
         OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: jt,
@@ -380,7 +417,7 @@ mod tests {
     }
 
     /// Returns (left_child_is_filter, right_child_is_filter) for the rule's output.
-    fn side_filters(out: Result<RewriteResult, String>) -> (bool, bool) {
+    fn side_filters(out: Result<RewriteResult, SqlCompileError>) -> (bool, bool) {
         match out.unwrap() {
             RewriteResult::Unchanged => (false, false),
             RewriteResult::Changed(plan) => {
@@ -548,21 +585,27 @@ mod tests {
                 expr: Box::new(col_typed("l", "a", 1, true)),
                 negated: true,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
         let not_null_pred_r = TypedExpr {
             kind: ExprKind::IsNull {
                 expr: Box::new(col_typed("r", "b", 2, true)),
                 negated: true,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
-        let pred_l_id =
-            crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &not_null_pred_l);
-        let pred_r_id =
-            crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &not_null_pred_r);
+        let pred_l_id = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &not_null_pred_l,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
+        let pred_r_id = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &not_null_pred_r,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
 
         let left_scan = ScanOp {
             database: "default".to_string(),
@@ -585,8 +628,8 @@ mod tests {
             columns: vec![OutputColumn {
                 column_id: ColumnId::new_for_test(1),
                 name: "a".to_string(),
-                data_type: DataType::Int32,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+
                 is_internal: false,
             }],
             predicates: vec![pred_l_id],
@@ -615,8 +658,8 @@ mod tests {
             columns: vec![OutputColumn {
                 column_id: ColumnId::new_for_test(2),
                 name: "b".to_string(),
-                data_type: DataType::Int32,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+
                 is_internal: false,
             }],
             predicates: vec![pred_r_id],
@@ -626,7 +669,12 @@ mod tests {
         };
 
         let cond = eq_expr(col_typed("l", "a", 1, true), col_typed("r", "b", 2, true));
-        let cond_id = crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &cond);
+        let cond_id = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &cond,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let plan = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
                 join_type: JoinKind::Inner,
@@ -669,8 +717,10 @@ mod tests {
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
-                data_type: DataType::Boolean,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    true,
+                ),
             };
             let plan = join_opt(
                 &mut arena,

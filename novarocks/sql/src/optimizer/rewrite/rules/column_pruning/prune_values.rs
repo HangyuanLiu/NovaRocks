@@ -49,7 +49,7 @@ impl LogicalRewriteRule for PruneValuesColumns {
     fn matches(&self, _expr: &OptExpr, _ctx: &RewriteContext) -> bool {
         true
     }
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, crate::compiler::SqlCompileError> {
         let OptExpr {
             op,
             children,
@@ -91,7 +91,8 @@ impl LogicalRewriteRule for PruneValuesColumns {
             .map(|(i, keep)| {
                 *keep
                     && matches!(arena.node(node.rows[0][i]), ScalarNode::Literal(_))
-                    && arena.data_type(node.rows[0][i]) == &node.columns[i].data_type
+                    && arena.data_type(node.rows[0][i]) == &node.columns[i].value_type.data_type
+                    && arena.value_type(node.rows[0][i]).logical_type == node.columns[i].value_type.logical_type
                     && node.rows.iter().all(|row| row[i] == node.rows[0][i])
             })
             .collect::<Vec<_>>();
@@ -116,14 +117,14 @@ impl LogicalRewriteRule for PruneValuesColumns {
                 } else {
                     ScalarNode::ColumnRef(column.column_id)
                 };
-                ScalarProjectItem {
-                    expr: arena.intern(scalar, column.data_type.clone(), column.nullable),
+                Ok(ScalarProjectItem {
+                    expr: arena.intern_observed(scalar, column.value_type.clone(), &ctx.control_view())?,
                     output_name: column.name.clone(),
                     output_column_id: column.column_id,
                     expr_display: None,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
         drop(arena);
         let source = keep
             .iter()
@@ -187,19 +188,17 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: format!("c{id}"),
-            data_type: DataType::Utf8,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
             is_internal: false,
         }
     }
     fn literal(arena: &mut ScalarArena, text: &str) -> ScalarId {
         arena.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::String(text.into()))),
-            DataType::Utf8,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         )
     }
-    fn context(arena: ScalarArena) -> RewriteContext {
+    fn context(arena: ScalarArena) -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         ctx
@@ -295,15 +294,14 @@ mod tests {
                 decimal_overflow_policy:
                     novarocks_type_contract::DecimalOverflowPolicy::ReportError,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         let mut ctx = context(arena);
         let mut input = values(vec![vec![a, a, bad_cast], vec![a, b, bad_cast]], &[2]);
         let Operator::LogicalValues(source) = &mut input.op else {
             unreachable!()
         };
-        source.columns[2].data_type = DataType::Int64;
+        source.columns[2].value_type.data_type = DataType::Int64;
         let rewritten = rewrite(input, &mut ctx);
         let Operator::LogicalValues(source) = rewritten.op else {
             panic!("expected VALUES source")

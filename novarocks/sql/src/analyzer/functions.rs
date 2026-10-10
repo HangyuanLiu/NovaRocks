@@ -158,7 +158,7 @@ pub(super) fn validate_scalar_function_call_typed(
 ) -> Result<(), String> {
     let arg_types = args
         .iter()
-        .map(|arg| arg.data_type.clone())
+        .map(|arg| arg.value_type.data_type.clone())
         .collect::<Vec<_>>();
     validate_scalar_function_call_impl(name, &arg_types, Some(args))
 }
@@ -361,27 +361,34 @@ fn validate_arrays_overlap_arguments(arg_types: &[DataType]) -> Result<(), Strin
 fn validate_arrays_overlap_typed_arguments(args: &[TypedExpr]) -> Result<(), String> {
     let arg_types = args
         .iter()
-        .map(|arg| arg.data_type.clone())
+        .map(|arg| arg.value_type.data_type.clone())
         .collect::<Vec<_>>();
     let Some(second) = args.get(1) else {
         return Ok(());
     };
-    if !matches!(second.data_type, DataType::List(_) | DataType::Null) {
+    if !matches!(
+        second.value_type.data_type,
+        DataType::List(_) | DataType::Null
+    ) {
         return Err(format!(
             "2-th input of arrays_overlap should be an array, rather than {}",
-            arrays_overlap_type_name(&second.data_type)
+            arrays_overlap_type_name(&second.value_type.data_type)
         ));
     }
     let Some(first) = args.first() else {
         return Ok(());
     };
-    if !matches!(first.data_type, DataType::List(_) | DataType::Null) {
+    if !matches!(
+        first.value_type.data_type,
+        DataType::List(_) | DataType::Null
+    ) {
         return Err(format!(
             "1-th input of arrays_overlap should be an array, rather than {}",
-            arrays_overlap_type_name(&first.data_type)
+            arrays_overlap_type_name(&first.value_type.data_type)
         ));
     }
-    if let (DataType::List(left), DataType::List(right)) = (&first.data_type, &second.data_type)
+    if let (DataType::List(left), DataType::List(right)) =
+        (&first.value_type.data_type, &second.value_type.data_type)
         && !arrays_overlap_element_compatible(left.data_type(), right.data_type())
     {
         return Err(arrays_overlap_no_matching_signature_typed(args, &arg_types));
@@ -691,7 +698,9 @@ pub(super) fn infer_scalar_return_type(name: &str, arg_types: &[DataType]) -> Da
         crate::functions::builtin_sql_function_catalog(),
         name,
         arg_types,
+        &crate::compiler::SqlCompileControl::unbounded(),
     )
+    .unwrap()
 }
 
 /// Infer an unregistered scalar return type using the function snapshot that
@@ -702,12 +711,15 @@ pub(super) fn infer_scalar_return_type_with_catalog(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     arg_types: &[DataType],
-) -> DataType {
-    legacy_scalar_return_type_with_catalog(function_catalog, name, arg_types)
-        // This compatibility helper is retained for staged non-analysis
-        // consumers. SQL analysis checks the Option-returning function below
-        // before it accepts an arbitrary scalar function name.
-        .unwrap_or(DataType::Utf8)
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<DataType, crate::analyze_error::AnalyzeError> {
+    Ok(
+        legacy_scalar_return_type_with_catalog(function_catalog, name, arg_types, control)?
+            // This compatibility helper is retained for staged non-analysis
+            // consumers. SQL analysis checks the Option-returning function below
+            // before it accepts an arbitrary scalar function name.
+            .unwrap_or(DataType::Utf8),
+    )
 }
 
 /// Return the legacy scalar type only when the name is known by either the
@@ -716,7 +728,8 @@ pub(super) fn legacy_scalar_return_type_with_catalog(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     arg_types: &[DataType],
-) -> Option<DataType> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<DataType>, crate::analyze_error::AnalyzeError> {
     // Step B: the central signature registry is the single source of
     // truth for nearly all scalar built-ins (~250 names) including the
     // `coalesce`/`if`/`ifnull` cast-match family. If the registry knows
@@ -726,10 +739,16 @@ pub(super) fn legacy_scalar_return_type_with_catalog(
     // extractors (`__array_element_at`, `map_keys`), and functions
     // whose permissive type fallbacks haven't been formalised as
     // signatures yet.
-    if let Ok(resolved) = function_catalog.resolve_scalar_signature(name, arg_types) {
-        return Some(resolved.return_type);
+    match function_catalog.resolve_scalar_signature(name, arg_types, control) {
+        Ok(resolved) => return Ok(Some(resolved.return_type)),
+        Err(error @ novarocks_functions::FunctionResolutionError::Control(_)) => {
+            return Err(crate::analyze_error::AnalyzeError::function_resolution(
+                error,
+            ));
+        }
+        Err(_) => {}
     }
-    dynamic_scalar_return_type(name, arg_types)
+    Ok(dynamic_scalar_return_type(name, arg_types))
 }
 
 /// Type-only portion of the dynamic builtin binder. Literal-dependent result
@@ -1374,7 +1393,9 @@ mod tests {
                 novarocks_functions::FunctionBindingRequest {
                     arguments: &arguments,
                     logical_argument_count: arguments.len(),
+                    expected_result_type: None,
                 },
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap_or_else(|error| panic!("aggregate {name} must resolve: {error}"));
         crate::functions::aggregate_result_type(&binding)
@@ -1403,8 +1424,7 @@ mod tests {
     fn string_array_literal() -> TypedExpr {
         let args = vec![TypedExpr {
             kind: ExprKind::Literal(LiteralValue::String("a".to_string())),
-            data_type: DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         }];
         TypedExpr {
             kind: ExprKind::FunctionCall {
@@ -1420,16 +1440,17 @@ mod tests {
                 distinct: false,
                 volatility: crate::functions::FunctionVolatility::Immutable,
             },
-            data_type: array_type(DataType::Utf8),
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                array_type(DataType::Utf8),
+                false,
+            ),
         }
     }
 
     fn int_array_literal() -> TypedExpr {
         let args = vec![TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(1)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }];
         TypedExpr {
             kind: ExprKind::FunctionCall {
@@ -1445,8 +1466,10 @@ mod tests {
                 distinct: false,
                 volatility: crate::functions::FunctionVolatility::Immutable,
             },
-            data_type: array_type(DataType::Int64),
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                array_type(DataType::Int64),
+                false,
+            ),
         }
     }
 
@@ -1771,8 +1794,10 @@ mod tests {
                         qualifier: None,
                         column: "aad_1".to_string(),
                     },
-                    data_type: array_type(array_type(array_type(DataType::Decimal128(26, 2)))),
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        array_type(array_type(array_type(DataType::Decimal128(26, 2)))),
+                        true,
+                    ),
                 },
                 string_array_literal(),
             ],
@@ -1794,8 +1819,10 @@ mod tests {
                         qualifier: None,
                         column: "aad_1".to_string(),
                     },
-                    data_type: array_type(array_type(array_type(DataType::Decimal128(26, 2)))),
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        array_type(array_type(array_type(DataType::Decimal128(26, 2)))),
+                        true,
+                    ),
                 },
                 int_array_literal(),
             ],
@@ -1872,11 +1899,36 @@ mod tests {
     #[test]
     fn sum_largeint_returns_largeint() {
         let largeint_type = DataType::FixedSizeBinary(largeint::LARGEINT_BYTE_WIDTH);
-
+        // This fixture declares a SQL LARGEINT source; the carrier alone does
+        // not distinguish numeric values from UUID or ordinary fixed binary.
+        let source_type = novarocks_functions::FunctionValueType::try_with_logical_type(
+            largeint_type.clone(),
+            true,
+            novarocks_type_contract::ValueLogicalType::LargeInt,
+        )
+        .unwrap();
+        let arguments = [novarocks_functions::FunctionArgument::Value {
+            value_type: source_type,
+            constant: None,
+        }];
+        let binding = crate::functions::builtin_engine_function_catalog()
+            .resolve_bound_user(
+                "sum",
+                novarocks_functions::FunctionKind::Aggregate,
+                novarocks_functions::FunctionBindingRequest {
+                    arguments: &arguments,
+                    logical_argument_count: arguments.len(),
+                    expected_result_type: None,
+                },
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+        let result = crate::functions::aggregate_result_type(&binding);
         assert_eq!(
-            resolve_aggregate("sum", std::slice::from_ref(&largeint_type)),
-            largeint_type
+            result.logical_type,
+            novarocks_type_contract::ValueLogicalType::LargeInt
         );
+        assert_eq!(result.data_type, largeint_type);
     }
 
     #[test]

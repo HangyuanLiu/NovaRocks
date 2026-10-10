@@ -17,6 +17,32 @@
 
 use arrow_schema::DataType;
 
+/// Frozen ordinary scalar operation; never interpreted from a runtime name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComparisonOperator {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+impl ComparisonOperator {
+    pub fn apply(self, ordering: std::cmp::Ordering) -> bool {
+        match self {
+            Self::Eq => ordering == std::cmp::Ordering::Equal,
+            Self::Ne => ordering != std::cmp::Ordering::Equal,
+            Self::Lt => ordering == std::cmp::Ordering::Less,
+            Self::Le => ordering != std::cmp::Ordering::Greater,
+            Self::Gt => ordering == std::cmp::Ordering::Greater,
+            Self::Ge => ordering != std::cmp::Ordering::Less,
+        }
+    }
+    pub fn is_ordering(self) -> bool {
+        matches!(self, Self::Lt | Self::Le | Self::Gt | Self::Ge)
+    }
+}
+
 /// Complete identity of an ordered value comparison algorithm.
 ///
 /// A variant freezes scalar interpretation and equality consistency. Direction
@@ -36,6 +62,17 @@ impl OrderedComparisonAlgorithm {
         match self {
             Self::NativeScalarOrderV1 => "novarocks.native-scalar-order.v1",
         }
+    }
+
+    /// Capability for a complete logical value domain. A signed LARGEINT
+    /// comparison cannot be borrowed by an unrelated binary carrier.
+    pub fn supports_value_type(self, ty: &crate::FunctionValueType) -> bool {
+        let identity = if crate::is_largeint_data_type(&ty.data_type) {
+            ty.logical_type == crate::ValueLogicalType::LargeInt
+        } else {
+            ty.logical_type == crate::ValueLogicalType::Physical
+        };
+        identity && self.supports_order_key(&ty.data_type)
     }
 
     /// Reports the exact Arrow scalar domain frozen by this revision.

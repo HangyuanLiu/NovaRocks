@@ -18,7 +18,9 @@
 //! Process-wide immutable engine function catalog.
 //!
 //! The catalog owns function identity, visibility and signature resolution.
-//! Execution-specific state erasure is intentionally not part of this crate.
+//! Scalar preparation and selected-batch invocation use neutral contracts.
+//! Framework-owned typed erasure resolves immutable aggregate CPU handles;
+//! Execution owns state storage, group mapping, memory scopes and teardown.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -28,16 +30,116 @@ use arrow_array::{Array, ArrayRef};
 use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit, UnionMode};
 use sha2::{Digest, Sha256};
 
+mod aggregate_call;
+mod aggregate_erasure;
+pub mod aggregate_format;
+mod aggregate_host_allocator;
+mod aggregate_invocation_backing;
+mod aggregate_kernel;
+pub mod aggregate_scalar;
+pub mod aggregate_scalar_fingerprint;
+mod aggregate_state_column;
+pub mod aggregate_types;
+pub mod approx_percentile_aggregate_core;
+pub mod approx_percentile_core;
+mod arithmetic;
 mod binding;
+pub mod bit_array;
+pub mod bit_numeric;
+pub mod bitmap_to_string_core;
+pub mod bitmap_value;
+pub mod builtin;
+pub mod calendar_julian;
+pub mod calendar_numeric;
+pub mod calendar_period_numeric;
+mod call_contract;
+#[cfg(test)]
+mod carrier_map_tests;
+pub mod carrier_text;
+mod cast;
+mod comparison;
+pub mod control_values;
+pub mod datasketches_hll;
+pub mod datasketches_hll_failure;
+pub mod datetime_value;
+pub mod decimal_text;
+mod effect_metadata;
+mod effect_refinement;
+mod evaluation;
+mod evaluation_failure;
+#[cfg(test)]
+mod exact_installed_owner_selection_tests;
+#[cfg(test)]
+mod exact_overload_selection_tests;
+pub mod exact_percentile_core;
+pub mod exact_percentile_failure;
+pub mod generate_series_core;
+mod higher_order_call;
+mod higher_order_kernel;
+pub mod hll;
+pub mod invocation_arity;
+mod kernel_control;
+mod kernel_input;
+mod lambda_rows;
+pub mod largeint;
+pub mod largeint_text;
+pub mod math_numeric;
+pub mod opaque_memory;
+pub mod pattern_memo;
+pub mod percentile_hash_core;
+pub mod percentile_input;
+mod pure_catalogue;
+mod scalar_kernel;
+pub mod selected_copy;
+pub mod sketch_hash;
+mod specialization;
+mod table_call;
+mod table_kernel;
+mod temporal_call;
+pub mod temporal_carrier;
+mod window_call;
+mod window_kernel;
 
+pub use aggregate_call::*;
+pub use aggregate_erasure::*;
+pub use aggregate_kernel::*;
+pub use aggregate_state_column::*;
+pub use arithmetic::*;
 pub use binding::*;
-pub use novarocks_type_contract::{
-    AggregateStateFormatId as AggregateStateFormatIdentity, FunctionArgumentEvaluation,
-    FunctionArgumentType, FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError,
-    FunctionKind, FunctionOverloadId, FunctionValueType, FunctionVolatility,
+pub use call_contract::*;
+pub use cast::*;
+pub use comparison::*;
+pub use effect_refinement::*;
+pub use evaluation::*;
+pub use evaluation_failure::*;
+pub use higher_order_call::*;
+pub use higher_order_kernel::*;
+pub use kernel_control::*;
+pub use kernel_input::validate_type_observed as validate_function_value_type_observed;
+pub use kernel_input::{
+    EvaluationCheckpoints, validate_argument_observed as validate_evaluated_argument_observed,
+    visit_selected_nulls,
 };
+pub use lambda_rows::*;
+pub use novarocks_constant_contract::{
+    ConstantError, ConstantPolicy, ConstantPool, ConstantResourceFacts, ConstantValue,
+};
+pub use novarocks_type_contract::{
+    AggregateStateArgumentContract, AggregateStateFormatId as AggregateStateFormatIdentity,
+    FunctionArgumentEvaluation, FunctionArgumentType, FunctionFailureBehavior, FunctionId,
+    FunctionIntrinsicRowError, FunctionKind, FunctionOverloadId, FunctionValueType,
+    FunctionVolatility, ValueLogicalType,
+};
+pub use pure_catalogue::*;
+pub use scalar_kernel::*;
+pub use specialization::FunctionSpecializationFailure;
+pub use table_call::*;
+pub use table_kernel::*;
+pub use temporal_call::{PreparedTemporalSource, TemporalCallContract, TemporalSourceChannel};
+pub use window_call::*;
+pub use window_kernel::*;
 
-const FUNCTION_CATALOG_DIGEST_DOMAIN: &[u8] = b"novarocks.engine-function-catalog/v4\0";
+const FUNCTION_CATALOG_DIGEST_DOMAIN: &[u8] = b"novarocks.engine-function-catalog/v7\0";
 const RESOLVED_AGGREGATE_DIGEST_DOMAIN: &[u8] = b"novarocks.resolved-aggregate/v1\0";
 
 const fn function_kind_tag(kind: FunctionKind) -> u8 {
@@ -235,6 +337,25 @@ impl ResolvedAggregateSignature {
 
 /// Safe parametric aggregate signature resolver.
 pub trait AggregateSignatureResolver: Send + Sync {
+    /// Declare the complete value domains admitted by this family before any
+    /// carrier-only kernel signature is materialized.
+    fn validate_value_arguments(
+        &self,
+        argument_types: &[novarocks_type_contract::FunctionValueType],
+    ) -> Result<(), FunctionResolutionError> {
+        for argument in argument_types {
+            argument
+                .validate()
+                .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?;
+            if argument.logical_type != novarocks_type_contract::ValueLogicalType::Physical {
+                return Err(FunctionResolutionError::BadSignature(
+                    "aggregate family does not declare this root logical identity".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn resolve_aggregate(
         &self,
         argument_types: &[DataType],
@@ -244,6 +365,17 @@ pub trait AggregateSignatureResolver: Send + Sync {
     /// expressions as additional executable update channels.
     fn supports_ordered_update_channels(&self) -> bool {
         false
+    }
+
+    /// The original owner declares how this exact overload compares logical
+    /// argument metadata across state-producing and state-consuming phases.
+    /// This is not a runtime-success, value-equality or source-lineage proof.
+    fn state_argument_contract(
+        &self,
+        _selected_overload: &AggregateOverloadIdentity,
+    ) -> Result<novarocks_type_contract::AggregateStateArgumentContract, FunctionResolutionError>
+    {
+        Ok(novarocks_type_contract::AggregateStateArgumentContract::ExactSignature)
     }
 
     /// Whether this aggregate can produce NULL.
@@ -257,27 +389,24 @@ pub trait AggregateSignatureResolver: Send + Sync {
     }
 
     /// Materialize the exact execution signature for an already-selected
-    /// logical overload. The default admits no extra update channels; ordered
-    /// aggregate families must opt in explicitly.
+    /// logical overload. The default refuses missing fixed-overload authors;
+    /// it never runs candidate resolution as a substitute. Ordered aggregate
+    /// families must declare their complete update channels explicitly.
     fn resolve_update_signature(
         &self,
         selected_overload: &AggregateOverloadIdentity,
         update_argument_types: &[DataType],
     ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
-        let resolved = self.resolve_aggregate(update_argument_types)?;
-        if &resolved.overload != selected_overload {
-            return Err(FunctionResolutionError::BadSignature(format!(
-                "aggregate update resolver selected overload `{}` instead of `{}`",
-                resolved.overload.as_str(),
-                selected_overload.as_str()
-            )));
-        }
-        Ok(resolved)
+        let _ = (selected_overload, update_argument_types);
+        Err(FunctionResolutionError::BadSignature(
+            "aggregate family does not declare fixed-overload update binding".into(),
+        ))
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FunctionResolutionError {
+    Control(novarocks_type_contract::CompileControlError),
     UnknownFunction,
     HiddenFunction,
     NoMatchingSignature {
@@ -290,6 +419,7 @@ pub enum FunctionResolutionError {
 impl fmt::Display for FunctionResolutionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Control(error) => error.fmt(formatter),
             Self::UnknownFunction => formatter.write_str("function not registered"),
             Self::HiddenFunction => formatter.write_str("function is hidden from user SQL"),
             Self::NoMatchingSignature { candidates, .. } => write!(
@@ -302,6 +432,36 @@ impl fmt::Display for FunctionResolutionError {
 }
 
 impl std::error::Error for FunctionResolutionError {}
+
+impl From<novarocks_type_contract::CompileControlError> for FunctionResolutionError {
+    fn from(error: novarocks_type_contract::CompileControlError) -> Self {
+        Self::Control(error)
+    }
+}
+
+impl FunctionResolutionError {
+    pub fn control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
+        match self {
+            Self::Control(error) => Some(*error),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn binding_test_control() -> &'static dyn novarocks_type_contract::PureCompileControl {
+    struct Control;
+    impl novarocks_type_contract::PureCompileControl for Control {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+    }
+    &Control
+}
 
 /// Safe type-level resolver supplied by a statically linked function bundle.
 pub trait FunctionSignatureResolver: Send + Sync {
@@ -533,6 +693,9 @@ pub trait TypedAggregateKernel: Send + Sync + 'static {
 pub enum AggregateStateMemoryPolicy {
     /// The state never owns memory outside its inline arena body.
     FixedZero,
+    /// Every state-owned allocation is authorized and released by the explicit
+    /// host allocator. Retained bytes are a fact, never a capacity grant.
+    AllocationTracked,
     /// The state may retain heap memory up to this per-state bound.
     ///
     /// Execution reserves the unconsumed headroom before every state mutation,
@@ -549,6 +712,25 @@ pub trait TypedAggregateFamily: Send + Sync + 'static {
     type Kernel: TypedAggregateKernel;
     type PrepareError: fmt::Display + Send + Sync + 'static;
 
+    /// Declare the complete value domains admitted by this family before any
+    /// carrier-only kernel signature is materialized.
+    fn validate_value_arguments(
+        &self,
+        argument_types: &[novarocks_type_contract::FunctionValueType],
+    ) -> Result<(), FunctionResolutionError> {
+        for argument in argument_types {
+            argument
+                .validate()
+                .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))?;
+            if argument.logical_type != novarocks_type_contract::ValueLogicalType::Physical {
+                return Err(FunctionResolutionError::BadSignature(
+                    "aggregate family does not declare this root logical identity".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn overloads(&self) -> &[AggregateOverloadDeclaration];
 
     fn resolve_signature(
@@ -558,6 +740,17 @@ pub trait TypedAggregateFamily: Send + Sync + 'static {
 
     fn supports_ordered_update_channels(&self) -> bool {
         false
+    }
+
+    /// The original family declares how this exact overload compares logical
+    /// argument metadata across state-producing and state-consuming phases.
+    /// This is not a runtime-success, value-equality or source-lineage proof.
+    fn state_argument_contract(
+        &self,
+        _selected_overload: &AggregateOverloadIdentity,
+    ) -> Result<novarocks_type_contract::AggregateStateArgumentContract, FunctionResolutionError>
+    {
+        Ok(novarocks_type_contract::AggregateStateArgumentContract::ExactSignature)
     }
 
     /// Whether this family can produce NULL. See
@@ -571,15 +764,10 @@ pub trait TypedAggregateFamily: Send + Sync + 'static {
         selected_overload: &AggregateOverloadIdentity,
         update_argument_types: &[DataType],
     ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
-        let resolved = self.resolve_signature(update_argument_types)?;
-        if &resolved.overload != selected_overload {
-            return Err(FunctionResolutionError::BadSignature(format!(
-                "aggregate update resolver selected overload `{}` instead of `{}`",
-                resolved.overload.as_str(),
-                selected_overload.as_str()
-            )));
-        }
-        Ok(resolved)
+        let _ = (selected_overload, update_argument_types);
+        Err(FunctionResolutionError::BadSignature(
+            "typed aggregate family does not declare fixed-overload update binding".into(),
+        ))
     }
 
     fn prepare(
@@ -635,6 +823,66 @@ impl<F: TypedAggregateFamily> TypedAggregateRegistration<F> {
         &self.implementation
     }
 
+    /// Attach selected CPU preparation while retaining this registration's
+    /// original typed family and implementation. Only explicit effect facts
+    /// may be added: identity, overloads, patterns, state interpretation and
+    /// legacy semantics must agree with the original binding declaration.
+    pub fn try_attach_pure_aggregate<O>(mut self, owner: Arc<O>) -> Result<Self, PureCatalogError>
+    where
+        O: PureFunctionMetadataOwner
+            + PureAggregateImplementation
+            + AggregateSignatureResolver
+            + 'static,
+    {
+        let original = self
+            .definition
+            .binding_declaration()
+            .expect("typed registration authors its binding declaration");
+        let pure = owner.binding_declaration();
+        let matches = original.function_id() == pure.function_id()
+            && original.kind() == pure.kind()
+            && original.overloads().len() == pure.overloads().len()
+            && original
+                .overloads()
+                .iter()
+                .zip(pure.overloads())
+                .all(|(old, new)| {
+                    old.identity == new.identity
+                        && old.semantics == new.semantics
+                        && old.argument_pattern == new.argument_pattern
+                        && old.result_pattern == new.result_pattern
+                        && old.aggregate == new.aggregate
+                        && old
+                            .effects
+                            .as_ref()
+                            .is_none_or(|effects| new.effects.as_ref() == Some(effects))
+                });
+        if !matches {
+            return Err(FunctionBindingError::InvalidBinding(
+                "pure aggregate attachment differs from its original typed declaration".into(),
+            )
+            .into());
+        }
+        let mut definition = FunctionDefinition::try_new_pure_aggregate(
+            self.definition.canonical_name(),
+            self.definition.visibility,
+            owner,
+        )?;
+        definition
+            .binding
+            .as_mut()
+            .expect("pure attachment authors its binding")
+            .retain_resolver_from(
+                self.definition
+                    .binding
+                    .as_ref()
+                    .expect("typed registration authors its binding"),
+            );
+        definition.aggregate_resolver = self.definition.aggregate_resolver.clone();
+        self.definition = definition;
+        Ok(self)
+    }
+
     pub fn into_parts(self) -> (FunctionDefinition, AggregateImplementationIdentity, Arc<F>) {
         (self.definition, self.implementation, self.family)
     }
@@ -645,6 +893,13 @@ struct TypedFamilySignatureResolver<F> {
 }
 
 impl<F: TypedAggregateFamily> AggregateSignatureResolver for TypedFamilySignatureResolver<F> {
+    fn validate_value_arguments(
+        &self,
+        argument_types: &[novarocks_type_contract::FunctionValueType],
+    ) -> Result<(), FunctionResolutionError> {
+        self.family.validate_value_arguments(argument_types)
+    }
+
     fn resolve_aggregate(
         &self,
         argument_types: &[DataType],
@@ -654,6 +909,14 @@ impl<F: TypedAggregateFamily> AggregateSignatureResolver for TypedFamilySignatur
 
     fn supports_ordered_update_channels(&self) -> bool {
         self.family.supports_ordered_update_channels()
+    }
+
+    fn state_argument_contract(
+        &self,
+        selected_overload: &AggregateOverloadIdentity,
+    ) -> Result<novarocks_type_contract::AggregateStateArgumentContract, FunctionResolutionError>
+    {
+        self.family.state_argument_contract(selected_overload)
     }
 
     fn produces_null(&self) -> bool {
@@ -890,6 +1153,36 @@ impl AggregateSignatureResolver for ExactAggregateResolver {
         argument_types: &[DataType],
     ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
         select_exact_aggregate_overload(&self.overloads, argument_types).map(Into::into)
+    }
+    fn resolve_update_signature(
+        &self,
+        selected_overload: &AggregateOverloadIdentity,
+        argument_types: &[DataType],
+    ) -> Result<ResolvedAggregateSignature, FunctionResolutionError> {
+        let selected = self
+            .overloads
+            .iter()
+            .find(|entry| &entry.identity == selected_overload)
+            .ok_or_else(|| {
+                FunctionResolutionError::BadSignature(
+                    "exact aggregate overload is not declared by this family".into(),
+                )
+            })?;
+        if selected.argument_types.len() != argument_types.len()
+            || !selected
+                .argument_types
+                .iter()
+                .zip(argument_types)
+                .all(|(expected, actual)| {
+                    novarocks_type_contract::arrow_data_types_exact(expected, actual)
+                })
+        {
+            return Err(FunctionResolutionError::NoMatchingSignature {
+                candidates: 1,
+                binding_enforced: true,
+            });
+        }
+        Ok(selected.into())
     }
 }
 
@@ -1922,6 +2215,37 @@ mod tests {
         assert_eq!(resolved.intermediate_type, DataType::Int64);
         assert_eq!(resolved.output_type, DataType::Int64);
         assert_eq!(resolved.state_format.as_str(), "sum-int64-state/v1");
+        assert_eq!(
+            catalog
+                .resolve_selected_aggregate_update_trusted(
+                    "typed_sum",
+                    &resolved.overload,
+                    &[DataType::Int64],
+                )
+                .unwrap(),
+            resolved,
+        );
+        // FLOAT64 is a declared candidate, but cannot replace the chosen I64
+        // overload at the update boundary.
+        assert!(
+            catalog
+                .resolve_selected_aggregate_update_trusted(
+                    "typed_sum",
+                    &resolved.overload,
+                    &[DataType::Float64],
+                )
+                .is_err()
+        );
+        let foreign = AggregateOverloadIdentity::try_new("foreign/int64/v1").unwrap();
+        assert!(
+            catalog
+                .resolve_selected_aggregate_update_trusted(
+                    "typed_sum",
+                    &foreign,
+                    &[DataType::Int64],
+                )
+                .is_err()
+        );
         assert!(matches!(
             catalog.resolve_aggregate_user("typed_sum", &[DataType::UInt64]),
             Err(FunctionResolutionError::NoMatchingSignature {
@@ -2273,6 +2597,13 @@ mod tests {
         let selected = catalog
             .resolve_aggregate_user("typed_sum", &[DataType::Int64])
             .unwrap();
+        assert!(
+            matches!(
+                family.resolve_update_signature(&selected.overload, &[DataType::Int64]),
+                Err(FunctionResolutionError::BadSignature(_)),
+            ),
+            "a working typed election author grants no default fixed capability"
+        );
         let kernel = family
             .prepare(&selected, &AggregateBindOptions::default())
             .unwrap();
@@ -2325,3 +2656,103 @@ mod tests {
         assert_eq!(options.max_output_bytes(), Some(4096));
     }
 }
+
+pub mod date_float_cast;
+
+pub mod append_trailing_core;
+pub mod float_date_cast;
+pub mod string_reverse_shared;
+
+pub mod legacy_arithmetic;
+pub mod legacy_decimal;
+pub mod legacy_literal;
+mod native_negate;
+pub use native_negate::*;
+
+pub mod binary_text;
+
+#[cfg(test)]
+mod native_negate_original_decimal_carrier_baseline_tests;
+
+pub mod decimal_float_cast;
+pub mod float_decimal128;
+
+pub mod time_text_cast;
+#[cfg(test)]
+mod time_text_cast_tests;
+
+pub mod time_calendar_cast;
+
+pub mod field_shared;
+
+mod native_bitnot;
+pub use native_bitnot::*;
+
+/// Original Decimal128 CAST computation shared by legacy and selected shells.
+pub mod decimal128_rescale;
+
+pub mod list_cast_core;
+mod list_cast_selected;
+
+mod native_between;
+pub use native_between::*;
+
+/// Original signed integral Decimal128 conversion and policy projection.
+pub mod integral_decimal128;
+
+pub mod native_inlist;
+pub use native_inlist::PreparedNativeInListRecipe;
+
+pub mod hll_hash_core;
+
+pub mod native_like;
+pub use native_like::PreparedNativeLikeRecipe;
+
+pub mod bitmap_aggregate_core;
+
+mod bitmap_decode_resources;
+
+pub mod percentile_approx_raw_core;
+
+pub mod approx_percentile_failure;
+
+mod arrow_result_custody;
+mod scalar_output_operation;
+mod scalar_output_resources;
+pub mod window_format;
+mod window_invocation_data;
+mod window_output_scalars;
+pub use window_invocation_data::{
+    WindowEvaluationFailure, WindowInvocationContext, WindowInvocationData, WindowInvocationPhase,
+};
+
+mod window_result_carrier;
+pub use window_result_carrier::WindowResultCarrier;
+
+mod window_invocation_input;
+pub use window_invocation_input::{
+    FullWindowInvocationInput, WindowFrameOrigin, WindowInvocationInput,
+};
+mod window_evaluation_invocation;
+pub use window_evaluation_invocation::WindowEvaluationInvocation;
+mod window_invocation_scratch;
+pub use window_invocation_scratch::WindowInvocationScratch;
+pub mod window_input_order;
+pub use window_invocation_data::WindowInvocationScope;
+
+mod array_backing_geometry;
+pub use arrow_result_custody::{SourceBackingOwner, retain_source_backing};
+
+pub mod string_repeat_pad_core;
+
+mod scalar_invocation;
+pub use scalar_invocation::*;
+
+pub mod string_left_right_core;
+
+pub mod string_split_part_core;
+
+pub mod approx_top_k_core;
+
+#[cfg(test)]
+mod common_type_m07_contract_tests;

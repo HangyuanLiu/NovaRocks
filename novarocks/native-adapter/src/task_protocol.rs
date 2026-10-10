@@ -61,6 +61,7 @@ use prost::Message;
 use tokio_stream::Stream;
 
 use crate::native_ingress::NativeIngressOwnership;
+use crate::static_package_admission::StaticPackageAdmission;
 use crate::task_protocol_fault;
 use novarocks_worker::{
     AdmissionTicketObservation, CoveredObservationFact, CoveredObservationFrame,
@@ -245,6 +246,12 @@ pub trait TaskOperationBatchApplier: Send + Sync {
         context: QueryContextRef,
         native_compatibility_id: Option<&proto::NativeCompatibilityId>,
     ) -> Result<Option<proto::TaskOperationReceipt>, tonic::Status>;
+
+    /// The compiled-package resource gate this process composed. A plan-tree
+    /// process composes none, and its creates pass with their carrier unread.
+    fn static_package_admission(&self) -> Option<&StaticPackageAdmission> {
+        None
+    }
 }
 
 /// Decodes one bounded operation batch and delegates each item in request
@@ -367,6 +374,15 @@ pub fn apply_task_operations_at(
         FieldPath::root("apply_task_operations"),
     )
     .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+    // A compiled-package process bounds every create's package here, before
+    // any owner classifies its identity, so a replay is gated like a winner.
+    // The batch decoder above is the only successful decode on this path:
+    // the earlier one only renders a refusal.
+    if let Some(admission) = applier.static_package_admission() {
+        admission
+            .admit_ordinary_batch(&operations, FieldPath::root("apply_task_operations"))
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+    }
     // The neutral operation constructors currently carry their default wait.
     // The validated wire envelopes retain each caller's actual max_wait.
     let waits = request
