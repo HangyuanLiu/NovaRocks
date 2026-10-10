@@ -368,6 +368,62 @@ fn count_actual_metadata_constructor_refusal_and_every_control_point_preserve_se
     }
 }
 #[test]
+fn count_actual_borrowed_lookup_refusal_keeps_first_cause_and_releases_prior_keys() {
+    let kernel = kernel(&[ty(DataType::Utf8)], AggregateKernelPhase::Single);
+    for query in ["abc", "missing"] {
+        let values = [text(query)];
+        let host = Arc::new(Host::default());
+        let mut state = new_state(&kernel, host.clone());
+        for key in ["abc", "def", ""] {
+            update(&kernel, &mut state, &[text(key)], &Control::default()).unwrap();
+        }
+        let control = Control::default();
+        update(&kernel, &mut state, &values, &control).unwrap();
+        let extent = control.trace.lock().unwrap().len();
+        assert!(extent > 0);
+        drop(state);
+        released(&host);
+
+        for stop in 0..extent {
+            for cause in causes() {
+                let host = Arc::new(Host::default());
+                let mut state = new_state(&kernel, host.clone());
+                let initial = host.snapshot();
+                for key in ["abc", "def", ""] {
+                    update(&kernel, &mut state, &[text(key)], &Control::default()).unwrap();
+                }
+                let stable = host.snapshot();
+                let control = Control {
+                    refusal: Some((stop, cause.clone())),
+                    ..Control::default()
+                };
+                assert_eq!(update(&kernel, &mut state, &values, &control), Err(cause));
+                if query == "abc" {
+                    assert_eq!(
+                        host.snapshot().attempts,
+                        stable.attempts,
+                        "duplicate lookup does not reserve even when refused"
+                    );
+                }
+                failed(&kernel, &state, &host, &initial);
+                let attempts = host.snapshot().attempts;
+                let secondary = Control {
+                    refusal: Some((0, KernelFailure::ResourceExhausted)),
+                    ..Control::default()
+                };
+                assert_eq!(
+                    update(&kernel, &mut state, &values, &secondary),
+                    Err(KernelFailure::InstanceFailed)
+                );
+                assert!(secondary.trace.lock().unwrap().is_empty());
+                assert_eq!(host.snapshot().attempts, attempts);
+                drop(state);
+                released(&host);
+            }
+        }
+    }
+}
+#[test]
 fn count_actual_hash_reserve_precedes_key_reserve_and_duplicate_insert_never_charges() {
     let kernel = kernel(&[ty(DataType::Utf8)], AggregateKernelPhase::Single);
     let values = [text("abc")];
