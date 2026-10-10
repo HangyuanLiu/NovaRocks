@@ -734,3 +734,91 @@ fn m07_shared_field_projection_retains_original_uea_namespace_without_cloning_fi
         source.schema_owner().schema()
     ));
 }
+
+#[test]
+fn project_original_metadata_materialization_survives_actual_output_and_nullable_rebuild() {
+    use crate::exec::chunk::{RootArrayStorageLimits, borrowed_root_chunk_storage};
+    use crate::exec::operators::materialize_project_output;
+    use arrow::buffer::NullBuffer;
+
+    let (original, child) = source();
+    let mut map = MaterializedMetadataMap::with_capacity(17);
+    map.insert("project.original".into(), "kept".into());
+    let source = SchemaMetadataMaterializations::from_materialized_owners(
+        map.into_schema(original.schema_owner().schema().fields().clone())
+            .into_shared(),
+        Arc::from(original.fields()),
+    );
+    let declared = ChunkSchema::from_compiled_layout(&layout(source, &Control::default())).unwrap();
+    let limits = RootArrayStorageLimits {
+        bytes: 96 << 20,
+        nodes: 8192,
+        depth: 64,
+    };
+    for nulls in [None, Some(NullBuffer::from(vec![true, false]))] {
+        let values: ArrayRef = Arc::new(Int64Array::from(vec![7, 8]));
+        let column: ArrayRef = Arc::new(StructArray::new(
+            vec![Arc::clone(&child)].into(),
+            vec![values],
+            nulls,
+        ));
+        let output = materialize_project_output(vec![column], &declared, false).unwrap();
+        let schema = output.chunk_schema();
+        // Chunk alignment preserves the existing empty root metadata contract.
+        assert!(schema.arrow_schema_ref().metadata().is_empty());
+        assert_eq!(
+            declared
+                .arrow_schema_ref()
+                .metadata()
+                .get("project.original"),
+            Some(&"kept".to_string())
+        );
+        let actual = schema.metadata_materializations().unwrap();
+        assert!(actual.schema_owner().lends(&schema.arrow_schema_ref()));
+        assert!(actual.field_origin(&child).is_some());
+        assert!(
+            actual
+                .field_origin(&schema.arrow_schema_ref().fields()[0])
+                .is_some()
+        );
+        assert_eq!(
+            schema.field(0).unwrap().is_nullable(),
+            output.batch.column(0).null_count() > 0
+        );
+        assert!(borrowed_root_chunk_storage(&output, limits).is_ok());
+    }
+}
+
+#[test]
+fn project_foreign_metadata_is_not_promoted_by_equal_original_field_values() {
+    use crate::exec::chunk::{
+        RootArrayStorageError, RootArrayStorageLimits, borrowed_root_chunk_storage,
+    };
+    use crate::exec::operators::materialize_project_output;
+
+    let (source, child) = source();
+    let original = ChunkSchema::from_compiled_layout(&layout(source, &Control::default())).unwrap();
+    let field = Arc::new(original.field(0).unwrap().clone());
+    let foreign = ChunkSchema::try_new_with_schema_metadata(
+        vec![ChunkSlotSchema::try_new_with_field_ref(SlotId::new(7), field, None, None).unwrap()],
+        original.arrow_schema_ref().metadata().clone(),
+    )
+    .unwrap();
+    assert_eq!(foreign.arrow_schema_ref(), original.arrow_schema_ref());
+    assert!(foreign.metadata_materializations().is_none());
+    let values: ArrayRef = Arc::new(Int64Array::from(vec![7, 8]));
+    let column: ArrayRef = Arc::new(StructArray::new(vec![child].into(), vec![values], None));
+    let output = materialize_project_output(vec![column], &foreign, false).unwrap();
+    assert!(output.chunk_schema().metadata_materializations().is_none());
+    assert_eq!(
+        borrowed_root_chunk_storage(
+            &output,
+            RootArrayStorageLimits {
+                bytes: 96 << 20,
+                nodes: 8192,
+                depth: 64
+            }
+        ),
+        Err(RootArrayStorageError::UnknownMetadataOwner),
+    );
+}

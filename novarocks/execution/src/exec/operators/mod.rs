@@ -99,6 +99,8 @@ pub(crate) use nljoin::NlJoinSharedState;
 pub use nljoin::{NlJoinBuildSinkFactory, NlJoinProbeProcessorFactory};
 pub use noop_sink::NoopSinkFactory;
 pub use project_processor::ProjectProcessorFactory;
+#[cfg(test)]
+pub(crate) use project_processor::materialize_project_output;
 pub use repeat_processor::RepeatProcessorFactory;
 pub(crate) use repeat_processor::repeat_output_chunk_schema;
 pub use result_buffer_sink::ResultBufferSinkFactory;

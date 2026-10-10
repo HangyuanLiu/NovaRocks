@@ -98,6 +98,8 @@ fn projected_chunk_schema(
 ) -> Result<ChunkSchemaRef, String> {
     let schema = if let Some(source) = declared.schema_metadata_origin() {
         ChunkSchema::try_new_with_derived_schema_metadata(slots, source)?
+    } else if let Some(source) = declared.metadata_materializations() {
+        ChunkSchema::try_new_with_original_schema_metadata(slots, source)?
     } else {
         ChunkSchema::try_new_with_schema_metadata(
             slots,

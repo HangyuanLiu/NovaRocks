@@ -196,13 +196,24 @@ impl ChunkFieldSchema {
     }
 }
 
-#[derive(Debug)]
 pub struct ChunkSlotSchema {
     slot_id: SlotId,
     field: OriginalSharedField,
     metadata_origins: Option<FieldMetadataOrigins>,
     field_schema: ChunkFieldSchema,
     unique_id: Option<i32>,
+}
+
+impl std::fmt::Debug for ChunkSlotSchema {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        out.debug_struct("ChunkSlotSchema")
+            .field("slot_id", &self.slot_id)
+            .field("field", self.field.field_ref())
+            .field("metadata_origins", &self.metadata_origins)
+            .field("field_schema", &self.field_schema)
+            .field("unique_id", &self.unique_id)
+            .finish()
+    }
 }
 
 impl Clone for ChunkSlotSchema {
@@ -948,6 +959,19 @@ impl ChunkSchema {
         metadata: HashMap<String, String>,
     ) -> Result<Self, String> {
         Self::try_new_with_metadata_source(slots, ChunkMetadataSource::Foreign(metadata), None)
+    }
+
+    /// Derive from this positively paired original Schema map and inherit its
+    /// exact field loans. Structural equality never elects an original source.
+    pub(crate) fn try_new_with_original_schema_metadata(
+        slots: Vec<ChunkSlotSchema>,
+        source: &SchemaMetadataMaterializations,
+    ) -> Result<Self, String> {
+        Self::try_new_with_metadata_source(
+            slots,
+            ChunkMetadataSource::Original(source.schema_owner().clone_metadata_original()),
+            Some(source.fields()),
+        )
     }
 
     pub fn try_new_with_owned_schema_metadata(
