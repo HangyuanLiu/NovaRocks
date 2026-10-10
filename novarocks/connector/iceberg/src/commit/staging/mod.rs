@@ -37,3 +37,6 @@ fn invalid(message: impl Into<String>) -> crate::iceberg::Error {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod interop_tests;
