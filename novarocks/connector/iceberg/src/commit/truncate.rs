@@ -15,28 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `TruncateCommit` — write a single `operation=delete` snapshot that marks
-//! every live data + delete file as DELETED while preserving schema, partition
-//! spec, properties, and other refs.
+//! TRUNCATE prepares a delete snapshot for the exact target ref.
 //!
-//! Differences from `OverwriteCommit`:
-//! * No `written` files: TRUNCATE never adds rows.
-//! * No row-lineage advance: spec says `last-row-id` is NOT advanced, so the
-//!   manifest list is written with `first_row_id: None` and the V3 snapshot
-//!   row range carries `(next_row_id, 0)` — the validator at
-//!   `iceberg-0.9.0/src/spec/table_metadata_builder.rs:419` rejects a V3
-//!   snapshot with a null first-row-id, but `added_rows_count = 0` means
-//!   `next_row_id` is preserved across the snapshot.
-//! * Splits enumerated entries by `DataContentType` so position-delete /
-//!   equality-delete / Iceberg v3 deletion-vector entries land in a separate
-//!   `Deletes`-typed manifest (the existing `write_overwrite_deletes_manifest`
-//!   helper is hard-wired to `build_v*_data()` and would reject delete-content
-//!   entries via `ManifestWriter::check_data_file`).
-//! * Summary `operation = "delete"` plus the proper `deleted-data-files` /
-//!   `removed-position-delete-files` / `removed-equality-delete-files` counts.
-//!
-//! Even when the base table is empty we still write a `delete` snapshot with
-//! `deleted-data-files = 0` so TRUNCATE leaves an audit trail entry.
+//! Every live data or delete entry is marked DELETED with its original facts.
+//! Schema, partitioning and other refs are preserved; no row IDs are allocated.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -61,6 +43,55 @@ use super::overwrite::{
 };
 use crate::commit::CommitOutcome;
 use crate::commit::abort::AbortLog;
+
+/// Remove every live logical entry from the exact target ref.
+pub(crate) struct TruncatePreparer;
+
+#[async_trait]
+impl super::staging::Preparer for TruncatePreparer {
+    async fn prepare(
+        &self,
+        view: &super::staging::StagedView<'_>,
+        intent: &super::model::OperationIntent,
+    ) -> crate::iceberg::Result<super::staging::PreparedChange> {
+        if view.metadata().format_version() == FormatVersion::V1 {
+            return Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::DataInvalid,
+                "TRUNCATE does not support V1 tables",
+            ));
+        }
+        if !intent.changes().added.is_empty() {
+            return Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::DataInvalid,
+                "TRUNCATE cannot add files",
+            ));
+        }
+        let parent = view
+            .metadata()
+            .snapshot_for_ref(intent.target_ref())
+            .map(|s| s.snapshot_id());
+        let mut inputs =
+            super::dependency::ValidationInputs::new(view.metadata(), parent, view.artifacts());
+        let removed: Vec<_> = inputs.live_set().await?.values().cloned().collect();
+        let snapshot_id = super::staging::new_snapshot_id(view.metadata());
+        let manifests = super::overwrite::write_live_entry_groups(
+            view,
+            snapshot_id,
+            removed.iter().cloned().map(|e| (e, true)).collect(),
+        )
+        .await?;
+        super::overwrite::prepare_snapshot_change(
+            view,
+            intent,
+            snapshot_id,
+            Operation::Delete,
+            manifests,
+            super::overwrite::snapshot_file_summary(&[], &removed)?,
+            true,
+        )
+        .await
+    }
+}
 
 pub struct TruncateCommit;
 

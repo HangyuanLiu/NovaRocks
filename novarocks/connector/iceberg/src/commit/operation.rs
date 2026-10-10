@@ -202,6 +202,18 @@ impl IcebergCommitOperation {
             .collect())
     }
 
+    /// Unknown publication retains readable ledger facts even after a poisoned mutation lock.
+    /// Reading them never repairs the ledger or grants cleanup/mutation authority.
+    pub(crate) fn recovery_artifacts(&self) -> Vec<ArtifactRecord> {
+        self.inner
+            .ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .records()
+            .cloned()
+            .collect()
+    }
+
     pub(crate) async fn pause(&self, duration: Duration) -> Result<()> {
         self.check_active()?;
         tokio::select! {
@@ -218,6 +230,28 @@ impl IcebergCommitOperation {
             Ok(ledger) => ledger.selected(scope),
             Err(_) => return IcebergCleanupReport::NotAttempted,
         };
+        self.cleanup_records(records).await
+    }
+
+    /// Only a known committed request authorizes deletion of unreachable owned objects.
+    /// Physical identity is used here: a carried blob keeps its entire shared Puffin alive.
+    pub(crate) async fn cleanup_after_commit(
+        &self,
+        retained: &[ObjectIdentity],
+    ) -> IcebergCleanupReport {
+        let retained: BTreeSet<_> = retained.iter().collect();
+        let records = match self.inner.ledger.lock() {
+            Ok(ledger) => ledger
+                .records()
+                .filter(|record| !retained.contains(&record.object))
+                .cloned()
+                .collect(),
+            Err(_) => return IcebergCleanupReport::NotAttempted,
+        };
+        self.cleanup_records(records).await
+    }
+
+    async fn cleanup_records(&self, records: Vec<ArtifactRecord>) -> IcebergCleanupReport {
         if records.is_empty() {
             return IcebergCleanupReport::Complete { deleted: 0 };
         }
@@ -351,6 +385,12 @@ pub(crate) struct IcebergCommitAttempt {
     operation: IcebergCommitOperation,
     token: AttemptToken,
     file_io: FileIO,
+}
+
+impl IcebergCommitAttempt {
+    pub(crate) fn operation_artifacts(&self) -> Result<Vec<ArtifactRecord>> {
+        self.operation.artifacts()
+    }
 }
 
 impl ArtifactWriter for IcebergCommitAttempt {
@@ -809,7 +849,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_delete_timeout_keeps_unknown_object_without_background_work() {
-        use std::io::{Read, Write};
+        use std::io::{BufRead, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -823,10 +863,10 @@ mod tests {
                         socket
                             .set_read_timeout(Some(Duration::from_secs(3)))
                             .unwrap();
-                        let mut bytes = [0; 4096];
-                        let length = socket.read(&mut bytes).unwrap_or(0);
-                        let _ = request_seen
-                            .send(String::from_utf8_lossy(&bytes[..length]).into_owned());
+                        // TCP reads need not contain a complete request line.
+                        let mut line = String::new();
+                        let _ = std::io::BufReader::new(&socket).read_line(&mut line);
+                        let _ = request_seen.send(line);
                         let _ = wait_release.recv_timeout(Duration::from_secs(3));
                         let _ = socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                         return;
@@ -892,7 +932,11 @@ mod tests {
         // Release and join even if an assertion fails below; this test owns its fake endpoint.
         let _ = release.send(());
         server.join().unwrap();
-        assert!(request.unwrap().starts_with("DELETE "));
+        let request = request.unwrap();
+        assert!(
+            request.starts_with("DELETE "),
+            "Expected DELETE request line: {request:?}"
+        );
         assert!(
             elapsed < Duration::from_secs(1),
             "cleanup escaped its independent budget: {elapsed:?}"

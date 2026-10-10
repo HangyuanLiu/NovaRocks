@@ -15,18 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Self-assembled fast-append action for INSERT INTO.
+//! Immutable append preparation for the exact target ref.
 //!
-//! Every append — v2 and v3 — is staged by `FastAppendV3TxnAction` and
-//! submitted through `helpers::submit_snapshot_occ_action`. iceberg-rust's built-in
-//! `Transaction::fast_append` is deliberately unused: `Transaction::commit`
-//! re-runs every action against the base it just reloaded and therefore
-//! recomputes each requirement from the value it is about to assert, which can
-//! never reject a stale writer carrying an external write fence. V3
-//! row-lineage tables additionally need the custom action so manifest-list
-//! `first_row_id` and snapshot row ranges are populated for subsequent
-//! `_row_id` scans and deletion-vector commits; v2 tables pass
-//! `row_lineage: None` and stay free of every row-lineage field.
+//! Each attempt creates fresh metadata artifacts from the same frozen file
+//! facts. New entries inherit their publication sequences; the manifest-list
+//! writer determines row-ID allocation, including historical first assignment.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -52,6 +45,53 @@ use super::helpers::{
 };
 use super::overwrite::write_added_data_manifest;
 use crate::commit::{CommitOutcome, IcebergWriteMode, WrittenFile};
+
+/// An append freezes file facts once and prepares fresh manifests per attempt.
+pub(crate) struct FastAppendPreparer;
+
+#[async_trait]
+impl super::staging::Preparer for FastAppendPreparer {
+    async fn prepare(
+        &self,
+        view: &super::staging::StagedView<'_>,
+        intent: &super::model::OperationIntent,
+    ) -> crate::iceberg::Result<super::staging::PreparedChange> {
+        super::overwrite::validate_added_data(intent)?;
+        let metadata = view.metadata();
+        let parent = metadata
+            .snapshot_for_ref(intent.target_ref())
+            .map(|s| s.snapshot_id());
+        let mut manifests = if let Some(id) = parent {
+            view.artifacts().check_active()?;
+            let snapshot = metadata.snapshot_by_id(id).ok_or_else(|| {
+                crate::iceberg::Error::new(
+                    crate::iceberg::ErrorKind::DataInvalid,
+                    "Append target ref snapshot is absent",
+                )
+            })?;
+            let list = snapshot
+                .load_manifest_list(view.artifacts().file_io(), metadata)
+                .await?;
+            view.artifacts().check_active()?;
+            list.entries().to_vec()
+        } else {
+            Vec::new()
+        };
+        let snapshot_id = super::staging::new_snapshot_id(metadata);
+        manifests
+            .extend(super::overwrite::write_added_intent_data(view, intent, snapshot_id).await?);
+        super::overwrite::prepare_snapshot_change(
+            view,
+            intent,
+            snapshot_id,
+            Operation::Append,
+            manifests,
+            super::overwrite::snapshot_file_summary(&intent.changes().added, &[])?,
+            false,
+        )
+        .await
+    }
+}
 
 pub struct FastAppendCommit;
 

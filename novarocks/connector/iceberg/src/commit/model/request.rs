@@ -77,7 +77,7 @@ pub struct FrozenRequestParts {
     pub artifacts: AttemptArtifacts,
 }
 
-/// Deliberately not Clone: one owner consumes the complete request at dispatch.
+/// Deliberately not Clone: one owner accepts the complete request and dispatches it once.
 #[derive(Debug)]
 pub struct FrozenRequest {
     parts: FrozenRequestParts,
@@ -239,11 +239,11 @@ impl FrozenRequest {
     }
     /// Only the catalog dispatch boundary calls this transitional SDK projection.
     /// Rust restricted visibility cannot name the sibling catalog module.
-    pub(crate) fn into_table_commit(self) -> TableCommit {
+    pub(crate) fn into_table_commit(&self) -> TableCommit {
         TableCommit::builder()
-            .ident(self.parts.target)
-            .requirements(self.parts.requirements)
-            .updates(self.parts.updates)
+            .ident(self.parts.target.clone())
+            .requirements(self.parts.requirements.clone())
+            .updates(self.parts.updates.clone())
             .build()
     }
 }

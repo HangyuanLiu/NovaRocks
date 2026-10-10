@@ -143,7 +143,9 @@ impl ArtifactWriter for TestWriter {
 fn existing(metadata: TableMetadata) -> StagingBase {
     StagingBase::Existing {
         metadata,
-        metadata_location: "s3://bucket/table/metadata/00000-00000000-0000-0000-0000-000000000001.metadata.json".into(),
+        metadata_location:
+            "s3://bucket/table/metadata/00000-00000000-0000-0000-0000-000000000001.metadata.json"
+                .into(),
     }
 }
 fn change(updates: Vec<TableUpdate>) -> PreparedChange {
@@ -315,7 +317,9 @@ async fn every_stage_equals_canonical_prefix_and_whole_request() {
         .identifier(intent.target().ident.clone())
         .metadata(base.clone())
         .file_io(writer.io.clone())
-        .metadata_location("s3://bucket/table/metadata/00000-00000000-0000-0000-0000-000000000001.metadata.json")
+        .metadata_location(
+            "s3://bucket/table/metadata/00000-00000000-0000-0000-0000-000000000001.metadata.json",
+        )
         .build()
         .unwrap();
     let applied = request.into_table_commit().apply(table).unwrap();
@@ -642,11 +646,16 @@ async fn manifest_roundtrip_preserves_d12_sequences_and_carried_row_ids() {
         ManifestContentType::Data,
         vec![
             ManifestEntryWrite::Added(
-                AddedContent::new_logical_data(data("s3://bucket/new.parquet", 3, None)).unwrap(),
+                AddedContent::new_logical_data(data("s3://bucket/new.parquet", 3, None), 0)
+                    .unwrap(),
             ),
             ManifestEntryWrite::Added(
-                AddedContent::rewritten_data(data("s3://bucket/rewrite.parquet", 4, Some(80)), 2)
-                    .unwrap(),
+                AddedContent::rewritten_data(
+                    data("s3://bucket/rewrite.parquet", 4, Some(80)),
+                    0,
+                    2,
+                )
+                .unwrap(),
             ),
             ManifestEntryWrite::Existing {
                 file: old.clone(),
@@ -694,7 +703,7 @@ async fn manifest_list_allocates_historical_null_ranges_from_actual_writer_count
         metadata.default_partition_spec().as_ref().clone(),
         ManifestContentType::Data,
         vec![ManifestEntryWrite::Added(
-            AddedContent::new_logical_data(data("s3://bucket/assigned", 7, None)).unwrap(),
+            AddedContent::new_logical_data(data("s3://bucket/assigned", 7, None), 0).unwrap(),
         )],
     )
     .await
@@ -714,7 +723,7 @@ async fn manifest_list_allocates_historical_null_ranges_from_actual_writer_count
         metadata.default_partition_spec().as_ref().clone(),
         ManifestContentType::Data,
         vec![ManifestEntryWrite::Added(
-            AddedContent::new_logical_data(data("s3://bucket/historical", 5, None)).unwrap(),
+            AddedContent::new_logical_data(data("s3://bucket/historical", 5, None), 0).unwrap(),
         )],
     )
     .await
@@ -729,7 +738,7 @@ async fn manifest_list_allocates_historical_null_ranges_from_actual_writer_count
         metadata.default_partition_spec().as_ref().clone(),
         ManifestContentType::Data,
         vec![ManifestEntryWrite::Added(
-            AddedContent::new_logical_data(data("s3://bucket/new", 3, None)).unwrap(),
+            AddedContent::new_logical_data(data("s3://bucket/new", 3, None), 0).unwrap(),
         )],
     )
     .await
@@ -812,7 +821,10 @@ async fn temporary_p9_transaction_export_matches_canonical_sequence() {
         .identifier(intent.target().ident.clone())
         .metadata(base.clone())
         .file_io(writer.io.clone())
-        .metadata_location("s3://bucket/table/metadata/00000-00000000-0000-0000-0000-000000000001.metadata.json".to_owned())
+        .metadata_location(
+            "s3://bucket/table/metadata/00000-00000000-0000-0000-0000-000000000001.metadata.json"
+                .to_owned(),
+        )
         .build()
         .unwrap();
     let mut old = Transaction::new(&table);

@@ -53,26 +53,38 @@ impl SeqField {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AddedContent {
     file: DataFile,
+    partition_spec_id: i32,
     data_sequence: SeqField,
 }
 
 impl AddedContent {
-    pub fn new_logical_data(file: DataFile) -> Result<Self> {
+    pub fn new_logical_data(file: DataFile, partition_spec_id: i32) -> Result<Self> {
         EntryIdentity::try_from(&file)?;
+        validate_partition_spec_id(partition_spec_id)?;
         Ok(Self {
             file,
+            partition_spec_id,
             data_sequence: SeqField::Inherit,
         })
     }
-    pub fn rewritten_data(file: DataFile, source_sequence: i64) -> Result<Self> {
+    pub fn rewritten_data(
+        file: DataFile,
+        partition_spec_id: i32,
+        source_sequence: i64,
+    ) -> Result<Self> {
         EntryIdentity::try_from(&file)?;
+        validate_partition_spec_id(partition_spec_id)?;
         Ok(Self {
             file,
+            partition_spec_id,
             data_sequence: SeqField::explicit(source_sequence)?,
         })
     }
     pub fn file(&self) -> &DataFile {
         &self.file
+    }
+    pub const fn partition_spec_id(&self) -> i32 {
+        self.partition_spec_id
     }
     pub const fn data_sequence(&self) -> SeqField {
         self.data_sequence
@@ -81,6 +93,15 @@ impl AddedContent {
     pub const fn file_sequence(&self) -> SeqField {
         SeqField::Inherit
     }
+}
+
+fn validate_partition_spec_id(id: i32) -> Result<()> {
+    if id < 0 {
+        return Err(invalid(
+            "Added content requires an actual nonnegative partition spec ID",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -160,14 +181,17 @@ mod tests {
 
     #[test]
     fn new_physical_files_inherit_file_age_and_new_logical_data_inherits_data_age() {
-        let added = AddedContent::new_logical_data(file(None)).unwrap();
+        let added = AddedContent::new_logical_data(file(None), 0).unwrap();
         assert_eq!(added.data_sequence(), SeqField::Inherit);
         assert_eq!(added.file_sequence(), SeqField::Inherit);
         assert_eq!(added.data_sequence().manifest_writer_value(), -1);
-        let rewritten = AddedContent::rewritten_data(file(Some(30)), 9).unwrap();
+        let rewritten = AddedContent::rewritten_data(file(Some(30)), 0, 9).unwrap();
         assert_eq!(rewritten.data_sequence(), SeqField::Explicit(9));
         assert_eq!(rewritten.file_sequence(), SeqField::Inherit);
-        assert!(AddedContent::rewritten_data(file(None), -1).is_err());
+        assert!(AddedContent::rewritten_data(file(None), 0, -1).is_err());
+        assert!(AddedContent::new_logical_data(file(None), -1).is_err());
+        let historical = AddedContent::new_logical_data(file(None), 3).unwrap();
+        assert_eq!(historical.partition_spec_id(), 3);
     }
 
     #[test]

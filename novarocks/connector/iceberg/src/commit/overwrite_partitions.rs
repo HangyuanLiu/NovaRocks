@@ -15,20 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! `OverwritePartitionsCommit` — `INSERT OVERWRITE PARTITIONS` semantics.
+//! Dynamic partition replacement preserves untouched logical entries.
 //!
-//! Replace only the partitions touched by the new data; preserve all other
-//! partitions. v3 row-lineage tables only.
-//!
-//! Differences from `OverwriteCommit`:
-//! * The base files marked DELETED are restricted to those whose partition
-//!   tuple appears in the set of new files' partition tuples (under the
-//!   current partition spec).
-//! * Cross-historical-spec base files are rejected with a hint to run
-//!   `OPTIMIZE TABLE` first; see spec §10.1 R2 and
-//!   `partition_match_in_touched` (`partition_spec.rs`).
-//! * Empty SELECT result is a noop overwrite snapshot — same audit-trail
-//!   behavior as `TruncateCommit` empty-table.
+//! The touched set uses output partitions bound to the staged default spec.
+//! Historical-spec matching remains unsupported and fails before publication.
+//! Existing assigned row IDs are carried; unassigned historical rows obtain
+//! their first range only through the successful manifest-list write.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -78,6 +70,90 @@ fn partition_match_in_touched(
 }
 use crate::commit::abort::AbortLog;
 use crate::commit::{CommitOutcome, IcebergWriteMode, WrittenFile};
+
+/// Dynamic partition replacement preserves untouched logical identities.
+pub(crate) struct OverwritePartitionsPreparer;
+
+#[async_trait]
+impl super::staging::Preparer for OverwritePartitionsPreparer {
+    async fn prepare(
+        &self,
+        view: &super::staging::StagedView<'_>,
+        intent: &super::model::OperationIntent,
+    ) -> crate::iceberg::Result<super::staging::PreparedChange> {
+        super::overwrite::validate_added_data(intent)?;
+        let metadata = view.metadata();
+        if metadata.format_version() != FormatVersion::V3 {
+            return Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::DataInvalid,
+                "Overwrite partitions requires a V3 table",
+            ));
+        }
+        if intent
+            .changes()
+            .added
+            .iter()
+            .any(|a| a.partition_spec_id() != metadata.default_partition_spec_id())
+        {
+            return Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::DataInvalid,
+                "Overwrite partitions output must use the staged default partition spec",
+            ));
+        }
+        let parent = metadata
+            .snapshot_for_ref(intent.target_ref())
+            .map(|s| s.snapshot_id());
+        let mut inputs =
+            super::dependency::ValidationInputs::new(metadata, parent, view.artifacts());
+        let touched: Vec<_> = intent
+            .changes()
+            .added
+            .iter()
+            .map(|a| a.file().partition().clone())
+            .collect();
+        let mut removed = Vec::new();
+        let mut entries = Vec::new();
+        for entry in inputs.live_set().await?.values() {
+            let deleted = match partition_match_in_touched(
+                entry.file.partition(),
+                entry.frozen.facts().partition_spec_id,
+                metadata.default_partition_spec_id(),
+                &touched,
+            ) {
+                PartitionMatch::InSet => true,
+                PartitionMatch::NotInSet => false,
+                PartitionMatch::DifferentSpec => {
+                    return Err(crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::DataInvalid,
+                        "Overwrite partitions cannot match a historical partition spec; consolidate first",
+                    ));
+                }
+            };
+            if deleted {
+                removed.push(entry.clone());
+            }
+            entries.push((entry.clone(), deleted));
+        }
+        let snapshot_id = super::staging::new_snapshot_id(metadata);
+        let mut manifests =
+            super::overwrite::write_live_entry_groups(view, snapshot_id, entries).await?;
+        manifests
+            .extend(super::overwrite::write_added_intent_data(view, intent, snapshot_id).await?);
+        let mut summary =
+            super::overwrite::snapshot_file_summary(&intent.changes().added, &removed)?;
+        summary.insert("replace-partitions".into(), "true".into());
+        super::overwrite::prepare_snapshot_change(
+            view,
+            intent,
+            snapshot_id,
+            Operation::Overwrite,
+            manifests,
+            summary,
+            false,
+        )
+        .await
+    }
+}
 
 pub struct OverwritePartitionsCommit;
 

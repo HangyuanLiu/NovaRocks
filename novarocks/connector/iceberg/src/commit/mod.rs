@@ -22,16 +22,17 @@
 
 pub mod abort;
 mod action;
+pub(crate) mod attempt;
 mod collector;
 mod data_file;
-pub(crate) mod dependency;
 pub mod data_writer;
+pub(crate) mod dependency;
 pub mod equality_delete_writer;
 mod fast_append;
 pub mod frozen_write;
 pub(crate) mod helpers;
-pub mod mv_provenance;
 pub(crate) mod model;
+pub mod mv_provenance;
 pub mod mv_publication_fence;
 pub mod mv_refresh_ref;
 pub(crate) mod operation;

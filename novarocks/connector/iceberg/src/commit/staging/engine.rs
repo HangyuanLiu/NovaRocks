@@ -39,7 +39,7 @@ pub enum StagingBase {
     },
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct PreparedChange {
     pub updates: Vec<TableUpdate>,
     pub requirements: Vec<TableRequirement>,

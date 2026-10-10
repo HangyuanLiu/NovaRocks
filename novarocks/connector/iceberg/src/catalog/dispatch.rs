@@ -138,7 +138,7 @@ impl CatalogCommitDispatch for UpdateTableDispatch {
     }
 }
 
-fn committed_snapshot_id(
+pub(crate) fn committed_snapshot_id(
     metadata: &crate::iceberg::spec::TableMetadata,
     target_ref: &str,
     expected_snapshot_id: Option<i64>,

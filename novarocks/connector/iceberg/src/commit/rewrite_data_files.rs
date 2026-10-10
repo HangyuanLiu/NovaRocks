@@ -878,6 +878,192 @@ fn lineage_long_bound(
     Ok(*value)
 }
 
+/// Whole-table physical replacement under the operation's frozen dependency.
+/// It never expands the removed set to include a concurrent writer's files.
+pub(crate) struct RewriteDataFilesPreparer;
+
+#[async_trait]
+impl super::staging::Preparer for RewriteDataFilesPreparer {
+    async fn prepare(
+        &self,
+        view: &super::staging::StagedView<'_>,
+        intent: &super::model::OperationIntent,
+    ) -> crate::iceberg::Result<super::staging::PreparedChange> {
+        let parent = view
+            .metadata()
+            .snapshot_for_ref(view.target_ref())
+            .map(|s| s.snapshot_id());
+        let mut inputs =
+            super::dependency::ValidationInputs::new(view.metadata(), parent, view.artifacts());
+        let live = inputs.live_set().await?;
+        let removed = intent
+            .changes()
+            .removed
+            .iter()
+            .map(|f| f.identity().clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        if removed != live.keys().cloned().collect() {
+            return Err(rewrite_invalid(
+                "Whole-data rewrite frozen set does not equal the target-ref live set",
+            ));
+        }
+        prepare_physical_rewrite(view, intent, live, &removed, true).await
+    }
+}
+
+/// Shared by whole-data and exact selected-delete replacement. All inputs are
+/// frozen before this attempt; live entries retain their actual source facts.
+pub(crate) async fn prepare_physical_rewrite(
+    view: &super::staging::StagedView<'_>,
+    intent: &super::model::OperationIntent,
+    live: &super::dependency::LiveSet,
+    removed: &std::collections::BTreeSet<super::model::EntryIdentity>,
+    data_rewrite: bool,
+) -> crate::iceberg::Result<super::staging::PreparedChange> {
+    use super::model::{EntryIdentity, SeqField};
+    use super::staging::{ManifestEntryWrite, write_manifest};
+    let metadata = view.metadata();
+    if metadata.format_version() == FormatVersion::V1 {
+        return Err(rewrite_invalid(
+            "Physical rewrite does not support V1 tables",
+        ));
+    }
+    if live.is_empty() && intent.changes().added.is_empty() {
+        return Ok(super::staging::PreparedChange::default());
+    }
+    let source = intent
+        .start()
+        .ok_or_else(|| rewrite_invalid("Physical rewrite has no frozen starting snapshot"))?;
+    for frozen in &intent.changes().removed {
+        let current = live
+            .get(frozen.identity())
+            .ok_or_else(|| rewrite_invalid("Frozen rewrite entry is no longer live"))?;
+        if current.frozen != *frozen {
+            return Err(rewrite_invalid(
+                "Frozen rewrite entry facts differ from the live entry",
+            ));
+        }
+    }
+    let mut added_groups: BTreeMap<(i32, bool), Vec<super::model::AddedContent>> = BTreeMap::new();
+    for added in &intent.changes().added {
+        if added.data_sequence() != SeqField::Explicit(source.sequence_number) {
+            return Err(rewrite_invalid(
+                "Physical rewrite output must carry the frozen starting data sequence",
+            ));
+        }
+        let spec_id = if data_rewrite {
+            if added.file().content_type() != DataContentType::Data {
+                return Err(rewrite_invalid(
+                    "Whole-data rewrite output must contain only data files",
+                ));
+            }
+            added.partition_spec_id()
+        } else {
+            let EntryIdentity::DeletionVector {
+                referenced_data_file,
+                ..
+            } = EntryIdentity::try_from(added.file())?
+            else {
+                return Err(rewrite_invalid(
+                    "Position-delete rewrite output must contain deletion vectors",
+                ));
+            };
+            let data = live
+                .get(&EntryIdentity::DataFile {
+                    path: referenced_data_file,
+                })
+                .ok_or_else(|| {
+                    rewrite_invalid(
+                        "Replacement DV references a data file absent from the target ref",
+                    )
+                })?;
+            if data.file.partition() != added.file().partition() {
+                return Err(rewrite_invalid(
+                    "Replacement DV partition differs from its exact referenced data file",
+                ));
+            }
+            if added.partition_spec_id() != data.frozen.facts().partition_spec_id {
+                return Err(rewrite_invalid(
+                    "Replacement DV spec differs from its exact referenced data file",
+                ));
+            }
+            added.partition_spec_id()
+        };
+        added_groups
+            .entry((
+                spec_id,
+                data_rewrite && added.file().first_row_id().is_some(),
+            ))
+            .or_default()
+            .push(added.clone());
+    }
+    let snapshot_id = super::staging::new_snapshot_id(metadata);
+    let entries = live
+        .iter()
+        .map(|(identity, entry)| (entry.clone(), removed.contains(identity)))
+        .collect();
+    let mut manifests =
+        super::overwrite::write_live_entry_groups(view, snapshot_id, entries).await?;
+    for ((spec_id, assigned), added) in added_groups {
+        let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
+            rewrite_invalid(format!("Rewrite partition spec {spec_id} is absent"))
+        })?;
+        let assigned_min =
+            (metadata.format_version() == FormatVersion::V3 && data_rewrite && assigned)
+                .then(|| {
+                    added
+                        .iter()
+                        .filter_map(|entry| entry.file().first_row_id())
+                        .min()
+                })
+                .flatten();
+        let mut manifest = write_manifest(
+            view.artifacts(),
+            metadata.format_version(),
+            snapshot_id,
+            metadata.current_schema().clone(),
+            spec.as_ref().clone(),
+            if data_rewrite {
+                ManifestContentType::Data
+            } else {
+                ManifestContentType::Deletes
+            },
+            added.into_iter().map(ManifestEntryWrite::Added),
+        )
+        .await?;
+        if let Some(first) = assigned_min {
+            manifest.first_row_id = Some(
+                u64::try_from(first)
+                    .map_err(|_| rewrite_invalid("Assigned rewrite row ID must be nonnegative"))?,
+            );
+        }
+        manifests.push(manifest);
+    }
+    let deleted = live
+        .iter()
+        .filter(|(identity, _)| removed.contains(*identity))
+        .map(|(_, entry)| entry.clone())
+        .collect::<Vec<_>>();
+    let mut summary = super::overwrite::snapshot_file_summary(&intent.changes().added, &deleted)?;
+    if !data_rewrite {
+        summary.insert("rewritten-delete-files".into(), removed.len().to_string());
+    }
+    super::overwrite::prepare_snapshot_change(
+        view,
+        intent,
+        snapshot_id,
+        Operation::Replace,
+        manifests,
+        summary,
+        false,
+    )
+    .await
+}
+
+fn rewrite_invalid(message: impl Into<String>) -> crate::iceberg::Error {
+    crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, message)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;

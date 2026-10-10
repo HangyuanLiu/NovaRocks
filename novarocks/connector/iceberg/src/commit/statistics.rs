@@ -37,3 +37,26 @@ pub(crate) async fn stage_statistics_file(
         .map_err(|error| format!("stage Iceberg SetStatistics: {error}"))?;
     Ok(tx.into_table_commit())
 }
+
+/// A metadata-only change, independent of the current ref head. The measured
+/// snapshot dependency is checked by the operation before preparation.
+pub(crate) struct StatisticsPreparer {
+    pub(crate) statistics: StatisticsFile,
+}
+
+#[async_trait::async_trait]
+impl super::staging::Preparer for StatisticsPreparer {
+    async fn prepare(
+        &self,
+        view: &super::staging::StagedView<'_>,
+        _intent: &super::model::OperationIntent,
+    ) -> crate::iceberg::Result<super::staging::PreparedChange> {
+        view.artifacts().check_active()?;
+        Ok(super::staging::PreparedChange {
+            updates: vec![crate::iceberg::TableUpdate::SetStatistics {
+                statistics: self.statistics.clone(),
+            }],
+            requirements: vec![],
+        })
+    }
+}

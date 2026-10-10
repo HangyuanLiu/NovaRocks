@@ -93,10 +93,17 @@ pub async fn write_manifest(
     for entry in entries {
         artifacts.check_active()?;
         match entry {
-            ManifestEntryWrite::Added(added) => writer.add_file(
-                added.file().clone(),
-                added.data_sequence().manifest_writer_value(),
-            )?,
+            ManifestEntryWrite::Added(added) => {
+                if added.partition_spec_id() != spec.spec_id() {
+                    return Err(invalid(
+                        "Added content partition spec does not match its manifest",
+                    ));
+                }
+                writer.add_file(
+                    added.file().clone(),
+                    added.data_sequence().manifest_writer_value(),
+                )?;
+            }
             ManifestEntryWrite::Existing { file, frozen } => {
                 let file = carry_file(file, &frozen, spec.spec_id())?;
                 let facts = frozen.facts();
