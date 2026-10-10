@@ -158,29 +158,64 @@ impl ScalarIntegerDomain {
     }
 }
 
+/// Borrowed progress checkpoints. No capacity, deadline, state or guard is minted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CheckPoint {
+    DecodeEntry,
+    DeclarationId,
+    Property,
+    LegacyField,
+    ValidationId,
+    ValidationField,
+    ValidationDefault,
+    ValidationTopLevel,
+    HistoryDomain,
+    HistorySchema,
+    HistoryField,
+}
+
 /// Resolve legacy current-schema names once, into stable provider-owned IDs.
-/// Dropped IDs in the new property are retained for historical structural reads.
+/// Ordinary callers retain the original signature and use the same kernel.
 pub(crate) fn declarations(
     schema: &Schema,
     properties: &HashMap<String, String>,
 ) -> Result<ScalarIntegerDomains, ConnectorError> {
+    declarations_checked(schema, properties, &|_| Ok(()))
+}
+
+pub(crate) fn declarations_checked<E: From<ConnectorError>>(
+    schema: &Schema,
+    properties: &HashMap<String, String>,
+    check: &dyn Fn(CheckPoint) -> Result<(), E>,
+) -> Result<ScalarIntegerDomains, E> {
     let mut domains = match properties.get(PROPERTY) {
         Some(raw) if raw.len() > MAX_BYTES => {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::ResourceExhausted,
                 "Iceberg scalar integer declarations exceed the hard limit",
-            ));
+            )
+            .into());
         }
-        Some(raw) => decode(raw)?,
+        Some(raw) => decode_checked(raw, check)?,
         None => BTreeMap::new(),
     };
-    if domains.len() > MAX_FIELDS || domains.keys().any(|id| *id <= 0) {
-        return Err(corrupt(
-            "Iceberg scalar integer declarations have invalid field IDs or count",
-        ));
+    if domains.len() > MAX_FIELDS {
+        return Err(
+            corrupt("Iceberg scalar integer declarations have invalid field IDs or count").into(),
+        );
+    }
+    for id in domains.keys() {
+        check(CheckPoint::DeclarationId)?;
+        if *id <= 0 {
+            return Err(corrupt(
+                "Iceberg scalar integer declarations have invalid field IDs or count",
+            )
+            .into());
+        }
     }
     let mut names = std::collections::HashSet::new();
     for (key, value) in properties {
+        check(CheckPoint::Property)?;
         let Some(name) = key.strip_prefix(LEGACY_PREFIX) else {
             continue;
         };
@@ -189,25 +224,27 @@ pub(crate) fn declarations(
             continue;
         }
         if !names.insert(name.to_ascii_lowercase()) {
-            return Err(corrupt(
-                "ambiguous Iceberg legacy scalar integer declaration",
-            ));
+            return Err(corrupt("ambiguous Iceberg legacy scalar integer declaration").into());
         }
-        let fields = schema
-            .as_struct()
-            .fields()
-            .iter()
-            .filter(|field| field.name.eq_ignore_ascii_case(name))
-            .collect::<Vec<_>>();
+        // Same full filter and first ambiguity error; retain every match in
+        // the original order before evaluating the original single-field rule.
+        let mut fields = Vec::new();
+        for field in schema.as_struct().fields() {
+            check(CheckPoint::LegacyField)?;
+            if field.name.eq_ignore_ascii_case(name) {
+                fields.push(field);
+            }
+        }
         let [field] = fields.as_slice() else {
             return Err(corrupt(
                 "Iceberg legacy scalar integer declaration does not identify one current top-level field",
-            ));
+            ).into());
         };
         if field.field_type.as_ref() != &Type::Primitive(PrimitiveType::Int) {
             return Err(corrupt(
                 "Iceberg active legacy scalar integer declaration requires INT storage",
-            ));
+            )
+            .into());
         }
         let domain = ScalarIntegerDomain::parse(&value)?;
         if let Some(previous) = domains.insert(field.id, domain)
@@ -215,28 +252,40 @@ pub(crate) fn declarations(
         {
             return Err(corrupt(
                 "Iceberg scalar integer field-ID declaration differs from its legacy declaration",
-            ));
+            )
+            .into());
         }
     }
-    validate_schema(schema, &domains)?;
+    validate_schema_checked(schema, &domains, check)?;
     Ok(domains)
 }
 
-/// Check every retained ID against authoritative schema history; an unknown
-/// future ID is not a declaration the metadata can prove.
+/// Check every retained ID against authoritative schema history.
 pub(crate) fn metadata_declarations(
     metadata: &crate::iceberg::spec::TableMetadata,
 ) -> Result<ScalarIntegerDomains, ConnectorError> {
-    let domains = declarations(metadata.current_schema(), metadata.properties())?;
+    metadata_declarations_checked(metadata, &|_| Ok(()))
+}
+
+pub(crate) fn metadata_declarations_checked<E: From<ConnectorError>>(
+    metadata: &crate::iceberg::spec::TableMetadata,
+    check: &dyn Fn(CheckPoint) -> Result<(), E>,
+) -> Result<ScalarIntegerDomains, E> {
+    let domains = declarations_checked(metadata.current_schema(), metadata.properties(), check)?;
     for id in domains.keys() {
+        check(CheckPoint::HistoryDomain)?;
         let mut found_int = false;
         for schema in metadata.schemas_iter() {
-            if let Some(field) = schema
-                .as_struct()
-                .fields()
-                .iter()
-                .find(|field| field.id == *id)
-            {
+            check(CheckPoint::HistorySchema)?;
+            let mut found = None;
+            for field in schema.as_struct().fields() {
+                check(CheckPoint::HistoryField)?;
+                if field.id == *id {
+                    found = Some(field);
+                    break;
+                }
+            }
+            if let Some(field) = found {
                 found_int |= field.field_type.as_ref() == &Type::Primitive(PrimitiveType::Int);
                 if !matches!(
                     field.field_type.as_ref(),
@@ -244,14 +293,16 @@ pub(crate) fn metadata_declarations(
                 ) {
                     return Err(corrupt(
                         "Iceberg retained scalar integer field ID has incompatible storage history",
-                    ));
+                    )
+                    .into());
                 }
             }
         }
         if !found_int {
             return Err(corrupt(
                 "Iceberg scalar integer declaration has no proven INT storage history",
-            ));
+            )
+            .into());
         }
     }
     Ok(domains)
@@ -261,12 +312,25 @@ pub(crate) fn validate_schema(
     schema: &Schema,
     domains: &ScalarIntegerDomains,
 ) -> Result<(), ConnectorError> {
-    if domains.len() > MAX_FIELDS || domains.keys().any(|id| *id <= 0) {
-        return Err(corrupt(
-            "invalid Iceberg scalar integer field-ID declaration",
-        ));
+    validate_schema_checked(schema, domains, &|_| Ok(()))
+}
+
+pub(crate) fn validate_schema_checked<E: From<ConnectorError>>(
+    schema: &Schema,
+    domains: &ScalarIntegerDomains,
+    check: &dyn Fn(CheckPoint) -> Result<(), E>,
+) -> Result<(), E> {
+    if domains.len() > MAX_FIELDS {
+        return Err(corrupt("invalid Iceberg scalar integer field-ID declaration").into());
+    }
+    for id in domains.keys() {
+        check(CheckPoint::ValidationId)?;
+        if *id <= 0 {
+            return Err(corrupt("invalid Iceberg scalar integer field-ID declaration").into());
+        }
     }
     for field in schema.as_struct().fields() {
+        check(CheckPoint::ValidationField)?;
         if let Some(domain) = domains.get(&field.id)
             && field.field_type.as_ref() == &Type::Primitive(PrimitiveType::Int)
         {
@@ -274,6 +338,7 @@ pub(crate) fn validate_schema(
                 .into_iter()
                 .flatten()
             {
+                check(CheckPoint::ValidationDefault)?;
                 match default {
                     crate::iceberg::spec::Literal::Primitive(
                         crate::iceberg::spec::PrimitiveLiteral::Int(value),
@@ -283,7 +348,8 @@ pub(crate) fn validate_schema(
                     _ => {
                         return Err(corrupt(
                             "Iceberg declared scalar integer default is not an INT32 value",
-                        ));
+                        )
+                        .into());
                     }
                 }
             }
@@ -296,21 +362,25 @@ pub(crate) fn validate_schema(
         {
             return Err(corrupt(
                 "Iceberg scalar integer declaration requires top-level INT storage",
-            ));
+            )
+            .into());
         }
     }
-    // A nested live field cannot masquerade as a dropped top-level field.
+    // Preserve field_by_id first and original any() short-circuit order.
     for id in domains.keys() {
-        if schema.field_by_id(*id).is_some()
-            && !schema
-                .as_struct()
-                .fields()
-                .iter()
-                .any(|field| field.id == *id)
-        {
-            return Err(corrupt(
-                "Iceberg scalar integer declaration is not top-level",
-            ));
+        check(CheckPoint::ValidationId)?;
+        if schema.field_by_id(*id).is_some() {
+            let mut top_level = false;
+            for field in schema.as_struct().fields() {
+                check(CheckPoint::ValidationTopLevel)?;
+                if field.id == *id {
+                    top_level = true;
+                    break;
+                }
+            }
+            if !top_level {
+                return Err(corrupt("Iceberg scalar integer declaration is not top-level").into());
+            }
         }
     }
     Ok(())
@@ -333,9 +403,26 @@ pub(crate) fn of_schema(
         .collect())
 }
 
+// Production ordinary wrappers already select the shared checked decoder's
+// noop specialization. Keep this original private test entry without a dead
+// production helper.
+#[cfg(test)]
 fn decode(raw: &str) -> Result<ScalarIntegerDomains, ConnectorError> {
-    struct Map;
-    impl<'de> serde::de::Visitor<'de> for Map {
+    decode_checked(raw, &|_| Ok(()))
+}
+
+fn decode_checked<E: From<ConnectorError>>(
+    raw: &str,
+    check: &dyn Fn(CheckPoint) -> Result<(), E>,
+) -> Result<ScalarIntegerDomains, E> {
+    // Serde's Visitor error type cannot carry the caller's E. This stack-local
+    // slot moves E back out after serde unwinds its partial map. It allocates
+    // no E wrapper and never formats/clones the original cause.
+    struct Map<'a, E> {
+        check: &'a dyn Fn(CheckPoint) -> Result<(), E>,
+        failure: &'a std::cell::RefCell<Option<E>>,
+    }
+    impl<'de, E> serde::de::Visitor<'de> for Map<'_, E> {
         type Value = ScalarIntegerDomains;
         fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter.write_str("a bounded unique scalar integer field-ID map")
@@ -345,7 +432,19 @@ fn decode(raw: &str) -> Result<ScalarIntegerDomains, ConnectorError> {
             mut input: M,
         ) -> Result<Self::Value, M::Error> {
             let mut domains = BTreeMap::new();
-            while let Some((id, domain)) = input.next_entry::<i32, ScalarIntegerDomain>()? {
+            loop {
+                if let Err(original) = (self.check)(CheckPoint::DecodeEntry) {
+                    *self.failure.borrow_mut() = Some(original);
+                    // Existing fixed diagnostic allocation only; outer E is
+                    // returned instead, so this sentinel never escapes as a
+                    // provider failure or formats arbitrary caller payload.
+                    return Err(serde::de::Error::custom(
+                        "duplicate, invalid, or excessive scalar integer field IDs",
+                    ));
+                }
+                let Some((id, domain)) = input.next_entry::<i32, ScalarIntegerDomain>()? else {
+                    break;
+                };
                 if id <= 0 || domains.len() >= MAX_FIELDS || domains.insert(id, domain).is_some() {
                     return Err(serde::de::Error::custom(
                         "duplicate, invalid, or excessive scalar integer field IDs",
@@ -355,8 +454,19 @@ fn decode(raw: &str) -> Result<ScalarIntegerDomains, ConnectorError> {
             Ok(domains)
         }
     }
+    let failure = std::cell::RefCell::new(None);
     let mut decoder = serde_json::Deserializer::from_str(raw);
-    let domains = serde::de::Deserializer::deserialize_map(&mut decoder, Map).map_err(|error| {
+    let decoded = serde::de::Deserializer::deserialize_map(
+        &mut decoder,
+        Map {
+            check,
+            failure: &failure,
+        },
+    );
+    if let Some(original) = failure.into_inner() {
+        return Err(original);
+    }
+    let domains = decoded.map_err(|error| {
         corrupt(format!(
             "invalid Iceberg scalar integer declarations: {error}"
         ))
@@ -691,3 +801,7 @@ mod tests {
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
     }
 }
+
+#[cfg(test)]
+#[path = "scalar_integer_domain/checked_tests.rs"]
+mod checked_tests;
