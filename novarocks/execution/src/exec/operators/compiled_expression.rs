@@ -97,15 +97,17 @@ impl RuntimeKernelControl {
 }
 impl KernelEvaluationControl for RuntimeKernelControl {
     fn checkpoint(&self, _work_units: u32) -> Result<(), KernelFailure> {
-        if self.error.error().is_some() {
+        if self.error.is_stopped() {
             return Err(KernelFailure::Cancelled);
         }
         Ok(())
     }
     fn wait(&self, duration: Duration) -> Result<(), KernelFailure> {
-        self.error
-            .wait_interruptibly(duration)
-            .map_err(|_| KernelFailure::Cancelled)
+        if self.error.wait_until_stopped(duration) {
+            Err(KernelFailure::Cancelled)
+        } else {
+            Ok(())
+        }
     }
 }
 
