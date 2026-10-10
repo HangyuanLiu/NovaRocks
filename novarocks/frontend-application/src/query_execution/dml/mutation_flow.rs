@@ -1313,6 +1313,7 @@ pub(crate) fn stage_prepared_update_mutation(
                 selection,
                 &write_lease,
                 &planning_lease,
+                &execution,
                 &connector_context,
             )?;
             let write = match build_cow_update_distributed_write(
@@ -1895,6 +1896,9 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
 /// `_last_updated_sequence_number`: a rewrite re-emits rows that already have a
 /// lineage, and carrying it through is what keeps their identity stable across
 /// the file replacement.
+#[path = "cow_necessary_before_begin.rs"]
+mod cow_necessary_before_begin;
+
 fn begin_cow_write_session(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
@@ -1902,6 +1906,7 @@ fn begin_cow_write_session(
     selection: novarocks_spi::connector::ConnectorRowMutationSelection,
     write_lease: &novarocks_spi::connector::ConnectorWriteLease,
     write_planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Arc<ConnectorWriteSession>, String> {
     use novarocks_execution::exec::row_position::{
@@ -1909,46 +1914,50 @@ fn begin_cow_write_session(
     };
     use novarocks_spi::connector::{ConnectorWriteFieldRequest, ConnectorWriteInputRequest};
 
-    let field = |name: &str, data_type: DataType, nullable: bool| {
-        ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(name, data_type, nullable))
-    };
-    let data_fields = cow_target_columns(preparation)
-        .iter()
-        .map(|column| field(&column.name, column.data_type.clone(), column.nullable))
-        .collect::<Vec<_>>();
-    let request = novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
-        table: Arc::from(format!("{}.{}", target.namespace, target.table).as_str()),
-        target_ref: preparation.target_ref().clone(),
-        intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
-        purpose: novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
-        input: ConnectorWriteInputRequest::RowLineage {
-            data_fields,
-            row_identity_fields: vec![
-                field(ICEBERG_ROW_ID_COL, DataType::Int64, true),
-                field(ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, true),
-            ],
+    cow_necessary_before_begin::before_request_owned(
+        preparation, selection, execution.result_capacity(), connector_context,
+        |selection| {
+        let field = |name: &str, data_type: DataType, nullable: bool| {
+            ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(name, data_type, nullable))
+        };
+        let data_fields = cow_target_columns(preparation)
+            .iter()
+            .map(|column| field(&column.name, column.data_type.clone(), column.nullable))
+            .collect::<Vec<_>>();
+        let request = novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
+            table: Arc::from(format!("{}.{}", target.namespace, target.table).as_str()),
+            target_ref: preparation.target_ref().clone(),
+            intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+            purpose: novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            input: ConnectorWriteInputRequest::RowLineage {
+                data_fields,
+                row_identity_fields: vec![
+                    field(ICEBERG_ROW_ID_COL, DataType::Int64, true),
+                    field(ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, true),
+                ],
+            },
+            // The base the match query ran against. The provider stamps its digest
+            // onto every branch's read contract, so a branch that re-read a
+            // different base than the statement matched fails closed here rather
+            // than rewriting rows nobody selected.
+            base: Some(preparation.base_version().clone()),
+            flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::CopyOnWrite {
+                selection,
+                match_contract: preparation.match_contract().clone(),
+            },
+            context: connector_context.clone(),
+        };
+        crate::query_execution::write_session::begin_connector_write_session(
+            crate::connector::write_target::derive_write_stack_lease(
+                state.typed_connector_control(),
+                write_planning_lease,
+            )?,
+            write_lease,
+            request,
+        )
         },
-        // The base the match query ran against. The provider stamps its digest
-        // onto every branch's read contract, so a branch that re-read a
-        // different base than the statement matched fails closed here rather
-        // than rewriting rows nobody selected.
-        base: Some(preparation.base_version().clone()),
-        flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::CopyOnWrite {
-            selection,
-            match_contract: preparation.match_contract().clone(),
-        },
-        context: connector_context.clone(),
-    };
-    crate::query_execution::write_session::begin_connector_write_session(
-        crate::connector::write_target::derive_write_stack_lease(
-            state.typed_connector_control(),
-            write_planning_lease,
-        )?,
-        write_lease,
-        request,
-    )
+    ).map_err(|error| error.to_string())?
 }
-
 /// The pinned relation one COW rewrite query scans.
 ///
 /// It carries no planned scan: the session froze which file this branch
@@ -3663,6 +3672,7 @@ pub(crate) fn stage_prepared_merge_mutation(
         selection,
         &write_lease,
         &planning_lease,
+        &execution,
         &connector_context,
     )?;
     let write = match build_cow_update_distributed_write(
@@ -4573,6 +4583,11 @@ fn build_merge_unmatched_insert_query(
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod before_begin_necessary {
+        use super::*;
+        include!("cow_before_begin_tests.rs");
+    }
+
     use arrow::datatypes::DataType;
     use novarocks_types::schema::ColumnDef;
 

@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 // The whole maximum coexistence envelope is authorized before any domain
 // decoder/collector construction. Nested stages reuse it, never acquire again.
-const INTERNAL_PEAK_BYTES: u64 = (2 * 336 + 256 + 32 + 32 + 8 + 8) * 1024 * 1024;
+pub(super) const INTERNAL_PEAK_BYTES: u64 = (2 * 336 + 256 + 32 + 32 + 8 + 8) * 1024 * 1024;
 
 /// Coverage check for closed first-party factories which embed the supplied
 /// alias into their actual payload backing before handing it off.
