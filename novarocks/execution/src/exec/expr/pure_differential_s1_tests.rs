@@ -1,0 +1,1150 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! S1 calendar owner differential evidence against the original v1 algorithms.
+
+use super::generate::{InputGenerator, InputProfile, TextProfile};
+use super::{
+    DifferentialFailure, ScalarDiffSpec, assert_scalar_matches_v1, run_scalar_differential,
+};
+use arrow::array::{
+    ArrayRef, Date32Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
+};
+use arrow::datatypes::{DataType, TimeUnit};
+use chrono::NaiveDate;
+use novarocks_type_contract::FunctionValueType;
+use std::sync::Arc;
+
+fn temporal_sources(seed: u64) -> Vec<ArrayRef> {
+    [
+        (DataType::Date32, InputProfile::default()),
+        (
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            InputProfile::default(),
+        ),
+        (
+            DataType::Utf8,
+            InputProfile::default().with_text(TextProfile::DateTimeText),
+        ),
+        (
+            DataType::Utf8,
+            InputProfile::default().with_text(TextProfile::DateText),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (ty, profile))| {
+        InputGenerator::new(seed + index as u64).column(
+            &FunctionValueType::new(ty, true),
+            256,
+            &profile,
+        )
+    })
+    .collect()
+}
+
+#[test]
+fn pure_differential_s1_date_trunc_every_unit_and_overload() {
+    for unit in [
+        "microsecond",
+        "millisecond",
+        "second",
+        "minute",
+        "hour",
+        "day",
+        "week",
+        "month",
+        "quarter",
+        "year",
+        "WeEk",
+        "QUARTER",
+    ] {
+        for source in temporal_sources(0xCA11) {
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new("date_trunc")
+                    .constant_array(Arc::new(StringArray::from(vec![unit])))
+                    .column(source),
+            );
+        }
+    }
+}
+
+#[test]
+fn pure_differential_s1_date_trunc_required_unit_errors_include_null_and_invalid_dates() {
+    let units: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("invalid"),
+        Some("YEAR"),
+        None,
+        Some(" day "),
+        Some("week"),
+        Some("µSECOND"),
+        Some("month"),
+        Some("minute"),
+    ]));
+    let dates: ArrayRef = Arc::new(StringArray::from(vec![
+        None,
+        Some("invalid"),
+        Some("2024-02-29"),
+        Some("2024-02-29"),
+        Some("0000-01-01"),
+        Some("invalid"),
+        Some("9999-12-31 23:59:59.999999"),
+        None,
+    ]));
+    let summary = assert_scalar_matches_v1(
+        ScalarDiffSpec::new("date_trunc")
+            .column(units)
+            .column(dates),
+    );
+    assert!(summary.legacy_batch_errors > 0);
+    assert!(summary.attributed_row_errors >= 3);
+}
+
+#[test]
+fn pure_differential_s1_date_trunc_preserves_date_width_and_subsecond_boundaries() {
+    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+    let date_days: Vec<_> = [
+        (0, 1, 1),
+        (1, 1, 1),
+        (1900, 2, 28),
+        (2000, 2, 29),
+        (2024, 2, 29),
+        (9999, 12, 31),
+    ]
+    .into_iter()
+    .map(|(y, m, d)| Some((NaiveDate::from_ymd_opt(y, m, d).unwrap() - epoch).num_days() as i32))
+    .chain([None, Some(i32::MIN), Some(i32::MAX)])
+    .collect();
+    for unit in ["week", "month", "quarter", "year", "hour"] {
+        assert_scalar_matches_v1(
+            ScalarDiffSpec::new("date_trunc")
+                .constant_array(Arc::new(StringArray::from(vec![unit])))
+                .column(Arc::new(Date32Array::from(date_days.clone()))),
+        );
+    }
+    for unit in [
+        "microsecond",
+        "millisecond",
+        "second",
+        "minute",
+        "hour",
+        "day",
+    ] {
+        assert_scalar_matches_v1(
+            ScalarDiffSpec::new("date_trunc")
+                .constant_array(Arc::new(StringArray::from(vec![unit])))
+                .column(Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(-1),
+                    Some(0),
+                    Some(1),
+                    Some(999),
+                    Some(1_000),
+                    Some(999_999),
+                    Some(1_000_001),
+                    None,
+                    Some(i64::MIN),
+                    Some(i64::MAX),
+                ]))),
+        );
+    }
+}
+
+#[test]
+fn pure_differential_s1_duration_differences_every_overload() {
+    for name in ["weeks_diff", "hours_diff", "minutes_diff", "seconds_diff"] {
+        let left = temporal_sources(0xD1FF);
+        let right = temporal_sources(0xD2FF);
+        for (left, right) in left.into_iter().zip(right) {
+            assert_scalar_matches_v1(ScalarDiffSpec::new(name).column(left).column(right));
+        }
+    }
+}
+
+#[test]
+fn pure_differential_s1_duration_differences_truncate_negative_fractional_intervals() {
+    for name in ["weeks_diff", "hours_diff", "minutes_diff", "seconds_diff"] {
+        let left: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(-1),
+            Some(1),
+            Some(-3_599_999_999),
+            Some(3_599_999_999),
+            Some(-86_399_999_999),
+            Some(86_399_999_999),
+            Some(-604_799_999_999),
+            Some(604_799_999_999),
+            None,
+        ]));
+        let right: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![Some(0); 9]));
+        assert_scalar_matches_v1(ScalarDiffSpec::new(name).column(left).column(right));
+    }
+}
+
+#[test]
+fn pure_differential_s1_timestamp_every_declared_overload() {
+    for source in temporal_sources(0x7157).into_iter().skip(1) {
+        assert_scalar_matches_v1(ScalarDiffSpec::new("timestamp").column(source));
+    }
+}
+
+#[test]
+fn pure_differential_s1_date_format_every_overload_and_original_mysql_tokens() {
+    for format in [
+        "%Y-%m-%d %H:%i:%s.%f",
+        "%c/%e/%y %h %I %S",
+        "%T",
+        "%a %b %j %w",
+        "%%f %%T",
+        "trailing%",
+        "中文🙂 %Y",
+        "",
+    ] {
+        for source in temporal_sources(0xF04A) {
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new("date_format")
+                    .column(source)
+                    .constant_array(Arc::new(StringArray::from(vec![format]))),
+            );
+        }
+    }
+}
+
+#[test]
+fn pure_differential_s1_date_format_preserves_128_byte_limit_and_null_parsing() {
+    let formats = [
+        "x".repeat(127),
+        "x".repeat(128),
+        "x".repeat(129),
+        "🙂".repeat(32),
+        "🙂".repeat(33),
+        "%Y".repeat(33),
+        "%Y".into(),
+        "%f".into(),
+    ];
+    let formats: ArrayRef = Arc::new(StringArray::from(formats.to_vec()));
+    let dates: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("2024-02-29 12:34:56.123456"),
+        Some("2024-02-29"),
+        Some("2024-02-29"),
+        Some("2024-02-29"),
+        Some("2024-02-29"),
+        Some("2024-02-29"),
+        None,
+        Some("invalid"),
+    ]));
+    assert_scalar_matches_v1(
+        ScalarDiffSpec::new("date_format")
+            .column(dates)
+            .column(formats),
+    );
+}
+
+#[test]
+fn pure_differential_s1_last_day_every_arity_and_source_overload() {
+    for source in temporal_sources(0x1A57) {
+        assert_scalar_matches_v1(ScalarDiffSpec::new("last_day").column(source.clone()));
+        for token in ["month", "QUARTER", "year", "invalid"] {
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new("last_day")
+                    .column(source.clone())
+                    .constant_array(Arc::new(StringArray::from(vec![token]))),
+            );
+        }
+    }
+}
+
+#[test]
+fn pure_differential_s1_last_day_invalid_date_suppresses_invalid_unit() {
+    let dates: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("invalid"),
+        None,
+        Some("2024-02-29"),
+        Some("2023-12-31"),
+        Some("0000-01-01"),
+        Some("9999-12-31"),
+    ]));
+    let units: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("invalid"),
+        Some("invalid"),
+        Some("bad"),
+        Some("quarter"),
+        Some("YEAR"),
+        None,
+    ]));
+    let summary =
+        assert_scalar_matches_v1(ScalarDiffSpec::new("last_day").column(dates).column(units));
+    assert!(summary.attributed_row_errors > 0);
+}
+
+#[test]
+fn pure_differential_s1_next_and_previous_day_every_source_and_weekday_token() {
+    for name in ["next_day", "previous_day"] {
+        for source in temporal_sources(0xDA7) {
+            for token in [
+                "Mo",
+                "Tue",
+                "Wednesday",
+                "Th",
+                "Friday",
+                "Sa",
+                "Sunday",
+                "invalid",
+                "monday",
+            ] {
+                assert_scalar_matches_v1(
+                    ScalarDiffSpec::new(name)
+                        .column(source.clone())
+                        .constant_array(Arc::new(StringArray::from(vec![token]))),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn pure_differential_s1_named_day_invalid_nonnull_date_preserves_required_token_error() {
+    for name in ["next_day", "previous_day"] {
+        let dates: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("invalid"),
+            None,
+            Some("2024-02-29"),
+            Some("2024-02-29"),
+            Some("0000-01-01"),
+            Some("9999-12-31"),
+        ]));
+        let tokens: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("bad"),
+            Some("bad"),
+            Some("bad"),
+            None,
+            Some("Sunday"),
+            Some("Monday"),
+        ]));
+        let summary =
+            assert_scalar_matches_v1(ScalarDiffSpec::new(name).column(dates).column(tokens));
+        assert!(summary.attributed_row_errors >= 2);
+    }
+}
+
+#[test]
+fn pure_differential_s1_str_to_date_original_patterns_fallback_and_sunday_weekyear() {
+    let inputs: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("2024-02-29"),
+        Some("2024-02-29 12:34:56.123456"),
+        Some("20240229"),
+        Some("2024-02-29"),
+        Some("2023-02-29"),
+        Some("202401 Sunday"),
+        Some("202401 Monday"),
+        Some("202453 Tuesday"),
+        Some("000001 Sunday"),
+        Some("999953 Saturday"),
+        Some("202400 Sunday"),
+        Some("202401 Sunday extra"),
+        None,
+        Some("2024-02-29"),
+    ]));
+    let formats: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("%Y-%m-%d"),
+        Some("%Y-%m-%d %H:%i:%s.%f"),
+        Some("%Y%m%d"),
+        Some("not a pattern"),
+        Some("%Y-%m-%d"),
+        Some("%X%V %W"),
+        Some("%X%V %W"),
+        Some("%x%v %w"),
+        Some("%X%V %W"),
+        Some("%X%V %W"),
+        Some("%X%V %W"),
+        Some("%X%V %W"),
+        Some("%Y-%m-%d"),
+        None,
+    ]));
+    assert_scalar_matches_v1(
+        ScalarDiffSpec::new("str_to_date")
+            .column(inputs)
+            .column(formats),
+    );
+    for text in temporal_sources(0x57D).into_iter().skip(2) {
+        for pattern in ["%Y-%m-%d", "%Y-%m-%d %T", "%Y-%m-%d %H:%i:%s.%f", "%Q", ""] {
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new("str_to_date")
+                    .column(text.clone())
+                    .constant_array(Arc::new(StringArray::from(vec![pattern]))),
+            );
+        }
+    }
+}
+
+#[test]
+fn pure_differential_s1_from_days_preserves_sentinel_and_integer_boundaries() {
+    let wide: ArrayRef = Arc::new(Int64Array::from(vec![
+        Some(i64::MIN),
+        Some(i32::MIN as i64 - 1),
+        Some(i32::MIN as i64),
+        Some(-1),
+        Some(0),
+        Some(1),
+        Some(3_652_424),
+        Some(3_652_425),
+        Some(i32::MAX as i64),
+        Some(i32::MAX as i64 + 1),
+        Some(i64::MAX),
+        None,
+    ]));
+    let narrow: ArrayRef = Arc::new(Int32Array::from(vec![
+        Some(i32::MIN),
+        Some(-1),
+        Some(0),
+        Some(1),
+        Some(3_652_424),
+        Some(3_652_425),
+        Some(i32::MAX),
+        None,
+    ]));
+    for array in [wide, narrow] {
+        assert_scalar_matches_v1(ScalarDiffSpec::new("from_days").column(array));
+    }
+    for ty in [DataType::Int32, DataType::Int64] {
+        let array = InputGenerator::new(0xFDD).column(
+            &FunctionValueType::new(ty, true),
+            256,
+            &InputProfile::default(),
+        );
+        assert_scalar_matches_v1(ScalarDiffSpec::new("from_days").column(array));
+    }
+}
+
+#[test]
+fn pure_differential_s1_all_declared_profiles_with_nonnull_columns_and_broadcast_constants() {
+    fn check(name: &str, arguments: Vec<ArrayRef>) {
+        for constants in [false, true] {
+            let mut spec = ScalarDiffSpec::new(name).constant_rows(8);
+            for argument in &arguments {
+                spec = if constants {
+                    spec.constant_array(argument.slice(0, 1))
+                } else {
+                    spec.typed_column(
+                        FunctionValueType::new(argument.data_type().clone(), false),
+                        Arc::clone(argument),
+                    )
+                };
+            }
+            assert_scalar_matches_v1(spec);
+        }
+    }
+    let temporal: Vec<ArrayRef> = vec![
+        Arc::new(Date32Array::from(vec![0; 8])),
+        Arc::new(TimestampMicrosecondArray::from(vec![0; 8])),
+        Arc::new(StringArray::from(vec!["2024-02-29 12:34:56.123456"; 8])),
+    ];
+    for source in &temporal {
+        check(
+            "date_trunc",
+            vec![
+                Arc::new(StringArray::from(vec!["month"; 8])),
+                Arc::clone(source),
+            ],
+        );
+        for name in ["weeks_diff", "hours_diff", "minutes_diff", "seconds_diff"] {
+            check(name, vec![Arc::clone(source), Arc::clone(source)]);
+        }
+        check(
+            "date_format",
+            vec![
+                Arc::clone(source),
+                Arc::new(StringArray::from(vec!["%Y-%m-%d %T.%f"; 8])),
+            ],
+        );
+        check("last_day", vec![Arc::clone(source)]);
+        check(
+            "last_day",
+            vec![
+                Arc::clone(source),
+                Arc::new(StringArray::from(vec!["quarter"; 8])),
+            ],
+        );
+        for name in ["next_day", "previous_day"] {
+            check(
+                name,
+                vec![
+                    Arc::clone(source),
+                    Arc::new(StringArray::from(vec!["Monday"; 8])),
+                ],
+            );
+        }
+    }
+    for source in temporal.into_iter().skip(1) {
+        check("timestamp", vec![source]);
+    }
+    check(
+        "str_to_date",
+        vec![
+            Arc::new(StringArray::from(vec!["2024-02-29 12:34:56"; 8])),
+            Arc::new(StringArray::from(vec!["%Y-%m-%d %T"; 8])),
+        ],
+    );
+    check(
+        "from_days",
+        vec![Arc::new(Int32Array::from(vec![719528; 8]))],
+    );
+    check(
+        "from_days",
+        vec![Arc::new(Int64Array::from(vec![719528; 8]))],
+    );
+}
+#[test]
+fn pure_differential_s1_timestampdiff_all_units_and_declared_temporal_profiles() {
+    for unit in [
+        "year",
+        "month",
+        "week",
+        "day",
+        "hour",
+        "minute",
+        "second",
+        "millisecond",
+        "WeEk",
+        "invalid",
+        " quarter ",
+    ] {
+        for (start, end) in temporal_sources(0x71D1)
+            .into_iter()
+            .zip(temporal_sources(0x71D2))
+        {
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new("timestampdiff")
+                    .constant_array(Arc::new(StringArray::from(vec![unit])))
+                    .column(start)
+                    .column(end),
+            );
+        }
+    }
+}
+
+#[test]
+fn pure_differential_s1_timestampdiff_calendar_fields_and_null_error_suppression() {
+    let start: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("2023-12-31 23:59:59"),
+        Some("2024-01-31"),
+        Some("invalid"),
+        None,
+        Some("2024-01-01 00:00:00.999999"),
+        Some("2024-01-01 00:00:00"),
+    ]));
+    let end: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("2024-01-01 00:00:00"),
+        Some("2024-02-01"),
+        Some("2024-01-01"),
+        Some("2024-01-01"),
+        Some("2024-01-01 00:00:00"),
+        Some("2024-01-01"),
+    ]));
+    let units: ArrayRef = Arc::new(StringArray::from(vec![
+        Some("year"),
+        Some("month"),
+        Some("invalid"),
+        Some("invalid"),
+        Some("second"),
+        Some("invalid"),
+    ]));
+    let summary = assert_scalar_matches_v1(
+        ScalarDiffSpec::new("timestampdiff")
+            .column(units)
+            .column(start)
+            .column(end),
+    );
+    assert!(summary.attributed_row_errors > 0);
+}
+
+#[test]
+fn pure_differential_s1_timestampdiff_profiles_have_nonnull_and_constant_broadcast_coverage() {
+    for source in [
+        Arc::new(Date32Array::from(vec![0; 8])) as ArrayRef,
+        Arc::new(TimestampMicrosecondArray::from(vec![0; 8])),
+        Arc::new(StringArray::from(vec!["2024-02-29"; 8])),
+    ] {
+        let unit: ArrayRef = Arc::new(StringArray::from(vec!["day"; 8]));
+        assert_scalar_matches_v1(
+            ScalarDiffSpec::new("timestampdiff")
+                .typed_column(
+                    FunctionValueType::new(DataType::Utf8, false),
+                    Arc::clone(&unit),
+                )
+                .typed_column(
+                    FunctionValueType::new(source.data_type().clone(), false),
+                    Arc::clone(&source),
+                )
+                .typed_column(
+                    FunctionValueType::new(source.data_type().clone(), false),
+                    Arc::clone(&source),
+                ),
+        );
+        assert_scalar_matches_v1(
+            ScalarDiffSpec::new("timestampdiff")
+                .constant_rows(8)
+                .constant_array(unit.slice(0, 1))
+                .constant_array(source.slice(0, 1))
+                .constant_array(source.slice(0, 1)),
+        );
+    }
+}
+#[test]
+fn pure_differential_s1_day_week_add_sub_all_declared_temporal_profiles() {
+    let offsets: ArrayRef = Arc::new(Int64Array::from(vec![
+        Some(-366),
+        Some(-31),
+        Some(-1),
+        Some(0),
+        Some(1),
+        Some(31),
+        Some(366),
+        None,
+    ]));
+    for name in [
+        "date_add",
+        "adddate",
+        "days_add",
+        "weeks_add",
+        "date_sub",
+        "subdate",
+        "days_sub",
+        "weeks_sub",
+    ] {
+        for source in [
+            Arc::new(Date32Array::from(vec![
+                Some(0),
+                Some(19782),
+                Some(19782),
+                None,
+                Some(0),
+                Some(19782),
+                Some(19782),
+                Some(0),
+            ])) as ArrayRef,
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(0),
+                Some(0),
+                Some(-1),
+                None,
+                Some(1),
+                Some(0),
+                Some(0),
+                Some(0),
+            ])),
+            Arc::new(StringArray::from(vec![
+                Some("2024-02-29 12:34:56.123456"),
+                Some("0000-01-01"),
+                Some("9999-12-31"),
+                None,
+                Some("invalid"),
+                Some("2024-02-29"),
+                Some("2023-01-31"),
+                Some("invalid"),
+            ])),
+        ] {
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .column(source)
+                    .column(Arc::clone(&offsets)),
+            );
+        }
+    }
+}
+
+#[test]
+fn pure_differential_s1_day_week_profiles_have_nonnull_and_constant_broadcast_coverage() {
+    for name in [
+        "date_add",
+        "adddate",
+        "days_add",
+        "weeks_add",
+        "date_sub",
+        "subdate",
+        "days_sub",
+        "weeks_sub",
+    ] {
+        for source in [
+            Arc::new(Date32Array::from(vec![0; 8])) as ArrayRef,
+            Arc::new(TimestampMicrosecondArray::from(vec![0; 8])),
+            Arc::new(StringArray::from(vec!["2024-02-29 12:34:56.123456"; 8])),
+        ] {
+            let offset: ArrayRef = Arc::new(Int64Array::from(vec![1; 8]));
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .typed_column(
+                        FunctionValueType::new(source.data_type().clone(), false),
+                        Arc::clone(&source),
+                    )
+                    .typed_column(
+                        FunctionValueType::new(DataType::Int64, false),
+                        Arc::clone(&offset),
+                    ),
+            );
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .constant_rows(8)
+                    .constant_array(source.slice(0, 1))
+                    .constant_array(offset.slice(0, 1)),
+            );
+        }
+    }
+}
+#[test]
+fn pure_differential_s1_month_year_all_consistent_declared_profiles() {
+    let intervals: ArrayRef = Arc::new(Int64Array::from(vec![
+        Some(-25),
+        Some(-1),
+        Some(0),
+        Some(1),
+        Some(12),
+        Some(25),
+        None,
+        Some(1_i64 << 32),
+    ]));
+    for name in [
+        "add_months",
+        "months_add",
+        "months_sub",
+        "years_add",
+        "years_sub",
+    ] {
+        let date: ArrayRef = Arc::new(Date32Array::from(vec![
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            None,
+            Some(0),
+        ]));
+        let timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![
+            Some(0),
+            Some(-1),
+            Some(1),
+            Some(0),
+            Some(0),
+            None,
+            Some(0),
+            Some(0),
+        ]));
+        let text: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("2024-01-31 12:34:56.123456"),
+            Some("2024-03-31"),
+            Some("2024-02-29"),
+            Some("0000-01-31"),
+            Some("invalid"),
+            None,
+            Some("2024-01-31"),
+            Some("2024-01-31"),
+        ]));
+        let sources = if name == "add_months" {
+            vec![date, timestamp]
+        } else {
+            vec![timestamp, text]
+        };
+        for source in sources {
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .column(source)
+                    .column(Arc::clone(&intervals)),
+            );
+        }
+    }
+}
+#[test]
+fn pure_differential_s1_month_year_consistent_profiles_have_nonnull_and_constant_broadcast_coverage()
+ {
+    for name in [
+        "add_months",
+        "months_add",
+        "months_sub",
+        "years_add",
+        "years_sub",
+    ] {
+        let date: ArrayRef = Arc::new(Date32Array::from(vec![0; 8]));
+        let timestamp: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![0; 8]));
+        let text: ArrayRef = Arc::new(StringArray::from(vec!["2024-01-31 12:34:56.123456"; 8]));
+        let sources = if name == "add_months" {
+            vec![date, timestamp]
+        } else {
+            vec![timestamp, text]
+        };
+        for source in sources {
+            let interval: ArrayRef = Arc::new(Int64Array::from(vec![1; 8]));
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .typed_column(
+                        FunctionValueType::new(source.data_type().clone(), false),
+                        Arc::clone(&source),
+                    )
+                    .typed_column(
+                        FunctionValueType::new(DataType::Int64, false),
+                        Arc::clone(&interval),
+                    ),
+            );
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .constant_rows(8)
+                    .constant_array(source.slice(0, 1))
+                    .constant_array(interval.slice(0, 1)),
+            );
+        }
+    }
+}
+
+#[test]
+fn pure_differential_s1_month_year_consistent_profiles_generated_inputs() {
+    let intervals: ArrayRef = Arc::new(Int64Array::from(
+        (0..256)
+            .map(|row| {
+                if row % 11 == 0 {
+                    None
+                } else {
+                    Some((row as i64 % 51) - 25)
+                }
+            })
+            .collect::<Vec<_>>(),
+    ));
+    for name in [
+        "add_months",
+        "months_add",
+        "months_sub",
+        "years_add",
+        "years_sub",
+    ] {
+        for source in temporal_sources(0xA10A).into_iter().filter(|source| {
+            if name == "add_months" {
+                source.data_type() != &DataType::Utf8
+            } else {
+                source.data_type() != &DataType::Date32
+            }
+        }) {
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .column(source)
+                    .column(Arc::clone(&intervals)),
+            );
+        }
+    }
+}
+#[test]
+fn pure_differential_s1_duration_all_consistent_declared_profiles() {
+    let intervals: ArrayRef = Arc::new(Int64Array::from(vec![
+        Some(-366),
+        Some(-31),
+        Some(-1),
+        Some(0),
+        Some(1),
+        Some(31),
+        Some(366),
+        None,
+    ]));
+    for name in [
+        "seconds_add",
+        "seconds_sub",
+        "minutes_add",
+        "minutes_sub",
+        "hours_add",
+        "hours_sub",
+        "microseconds_add",
+        "microseconds_sub",
+    ] {
+        for source in [
+            Arc::new(TimestampMicrosecondArray::from(vec![
+                Some(0),
+                Some(0),
+                Some(-1),
+                None,
+                Some(1),
+                Some(0),
+                Some(0),
+                Some(0),
+            ])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("2024-02-29 12:34:56.123456"),
+                Some("0000-01-01"),
+                Some("9999-12-31 23:59:59.999999"),
+                None,
+                Some("invalid"),
+                Some("2024-02-29"),
+                Some("2023-01-31"),
+                Some("invalid"),
+            ])),
+        ] {
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .column(source)
+                    .column(Arc::clone(&intervals)),
+            );
+        }
+    }
+}
+#[test]
+fn pure_differential_s1_duration_consistent_profiles_have_nonnull_and_constant_broadcast_coverage()
+{
+    for name in [
+        "seconds_add",
+        "seconds_sub",
+        "minutes_add",
+        "minutes_sub",
+        "hours_add",
+        "hours_sub",
+        "microseconds_add",
+        "microseconds_sub",
+    ] {
+        for source in [
+            Arc::new(TimestampMicrosecondArray::from(vec![0; 8])) as ArrayRef,
+            Arc::new(StringArray::from(vec!["2024-02-29 12:34:56.123456"; 8])),
+        ] {
+            let interval: ArrayRef = Arc::new(Int64Array::from(vec![1; 8]));
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .typed_column(
+                        FunctionValueType::new(source.data_type().clone(), false),
+                        Arc::clone(&source),
+                    )
+                    .typed_column(
+                        FunctionValueType::new(DataType::Int64, false),
+                        Arc::clone(&interval),
+                    ),
+            );
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .constant_rows(8)
+                    .constant_array(source.slice(0, 1))
+                    .constant_array(interval.slice(0, 1)),
+            );
+        }
+    }
+}
+#[test]
+fn pure_differential_s1_duration_consistent_profiles_generated_inputs() {
+    let intervals: ArrayRef = Arc::new(Int64Array::from(
+        (0..256)
+            .map(|row| {
+                if row % 11 == 0 {
+                    None
+                } else {
+                    Some(row as i64 - 128)
+                }
+            })
+            .collect::<Vec<_>>(),
+    ));
+    for name in [
+        "seconds_add",
+        "seconds_sub",
+        "minutes_add",
+        "minutes_sub",
+        "hours_add",
+        "hours_sub",
+        "microseconds_add",
+        "microseconds_sub",
+    ] {
+        for source in temporal_sources(0xD042)
+            .into_iter()
+            .filter(|source| source.data_type() != &DataType::Date32)
+        {
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new(name)
+                    .column(source)
+                    .column(Arc::clone(&intervals)),
+            );
+        }
+    }
+}
+
+#[test]
+fn pure_differential_s1_duration_date32_declared_carrier_drift_is_refused_by_name() {
+    for name in [
+        "seconds_add",
+        "seconds_sub",
+        "minutes_add",
+        "minutes_sub",
+        "hours_add",
+        "hours_sub",
+        "microseconds_add",
+        "microseconds_sub",
+    ] {
+        let source: ArrayRef = Arc::new(arrow::array::Date32Array::from(vec![Some(0), None]));
+        let interval: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), Some(1)]));
+        let failure =
+            run_scalar_differential(&ScalarDiffSpec::new(name).column(source).column(interval))
+                .expect_err("the legacy Date32 carrier drift must be refused");
+        let DifferentialFailure::Specialization(message) = failure else {
+            panic!("{name}: expected exact profile preparation refusal, got {failure}");
+        };
+        assert!(message.contains(name), "{message}");
+        assert!(
+            message.contains("legacy duration shift returns Timestamp(Microsecond, None)"),
+            "{message}"
+        );
+    }
+}
+#[test]
+fn pure_differential_s1_unix_timestamp_argument_only_all_declared_temporal_profiles() {
+    for source in temporal_sources(0xE101) {
+        assert_scalar_matches_v1(ScalarDiffSpec::new("unix_timestamp").column(source));
+    }
+}
+#[test]
+fn pure_differential_s1_unix_timestamp_argument_profiles_have_nonnull_and_constant_coverage() {
+    for source in [
+        Arc::new(Date32Array::from(vec![0; 8])) as ArrayRef,
+        Arc::new(TimestampMicrosecondArray::from(vec![-1; 8])),
+        Arc::new(StringArray::from(vec!["1969-12-31 23:59:59.999999"; 8])),
+    ] {
+        assert_scalar_matches_v1(ScalarDiffSpec::new("unix_timestamp").typed_column(
+            FunctionValueType::new(source.data_type().clone(), false),
+            Arc::clone(&source),
+        ));
+        assert_scalar_matches_v1(
+            ScalarDiffSpec::new("unix_timestamp")
+                .constant_rows(8)
+                .constant_array(source.slice(0, 1)),
+        );
+    }
+}
+#[test]
+fn pure_differential_s1_epoch_ntz_both_declared_int64_profiles_and_scales() {
+    let value: ArrayRef = Arc::new(Int64Array::from(vec![
+        Some(i64::MIN),
+        Some(-1),
+        Some(0),
+        Some(1),
+        Some(i64::MAX),
+        None,
+        Some(253_402_300_800),
+        Some(-62_167_219_201),
+    ]));
+    assert_scalar_matches_v1(ScalarDiffSpec::new("to_datetime_ntz").column(Arc::clone(&value)));
+    for scale in [-1, 0, 1, 3, 6, 9, i64::MIN, i64::MAX] {
+        assert_scalar_matches_v1(
+            ScalarDiffSpec::new("to_datetime_ntz")
+                .column(Arc::clone(&value))
+                .constant_array(Arc::new(Int64Array::from(vec![scale]))),
+        );
+    }
+    assert_scalar_matches_v1(ScalarDiffSpec::new("to_datetime_ntz").column(value).column(
+        Arc::new(Int64Array::from(vec![
+            Some(0),
+            Some(3),
+            Some(6),
+            None,
+            Some(6),
+            Some(0),
+            Some(3),
+            Some(6),
+        ])),
+    ));
+}
+#[test]
+fn pure_differential_s1_epoch_ntz_profiles_have_nonnull_and_constant_coverage() {
+    let value: ArrayRef = Arc::new(Int64Array::from(vec![-1; 8]));
+    let scale: ArrayRef = Arc::new(Int64Array::from(vec![6; 8]));
+    assert_scalar_matches_v1(ScalarDiffSpec::new("to_datetime_ntz").typed_column(
+        FunctionValueType::new(DataType::Int64, false),
+        Arc::clone(&value),
+    ));
+    assert_scalar_matches_v1(
+        ScalarDiffSpec::new("to_datetime_ntz")
+            .typed_column(
+                FunctionValueType::new(DataType::Int64, false),
+                Arc::clone(&value),
+            )
+            .typed_column(
+                FunctionValueType::new(DataType::Int64, false),
+                Arc::clone(&scale),
+            ),
+    );
+    assert_scalar_matches_v1(
+        ScalarDiffSpec::new("to_datetime_ntz")
+            .constant_rows(8)
+            .constant_array(value.slice(0, 1)),
+    );
+    assert_scalar_matches_v1(
+        ScalarDiffSpec::new("to_datetime_ntz")
+            .constant_rows(8)
+            .constant_array(value.slice(0, 1))
+            .constant_array(scale.slice(0, 1)),
+    );
+}
+
+#[test]
+fn pure_differential_s1_unix_zero_argument_clock_form_is_explicitly_refused() {
+    let failure = run_scalar_differential(&ScalarDiffSpec::new("unix_timestamp").constant_rows(2))
+        .expect_err("the clock form requires its explicit statement-time contract");
+    let DifferentialFailure::Specialization(message) = failure else {
+        panic!("expected zero-argument preparation refusal, got {failure}");
+    };
+    assert!(message.contains("unix_timestamp"), "{message}");
+    assert!(
+        message.contains("explicit statement-time contract is required"),
+        "{message}"
+    );
+}
+#[test]
+fn pure_differential_s1_convert_tz_explicit_offsets_named_dst_null_and_invalid_domains() {
+    for source in temporal_sources(0x7A01u64)
+        .into_iter()
+        .filter(|source| source.data_type() == &DataType::Timestamp(TimeUnit::Microsecond, None))
+    {
+        for (from, to) in [
+            ("UTC", "+08:00"),
+            ("Asia/Shanghai", "America/New_York"),
+            ("America/New_York", "UTC"),
+            ("utc", "UTC"),
+            ("local", "UTC"),
+            ("UTC", "unknown"),
+        ] {
+            assert_scalar_matches_v1(
+                ScalarDiffSpec::new("convert_tz")
+                    .column(Arc::clone(&source))
+                    .constant_array(Arc::new(StringArray::from(vec![from])))
+                    .constant_array(Arc::new(StringArray::from(vec![to]))),
+            );
+        }
+    }
+}
+#[test]
+fn pure_differential_s1_convert_tz_profile_has_nonnull_and_constant_coverage() {
+    let date: ArrayRef = Arc::new(TimestampMicrosecondArray::from(vec![0; 8]));
+    let from: ArrayRef = Arc::new(StringArray::from(vec!["UTC"; 8]));
+    let to: ArrayRef = Arc::new(StringArray::from(vec!["Asia/Shanghai"; 8]));
+    assert_scalar_matches_v1(
+        ScalarDiffSpec::new("convert_tz")
+            .typed_column(
+                FunctionValueType::new(date.data_type().clone(), false),
+                Arc::clone(&date),
+            )
+            .typed_column(
+                FunctionValueType::new(DataType::Utf8, false),
+                Arc::clone(&from),
+            )
+            .typed_column(
+                FunctionValueType::new(DataType::Utf8, false),
+                Arc::clone(&to),
+            ),
+    );
+    assert_scalar_matches_v1(
+        ScalarDiffSpec::new("convert_tz")
+            .constant_rows(8)
+            .constant_array(date.slice(0, 1))
+            .constant_array(from.slice(0, 1))
+            .constant_array(to.slice(0, 1)),
+    );
+}

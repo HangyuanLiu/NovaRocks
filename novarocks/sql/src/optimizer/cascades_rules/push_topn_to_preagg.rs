@@ -40,16 +40,23 @@ impl Rule for PushDownTopNToPreAgg {
         matches!(op, Operator::LogicalTopN(_))
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalTopN(topn) = &expr.op else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         if expr.children.len() != 1 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let Some(global_group) = memo.groups.get(expr.children[0]) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut candidates = Vec::new();
         for global_expr in &global_group.logical_exprs {
@@ -79,9 +86,10 @@ impl Rule for PushDownTopNToPreAgg {
                 &local,
                 local_group_id,
                 memo,
-            ));
+                control,
+            )?);
         }
-        results
+        Ok(results)
     }
 
     fn pattern(&self) -> Pattern {
@@ -97,19 +105,26 @@ impl Rule for PushDownTopNToPreAgg {
         }
     }
 
-    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply_bound(
+        &self,
+        binding: &Binding,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         // interior 0 = TopN, 1 = global Aggregate, 2 = local Aggregate.
         let Operator::LogicalTopN(topn) = binding.op(memo, 0).clone() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Operator::LogicalAggregate(global) = binding.op(memo, 1).clone() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Operator::LogicalAggregate(local) = binding.op(memo, 2).clone() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let local_group_id = binding.children(1)[0];
-        rewrite_topn_preagg(&topn, &global, &local, local_group_id, memo)
+        rewrite_topn_preagg(&topn, &global, &local, local_group_id, memo, control)
     }
 }
 
@@ -119,34 +134,40 @@ fn rewrite_topn_preagg(
     local: &LogicalAggregateOp,
     local_group_id: GroupId,
     memo: &mut Memo,
-) -> Vec<NewExpr> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
     if topn.phase != TopNPhase::Final || topn.is_split {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let Some(limit) = topn.limit else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     if limit < 0 || topn.offset.unwrap_or(0) != 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     if global.stage != AggStage::Global || local.stage != AggStage::Local {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     if !global.is_split || !local.is_split {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     if global.aggregates.iter().any(|agg| agg.distinct)
         || local.aggregates.iter().any(|agg| agg.distinct)
     {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     if !order_by_covers_group_by(&topn.items, global, &memo.scalars) {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let Some(partial_items) =
-        partial_order_by_for_local_group_by(&topn.items, global, local, &mut memo.scalars)
+    let Some(partial_items) = partial_order_by_for_local_group_by(
+        &topn.items,
+        global,
+        local,
+        &mut memo.scalars,
+        control,
+    )?
     else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     let partial_op = Operator::LogicalTopN(TopNOp {
@@ -185,10 +206,10 @@ fn rewrite_topn_preagg(
             },
         );
 
-    vec![NewExpr {
+    Ok(vec![NewExpr {
         op: Operator::LogicalTopN(topn.clone()),
         children: vec![new_global_group_id],
-    }]
+    }])
 }
 
 fn order_by_covers_group_by(
@@ -231,35 +252,43 @@ fn partial_order_by_for_local_group_by(
     global: &LogicalAggregateOp,
     local: &LogicalAggregateOp,
     arena: &mut ScalarArena,
-) -> Option<Vec<SortKey>> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<Vec<SortKey>>, crate::compiler::SqlCompileError> {
     if items.is_empty() {
-        return None;
+        return Ok(None);
     }
     if global.group_by.len() != local.group_by.len() {
-        return None;
+        return Ok(None);
     }
-    let global_group_outputs = group_key_outputs(global)?;
-    let local_group_outputs = group_key_outputs(local)?;
+    let Some(global_group_outputs) = group_key_outputs(global) else {
+        return Ok(None);
+    };
+    let Some(local_group_outputs) = group_key_outputs(local) else {
+        return Ok(None);
+    };
 
     let mut local_outputs_for_items = Vec::with_capacity(items.len());
     for item in items {
         let global_column_id = match arena.node(item.expr) {
             ScalarNode::ColumnRef(column_id) => *column_id,
-            _ => return None,
+            _ => return Ok(None),
         };
         let position = global_group_outputs
             .iter()
-            .position(|column| column.column_id == global_column_id)?;
+            .position(|column| column.column_id == global_column_id);
+        let Some(position) = position else {
+            return Ok(None);
+        };
         local_outputs_for_items.push(&local_group_outputs[position]);
     }
 
     let mut remapped = Vec::with_capacity(items.len());
     for (item, local_output) in items.iter().zip(local_outputs_for_items) {
-        let local_expr = arena.intern(
+        let local_expr = arena.intern_observed(
             ScalarNode::ColumnRef(local_output.column_id),
-            local_output.data_type.clone(),
-            local_output.nullable,
-        );
+            local_output.value_type.clone(),
+            control,
+        )?;
         remapped.push(SortKey {
             expr: local_expr,
             asc: item.asc,
@@ -267,7 +296,7 @@ fn partial_order_by_for_local_group_by(
             display: Some(ColumnDisplay::new(None, local_output.name.clone())),
         });
     }
-    Some(remapped)
+    Ok(Some(remapped))
 }
 
 fn group_key_outputs(agg: &LogicalAggregateOp) -> Option<&[OutputColumn]> {
@@ -316,8 +345,8 @@ mod tests {
         OutputColumn {
             column_id: id,
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -325,8 +354,7 @@ mod tests {
     fn col_ref(arena: &mut ScalarArena, id: u32) -> crate::optimizer::scalar::ScalarId {
         arena.intern(
             ScalarNode::ColumnRef(ColumnId::new_for_test(id)),
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         )
     }
 
@@ -343,10 +371,12 @@ mod tests {
         ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(201),
             name: "sum".to_string(),
-            args: vec![sales],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![sales],
+                vec![],
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            ),
         }
     }
 
@@ -467,7 +497,13 @@ mod tests {
 
     fn assert_does_not_fire(fixture: &mut PreAggMemo) {
         let expr = root_expr(fixture);
-        let out = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
+        let out = PushDownTopNToPreAgg
+            .apply(
+                &expr,
+                &mut fixture.memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(out.is_empty(), "expected PushDownTopNToPreAgg not to fire");
     }
@@ -624,7 +660,13 @@ mod tests {
         let mut fixture = preagg_memo();
         let expr = root_expr(&fixture);
 
-        let out = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
+        let out = PushDownTopNToPreAgg
+            .apply(
+                &expr,
+                &mut fixture.memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_preagg_rewrite_shape(&out, &fixture.memo, &fixture);
     }
@@ -647,7 +689,13 @@ mod tests {
         global.output_columns = global.output_layout.aggregate_columns.clone();
 
         let expr = root_expr(&fixture);
-        let out = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
+        let out = PushDownTopNToPreAgg
+            .apply(
+                &expr,
+                &mut fixture.memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_preagg_rewrite_shape(&out, &fixture.memo, &fixture);
     }
@@ -657,13 +705,25 @@ mod tests {
         let mut fixture = preagg_memo();
         let expr = root_expr(&fixture);
 
-        let first = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
+        let first = PushDownTopNToPreAgg
+            .apply(
+                &expr,
+                &mut fixture.memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(first.len(), 1);
         let groups_after_first = fixture.memo.groups.len();
         let first_global_group = first[0].children[0];
         let first_partial_group = partial_group_under_global(&fixture.memo, first_global_group);
 
-        let second = PushDownTopNToPreAgg.apply(&expr, &mut fixture.memo);
+        let second = PushDownTopNToPreAgg
+            .apply(
+                &expr,
+                &mut fixture.memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(second.len(), 1);
         let second_global_group = second[0].children[0];
         let second_partial_group = partial_group_under_global(&fixture.memo, second_global_group);
@@ -769,7 +829,13 @@ mod tests {
             children: vec![global_group],
         };
 
-        let out = PushDownTopNToPreAgg.apply(&topn, &mut memo);
+        let out = PushDownTopNToPreAgg
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -862,7 +928,13 @@ mod tests {
             children: vec![single_group],
         };
 
-        let out = PushDownTopNToPreAgg.apply(&topn, &mut memo);
+        let out = PushDownTopNToPreAgg
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -904,10 +976,18 @@ mod tests {
             &fixture.memo,
             fixture.root_group,
             0,
-        );
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         assert_eq!(bindings.len(), 1);
 
-        let out = PushDownTopNToPreAgg.apply_bound(&bindings[0], &mut fixture.memo);
+        let out = PushDownTopNToPreAgg
+            .apply_bound(
+                &bindings[0],
+                &mut fixture.memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_preagg_rewrite_shape(&out, &fixture.memo, &fixture);
     }

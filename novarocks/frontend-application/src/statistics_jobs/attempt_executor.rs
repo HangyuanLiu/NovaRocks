@@ -52,6 +52,8 @@ use novarocks_spi::connector::{
 /// version, and schema columns are attempt-local facts.
 #[derive(Clone)]
 pub(crate) struct StatisticsAttemptExecutionPorts {
+    constant_policy: novarocks_functions::ConstantPolicy,
+    static_plan_carrier: crate::query_execution::package_freeze::StaticPlanCarrier,
     execution_role: novarocks_types::ClusterRole,
     connector_control: Arc<dyn ConnectorControlRegistry>,
     /// The composition root's single typed control registry. A collection is
@@ -75,8 +77,12 @@ impl StatisticsAttemptExecutionPorts {
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
         attempt_timeout: Duration,
         runtime: tokio::runtime::Handle,
+        constant_policy: novarocks_functions::ConstantPolicy,
+        static_plan_carrier: crate::query_execution::package_freeze::StaticPlanCarrier,
     ) -> Self {
         Self {
+            constant_policy,
+            static_plan_carrier,
             execution_role,
             connector_control,
             typed_connector_control,
@@ -181,6 +187,7 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
 
     fn failure(message: impl Into<String>) -> CoreStatisticsAttemptError {
         CoreStatisticsAttemptError::Failed(StatisticsFailure {
+            compile_control: None,
             message: Arc::from(message.into()),
         })
     }
@@ -188,6 +195,7 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
     fn scope_error(error: novarocks_workload_control::WorkError) -> CoreStatisticsAttemptError {
         if matches!(error, novarocks_workload_control::WorkError::Cancelled(_)) {
             CoreStatisticsAttemptError::Cancelled(StatisticsFailure {
+                compile_control: None,
                 message: Arc::from(error.to_string()),
             })
         } else {
@@ -198,6 +206,7 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
     fn application_error(error: StatisticsApplicationError) -> CoreStatisticsAttemptError {
         if error.target_binding_failure().is_some() {
             CoreStatisticsAttemptError::Stale(StatisticsFailure {
+                compile_control: None,
                 message: Arc::from(error.to_string()),
             })
         } else if error.publication_terminal().is_some() {
@@ -253,6 +262,7 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
             );
         if cancellation.is_cancelled() {
             return Err(CoreStatisticsAttemptError::Cancelled(StatisticsFailure {
+                compile_control: None,
                 message: Arc::from("statistics attempt cancelled before phase start"),
             }));
         }
@@ -286,6 +296,7 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
                     finalization_failure: match finalization {
                         ExternalMutationFinalization::Complete => None,
                         ExternalMutationFinalization::Failed(error) => Some(StatisticsFailure {
+                            compile_control: None,
                             message: Arc::from(error.to_string()),
                         }),
                     },
@@ -297,6 +308,9 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
                     finalization_failure: match cleanup {
                         ExternalMutationFinalization::Complete => None,
                         ExternalMutationFinalization::Failed(error) => Some(StatisticsFailure {
+                            // Provider finalization has no compile-control provenance;
+                            // the original attempt failure retains its typed compile cause.
+                            compile_control: None,
                             message: Arc::from(error.to_string()),
                         }),
                     },
@@ -350,16 +364,19 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
         match original {
             CoreStatisticsAttemptError::Failed(failure) => {
                 CoreStatisticsAttemptError::Failed(StatisticsFailure {
+                    compile_control: failure.compile_control,
                     message: Arc::from(format!("{}; {context}", failure.message)),
                 })
             }
             CoreStatisticsAttemptError::Stale(failure) => {
                 CoreStatisticsAttemptError::Stale(StatisticsFailure {
+                    compile_control: failure.compile_control,
                     message: Arc::from(format!("{}; {context}", failure.message)),
                 })
             }
             CoreStatisticsAttemptError::Cancelled(failure) => {
                 CoreStatisticsAttemptError::Cancelled(StatisticsFailure {
+                    compile_control: failure.compile_control,
                     message: Arc::from(format!("{}; {context}", failure.message)),
                 })
             }
@@ -459,6 +476,8 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
                     crate::query_execution::statistics::CompletedStatisticsPlanningServices::new(
                         &self.ports.typed_connector_control,
                         self.ports.function_catalog.as_ref(),
+                        self.ports.constant_policy,
+                        &self.ports.static_plan_carrier,
                     ),
                     &execution,
                     context,
@@ -466,7 +485,12 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
                     program,
                     planning_lease,
                 )
-                .map_err(|error| Self::failure(error.to_string()))
+                .map_err(|error| {
+                    CoreStatisticsAttemptError::Failed(StatisticsFailure {
+                        compile_control: error.compile_control_error(),
+                        message: Arc::from(error.to_string()),
+                    })
+                })
             })();
             let request = match request {
                 Ok(request) => request,
@@ -626,13 +650,9 @@ mod tests {
             },
         );
         assert_eq!(outcome.fact, StatisticsPublicationFact::KnownUncommitted);
-        assert!(
-            outcome
-                .finalization_failure
-                .unwrap()
-                .message
-                .contains("Puffin delete completion absent")
-        );
+        let failure = outcome.finalization_failure.unwrap();
+        assert_eq!(failure.compile_control, None);
+        assert!(failure.message.contains("Puffin delete completion absent"));
     }
 
     fn test_root_capacity() -> (
@@ -846,5 +866,38 @@ mod tests {
 
         assert!(matches!(error, CoreStatisticsAttemptError::Failed(_)));
         assert_eq!(abort_calls.load(Ordering::SeqCst), 1);
+    }
+    #[test]
+    fn abort_context_preserves_statistics_attempt_class_and_compile_cause() {
+        use novarocks_type_contract::CompileControlError;
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for class in 0..3 {
+                let failure = StatisticsFailure {
+                    compile_control: Some(control),
+                    message: Arc::from("compile failed"),
+                };
+                let original = match class {
+                    0 => CoreStatisticsAttemptError::Failed(failure),
+                    1 => CoreStatisticsAttemptError::Stale(failure),
+                    _ => CoreStatisticsAttemptError::Cancelled(failure),
+                };
+                let actual = FrontendThreePhaseStatisticsAttemptExecutor::with_abort_context(
+                    original,
+                    "abort failed",
+                );
+                let failure = match (class, actual) {
+                    (0, CoreStatisticsAttemptError::Failed(failure))
+                    | (1, CoreStatisticsAttemptError::Stale(failure))
+                    | (2, CoreStatisticsAttemptError::Cancelled(failure)) => failure,
+                    _ => panic!("cleanup must preserve the original attempt class"),
+                };
+                assert_eq!(failure.compile_control, Some(control));
+                assert_eq!(&*failure.message, "compile failed; abort failed");
+            }
+        }
     }
 }

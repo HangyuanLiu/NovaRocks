@@ -325,25 +325,7 @@ impl ConnectorWriteFieldRequest {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct ConnectorWriteFieldBinding {
-    token: ConnectorWriteFieldToken,
-    field: Field,
-}
-
-impl ConnectorWriteFieldBinding {
-    pub fn new(token: ConnectorWriteFieldToken, field: Field) -> Self {
-        Self { token, field }
-    }
-
-    pub const fn token(&self) -> ConnectorWriteFieldToken {
-        self.token
-    }
-
-    pub fn field(&self) -> &Field {
-        &self.field
-    }
-}
+pub use novarocks_connector_contract::ConnectorWriteFieldBinding;
 
 /// SQL-owned input requirements submitted to the Provider during admission.
 /// Each variant contains the entire required set so callers cannot represent a
@@ -370,91 +352,7 @@ pub enum ConnectorWriteInputRequest {
     },
 }
 
-/// Provider-signed counterpart to [`ConnectorWriteInputRequest`].
-#[derive(Clone, Debug)]
-pub enum ConnectorWriteInputShape {
-    Data {
-        fields: Vec<ConnectorWriteFieldBinding>,
-    },
-    RowLineage {
-        data_fields: Vec<ConnectorWriteFieldBinding>,
-        row_identity_fields: Vec<ConnectorWriteFieldBinding>,
-    },
-    PositionDelete {
-        identity_fields: Vec<ConnectorWriteFieldBinding>,
-        partition_source_fields: Vec<ConnectorWriteFieldBinding>,
-    },
-    DeletionVector {
-        identity_fields: Vec<ConnectorWriteFieldBinding>,
-        partition_source_fields: Vec<ConnectorWriteFieldBinding>,
-    },
-    EqualityDelete {
-        equality_fields: Vec<ConnectorWriteFieldBinding>,
-    },
-}
-
-impl ConnectorWriteInputShape {
-    pub fn validate(&self) -> Result<(), ConnectorError> {
-        let mut tokens = HashSet::new();
-        let mut names = HashSet::new();
-        let fields: Vec<&ConnectorWriteFieldBinding> = match self {
-            Self::Data { fields } => fields.iter().collect(),
-            Self::RowLineage {
-                data_fields,
-                row_identity_fields,
-            } => data_fields.iter().chain(row_identity_fields).collect(),
-            Self::PositionDelete {
-                identity_fields,
-                partition_source_fields,
-            }
-            | Self::DeletionVector {
-                identity_fields,
-                partition_source_fields,
-            } => identity_fields
-                .iter()
-                .chain(partition_source_fields)
-                .collect(),
-            Self::EqualityDelete { equality_fields } => equality_fields.iter().collect(),
-        };
-        if fields.is_empty() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector write input shape must contain at least one field",
-            ));
-        }
-        for binding in fields {
-            if !tokens.insert(binding.token) || !names.insert(binding.field.name().to_owned()) {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "connector write input shape contains a duplicate field token or name",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn fields(&self) -> Vec<&ConnectorWriteFieldBinding> {
-        match self {
-            Self::Data { fields } => fields.iter().collect(),
-            Self::RowLineage {
-                data_fields,
-                row_identity_fields,
-            } => data_fields.iter().chain(row_identity_fields).collect(),
-            Self::PositionDelete {
-                identity_fields,
-                partition_source_fields,
-            }
-            | Self::DeletionVector {
-                identity_fields,
-                partition_source_fields,
-            } => identity_fields
-                .iter()
-                .chain(partition_source_fields)
-                .collect(),
-            Self::EqualityDelete { equality_fields } => equality_fields.iter().collect(),
-        }
-    }
-}
+pub use novarocks_connector_contract::ConnectorWriteInputShape;
 
 /// Opaque provider version captured during write admission.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2780,8 +2678,8 @@ fn preparation_digest(
 fn digest_bound_fields(hasher: &mut Sha256, fields: &[ConnectorWriteFieldBinding]) {
     hasher.update((fields.len() as u64).to_be_bytes());
     for field in fields {
-        hasher.update(field.token.to_bytes());
-        digest_bytes(hasher, format!("{:?}", field.field).as_bytes());
+        hasher.update(field.token().to_bytes());
+        digest_bytes(hasher, format!("{:?}", field.field()).as_bytes());
     }
 }
 

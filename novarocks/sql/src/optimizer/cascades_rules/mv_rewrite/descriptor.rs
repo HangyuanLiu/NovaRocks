@@ -124,6 +124,15 @@ pub(crate) struct SpjgDescriptor {
     pub joins: Option<JoinShape>,
 }
 
+macro_rules! miss {
+    ($value:expr) => {
+        match $value {
+            Some(value) => value,
+            None => return Ok(None),
+        }
+    };
+}
+
 impl SpjgDescriptor {
     /// Map from scan ColumnId to base column name (for cross-side matching:
     /// the two sides see the same physical table through different ids).
@@ -146,7 +155,8 @@ impl SpjgDescriptor {
     pub(crate) fn from_opt_expr(
         expr: &OptExpr,
         arena: &mut ScalarArena,
-    ) -> Result<SpjgDescriptor, String> {
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<SpjgDescriptor, crate::compiler::SqlCompileError> {
         // Accepted normal form, peeled top-down:
         //   [Project] -> [Aggregate] -> [Project] -> [Filter]* -> Scan
         // Anything else (Join/Sort/Limit/Window/Union/CTE/...) is rejected.
@@ -167,7 +177,9 @@ impl SpjgDescriptor {
         let aggregate = match &node.op {
             Operator::LogicalAggregate(a) => {
                 if a.stage != AggStage::Single || a.is_split || aggregate_has_order_by(a) {
-                    return Err("unsupported aggregate shape for MV rewrite".to_string());
+                    return Err("unsupported aggregate shape for MV rewrite"
+                        .to_string()
+                        .into());
                 }
                 node = node
                     .children
@@ -208,7 +220,7 @@ impl SpjgDescriptor {
         let mut defs: HashMap<ColumnId, ScalarId> = HashMap::new();
         if let Some(p) = mid_project {
             for item in &p.items {
-                let composed = substitute_scalar(arena, item.expr, &defs);
+                let composed = substitute_scalar(arena, item.expr, &defs, control)?;
                 defs.insert(item.output_column_id, composed);
             }
         }
@@ -218,13 +230,15 @@ impl SpjgDescriptor {
                 let group_by: Vec<ScalarId> = a
                     .group_by
                     .iter()
-                    .map(|expr| substitute_scalar(arena, *expr, &defs))
-                    .collect();
+                    .map(|expr| substitute_scalar(arena, *expr, &defs, control))
+                    .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
                 let aggregates: Vec<ScalarAggregateSpec> = a
                     .aggregates
                     .iter()
-                    .map(|c| substitute_aggregate(arena, c, &defs))
-                    .collect::<Option<Vec<_>>>()
+                    .map(|c| substitute_aggregate(arena, c, &defs, control))
+                    .map(Result::transpose)
+                    .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                    .transpose()?
                     .ok_or_else(|| "unsupported aggregate order_by in MV rewrite".to_string())?;
                 if a.output_layout.group_key_columns.len() != a.group_by.len()
                     || a.output_layout.aggregate_columns.len() != a.aggregates.len()
@@ -235,7 +249,7 @@ impl SpjgDescriptor {
                         a.group_by.len(),
                         a.output_layout.aggregate_columns.len(),
                         a.aggregates.len()
-                    ));
+                    ).into());
                 }
                 // Binding map at the aggregate's outputs.
                 let mut agg_outputs: Vec<SpjgOutput> = Vec::new();
@@ -253,35 +267,39 @@ impl SpjgDescriptor {
                         expr: SpjgOutputExpr::Aggregate(aggregates[idx].clone()),
                     });
                 }
-                let outputs = apply_top_project(arena, top_project, agg_outputs)?;
+                let outputs = apply_top_project(arena, top_project, agg_outputs, control)?;
                 (Some(SpjgAggregate { group_by }), outputs)
             }
             None => {
                 let scan_outputs: Vec<SpjgOutput> = scan
                     .columns
                     .iter()
-                    .map(|c| SpjgOutput {
-                        name: c.name.clone(),
-                        column_id: c.column_id,
-                        expr: SpjgOutputExpr::Dimension(column_ref(arena, c)),
+                    .map(|c| {
+                        Ok(SpjgOutput {
+                            name: c.name.clone(),
+                            column_id: c.column_id,
+                            expr: SpjgOutputExpr::Dimension(column_ref(arena, c, control)?),
+                        })
                     })
-                    .collect();
+                    .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
                 // mid_project without aggregate is just "the" project.
                 let scan_outputs = match mid_project {
                     Some(p) => p
                         .items
                         .iter()
-                        .map(|item| SpjgOutput {
-                            name: item.output_name.clone(),
-                            column_id: item.output_column_id,
-                            expr: SpjgOutputExpr::Dimension(substitute_scalar(
-                                arena, item.expr, &defs,
-                            )),
+                        .map(|item| {
+                            Ok(SpjgOutput {
+                                name: item.output_name.clone(),
+                                column_id: item.output_column_id,
+                                expr: SpjgOutputExpr::Dimension(substitute_scalar(
+                                    arena, item.expr, &defs, control,
+                                )?),
+                            })
                         })
-                        .collect(),
+                        .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
                     None => scan_outputs,
                 };
-                let outputs = apply_top_project(arena, top_project, scan_outputs)?;
+                let outputs = apply_top_project(arena, top_project, scan_outputs, control)?;
                 (None, outputs)
             }
         };
@@ -315,15 +333,16 @@ impl SpjgDescriptor {
     pub(crate) fn from_memo(
         expr: &MExpr,
         memo: &mut Memo,
-    ) -> Option<(SpjgDescriptor, MatchedShape)> {
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Option<(SpjgDescriptor, MatchedShape)>, crate::compiler::SqlCompileError> {
         // Peel an optional top aggregate.
         let (aggregate, mut node) = match &expr.op {
             Operator::LogicalAggregate(a) => {
                 // Only the original, unsplit Single aggregate is accepted.
                 if a.stage != AggStage::Single || a.is_split || aggregate_has_order_by(a) {
-                    return None;
+                    return Ok(None);
                 }
-                let child = first_logical_expr(memo, *expr.children.first()?)?;
+                let child = miss!(first_logical_expr(memo, *miss!(expr.children.first())));
                 (Some(a.clone()), child)
             }
             _ => (None, expr.clone()),
@@ -332,7 +351,7 @@ impl SpjgDescriptor {
         // Optional pre-aggregate (or sole) project below the current node.
         let mid_project = match &node.op {
             Operator::LogicalProject(p) => {
-                let child = first_logical_expr(memo, *node.children.first()?)?;
+                let child = miss!(first_logical_expr(memo, *miss!(node.children.first())));
                 let saved = p.clone();
                 node = child;
                 Some(saved)
@@ -341,10 +360,10 @@ impl SpjgDescriptor {
         };
 
         let mut predicates: Vec<ScalarId> = Vec::new();
-        let (scan, joins) = peel_join_spine_memo(&node, memo, &mut predicates)?;
+        let (scan, joins) = miss!(peel_join_spine_memo(&node, memo, &mut predicates));
         // Reject scans already injected by a prior MV rewrite (MV-on-MV).
         if scan.mv_rewritten_from.is_some() {
-            return None;
+            return Ok(None);
         }
         predicates.extend(scan.predicates.iter().copied());
 
@@ -352,7 +371,7 @@ impl SpjgDescriptor {
         let mut defs: HashMap<ColumnId, ScalarId> = HashMap::new();
         if let Some(p) = &mid_project {
             for item in &p.items {
-                let composed = substitute_scalar(&mut memo.scalars, item.expr, &defs);
+                let composed = substitute_scalar(&mut memo.scalars, item.expr, &defs, control)?;
                 defs.insert(item.output_column_id, composed);
             }
         }
@@ -362,17 +381,20 @@ impl SpjgDescriptor {
                 let group_by: Vec<ScalarId> = a
                     .group_by
                     .iter()
-                    .map(|expr| substitute_scalar(&mut memo.scalars, *expr, &defs))
-                    .collect();
-                let aggregates: Vec<ScalarAggregateSpec> = a
-                    .aggregates
-                    .iter()
-                    .map(|c| substitute_aggregate(&mut memo.scalars, c, &defs))
-                    .collect::<Option<Vec<_>>>()?;
+                    .map(|expr| substitute_scalar(&mut memo.scalars, *expr, &defs, control))
+                    .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
+                let aggregates: Vec<ScalarAggregateSpec> = miss!(
+                    a.aggregates
+                        .iter()
+                        .map(|c| substitute_aggregate(&mut memo.scalars, c, &defs, control))
+                        .map(Result::transpose)
+                        .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                        .transpose()?
+                );
                 if a.output_layout.group_key_columns.len() != a.group_by.len()
                     || a.output_layout.aggregate_columns.len() != a.aggregates.len()
                 {
-                    return None;
+                    return Ok(None);
                 }
                 let mut agg_outputs: Vec<SpjgOutput> = Vec::new();
                 for (idx, oc) in a.output_layout.group_key_columns.iter().enumerate() {
@@ -402,16 +424,19 @@ impl SpjgDescriptor {
                     Some(p) => p
                         .items
                         .iter()
-                        .map(|item| SpjgOutput {
-                            name: item.output_name.clone(),
-                            column_id: item.output_column_id,
-                            expr: SpjgOutputExpr::Dimension(substitute_scalar(
-                                &mut memo.scalars,
-                                item.expr,
-                                &defs,
-                            )),
+                        .map(|item| {
+                            Ok(SpjgOutput {
+                                name: item.output_name.clone(),
+                                column_id: item.output_column_id,
+                                expr: SpjgOutputExpr::Dimension(substitute_scalar(
+                                    &mut memo.scalars,
+                                    item.expr,
+                                    &defs,
+                                    control,
+                                )?),
+                            })
                         })
-                        .collect(),
+                        .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
                     // No surviving Project: the scan's output IS the subtree
                     // output. Honor the scan's pruned `required_columns` when
                     // present so the descriptor reflects the columns the plan
@@ -430,19 +455,25 @@ impl SpjgDescriptor {
                         scan.columns
                             .iter()
                             .filter(|c| pruned.is_none_or(|req| req.contains(&c.column_id)))
-                            .map(|c| SpjgOutput {
-                                name: c.name.clone(),
-                                column_id: c.column_id,
-                                expr: SpjgOutputExpr::Dimension(column_ref(&mut memo.scalars, c)),
+                            .map(|c| {
+                                Ok(SpjgOutput {
+                                    name: c.name.clone(),
+                                    column_id: c.column_id,
+                                    expr: SpjgOutputExpr::Dimension(column_ref(
+                                        &mut memo.scalars,
+                                        c,
+                                        control,
+                                    )?),
+                                })
                             })
-                            .collect()
+                            .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?
                     }
                 };
                 (None, outputs, MatchedShape::Spj)
             }
         };
 
-        Some((
+        Ok(Some((
             SpjgDescriptor {
                 table: scan.table.clone(),
                 scan_columns: scan.columns.clone(),
@@ -452,7 +483,7 @@ impl SpjgDescriptor {
                 joins,
             },
             shape,
-        ))
+        )))
     }
 }
 
@@ -463,7 +494,8 @@ fn apply_top_project(
     arena: &mut ScalarArena,
     project: Option<&ProjectOp>,
     inputs: Vec<SpjgOutput>,
-) -> Result<Vec<SpjgOutput>, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<SpjgOutput>, crate::compiler::SqlCompileError> {
     let Some(p) = project else {
         return Ok(inputs);
     };
@@ -478,7 +510,11 @@ fn apply_top_project(
                     column_id: item.output_column_id,
                     expr: o.expr.clone(),
                 })
-                .ok_or_else(|| "top project references unknown column".to_string()),
+                .ok_or_else(|| {
+                    crate::compiler::SqlCompileError::Compilation(
+                        "top project references unknown column".to_string(),
+                    )
+                }),
             // A computed top-project item over a pure-dimension input can be
             // composed; over aggregate outputs it is rejected (MVP).
             _ => {
@@ -491,9 +527,11 @@ fn apply_top_project(
                         SpjgOutputExpr::Aggregate(_) => {}
                     }
                 }
-                let composed = substitute_scalar(arena, item.expr, &defs);
+                let composed = substitute_scalar(arena, item.expr, &defs, control)?;
                 if references_any(arena, composed, &inputs_agg_ids(&inputs)) {
-                    Err("computed top-project over aggregate output (unsupported)".to_string())
+                    Err("computed top-project over aggregate output (unsupported)"
+                        .to_string()
+                        .into())
                 } else {
                     Ok(SpjgOutput {
                         name: item.output_name.clone(),
@@ -528,42 +566,48 @@ fn references_any(arena: &ScalarArena, expr: ScalarId, ids: &[ColumnId]) -> bool
 }
 
 fn aggregate_has_order_by(agg: &LogicalAggregateOp) -> bool {
-    agg.aggregates.iter().any(|call| !call.order_by.is_empty())
+    agg.aggregates
+        .iter()
+        .any(|call| !call.source.order_by().is_empty())
 }
 
 fn substitute_aggregate(
     arena: &mut ScalarArena,
     call: &ScalarAggregateSpec,
     defs: &HashMap<ColumnId, ScalarId>,
-) -> Option<ScalarAggregateSpec> {
-    if !call.order_by.is_empty() {
-        return None;
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarAggregateSpec>, crate::compiler::SqlCompileError> {
+    if !call.source.order_by().is_empty() {
+        return Ok(None);
     }
-    Some(ScalarAggregateSpec {
+    Ok(Some(ScalarAggregateSpec {
         output_column_id: call.output_column_id,
         name: call.name.clone(),
-        args: call
-            .args
-            .iter()
-            .map(|arg| substitute_scalar(arena, *arg, defs))
-            .collect(),
         distinct: call.distinct,
-        order_by: vec![],
-        resolved: call.resolved.clone(),
-    })
+        source: call.source.try_rewrite_parts(
+            |arguments| {
+                arguments
+                    .iter()
+                    .map(|arg| substitute_scalar(arena, *arg, defs, control))
+                    .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()
+            },
+            |_| Ok::<_, crate::compiler::SqlCompileError>(vec![]),
+        )?,
+    }))
 }
 
 fn substitute_sort_key(
     arena: &mut ScalarArena,
     key: &SortKey,
     defs: &HashMap<ColumnId, ScalarId>,
-) -> SortKey {
-    SortKey {
-        expr: substitute_scalar(arena, key.expr, defs),
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<SortKey, crate::compiler::SqlCompileError> {
+    Ok(SortKey {
+        expr: substitute_scalar(arena, key.expr, defs, control)?,
         asc: key.asc,
         nulls_first: key.nulls_first,
         display: key.display.clone(),
-    }
+    })
 }
 
 fn peel_join_spine_memo(
@@ -837,16 +881,20 @@ pub(crate) fn substitute_scalar(
     arena: &mut ScalarArena,
     expr: ScalarId,
     defs: &HashMap<ColumnId, ScalarId>,
-) -> ScalarId {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     if let ScalarNode::ColumnRef(column_id) = arena.node(expr)
         && let Some(replacement) = defs.get(column_id)
     {
-        return *replacement;
+        return Ok(*replacement);
     }
     let original = arena.node(expr).clone();
     let rewritten = match original {
-        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
-            return expr;
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => {
+            return Ok(expr);
         }
         ScalarNode::BinaryOp {
             op,
@@ -855,13 +903,13 @@ pub(crate) fn substitute_scalar(
             decimal_overflow_policy,
         } => ScalarNode::BinaryOp {
             op,
-            left: substitute_scalar(arena, left, defs),
-            right: substitute_scalar(arena, right, defs),
+            left: substitute_scalar(arena, left, defs, control)?,
+            right: substitute_scalar(arena, right, defs, control)?,
             decimal_overflow_policy,
         },
         ScalarNode::UnaryOp { op, child } => ScalarNode::UnaryOp {
             op,
-            child: substitute_scalar(arena, child, defs),
+            child: substitute_scalar(arena, child, defs, control)?,
         },
         ScalarNode::FunctionCall {
             name,
@@ -873,8 +921,8 @@ pub(crate) fn substitute_scalar(
             name,
             args: args
                 .into_iter()
-                .map(|arg| substitute_scalar(arena, arg, defs))
-                .collect(),
+                .map(|arg| substitute_scalar(arena, arg, defs, control))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
             distinct,
             binding,
             volatility,
@@ -889,13 +937,13 @@ pub(crate) fn substitute_scalar(
             name,
             args: args
                 .into_iter()
-                .map(|arg| substitute_scalar(arena, arg, defs))
-                .collect(),
+                .map(|arg| substitute_scalar(arena, arg, defs, control))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
             distinct,
             order_by: order_by
                 .iter()
-                .map(|key| substitute_sort_key(arena, key, defs))
-                .collect(),
+                .map(|key| substitute_sort_key(arena, key, defs, control))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
             resolved,
         },
         ScalarNode::Cast {
@@ -903,12 +951,12 @@ pub(crate) fn substitute_scalar(
             target,
             decimal_overflow_policy,
         } => ScalarNode::Cast {
-            child: substitute_scalar(arena, child, defs),
+            child: substitute_scalar(arena, child, defs, control)?,
             target,
             decimal_overflow_policy,
         },
         ScalarNode::IsNull { child, negated } => ScalarNode::IsNull {
-            child: substitute_scalar(arena, child, defs),
+            child: substitute_scalar(arena, child, defs, control)?,
             negated,
         },
         ScalarNode::InList {
@@ -916,11 +964,11 @@ pub(crate) fn substitute_scalar(
             list,
             negated,
         } => ScalarNode::InList {
-            child: substitute_scalar(arena, child, defs),
+            child: substitute_scalar(arena, child, defs, control)?,
             list: list
                 .into_iter()
-                .map(|item| substitute_scalar(arena, item, defs))
-                .collect(),
+                .map(|item| substitute_scalar(arena, item, defs, control))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
             negated,
         },
         ScalarNode::Between {
@@ -929,9 +977,9 @@ pub(crate) fn substitute_scalar(
             high,
             negated,
         } => ScalarNode::Between {
-            child: substitute_scalar(arena, child, defs),
-            low: substitute_scalar(arena, low, defs),
-            high: substitute_scalar(arena, high, defs),
+            child: substitute_scalar(arena, child, defs, control)?,
+            low: substitute_scalar(arena, low, defs, control)?,
+            high: substitute_scalar(arena, high, defs, control)?,
             negated,
         },
         ScalarNode::Like {
@@ -939,8 +987,8 @@ pub(crate) fn substitute_scalar(
             pattern,
             negated,
         } => ScalarNode::Like {
-            child: substitute_scalar(arena, child, defs),
-            pattern: substitute_scalar(arena, pattern, defs),
+            child: substitute_scalar(arena, child, defs, control)?,
+            pattern: substitute_scalar(arena, pattern, defs, control)?,
             negated,
         },
         ScalarNode::Case {
@@ -948,28 +996,34 @@ pub(crate) fn substitute_scalar(
             when_then,
             else_expr,
         } => ScalarNode::Case {
-            operand: operand.map(|item| substitute_scalar(arena, item, defs)),
+            operand: operand
+                .map(|item| substitute_scalar(arena, item, defs, control))
+                .transpose()?,
             when_then: when_then
                 .into_iter()
                 .map(|(when, then)| {
-                    (
-                        substitute_scalar(arena, when, defs),
-                        substitute_scalar(arena, then, defs),
-                    )
+                    Ok((
+                        substitute_scalar(arena, when, defs, control)?,
+                        substitute_scalar(arena, then, defs, control)?,
+                    ))
                 })
-                .collect(),
-            else_expr: else_expr.map(|item| substitute_scalar(arena, item, defs)),
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
+            else_expr: else_expr
+                .map(|item| substitute_scalar(arena, item, defs, control))
+                .transpose()?,
         },
         ScalarNode::IsTruthValue {
             child,
             value,
             negated,
         } => ScalarNode::IsTruthValue {
-            child: substitute_scalar(arena, child, defs),
+            child: substitute_scalar(arena, child, defs, control)?,
             value,
             negated,
         },
-        ScalarNode::Nested(inner) => ScalarNode::Nested(substitute_scalar(arena, inner, defs)),
+        ScalarNode::Nested(inner) => {
+            ScalarNode::Nested(substitute_scalar(arena, inner, defs, control)?)
+        }
         ScalarNode::WindowCall {
             name,
             args,
@@ -985,45 +1039,44 @@ pub(crate) fn substitute_scalar(
             name,
             args: args
                 .into_iter()
-                .map(|arg| substitute_scalar(arena, arg, defs))
-                .collect(),
+                .map(|arg| substitute_scalar(arena, arg, defs, control))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
             distinct,
             binding,
             function_order_by: function_order_by
                 .iter()
-                .map(|key| substitute_sort_key(arena, key, defs))
-                .collect(),
+                .map(|key| substitute_sort_key(arena, key, defs, control))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
             aggregate_binding,
             partition_by: partition_by
                 .into_iter()
-                .map(|item| substitute_scalar(arena, item, defs))
-                .collect(),
+                .map(|item| substitute_scalar(arena, item, defs, control))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
             order_by: order_by
                 .iter()
-                .map(|key| substitute_sort_key(arena, key, defs))
-                .collect(),
+                .map(|key| substitute_sort_key(arena, key, defs, control))
+                .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?,
             window_frame,
             ignore_nulls,
         },
         ScalarNode::LambdaFunction { params, body } => ScalarNode::LambdaFunction {
             params,
-            body: substitute_scalar(arena, body, defs),
+            body: substitute_scalar(arena, body, defs, control)?,
         },
         ScalarNode::Lambda { params, body } => ScalarNode::Lambda {
             params,
-            body: substitute_scalar(arena, body, defs),
+            body: substitute_scalar(arena, body, defs, control)?,
         },
     };
-    arena.intern(
-        rewritten,
-        arena.data_type(expr).clone(),
-        arena.nullable(expr),
-    )
+    arena.intern_observed(rewritten, arena.value_type(expr).clone(), control)
 }
 
 fn scalar_children(node: &ScalarNode) -> Vec<ScalarId> {
     match node {
-        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => {
             vec![]
         }
         ScalarNode::BinaryOp { left, right, .. } => vec![*left, *right],
@@ -1071,12 +1124,16 @@ fn scalar_children(node: &ScalarNode) -> Vec<ScalarId> {
     }
 }
 
-pub(crate) fn column_ref(arena: &mut ScalarArena, c: &OutputColumn) -> ScalarId {
+pub(crate) fn column_ref(
+    arena: &mut ScalarArena,
+    c: &OutputColumn,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     arena.remember_project_output_display(c.column_id, None, c.name.clone());
-    arena.intern(
+    arena.intern_observed(
         ScalarNode::ColumnRef(c.column_id),
-        c.data_type.clone(),
-        c.nullable,
+        c.value_type.clone(),
+        control,
     )
 }
 
@@ -1096,8 +1153,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -1109,16 +1166,14 @@ mod tests {
                 qualifier: None,
                 column: c.name.clone(),
             },
-            data_type: c.data_type.clone(),
-            nullable: c.nullable,
+            value_type: c.value_type.clone(),
         }
     }
 
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -1130,8 +1185,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -1153,8 +1207,8 @@ mod tests {
                     .iter()
                     .map(|c| ColumnDef {
                         name: c.name.clone(),
-                        data_type: c.data_type.clone(),
-                        nullable: c.nullable,
+                        data_type: c.value_type.data_type.clone(),
+                        nullable: c.value_type.nullable,
                         write_default: None,
                         logical_type: None,
                     })
@@ -1209,11 +1263,18 @@ mod tests {
 
     fn descriptor_from_plan(
         plan: &LogicalPlanNode,
-    ) -> Result<(SpjgDescriptor, ScalarArena), String> {
+    ) -> Result<(SpjgDescriptor, ScalarArena), crate::compiler::SqlCompileError> {
         let mut arena = ScalarArena::new();
-        let opt_expr =
-            crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(plan, &mut arena)?;
-        let descriptor = SpjgDescriptor::from_opt_expr(&opt_expr, &mut arena)?;
+        let opt_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+            plan,
+            &mut arena,
+            crate::optimizer::test_optimizer_control(),
+        )?;
+        let descriptor = SpjgDescriptor::from_opt_expr(
+            &opt_expr,
+            &mut arena,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )?;
         Ok((descriptor, arena))
     }
 
@@ -1224,8 +1285,14 @@ mod tests {
         let mut arena = ScalarArena::new();
         // a(=col 1) = b(=col 2)  AND  a > b   (the `>` conjunct is a residual;
         // two ColumnRefs avoid depending on the ScalarNode::Literal payload type).
-        let a_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, true);
-        let b_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Int64, true);
+        let a_ref = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
+        let b_ref = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(2)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         let eq = arena.intern(
             ScalarNode::BinaryOp {
                 op: BinOp::Eq,
@@ -1233,8 +1300,7 @@ mod tests {
                 right: b_ref,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
         let gt = arena.intern(
             ScalarNode::BinaryOp {
@@ -1243,8 +1309,7 @@ mod tests {
                 right: b_ref,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
         let cond = arena.intern(
             ScalarNode::BinaryOp {
@@ -1253,8 +1318,7 @@ mod tests {
                 right: gt,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
 
         let left_columns = HashSet::from([ColumnId(1)]);
@@ -1283,8 +1347,14 @@ mod tests {
         use crate::analysis::BinOp;
 
         let mut arena = ScalarArena::new();
-        let a_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, true);
-        let c_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(3)), DataType::Int64, true);
+        let a_ref = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
+        let c_ref = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(3)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         let cond = arena.intern(
             ScalarNode::BinaryOp {
                 op: BinOp::Eq,
@@ -1292,8 +1362,7 @@ mod tests {
                 right: a_ref,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
 
         let left_columns = HashSet::from([ColumnId(1), ColumnId(2)]);
@@ -1311,8 +1380,14 @@ mod tests {
         use crate::analysis::BinOp;
 
         let mut arena = ScalarArena::new();
-        let a_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, true);
-        let b_ref = arena.intern(ScalarNode::ColumnRef(ColumnId(2)), DataType::Int64, true);
+        let a_ref = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
+        let b_ref = arena.intern(
+            ScalarNode::ColumnRef(ColumnId(2)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         let cond = arena.intern(
             ScalarNode::BinaryOp {
                 op: BinOp::Eq,
@@ -1320,8 +1395,7 @@ mod tests {
                 right: b_ref,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         );
 
         let left_columns = HashSet::from([ColumnId(1), ColumnId(2)]);
@@ -1568,15 +1642,13 @@ mod tests {
                 group_by: vec![col_ref(&a)],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![col_ref(&v)],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: vec![],
                     output_column_id: sum_out.column_id,
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_ref(&v)],
+                        vec![],
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![col(1, "a"), sum_out.clone()],
@@ -1621,9 +1693,15 @@ mod tests {
         let opt_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             plan,
             &mut memo.scalars,
+            crate::optimizer::test_optimizer_control(),
         )
         .expect("logical plan to opt expr");
-        let root = crate::optimizer::memo_copy::opt_expr_to_memo(&opt_expr, &mut memo);
+        let root = crate::optimizer::memo_copy::opt_expr_to_memo(
+            &opt_expr,
+            &mut memo,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let root_expr = memo.groups[root].logical_exprs[0].clone();
         (memo, root_expr)
     }
@@ -1641,7 +1719,13 @@ mod tests {
         );
         let (logical, _arena) = descriptor_from_plan(&plan).expect("spjg");
         let (mut memo, root_expr) = memo_root(&plan);
-        let (mem, shape) = SpjgDescriptor::from_memo(&root_expr, &mut memo).expect("from_memo");
+        let (mem, shape) = SpjgDescriptor::from_memo(
+            &root_expr,
+            &mut memo,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .expect("from_memo");
         assert!(matches!(shape, MatchedShape::Spj));
         assert_eq!(mem.table.name, logical.table.name);
         assert_eq!(mem.predicates.len(), logical.predicates.len());
@@ -1665,8 +1749,13 @@ mod tests {
             Some(on),
         );
         let (mut memo, root_expr) = memo_root(&plan);
-        let (mem, shape) =
-            SpjgDescriptor::from_memo(&root_expr, &mut memo).expect("from_memo join");
+        let (mem, shape) = SpjgDescriptor::from_memo(
+            &root_expr,
+            &mut memo,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .expect("from_memo join");
         assert!(matches!(shape, MatchedShape::Spj));
         assert_eq!(mem.table.name, "t1");
         let joins = mem.joins.as_ref().expect("join shape present");
@@ -1691,7 +1780,15 @@ mod tests {
             Some(on),
         );
         let (mut memo, root_expr) = memo_root(&plan);
-        assert!(SpjgDescriptor::from_memo(&root_expr, &mut memo).is_none());
+        assert!(
+            SpjgDescriptor::from_memo(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -1716,8 +1813,13 @@ mod tests {
             Some(on),
         );
         let (mut memo, root_expr) = memo_root(&plan);
-        let (mem, shape) =
-            SpjgDescriptor::from_memo(&root_expr, &mut memo).expect("from_memo join");
+        let (mem, shape) = SpjgDescriptor::from_memo(
+            &root_expr,
+            &mut memo,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .expect("from_memo join");
         assert!(matches!(shape, MatchedShape::Spj));
         assert_eq!(mem.table.name, "t1");
         assert_eq!(
@@ -1743,7 +1845,15 @@ mod tests {
             None,
         );
         let (mut memo, root_expr) = memo_root(&plan);
-        assert!(SpjgDescriptor::from_memo(&root_expr, &mut memo).is_none());
+        assert!(
+            SpjgDescriptor::from_memo(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -1756,15 +1866,13 @@ mod tests {
                 group_by: vec![col_ref(&a)],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![col_ref(&v)],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: vec![],
                     output_column_id: sum_out.column_id,
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_ref(&v)],
+                        vec![],
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![col(1, "a"), sum_out.clone()],
@@ -1775,7 +1883,13 @@ mod tests {
         );
         let (logical, _arena) = descriptor_from_plan(&plan).expect("spjg");
         let (mut memo, root_expr) = memo_root(&plan);
-        let (mem, shape) = SpjgDescriptor::from_memo(&root_expr, &mut memo).expect("from_memo");
+        let (mem, shape) = SpjgDescriptor::from_memo(
+            &root_expr,
+            &mut memo,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .expect("from_memo");
         // Shape carries the original aggregate op for output-id reuse.
         let MatchedShape::Spjg { original_agg } = &shape else {
             panic!("expected Spjg shape");
@@ -1805,26 +1919,37 @@ mod tests {
         let opt_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             &plan,
             &mut memo.scalars,
+            crate::optimizer::test_optimizer_control(),
         )
         .expect("logical plan to opt expr");
-        let scan_gid = crate::optimizer::memo_copy::opt_expr_to_memo(&opt_expr, &mut memo);
-        let group_by = intern_exprs(&mut memo.scalars, &[col_ref(&a)]);
+        let scan_gid = crate::optimizer::memo_copy::opt_expr_to_memo(
+            &opt_expr,
+            &mut memo,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let group_by = intern_exprs(
+            &mut memo.scalars,
+            &[col_ref(&a)],
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         let aggregates = intern_aggregate_calls(
             &mut memo.scalars,
             &[AggregateCall {
                 name: "sum".to_string(),
-                args: vec![col_ref(&v)],
                 distinct: false,
                 result_type: DataType::Int64,
-                order_by: vec![],
                 output_column_id: sum_out.column_id,
-                resolved: crate::functions::test_resolved_aggregate(
-                    "sum",
-                    &[DataType::Int64],
-                    false,
+                source: crate::binding::AggregateArgumentSource::uncertified(
+                    vec![col_ref(&v)],
+                    vec![],
+                    crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                 ),
             }],
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let output_columns = vec![col(1, "a"), sum_out.clone()];
         let output_layout = AggregateOutputLayout::new(
             output_columns
@@ -1852,6 +1977,232 @@ mod tests {
             op: Operator::LogicalAggregate(split),
             children: vec![scan_gid],
         };
-        assert!(SpjgDescriptor::from_memo(&expr, &mut memo).is_none());
+        assert!(
+            SpjgDescriptor::from_memo(
+                &expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn aggregate_mv_substitution_renews_actual_source_revision_without_upgrading_uncertified() {
+        let control = crate::optimizer::test_optimizer_control();
+        let mut arena = ScalarArena::new();
+        let column = col(71, "original_input");
+        let input = crate::planner::optimizer_bridge::scalar::intern_exprs(
+            &mut arena,
+            &[col_ref(&column)],
+            control,
+        )
+        .unwrap()[0];
+        let authored =
+            crate::analysis::function_argument(&int_lit(7), arena.constant_policy(), control)
+                .unwrap();
+        let novarocks_functions::FunctionArgument::Value {
+            value_type,
+            constant: Some(value),
+        } = authored
+        else {
+            panic!("sole literal author must retain its real constant")
+        };
+        let replacement = arena
+            .intern_observed(ScalarNode::Constant(value.clone()), value_type, control)
+            .unwrap();
+        let defs = HashMap::from([(column.column_id, replacement)]);
+        for certified in [true, false] {
+            let binding =
+                crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false);
+            let source = if certified {
+                crate::binding::AggregateArgumentSource::logical_update(
+                    vec![input],
+                    vec![],
+                    binding,
+                )
+            } else {
+                crate::binding::AggregateArgumentSource::uncertified(vec![input], vec![], binding)
+            };
+            let call = ScalarAggregateSpec {
+                name: "count".into(),
+                output_column_id: ColumnId(72),
+                distinct: false,
+                source,
+            };
+            let before = call.source.clone();
+            let rewritten = substitute_aggregate(&mut arena, &call, &defs, control)
+                .unwrap()
+                .expect("actual projection substitution");
+            assert_eq!(rewritten.source.arguments(), &[replacement]);
+            assert_eq!(call.source.arguments(), &[input]);
+            assert!(std::ptr::eq(
+                call.source.binding().resolved(),
+                rewritten.source.binding().resolved()
+            ));
+            assert!(std::ptr::eq(
+                before.binding().resolved(),
+                call.source.binding().resolved()
+            ));
+            match (
+                before.logical_identity(),
+                rewritten.source.logical_identity(),
+            ) {
+                (Some(old), Some(new)) => {
+                    assert!(old.same_revision(call.source.logical_identity().unwrap()));
+                    assert!(old.same_lineage(new));
+                    assert!(!old.same_revision(new));
+                }
+                (None, None) => assert!(rewritten.source.logical_parts().is_none()),
+                _ => panic!("actual substitution cannot change certification"),
+            }
+            assert!(matches!(
+                crate::optimizer::scalar::function_argument(&arena, input, control).unwrap(),
+                novarocks_functions::FunctionArgument::Value { constant: None, .. }
+            ));
+            let actual =
+                crate::optimizer::scalar::function_argument(&arena, replacement, control).unwrap();
+            let novarocks_functions::FunctionArgument::Value {
+                constant: Some(actual),
+                ..
+            } = actual
+            else {
+                panic!("replacement is an actual constant source")
+            };
+            assert_eq!(actual.ordinal(), value.ordinal());
+            assert!(std::sync::Arc::ptr_eq(
+                actual.pool().array(),
+                value.pool().array()
+            ));
+            assert!(std::sync::Arc::ptr_eq(
+                actual.pool().field_ref(),
+                value.pool().field_ref()
+            ));
+        }
+    }
+
+    #[test]
+    fn aggregate_mv_substitution_ordinary_and_control_refusal_leave_original_revision() {
+        use crate::compiler::SqlFunctionCatalog;
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Refuse {
+            cause: CompileControlError,
+            calls: AtomicUsize,
+        }
+        impl PureCompileControl for Refuse {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                assert_eq!(
+                    self.calls.fetch_add(1, Ordering::SeqCst),
+                    0,
+                    "callback after first cause"
+                );
+                Err(self.cause)
+            }
+        }
+        let control = crate::optimizer::test_optimizer_control();
+        let mut arena = ScalarArena::new();
+        let column = col(81, "original_input");
+        let ids = crate::planner::optimizer_bridge::scalar::intern_exprs(
+            &mut arena,
+            &[
+                col_ref(&column),
+                int_lit(9),
+                cmp(col_ref(&column), BinOp::Eq, int_lit(9)),
+            ],
+            control,
+        )
+        .unwrap();
+        let arguments = [
+            crate::optimizer::scalar::function_argument(&arena, ids[0], control).unwrap(),
+            crate::optimizer::scalar::function_argument(&arena, ids[0], control).unwrap(),
+        ];
+        let selected = crate::functions::builtin_engine_function_catalog()
+            .resolve_aggregate_binding("array_agg", 1, &arguments, control)
+            .unwrap();
+        let ordered = ScalarAggregateSpec {
+            name: "array_agg".into(),
+            output_column_id: ColumnId(82),
+            distinct: false,
+            source: crate::binding::AggregateArgumentSource::logical_update(
+                vec![ids[0]],
+                vec![SortKey {
+                    expr: ids[0],
+                    asc: false,
+                    nulls_first: true,
+                    display: None,
+                }],
+                crate::binding::SqlFunctionBinding::new(
+                    selected,
+                    novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                ),
+            ),
+        };
+        let original = ordered.source.clone();
+        assert!(
+            substitute_aggregate(
+                &mut arena,
+                &ordered,
+                &HashMap::from([(column.column_id, ids[1])]),
+                control
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            original
+                .logical_identity()
+                .unwrap()
+                .same_revision(ordered.source.logical_identity().unwrap())
+        );
+        assert_eq!(ordered.source.arguments(), &[ids[0]]);
+        assert_eq!(ordered.source.order_by()[0].expr, ids[0]);
+
+        // A real compound argument reaches the original scalar interner's
+        // controlled reconstruction, rather than a direct leaf replacement.
+        let call = ScalarAggregateSpec {
+            name: "count".into(),
+            output_column_id: ColumnId(83),
+            distinct: false,
+            source: crate::binding::AggregateArgumentSource::logical_update(
+                vec![ids[2]],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[DataType::Boolean], false),
+            ),
+        };
+        let before = call.source.clone();
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let refusal = Refuse {
+                cause,
+                calls: AtomicUsize::new(0),
+            };
+            assert_eq!(
+                substitute_aggregate(
+                    &mut arena,
+                    &call,
+                    &HashMap::from([(column.column_id, ids[1])]),
+                    &refusal
+                )
+                .unwrap_err(),
+                crate::compiler::SqlCompileError::from(cause)
+            );
+            assert_eq!(refusal.calls.load(Ordering::SeqCst), 1);
+            assert!(
+                before
+                    .logical_identity()
+                    .unwrap()
+                    .same_revision(call.source.logical_identity().unwrap())
+            );
+            assert_eq!(call.source.arguments(), &[ids[2]]);
+            assert!(std::ptr::eq(
+                before.binding().resolved(),
+                call.source.binding().resolved()
+            ));
+        }
     }
 }

@@ -12,6 +12,8 @@ name = "novarocks"
 path = "src/main.rs"
 
 [dependencies]
+novarocks-arrow-ipc-frame = { workspace = true, optional = true }
+novarocks-connector-contract.workspace = true
 novarocks-connector-iceberg.workspace = true
 novarocks-connector-paimon.workspace = true
 novarocks-connector-iceberg-functions.workspace = true
@@ -29,12 +31,14 @@ novarocks-native-trust.workspace = true
 novarocks-native-adapter.workspace = true
 novarocks-query-application.workspace = true
 novarocks-physical-plan.workspace = true
+novarocks-plan-codec = { workspace = true, optional = true }
 novarocks-secret.workspace = true
 novarocks-spi.workspace = true
 novarocks-state-store-api.workspace = true
 novarocks-state-store-runtime.workspace = true
 novarocks-sql.workspace = true
 novarocks-state-store-sqlite.workspace = true
+novarocks-type-contract.workspace = true
 novarocks-types.workspace = true
 novarocks-version.workspace = true
 novarocks-worker.workspace = true
@@ -64,6 +68,8 @@ tikv-jemallocator = { workspace = true, optional = true }
 tikv-jemallocator = { workspace = true, optional = true, features = ["background_threads"] }
 
 [features]
+mem-1-m07-hms-listing-observe = ["novarocks-connector-iceberg/mem-1-m07-hms-listing-observe", "novarocks-frontend-application/mem-1-m07-hms-listing-observe"]
+mem-1-m07-closing-pressure = ["novarocks-frontend-application/mem-1-m07-closing-pressure"]
 mem-1-m07-root-observation = ["novarocks-frontend-application/mem-1-m07-root-observation"]
 mem-1-m07-exact-mysql-write = ["novarocks-frontend-application/mem-1-m07-exact-mysql-write"]
 default = ["jemalloc"]
@@ -73,8 +79,16 @@ default = ["jemalloc"]
 jemalloc = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemallocator"]
 mv-first-refresh-staging-test-support = []
 native-compatibility-test-fixture = ["novarocks-version/native-compatibility-test-fixture"]
+# Debug-only candidate island for physical wire v2: every role in the binary
+# composes the compiled-package static plan interpreter instead of the plan
+# tree, on its own compatibility island. Only debug and dev-opt builds accept
+# it; a build without debug assertions refuses it at compile time. No
+# dependency may enable it, and the one-shot flip deletes it together with the
+# plan-tree interpreter.
+physical-wire-v2-candidate = ["dep:novarocks-arrow-ipc-frame", "dep:novarocks-plan-codec"]
 
 [dev-dependencies]
+arrow-schema.workspace = true
 serde_json.workspace = true
 # `server_binary_smoke` spawns the real `novarocks` binary and drives it over
 # MySQL; `state_store_app_config` asserts config/composition by direct call.

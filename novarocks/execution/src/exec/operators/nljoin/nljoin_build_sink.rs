@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::sync::Arc;
 
 use crate::exec::chunk::Chunk;
@@ -118,7 +120,7 @@ impl ProcessorOperator for NlJoinBuildSinkOperator {
         false
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, mut chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, mut chunk: Chunk) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }
@@ -131,11 +133,11 @@ impl ProcessorOperator for NlJoinBuildSinkOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         Ok(None)
     }
 
-    fn set_finishing(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }

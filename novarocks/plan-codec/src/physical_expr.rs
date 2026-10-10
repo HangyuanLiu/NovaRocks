@@ -18,14 +18,24 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use novarocks_physical_plan::{
-    BinaryOperator, ExprId, ExprKind, Fragment, FunctionId, LiteralValue, NodeId, NullOrdering,
-    SortDirection, SortExpr, UnaryOperator, ValueId, WindowBound, WindowFrame,
-    WindowFrameExclusion, WindowFrameUnits,
+    BinaryOperator, ExprId, ExprKind, Fragment, FunctionId, NodeId, NullOrdering, SortDirection,
+    SortExpr, UnaryOperator, ValueId, WindowBound, WindowFrame, WindowFrameExclusion,
+    WindowFrameUnits,
 };
 use novarocks_proto_models::{common, expr};
 
 use crate::physical_type::encode_physical_type;
-use crate::{WireLayout, WireSlotId};
+use crate::{PhysicalEncodeError, WireLayout, WireSlotId};
+use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
+
+#[path = "cv_projection.rs"]
+mod cv_projection;
+
+#[derive(Clone, Copy)]
+pub(crate) struct ExpressionEncodingContext<'a> {
+    pub(crate) constants: &'a novarocks_physical_plan::ConstantPools,
+    pub(crate) control: &'a dyn PureCompileControl,
+}
 
 pub(crate) const NATIVE_V1_MAX_WIRE_NESTING: usize = 96;
 const NATIVE_V1_MAX_EXPANDED_EXPR_MESSAGES: usize = 262_144;
@@ -52,7 +62,24 @@ pub(crate) struct WireExpressionPreflight<'a> {
 }
 
 impl<'a> WireExpressionPreflight<'a> {
-    pub(crate) fn try_new(fragment: &'a Fragment) -> Result<Self, String> {
+    pub(crate) fn try_new(
+        fragment: &'a Fragment,
+        context: ExpressionEncodingContext<'_>,
+    ) -> Result<Self, PhysicalEncodeError> {
+        let mut work = CompileCheckpoints::try_new(context.control, CompilePhase::Encode)?;
+        let result = Self::try_new_inner(fragment, context, &mut work);
+        if matches!(result, Err(PhysicalEncodeError::Control(_))) {
+            return result;
+        }
+        work.finish()?;
+        result
+    }
+
+    fn try_new_inner(
+        fragment: &'a Fragment,
+        context: ExpressionEncodingContext<'_>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, PhysicalEncodeError> {
         let expression_count = fragment.expressions().len();
         let nodes = fragment
             .expressions()
@@ -78,10 +105,12 @@ impl<'a> WireExpressionPreflight<'a> {
                         fragment.id().get(),
                         id.get(),
                         child.get()
-                    ));
+                    )
+                    .into());
                 }
                 dependents.entry(*child).or_default().push(*id);
             }
+            work.step()?;
             remaining.insert(*id, unique.len());
             references.insert(*id, children);
             if unique.is_empty() {
@@ -99,8 +128,19 @@ impl<'a> WireExpressionPreflight<'a> {
                 )
             })?;
             let children = &references[&id];
-            let mut messages = local_expression_messages(&expression.kind);
-            let mut dynamic_bytes = local_expression_dynamic_bytes(expression);
+            let (additional, payload) = match expression.kind {
+                ExprKind::Constant(reference) => {
+                    cv_projection::cost(reference, &expression.ty, context)?
+                }
+                ExprKind::Literal(_) => {
+                    return Err("native wire v1 requires a checked constant reference".into());
+                }
+                _ => (0, 0),
+            };
+            let mut messages =
+                local_expression_messages(&expression.kind).saturating_add(additional);
+            let mut dynamic_bytes =
+                local_expression_dynamic_bytes(expression).saturating_add(payload);
             let mut depth = 4_usize;
             for child in children {
                 let child_cost = costs.get(child).ok_or_else(|| {
@@ -128,6 +168,7 @@ impl<'a> WireExpressionPreflight<'a> {
                 };
                 depth = depth.max(child_cost.depth.saturating_add(edge_messages));
             }
+            work.step()?;
             costs.insert(
                 id,
                 WireExpressionCost {
@@ -146,6 +187,7 @@ impl<'a> WireExpressionPreflight<'a> {
                         )
                     })?;
                     *count -= 1;
+                    work.step()?;
                     if *count == 0 {
                         ready.push(*user);
                     }
@@ -156,7 +198,8 @@ impl<'a> WireExpressionPreflight<'a> {
             return Err(format!(
                 "fragment {} expression graph contains a cycle",
                 fragment.id().get()
-            ));
+            )
+            .into());
         }
         Ok(Self {
             fragment,
@@ -215,6 +258,24 @@ impl<'a> WireExpressionPreflight<'a> {
     }
 }
 
+/// Project a selected checked scalar for operator-specific v1 facts.
+pub(crate) fn encode_constant_payload(
+    fragment: &Fragment,
+    expression: ExprId,
+    context: ExpressionEncodingContext<'_>,
+) -> Result<Option<common::LiteralValue>, PhysicalEncodeError> {
+    let Some(node) = fragment.expressions().get(expression) else {
+        return Ok(None);
+    };
+    match node.kind {
+        ExprKind::Constant(reference) => {
+            cv_projection::encode(reference, &node.ty, context).map(Some)
+        }
+        ExprKind::Literal(_) => Err("native wire v1 requires a checked constant reference".into()),
+        _ => Ok(None),
+    }
+}
+
 fn capped_add(left: usize, right: usize, maximum: usize) -> usize {
     left.checked_add(right)
         .map_or(maximum.saturating_add(1), |value| {
@@ -224,7 +285,10 @@ fn capped_add(left: usize, right: usize, maximum: usize) -> usize {
 
 fn expression_children(kind: &ExprKind) -> Vec<ExprId> {
     match kind {
-        ExprKind::Value(_) | ExprKind::LambdaParameter { .. } | ExprKind::Literal(_) => Vec::new(),
+        ExprKind::Value(_)
+        | ExprKind::LambdaParameter { .. }
+        | ExprKind::Constant(_)
+        | ExprKind::Literal(_) => Vec::new(),
         ExprKind::Unary { expr, .. }
         | ExprKind::Lambda { body: expr, .. }
         | ExprKind::Cast { expr, .. }
@@ -273,8 +337,6 @@ fn expression_children(kind: &ExprKind) -> Vec<ExprId> {
 fn local_expression_messages(kind: &ExprKind) -> usize {
     let additional = match kind {
         ExprKind::Case { when_then, .. } => when_then.len(),
-        ExprKind::Literal(LiteralValue::Decimal128(_)) => 1,
-        ExprKind::Literal(LiteralValue::Decimal256(_)) => 3,
         _ => 0,
     };
     8_usize.saturating_add(additional)
@@ -282,8 +344,6 @@ fn local_expression_messages(kind: &ExprKind) -> usize {
 
 fn local_expression_dynamic_bytes(expression: &novarocks_physical_plan::ExprNode) -> usize {
     let dynamic = match &expression.kind {
-        ExprKind::Literal(LiteralValue::Utf8(value)) => value.len(),
-        ExprKind::Literal(LiteralValue::Binary(value)) => value.len(),
         ExprKind::FunctionCall { function, .. } | ExprKind::WindowCall { function, .. } => {
             function.function_id.as_str().len()
         }
@@ -326,7 +386,8 @@ pub(crate) fn encode_physical_expr(
     owner: NodeId,
     expression: ExprId,
     resolution: ValueResolution<'_>,
-) -> Result<expr::Expr, String> {
+    context: ExpressionEncodingContext<'_>,
+) -> Result<expr::Expr, PhysicalEncodeError> {
     let node = fragment.expressions().get(expression).ok_or_else(|| {
         format!(
             "fragment {} is missing expression {}",
@@ -341,7 +402,8 @@ pub(crate) fn encode_physical_expr(
             expression.get(),
             node.owner.get(),
             owner.get()
-        ));
+        )
+        .into());
     }
     Ok(expr::Expr {
         r#type: Some(encode_physical_type(&node.ty.data_type)?),
@@ -351,9 +413,10 @@ pub(crate) fn encode_physical_expr(
             layout,
             owner,
             expression,
-            &node.ty.data_type,
+            &node.ty,
             &node.kind,
             &resolution,
+            context,
         )?),
     })
 }
@@ -377,7 +440,8 @@ fn encode_connective(
     owner: NodeId,
     expression_type: &arrow::datatypes::DataType,
     resolution: &ValueResolution<'_>,
-) -> Result<expr::expr::Kind, String> {
+    context: ExpressionEncodingContext<'_>,
+) -> Result<expr::expr::Kind, PhysicalEncodeError> {
     let nullable = args.iter().try_fold(false, |nullable, arg| {
         fragment
             .expressions()
@@ -391,7 +455,7 @@ fn encode_connective(
                 )
             })
     })?;
-    let build = |range: &[ExprId]| -> Result<expr::Expr, String> {
+    let build = |range: &[ExprId]| -> Result<expr::Expr, PhysicalEncodeError> {
         encode_connective_range(
             op,
             range,
@@ -401,6 +465,7 @@ fn encode_connective(
             expression_type,
             nullable,
             resolution,
+            context,
         )
     };
     let (left, right) = split_connective(args)?;
@@ -420,16 +485,18 @@ pub(crate) fn encode_predicate_conjunction(
     owner: NodeId,
     predicates: &[ExprId],
     resolution: ValueResolution<'_>,
-) -> Result<expr::Expr, String> {
+    context: ExpressionEncodingContext<'_>,
+) -> Result<expr::Expr, PhysicalEncodeError> {
     let Some(first) = predicates.first() else {
         return Err(format!(
             "fragment {} node {} filter has no predicate",
             fragment.id().get(),
             owner.get()
-        ));
+        )
+        .into());
     };
     if predicates.len() == 1 {
-        return encode_physical_expr(fragment, layout, owner, *first, resolution);
+        return encode_physical_expr(fragment, layout, owner, *first, resolution, context);
     }
     let nullable = predicates.iter().try_fold(false, |nullable, predicate| {
         fragment
@@ -453,6 +520,7 @@ pub(crate) fn encode_predicate_conjunction(
         &arrow::datatypes::DataType::Boolean,
         nullable,
         &resolution,
+        context,
     )
 }
 
@@ -473,7 +541,8 @@ fn encode_connective_range(
     expression_type: &arrow::datatypes::DataType,
     nullable: bool,
     resolution: &ValueResolution<'_>,
-) -> Result<expr::Expr, String> {
+    context: ExpressionEncodingContext<'_>,
+) -> Result<expr::Expr, PhysicalEncodeError> {
     if let [single] = args {
         return encode_physical_expr(
             fragment,
@@ -481,6 +550,7 @@ fn encode_connective_range(
             owner,
             *single,
             copy_resolution(resolution),
+            context,
         );
     }
     let (left, right) = split_connective(args)?;
@@ -499,6 +569,7 @@ fn encode_connective_range(
                 expression_type,
                 nullable,
                 resolution,
+                context,
             )?)),
             right: Some(Box::new(encode_connective_range(
                 op,
@@ -509,6 +580,7 @@ fn encode_connective_range(
                 expression_type,
                 nullable,
                 resolution,
+                context,
             )?)),
         }))),
     })
@@ -519,13 +591,23 @@ fn encode_kind(
     layout: &WireLayout,
     owner: NodeId,
     expression: ExprId,
-    expression_type: &arrow::datatypes::DataType,
+    expression_type: &novarocks_physical_plan::ValueType,
     kind: &ExprKind,
     resolution: &ValueResolution<'_>,
-) -> Result<expr::expr::Kind, String> {
+    context: ExpressionEncodingContext<'_>,
+) -> Result<expr::expr::Kind, PhysicalEncodeError> {
     use expr::expr::Kind;
 
-    let child = |id| encode_physical_expr(fragment, layout, owner, id, copy_resolution(resolution));
+    let child = |id| {
+        encode_physical_expr(
+            fragment,
+            layout,
+            owner,
+            id,
+            copy_resolution(resolution),
+            context,
+        )
+    };
     Ok(match kind {
         ExprKind::Value(value) => Kind::ColumnRef(expr::ColumnRef {
             column_id: resolve_value(layout, owner, *value, resolution)?.get_u32(),
@@ -538,8 +620,16 @@ fn encode_kind(
                 name: None,
             })
         }
-        ExprKind::Literal(value) => Kind::Literal(expr::LiteralExpr {
-            value: Some(encode_literal(value, expression_type)?),
+        ExprKind::Literal(_) => {
+            return Err("native wire v1 requires a checked constant reference".into());
+        }
+        ExprKind::Constant(_) => Kind::Literal(expr::LiteralExpr {
+            value: Some(cv_projection::encode(
+                novarocks_physical_plan::native_v1_emitted_constant_reference(kind)
+                    .expect("matched actual native v1 Constant emission"),
+                expression_type,
+                context,
+            )?),
         }),
         ExprKind::Unary { op, expr: operand } => Kind::UnaryOp(Box::new(expr::UnaryOpExpr {
             op: encode_unary(*op)? as i32,
@@ -550,6 +640,9 @@ fn encode_kind(
             op,
             right,
             decimal_overflow_policy,
+            // Complete-plan v1 preflight checks this value against admitted
+            // QueryOptions; the v2 carrier retains the reference identity.
+            allow_throw_exception: _,
         } => Kind::BinaryOp(Box::new(expr::BinaryOpExpr {
             op: encode_binary(*op)? as i32,
             decimal_overflow_policy: encode_decimal_overflow_policy(*decimal_overflow_policy),
@@ -562,8 +655,9 @@ fn encode_kind(
             fragment,
             layout,
             owner,
-            expression_type,
+            &expression_type.data_type,
             resolution,
+            context,
         )?,
         ExprKind::Disjunction { args } => encode_connective(
             expr::BinaryOp::Or,
@@ -571,12 +665,13 @@ fn encode_kind(
             fragment,
             layout,
             owner,
-            expression_type,
+            &expression_type.data_type,
             resolution,
+            context,
         )?,
         ExprKind::FunctionCall { function, args } => Kind::FunctionCall(expr::FunctionCall {
             function_name: wire_function_name(&function.function_id)?.into(),
-            args: encode_exprs(fragment, layout, owner, args, resolution)?,
+            args: encode_exprs(fragment, layout, owner, args, resolution, context)?,
             distinct: false,
         }),
         ExprKind::Lambda {
@@ -603,6 +698,9 @@ fn encode_kind(
             expr: operand,
             target,
             decimal_overflow_policy,
+            // Complete-plan v1 preflight checks this value against admitted
+            // QueryOptions; the v2 carrier retains the reference identity.
+            allow_throw_exception: _,
         } => Kind::Cast(Box::new(expr::CastExpr {
             operand: Some(Box::new(child(*operand)?)),
             target: Some(encode_physical_type(target)?),
@@ -621,7 +719,7 @@ fn encode_kind(
             negated,
         } => Kind::InList(Box::new(expr::InListExpr {
             operand: Some(Box::new(child(*operand)?)),
-            list: encode_exprs(fragment, layout, owner, list, resolution)?,
+            list: encode_exprs(fragment, layout, owner, list, resolution, context)?,
             negated: *negated,
         })),
         ExprKind::Between {
@@ -658,7 +756,7 @@ fn encode_kind(
                         then: Some(child(*then)?),
                     })
                 })
-                .collect::<Result<Vec<_>, String>>()?,
+                .collect::<Result<Vec<_>, PhysicalEncodeError>>()?,
             else_expr: else_expr.map(child).transpose()?.map(Box::new),
         })),
         ExprKind::IsTruthValue {
@@ -675,7 +773,8 @@ fn encode_kind(
                 "fragment {} node {} window call must be encoded by its Window node",
                 fragment.id().get(),
                 owner.get()
-            ));
+            )
+            .into());
         }
     })
 }
@@ -686,7 +785,8 @@ pub(crate) fn encode_exprs(
     owner: NodeId,
     expressions: &[ExprId],
     resolution: &ValueResolution<'_>,
-) -> Result<Vec<expr::Expr>, String> {
+    context: ExpressionEncodingContext<'_>,
+) -> Result<Vec<expr::Expr>, PhysicalEncodeError> {
     expressions
         .iter()
         .map(|expression| {
@@ -696,6 +796,7 @@ pub(crate) fn encode_exprs(
                 owner,
                 *expression,
                 copy_resolution(resolution),
+                context,
             )
         })
         .collect()
@@ -706,7 +807,8 @@ pub(crate) fn encode_sort_items(
     layout: &WireLayout,
     owner: NodeId,
     items: &[SortExpr],
-) -> Result<Vec<expr::SortItem>, String> {
+    context: ExpressionEncodingContext<'_>,
+) -> Result<Vec<expr::SortItem>, PhysicalEncodeError> {
     items
         .iter()
         .map(|item| {
@@ -717,6 +819,7 @@ pub(crate) fn encode_sort_items(
                     owner,
                     item.expr,
                     ValueResolution::NodeInput,
+                    context,
                 )?),
                 asc: item.direction == SortDirection::Ascending,
                 nulls_first: item.null_ordering == NullOrdering::First,
@@ -778,23 +881,19 @@ fn lambda_parameter_slot(lambda: ExprId, ordinal: u32) -> Result<i32, String> {
 /// signature its own resolver answers. Both resolve by the same name on the
 /// backend, so both strip to the same thing here.
 pub(crate) fn wire_function_name(function: &FunctionId) -> Result<&str, String> {
-    let identity = function.as_str();
-    let name = identity
-        .strip_prefix("builtin.")
-        .or_else(|| identity.strip_prefix("parametric."))
-        .and_then(|identity| identity.split_once('/').map(|(_, rest)| rest))
-        .and_then(|identity| identity.strip_suffix("/v1"))
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| {
-            format!("native wire v1 cannot encode non-canonical function identity `{identity}`")
-        })?;
-    Ok(name)
+    novarocks_physical_plan::native_v1_function_name(function).map_err(|_| {
+        format!(
+            "native wire v1 cannot encode non-canonical function identity `{}`",
+            function.as_str()
+        )
+    })
 }
 
 pub(crate) fn encode_window_frame(
     fragment: &Fragment,
     frame: &WindowFrame,
-) -> Result<expr::WindowFrame, String> {
+    context: ExpressionEncodingContext<'_>,
+) -> Result<expr::WindowFrame, PhysicalEncodeError> {
     if frame.exclusion != WindowFrameExclusion::NoOthers {
         return Err("native wire v1 cannot encode window frame exclusion".into());
     }
@@ -807,15 +906,16 @@ pub(crate) fn encode_window_frame(
     };
     Ok(expr::WindowFrame {
         frame_type: frame_type as i32,
-        start: Some(encode_window_bound(fragment, &frame.start)?),
-        end: Some(encode_window_bound(fragment, &frame.end)?),
+        start: Some(encode_window_bound(fragment, &frame.start, context)?),
+        end: Some(encode_window_bound(fragment, &frame.end, context)?),
     })
 }
 
 fn encode_window_bound(
     fragment: &Fragment,
     bound: &WindowBound,
-) -> Result<expr::WindowBound, String> {
+    context: ExpressionEncodingContext<'_>,
+) -> Result<expr::WindowBound, PhysicalEncodeError> {
     use expr::window_bound::Bound;
 
     let bound = match bound {
@@ -823,24 +923,27 @@ fn encode_window_bound(
         WindowBound::CurrentRow => Bound::CurrentRow(true),
         WindowBound::UnboundedFollowing => Bound::UnboundedFollowing(true),
         WindowBound::Preceding(expression) => {
-            Bound::Preceding(window_bound_literal(fragment, *expression)?)
+            Bound::Preceding(window_bound_literal(fragment, *expression, context)?)
         }
         WindowBound::Following(expression) => {
-            Bound::Following(window_bound_literal(fragment, *expression)?)
+            Bound::Following(window_bound_literal(fragment, *expression, context)?)
         }
     };
     Ok(expr::WindowBound { bound: Some(bound) })
 }
 
-fn window_bound_literal(fragment: &Fragment, expression: ExprId) -> Result<i64, String> {
-    match fragment
-        .expressions()
-        .get(expression)
-        .map(|node| &node.kind)
-    {
-        Some(ExprKind::Literal(LiteralValue::Int64(value))) if *value >= 0 => Ok(*value),
-        _ => Err("native wire v1 window bound must be a non-negative Int64 literal".into()),
-    }
+fn window_bound_literal(
+    fragment: &Fragment,
+    expression: ExprId,
+    context: ExpressionEncodingContext<'_>,
+) -> Result<i64, PhysicalEncodeError> {
+    let node = fragment.expressions().get(expression).ok_or_else(|| {
+        PhysicalEncodeError::Invalid("native wire v1 window offset expression is missing".into())
+    })?;
+    let ExprKind::Constant(reference) = node.kind else {
+        return Err("native wire v1 window bound must reference an exact checked constant".into());
+    };
+    cv_projection::window_offset(reference, &node.ty, context)
 }
 
 fn resolve_value(
@@ -900,49 +1003,4 @@ fn encode_unary(operator: UnaryOperator) -> Result<expr::UnaryOp, String> {
             return Err("native wire v1 cannot encode unary plus".into());
         }
     })
-}
-
-fn encode_literal(
-    literal: &LiteralValue,
-    expression_type: &arrow::datatypes::DataType,
-) -> Result<common::LiteralValue, String> {
-    use common::literal_value::Value;
-
-    let value = match literal {
-        LiteralValue::Null => Value::NullValue(true),
-        LiteralValue::Boolean(value) => Value::BoolValue(*value),
-        LiteralValue::Int64(value) => Value::IntValue(*value),
-        LiteralValue::Float64Bits(value) => Value::FloatValue(f64::from_bits(*value)),
-        LiteralValue::LargeInt(value) => Value::LargeintValue(value.to_be_bytes().to_vec()),
-        LiteralValue::Decimal128(value) => {
-            let arrow::datatypes::DataType::Decimal128(precision, scale) = expression_type else {
-                return Err("Decimal128 literal has a non-decimal expression type".into());
-            };
-            Value::DecimalValue(common::DecimalLiteral {
-                value: value.to_be_bytes().to_vec(),
-                precision: u32::from(*precision),
-                scale: i32::from(*scale),
-            })
-        }
-        LiteralValue::Decimal256(value) => {
-            let arrow::datatypes::DataType::Decimal256(precision, scale) = expression_type else {
-                return Err("Decimal256 literal has a non-decimal expression type".into());
-            };
-            Value::DecimalValue(common::DecimalLiteral {
-                value: value.to_vec(),
-                precision: u32::from(*precision),
-                scale: i32::from(*scale),
-            })
-        }
-        LiteralValue::Utf8(value) => Value::StringValue(value.to_string()),
-        LiteralValue::Binary(value) => Value::BinaryValue(value.to_vec()),
-        LiteralValue::Date32(value) => Value::Date32Value(*value),
-        LiteralValue::UInt64(_)
-        | LiteralValue::Time64(_)
-        | LiteralValue::Timestamp(_)
-        | LiteralValue::IntervalMonthDayNano(_) => {
-            return Err("native wire v1 cannot preserve this literal kind".into());
-        }
-    };
-    Ok(common::LiteralValue { value: Some(value) })
 }

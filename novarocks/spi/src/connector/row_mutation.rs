@@ -1015,6 +1015,111 @@ impl ConnectorRowMutationSelection {
         self.source_ownership.is_some()
     }
 
+    /// Borrow the original safe-source receipt without cloning or encoding data.
+    /// This is an ownership size fact, not a capacity permit. Legacy selections
+    /// have no constructor receipt and cannot manufacture one here.
+    pub fn owned_source_backing_upper(&self) -> Result<Option<usize>, ConnectorError> {
+        let Some(ownership) = &self.source_ownership else {
+            return Ok(None);
+        };
+        if ownership.len() != self.batches.len() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "COW selection source receipts differ from its batches",
+            ));
+        }
+        let mut total = ConnectorRowConversionFootprint::retained_schema_bytes(&self.schema)?;
+        for source_bytes in ownership.iter() {
+            total = total.checked_add(*source_bytes).ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::ResourceExhausted,
+                    "COW source backing receipt overflowed",
+                )
+            })?;
+        }
+        if total > 64 * 1024 * 1024 || total as u64 > self.max_bytes {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "COW source backing receipt exceeds its original profile",
+            ));
+        }
+        Ok(Some(total))
+    }
+
+    /// Private-vector blocks retained by this selection, besides the original
+    /// source receipt. That receipt covers one current batch column-vector
+    /// set, including a replacement after the original set exits. Schema and
+    /// array backing remain shared. Every simultaneously live whole-selection
+    /// clone additionally needs its prospective fresh column-vector blocks.
+    pub fn retained_container_bytes(&self) -> Result<usize, ConnectorError> {
+        let exhausted = || {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "COW selection container footprint overflowed",
+            )
+        };
+        let mut bytes = size_of::<Self>();
+        for (capacity, item_bytes) in [
+            (self.batches.capacity(), size_of::<RecordBatch>()),
+            (self.batch_row_offsets.capacity(), size_of::<u64>()),
+            (
+                self.retention.capacity(),
+                size_of::<crate::connector::ConnectorPayloadRetentionGuard>(),
+            ),
+        ] {
+            bytes = bytes
+                .checked_add(capacity.checked_mul(item_bytes).ok_or_else(exhausted)?)
+                .ok_or_else(exhausted)?;
+        }
+        if let Some(ownership) = &self.source_ownership {
+            // Arc<[usize]> shares this allocation across every selection clone.
+            // Two counters and aligned usize data are the allocation layout.
+            let shared = ownership
+                .len()
+                .checked_add(2)
+                .and_then(|slots| slots.checked_mul(size_of::<usize>()))
+                .ok_or_else(exhausted)?;
+            bytes = bytes.checked_add(shared).ok_or_else(exhausted)?;
+        }
+        Ok(bytes)
+    }
+
+    /// Fresh private blocks requested by derive(Clone); Arrow/schema/guard
+    /// pointees and the original source receipt remain shared. RecordBatch's
+    /// pinned Clone copies its Vec<ArrayRef>, whose entries clone only Arcs.
+    pub fn cloned_container_bytes(&self) -> Result<usize, ConnectorError> {
+        let exhausted = || {
+            ConnectorError::new(
+                ConnectorErrorKind::ResourceExhausted,
+                "COW selection clone footprint overflowed",
+            )
+        };
+        let mut bytes = size_of::<Self>();
+        for (length, item_bytes) in [
+            (self.batches.len(), size_of::<RecordBatch>()),
+            (self.batch_row_offsets.len(), size_of::<u64>()),
+            (
+                self.retention.len(),
+                size_of::<crate::connector::ConnectorPayloadRetentionGuard>(),
+            ),
+        ] {
+            bytes = bytes
+                .checked_add(length.checked_mul(item_bytes).ok_or_else(exhausted)?)
+                .ok_or_else(exhausted)?;
+        }
+        for batch in &self.batches {
+            bytes = bytes
+                .checked_add(
+                    batch
+                        .num_columns()
+                        .checked_mul(size_of::<arrow::array::ArrayRef>())
+                        .ok_or_else(exhausted)?,
+                )
+                .ok_or_else(exhausted)?;
+        }
+        Ok(bytes)
+    }
+
     pub fn try_new(
         schema: SchemaRef,
         batches: Vec<RecordBatch>,
@@ -3721,3 +3826,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "row_mutation/source_receipt_tests.rs"]
+mod source_receipt_tests;

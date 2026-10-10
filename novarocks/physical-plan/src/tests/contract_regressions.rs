@@ -149,8 +149,20 @@ fn finish_largeint_literal(value_type: ValueType) -> Result<Fragment, String> {
 #[test]
 fn largeint_literal_requires_a_largeint_carrier_that_may_admit_null() {
     let largeint = DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH);
-    finish_largeint_literal(ty(largeint.clone(), false)).unwrap();
-    finish_largeint_literal(ty(largeint, true)).unwrap();
+    for nullable in [false, true] {
+        finish_largeint_literal(
+            ValueType::try_with_logical_type(
+                largeint.clone(),
+                nullable,
+                novarocks_type_contract::ValueLogicalType::LargeInt,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    // The same physical width does not author the LARGEINT logical domain.
+    let opaque = finish_largeint_literal(ty(largeint, false)).unwrap_err();
+    assert!(opaque.contains("literal largeint differs from its declared type"));
 
     let wrong_type = finish_largeint_literal(ty(DataType::Int64, false)).unwrap_err();
     assert!(wrong_type.contains("literal largeint differs from its declared type Int64"));
@@ -317,7 +329,7 @@ fn null_safe_join_filter(
     (fragment, filter, other_left_value)
 }
 
-fn scan_lineage_filter(
+pub(super) fn scan_lineage_filter(
     through_filter: bool,
     through_project: bool,
     through_inner_join: bool,
@@ -691,13 +703,11 @@ fn local_runtime_filter_cuts(fragment: &Fragment, filter: &RuntimeFilter) -> Fra
     FragmentCuts {
         inbound: Box::default(),
         outbound: Box::default(),
-        artifact_refs: Box::default(),
         runtime_filters: Box::from([filter.clone()]),
-        runtime_filter_proof: RuntimeFilterProofGraph {
-            fragments: Box::from([fragment.clone()]),
-            edges: Box::default(),
-            filters: Box::from([filter.clone()]),
-        },
+        runtime_filter_bindings: single_fragment_runtime_filter_bindings(
+            fragment.id(),
+            std::slice::from_ref(filter),
+        ),
     }
 }
 
@@ -795,6 +805,7 @@ fn aggregate_topn_filter() -> (Fragment, RuntimeFilter) {
                 columns: Box::from([scan_value]),
             },
             kind: NodeKind::TopN {
+                reduction: crate::TopNReduction::Rows,
                 order_by: Box::from([SortExpr {
                     expr: order_key,
                     direction: SortDirection::Ascending,
@@ -957,6 +968,254 @@ fn runtime_filter_scan_field_accepts_direct_and_identity_project_lineage() {
         let (fragment, filter, _) =
             scan_lineage_filter(through_filter, through_project, false, false);
         assert_runtime_filter_plan_accepted(fragment, filter);
+    }
+}
+
+#[test]
+fn remote_labels_cannot_bypass_local_runtime_filter_lineage() {
+    let (fragment, filter, _) = scan_lineage_filter(true, true, false, false);
+    for mutation in 0..3 {
+        let mut malformed = filter.clone();
+        let RuntimeFilterConsumerTarget::ScanField { lineage, .. } =
+            &mut malformed.consumers[0].target
+        else {
+            unreachable!()
+        };
+        let mut steps = lineage.to_vec();
+        match mutation {
+            0 => steps.insert(
+                0,
+                RuntimeFilterLineageStep::ExchangeMapping {
+                    edge: EdgeId::new(900_001),
+                    mapping_ordinal: 0,
+                },
+            ),
+            1 => {
+                let RuntimeFilterLineageStep::ProjectIdentity { fragment: id, .. } = &mut steps[0]
+                else {
+                    unreachable!()
+                };
+                *id = FragmentId::new(900_001);
+            }
+            _ => {
+                let RuntimeFilterLineageStep::FilterPassThrough { input_ordinal, .. } =
+                    &mut steps[1]
+                else {
+                    unreachable!()
+                };
+                *input_ordinal = 1;
+                steps.insert(
+                    0,
+                    RuntimeFilterLineageStep::ExchangeMapping {
+                        edge: EdgeId::new(900_001),
+                        mapping_ordinal: 0,
+                    },
+                );
+            }
+        }
+        *lineage = steps.into_boxed_slice();
+        assert_local_runtime_filter_rejected_at_both_boundaries(
+            fragment.clone(),
+            malformed,
+            "runtime filter scan consumer is not connected to its exact probe key by a safe lineage",
+        );
+    }
+}
+
+pub(super) fn cross_fragment_scan_lineage_plan() -> (PhysicalPlan, FragmentId, FragmentId) {
+    let (original, mut filter, _) = scan_lineage_filter(true, true, false, false);
+    let destination_id = original.id();
+    let source_id = FragmentId::new(900);
+    let edge_id = EdgeId::new(900);
+    let join = &original.nodes()[&original.root()];
+    let probe_root = join.inputs[0];
+    let mut source_nodes = std::collections::BTreeSet::new();
+    let mut pending = vec![probe_root];
+    while let Some(id) = pending.pop() {
+        if source_nodes.insert(id) {
+            pending.extend(original.nodes()[&id].inputs.iter().copied());
+        }
+    }
+    let source_owns_value = |value: &ValueDef| match value.origin {
+        ValueOrigin::ProviderField { scan_node, .. } => source_nodes.contains(&scan_node),
+        ValueOrigin::Expr { node, .. } | ValueOrigin::NodeOutput { node, .. } => {
+            source_nodes.contains(&node)
+        }
+        _ => false,
+    };
+    let output = original.nodes()[&probe_root].output.columns.clone();
+    let mut source = FragmentBuilder::new(source_id);
+    let mut destination = FragmentBuilder::new(destination_id);
+    for expression in original
+        .expressions()
+        .iter()
+        .map(|(_, expression)| expression)
+    {
+        if source_nodes.contains(&expression.owner) {
+            source.insert_expression(expression.clone()).unwrap();
+        } else {
+            destination.insert_expression(expression.clone()).unwrap();
+        }
+    }
+    for value in original.values().values() {
+        if source_owns_value(value) {
+            source.insert_value(value.clone()).unwrap();
+            if output.contains(&value.id) {
+                let mut imported = value.clone();
+                imported.origin = ValueOrigin::ExchangeImport {
+                    edge: edge_id,
+                    source_value: value.id,
+                };
+                destination.insert_value(imported).unwrap();
+            }
+        } else {
+            destination.insert_value(value.clone()).unwrap();
+        }
+    }
+    for node in original.nodes().values() {
+        if source_nodes.contains(&node.id) {
+            source.insert_node_unchecked(node.clone()).unwrap();
+        } else {
+            destination.insert_node_unchecked(node.clone()).unwrap();
+        }
+    }
+    let properties = original.nodes()[&probe_root].output_properties.clone();
+    destination
+        .insert_node_unchecked(PhysicalNode {
+            id: probe_root,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: properties.clone(),
+            output: OutputPort {
+                node: probe_root,
+                columns: output.clone(),
+            },
+            kind: NodeKind::ExchangeSource {
+                edge: edge_id,
+                imports: output.iter().map(|value| (*value, *value)).collect(),
+            },
+        })
+        .unwrap();
+    source.attach_runtime_filter(filter.id).unwrap();
+    destination.attach_runtime_filter(filter.id).unwrap();
+    filter.consumers[0].endpoint.fragment = source_id;
+    let RuntimeFilterConsumerTarget::ScanField { lineage, .. } = &mut filter.consumers[0].target
+    else {
+        unreachable!()
+    };
+    let mut steps = vec![RuntimeFilterLineageStep::ExchangeMapping {
+        edge: edge_id,
+        mapping_ordinal: 0,
+    }];
+    for mut step in lineage.iter().cloned() {
+        match &mut step {
+            RuntimeFilterLineageStep::FilterPassThrough { fragment, .. }
+            | RuntimeFilterLineageStep::ProjectIdentity { fragment, .. } => *fragment = source_id,
+            _ => unreachable!(),
+        }
+        steps.push(step);
+    }
+    *lineage = steps.into_boxed_slice();
+    filter.producers[0].progress.non_build_edges = Box::from([edge_id]);
+    let source = source
+        .finish_definition(probe_root, FragmentSink::Stream { edge: edge_id }, dop())
+        .unwrap();
+    let destination = destination
+        .finish_definition(original.root(), original.sink().clone(), dop())
+        .unwrap();
+    let mut plan = PlanBuilder::new(version());
+    plan.add_fragment(source).unwrap();
+    plan.add_fragment(destination).unwrap();
+    plan.add_edge(Edge {
+        id: edge_id,
+        kind: EdgeKind::Stream,
+        source: EdgeSource {
+            fragment: source_id,
+            projection: output.clone(),
+        },
+        destination: EdgeDestination {
+            fragment: destination_id,
+            node: probe_root,
+            receive_mapping: output.iter().map(|value| (*value, *value)).collect(),
+        },
+        partitioning: EdgePartitioning {
+            source: properties.distribution.clone(),
+            source_multiplicity: properties.row_multiplicity,
+            destination: properties.distribution,
+            destination_multiplicity: properties.row_multiplicity,
+        },
+    })
+    .unwrap();
+    plan.add_runtime_filter(filter).unwrap();
+    (plan.finish().unwrap(), source_id, destination_id)
+}
+
+#[test]
+fn cross_fragment_runtime_filter_validates_local_prefix_and_suffix() {
+    let (plan, source_id, destination_id) = cross_fragment_scan_lineage_plan();
+    for id in [source_id, destination_id] {
+        let fragment = &plan.fragments()[&id];
+        let cuts = fragment_cuts(&plan, id).unwrap();
+        validate_fragment(fragment, &cuts).unwrap();
+        for mutation in 0..5 {
+            let mut malformed = cuts.clone();
+            let RuntimeFilterConsumerTarget::ScanField { lineage, .. } =
+                &mut malformed.runtime_filters[0].consumers[0].target
+            else {
+                unreachable!()
+            };
+            match mutation {
+                0 => {
+                    let RuntimeFilterLineageStep::ExchangeMapping {
+                        mapping_ordinal, ..
+                    } = &mut lineage[0]
+                    else {
+                        unreachable!()
+                    };
+                    *mapping_ordinal = 2; // The other projected value cannot reach the requested provider field.
+                }
+                1 => {
+                    let RuntimeFilterLineageStep::ProjectIdentity { output_ordinal, .. } =
+                        &mut lineage[1]
+                    else {
+                        unreachable!()
+                    };
+                    *output_ordinal = 2;
+                }
+                2 => {
+                    let RuntimeFilterLineageStep::FilterPassThrough { input_ordinal, .. } =
+                        &mut lineage[2]
+                    else {
+                        unreachable!()
+                    };
+                    *input_ordinal = 1;
+                }
+                3 => {
+                    let RuntimeFilterLineageStep::ExchangeMapping { edge, .. } = &mut lineage[0]
+                    else {
+                        unreachable!()
+                    };
+                    *edge = EdgeId::new(900_001);
+                }
+                _ => {
+                    let RuntimeFilterLineageStep::ProjectIdentity { fragment, .. } =
+                        &mut lineage[1]
+                    else {
+                        unreachable!()
+                    };
+                    *fragment = FragmentId::new(900_001);
+                }
+            }
+            // Remote suffix mistakes remain FE-owned at the producer. Both
+            // ends must still refuse an unknown or inconsistent local cut.
+            if id == source_id || mutation == 0 || mutation == 3 || mutation == 4 {
+                assert!(
+                    validate_fragment(fragment, &malformed).is_err(),
+                    "accepted mutation {mutation} at fragment {}",
+                    id.get()
+                );
+            }
+        }
     }
 }
 
@@ -1947,6 +2206,14 @@ fn table_function_fragment(
             },
             kind: NodeKind::TableFunction {
                 function: BoundTableFunction {
+                    legacy_metadata: Some(crate::LegacyBindingMetadata {
+                        semantic_parameters: Box::default(),
+                        volatility: FunctionVolatility::Immutable,
+                        argument_evaluation: FunctionArgumentEvaluation::Eager,
+                        failure_behavior: FunctionFailureBehavior::Propagate,
+                        intrinsic_row_error:
+                            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
+                    }),
                     function_id: FunctionId::try_new("builtin/test_relation/v1").unwrap(),
                     overload: FunctionOverloadId::try_new("i64-to-i64-utf8").unwrap(),
                     argument_types: Box::from([FunctionArgumentType::Value(ty(
@@ -1957,11 +2224,6 @@ fn table_function_fragment(
                         ty(DataType::Int64, false),
                         ty(DataType::Utf8, false),
                     ]),
-                    volatility: FunctionVolatility::Immutable,
-                    argument_evaluation: FunctionArgumentEvaluation::Eager,
-                    failure_behavior: FunctionFailureBehavior::Propagate,
-                    intrinsic_row_error:
-                        novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
                 },
                 arguments: Box::from([argument]),
                 outputs: Box::from([
@@ -2000,9 +2262,14 @@ fn table_function_relation_results_and_outer_occurrences_have_separate_mappings(
             fragment.values()[&columns[2]].ty,
             ty(DataType::Int64, left_outer)
         );
+        // The relation's original request: its one bound Value argument.
+        let fragment = super::original_call_requests::with_original_relational_requests(
+            fragment,
+            &GroupedConstantControl,
+        );
         let mut builder = PlanBuilder::new(version());
         builder.add_fragment(fragment).unwrap();
-        let plan = builder.finish().unwrap();
+        let plan = builder.finish_observed(&GroupedConstantControl).unwrap();
         let fragment_id = FragmentId::new(101);
         validate_fragment(
             &plan.fragments()[&fragment_id],
@@ -2039,16 +2306,19 @@ fn table_function_binding_cannot_be_published_as_a_scalar_call() {
             value_type.clone(),
             ExprKind::FunctionCall {
                 function: BoundFunction {
+                    legacy_metadata: Some(crate::LegacyBindingMetadata {
+                        semantic_parameters: Box::default(),
+                        volatility: FunctionVolatility::Immutable,
+                        argument_evaluation: FunctionArgumentEvaluation::Eager,
+                        failure_behavior: FunctionFailureBehavior::Propagate,
+                        intrinsic_row_error:
+                            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
+                    }),
                     function_id: FunctionId::try_new("builtin/test_relation/v1").unwrap(),
                     overload: FunctionOverloadId::try_new("disguised-scalar").unwrap(),
                     kind: FunctionKind::Table,
                     argument_types: Box::default(),
                     result_type: value_type.clone(),
-                    volatility: FunctionVolatility::Immutable,
-                    argument_evaluation: FunctionArgumentEvaluation::Eager,
-                    failure_behavior: FunctionFailureBehavior::Propagate,
-                    intrinsic_row_error:
-                        novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
                 },
                 args: Box::default(),
             },
@@ -2159,16 +2429,19 @@ fn higher_order_function_fragment(
             parameter_type.clone(),
             ExprKind::FunctionCall {
                 function: BoundFunction {
+                    legacy_metadata: Some(crate::LegacyBindingMetadata {
+                        semantic_parameters: Box::default(),
+                        volatility: FunctionVolatility::Immutable,
+                        argument_evaluation: FunctionArgumentEvaluation::Eager,
+                        failure_behavior: FunctionFailureBehavior::Propagate,
+                        intrinsic_row_error:
+                            novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
+                    }),
                     function_id: FunctionId::try_new("builtin/test_higher_order/v1").unwrap(),
                     overload: FunctionOverloadId::try_new("lambda-i64-to-i64").unwrap(),
                     kind: FunctionKind::Scalar,
                     argument_types,
                     result_type: parameter_type.clone(),
-                    volatility: FunctionVolatility::Immutable,
-                    argument_evaluation: FunctionArgumentEvaluation::Eager,
-                    failure_behavior: FunctionFailureBehavior::Propagate,
-                    intrinsic_row_error:
-                        novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
                 },
                 args: arguments,
             },
@@ -2180,6 +2453,11 @@ fn higher_order_function_fragment(
                 node,
                 parameter_type.clone(),
                 ExprKind::Binary {
+                    allow_throw_exception: Some(novarocks_type_contract::SemanticParameterRef {
+                        id: novarocks_type_contract::SemanticParameterId::new(0),
+                        expected_key:
+                            novarocks_type_contract::SemanticParameterKey::AllowThrowException,
+                    }),
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     left: call,
@@ -2259,15 +2537,16 @@ fn lambda_cannot_be_reused_outside_its_exact_bound_argument_positions() {
 }
 
 #[derive(Clone, Copy)]
-enum TableWriterFixture {
+pub(super) enum TableWriterFixture {
     InputPort,
     TargetField,
     Distribution,
     SchemaRevision,
     SchemaRole,
+    ProviderName(usize),
 }
 
-fn invalid_table_writer_fragment(
+pub(super) fn invalid_table_writer_fragment(
     fixture: TableWriterFixture,
 ) -> Result<Fragment, ValidationErrors> {
     use novarocks_connector_contract::{ConnectorCodecCategory, ConnectorWriteFieldToken};
@@ -2357,6 +2636,10 @@ fn invalid_table_writer_fragment(
                     }]),
                     required_distribution: writer_distribution,
                     target_fields: Box::from([WriterTargetField {
+                        provider_name: match fixture {
+                            TableWriterFixture::ProviderName(bytes) => "v".repeat(bytes).into(),
+                            _ => "v".into(),
+                        },
                         token: ConnectorWriteFieldToken::from_bytes([7; 32]),
                         input: if matches!(fixture, TableWriterFixture::TargetField) {
                             output_value
@@ -2422,6 +2705,22 @@ fn table_writer_rejects_a_relabelled_fixed_relation_field() {
     assert!(error.contains("writer relation field differs from its closed role contract"));
 }
 
+#[test]
+fn table_writer_provider_name_is_complete_and_bounded() {
+    invalid_table_writer_fragment(TableWriterFixture::ProviderName(1)).unwrap();
+    invalid_table_writer_fragment(TableWriterFixture::ProviderName(
+        MAX_DATA_TYPE_FIELD_NAME_BYTES,
+    ))
+    .unwrap();
+    let empty = invalid_table_writer_fragment(TableWriterFixture::ProviderName(0)).unwrap_err();
+    assert!(empty.to_string().contains("empty provider name"));
+    let oversized = invalid_table_writer_fragment(TableWriterFixture::ProviderName(
+        MAX_DATA_TYPE_FIELD_NAME_BYTES + 1,
+    ))
+    .unwrap_err();
+    assert!(oversized.to_string().contains("field-name byte limit"));
+}
+
 #[derive(Clone, Copy)]
 enum GroupedWriterFixture {
     SharedChannel,
@@ -2458,7 +2757,116 @@ fn writer_schema_role(ordinal: usize) -> WriterRelationFieldRole {
     }
 }
 
-fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, ValidationErrors> {
+// These are explicit finite test-source admission ceilings, not production
+// defaults or a replacement for the mandatory special-consumer gate.
+fn grouped_constant_policy() -> novarocks_constant_contract::ConstantPolicy {
+    novarocks_constant_contract::ConstantPolicy {
+        max_rows: 3,
+        max_array_nodes: 4096,
+        max_logical_elements: 1_000_000,
+        max_retained_buffer_bytes: 16_777_216,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 16,
+        max_metadata_bytes: 1_048_576,
+        max_library_validation_work: 67_108_864,
+        max_library_validation_bytes: 67_108_864,
+    }
+}
+#[derive(Default)]
+struct GroupedConstantControl;
+impl novarocks_type_contract::PureCompileControl for GroupedConstantControl {
+    fn checkpoint(
+        &self,
+        _: novarocks_type_contract::CompilePhase,
+        units: u32,
+    ) -> Result<(), novarocks_type_contract::CompileControlError> {
+        assert!(units <= 256);
+        Ok(())
+    }
+}
+fn grouped_collection_pools(
+    fixture: GroupedWriterFixture,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> ConstantPools {
+    use arrow_array::{
+        Array,
+        builder::{Int32Builder, ListBuilder, MapBuilder, StringBuilder},
+    };
+    use arrow_schema::Field;
+    use std::sync::Arc;
+    let mut lists = ListBuilder::new(Int32Builder::new()).with_field(Arc::new(Field::new(
+        "item",
+        DataType::Int32,
+        false,
+    )));
+    // The first row is deliberately unused; selected rows are nonzero ordinals.
+    for row in 0..3 {
+        let n = if row == 1 && matches!(fixture, GroupedWriterFixture::NestedLiteralBudgetExceeded)
+        {
+            PlanLimits::FROZEN.unpivot_collection_items + 1
+        } else {
+            1
+        };
+        for _ in 0..n {
+            lists
+                .values()
+                .append_value(if row == 0 { 99 } else { row + 10 });
+        }
+        lists.append(true);
+    }
+    let lists = lists.finish();
+    let mut maps = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new())
+        .with_keys_field(Arc::new(Field::new("key", DataType::Utf8, false)))
+        .with_values_field(Arc::new(Field::new("value", DataType::Utf8, false)));
+    for row in 0..3 {
+        let pairs: &[(&str, &str)] = match (row, fixture) {
+            (0, _) => &[("unused", "prefix")],
+            (1, GroupedWriterFixture::EmptyMapKey) => &[("", "value")],
+            (1, GroupedWriterFixture::UnsortedMapKeys) => &[("zeta", "first"), ("alpha", "second")],
+            (1, GroupedWriterFixture::DuplicateMapKey) => &[("same", "first"), ("same", "second")],
+            _ => &[],
+        };
+        for (key, value) in pairs {
+            maps.keys().append_value(key);
+            maps.values().append_value(value);
+        }
+        maps.append(true).unwrap();
+    }
+    let maps = maps.finish();
+    let mut pools = ConstantPools::empty();
+    for (id, data) in [(0, lists.to_data()), (u32::MAX, maps.to_data())] {
+        let source = ty(data.data_type().clone(), false);
+        let field = Arc::new(source.try_to_field("grouped_collection_source").unwrap());
+        let pool = novarocks_constant_contract::ConstantPool::try_new(
+            field,
+            source,
+            data,
+            grouped_constant_policy(),
+            novarocks_type_contract::CompilePhase::Validate,
+            control,
+        )
+        .unwrap();
+        pools.insert(ConstantPoolId::new(id), pool).unwrap();
+    }
+    pools
+}
+fn grouped_reference(pool: u32, target: usize) -> ConstantReference {
+    ConstantReference {
+        pool: ConstantPoolId::new(pool),
+        ordinal: u32::try_from(target + 1).unwrap(),
+    }
+}
+fn grouped_writer_fragment(
+    fixture: GroupedWriterFixture,
+) -> Result<Fragment, PlanConstructionError> {
+    grouped_writer_fragment_with_sources(fixture).map(|(fragment, _)| fragment)
+}
+// This helper exercises structure first, then the original mandatory observed
+// constant consumer. It is not a complete FragmentPackage or runtime fixture.
+fn grouped_writer_fragment_with_sources(
+    fixture: GroupedWriterFixture,
+) -> Result<(Fragment, ConstantPools), PlanConstructionError> {
     use std::sync::Arc;
 
     use arrow_schema::{Field, Fields};
@@ -2473,6 +2881,8 @@ fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, Va
     const WRITER_MULTIPLEX_SCHEMA_REVISION: u32 = 1;
     const ROOT_WRITE_RESULT_SCHEMA_REVISION: u32 = 1;
 
+    let control = GroupedConstantControl;
+    let pools = grouped_collection_pools(fixture, &control);
     let mut builder = FragmentBuilder::new(FragmentId::new(103));
     let input = builder.reserve_node_id().unwrap();
     let finish = builder.reserve_node_id().unwrap();
@@ -2596,7 +3006,7 @@ fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, Va
             ty(DataType::Binary, true),
             ValueOrigin::WriterDerived {
                 writer_node: finish,
-                kind: WriterDerivedKind::ArtifactReference,
+                kind: WriterDerivedKind::RelationAuxiliary,
             },
         )
         .unwrap();
@@ -2608,7 +3018,18 @@ fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, Va
             shared_state_input
         },
         binding: AggregateBinding {
+            state_interpretation: None,
+            state_argument_contract:
+                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
             function: BoundFunction {
+                legacy_metadata: Some(crate::LegacyBindingMetadata {
+                    semantic_parameters: Box::default(),
+                    volatility: FunctionVolatility::Immutable,
+                    argument_evaluation: FunctionArgumentEvaluation::Eager,
+                    failure_behavior: FunctionFailureBehavior::Propagate,
+                    intrinsic_row_error:
+                        novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
+                }),
                 function_id: FunctionId::try_new("builtin/test_statistics/v1").unwrap(),
                 overload: FunctionOverloadId::try_new("i64-to-binary").unwrap(),
                 kind: FunctionKind::Aggregate,
@@ -2621,11 +3042,6 @@ fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, Va
                     Box::from([FunctionArgumentType::Value(ty(DataType::Int64, true))])
                 },
                 result_type: ty(DataType::Binary, true),
-                volatility: FunctionVolatility::Immutable,
-                argument_evaluation: FunctionArgumentEvaluation::Eager,
-                failure_behavior: FunctionFailureBehavior::Propagate,
-                intrinsic_row_error:
-                    novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
             },
             phase: AggregatePhase::Final {
                 sequence: AggregateSequenceId::new(1),
@@ -2649,7 +3065,7 @@ fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, Va
                 ty(DataType::Binary, true),
                 ValueOrigin::WriterDerived {
                     writer_node: finish,
-                    kind: WriterDerivedKind::ArtifactReference,
+                    kind: WriterDerivedKind::RelationAuxiliary,
                 },
             )
             .unwrap();
@@ -2693,38 +3109,20 @@ fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, Va
                 )
                 .unwrap()
         };
-        let properties = match fixture {
-            GroupedWriterFixture::EmptyMapKey if target == 0 => {
-                Box::from([("".into(), "value".into())])
-            }
-            GroupedWriterFixture::UnsortedMapKeys if target == 0 => Box::from([
-                ("zeta".into(), "first".into()),
-                ("alpha".into(), "second".into()),
-            ]),
-            GroupedWriterFixture::DuplicateMapKey if target == 0 => Box::from([
-                ("same".into(), "first".into()),
-                ("same".into(), "second".into()),
-            ]),
-            _ => Box::default(),
-        };
         let mut constants = vec![
-            if matches!(fixture, GroupedWriterFixture::NestedLiteralBudgetExceeded) && target == 0 {
-                UnpivotConstant::Int32List(
-                    vec![0; PlanLimits::FROZEN.unpivot_collection_items + 1].into_boxed_slice(),
-                )
-            } else if matches!(fixture, GroupedWriterFixture::WrongConstantType) {
-                UnpivotConstant::Utf8Map(Box::default())
+            if matches!(fixture, GroupedWriterFixture::WrongConstantType) {
+                UnpivotConstant::Utf8Map(grouped_reference(u32::MAX, target))
             } else {
-                UnpivotConstant::Int32List(Box::from([i32::try_from(target + 11).unwrap()]))
+                UnpivotConstant::Int32List(grouped_reference(0, target))
             },
             UnpivotConstant::Scalar(scalar_constant),
-            UnpivotConstant::Utf8Map(properties),
+            UnpivotConstant::Utf8Map(grouped_reference(u32::MAX, target)),
         ];
         if matches!(fixture, GroupedWriterFixture::UncoveredAuxiliaryOutput) {
             constants.pop();
         }
         mappings.push(WriterGroupedUnpivotMapping {
-            write_target_ordinal: write_target_ordinal(target),
+            write_target_ordinal: write_target_ordinal(u32::try_from(target).unwrap()),
             input: if matches!(fixture, GroupedWriterFixture::NonFinalInput) {
                 shared_state_input
             } else {
@@ -2830,7 +3228,15 @@ fn grouped_writer_fragment(fixture: GroupedWriterFixture) -> Result<Fragment, Va
             }),
         })
         .unwrap();
-    builder.finish_definition(finish, FragmentSink::Noop, dop())
+    let fragment = builder.finish_definition(finish, FragmentSink::Noop, dop())?;
+    crate::constants::validate_fragment_constants_observed(
+        &fragment,
+        &pools,
+        true,
+        PlanLimits::FROZEN,
+        &control,
+    )?;
+    Ok((fragment, pools))
 }
 
 #[test]
@@ -2853,7 +3259,8 @@ fn writer_grouped_unpivot_allows_a_write_target_without_statistics() {
 
 #[test]
 fn writer_grouped_unpivot_keeps_target_local_mappings_for_a_shared_aggregate_channel() {
-    let fragment = grouped_writer_fragment(GroupedWriterFixture::SharedChannel).unwrap();
+    let (fragment, pools) =
+        grouped_writer_fragment_with_sources(GroupedWriterFixture::SharedChannel).unwrap();
     let NodeKind::TableFinish(finish) = &fragment.nodes()[&fragment.root()].kind else {
         panic!("expected a table finish node");
     };
@@ -2872,6 +3279,43 @@ fn writer_grouped_unpivot_keeps_target_local_mappings_for_a_shared_aggregate_cha
     assert_ne!(unpivot.mappings[0].constants, unpivot.mappings[1].constants);
     assert!(fragment.values()[&unpivot.passthrough_output].ty.nullable);
     assert!(!fragment.values()[&unpivot.grouping_output].ty.nullable);
+
+    let control = GroupedConstantControl;
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        &control,
+        novarocks_type_contract::CompilePhase::Validate,
+    )
+    .unwrap();
+    for (target, expected) in [11, 12].into_iter().enumerate() {
+        let UnpivotConstant::Int32List(reference) = unpivot.mappings[target].constants[0] else {
+            panic!("selected list source");
+        };
+        assert_eq!(reference, grouped_reference(0, target));
+        let selected = pools.resolve_source_observed(reference, &mut work).unwrap();
+        work.flush().unwrap();
+        let view = selected
+            .int32_list_observed(novarocks_type_contract::CompilePhase::Validate, &control)
+            .unwrap()
+            .unwrap();
+        work.flush().unwrap();
+        assert_eq!(view.len(), 1);
+        assert_eq!(view.item_observed(0, &mut work).unwrap(), Some(expected));
+        assert_eq!(selected.ordinal(), u32::try_from(target + 1).unwrap());
+        assert!(!selected.value_type().nullable);
+        let UnpivotConstant::Utf8Map(reference) = unpivot.mappings[target].constants[2] else {
+            panic!("selected map source");
+        };
+        assert_eq!(reference, grouped_reference(u32::MAX, target));
+        let selected = pools.resolve_source_observed(reference, &mut work).unwrap();
+        work.flush().unwrap();
+        let view = selected
+            .utf8_map_observed(novarocks_type_contract::CompilePhase::Validate, &control)
+            .unwrap()
+            .unwrap();
+        work.flush().unwrap();
+        assert!(view.is_empty());
+    }
+    work.finish().unwrap();
 }
 
 #[test]
@@ -2964,31 +3408,34 @@ fn writer_grouped_unpivot_roles_must_cover_every_auxiliary_output() {
 
 #[test]
 fn writer_grouped_unpivot_map_keys_must_be_non_empty() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::EmptyMapKey)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("writer grouped Unpivot map keys must be non-empty and strictly increasing")
+    let error = grouped_writer_fragment(GroupedWriterFixture::EmptyMapKey).unwrap_err();
+    assert_eq!(
+        error,
+        PlanConstructionError::Constants(ConstantReferenceError::InvalidConsumer(
+            "unpivot map keys must be non-empty and strictly increasing",
+        ))
     );
 }
 
 #[test]
 fn writer_grouped_unpivot_map_keys_must_be_strictly_ordered() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::UnsortedMapKeys)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("writer grouped Unpivot map keys must be non-empty and strictly increasing")
+    let error = grouped_writer_fragment(GroupedWriterFixture::UnsortedMapKeys).unwrap_err();
+    assert_eq!(
+        error,
+        PlanConstructionError::Constants(ConstantReferenceError::InvalidConsumer(
+            "unpivot map keys must be non-empty and strictly increasing",
+        ))
     );
 }
 
 #[test]
 fn writer_grouped_unpivot_map_keys_must_be_unique() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::DuplicateMapKey)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("writer grouped Unpivot map keys must be non-empty and strictly increasing")
+    let error = grouped_writer_fragment(GroupedWriterFixture::DuplicateMapKey).unwrap_err();
+    assert_eq!(
+        error,
+        PlanConstructionError::Constants(ConstantReferenceError::InvalidConsumer(
+            "unpivot map keys must be non-empty and strictly increasing",
+        ))
     );
 }
 
@@ -3048,8 +3495,266 @@ fn writer_grouped_unpivot_rejects_output_bounds_above_the_contract_maximum() {
 
 #[test]
 fn writer_grouped_unpivot_rejects_nested_literal_collections_above_the_budget() {
-    let error = grouped_writer_fragment(GroupedWriterFixture::NestedLiteralBudgetExceeded)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("unpivot literal collections exceed the contract budget"));
+    let error =
+        grouped_writer_fragment(GroupedWriterFixture::NestedLiteralBudgetExceeded).unwrap_err();
+    assert_eq!(
+        error,
+        PlanConstructionError::Constants(ConstantReferenceError::Control(
+            novarocks_type_contract::CompileControlError::ResourceExhausted,
+        ))
+    );
+}
+
+#[test]
+fn writer_grouped_unpivot_source_gate_preserves_each_original_control_and_ordinary_tail() {
+    use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+    use std::sync::Mutex;
+    struct Control {
+        trace: Mutex<Vec<(CompilePhase, u32)>>,
+        refusal: Option<(usize, CompileControlError)>,
+    }
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert_eq!(phase, CompilePhase::Validate);
+            assert!(units <= 256);
+            let mut trace = self.trace.lock().unwrap();
+            let at = trace.len();
+            if let Some((stop, _)) = self.refusal {
+                assert!(at <= stop, "callback after original refusal");
+            }
+            trace.push((phase, units));
+            match self.refusal {
+                Some((stop, cause)) if stop == at => Err(cause),
+                _ => Ok(()),
+            }
+        }
+    }
+    let (fragment, pools) =
+        grouped_writer_fragment_with_sources(GroupedWriterFixture::SharedChannel).unwrap();
+    let mut parts = fragment.clone().into_parts();
+    let NodeKind::TableFinish(finish) = &mut parts.nodes.get_mut(&fragment.root()).unwrap().kind
+    else {
+        unreachable!()
+    };
+    let UnpivotConstant::Int32List(reference) =
+        &mut finish.grouped_unpivot.as_mut().unwrap().mappings[0].constants[0]
+    else {
+        unreachable!()
+    };
+    reference.pool = ConstantPoolId::new(42);
+    let missing: Fragment = parts.into();
+    for (source, ordinary) in [(&fragment, false), (&missing, true)] {
+        let baseline = Control {
+            trace: Mutex::default(),
+            refusal: None,
+        };
+        let result = crate::constants::validate_fragment_constants_observed(
+            source,
+            &pools,
+            true,
+            PlanLimits::FROZEN,
+            &baseline,
+        );
+        if ordinary {
+            assert_eq!(
+                result,
+                Err(ConstantReferenceError::MissingPool(ConstantPoolId::new(42)))
+            );
+        } else {
+            result.unwrap();
+        }
+        let trace = baseline.trace.lock().unwrap().clone();
+        assert!(trace.len() >= 2);
+        for at in 0..trace.len() {
+            for cause in [
+                CompileControlError::Cancelled,
+                CompileControlError::DeadlineExceeded,
+                CompileControlError::ResourceExhausted,
+            ] {
+                let refusal = Control {
+                    trace: Mutex::default(),
+                    refusal: Some((at, cause)),
+                };
+                assert_eq!(
+                    crate::constants::validate_fragment_constants_observed(
+                        source,
+                        &pools,
+                        true,
+                        PlanLimits::FROZEN,
+                        &refusal
+                    ),
+                    Err(ConstantReferenceError::Control(cause))
+                );
+                assert_eq!(*refusal.trace.lock().unwrap(), trace[..=at]);
+            }
+        }
+    }
+}
+
+#[test]
+fn package_parameter_closure_includes_writer_final_state_calls() {
+    use novarocks_type_contract::{
+        ArgumentControl, CallEffects, CallProofScope, CompileControlError, CompilePhase,
+        ControlShape, EvaluationDomainId, ExpressionControlFlow, ExpressionEffectContext,
+        ExpressionEvaluationDomain, ExpressionInvocation, ExpressionUseId, FunctionInstanceState,
+        FunctionNullBehavior, ObservableEffects, PureCompileControl, SemanticParameterError,
+        SemanticParameterId, SemanticParameterKey, SemanticParameterProjectionError,
+        SemanticParameterRef, SemanticParameterValue, SemanticParameters,
+    };
+    struct Control;
+    impl PureCompileControl for Control {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    let fragment = grouped_writer_fragment(GroupedWriterFixture::SharedChannel).unwrap();
+    let reference = SemanticParameterRef {
+        id: SemanticParameterId::new(u32::MAX),
+        expected_key: SemanticParameterKey::TimeZone,
+    };
+    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control).unwrap();
+    let domain = EvaluationDomainId::new(0);
+    let mut invocations = Vec::new();
+    let mut bindings = Vec::new();
+    for (ordinal, (site, root)) in roots.sites().iter().enumerate() {
+        assert!(matches!(
+            fragment.expressions().get(root.expr).unwrap().kind,
+            ExprKind::Literal(_)
+        ));
+        let id = ExpressionUseId::new(ordinal as u32);
+        invocations.push(ExpressionInvocation {
+            context: ExpressionEffectContext {
+                use_id: id,
+                domain,
+                demand: root.demand,
+            },
+            definition: root.expr,
+            control: ControlShape::Eager,
+            arguments: Box::default(),
+        });
+        bindings.push((*site, id));
+    }
+    let flow = ExpressionControlFlow::try_new(
+        vec![ExpressionEvaluationDomain {
+            id: domain,
+            parent: None,
+            guard: None,
+        }],
+        invocations,
+        fragment.expressions(),
+        CompilePhase::Validate,
+        &Control,
+    )
+    .unwrap();
+    let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &Control).unwrap();
+    // This is a real checked writer definition. Complete occurrence claims
+    // remain independent of its legacy binding metadata and are not an owner
+    // authentication receipt or a fabricated writer-cut package.
+    let site = PhysicalCallSite::WriterFinal {
+        node: fragment.root(),
+        call: 0,
+    };
+    let call = FrozenPhysicalCall {
+        regexp_count_pattern_source: None,
+        to_base64_byte_source: None,
+        temporal_source: None,
+        decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+        site,
+        context: ExpressionEffectContext {
+            use_id: ExpressionUseId::new(u32::MAX),
+            domain,
+            demand: novarocks_type_contract::EvaluationDemand::Value,
+        },
+        effects: CallEffects {
+            value_stability: FunctionVolatility::Stable,
+            own_row_error: FunctionIntrinsicRowError::NotRowEvaluated,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+            null_behavior: FunctionNullBehavior::CalledOnNull,
+            argument_control: ArgumentControl::Aggregate,
+            instance_state: FunctionInstanceState::AggregateInstance,
+            observable_effects: ObservableEffects::NONE,
+            environment: Box::from([reference]),
+            proof_scope: CallProofScope::Unconditional,
+        },
+    };
+    let calls =
+        FrozenFragmentCalls::try_new(&fragment, &uses, vec![call.clone()], &Control).unwrap();
+    let NodeKind::TableFinish(finish) = &fragment.nodes()[&fragment.root()].kind else {
+        unreachable!()
+    };
+    let Some(PhysicalCallBinding::Aggregate(binding)) = calls.binding(&fragment, &uses, site)
+    else {
+        unreachable!()
+    };
+    assert!(std::ptr::eq(binding, &finish.final_aggregates[0].binding));
+    assert!(
+        binding
+            .function
+            .legacy_metadata
+            .as_ref()
+            .unwrap()
+            .semantic_parameters
+            .is_empty()
+    );
+    assert_eq!(
+        calls.parameter_references().collect::<Vec<_>>(),
+        vec![reference]
+    );
+    let mut wrong_site = call;
+    wrong_site.site = PhysicalCallSite::WriterPartial {
+        node: fragment.root(),
+        call: 0,
+    };
+    assert_eq!(
+        FrozenFragmentCalls::try_new(&fragment, &uses, vec![wrong_site], &Control),
+        Err(FrozenCallError::MissingSite(site))
+    );
+    let required = SemanticParameters::try_new([(
+        reference.id,
+        SemanticParameterValue::TimeZone("UTC".into()),
+    )])
+    .unwrap();
+    let parameters = SemanticParameters::try_new([
+        (reference.id, SemanticParameterValue::TimeZone("UTC".into())),
+        (
+            SemanticParameterId::new(0),
+            SemanticParameterValue::AllowThrowException(true),
+        ),
+    ])
+    .unwrap();
+    assert_eq!(
+        parameters
+            .project_observed(
+                calls.parameter_references(),
+                CompilePhase::Validate,
+                &Control
+            )
+            .unwrap(),
+        required
+    );
+    assert_eq!(
+        SemanticParameters::default().project_observed(
+            calls.parameter_references(),
+            CompilePhase::Validate,
+            &Control
+        ),
+        Err(SemanticParameterProjectionError::Parameter(
+            SemanticParameterError::MissingId(reference.id)
+        ))
+    );
+    let wrong_key = SemanticParameters::try_new([(
+        reference.id,
+        SemanticParameterValue::AllowThrowException(true),
+    )])
+    .unwrap();
+    assert_eq!(
+        wrong_key.project_observed(
+            calls.parameter_references(),
+            CompilePhase::Validate,
+            &Control
+        ),
+        Err(SemanticParameterProjectionError::Parameter(
+            SemanticParameterError::KeyMismatch(reference)
+        ))
+    );
 }

@@ -1921,3 +1921,52 @@ async fn pending_resource_wait_retains_completed_scope_until_future_drop() {
     assert_eq!(authority.snapshot().held_bytes(), 112);
     drop(memory);
 }
+
+#[test]
+fn result_observation_uses_original_authority_and_keeps_alias_retention_visible() {
+    let first = WorkloadControl::try_new_counted(WorkloadConfig::default())
+        .unwrap()
+        .owner;
+    let foreign = WorkloadControl::try_new_counted(WorkloadConfig::default())
+        .unwrap()
+        .owner;
+    let capacity = first
+        .configure_result_capacity(ResultCapacityConfig::V1)
+        .unwrap();
+    foreign
+        .configure_result_capacity(ResultCapacityConfig::V1)
+        .unwrap();
+    first.mark_ready().unwrap();
+    foreign.mark_ready().unwrap();
+    let work = first
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let other = foreign
+        .try_begin_root(WorkRequest::new(WorkClass::Query))
+        .unwrap();
+    let observed = first.observation();
+    assert_eq!(
+        work.owner.scope().id(),
+        other.owner.scope().id(),
+        "local ids alone are not authority"
+    );
+    assert!(observed.observes_scope(&work.owner.scope()));
+    assert!(!observed.observes_scope(&other.owner.scope()));
+    let grant = capacity
+        .try_acquire_closing(&work.owner.scope(), ResultClosingCut::OriginatingFailure)
+        .unwrap();
+    let alias = grant.retain_alias();
+    assert_eq!(observed.result_capacity_snapshot(), capacity.snapshot());
+    assert_eq!(observed.result_capacity_snapshot().held_positions[3], 1);
+    assert_eq!(
+        foreign
+            .observation()
+            .result_capacity_snapshot()
+            .held_positions[3],
+        0
+    );
+    drop(grant);
+    assert_eq!(observed.result_capacity_snapshot().held_positions[3], 1);
+    drop(alias);
+    assert_eq!(observed.result_capacity_snapshot().held_positions, [0; 4]);
+}

@@ -16,7 +16,6 @@
 // under the License.
 use arrow::array::{ArrayRef, BinaryArray, BinaryBuilder, StructArray};
 use arrow::datatypes::DataType;
-use arrow_buffer::i256;
 use std::sync::Arc;
 
 use crate::exec::node::aggregate::AggFunction;
@@ -24,30 +23,36 @@ use crate::runtime::mem_tracker::MemTracker;
 
 use super::super::*;
 use super::AggregateFunction;
-use super::common::{
-    TrackedAggScalarValue, aggregate_vec_with_capacity, build_scalar_array,
-    compare_tracked_scalar_values, tracked_scalar_from_array, tracked_scalar_to_output,
-};
+use super::common::build_scalar_array;
 
 pub(super) struct MaxMinByAgg;
 
-#[derive(Debug)]
-struct MaxMinByState {
-    allocator: AggregateAllocator,
-    key: Option<TrackedAggScalarValue>,
-    value: Option<TrackedAggScalarValue>,
-}
-
-impl MaxMinByState {
-    fn new(allocator: AggregateAllocator) -> Self {
-        Self {
-            allocator,
-            key: None,
-            value: None,
-        }
+type MaxMinByState = novarocks_functions::builtin::aggregate_by_core::ByState<AggregateAllocator>;
+fn direction(kind: &AggKind) -> novarocks_functions::builtin::aggregate_by_core::ByDirection {
+    if is_max_kind(kind) {
+        novarocks_functions::builtin::aggregate_by_core::ByDirection::Maximum
+    } else {
+        novarocks_functions::builtin::aggregate_by_core::ByDirection::Minimum
     }
 }
-
+struct LegacyByBuffer(Vec<u8>);
+impl novarocks_functions::builtin::aggregate_by_core::ByEncodeBuffer for LegacyByBuffer {
+    fn push(
+        &mut self,
+        byte: u8,
+    ) -> Result<(), novarocks_functions::aggregate_scalar::ScalarStateError> {
+        self.0.push(byte);
+        Ok(())
+    }
+    fn append(
+        &mut self,
+        bytes: &[u8],
+        _work: &mut novarocks_functions::aggregate_scalar::ScalarWork<'_, '_>,
+    ) -> Result<(), novarocks_functions::aggregate_scalar::ScalarStateError> {
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+}
 fn is_max_kind(kind: &AggKind) -> bool {
     matches!(kind, AggKind::MaxBy | AggKind::MaxByV2)
 }
@@ -59,236 +64,6 @@ fn kind_from_name(name: &str) -> Option<AggKind> {
         "min_by" => Some(AggKind::MinBy),
         "min_by_v2" => Some(AggKind::MinByV2),
         _ => None,
-    }
-}
-
-fn need_len(input: &[u8], need: usize, label: &str) -> Result<(), String> {
-    if input.len() < need {
-        Err(format!("max_by/min_by {} decode failed", label))
-    } else {
-        Ok(())
-    }
-}
-
-fn read_u32(input: &mut &[u8], label: &str) -> Result<u32, String> {
-    need_len(input, 4, label)?;
-    let value = u32::from_le_bytes(input[..4].try_into().unwrap());
-    *input = &input[4..];
-    Ok(value)
-}
-
-fn encode_tracked_scalar_value(
-    value: &TrackedAggScalarValue,
-    output: &mut Vec<u8>,
-) -> Result<(), String> {
-    match value {
-        TrackedAggScalarValue::Bool(value) => {
-            output.push(1);
-            output.push(*value as u8);
-        }
-        TrackedAggScalarValue::Int64(value) => {
-            output.push(2);
-            output.extend_from_slice(&value.to_le_bytes());
-        }
-        TrackedAggScalarValue::Float64(value) => {
-            output.push(3);
-            output.extend_from_slice(&value.to_bits().to_le_bytes());
-        }
-        TrackedAggScalarValue::Utf8(value) => {
-            output.push(4);
-            let len = u32::try_from(value.len())
-                .map_err(|_| "max_by/min_by tracked UTF-8 value too large".to_string())?;
-            output.extend_from_slice(&len.to_le_bytes());
-            output.extend_from_slice(value);
-        }
-        TrackedAggScalarValue::Date32(value) => {
-            output.push(5);
-            output.extend_from_slice(&value.to_le_bytes());
-        }
-        TrackedAggScalarValue::Timestamp(value) => {
-            output.push(6);
-            output.extend_from_slice(&value.to_le_bytes());
-        }
-        TrackedAggScalarValue::Decimal128(value) => {
-            output.push(7);
-            output.extend_from_slice(&value.to_le_bytes());
-        }
-        TrackedAggScalarValue::Struct(values) => {
-            output.push(8);
-            let len = u32::try_from(values.len())
-                .map_err(|_| "max_by/min_by tracked struct too large".to_string())?;
-            output.extend_from_slice(&len.to_le_bytes());
-            for value in values {
-                encode_tracked_scalar(value, output)?;
-            }
-        }
-        TrackedAggScalarValue::Map(entries) => {
-            output.push(9);
-            let len = u32::try_from(entries.len())
-                .map_err(|_| "max_by/min_by tracked map too large".to_string())?;
-            output.extend_from_slice(&len.to_le_bytes());
-            for (key, value) in entries {
-                encode_tracked_scalar(key, output)?;
-                encode_tracked_scalar(value, output)?;
-            }
-        }
-        TrackedAggScalarValue::List(values) => {
-            output.push(10);
-            let len = u32::try_from(values.len())
-                .map_err(|_| "max_by/min_by tracked list too large".to_string())?;
-            output.extend_from_slice(&len.to_le_bytes());
-            for value in values {
-                encode_tracked_scalar(value, output)?;
-            }
-        }
-        TrackedAggScalarValue::Decimal256(value) => {
-            output.push(11);
-            let text = value.to_string();
-            let len = u32::try_from(text.len())
-                .map_err(|_| "max_by/min_by decimal256 too large".to_string())?;
-            output.extend_from_slice(&len.to_le_bytes());
-            output.extend_from_slice(text.as_bytes());
-        }
-        TrackedAggScalarValue::Binary(value) => {
-            output.push(12);
-            let len = u32::try_from(value.len())
-                .map_err(|_| "max_by/min_by tracked binary too large".to_string())?;
-            output.extend_from_slice(&len.to_le_bytes());
-            output.extend_from_slice(value);
-        }
-    }
-    Ok(())
-}
-
-fn encode_tracked_scalar(
-    value: &Option<TrackedAggScalarValue>,
-    output: &mut Vec<u8>,
-) -> Result<(), String> {
-    match value {
-        Some(value) => {
-            output.push(1);
-            encode_tracked_scalar_value(value, output)
-        }
-        None => {
-            output.push(0);
-            Ok(())
-        }
-    }
-}
-
-fn decode_tracked_scalar_value(
-    input: &mut &[u8],
-    allocator: &AggregateAllocator,
-) -> Result<TrackedAggScalarValue, String> {
-    need_len(input, 1, "tracked scalar")?;
-    let tag = input[0];
-    *input = &input[1..];
-    match tag {
-        1 => {
-            need_len(input, 1, "tracked bool")?;
-            let value = input[0] != 0;
-            *input = &input[1..];
-            Ok(TrackedAggScalarValue::Bool(value))
-        }
-        2 => {
-            need_len(input, 8, "tracked int64")?;
-            let value = i64::from_le_bytes(input[..8].try_into().unwrap());
-            *input = &input[8..];
-            Ok(TrackedAggScalarValue::Int64(value))
-        }
-        3 => {
-            need_len(input, 8, "tracked float64")?;
-            let value = f64::from_bits(u64::from_le_bytes(input[..8].try_into().unwrap()));
-            *input = &input[8..];
-            Ok(TrackedAggScalarValue::Float64(value))
-        }
-        4 | 12 => {
-            let len = read_u32(input, "tracked bytes")? as usize;
-            need_len(input, len, "tracked bytes")?;
-            let value = aggregate_bytes(allocator.clone(), &input[..len])?;
-            *input = &input[len..];
-            if tag == 4 {
-                std::str::from_utf8(&value).map_err(|error| error.to_string())?;
-                Ok(TrackedAggScalarValue::Utf8(value))
-            } else {
-                Ok(TrackedAggScalarValue::Binary(value))
-            }
-        }
-        5 => {
-            need_len(input, 4, "tracked date32")?;
-            let value = i32::from_le_bytes(input[..4].try_into().unwrap());
-            *input = &input[4..];
-            Ok(TrackedAggScalarValue::Date32(value))
-        }
-        6 => {
-            need_len(input, 8, "tracked timestamp")?;
-            let value = i64::from_le_bytes(input[..8].try_into().unwrap());
-            *input = &input[8..];
-            Ok(TrackedAggScalarValue::Timestamp(value))
-        }
-        7 => {
-            need_len(input, 16, "tracked decimal128")?;
-            let value = i128::from_le_bytes(input[..16].try_into().unwrap());
-            *input = &input[16..];
-            Ok(TrackedAggScalarValue::Decimal128(value))
-        }
-        8 | 10 => {
-            let len = read_u32(input, "tracked sequence")? as usize;
-            let operation = if tag == 8 {
-                "reserve tracked aggregate struct decode"
-            } else {
-                "reserve tracked aggregate list decode"
-            };
-            let mut values = aggregate_vec_with_capacity(allocator, len, operation)?;
-            for _ in 0..len {
-                values.push(decode_tracked_scalar(input, allocator)?);
-            }
-            if tag == 8 {
-                Ok(TrackedAggScalarValue::Struct(values))
-            } else {
-                Ok(TrackedAggScalarValue::List(values))
-            }
-        }
-        9 => {
-            let len = read_u32(input, "tracked map")? as usize;
-            let mut entries = aggregate_vec_with_capacity(
-                allocator,
-                len,
-                "reserve tracked aggregate map decode",
-            )?;
-            for _ in 0..len {
-                entries.push((
-                    decode_tracked_scalar(input, allocator)?,
-                    decode_tracked_scalar(input, allocator)?,
-                ));
-            }
-            Ok(TrackedAggScalarValue::Map(entries))
-        }
-        11 => {
-            let len = read_u32(input, "tracked decimal256")? as usize;
-            need_len(input, len, "tracked decimal256")?;
-            let text = std::str::from_utf8(&input[..len]).map_err(|error| error.to_string())?;
-            *input = &input[len..];
-            Ok(TrackedAggScalarValue::Decimal256(
-                text.parse::<i256>()
-                    .map_err(|_| "max_by/min_by decimal256 decode failed".to_string())?,
-            ))
-        }
-        _ => Err("max_by/min_by tracked scalar decode failed: unknown tag".to_string()),
-    }
-}
-
-fn decode_tracked_scalar(
-    input: &mut &[u8],
-    allocator: &AggregateAllocator,
-) -> Result<Option<TrackedAggScalarValue>, String> {
-    need_len(input, 1, "tracked scalar")?;
-    let has_value = input[0];
-    *input = &input[1..];
-    match has_value {
-        0 => Ok(None),
-        1 => decode_tracked_scalar_value(input, allocator).map(Some),
-        _ => Err("max_by/min_by tracked scalar decode failed: invalid null flag".to_string()),
     }
 }
 
@@ -430,29 +205,19 @@ impl AggregateFunction for MaxMinByAgg {
         }
         let value_arr = struct_arr.column(0);
         let key_arr = struct_arr.column(1);
-        let is_max = is_max_kind(&spec.kind);
 
         for (row, &base) in state_ptrs.iter().enumerate() {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MaxMinByState) };
-            let key = tracked_scalar_from_array(key_arr, row, &state.allocator)?;
-            let Some(key) = key else { continue };
-            let value = tracked_scalar_from_array(value_arr, row, &state.allocator)?;
-
-            let should_update = match state.key.as_ref() {
-                None => true,
-                Some(current) => {
-                    let ordering = compare_tracked_scalar_values(&key, current)?;
-                    if is_max {
-                        ordering == std::cmp::Ordering::Greater
-                    } else {
-                        ordering == std::cmp::Ordering::Less
-                    }
-                }
-            };
-            if should_update {
-                state.key = Some(key);
-                state.value = value;
-            }
+            state
+                .update_from_arrays(
+                    direction(&spec.kind),
+                    value_arr,
+                    row,
+                    key_arr,
+                    row,
+                    &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
+                )
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -467,35 +232,19 @@ impl AggregateFunction for MaxMinByAgg {
         let AggInputView::Binary(arr) = input else {
             return Err("max_by/min_by merge input type mismatch".to_string());
         };
-        let is_max = is_max_kind(&spec.kind);
         for (row, &base) in state_ptrs.iter().enumerate() {
             if arr.is_null(row) {
                 continue;
             }
             let bytes = arr.value(row);
-            let mut slice = bytes;
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MaxMinByState) };
-            let key = decode_tracked_scalar(&mut slice, &state.allocator)?
-                .ok_or_else(|| "max_by/min_by merge missing key".to_string())?;
-            let value = decode_tracked_scalar(&mut slice, &state.allocator)?;
-            if !slice.is_empty() {
-                return Err("max_by/min_by merge input has trailing bytes".to_string());
-            }
-            let should_update = match state.key.as_ref() {
-                None => true,
-                Some(current) => {
-                    let ordering = compare_tracked_scalar_values(&key, current)?;
-                    if is_max {
-                        ordering == std::cmp::Ordering::Greater
-                    } else {
-                        ordering == std::cmp::Ordering::Less
-                    }
-                }
-            };
-            if should_update {
-                state.key = Some(key);
-                state.value = value;
-            }
+            state
+                .merge_bytes(
+                    direction(&spec.kind),
+                    bytes,
+                    &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
+                )
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -511,14 +260,18 @@ impl AggregateFunction for MaxMinByAgg {
             let mut builder = BinaryBuilder::new();
             for &base in group_states {
                 let state = unsafe { &*((base as *mut u8).add(offset) as *const MaxMinByState) };
-                if state.key.is_none() {
+                let mut buf = LegacyByBuffer(Vec::new());
+                if state
+                    .serialize(
+                        &mut buf,
+                        &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
+                    )
+                    .map_err(|error| error.to_string())?
+                {
+                    builder.append_value(&buf.0);
+                } else {
                     builder.append_null();
-                    continue;
                 }
-                let mut buf = Vec::new();
-                encode_tracked_scalar(&state.key, &mut buf)?;
-                encode_tracked_scalar(&state.value, &mut buf)?;
-                builder.append_value(&buf);
             }
             return Ok(std::sync::Arc::new(builder.finish()));
         }
@@ -526,17 +279,13 @@ impl AggregateFunction for MaxMinByAgg {
         let mut values = Vec::with_capacity(group_states.len());
         for &base in group_states {
             let state = unsafe { &*((base as *mut u8).add(offset) as *const MaxMinByState) };
-            if state.key.is_some() {
-                values.push(
-                    state
-                        .value
-                        .as_ref()
-                        .map(tracked_scalar_to_output)
-                        .transpose()?,
-                );
-            } else {
-                values.push(None);
-            }
+            values.push(
+                state
+                    .output(&mut novarocks_functions::aggregate_scalar::ScalarWork::new(
+                        None,
+                    ))
+                    .map_err(|error| error.to_string())?,
+            );
         }
         build_scalar_array(&spec.output_type, values)
     }
@@ -1201,3 +950,7 @@ mod tests {
         assert_eq!(destination_tracker.current(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "max_by_baseline_tests.rs"]
+mod max_by_baseline_tests;

@@ -22,6 +22,7 @@
 
 pub(crate) mod cte;
 pub(crate) mod expr_display;
+pub(crate) mod expr_identity;
 
 use arrow::datatypes::DataType;
 use novarocks_parser::ast::{Expr as SqlExpr, Query as SqlQuery};
@@ -42,7 +43,7 @@ pub enum UnpivotConstant {
 impl UnpivotConstant {
     pub fn data_type(&self) -> arrow::datatypes::DataType {
         match self {
-            Self::Scalar(expression) => expression.data_type.clone(),
+            Self::Scalar(expression) => expression.value_type.data_type.clone(),
             Self::Int32List(_) => arrow::datatypes::DataType::List(std::sync::Arc::new(
                 arrow::datatypes::Field::new("item", arrow::datatypes::DataType::Int32, false),
             )),
@@ -70,7 +71,7 @@ impl UnpivotConstant {
 
     pub fn nullable(&self) -> bool {
         match self {
-            Self::Scalar(expression) => expression.nullable,
+            Self::Scalar(expression) => expression.value_type.nullable,
             Self::Int32List(_) | Self::Utf8Map(_) => false,
         }
     }
@@ -336,102 +337,76 @@ pub(crate) struct ResolvedValues {
 #[derive(Clone, Debug)]
 pub struct TypedExpr {
     pub kind: ExprKind,
-    pub data_type: DataType,
-    pub nullable: bool,
+    pub value_type: novarocks_type_contract::FunctionValueType,
 }
 
-pub(crate) fn function_argument(expr: &TypedExpr) -> novarocks_functions::FunctionArgument {
-    use novarocks_functions::{FunctionArgument, FunctionLiteral, FunctionValueType};
-
-    match &expr.kind {
-        ExprKind::LambdaFunction { params, body } => FunctionArgument::Lambda {
-            parameter_types: params
-                .iter()
-                .map(|param| FunctionValueType::new(param.data_type.clone(), param.nullable))
-                .collect(),
-            result_type: FunctionValueType::new(body.data_type.clone(), body.nullable),
-        },
-        ExprKind::Literal(value) => {
-            let constant = match value {
-                LiteralValue::Null => Some(FunctionLiteral::Null),
-                LiteralValue::Bool(value) => Some(FunctionLiteral::Boolean(*value)),
-                LiteralValue::Int(value) => Some(FunctionLiteral::Int64(*value)),
-                LiteralValue::LargeInt(value) => Some(FunctionLiteral::LargeInt(*value)),
-                LiteralValue::Float(value) => Some(FunctionLiteral::Float64Bits(value.to_bits())),
-                LiteralValue::Decimal(value) => match &expr.data_type {
-                    DataType::Decimal128(_, scale) => Some(FunctionLiteral::Decimal128(
-                        decimal128_literal_unscaled(value, *scale).unwrap_or_else(|message| {
-                            panic!(
-                                "analyzed Decimal128 literal must have an exact value: {message}"
-                            )
-                        }),
-                    )),
-                    _ => None,
-                },
-                LiteralValue::String(value) => {
-                    Some(FunctionLiteral::Utf8(value.clone().into_boxed_str()))
+pub(crate) fn function_argument(
+    expr: &TypedExpr,
+    policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<novarocks_functions::FunctionArgument, novarocks_functions::FunctionBindingError> {
+    use novarocks_functions::FunctionArgument;
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+    let result = (|| {
+        work.step()?;
+        Ok(match &expr.kind {
+            ExprKind::LambdaFunction { params, body } => {
+                let mut parameter_types = Vec::with_capacity(params.len());
+                for param in params {
+                    work.step()?;
+                    parameter_types.push(param.value_type.clone());
                 }
-                LiteralValue::Binary(value) => {
-                    Some(FunctionLiteral::Binary(value.clone().into_boxed_slice()))
+                FunctionArgument::Lambda {
+                    parameter_types: parameter_types.into_boxed_slice(),
+                    result_type: body.value_type.clone(),
                 }
-            };
-            FunctionArgument::Value {
-                value_type: FunctionValueType::new(expr.data_type.clone(), expr.nullable),
-                constant,
             }
-        }
-        _ => FunctionArgument::Value {
-            value_type: FunctionValueType::new(expr.data_type.clone(), expr.nullable),
-            constant: None,
-        },
+            ExprKind::Literal(value) => {
+                work.flush()?;
+                let constant = crate::constant::admit_syntax_constant(
+                    value,
+                    &expr.value_type,
+                    policy,
+                    work.control(),
+                )?;
+                work.flush()?;
+                FunctionArgument::Value {
+                    value_type: expr.value_type.clone(),
+                    constant: Some(constant),
+                }
+            }
+            ExprKind::Constant(value) => {
+                if !expr
+                    .value_type
+                    .exactly_equals_observed(value.value_type(), || {
+                        work.step()
+                            .map_err(novarocks_functions::FunctionBindingError::from)
+                    })?
+                {
+                    return Err(novarocks_functions::FunctionBindingError::InvalidBinding(
+                        "materialized constant source type differs from its expression".into(),
+                    ));
+                }
+                FunctionArgument::Value {
+                    value_type: expr.value_type.clone(),
+                    constant: Some(value.clone()),
+                }
+            }
+            _ => FunctionArgument::Value {
+                value_type: expr.value_type.clone(),
+                constant: None,
+            },
+        })
+    })();
+    if matches!(
+        result,
+        Err(novarocks_functions::FunctionBindingError::Control(_))
+    ) {
+        return result;
     }
-}
-
-pub(crate) fn decimal128_literal_unscaled(value: &str, scale: i8) -> Result<i128, String> {
-    let scale = usize::try_from(scale)
-        .map_err(|_| format!("negative Decimal128 literal scale is unsupported: {scale}"))?;
-    let (negative, unsigned) = value
-        .strip_prefix('-')
-        .map_or((false, value), |rest| (true, rest));
-    let unsigned = unsigned.strip_prefix('+').unwrap_or(unsigned);
-    let mut parts = unsigned.split('.');
-    let integer = parts.next().unwrap_or_default();
-    let fraction = parts.next().unwrap_or_default();
-    if parts.next().is_some()
-        || (integer.is_empty() && fraction.is_empty())
-        || !integer.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return Err(format!("invalid Decimal128 literal `{value}`"));
-    }
-    let (retained_fraction, discarded_fraction) = if fraction.len() > scale {
-        fraction.split_at(scale)
-    } else {
-        (fraction, "")
-    };
-    if discarded_fraction.bytes().any(|byte| byte != b'0') {
-        return Err(format!(
-            "Decimal128 literal `{value}` cannot be represented exactly at scale {scale}"
-        ));
-    }
-    let digits = format!(
-        "{}{}{}",
-        if integer.is_empty() { "0" } else { integer },
-        retained_fraction,
-        "0".repeat(scale.saturating_sub(retained_fraction.len()))
-    );
-    let magnitude = digits
-        .parse::<u128>()
-        .map_err(|_| format!("Decimal128 literal `{value}` exceeds the i128 carrier"))?;
-    let magnitude = i128::try_from(magnitude)
-        .map_err(|_| format!("Decimal128 literal `{value}` exceeds the i128 carrier"))?;
-    if negative {
-        magnitude
-            .checked_neg()
-            .ok_or_else(|| format!("Decimal128 literal `{value}` exceeds the i128 carrier"))
-    } else {
-        Ok(magnitude)
-    }
+    work.finish()?;
+    result
 }
 
 fn converse_window_bound(bound: &WindowBound) -> WindowBound {
@@ -484,12 +459,17 @@ pub(crate) fn resolve_function_binding(
     catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     args: &[TypedExpr],
-) -> Result<crate::binding::SqlFunctionBinding, String> {
-    let arguments = args.iter().map(function_argument).collect::<Vec<_>>();
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::binding::SqlFunctionBinding, novarocks_functions::FunctionBindingError> {
+    let arguments = args
+        .iter()
+        .map(|arg| function_argument(arg, constant_policy, control))
+        .collect::<Result<Vec<_>, _>>()?;
     catalog
-        .resolve_scalar_binding(name, &arguments)
-        .map(crate::binding::SqlFunctionBinding::new)
-        .map_err(|error| error.to_string())
+        .resolve_scalar_binding(name, &arguments, control)
+        .map(|binding| crate::binding::SqlFunctionBinding::new(binding, decimal_overflow_policy))
 }
 
 /// Builds an explicit, fully typed function contract for structural IR tests
@@ -509,32 +489,48 @@ pub(crate) fn test_function_binding(
         ResolvedFunctionBinding,
     };
 
-    crate::binding::SqlFunctionBinding::new(ResolvedFunctionBinding {
-        function_id: FunctionId::try_new(format!("test.scalar/{name}/v1"))
-            .expect("test function identity"),
-        kind: FunctionKind::Scalar,
-        semantics: FunctionSemantics {
-            volatility,
-            argument_evaluation: FunctionArgumentEvaluation::Eager,
-            failure_behavior: FunctionFailureBehavior::Propagate,
-            intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
+    crate::binding::SqlFunctionBinding::new(
+        ResolvedFunctionBinding {
+            admitted_execution_abi: None,
+            function_id: FunctionId::try_new(format!("test.scalar/{name}/v1"))
+                .expect("test function identity"),
+            kind: FunctionKind::Scalar,
+            semantics: FunctionSemantics {
+                volatility,
+                argument_evaluation: FunctionArgumentEvaluation::Eager,
+                failure_behavior: FunctionFailureBehavior::Propagate,
+                intrinsic_row_error: novarocks_type_contract::FunctionIntrinsicRowError::NoRowError,
+            },
+            logical_argument_count: args.len(),
+            selected: novarocks_functions::FunctionBindingSelection {
+                overload: FunctionOverloadId::try_new(format!("test.scalar/{name}/overload-v1"))
+                    .expect("test function overload identity"),
+                argument_types: args
+                    .iter()
+                    .map(|argument| match &argument.kind {
+                        ExprKind::LambdaFunction { params, body } => {
+                            novarocks_functions::FunctionArgumentType::Lambda {
+                                parameter_types: params
+                                    .iter()
+                                    .map(|param| param.value_type.clone())
+                                    .collect(),
+                                result_type: body.value_type.clone(),
+                            }
+                        }
+                        _ => novarocks_functions::FunctionArgumentType::Value(
+                            argument.value_type.clone(),
+                        ),
+                    })
+                    .collect(),
+                result_type: FunctionResultType::Scalar(FunctionValueType::new(
+                    result_type,
+                    result_nullable,
+                )),
+                aggregate: None,
+            },
         },
-        logical_argument_count: args.len(),
-        selected: novarocks_functions::FunctionBindingSelection {
-            overload: FunctionOverloadId::try_new(format!("test.scalar/{name}/overload-v1"))
-                .expect("test function overload identity"),
-            argument_types: args
-                .iter()
-                .map(function_argument)
-                .map(|argument| argument.argument_type())
-                .collect(),
-            result_type: FunctionResultType::Scalar(FunctionValueType::new(
-                result_type,
-                result_nullable,
-            )),
-            aggregate: None,
-        },
-    })
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+    )
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -563,7 +559,10 @@ pub(crate) fn test_window_binding(
     binding.selected.overload =
         FunctionOverloadId::try_new(format!("test.window/{name}/overload-v1"))
             .expect("test window function overload identity");
-    crate::binding::SqlFunctionBinding::new(binding)
+    crate::binding::SqlFunctionBinding::new(
+        binding,
+        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -578,6 +577,8 @@ pub enum ExprKind {
     LambdaParamRef { name: String, slot_id: i32 },
     /// Literal value.
     Literal(LiteralValue),
+    /// Materialized values keep their original Field, pool and selected ordinal.
+    Constant(novarocks_functions::ConstantValue),
     /// Binary operation (arithmetic, comparison, logical).
     BinaryOp {
         left: Box<TypedExpr>,

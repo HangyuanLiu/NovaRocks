@@ -6,6 +6,10 @@
 
 pub const SCHEMA_LEDGER_VERSION: u32 = 1;
 
+pub mod resource_layout;
+
+include!(concat!(env!("OUT_DIR"), "/resource_layout_registry.rs"));
+
 /// File descriptor set generated from the canonical repository-level IDL.
 pub const FILE_DESCRIPTOR_SET: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/novarocks_descriptor.bin"));
@@ -38,6 +42,36 @@ pub mod expr {
 
 pub mod filter {
     include!(concat!(env!("OUT_DIR"), "/novarocks.filter.rs"));
+}
+
+/// Flat type-table component of the v2 physical package vocabulary.
+pub mod physical_type_v2 {
+    include!(concat!(env!("OUT_DIR"), "/novarocks.physical_type_v2.rs"));
+}
+
+/// Flat invocation/control component of the v2 physical package vocabulary.
+pub mod physical_control_v2 {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/novarocks.physical_control_v2.rs"
+    ));
+}
+
+/// Complete frozen call-effects and parameter component of the v2 vocabulary.
+pub mod physical_semantics_v2 {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/novarocks.physical_semantics_v2.rs"
+    ));
+}
+
+/// Complete flat fragment carrier. Generated DTOs remain codec-owned;
+/// structural and installed-capability validation precede local compilation.
+pub mod physical_package_v2 {
+    include!(concat!(
+        env!("OUT_DIR"),
+        "/novarocks.physical_package_v2.rs"
+    ));
 }
 
 #[allow(clippy::large_enum_variant)]

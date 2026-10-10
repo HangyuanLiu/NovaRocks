@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::sync::Arc;
 
 use crate::runtime::fragment::io::exchange_edge::ExchangeEdgeGates;
@@ -214,28 +216,28 @@ impl Operator for MultiCastDataStreamSinkOperator {
         }
     }
 
-    fn bind_runtime_state(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         for sink in &mut self.sinks {
             sink.op.bind_runtime_state(state)?;
         }
         Ok(())
     }
 
-    fn activate(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn activate(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         for sink in &mut self.sinks {
             sink.op.activate(state)?;
         }
         Ok(())
     }
 
-    fn prepare(&mut self) -> Result<(), String> {
+    fn prepare(&mut self) -> ExecutionResult<()> {
         for sink in &mut self.sinks {
             sink.op.prepare()?;
         }
         Ok(())
     }
 
-    fn close(&mut self) -> Result<(), String> {
+    fn close(&mut self) -> ExecutionResult<()> {
         for sink in &mut self.sinks {
             sink.op.close()?;
         }
@@ -322,9 +324,9 @@ impl ProcessorOperator for MultiCastDataStreamSinkOperator {
         false
     }
 
-    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if let Some(err) = self.init_error.as_ref() {
-            return Err(err.clone());
+            return Err(err.clone().into());
         }
         if self.is_finished() || self.finishing {
             return Ok(());
@@ -368,7 +370,7 @@ impl ProcessorOperator for MultiCastDataStreamSinkOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         Ok(None)
     }
 
@@ -381,9 +383,9 @@ impl ProcessorOperator for MultiCastDataStreamSinkOperator {
     /// Returning early once `finishing` was set swallowed those turns, so a
     /// branch that was not ready at the first call never sent its
     /// end-of-stream and its receiver counted a sender that never sealed.
-    fn set_finishing(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         if let Some(err) = self.init_error.as_ref() {
-            return Err(err.clone());
+            return Err(err.clone().into());
         }
         let first_call = !self.finishing;
         self.finishing = true;
@@ -453,7 +455,7 @@ mod tests {
             "binding"
         }
 
-        fn bind_runtime_state(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn bind_runtime_state(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             self.binds.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -504,15 +506,15 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             self.finishing = true;
             Ok(())
         }
@@ -554,15 +556,15 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
-            Err("refusing sink must not receive input".to_string())
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
+            Err("refusing sink must not receive input".to_string().into())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
 
@@ -756,15 +758,15 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             self.finishing = true;
             if self.permitted.load(Ordering::SeqCst) {
                 self.sealed.store(true, Ordering::SeqCst);

@@ -30,6 +30,15 @@ impl std::error::Error for OriginalPrelaunchRefusal {}
 
 #[test]
 fn denied_original_prepared_config_callback_preserves_cause_before_any_role_spawn() -> Result<()> {
+    denied_prepared_config_precedes_every_role_spawn(false)
+}
+
+#[test]
+fn denied_live_prepared_fence_precedes_every_role_and_log_owner() -> Result<()> {
+    denied_prepared_config_precedes_every_role_spawn(true)
+}
+
+fn denied_prepared_config_precedes_every_role_spawn(live_fences: bool) -> Result<()> {
     let directory = tempfile::tempdir()?;
     let marker = directory.path().join("role-was-spawned");
     let binary = directory.path().join("must-never-run");
@@ -43,34 +52,41 @@ fn denied_original_prepared_config_callback_preserves_cause_before_any_role_spaw
     let calls = std::cell::Cell::new(0usize);
     let config = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tools/ci/fixtures/system-scenarios-base.toml");
-    let result = CrossProcessServerHandle::launch_with_exact_mysql_prelaunch_check(
-        CrossProcessClusterOptions {
-            binary,
-            fe_binary: None,
-            be_binaries: Vec::new(),
-            expected_eligible_backend_count: None,
-            base_config_path: config,
-            runtime_root: directory.path().join("runtime"),
-            cluster_size: 3,
-            launch_profile: LaunchProfile::FaultScenario,
-            startup_timeout: Duration::from_secs(1),
-            child_environment: CrossProcessChildEnvironment::default(),
-            config_overlay: CrossProcessConfigOverlay::default(),
-            native_trust_fixture: NativeTrustFixture::default(),
-        },
-        &|artifact| {
-            calls.set(calls.get() + 1);
-            ensure!(
-                !artifact.artifact_bytes().is_empty(),
-                "actual prepared projection absent"
-            );
-            ensure!(
-                artifact.artifact_sha256() == artifact.semantics_sha256(),
-                "actual prepared digests differ"
-            );
-            Err(OriginalPrelaunchRefusal.into())
-        },
-    );
+    let options = CrossProcessClusterOptions {
+        binary,
+        fe_binary: None,
+        be_binaries: Vec::new(),
+        expected_eligible_backend_count: None,
+        base_config_path: config,
+        runtime_root: directory.path().join("runtime"),
+        cluster_size: 3,
+        launch_profile: LaunchProfile::FaultScenario,
+        startup_timeout: Duration::from_secs(1),
+        child_environment: CrossProcessChildEnvironment::default(),
+        config_overlay: CrossProcessConfigOverlay::default(),
+        native_trust_fixture: NativeTrustFixture::default(),
+    };
+    let prepared = |artifact: &EffectiveLaunchConfigEvidence| {
+        calls.set(calls.get() + 1);
+        ensure!(
+            !artifact.artifact_bytes().is_empty(),
+            "actual prepared projection absent"
+        );
+        ensure!(
+            artifact.artifact_sha256() == artifact.semantics_sha256(),
+            "actual prepared digests differ"
+        );
+        Err(OriginalPrelaunchRefusal.into())
+    };
+    let result = if live_fences {
+        CrossProcessServerHandle::launch_with_held_live_source_checks(
+            options,
+            &prepared,
+            &|_, _| anyhow::bail!("log owner observed after refused preparation"),
+        )
+    } else {
+        CrossProcessServerHandle::launch_with_exact_mysql_prelaunch_check(options, &prepared)
+    };
     let error = match result {
         Ok(mut unexpected) => {
             unexpected.shutdown()?;

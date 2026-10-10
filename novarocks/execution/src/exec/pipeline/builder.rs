@@ -30,7 +30,9 @@
 
 use std::sync::Arc;
 
+mod compiled;
 mod local;
+pub(crate) use compiled::build_compiled_pipeline_graph;
 pub(crate) use local::build_native_pipeline_graph_for_local_program_with_runtime_settings;
 
 use crate::runtime_filter as execution;
@@ -115,6 +117,9 @@ struct PipelineBuildContext {
     runtime_filter_execution: PipelineRuntimeFilterExecution,
     exchange_bindings: ExchangeBindings,
     scan_bindings: ScanBindings,
+    /// A compiled program's Task write capabilities; empty for every other
+    /// builder.
+    compiled_writers: crate::runtime::fragment::CompiledWriterBindings,
     next_pipeline_id: i32,
     pipeline_dop: i32,
     operator_buffer_chunks: usize,
@@ -365,6 +370,7 @@ fn build_pipeline_graph_in_mode(
         runtime_filter_execution,
         exchange_bindings,
         scan_bindings,
+        compiled_writers: Default::default(),
         next_pipeline_id: 0,
         pipeline_dop: pipeline_dop.max(1),
         operator_buffer_chunks: operator_buffer_chunks.max(1),
@@ -542,11 +548,56 @@ fn shuffle_by_hash(
 }
 
 fn shuffle_by_hash_on_input_slots(
-    mut build: PipelineBuildResult,
+    build: PipelineBuildResult,
     ctx: &mut PipelineBuildContext,
     owner_node_id: i32,
     partition_slot_ids: Vec<novarocks_types::SlotId>,
     distribution_keys: Vec<crate::exec::expr::ExprId>,
+    partition_count: usize,
+) -> PipelineBuildResult {
+    shuffle_input_slots_with_distribution(
+        build,
+        ctx,
+        owner_node_id,
+        partition_slot_ids,
+        Distribution::Hash {
+            keys: distribution_keys,
+            partitions: partition_count.max(1),
+            hash_version: 0,
+        },
+        partition_count,
+    )
+}
+
+// The same original exchange body reads exact slots, without expression lookup.
+fn shuffle_compiled_group_input_slots(
+    build: PipelineBuildResult,
+    ctx: &mut PipelineBuildContext,
+    owner_node_id: i32,
+    slots: Vec<novarocks_types::SlotId>,
+    partition_count: usize,
+) -> PipelineBuildResult {
+    let distribution = Distribution::HashInputSlots {
+        slots: slots.clone(),
+        partitions: partition_count.max(1),
+        hash_version: 0,
+    };
+    shuffle_input_slots_with_distribution(
+        build,
+        ctx,
+        owner_node_id,
+        slots,
+        distribution,
+        partition_count,
+    )
+}
+
+fn shuffle_input_slots_with_distribution(
+    mut build: PipelineBuildResult,
+    ctx: &mut PipelineBuildContext,
+    owner_node_id: i32,
+    partition_slot_ids: Vec<novarocks_types::SlotId>,
+    distribution: Distribution,
     partition_count: usize,
 ) -> PipelineBuildResult {
     let partition_count = partition_count.max(1);
@@ -588,11 +639,7 @@ fn shuffle_by_hash_on_input_slots(
         extra_pipelines,
         stream: StreamDesc {
             dop: partition_count as i32,
-            distribution: Distribution::Hash {
-                keys: distribution_keys,
-                partitions: partition_count,
-                hash_version: 0,
-            },
+            distribution,
         },
     }
 }
@@ -2983,7 +3030,7 @@ mod tests {
                     inputs: vec![v],
                     input_is_intermediate: true,
                     types: Some(AggTypeSignature {
-                        intermediate_type: Some(DataType::Int64),
+                        intermediate_type: Some(DataType::Decimal128(38, 0)),
                         output_type: Some(DataType::Int64),
                         input_arg_type: Some(DataType::Int32),
                     }),
@@ -3065,7 +3112,7 @@ mod tests {
                     inputs: vec![v],
                     input_is_intermediate: false,
                     types: Some(AggTypeSignature {
-                        intermediate_type: Some(DataType::Int64),
+                        intermediate_type: Some(DataType::Decimal128(38, 0)),
                         output_type: Some(DataType::Int64),
                         input_arg_type: Some(DataType::Int32),
                     }),

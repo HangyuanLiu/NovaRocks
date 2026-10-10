@@ -25,6 +25,7 @@
 //!
 //! Migrated to `OptExpr` / `LogicalRewriteRule`.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashMap;
 
 use crate::column_id::ColumnId;
@@ -64,7 +65,11 @@ impl LogicalRewriteRule for PushDownPredicateProject {
         true
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             mut children,
@@ -108,7 +113,12 @@ impl LogicalRewriteRule for PushDownPredicateProject {
         let mut pushable = Vec::new();
         let mut remaining = Vec::new();
         for conj in conjuncts {
-            match remap_predicate_through_project(&mut arena, conj, &proj.items) {
+            match remap_predicate_through_project(
+                &mut arena,
+                conj,
+                &proj.items,
+                &ctx.control_view(),
+            )? {
                 Some(rewritten) => pushable.push(rewritten),
                 None => remaining.push(conj),
             }
@@ -118,7 +128,9 @@ impl LogicalRewriteRule for PushDownPredicateProject {
             return Ok(RewriteResult::Unchanged);
         }
 
-        let Some(pushed_id) = scalar_expr::combine_conjuncts(&mut arena, pushable) else {
+        let Some(pushed_id) =
+            scalar_expr::combine_conjuncts(&mut arena, pushable, &ctx.control_view())?
+        else {
             return Ok(RewriteResult::Unchanged);
         };
         let new_child = OptExpr::new(
@@ -135,18 +147,34 @@ impl LogicalRewriteRule for PushDownPredicateProject {
             children: vec![new_child],
             required_output_columns,
         };
-        let result = wrap_remaining_filter_opt_scalar(new_project, remaining, &mut arena);
+        let result = wrap_remaining_filter_opt_scalar(
+            new_project,
+            remaining,
+            &mut arena,
+            &ctx.control_view(),
+        )?;
         Ok(RewriteResult::Changed(result))
     }
+}
+
+// A rejected candidate short-circuits separately from a typed control failure.
+macro_rules! candidate_or_none {
+    ($candidate:expr) => {
+        match $candidate {
+            Some(value) => value,
+            None => return Ok(None),
+        }
+    };
 }
 
 fn remap_predicate_through_project(
     arena: &mut ScalarArena,
     predicate: ScalarId,
     project_items: &[ScalarProjectItem],
-) -> Option<ScalarId> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, SqlCompileError> {
     let bindings = project_bindings(arena, project_items);
-    remap_scalar(arena, predicate, &bindings)
+    remap_scalar(arena, predicate, &bindings, control)
 }
 
 fn project_bindings(
@@ -171,35 +199,37 @@ fn remap_scalar(
     arena: &mut ScalarArena,
     expr: ScalarId,
     bindings: &HashMap<ColumnId, Option<ScalarId>>,
-) -> Option<ScalarId> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarId>, SqlCompileError> {
     let node = arena.node(expr).clone();
-    let data_type = arena.data_type(expr).clone();
-    let nullable = arena.nullable(expr);
-    match node {
+    let value_type = arena.value_type(expr).clone();
+    Ok(match node {
         ScalarNode::ColumnRef(column_id) => bindings.get(&column_id).copied().flatten(),
-        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => Some(expr),
+        ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) | ScalarNode::Constant(_) => {
+            Some(expr)
+        }
         ScalarNode::BinaryOp {
             op,
             left,
             right,
             decimal_overflow_policy,
         } => {
-            let left = remap_scalar(arena, left, bindings)?;
-            let right = remap_scalar(arena, right, bindings)?;
-            Some(arena.intern(
+            let left = candidate_or_none!(remap_scalar(arena, left, bindings, control)?);
+            let right = candidate_or_none!(remap_scalar(arena, right, bindings, control)?);
+            Some(arena.intern_observed(
                 ScalarNode::BinaryOp {
                     op,
                     left,
                     right,
                     decimal_overflow_policy,
                 },
-                data_type,
-                nullable,
-            ))
+                value_type,
+                control,
+            )?)
         }
         ScalarNode::UnaryOp { op, child } => {
-            let child = remap_scalar(arena, child, bindings)?;
-            Some(arena.intern(ScalarNode::UnaryOp { op, child }, data_type, nullable))
+            let child = candidate_or_none!(remap_scalar(arena, child, bindings, control)?);
+            Some(arena.intern_observed(ScalarNode::UnaryOp { op, child }, value_type, control)?)
         }
         ScalarNode::FunctionCall {
             name,
@@ -208,8 +238,8 @@ fn remap_scalar(
             binding,
             volatility,
         } => {
-            let args = remap_scalar_vec(arena, args, bindings)?;
-            Some(arena.intern(
+            let args = candidate_or_none!(remap_scalar_vec(arena, args, bindings, control)?);
+            Some(arena.intern_observed(
                 ScalarNode::FunctionCall {
                     name,
                     args,
@@ -217,17 +247,17 @@ fn remap_scalar(
                     binding,
                     volatility,
                 },
-                data_type,
-                nullable,
-            ))
+                value_type,
+                control,
+            )?)
         }
         ScalarNode::LambdaFunction { params, body } => {
-            let body = remap_scalar(arena, body, bindings)?;
-            Some(arena.intern(
+            let body = candidate_or_none!(remap_scalar(arena, body, bindings, control)?);
+            Some(arena.intern_observed(
                 ScalarNode::LambdaFunction { params, body },
-                data_type,
-                nullable,
-            ))
+                value_type,
+                control,
+            )?)
         }
         ScalarNode::AggregateCall {
             name,
@@ -236,9 +266,9 @@ fn remap_scalar(
             order_by,
             resolved,
         } => {
-            let args = remap_scalar_vec(arena, args, bindings)?;
-            let order_by = remap_sort_keys(arena, order_by, bindings)?;
-            Some(arena.intern(
+            let args = candidate_or_none!(remap_scalar_vec(arena, args, bindings, control)?);
+            let order_by = candidate_or_none!(remap_sort_keys(arena, order_by, bindings, control)?);
+            Some(arena.intern_observed(
                 ScalarNode::AggregateCall {
                     name,
                     args,
@@ -246,46 +276,50 @@ fn remap_scalar(
                     order_by,
                     resolved,
                 },
-                data_type,
-                nullable,
-            ))
+                value_type,
+                control,
+            )?)
         }
         ScalarNode::Cast {
             child,
             target,
             decimal_overflow_policy,
         } => {
-            let child = remap_scalar(arena, child, bindings)?;
-            Some(arena.intern(
+            let child = candidate_or_none!(remap_scalar(arena, child, bindings, control)?);
+            Some(arena.intern_observed(
                 ScalarNode::Cast {
                     child,
                     target,
                     decimal_overflow_policy,
                 },
-                data_type,
-                nullable,
-            ))
+                value_type,
+                control,
+            )?)
         }
         ScalarNode::IsNull { child, negated } => {
-            let child = remap_scalar(arena, child, bindings)?;
-            Some(arena.intern(ScalarNode::IsNull { child, negated }, data_type, nullable))
+            let child = candidate_or_none!(remap_scalar(arena, child, bindings, control)?);
+            Some(arena.intern_observed(
+                ScalarNode::IsNull { child, negated },
+                value_type,
+                control,
+            )?)
         }
         ScalarNode::InList {
             child,
             list,
             negated,
         } => {
-            let child = remap_scalar(arena, child, bindings)?;
-            let list = remap_scalar_vec(arena, list, bindings)?;
-            Some(arena.intern(
+            let child = candidate_or_none!(remap_scalar(arena, child, bindings, control)?);
+            let list = candidate_or_none!(remap_scalar_vec(arena, list, bindings, control)?);
+            Some(arena.intern_observed(
                 ScalarNode::InList {
                     child,
                     list,
                     negated,
                 },
-                data_type,
-                nullable,
-            ))
+                value_type,
+                control,
+            )?)
         }
         ScalarNode::Between {
             child,
@@ -293,82 +327,82 @@ fn remap_scalar(
             high,
             negated,
         } => {
-            let child = remap_scalar(arena, child, bindings)?;
-            let low = remap_scalar(arena, low, bindings)?;
-            let high = remap_scalar(arena, high, bindings)?;
-            Some(arena.intern(
+            let child = candidate_or_none!(remap_scalar(arena, child, bindings, control)?);
+            let low = candidate_or_none!(remap_scalar(arena, low, bindings, control)?);
+            let high = candidate_or_none!(remap_scalar(arena, high, bindings, control)?);
+            Some(arena.intern_observed(
                 ScalarNode::Between {
                     child,
                     low,
                     high,
                     negated,
                 },
-                data_type,
-                nullable,
-            ))
+                value_type,
+                control,
+            )?)
         }
         ScalarNode::Like {
             child,
             pattern,
             negated,
         } => {
-            let child = remap_scalar(arena, child, bindings)?;
-            let pattern = remap_scalar(arena, pattern, bindings)?;
-            Some(arena.intern(
+            let child = candidate_or_none!(remap_scalar(arena, child, bindings, control)?);
+            let pattern = candidate_or_none!(remap_scalar(arena, pattern, bindings, control)?);
+            Some(arena.intern_observed(
                 ScalarNode::Like {
                     child,
                     pattern,
                     negated,
                 },
-                data_type,
-                nullable,
-            ))
+                value_type,
+                control,
+            )?)
         }
         ScalarNode::Case {
             operand,
             when_then,
             else_expr,
         } => {
-            let operand = remap_optional_scalar(arena, operand, bindings)?;
-            let when_then = when_then
-                .into_iter()
-                .map(|(when, then)| {
-                    Some((
-                        remap_scalar(arena, when, bindings)?,
-                        remap_scalar(arena, then, bindings)?,
-                    ))
-                })
-                .collect::<Option<Vec<_>>>()?;
-            let else_expr = remap_optional_scalar(arena, else_expr, bindings)?;
-            Some(arena.intern(
+            let operand =
+                candidate_or_none!(remap_optional_scalar(arena, operand, bindings, control)?);
+            let mut rewritten_pairs = Vec::with_capacity(when_then.len());
+            for (when, then) in when_then {
+                let when = candidate_or_none!(remap_scalar(arena, when, bindings, control)?);
+                let then = candidate_or_none!(remap_scalar(arena, then, bindings, control)?);
+                rewritten_pairs.push((when, then));
+            }
+            let when_then = rewritten_pairs;
+            let else_expr =
+                candidate_or_none!(remap_optional_scalar(arena, else_expr, bindings, control)?);
+            Some(arena.intern_observed(
                 ScalarNode::Case {
                     operand,
                     when_then,
                     else_expr,
                 },
-                data_type,
-                nullable,
-            ))
+                value_type,
+                control,
+            )?)
         }
         ScalarNode::IsTruthValue {
             child,
             value,
             negated,
         } => {
-            let child = remap_scalar(arena, child, bindings)?;
-            Some(arena.intern(
+            let child = candidate_or_none!(remap_scalar(arena, child, bindings, control)?);
+            Some(arena.intern_observed(
                 ScalarNode::IsTruthValue {
                     child,
                     value,
                     negated,
                 },
-                data_type,
-                nullable,
-            ))
+                value_type,
+                control,
+            )?)
         }
         ScalarNode::Nested(child) => {
-            let child = remap_scalar(arena, child, bindings)?;
-            Some(arena.intern(ScalarNode::Nested(child), data_type, nullable))
+            let child = candidate_or_none!(remap_scalar(arena, child, bindings, control)?);
+            Some(arena.intern_observed(ScalarNode::Nested(child), value_type, control)?)
         }
         ScalarNode::WindowCall {
             name,
@@ -382,11 +416,17 @@ fn remap_scalar(
             window_frame,
             ignore_nulls,
         } => {
-            let args = remap_scalar_vec(arena, args, bindings)?;
-            let function_order_by = remap_sort_keys(arena, function_order_by, bindings)?;
-            let partition_by = remap_scalar_vec(arena, partition_by, bindings)?;
-            let order_by = remap_sort_keys(arena, order_by, bindings)?;
-            Some(arena.intern(
+            let args = candidate_or_none!(remap_scalar_vec(arena, args, bindings, control)?);
+            let function_order_by = candidate_or_none!(remap_sort_keys(
+                arena,
+                function_order_by,
+                bindings,
+                control
+            )?);
+            let partition_by =
+                candidate_or_none!(remap_scalar_vec(arena, partition_by, bindings, control)?);
+            let order_by = candidate_or_none!(remap_sort_keys(arena, order_by, bindings, control)?);
+            Some(arena.intern_observed(
                 ScalarNode::WindowCall {
                     name,
                     args,
@@ -399,54 +439,66 @@ fn remap_scalar(
                     window_frame,
                     ignore_nulls,
                 },
-                data_type,
-                nullable,
-            ))
+                value_type,
+                control,
+            )?)
         }
         ScalarNode::Lambda { params, body } => {
-            let body = remap_scalar(arena, body, bindings)?;
-            Some(arena.intern(ScalarNode::Lambda { params, body }, data_type, nullable))
+            let body = candidate_or_none!(remap_scalar(arena, body, bindings, control)?);
+            Some(arena.intern_observed(ScalarNode::Lambda { params, body }, value_type, control)?)
         }
-    }
+    })
 }
 
 fn remap_scalar_vec(
     arena: &mut ScalarArena,
     exprs: Vec<ScalarId>,
     bindings: &HashMap<ColumnId, Option<ScalarId>>,
-) -> Option<Vec<ScalarId>> {
-    exprs
-        .into_iter()
-        .map(|expr| remap_scalar(arena, expr, bindings))
-        .collect()
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<Vec<ScalarId>>, SqlCompileError> {
+    let mut out = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        let Some(expr) = remap_scalar(arena, expr, bindings, control)? else {
+            return Ok(None);
+        };
+        out.push(expr);
+    }
+    Ok(Some(out))
 }
 
 fn remap_optional_scalar(
     arena: &mut ScalarArena,
     expr: Option<ScalarId>,
     bindings: &HashMap<ColumnId, Option<ScalarId>>,
-) -> Option<Option<ScalarId>> {
-    match expr {
-        Some(expr) => Some(Some(remap_scalar(arena, expr, bindings)?)),
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<Option<ScalarId>>, SqlCompileError> {
+    Ok(match expr {
+        Some(expr) => Some(Some(candidate_or_none!(remap_scalar(
+            arena, expr, bindings, control
+        )?))),
         None => Some(None),
-    }
+    })
 }
 
 fn remap_sort_keys(
     arena: &mut ScalarArena,
     keys: Vec<SortKey>,
     bindings: &HashMap<ColumnId, Option<ScalarId>>,
-) -> Option<Vec<SortKey>> {
-    keys.into_iter()
-        .map(|key| {
-            Some(SortKey {
-                expr: remap_scalar(arena, key.expr, bindings)?,
-                asc: key.asc,
-                nulls_first: key.nulls_first,
-                display: key.display,
-            })
-        })
-        .collect()
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<Vec<SortKey>>, SqlCompileError> {
+    let mut out = Vec::with_capacity(keys.len());
+    for key in keys {
+        let Some(expr) = remap_scalar(arena, key.expr, bindings, control)? else {
+            return Ok(None);
+        };
+        out.push(SortKey {
+            expr,
+            asc: key.asc,
+            nulls_first: key.nulls_first,
+            display: key.display,
+        });
+    }
+    Ok(Some(out))
 }
 
 #[cfg(test)]
@@ -478,8 +530,8 @@ mod tests {
 
     fn col_ref(name: &str, id: ColumnId) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             kind: ExprKind::ColumnRef {
                 column_id: id,
                 qualifier: None,
@@ -490,8 +542,8 @@ mod tests {
 
     fn qualified_col_ref(qualifier: &str, name: &str, id: ColumnId) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             kind: ExprKind::ColumnRef {
                 column_id: id,
                 qualifier: Some(qualifier.into()),
@@ -502,16 +554,16 @@ mod tests {
 
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             kind: ExprKind::Literal(LiteralValue::Int(v)),
         }
     }
 
     fn is_not_null(expr: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::IsNull {
                 expr: Box::new(expr),
                 negated: true,
@@ -521,8 +573,8 @@ mod tests {
 
     fn eq(a: TypedExpr, b: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(a),
                 op: BinOp::Eq,
@@ -534,8 +586,8 @@ mod tests {
 
     fn and(a: TypedExpr, b: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(a),
                 op: BinOp::And,
@@ -576,8 +628,11 @@ mod tests {
                 .map(|(n, id)| OutputColumn {
                     column_id: *id,
                     name: (*n).into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 })
                 .collect(),
@@ -601,7 +656,9 @@ mod tests {
                 let expr_id = crate::planner::optimizer_bridge::scalar::intern_typed(
                     arena,
                     &col_ref(name, *id),
-                );
+                    crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+                )
+                .unwrap();
                 ScalarProjectItem {
                     expr: expr_id,
                     output_name: (*name).into(),
@@ -620,14 +677,19 @@ mod tests {
     }
 
     fn filter_opt(arena: &mut ScalarArena, predicate: TypedExpr, child: OptExpr) -> OptExpr {
-        let pred_id = crate::planner::optimizer_bridge::scalar::intern_typed(arena, &predicate);
+        let pred_id = crate::planner::optimizer_bridge::scalar::intern_typed(
+            arena,
+            &predicate,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         OptExpr::new(
             Operator::LogicalFilter(FilterOp { predicate: pred_id }),
             vec![child],
         )
     }
 
-    fn make_ctx(arena: ScalarArena) -> RewriteContext {
+    fn make_ctx(arena: ScalarArena) -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(std::iter::empty::<String>());
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         ctx
@@ -646,7 +708,15 @@ mod tests {
 
         let rule = PushDownPredicateProject;
         let mut ctx = make_ctx(arena);
-        assert!(bind_tree(&rule.pattern(), &filter).is_some());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &filter,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
         let result = rule.apply(filter, &mut ctx).unwrap();
 
         match result {
@@ -731,8 +801,8 @@ mod tests {
         let scan = scan_opt(&mut arena, &[("a", a_id)]);
         // Build: Project(Scan) with computed item x = a + 1.
         let computed_expr = TypedExpr {
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(col_ref("a", a_id)),
                 op: BinOp::Add,
@@ -740,8 +810,12 @@ mod tests {
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         };
-        let computed_id =
-            crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &computed_expr);
+        let computed_id = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &computed_expr,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let project = OptExpr::new(
             Operator::LogicalProject(ProjectOp {
                 items: vec![ScalarProjectItem {
@@ -758,7 +832,15 @@ mod tests {
 
         let rule = PushDownPredicateProject;
         let mut ctx = make_ctx(arena);
-        assert!(bind_tree(&rule.pattern(), &filter).is_some());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &filter,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
         let result = rule.apply(filter, &mut ctx).unwrap();
         assert!(
             matches!(result, RewriteResult::Unchanged),
@@ -797,8 +879,8 @@ mod tests {
         let x_id = col_id(2);
         let scan = scan_opt(&mut arena, &[("a", a_id)]);
         let computed_expr = TypedExpr {
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(col_ref("a", a_id)),
                 op: BinOp::Add,
@@ -806,10 +888,18 @@ mod tests {
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
         };
-        let passthrough_id =
-            crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &col_ref("a", a_id));
-        let computed_id =
-            crate::planner::optimizer_bridge::scalar::intern_typed(&mut arena, &computed_expr);
+        let passthrough_id = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &col_ref("a", a_id),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
+        let computed_id = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &computed_expr,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let project = OptExpr::new(
             Operator::LogicalProject(ProjectOp {
                 items: vec![
@@ -880,8 +970,7 @@ mod tests {
             };
             let input = arena.intern(
                 ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(literal)),
-                input_type.clone(),
-                false,
+                novarocks_type_contract::FunctionValueType::new(input_type.clone(), false),
             );
             let args = [FunctionArgument::Value {
                 value_type: FunctionValueType::new(input_type, false),
@@ -893,18 +982,22 @@ mod tests {
                     name,
                     FunctionKind::Scalar,
                     FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &args,
                         logical_argument_count: 1,
                     },
+                    &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap();
             catalog
                 .validate_bound(
                     &bound,
                     FunctionBindingRequest {
+                        expected_result_type: None,
                         arguments: &args,
                         logical_argument_count: 1,
                     },
+                    &crate::compiler::SqlCompileControl::unbounded(),
                 )
                 .unwrap();
             let FunctionResultType::Scalar(output) = bound.selected.result_type.clone() else {
@@ -916,11 +1009,13 @@ mod tests {
                     name: name.into(),
                     args: vec![input],
                     distinct: false,
-                    binding: bound.into(),
+                    binding: crate::binding::SqlFunctionBinding::new(
+                        bound,
+                        novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                    ),
                     volatility,
                 },
-                output.data_type,
-                output.nullable,
+                novarocks_type_contract::FunctionValueType::new(output.data_type, output.nullable),
             );
             let Operator::LogicalProject(proj) = &mut project.op else {
                 unreachable!()

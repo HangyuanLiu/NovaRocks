@@ -34,6 +34,7 @@ use crate::scenarios::result_delivery_root_protocol::{
     probe_owned,
 };
 use anyhow::{Context, Result, ensure};
+use novarocks_cluster_harness::process_resources::ProcessLaunchIdentity;
 use novarocks_cluster_harness::{LaunchProfile, ServerHandle};
 use novarocks_execution_contract::{TaskIdentity, root_result::RootResultRead};
 use novarocks_proto_codec::FieldPath;
@@ -73,21 +74,29 @@ const ROOT_FIELDS: [&str; 14] = [
     "metadata_bytes",
 ];
 
-/// OPEN until root's prelaunch admission verifies the new immutable input and
-/// the actual neutral-marker feature diagnostic as well as all ordinary build pins.
-/// validate_shape is a local consistency check and does not perform that admission.
-pub(super) fn from_admitted(run: AdmittedExactNativeRun) -> Result<Box<dyn Scenario>> {
+/// Called after prelaunch admission verifies the immutable input, actual
+/// neutral-marker feature and original build pins. Shape checking below is local.
+pub(super) fn from_admitted(
+    run: AdmittedExactNativeRun,
+    live_fences: bool,
+) -> Result<Box<dyn Scenario>> {
     run.validate_shape()?;
     Ok(Box::new(HeldLateAck {
         run: Arc::new(run),
         clock: Mutex::new(None),
         prepared: Mutex::new(None),
+        source_fences: Mutex::new(if live_fences {
+            Some(crate::held_live_source_fence::SourceFenceOwner::from_original_stdin()?)
+        } else {
+            None
+        }),
     }))
 }
 struct HeldLateAck {
     run: Arc<AdmittedExactNativeRun>,
     clock: Mutex<Option<Instant>>,
     prepared: Mutex<Option<OriginalPreparedConfig>>,
+    source_fences: Mutex<Option<crate::held_live_source_fence::SourceFenceOwner>>,
 }
 impl HeldLateAck {
     fn clock(&self) -> Result<Instant> {
@@ -145,7 +154,29 @@ impl Scenario for HeldLateAck {
             .map_err(|_| anyhow::anyhow!("prepared owner poisoned"))?;
         ensure!(prepared.is_none(), "prepared config already frozen");
         *prepared = Some(OriginalPreparedConfig::freeze(artifact, root, deadline)?);
+        let mut fences = self
+            .source_fences
+            .lock()
+            .map_err(|_| anyhow::anyhow!("original source fence owner poisoned"))?;
+        if let Some(fences) = fences.as_mut() {
+            fences.prepared(deadline)?;
+        }
         Ok(())
+    }
+    fn observe_original_durable_log_owner(
+        &self,
+        role: &str,
+        device: u64,
+        inode: u64,
+    ) -> Result<()> {
+        let mut fences = self
+            .source_fences
+            .lock()
+            .map_err(|_| anyhow::anyhow!("original source fence owner poisoned"))?;
+        fences
+            .as_mut()
+            .context("original source fence owner is not enabled")?
+            .log_owner(role, device, inode, self.clock()?)
     }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         let deadline = self.clock()?;
@@ -165,7 +196,7 @@ impl Scenario for HeldLateAck {
             .enable_all()
             .build()?;
         context.retain_artifacts();
-        run_owned(context, &runtime, deadline, &self.run)
+        run_owned(context, &runtime, deadline, &self.run, &self.source_fences)
     }
     fn teardown(&self) -> Result<()> {
         let prepared = self
@@ -185,6 +216,12 @@ struct Facts {
     samples: Vec<Value>, // admission on every push: at most the original 51 positions
     actor: Option<HeldObservation>,
     root: Option<Value>,
+    target_source: Option<Value>,
+    closed_acks: Vec<Value>, // checked before each push: at most two
+    original_prelaunch: Option<Instant>,
+    mysql_terminal_code: Option<u16>,
+    health_before_tasks_created: Option<[u64; 3]>,
+    health_after_tasks_created: Option<[u64; 3]>,
     protocol_complete: bool,
     actor_actual_join: bool,
     mysql_actual_join: bool,
@@ -283,24 +320,26 @@ fn roots_match(
     if !common {
         return Ok(false);
     }
+    // The completed unary encode copies the body into its own backing. A held
+    // Native send keeps that copy's grant, delivery and metadata alive, while
+    // seal retires the two original Worker segments. These are separate facts.
     if sealed {
-        if root["data_positions"] != 0 || root["payload_bytes"] != 0 {
+        if root["data_positions"] != 0 || root["payload_bytes"] != 0 || root["segments"] != 0 {
             return Ok(false);
         }
-    } else if root["data_positions"] != 2 || root["payload_bytes"] != S + 8 {
+    } else if root["data_positions"] != 2 || root["payload_bytes"] != S + 8 || root["segments"] != 2
+    {
         return Ok(false);
     }
     if positive_holder {
         Ok(root["deliveries"] > 0
             && root["retained_reservations"] > 0
             && root["metadata_holders"] > 0
-            && root["metadata_bytes"] > 0
-            && root["segments"] > 0)
+            && root["metadata_bytes"] > 0)
     } else {
         Ok(root["deliveries"] == 0
             && root["retained_reservations"] == 0
-            && root["metadata_holders"] == 0
-            && root["segments"] == 2)
+            && root["metadata_holders"] == 0)
     }
 }
 fn same_target(
@@ -334,9 +373,17 @@ fn sample(
         "original sample positions exhausted"
     );
     let value = runtime.block_on(census(context, deadline))?;
-    facts
-        .samples
-        .push(json!({"phase":label,"roots":value.roots,"tasks_created":value.created}));
+    let observed_us = Instant::now()
+        .saturating_duration_since(
+            facts
+                .original_prelaunch
+                .context("original census clock origin absent")?,
+        )
+        .as_micros();
+    facts.samples.push(
+        json!({"phase":label,"roots":value.roots,"tasks_created":value.created,
+        "observed_from_original_prelaunch_us":observed_us}),
+    );
     check(deadline)?;
     Ok(value)
 }
@@ -392,12 +439,36 @@ fn validate_mysql(value: &OwnedTextResultObservation, health: bool) -> Result<()
     Ok(())
 }
 
+fn original_role_inventory(
+    (frontend, backends): (&ProcessLaunchIdentity, &[ProcessLaunchIdentity]),
+) -> Result<Value> {
+    ensure!(
+        frontend.role == "fe"
+            && backends.len() == 3
+            && backends
+                .iter()
+                .zip(["be-0", "be-1", "be-2"])
+                .all(|(role, name)| role.role == name),
+        "original held role inventory differs from the admitted topology"
+    );
+    // The harness API returns (FE, BE slice). Serialize the same four original
+    // launch identities in order, not that tuple's nested JSON representation.
+    Ok(serde_json::to_value([
+        frontend,
+        &backends[0],
+        &backends[1],
+        &backends[2],
+    ])?)
+}
+
 fn run_owned(
     context: &mut ScenarioContext,
     runtime: &Runtime,
     deadline: Instant,
     admitted: &AdmittedExactNativeRun,
+    source_fences: &Mutex<Option<crate::held_live_source_fence::SourceFenceOwner>>,
 ) -> Result<()> {
+    let original_roles = original_role_inventory(context.process_launch_identities())?;
     // Every original handle stays outside the primary operation and all fallible writes.
     let mut actor: Option<HeldRootResponse> = None;
     let mut job: Option<MysqlJob> = None;
@@ -405,7 +476,10 @@ fn run_owned(
     let mut stream: Option<AsyncMysqlStream> = None;
     let mut cid: Option<u32> = None;
     let mut protocol_deadline = None;
-    let mut facts = Facts::default();
+    let mut facts = Facts {
+        original_prelaunch: Some(deadline - WHOLE),
+        ..Facts::default()
+    };
     let mut errors: [Option<anyhow::Error>; 8] = std::array::from_fn(|_| None);
     let mut expected_server_error: Option<anyhow::Error> = None;
     let mut expected_driver_exit: Option<tokio::task::JoinError> = None;
@@ -421,6 +495,14 @@ fn run_owned(
             deadline,
             FrontendIdentitySource::RootObservation,
         )?;
+        {
+            let mut fences = source_fences
+                .lock()
+                .map_err(|_| anyhow::anyhow!("original source fence owner poisoned"))?;
+            if let Some(fences) = fences.as_mut() {
+                fences.baseline(observer.original_baseline_log_bytes(), deadline)?;
+            }
+        }
         let user = context.mysql_user().to_owned();
         let port = context.mysql_port();
         check(deadline)?;
@@ -476,8 +558,17 @@ fn run_owned(
                 .saturating_duration_since(deadline - WHOLE)
                 .as_micros(),
         );
-        let target = observer.observe_until(context, phase)?;
+        let target = observer.observe_ready_until(context, phase)?;
+        {
+            let mut fences = source_fences
+                .lock()
+                .map_err(|_| anyhow::anyhow!("original source fence owner poisoned"))?;
+            if let Some(fences) = fences.as_mut() {
+                fences.target(target.after_log_bytes, phase)?;
+            }
+        }
         facts.root = Some(identity(target.root));
+        facts.target_source = Some(observer.source_evidence(&target)?);
         // Same closed whole-cluster inventory and two genuine retained Data positions.
         qualify(
             context, runtime, &mut facts, &observer, &target, phase, false, false, "W2",
@@ -566,6 +657,18 @@ fn run_owned(
                 phase,
             )?;
             actor.as_ref().unwrap().require_closed_ack(&ack, &reply)?;
+            ensure!(
+                facts.closed_acks.len() < 2,
+                "closed ACK observation positions exhausted"
+            );
+            facts
+                .closed_acks
+                .push(json!({"label":label,"root":identity(reply.root_task),
+                "profile":reply.profile.get(),"kind":"ClientRows", // actual typed proof checked above
+                "wanted":ack.wanted().map(|n| n.get()),"consumed":ack.consumed(),
+                "accepted_consumed":reply.accepted_consumed,"outcome":"AwaitTerminalControl",
+                "observed_from_original_prelaunch_us":Instant::now()
+                    .saturating_duration_since(deadline-WHOLE).as_micros()}));
             qualify(
                 context, runtime, &mut facts, &observer, &target, phase, true, true, label,
             )?;
@@ -620,6 +723,7 @@ fn run_owned(
         match runtime.block_on(handle) {
             Ok((client, mut value)) => {
                 facts.mysql_actual_join = true;
+                facts.mysql_terminal_code = value.server_result_error_code;
                 if let Err(error) = validate_mysql(&value, false) {
                     retain_secondary(&mut errors[3], error);
                 }
@@ -640,6 +744,7 @@ fn run_owned(
     if errors.iter().all(Option::is_none) {
         let recovery = (|| -> Result<()> {
             let before = runtime.block_on(census(context, deadline))?.created;
+            facts.health_before_tasks_created = Some(before);
             let client = stream
                 .as_mut()
                 .context("original client disappeared before health")?;
@@ -656,6 +761,7 @@ fn run_owned(
             }
             validation?;
             let after = runtime.block_on(census(context, deadline))?.created;
+            facts.health_after_tasks_created = Some(after);
             ensure!(
                 after
                     .iter()
@@ -682,7 +788,11 @@ fn run_owned(
             "clean_revision":admitted.clean_revision,"source_tree_sha256":admitted.source_tree_sha256,
             "server_binary_sha256":admitted.server_binary_sha256,"runner_binary_sha256":admitted.runner_binary_sha256,
             "base_config_sha256":admitted.base_config_sha256,"execution_binding_sha256":admitted.frozen_execution_binding_sha256},
-        "original_roles":context.process_launch_identities(),"selected_root":facts.root,
+        "original_roles":original_roles,"selected_root":facts.root,
+        "independent_target_source":facts.target_source,"closed_acks":facts.closed_acks,
+        "mysql_terminal_code":facts.mysql_terminal_code,
+        "health_before_tasks_created":facts.health_before_tasks_created,
+        "health_after_tasks_created":facts.health_after_tasks_created,
         "protocol_complete":facts.protocol_complete,"actor":facts.actor,
         "actor_actual_join":facts.actor_actual_join,"mysql_actual_join":facts.mysql_actual_join,
         "kill_attempted":facts.kill_attempted,"kill_returned":facts.kill_returned,

@@ -38,6 +38,44 @@ pub trait ConnectorOperationControl: Send + Sync {
     fn check_active(&self) -> Result<(), ConnectorError>;
 }
 
+/// A read-only, allocation-free clone of an existing operation's control.
+/// It shares the original stop view and copies the original absolute deadline.
+/// It carries no storage/credential projection, capacity, or activity lease.
+#[derive(Clone)]
+pub struct ConnectorOperationControlView {
+    deadline: Instant,
+    stop: ConnectorStopView,
+}
+impl ConnectorOperationControlView {
+    pub const fn deadline(&self) -> Instant {
+        self.deadline
+    }
+}
+impl ConnectorOperationControl for ConnectorOperationControlView {
+    fn check_active(&self) -> Result<(), ConnectorError> {
+        check_operation_control(self.deadline, &self.stop)
+    }
+}
+
+fn check_operation_control(
+    deadline: Instant,
+    stop: &ConnectorStopView,
+) -> Result<(), ConnectorError> {
+    if stop.is_stopped() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Cancelled,
+            "connector operation was cancelled",
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::DeadlineExceeded,
+            "connector operation deadline elapsed",
+        ));
+    }
+    Ok(())
+}
+
 /// Runtime-only identity for fair scan I/O scheduling. This does not belong in
 /// a connector handle or a frozen plan: placement and attempt identity are
 /// known only when the backend binds the scan node.
@@ -622,6 +660,14 @@ impl ConnectorRequestContext {
         self
     }
 
+    /// Project only the existing control; do not clone credential properties.
+    pub fn original_operation_control(&self) -> ConnectorOperationControlView {
+        ConnectorOperationControlView {
+            deadline: self.deadline,
+            stop: self.stop.clone(),
+        }
+    }
+
     pub const fn deadline(&self) -> Instant {
         self.deadline
     }
@@ -675,19 +721,7 @@ impl ConnectorRequestContext {
 
 impl ConnectorOperationControl for ConnectorRequestContext {
     fn check_active(&self) -> Result<(), ConnectorError> {
-        if self.is_cancelled() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::Cancelled,
-                "connector operation was cancelled",
-            ));
-        }
-        if Instant::now() >= self.deadline {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::DeadlineExceeded,
-                "connector operation deadline elapsed",
-            ));
-        }
-        Ok(())
+        check_operation_control(self.deadline, &self.stop)
     }
 }
 

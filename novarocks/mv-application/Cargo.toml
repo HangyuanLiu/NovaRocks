@@ -11,6 +11,7 @@ workspace = true
 test-support = []
 
 [dependencies]
+novarocks-type-contract.workspace = true
 apache-avro.workspace = true
 async-trait.workspace = true
 bytes.workspace = true

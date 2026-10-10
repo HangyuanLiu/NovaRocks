@@ -115,7 +115,9 @@ mod tests {
     fn intern_group_by(scalars: &mut ScalarArena, exprs: Vec<TypedExpr>) -> Vec<ScalarId> {
         exprs
             .iter()
-            .map(|expr| intern_typed(scalars, expr))
+            .map(|expr| {
+                intern_typed(scalars, expr, crate::optimizer::test_optimizer_control()).unwrap()
+            })
             .collect()
     }
 
@@ -127,8 +129,10 @@ mod tests {
                 qualifier: Some("t".into()),
                 column: "city".into(),
             },
-            data_type: arrow::datatypes::DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Utf8,
+                false,
+            ),
         };
         let mut scalars = ScalarArena::new();
         let op = PhysicalHashAggregateOp {
@@ -139,8 +143,11 @@ mod tests {
                 vec![OutputColumn {
                     column_id: ColumnId(3),
                     name: "city".into(),
-                    data_type: arrow::datatypes::DataType::Utf8,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Utf8,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 vec![],
@@ -148,8 +155,11 @@ mod tests {
             output_columns: vec![OutputColumn {
                 column_id: ColumnId(3),
                 name: "city".into(),
-                data_type: arrow::datatypes::DataType::Utf8,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Utf8,
+                    false,
+                ),
+
                 is_internal: false,
             }],
             is_merge: vec![],
@@ -170,8 +180,10 @@ mod tests {
                 qualifier: Some("t".into()),
                 column: "city".into(),
             },
-            data_type: arrow::datatypes::DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Utf8,
+                false,
+            ),
         };
         let mut scalars = ScalarArena::new();
         let op = PhysicalHashAggregateOp {
@@ -182,8 +194,11 @@ mod tests {
                 vec![OutputColumn {
                     column_id: ColumnId(3),
                     name: "city".into(),
-                    data_type: arrow::datatypes::DataType::Utf8,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Utf8,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 vec![],
@@ -191,8 +206,11 @@ mod tests {
             output_columns: vec![OutputColumn {
                 column_id: ColumnId(3),
                 name: "city".into(),
-                data_type: arrow::datatypes::DataType::Utf8,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Utf8,
+                    false,
+                ),
+
                 is_internal: false,
             }],
             is_merge: vec![],
@@ -215,8 +233,10 @@ mod tests {
                 qualifier: Some("t".into()),
                 column: "city".into(),
             },
-            data_type: arrow::datatypes::DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Utf8,
+                false,
+            ),
         };
         let mut scalars = ScalarArena::new();
         let op = PhysicalHashAggregateOp {
@@ -227,8 +247,11 @@ mod tests {
                 vec![OutputColumn {
                     column_id: ColumnId(30),
                     name: "city".into(),
-                    data_type: arrow::datatypes::DataType::Utf8,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Utf8,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 vec![],
@@ -254,8 +277,10 @@ mod tests {
                 qualifier: None,
                 column: "g".into(),
             },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         };
         let col_x = TypedExpr {
             kind: ExprKind::ColumnRef {
@@ -263,8 +288,10 @@ mod tests {
                 qualifier: None,
                 column: "x".into(),
             },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         };
         let mut scalars = ScalarArena::new();
         let op = PhysicalHashAggregateOp {
@@ -276,15 +303,21 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId(4),
                         name: "g".into(),
-                        data_type: arrow::datatypes::DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            arrow::datatypes::DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId(5),
                         name: "x".into(),
-                        data_type: arrow::datatypes::DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            arrow::datatypes::DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -343,8 +376,10 @@ mod tests {
                 qualifier: None,
                 column: "k".into(),
             },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         };
         let mut scalars = ScalarArena::new();
         for mode in [AggMode::Local, AggMode::DistinctLocal] {
@@ -356,8 +391,11 @@ mod tests {
                     vec![OutputColumn {
                         column_id: ColumnId(7),
                         name: "k".into(),
-                        data_type: arrow::datatypes::DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            arrow::datatypes::DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     }],
                     vec![],
@@ -365,8 +403,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: ColumnId(7),
                     name: "k".into(),
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 is_merge: vec![],

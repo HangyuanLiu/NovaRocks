@@ -225,7 +225,13 @@ impl PlannerTableProvider for TestCatalog {
 
 fn parse_analyze_and_plan(sql: &str) -> Result<LogicalPlanNode, String> {
     let (resolved, cte_registry, mut factory) = parse_analyze_query(sql)?;
-    plan_query(resolved, cte_registry, &mut factory)
+    plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn parse_analyze_query(
@@ -247,7 +253,13 @@ fn parse_analyze_query_apply(
 /// Analyze and plan `sql` with the Apply subquery framework.
 fn parse_analyze_and_plan_apply(sql: &str) -> Result<LogicalPlanNode, String> {
     let (resolved, cte_registry, mut factory) = parse_analyze_query_apply(sql)?;
-    plan_query(resolved, cte_registry, &mut factory)
+    plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn plan_test_query(sql: &str) -> LogicalPlanNode {
@@ -367,8 +379,7 @@ fn planner_group_by_targets_ignore_aggregate_public_output_order() {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -376,8 +387,8 @@ fn planner_group_by_targets_ignore_aggregate_public_output_order() {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -386,18 +397,24 @@ fn planner_group_by_targets_ignore_aggregate_public_output_order() {
         group_by: vec![col(1, "k"), col(2, "region")],
         aggregates: vec![AggregateCall {
             name: "count".to_string(),
-            args: Vec::new(),
             distinct: false,
             result_type: DataType::Int64,
-            order_by: Vec::new(),
             output_column_id: ColumnId(30),
-            resolved: crate::functions::test_resolved_aggregate("count", &[], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                Vec::new(),
+                Vec::new(),
+                crate::functions::test_resolved_aggregate("count", &[], false),
+            ),
         }],
         output_columns: vec![output(30, "sum(v)"), output(1, "k"), output(2, "region")],
         already_pushed: false,
     };
 
-    let targets = planner_aggregate_group_by_targets(&aggregate);
+    let targets = planner_aggregate_group_by_targets(
+        &aggregate,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .unwrap();
 
     assert_eq!(
         targets
@@ -580,8 +597,11 @@ fn adapt_plan_output_passthrough_when_outputs_match() {
             columns: vec![OutputColumn {
                 column_id: source_id,
                 name: "k".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }],
         }),
@@ -591,8 +611,11 @@ fn adapt_plan_output_passthrough_when_outputs_match() {
     let target = vec![OutputColumn {
         column_id: source_id,
         name: "k".to_string(),
-        data_type: arrow::datatypes::DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            false,
+        ),
+
         is_internal: false,
     }];
 
@@ -610,8 +633,11 @@ fn adapt_plan_output_renames_and_rebinds_with_project() {
             columns: vec![OutputColumn {
                 column_id: source_id,
                 name: "k".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }],
         }),
@@ -621,8 +647,11 @@ fn adapt_plan_output_renames_and_rebinds_with_project() {
     let target = vec![OutputColumn {
         column_id: target_id,
         name: "alias_k".to_string(),
-        data_type: arrow::datatypes::DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            false,
+        ),
+
         is_internal: false,
     }];
 
@@ -653,8 +682,11 @@ fn adapt_plan_output_with_qualifier_preserves_cte_alias_lookup() {
             columns: vec![OutputColumn {
                 column_id: source_id,
                 name: "k1".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }],
         }),
@@ -664,8 +696,11 @@ fn adapt_plan_output_with_qualifier_preserves_cte_alias_lookup() {
     let target = vec![OutputColumn {
         column_id: target_id,
         name: "k1".to_string(),
-        data_type: arrow::datatypes::DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            false,
+        ),
+
         is_internal: false,
     }];
 
@@ -698,8 +733,11 @@ fn adapt_plan_output_with_qualifier_inserts_project_when_outputs_match() {
             columns: vec![OutputColumn {
                 column_id: source_id,
                 name: "rnk".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }],
         }),
@@ -709,8 +747,11 @@ fn adapt_plan_output_with_qualifier_inserts_project_when_outputs_match() {
     let target = vec![OutputColumn {
         column_id: source_id,
         name: "rnk".to_string(),
-        data_type: arrow::datatypes::DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            false,
+        ),
+
         is_internal: false,
     }];
 
@@ -744,8 +785,11 @@ fn adapt_plan_output_allows_nullable_widening() {
             columns: vec![OutputColumn {
                 column_id: source_id,
                 name: "k".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
+
                 is_internal: false,
             }],
         }),
@@ -755,8 +799,11 @@ fn adapt_plan_output_allows_nullable_widening() {
     let target = vec![OutputColumn {
         column_id: target_id,
         name: "nullable_k".to_string(),
-        data_type: arrow::datatypes::DataType::Int64,
-        nullable: true,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            true,
+        ),
+
         is_internal: false,
     }];
 
@@ -765,7 +812,7 @@ fn adapt_plan_output_allows_nullable_widening() {
         panic!("expected Project adapter");
     };
     assert_eq!(project.items.len(), 1);
-    assert!(project.items[0].expr.nullable);
+    assert!(project.items[0].expr.value_type.nullable);
     assert_eq!(project.items[0].output_column_id, target_id);
 }
 
@@ -777,8 +824,11 @@ fn adapt_plan_output_rejects_nullable_narrowing() {
             columns: vec![OutputColumn {
                 column_id: ColumnId::new_for_test(10),
                 name: "k".to_string(),
-                data_type: arrow::datatypes::DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ),
+
                 is_internal: false,
             }],
         }),
@@ -788,8 +838,11 @@ fn adapt_plan_output_rejects_nullable_narrowing() {
     let target = vec![OutputColumn {
         column_id: ColumnId::new_for_test(20),
         name: "not_null_k".to_string(),
-        data_type: arrow::datatypes::DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            false,
+        ),
+
         is_internal: false,
     }];
 
@@ -814,8 +867,11 @@ fn adapt_plan_output_rejects_shape_mismatch() {
     let target = vec![OutputColumn {
         column_id: ColumnId::new_for_test(20),
         name: "alias_k".to_string(),
-        data_type: arrow::datatypes::DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            false,
+        ),
+
         is_internal: false,
     }];
 
@@ -945,7 +1001,7 @@ fn computed_aggregate_in_predicate_preserves_projection_nullability() {
         "SELECT x.a FROM t x INNER JOIN t y ON x.a = y.a AND y.b IN (SELECT MAX(b) - 501 FROM t)",
     )
     .unwrap();
-    let plan = plan_query(resolved, registry, &mut factory)
+    let plan = plan_query(resolved, registry, &mut factory, &crate::compiler::SqlCompileControl::unbounded())
         .expect("computed aggregate IN predicate must preserve its output contract");
     fn find_indicator(node: &LogicalPlanNode) -> Option<&ProjectItem> {
         if let LogicalPlanKind::Project(project) = &node.kind
@@ -960,18 +1016,18 @@ fn computed_aggregate_in_predicate_preserves_projection_nullability() {
     }
     let indicator = find_indicator(&plan).expect("JOIN ON must retain its match indicator");
     assert!(
-        !indicator.expr.nullable,
+        !indicator.expr.value_type.nullable,
         "the literal producer cannot emit NULL"
     );
     assert!(
-        factory.get(indicator.output_column_id).nullable,
+        factory.get(indicator.output_column_id).value_type.nullable,
         "the outer-join symbol must remain nullable for non-matches"
     );
 
     let max_plan = plan_test_query("SELECT MAX(b) - 501 FROM t WHERE false");
     let (project, _) = root_project_over_aggregate(&max_plan);
     assert!(
-        project.items[0].expr.nullable,
+        project.items[0].expr.value_type.nullable,
         "empty MAX must still admit NULL"
     );
 }
@@ -1197,12 +1253,18 @@ fn p3_cube_without_grouping_survives_optimizer_id_binding() {
                    SELECT a, b FROM t GROUP BY CUBE(a, b) ORDER BY a, b";
     let (resolved, cte_registry, mut factory) =
         parse_analyze_query(sql).expect("analyzer should succeed");
-    let logical_plan =
-        plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+    let logical_plan = plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("planner should succeed");
     let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
     let optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical_plan,
         &mut scalar_arena,
+        crate::optimizer::test_optimizer_control(),
     )
     .expect("logical to opt expr");
     let optimized_tree = crate::optimizer::optimize_with_test_table_statistics(
@@ -1225,12 +1287,18 @@ fn p3_rollup_order_by_only_key_survives_optimizer_id_binding() {
                    FROM t GROUP BY ROLLUP(a) ORDER BY a";
     let (resolved, cte_registry, mut factory) =
         parse_analyze_query(sql).expect("analyzer should succeed");
-    let logical_plan =
-        plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+    let logical_plan = plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("planner should succeed");
     let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
     let optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical_plan,
         &mut scalar_arena,
+        crate::optimizer::test_optimizer_control(),
     )
     .expect("logical to opt expr");
     let optimized_tree = crate::optimizer::optimize_with_test_table_statistics(
@@ -1266,12 +1334,18 @@ fn p3_rollup_window_order_by_alias_extra_survives_optimizer_id_binding() {
                    LIMIT 10";
     let (resolved, cte_registry, mut factory) =
         parse_analyze_query(sql).expect("analyzer should succeed");
-    let logical_plan =
-        plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+    let logical_plan = plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("planner should succeed");
     let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
     let optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical_plan,
         &mut scalar_arena,
+        crate::optimizer::test_optimizer_control(),
     )
     .expect("logical to opt expr");
     let optimized_tree = crate::optimizer::optimize_with_test_table_statistics(
@@ -1297,12 +1371,18 @@ fn p3_aggregate_order_by_alias_topn_survives_optimizer_id_binding() {
                    LIMIT 10";
     let (resolved, cte_registry, mut factory) =
         parse_analyze_query(sql).expect("analyzer should succeed");
-    let logical_plan =
-        plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+    let logical_plan = plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("planner should succeed");
     let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
     let optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &logical_plan,
         &mut scalar_arena,
+        crate::optimizer::test_optimizer_control(),
     )
     .expect("logical to opt expr");
     let optimized_tree = crate::optimizer::optimize_with_test_table_statistics(
@@ -2160,7 +2240,13 @@ fn p2_values_output_uses_single_column_id() {
     let (resolved, cte_registry, mut factory) =
         parse_analyze_query("VALUES (1, 2), (3, 4)").expect("analyzer should succeed");
     let analyzer_output_columns = resolved.output_columns.clone();
-    let plan = plan_query(resolved, cte_registry, &mut factory).expect("planner should succeed");
+    let plan = plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("planner should succeed");
     let LogicalPlanKind::Values(values) = &plan.kind else {
         panic!("expected Values root");
     };
@@ -2349,9 +2435,9 @@ fn grouping_input_sum_distinct_count_and_ordered_array_keep_original_rows() {
         assert_eq!(column_ref_id(&project.items[0].expr), repeat_key_id);
         assert_eq!(aggregate.aggregates.len(), 3);
         for call in &aggregate.aggregates {
-            assert_eq!(call.args.len(), 1);
+            assert_eq!(call.source.arguments().len(), 1);
             assert_eq!(
-                grouping_input_expr_column_ids(&call.args[0]),
+                grouping_input_expr_column_ids(&call.source.arguments()[0]),
                 [source_id].into(),
                 "{grouping}: {} must aggregate the original input, including total levels",
                 call.name
@@ -2360,10 +2446,10 @@ fn grouping_input_sum_distinct_count_and_ordered_array_keep_original_rows() {
                 assert!(call.distinct);
             }
             if call.name == "array_agg" {
-                assert_eq!(call.order_by.len(), 1);
-                assert!(!call.order_by[0].asc);
+                assert_eq!(call.source.order_by().len(), 1);
+                assert!(!call.source.order_by()[0].asc);
                 assert_eq!(
-                    grouping_input_expr_column_ids(&call.order_by[0].expr),
+                    grouping_input_expr_column_ids(&call.source.order_by()[0].expr),
                     [source_id].into(),
                     "ordered aggregate sorting belongs to the original row domain"
                 );
@@ -2383,7 +2469,7 @@ fn grouping_input_computed_key_does_not_replace_aggregate_arithmetic() {
         panic!("expected SUM");
     };
     assert_eq!(call.name, "sum");
-    let [arg] = call.args.as_slice() else {
+    let [arg] = call.source.arguments() else {
         panic!("expected SUM input expression");
     };
     assert!(
@@ -2405,7 +2491,7 @@ fn grouping_input_having_uses_group_outputs_and_original_aggregate_inputs() {
         panic!("expected one deduplicated SUM");
     };
     assert_eq!(
-        grouping_input_expr_column_ids(&sum.args[0]),
+        grouping_input_expr_column_ids(&sum.source.arguments()[0]),
         [source_id].into()
     );
     assert_eq!(column_ref_id(&project.items[0].expr), repeat_key_id);
@@ -2428,7 +2514,7 @@ fn grouping_input_window_orders_group_outputs_without_rewriting_inner_sum() {
         panic!("expected one inner SUM");
     };
     assert_eq!(
-        grouping_input_expr_column_ids(&sum.args[0]),
+        grouping_input_expr_column_ids(&sum.source.arguments()[0]),
         [source_id].into()
     );
     let windows = first_window_exprs(&plan);
@@ -2459,7 +2545,7 @@ fn grouping_input_scalar_predicate_preserves_non_group_argument_columns() {
         panic!("expected one SUM");
     };
     assert_eq!(
-        grouping_input_expr_column_ids(&sum.args[0]),
+        grouping_input_expr_column_ids(&sum.source.arguments()[0]),
         [b.output_column_id].into()
     );
     assert_ne!(b.output_column_id, repeat_key_id);
@@ -2481,12 +2567,26 @@ fn grouping_input_quoted_column_name_cannot_replace_an_entire_aggregate() {
     };
     let source_id = column_ref_id(&args[0]);
     assert_eq!(
-        crate::analysis::expr_display::typed_expr_display_name(&select.group_by[0]),
-        crate::analysis::expr_display::typed_expr_display_name(&select.projection[1].expr),
+        crate::analysis::expr_display::typed_expr_display_name(
+            &select.group_by[0],
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap(),
+        crate::analysis::expr_display::typed_expr_display_name(
+            &select.projection[1].expr,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap(),
         "the quoted grouping key and real aggregate intentionally share a display name"
     );
 
-    let plan = plan_query(resolved, registry, &mut factory).expect("collision must preserve SUM");
+    let plan = plan_query(
+        resolved,
+        registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("collision must preserve SUM");
     let (_, repeat) = first_repeat_node(&plan);
     let key_id = repeat.all_rollup_column_ids[0];
     let (project, aggregate) = root_project_over_aggregate(&plan);
@@ -2495,7 +2595,7 @@ fn grouping_input_quoted_column_name_cannot_replace_an_entire_aggregate() {
     };
     assert_eq!(sum.name, "sum");
     assert_eq!(
-        grouping_input_expr_column_ids(&sum.args[0]),
+        grouping_input_expr_column_ids(&sum.source.arguments()[0]),
         [source_id].into()
     );
     assert_eq!(column_ref_id(&project.items[0].expr), key_id);
@@ -2681,15 +2781,15 @@ fn apply_output_columns_extend_left_with_output_column() {
     let left_col = OutputColumn {
         column_id: ColumnId(11),
         name: "l1".to_string(),
-        data_type: DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
         is_internal: false,
     };
     let out_col = OutputColumn {
         column_id: ColumnId(12),
         name: "__sq_1".to_string(),
-        data_type: DataType::Int64,
-        nullable: true,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
         is_internal: true,
     };
     let plan = LogicalPlanNode::new(
@@ -2701,8 +2801,7 @@ fn apply_output_columns_extend_left_with_output_column() {
                     qualifier: None,
                     column: "__sq_1".to_string(),
                 },
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             },
             output_column: out_col.clone(),
             inner_output_column_id: out_col.column_id,
@@ -2752,8 +2851,8 @@ fn assert_one_row_output_columns_pass_through() {
     let col = OutputColumn {
         column_id: ColumnId(21),
         name: "c1".to_string(),
-        data_type: DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
         is_internal: false,
     };
     let plan = LogicalPlanNode::new(
@@ -2938,8 +3037,13 @@ fn plan_with_single_predicate_apply_spec(
         "test query must record exactly one predicate apply spec"
     );
     let spec = select.predicate_apply_specs[0].clone();
-    let plan = plan_query(resolved, cte_registry, &mut factory)
-        .expect("planner must consume predicate apply spec");
+    let plan = plan_query(
+        resolved,
+        cte_registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("planner must consume predicate apply spec");
     (plan, spec)
 }
 
@@ -2965,8 +3069,8 @@ fn direct_where_apply(plan: &LogicalPlanNode) -> &LogicalApplyNode {
 }
 
 fn assert_same_column_ref_expr(actual: &TypedExpr, expected: &TypedExpr) {
-    assert_eq!(actual.data_type, expected.data_type);
-    assert_eq!(actual.nullable, expected.nullable);
+    assert_eq!(actual.value_type.data_type, expected.value_type.data_type);
+    assert_eq!(actual.value_type.nullable, expected.value_type.nullable);
     let ExprKind::ColumnRef {
         column_id: actual_id,
         qualifier: actual_qualifier,
@@ -3050,11 +3154,11 @@ fn plan_exists_subquery_expr_is_boolean_colref() {
     let apply = direct_where_apply(&plan);
 
     assert_eq!(
-        apply.subquery_expr.data_type,
+        apply.subquery_expr.value_type.data_type,
         arrow::datatypes::DataType::Boolean
     );
     assert_eq!(
-        apply.subquery_expr.nullable, spec.output_column.nullable,
+        apply.subquery_expr.value_type.nullable, spec.output_column.value_type.nullable,
         "EXISTS subquery_expr must mirror the Boolean predicate output nullability"
     );
     let ExprKind::ColumnRef { column_id, .. } = apply.subquery_expr.kind else {
@@ -3078,20 +3182,15 @@ fn array_agg_json_project_retains_semantics_above_exact_aggregate_slots() {
     ] {
         let plan = plan_test_query(sql);
         let (project, aggregate) = root_project_over_aggregate(&plan);
-        let DataType::List(json_item) = &project.items[0].expr.data_type else {
+        let DataType::List(json_item) = &project.items[0].expr.value_type.data_type else {
             panic!("expected JSON List");
         };
-        let DataType::List(string_item) = &project.items[1].expr.data_type else {
+        let DataType::List(string_item) = &project.items[1].expr.value_type.data_type else {
             panic!("expected STRING List");
         };
         assert_eq!(logical_type_of_field(json_item), Some(LogicalType::Json));
         assert_eq!(logical_type_of_field(string_item), None);
-        let ExprKind::Cast {
-            expr: reference, ..
-        } = &project.items[0].expr.kind
-        else {
-            panic!("expected output adapter");
-        };
+        let reference = &project.items[0].expr;
         let ExprKind::ColumnRef { column_id, .. } = reference.kind else {
             panic!("expected exact aggregate output slot");
         };
@@ -3100,21 +3199,22 @@ fn array_agg_json_project_retains_semantics_above_exact_aggregate_slots() {
             .iter()
             .find(|call| call.output_column_id == column_id)
             .unwrap();
-        assert_eq!(reference.data_type, call.result_type);
-        assert_eq!(
-            call.result_type,
-            crate::functions::aggregate_result_type(&call.resolved).data_type
-        );
-        let DataType::List(physical_item) = &call.result_type else {
-            panic!("expected physical List");
+        let selected = crate::functions::aggregate_result_type(call.source.binding());
+        assert_eq!(&reference.value_type, selected);
+        assert_eq!(call.result_type, selected.data_type);
+        let DataType::List(selected_item) = &selected.data_type else {
+            panic!("expected selected JSON List");
         };
-        assert_eq!(logical_type_of_field(physical_item), None);
+        assert_eq!(
+            logical_type_of_field(selected_item),
+            Some(LogicalType::Json)
+        );
         let output = aggregate
             .output_columns
             .iter()
             .find(|output| output.column_id == column_id)
             .unwrap();
-        assert_eq!(output.data_type, call.result_type);
+        assert_eq!(&output.value_type, selected);
     }
 }
 
@@ -3140,7 +3240,7 @@ fn assert_m07_planned_domains(sql: &str, expected: Vec<Option<novarocks_types::s
         .iter()
         .map(|id| factory.has_json_list_provenance(*id))
         .collect();
-    let plan = plan_query(resolved, registry, &mut factory)
+    let plan = plan_query(resolved, registry, &mut factory, &crate::compiler::SqlCompileControl::unbounded())
         .unwrap_or_else(|error| panic!("{sql}: {error}"));
     let columns = plan_output_columns(&plan).unwrap();
     assert_eq!(
@@ -3224,7 +3324,7 @@ fn m07_aggregate_symbol_rewrites_keep_original_output_domains() {
     ] {
         assert_m07_planned_domains(sql, expected);
         let (resolved, registry, mut factory) = parse_analyze_query(sql).unwrap();
-        let plan = plan_query(resolved, registry, &mut factory).unwrap();
+        let plan = plan_query(resolved, registry, &mut factory, &crate::compiler::SqlCompileControl::unbounded()).unwrap();
         let columns = plan_output_columns(&plan).unwrap();
         assert_ne!(
             columns[0].column_id, columns[1].column_id,
@@ -3287,9 +3387,9 @@ fn m07_shared_aggregate_symbol_refuses_conflicting_occurrence_facts() {
         for ordinal in [0, 1] {
             let (resolved, registry, mut factory) = parse_analyze_query(sql).unwrap();
             factory.set_logical_type(resolved.output_columns[ordinal].column_id, conflict.clone());
-            let error = plan_query(resolved, registry, &mut factory).unwrap_err();
+            let error = plan_query(resolved, registry, &mut factory, &crate::compiler::SqlCompileControl::unbounded()).unwrap_err();
             assert!(
-                error.contains("merged conflicting source domains"),
+                error.to_string().contains("merged conflicting source domains"),
                 "{error}"
             );
         }
@@ -3300,23 +3400,23 @@ fn m07_shared_aggregate_symbol_refuses_conflicting_occurrence_facts() {
 fn m07_same_value_transfer_checks_carrier_nullability_and_existing_facts() {
     use novarocks_types::schema::SqlType;
     let mut factory = ColumnRefFactory::new();
-    let source = factory.create(None, "source".into(), DataType::Binary, true);
+    let source = factory.create(None, "source".into(), novarocks_type_contract::FunctionValueType::new(DataType::Binary, true));
     factory.set_logical_type(source, Some(SqlType::Hll));
-    let wrong_type = factory.create(None, "wrong".into(), DataType::Utf8, true);
+    let wrong_type = factory.create(None, "wrong".into(), novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true));
     assert!(
         factory
             .transfer_value_provenance(source, wrong_type)
             .unwrap_err()
             .contains("carrier")
     );
-    let narrowed = factory.create(None, "narrowed".into(), DataType::Binary, false);
+    let narrowed = factory.create(None, "narrowed".into(), novarocks_type_contract::FunctionValueType::new(DataType::Binary, false));
     assert!(
         factory
             .transfer_value_provenance(source, narrowed)
             .unwrap_err()
             .contains("nullability")
     );
-    let conflict = factory.create(None, "conflict".into(), DataType::Binary, true);
+    let conflict = factory.create(None, "conflict".into(), novarocks_type_contract::FunctionValueType::new(DataType::Binary, true));
     factory.set_logical_type(conflict, Some(SqlType::Bitmap));
     assert!(
         factory
@@ -3324,7 +3424,7 @@ fn m07_same_value_transfer_checks_carrier_nullability_and_existing_facts() {
             .unwrap_err()
             .contains("logical domains")
     );
-    let target = factory.create(None, "target".into(), DataType::Binary, true);
+    let target = factory.create(None, "target".into(), novarocks_type_contract::FunctionValueType::new(DataType::Binary, true));
     factory.transfer_value_provenance(source, target).unwrap();
     assert_eq!(factory.logical_type(target), Some(SqlType::Hll));
 }

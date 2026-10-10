@@ -581,6 +581,7 @@ impl RawCreate {
                 .expect("a raw context carries its backend"),
         };
         let frozen = proto::FrozenFragment {
+            package: Default::default(),
             plan_version: vec![0x5b; 16],
             plan_contract_revision: 1,
             fragment_contract_version: 1,

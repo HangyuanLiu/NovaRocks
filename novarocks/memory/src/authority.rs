@@ -205,6 +205,18 @@ impl MemoryAuthority {
         (registry.records.capacity() * std::mem::size_of::<Option<crate::LaneHandle>>()) as u64
             + registry.occupied as u64 * crate::lane::OBSERVATION_LANE_METADATA_BYTES
     }
+    /// Bound one original maintenance pass by the actual immutable index
+    /// lengths. Stopped domains can retain records after leaving the active
+    /// owner cap, so max_active_owners is not this traversal's domain bound.
+    /// This observation does not pin membership, complete a busy sweep, or
+    /// authorize any allocation.
+    pub fn maintenance_scan_bound(&self) -> Result<usize, CapacityError> {
+        let domains = self.shared.domains.lock().unwrap().records.len();
+        let accounts = self.shared.accounts.lock().unwrap().records.len();
+        domains.checked_add(accounts).ok_or(CapacityError::Invalid {
+            detail: "maintenance registry scan bound overflows usize",
+        })
+    }
     pub const fn config(&self) -> AuthorityConfig {
         self.config
     }

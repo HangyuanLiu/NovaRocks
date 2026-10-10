@@ -26,6 +26,7 @@
 //! predicates.
 
 use crate::analysis::{ExprKind, JoinKind, OutputColumn, ProjectItem, TypedExpr};
+use crate::compiler::SqlCompileError;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::rewrite::context::RewriteContext;
 use crate::optimizer::rewrite::phase::RewritePhase;
@@ -164,9 +165,9 @@ fn is_signed_state_aggregate(node: &LogicalAggregateNode) -> bool {
 
 fn is_hidden_retraction_count_call(call: &crate::planner::payload::AggregateCall) -> bool {
     call.name.eq_ignore_ascii_case("sum")
-        && call.args.len() == 1
+        && call.source.arguments().len() == 1
         && matches!(
-            &call.args[0].kind,
+            &call.source.arguments()[0].kind,
             ExprKind::ColumnRef { column, .. } if column.eq_ignore_ascii_case(ImvActionColumn::NAME)
         )
 }
@@ -287,6 +288,7 @@ fn expr_contains_function(expr: &TypedExpr, name: &str) -> bool {
         ExprKind::ColumnRef { .. }
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. } => false,
     }
 }
@@ -391,7 +393,11 @@ impl LogicalRewriteRule for InjectActionColumnRule {
         }
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         bridge_apply_result(expr, ctx, |mut plan, ctx| {
             let LogicalPlanKind::Scan(scan) = &mut plan.kind else {
                 return Ok(PlanRewriteResult::Unchanged);
@@ -399,8 +405,10 @@ impl LogicalRewriteRule for InjectActionColumnRule {
             let column_id = crate::planner::imv_rewrite::column_alloc::allocate_imv_column(
                 ctx,
                 ImvActionColumn::NAME,
-                arrow::datatypes::DataType::Int8,
-                false,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int8,
+                    false,
+                ),
             )?;
             scan.columns
                 .retain(|column| !is_action_column_name(&column.name));
@@ -480,7 +488,11 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
         }
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         bridge_apply_result(expr, ctx, |mut plan, ctx| {
             // Diagnostic: the delta base under an unsupported node, if any. Computed
             // up-front from `&plan` so the fail-fast arms can name the offending
@@ -508,8 +520,7 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                                 qualifier: None,
                                 column: col.name.clone(),
                             },
-                            data_type: col.data_type.clone(),
-                            nullable: col.nullable,
+                            value_type: col.value_type.clone(),
                         },
                         output_name: col.name.clone(),
                         output_column_id: col.column_id,
@@ -526,8 +537,10 @@ impl LogicalRewriteRule for PropagateActionColumnRule {
                 let row_id_column = crate::planner::imv_rewrite::column_alloc::allocate_imv_column(
                     ctx,
                     crate::planner::imv_rewrite::row_id_column::ImvRowIdColumn::NAME,
-                    arrow::datatypes::DataType::Int64,
-                    false,
+                    novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        false,
+                    ),
                 )?;
                 for input in &mut plan.children {
                     normalize_branch_row_id_output(input, row_id_column)?;
@@ -625,8 +638,7 @@ fn promote_project_union_row_id_output(
     let row_id_column = crate::planner::imv_rewrite::column_alloc::allocate_imv_column(
         ctx,
         crate::planner::imv_rewrite::row_id_column::ImvRowIdColumn::NAME,
-        arrow::datatypes::DataType::Int64,
-        false,
+        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int64, false),
     )?;
     let Some(union_plan) = plan.children.get_mut(0) else {
         return Ok(false);
@@ -656,8 +668,8 @@ fn promote_project_union_row_id_output(
             *column_id = row_id_column;
             *column = ImvRowIdColumn::NAME.to_string();
         }
-        item.expr.data_type = arrow::datatypes::DataType::Int64;
-        item.expr.nullable = false;
+        item.expr.value_type.data_type = arrow::datatypes::DataType::Int64;
+        item.expr.value_type.nullable = false;
         item.output_column_id = row_id_column;
         item.output_name = ImvRowIdColumn::NAME.to_string();
     }
@@ -716,8 +728,8 @@ fn branch_output_action_column_id(plan: &LogicalPlanNode) -> Option<crate::colum
                     return None;
                 };
                 (*column_id == item.output_column_id
-                    && item.expr.data_type == arrow::datatypes::DataType::Int8
-                    && !item.expr.nullable)
+                    && item.expr.value_type.data_type == arrow::datatypes::DataType::Int8
+                    && !item.expr.value_type.nullable)
                     .then_some(item.output_column_id)
             }),
         LogicalPlanKind::ImvDelta(_) | LogicalPlanKind::ImvVersion(_) => {
@@ -813,7 +825,7 @@ mod tests {
     use crate::planner::optimizer_bridge::logical::{to_logical_plan, to_optimizer_expr};
     use crate::planner::payload::{PlanFilterNode, PlanScanNode};
 
-    fn build_ctx() -> RewriteContext {
+    fn build_ctx() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::new());
         let factory = Rc::new(RefCell::new(crate::column_id::ColumnRefFactory::new()));
         factory.borrow_mut().reserve_until(100);
@@ -866,8 +878,8 @@ mod tests {
             columns: vec![OutputColumn {
                 column_id: ColumnId(1),
                 name: "k".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             }],
             predicates: Vec::new(),
@@ -919,8 +931,8 @@ mod tests {
             .iter()
             .find(|c| ImvActionColumn::matches(c))
             .expect("action column must be present");
-        assert_eq!(action.data_type, DataType::Int8);
-        assert!(!action.nullable);
+        assert_eq!(action.value_type.data_type, DataType::Int8);
+        assert!(!action.value_type.nullable);
         assert!(action.is_internal);
         assert_eq!(action.column_id, ColumnId(100));
         assert!(
@@ -1016,8 +1028,10 @@ mod tests {
                             qualifier: None,
                             column: "k".to_string(),
                         },
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
                     output_name: "k".to_string(),
                     output_column_id: projected_user_col_id,
@@ -1048,8 +1062,10 @@ mod tests {
                                 qualifier: None,
                                 column: "k".to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: "k".to_string(),
                         output_column_id: user_col_id,
@@ -1061,8 +1077,10 @@ mod tests {
                                 qualifier: None,
                                 column: ImvActionColumn::NAME.to_string(),
                             },
-                            data_type: DataType::Int8,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int8,
+                                false,
+                            ),
                         },
                         output_name: ImvActionColumn::NAME.to_string(),
                         output_column_id: action_id,
@@ -1097,8 +1115,10 @@ mod tests {
                         qualifier: None,
                         column: ImvRowIdColumn::NAME.to_string(),
                     },
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 },
                 output_name: ImvRowIdColumn::NAME.to_string(),
                 output_column_id: row_id,
@@ -1119,8 +1139,10 @@ mod tests {
                             qualifier: None,
                             column: "k".to_string(),
                         },
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
                     output_name: "k".to_string(),
                     output_column_id: user_col_id,
@@ -1152,8 +1174,10 @@ mod tests {
                             qualifier: None,
                             column: "k".to_string(),
                         },
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
                     output_name: "k".to_string(),
                     output_column_id: user_col_id,
@@ -1192,8 +1216,10 @@ mod tests {
                                 qualifier: None,
                                 column: "k".to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: "k".to_string(),
                         output_column_id: user_col_id,
@@ -1205,8 +1231,10 @@ mod tests {
                                 qualifier: None,
                                 column: ImvActionColumn::NAME.to_string(),
                             },
-                            data_type: DataType::Int8,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int8,
+                                false,
+                            ),
                         },
                         output_name: ImvActionColumn::NAME.to_string(),
                         output_column_id: action_id,
@@ -1227,8 +1255,11 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     ImvActionColumn::output_column(action_id),
@@ -1268,8 +1299,10 @@ mod tests {
                                 qualifier: None,
                                 column: "k".to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: "k".to_string(),
                         output_column_id: user_col_id,
@@ -1281,8 +1314,10 @@ mod tests {
                                 qualifier: None,
                                 column: "k".to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: ImvActionColumn::NAME.to_string(),
                         output_column_id: action_id,
@@ -1313,8 +1348,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(column_id),
             name: name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             is_internal,
         }
     }
@@ -1343,8 +1378,8 @@ mod tests {
             ExprKind::ColumnRef { column_id, .. } => assert_eq!(*column_id, ColumnId(100)),
             other => panic!("expected ColumnRef, got {:?}", other),
         }
-        assert_eq!(last.expr.data_type, DataType::Int8);
-        assert!(!last.expr.nullable);
+        assert_eq!(last.expr.value_type.data_type, DataType::Int8);
+        assert!(!last.expr.value_type.nullable);
     }
 
     #[test]
@@ -1361,8 +1396,10 @@ mod tests {
                         qualifier: None,
                         column: "__change_op".to_string(),
                     },
-                    data_type: DataType::Int8,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int8,
+                        false,
+                    ),
                 },
                 output_name: "__change_op".to_string(),
                 output_column_id: ColumnId(100),
@@ -1403,6 +1440,9 @@ mod tests {
         let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Aggregate must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(err.contains("Phase 4"), "unexpected error: {err}");
         assert!(err.contains("ice.db.b"), "unexpected error: {err}");
     }
@@ -1425,6 +1465,9 @@ mod tests {
         let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Join must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(
             err.contains("delta-pushdown fixpoint"),
             "unexpected error: {err}"
@@ -1451,6 +1494,9 @@ mod tests {
         let expr = to_optimizer_expr(&plan, &mut arena);
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(err.contains("Phase 6"), "unexpected error: {err}");
         assert!(err.contains("ice.db.b"), "unexpected error: {err}");
     }
@@ -1464,8 +1510,10 @@ mod tests {
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![recursive_join_delta_union(action_id)],
@@ -1504,8 +1552,11 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     ImvActionColumn::output_column(action_id),
@@ -1565,6 +1616,9 @@ mod tests {
         let expr = to_optimizer_expr(&union, &mut arena_rc.borrow_mut());
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(err.contains("Phase 6"), "unexpected error: {err}");
         assert!(err.contains("ice.db.b"), "unexpected error: {err}");
     }
@@ -1602,8 +1656,11 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     ImvActionColumn::output_column(action_id),
@@ -1661,8 +1718,11 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     ImvActionColumn::output_column(action_id),
@@ -1684,8 +1744,10 @@ mod tests {
                                 qualifier: None,
                                 column: "k".to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: "k".to_string(),
                         output_column_id: ColumnId(1),
@@ -1697,8 +1759,10 @@ mod tests {
                                 qualifier: None,
                                 column: ImvRowIdColumn::NAME.to_string(),
                             },
-                            data_type: DataType::Int64,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
                         },
                         output_name: ImvRowIdColumn::NAME.to_string(),
                         output_column_id: ColumnId(101),
@@ -1773,6 +1837,9 @@ mod tests {
         drop(arena_rc);
         assert!(rule.matches(&expr, &ctx));
         let err = rule.apply(expr, &mut ctx).expect_err("Union must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(err.contains("Phase 6"), "unexpected error: {err}");
         assert!(err.contains("ice.db.b"), "unexpected error: {err}");
     }
@@ -1818,8 +1885,10 @@ mod tests {
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![scan],

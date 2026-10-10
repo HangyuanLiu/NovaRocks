@@ -53,7 +53,7 @@ pub(crate) const DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP: Duration = Duration::f
 /// One typed scan's split source, with the scan it feeds.
 pub(crate) struct RoundSplitSource {
     pub(crate) scan: super::ScanNodeKey,
-    pub(crate) source: Box<dyn ConnectorReadSplitSource>,
+    pub(crate) source: super::SupervisedSplitSource,
     pub(crate) encoder: Arc<dyn ConnectorReadWireEncoder>,
     /// FE admission state is query-attempt local and shared only with this
     /// attempt's control readers.  The source observes it afresh for every
@@ -64,6 +64,8 @@ pub(crate) struct RoundSplitSource {
     pub(crate) feedback_bindings: Vec<(u32, ConnectorReadColumnHandle)>,
     pub(crate) initial_wait_initialized: bool,
     pub(crate) initial_wait_deadline: Option<Instant>,
+    // All enclosing source backings retire before this fixed original alias.
+    pub(crate) _backing: Option<crate::task_execution::blocking_io::ConnectorBlockingIoBacking>,
 }
 
 /// The per-round owner of every split source and the driver that drains them.
@@ -93,25 +95,51 @@ pub(crate) enum RoundSplitEnumeration {
 /// One source moved into an ordinary blocking job.
 pub(crate) struct RoundSplitEnumerationRequest {
     slot: usize,
-    source: RoundSplitSource,
     dynamic_filter:
         Option<novarocks_spi::connector::read_stack::ConnectorReadDynamicFilterSnapshot>,
     started_at: Instant,
     initial_dynamic_filter_wait_cap: Duration,
+    source: RoundSplitSource,
+}
+
+impl RoundSplitEnumerationRequest {
+    pub(crate) fn join_pin(
+        &self,
+    ) -> Option<crate::task_execution::blocking_io::ConnectorBlockingIoJoinPin> {
+        self.source.source.join_pin()
+    }
 }
 
 /// One completed Connector call, including the source the serial owner must
 /// either adopt or close through supervised work.
 pub(crate) struct RoundSplitEnumerationResult {
     pub(crate) slot: usize,
-    pub(crate) source: RoundSplitSource,
     pub(crate) batch: Result<
         Option<ConnectorSplitBatch<novarocks_spi::connector::read_stack::ConnectorReadSplit>>,
         SplitAssignmentDriverError,
     >,
+    pub(crate) source: RoundSplitSource,
+}
+
+impl RoundSplitEnumerationResult {
+    pub(crate) fn discard_batch(self) -> RoundSplitSource {
+        let Self { batch, source, .. } = self;
+        // Keep the source's original backing until the unadopted batch retires.
+        drop(batch);
+        source
+    }
 }
 
 impl RoundSplitAssignment {
+    pub(crate) fn join_pins(
+        &self,
+    ) -> Vec<crate::task_execution::blocking_io::ConnectorBlockingIoJoinPin> {
+        self.sources
+            .iter()
+            .flatten()
+            .filter_map(|source| source.source.join_pin())
+            .collect()
+    }
     pub(crate) fn profile_snapshot(&self) -> SplitSourceProfile {
         self.sources
             .iter()
@@ -531,7 +559,9 @@ mod tests {
             1,
             vec![RoundSplitSource {
                 scan: crate::query_execution::split_assignment::ScanNodeKey::new(1u32, 7),
-                source: Box::new(CloseCountingSource { close_calls }),
+                source: super::super::SupervisedSplitSource::fixture(Box::new(
+                    CloseCountingSource { close_calls },
+                )),
                 encoder: Arc::new(InertCodec),
                 feedback: Arc::new(
                     RuntimeFilterFeedbackState::new(execution_id, Default::default())
@@ -540,6 +570,7 @@ mod tests {
                 feedback_bindings: Vec::new(),
                 initial_wait_initialized: false,
                 initial_wait_deadline: None,
+                _backing: None,
             }],
             TaskUpdateRetryPolicy::default(),
             DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP,

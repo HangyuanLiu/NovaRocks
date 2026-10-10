@@ -20,9 +20,11 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, TimeUnit};
-use novarocks_types::largeint::LARGEINT_BYTE_WIDTH;
-use sha2::{Digest, Sha256};
+use arrow::datatypes::DataType;
+use novarocks_local_program::{
+    FilterMembershipSchema, FilterMembershipSchemaError, FilterNullSemantics,
+    encode_filter_key_type,
+};
 
 pub mod contribution;
 pub mod evaluator;
@@ -129,12 +131,13 @@ pub enum RuntimeFilterNullSemantics {
     NullSafeEqual,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The runtime view of a canonical membership artifact schema. The canonical
+/// bytes and their digest are owned by `novarocks-local-program`, which is
+/// also what a static membership contract was digested with; this type only
+/// projects that one schema into the Execution vocabulary.
+#[derive(Clone, Eq, PartialEq)]
 pub struct RuntimeFilterMembershipSchema {
-    data_type: DataType,
-    null_semantics: RuntimeFilterNullSemantics,
-    canonical_bytes: Arc<[u8]>,
-    digest: [u8; 32],
+    canonical: FilterMembershipSchema,
 }
 
 impl RuntimeFilterMembershipSchema {
@@ -142,234 +145,80 @@ impl RuntimeFilterMembershipSchema {
         data_type: &DataType,
         null_semantics: RuntimeFilterNullSemantics,
     ) -> Result<Self, RuntimeFilterContractViolation> {
-        let mut canonical = Vec::with_capacity(48);
-        canonical.extend_from_slice(b"novarocks.runtime-filter.artifact-schema");
-        canonical.push(1);
-        encode_membership_schema_type(data_type, &mut canonical)?;
-        canonical.push(match null_semantics {
-            RuntimeFilterNullSemantics::NeverMatches => 1,
-            RuntimeFilterNullSemantics::NullSafeEqual => 2,
-        });
-        let digest = Sha256::digest(&canonical).into();
-        Ok(Self {
-            data_type: data_type.clone(),
-            null_semantics,
-            canonical_bytes: canonical.into(),
-            digest,
-        })
+        let canonical = FilterMembershipSchema::try_new(data_type, null_semantics.canonical())
+            .map_err(membership_schema_error)?;
+        Ok(Self { canonical })
     }
 
     pub fn from_canonical(
         canonical_bytes: impl AsRef<[u8]>,
         expected_digest: [u8; 32],
     ) -> Result<Self, RuntimeFilterContractViolation> {
-        let canonical = canonical_bytes.as_ref();
-        let digest: [u8; 32] = Sha256::digest(canonical).into();
-        if digest != expected_digest {
-            return Err(RuntimeFilterContractViolation::new(
-                RuntimeFilterContractViolationKind::ContractMismatch,
-                "membership schema digest does not match canonical bytes",
-            ));
-        }
-        const DOMAIN: &[u8] = b"novarocks.runtime-filter.artifact-schema";
-        let mut cursor = MembershipSchemaCursor::new(canonical);
-        if cursor.take(DOMAIN.len())? != DOMAIN || cursor.u8()? != 1 {
-            return Err(membership_schema_error(
-                "unknown canonical membership schema prefix",
-            ));
-        }
-        let data_type = decode_membership_schema_type(&mut cursor)?;
-        let null_semantics = match cursor.u8()? {
-            1 => RuntimeFilterNullSemantics::NeverMatches,
-            2 => RuntimeFilterNullSemantics::NullSafeEqual,
-            _ => return Err(membership_schema_error("invalid membership null semantics")),
-        };
-        if !cursor.empty() {
-            return Err(membership_schema_error(
-                "membership schema has trailing bytes",
-            ));
-        }
-        Ok(Self {
-            data_type,
-            null_semantics,
-            canonical_bytes: Arc::from(canonical),
-            digest,
-        })
+        let canonical = FilterMembershipSchema::from_canonical(canonical_bytes, expected_digest)
+            .map_err(membership_schema_error)?;
+        Ok(Self { canonical })
     }
 
     pub const fn data_type(&self) -> &DataType {
-        &self.data_type
+        self.canonical.data_type()
     }
 
     pub const fn null_semantics(&self) -> RuntimeFilterNullSemantics {
-        self.null_semantics
+        RuntimeFilterNullSemantics::from_canonical(self.canonical.null_semantics())
     }
 
     pub fn canonical_bytes(&self) -> &[u8] {
-        &self.canonical_bytes
+        self.canonical.canonical_bytes()
     }
 
     pub const fn digest(&self) -> [u8; 32] {
-        self.digest
+        self.canonical.digest()
     }
 }
 
-fn membership_schema_error(detail: &'static str) -> RuntimeFilterContractViolation {
+impl fmt::Debug for RuntimeFilterMembershipSchema {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeFilterMembershipSchema")
+            .field("data_type", self.data_type())
+            .field("null_semantics", &self.null_semantics())
+            .field("canonical_bytes", &self.canonical_bytes())
+            .field("digest", &self.digest())
+            .finish()
+    }
+}
+
+impl RuntimeFilterNullSemantics {
+    /// The same semantics in the canonical schema owner's vocabulary.
+    pub const fn canonical(self) -> FilterNullSemantics {
+        match self {
+            Self::NeverMatches => FilterNullSemantics::NeverMatches,
+            Self::NullSafeEqual => FilterNullSemantics::NullSafeEqual,
+        }
+    }
+
+    pub const fn from_canonical(semantics: FilterNullSemantics) -> Self {
+        match semantics {
+            FilterNullSemantics::NeverMatches => Self::NeverMatches,
+            FilterNullSemantics::NullSafeEqual => Self::NullSafeEqual,
+        }
+    }
+}
+
+fn membership_schema_error(error: FilterMembershipSchemaError) -> RuntimeFilterContractViolation {
     RuntimeFilterContractViolation::new(
         RuntimeFilterContractViolationKind::ContractMismatch,
-        detail,
+        error.detail(),
     )
 }
 
-struct MembershipSchemaCursor<'a> {
-    remaining: &'a [u8],
-}
-
-impl<'a> MembershipSchemaCursor<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
-        Self { remaining: bytes }
-    }
-
-    const fn empty(&self) -> bool {
-        self.remaining.is_empty()
-    }
-
-    fn take(&mut self, length: usize) -> Result<&'a [u8], RuntimeFilterContractViolation> {
-        let (value, remaining) = self
-            .remaining
-            .split_at_checked(length)
-            .ok_or_else(|| membership_schema_error("truncated membership schema"))?;
-        self.remaining = remaining;
-        Ok(value)
-    }
-
-    fn u8(&mut self) -> Result<u8, RuntimeFilterContractViolation> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32, RuntimeFilterContractViolation> {
-        Ok(u32::from_be_bytes(
-            self.take(4)?
-                .try_into()
-                .expect("schema cursor guarantees four bytes"),
-        ))
-    }
-}
-
+/// Append the canonical encoding of one runtime-filter key type, as owned by
+/// the canonical schema in `novarocks-local-program`.
 fn encode_membership_schema_type(
     data_type: &DataType,
     output: &mut Vec<u8>,
 ) -> Result<(), RuntimeFilterContractViolation> {
-    match data_type {
-        DataType::Boolean => output.push(1),
-        DataType::Int8 => output.push(2),
-        DataType::Int16 => output.push(3),
-        DataType::Int32 => output.push(4),
-        DataType::Int64 => output.push(5),
-        DataType::FixedSizeBinary(width) if *width == LARGEINT_BYTE_WIDTH => output.push(6),
-        DataType::Float32 => output.push(7),
-        DataType::Float64 => output.push(8),
-        DataType::Utf8 => output.push(9),
-        DataType::Date32 => output.push(10),
-        DataType::Timestamp(unit, timezone) => {
-            output.extend_from_slice(&[
-                11,
-                match unit {
-                    TimeUnit::Second => 1,
-                    TimeUnit::Millisecond => 2,
-                    TimeUnit::Microsecond => 3,
-                    TimeUnit::Nanosecond => 4,
-                },
-            ]);
-            match timezone {
-                Some(timezone) => {
-                    output.push(1);
-                    let length = u32::try_from(timezone.len()).map_err(|_| {
-                        membership_schema_error("membership schema timezone length overflows u32")
-                    })?;
-                    output.extend_from_slice(&length.to_be_bytes());
-                    output.extend_from_slice(timezone.as_bytes());
-                }
-                None => output.push(0),
-            }
-        }
-        DataType::Decimal128(precision, scale)
-            if *precision != 0
-                && *precision <= DECIMAL128_MAX_PRECISION
-                && *scale <= DECIMAL128_MAX_SCALE
-                && (*scale <= 0 || (*scale as u8) <= *precision) =>
-        {
-            output.extend_from_slice(&[12, *precision, *scale as u8]);
-        }
-        _ => {
-            return Err(membership_schema_error(
-                "unsupported membership schema type",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn decode_membership_schema_type(
-    cursor: &mut MembershipSchemaCursor<'_>,
-) -> Result<DataType, RuntimeFilterContractViolation> {
-    match cursor.u8()? {
-        1 => Ok(DataType::Boolean),
-        2 => Ok(DataType::Int8),
-        3 => Ok(DataType::Int16),
-        4 => Ok(DataType::Int32),
-        5 => Ok(DataType::Int64),
-        6 => Ok(DataType::FixedSizeBinary(LARGEINT_BYTE_WIDTH)),
-        7 => Ok(DataType::Float32),
-        8 => Ok(DataType::Float64),
-        9 => Ok(DataType::Utf8),
-        10 => Ok(DataType::Date32),
-        11 => {
-            let unit = match cursor.u8()? {
-                1 => TimeUnit::Second,
-                2 => TimeUnit::Millisecond,
-                3 => TimeUnit::Microsecond,
-                4 => TimeUnit::Nanosecond,
-                _ => return Err(membership_schema_error("invalid timestamp time unit")),
-            };
-            let timezone = match cursor.u8()? {
-                0 => None,
-                1 => {
-                    let length = usize::try_from(cursor.u32()?).map_err(|_| {
-                        membership_schema_error("timestamp timezone length overflow")
-                    })?;
-                    Some(
-                        std::str::from_utf8(cursor.take(length)?)
-                            .map_err(|_| {
-                                membership_schema_error("timestamp timezone is not UTF-8")
-                            })?
-                            .into(),
-                    )
-                }
-                _ => {
-                    return Err(membership_schema_error(
-                        "invalid timestamp timezone metadata",
-                    ));
-                }
-            };
-            Ok(DataType::Timestamp(unit, timezone))
-        }
-        12 => {
-            let precision = cursor.u8()?;
-            let scale = cursor.u8()? as i8;
-            if precision == 0
-                || precision > DECIMAL128_MAX_PRECISION
-                || scale > DECIMAL128_MAX_SCALE
-                || (scale > 0 && scale as u8 > precision)
-            {
-                return Err(membership_schema_error("invalid decimal schema metadata"));
-            }
-            Ok(DataType::Decimal128(precision, scale))
-        }
-        _ => Err(membership_schema_error(
-            "unsupported membership schema type tag",
-        )),
-    }
+    encode_filter_key_type(data_type, output).map_err(membership_schema_error)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

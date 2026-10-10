@@ -226,10 +226,12 @@ fn provider_failure(error: MvCreateProviderError) -> MvProviderFailure {
         | MvCreateProviderErrorKind::CatalogRegistration => MvProviderFailureKind::Unavailable,
     };
     MvProviderFailure::new(kind, error.to_string())
+        .with_compile_control(error.compile_control_error())
 }
 
 fn engine_error(error: MvCreateProviderError) -> MvApplicationError {
     MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string())
+        .with_compile_control(error.compile_control_error())
 }
 
 fn product_error(error: MvProductError) -> MvApplicationError {
@@ -247,4 +249,29 @@ fn product_error(error: MvProductError) -> MvApplicationError {
         | MvProductErrorKind::ShutdownCancelled => MvApplicationErrorKind::Engine,
     };
     MvApplicationError::new(kind, error.to_string())
+        .with_compile_control(error.compile_control_error())
+}
+
+#[cfg(test)]
+mod compile_control_tests {
+    use super::*;
+    use novarocks_type_contract::CompileControlError;
+
+    #[test]
+    fn create_preanalysis_control_survives_provider_product_and_frontend_bridges() {
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let failure = MvCreateProviderError::from_compile(control.into());
+            let direct = engine_error(failure.clone());
+            assert_eq!(direct.compile_control_error(), Some(control));
+            assert_eq!(direct.kind(), MvApplicationErrorKind::Engine);
+            let product = provider_failure(failure).into_product_error();
+            let terminal = product_error(product);
+            assert_eq!(terminal.compile_control_error(), Some(control));
+            assert_eq!(terminal.kind(), MvApplicationErrorKind::Engine);
+        }
+    }
 }

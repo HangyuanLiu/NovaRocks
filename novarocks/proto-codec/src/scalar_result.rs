@@ -222,14 +222,51 @@ pub fn decode_scalar_schema(
     input_columns: usize,
     path: FieldPath,
 ) -> Result<ScalarSchema, ProtocolError> {
+    decode_scalar_schema_with_binding(src, input_columns, path, SchemaBinding::NativeSource)
+}
+
+/// Decode the compiler ResultPort's semantic field tree before local native
+/// slots exist. This entry accepts only an explicitly unbound source; it never
+/// manufactures a slot or substitutes for the bound native schema contract.
+pub fn decode_semantic_result_scalar_schema(
+    src: &wire::ScalarSchema,
+    input_columns: usize,
+    path: FieldPath,
+) -> Result<ScalarSchema, ProtocolError> {
+    decode_scalar_schema_with_binding(src, input_columns, path, SchemaBinding::SemanticResult)
+}
+
+#[derive(Clone, Copy)]
+enum SchemaBinding {
+    NativeSource,
+    SemanticResult,
+}
+
+fn decode_scalar_schema_with_binding(
+    src: &wire::ScalarSchema,
+    input_columns: usize,
+    path: FieldPath,
+    binding: SchemaBinding,
+) -> Result<ScalarSchema, ProtocolError> {
+    let invalid_source = match binding {
+        SchemaBinding::NativeSource => src.source_slot.is_none(),
+        SchemaBinding::SemanticResult => src.source_slot.is_some(),
+    };
     if input_columns != 1
-        || src.source_slot.is_none()
+        || invalid_source
         || src.field_nodes.is_empty()
         || src.field_nodes.len() > P::SCHEMA_TYPE_NODES
     {
         return Err(invalid(
             &path,
-            "scalar schema requires one bound source and bounded nodes",
+            match binding {
+                SchemaBinding::NativeSource => {
+                    "scalar schema requires one bound source and bounded nodes"
+                }
+                SchemaBinding::SemanticResult => {
+                    "semantic result scalar schema requires one unbound source and bounded nodes"
+                }
+            },
         ));
     }
     let mut overlap =
@@ -291,9 +328,12 @@ pub fn decode_scalar_schema(
     let root = decode_field(src, src.root_field_node_id, &path)?;
     let schema =
         ScalarSchema::try_new(root).map_err(|_| invalid(&path, "invalid bounded scalar schema"))?;
-    schema
-        .bind_native_slots(&[src.source_slot.expect("preflight checked source slot")])
-        .map_err(|_| invalid(&path, "invalid scalar source binding"))
+    match binding {
+        SchemaBinding::NativeSource => schema
+            .bind_native_slots(&[src.source_slot.expect("preflight checked source slot")])
+            .map_err(|_| invalid(&path, "invalid scalar source binding")),
+        SchemaBinding::SemanticResult => Ok(schema),
+    }
 }
 fn node_at<'a>(
     src: &'a wire::ScalarSchema,
@@ -971,5 +1011,68 @@ mod tests {
         let result = boxed(field, &path);
         FAIL_BOX.with(|v| v.set(false));
         assert!(result.unwrap_err().detail().contains("child box"));
+    }
+    #[test]
+    fn semantic_result_scalar_schema_preserves_unbound_tree_and_native_refusal() {
+        let expected = ScalarSchema::try_new(f(S::String, true)).unwrap();
+        let wire = encode_scalar_schema(&expected);
+        assert_eq!(wire.source_slot, None);
+        let path = FieldPath::root("result.scalar_schema");
+        let decoded = decode_semantic_result_scalar_schema(&wire, 1, path.clone()).unwrap();
+        assert_eq!(decoded, expected);
+        let original = decode_scalar_schema(&wire, 1, path).unwrap_err();
+        assert!(
+            original
+                .to_string()
+                .contains("scalar schema requires one bound source and bounded nodes")
+        );
+        let bound = decoded.bind_native_slots(&[37]).unwrap();
+        let bound_wire = encode_scalar_schema(&bound);
+        assert_eq!(decode(&bound_wire).unwrap(), bound);
+        assert!(
+            decode_semantic_result_scalar_schema(
+                &bound_wire,
+                1,
+                FieldPath::root("result.scalar_schema")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn semantic_result_scalar_schema_keeps_original_width_and_node_guards() {
+        let expected = ScalarSchema::try_new(f(S::String, true)).unwrap();
+        let valid = encode_scalar_schema(&expected);
+        for columns in [0, 2] {
+            assert!(
+                decode_semantic_result_scalar_schema(
+                    &valid,
+                    columns,
+                    FieldPath::root("result.scalar_schema")
+                )
+                .is_err()
+            );
+        }
+        let mut empty = valid.clone();
+        empty.field_nodes.clear();
+        let mut over = valid.clone();
+        over.field_nodes
+            .resize(P::SCHEMA_TYPE_NODES + 1, wire::ScalarField::default());
+        let mut unreachable = valid.clone();
+        unreachable
+            .field_nodes
+            .push(unreachable.field_nodes[0].clone());
+        let mut invalid_root = valid.clone();
+        invalid_root.root_field_node_id = 0;
+        for invalid in [empty, over, unreachable, invalid_root] {
+            assert!(
+                decode_semantic_result_scalar_schema(
+                    &invalid,
+                    1,
+                    FieldPath::root("result.scalar_schema")
+                )
+                .is_err()
+            );
+        }
     }
 }

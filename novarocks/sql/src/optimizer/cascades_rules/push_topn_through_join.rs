@@ -42,17 +42,24 @@ impl Rule for PushTopNThroughJoin {
         matches!(op, Operator::LogicalTopN(_))
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalTopN(topn) = &expr.op else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         if expr.children.len() != 1 {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let join_group_id = expr.children[0];
         let Some(join_group) = memo.groups.get(join_group_id).cloned() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let mut candidates = Vec::new();
         for join_expr in &join_group.logical_exprs {
@@ -75,7 +82,7 @@ impl Rule for PushTopNThroughJoin {
                 memo,
             ));
         }
-        results
+        Ok(results)
     }
 
     fn pattern(&self) -> Pattern {
@@ -88,17 +95,30 @@ impl Rule for PushTopNThroughJoin {
         }
     }
 
-    fn apply_bound(&self, binding: &Binding, memo: &mut Memo) -> Vec<NewExpr> {
+    fn apply_bound(
+        &self,
+        binding: &Binding,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let _ = control;
+
         let Operator::LogicalTopN(topn) = binding.op(memo, 0).clone() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Operator::LogicalJoin(join) = binding.op(memo, 1).clone() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         let Some(&join_group_id) = binding.children(0).first() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
-        rewrite_topn_through_join(&topn, &join, binding.children(1), join_group_id, memo)
+        Ok(rewrite_topn_through_join(
+            &topn,
+            &join,
+            binding.children(1),
+            join_group_id,
+            memo,
+        ))
     }
 }
 
@@ -313,8 +333,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -373,13 +393,13 @@ mod tests {
     }
 
     fn eq_condition(memo: &mut Memo, left: u32, right: u32) -> crate::optimizer::scalar::ScalarId {
-        let left =
-            memo.scalars
-                .intern(ScalarNode::ColumnRef(ColumnId(left)), DataType::Int64, true);
+        let left = memo.scalars.intern(
+            ScalarNode::ColumnRef(ColumnId(left)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         let right = memo.scalars.intern(
             ScalarNode::ColumnRef(ColumnId(right)),
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         memo.scalars.intern(
             ScalarNode::BinaryOp {
@@ -388,15 +408,15 @@ mod tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         )
     }
 
     fn sort_key(memo: &mut Memo, id: u32) -> ScalarSortKey {
-        let expr = memo
-            .scalars
-            .intern(ScalarNode::ColumnRef(ColumnId(id)), DataType::Int64, true);
+        let expr = memo.scalars.intern(
+            ScalarNode::ColumnRef(ColumnId(id)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         ScalarSortKey {
             expr,
             asc: true,
@@ -406,13 +426,13 @@ mod tests {
     }
 
     fn binary_sort_key(memo: &mut Memo, left: u32, right: u32) -> ScalarSortKey {
-        let left =
-            memo.scalars
-                .intern(ScalarNode::ColumnRef(ColumnId(left)), DataType::Int64, true);
+        let left = memo.scalars.intern(
+            ScalarNode::ColumnRef(ColumnId(left)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         let right = memo.scalars.intern(
             ScalarNode::ColumnRef(ColumnId(right)),
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         let expr = memo.scalars.intern(
             ScalarNode::BinaryOp {
@@ -421,8 +441,7 @@ mod tests {
                 right,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         );
         ScalarSortKey {
             expr,
@@ -442,8 +461,7 @@ mod tests {
             .map(|(input_id, output_id, name)| {
                 let expr = memo.scalars.intern(
                     ScalarNode::ColumnRef(ColumnId(*input_id)),
-                    DataType::Int64,
-                    true,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
                 );
                 ScalarProjectItem {
                     expr,
@@ -583,7 +601,13 @@ mod tests {
             join,
         );
 
-        let out = PushTopNThroughJoin.apply(&topn, &mut memo);
+        let out = PushTopNThroughJoin
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(out.len(), 1);
         assert_rewrite_pushes_preserved_side(&memo, &out[0], left, right, 0);
@@ -606,7 +630,13 @@ mod tests {
             join,
         );
 
-        let out = PushTopNThroughJoin.apply(&topn, &mut memo);
+        let out = PushTopNThroughJoin
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(
             out.is_empty(),
@@ -639,12 +669,27 @@ mod tests {
             false,
             join,
         );
-        let bindings = bind(&PushTopNThroughJoin.pattern(), &memo, topn_group, 0);
+        let bindings = bind(
+            &PushTopNThroughJoin.pattern(),
+            &memo,
+            topn_group,
+            0,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         assert_eq!(bindings.len(), 2);
 
         let rewrites = bindings
             .iter()
-            .flat_map(|binding| PushTopNThroughJoin.apply_bound(binding, &mut memo))
+            .flat_map(|binding| {
+                PushTopNThroughJoin
+                    .apply_bound(
+                        binding,
+                        &mut memo,
+                        &crate::compiler::SqlCompileControl::unbounded(),
+                    )
+                    .unwrap()
+            })
             .collect::<Vec<_>>();
 
         assert!(
@@ -680,7 +725,13 @@ mod tests {
                 join,
             );
 
-            let out = PushTopNThroughJoin.apply(&topn, &mut memo);
+            let out = PushTopNThroughJoin
+                .apply(
+                    &topn,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
 
             assert!(out.is_empty(), "{kind:?} must not push TopN through Join");
         }
@@ -705,7 +756,13 @@ mod tests {
             join,
         );
 
-        let out = PushTopNThroughJoin.apply(&topn, &mut memo);
+        let out = PushTopNThroughJoin
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(out.is_empty());
     }
@@ -729,7 +786,13 @@ mod tests {
             join,
         );
 
-        let out = PushTopNThroughJoin.apply(&topn, &mut memo);
+        let out = PushTopNThroughJoin
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(out.is_empty());
     }
@@ -750,7 +813,13 @@ mod tests {
             let item = sort_key(&mut memo, 1);
             let topn = topn_with_key(&mut memo, item, limit, offset, phase, is_split, join);
 
-            let out = PushTopNThroughJoin.apply(&topn, &mut memo);
+            let out = PushTopNThroughJoin
+                .apply(
+                    &topn,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
 
             assert!(out.is_empty());
         }
@@ -773,7 +842,13 @@ mod tests {
             join,
         );
 
-        let first = PushTopNThroughJoin.apply(&topn, &mut memo);
+        let first = PushTopNThroughJoin
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(first.len(), 1);
         let first = first.into_iter().next().unwrap();
         let pushed_root = MExpr {
@@ -782,7 +857,13 @@ mod tests {
             children: first.children,
         };
 
-        let second = PushTopNThroughJoin.apply(&pushed_root, &mut memo);
+        let second = PushTopNThroughJoin
+            .apply(
+                &pushed_root,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert!(second.is_empty());
     }
@@ -818,7 +899,13 @@ mod tests {
             join,
         );
 
-        let out = PushTopNThroughJoin.apply(&topn, &mut memo);
+        let out = PushTopNThroughJoin
+            .apply(
+                &topn,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(out.len(), 1);
         assert!(
@@ -844,10 +931,23 @@ mod tests {
             false,
             join,
         );
-        let bindings = bind(&PushTopNThroughJoin.pattern(), &memo, topn_group, 0);
+        let bindings = bind(
+            &PushTopNThroughJoin.pattern(),
+            &memo,
+            topn_group,
+            0,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         assert_eq!(bindings.len(), 1);
 
-        let out = PushTopNThroughJoin.apply_bound(&bindings[0], &mut memo);
+        let out = PushTopNThroughJoin
+            .apply_bound(
+                &bindings[0],
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
 
         assert_eq!(out.len(), 1);
         assert_rewrite_pushes_preserved_side(&memo, &out[0], left, right, 0);
@@ -876,7 +976,10 @@ mod tests {
             &mut memo,
             &crate::optimizer::cascades_rules::all_transformation_rules(),
             &crate::optimizer::options::OptimizerOptions::default_settings(),
-            Instant::now() + Duration::from_secs(5),
+            &crate::optimizer::OptimizerControl {
+                request: crate::optimizer::test_optimizer_control(),
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
         )
         .expect("explore should finish");
 
@@ -934,23 +1037,35 @@ mod tests {
             &mut memo,
             &crate::optimizer::cascades_rules::all_transformation_rules(),
             &options,
-            Instant::now() + Duration::from_secs(5),
+            &crate::optimizer::OptimizerControl {
+                request: crate::optimizer::test_optimizer_control(),
+                deadline: Instant::now() + Duration::from_secs(5),
+            },
         )
         .expect("explore should finish");
         crate::optimizer::implement(
             &mut memo,
             &crate::optimizer::cascades_rules::all_implementation_rules(),
             &options,
-        );
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("implementation should finish");
         assert!(
             has_physical_hash_join_with_pushed_preserved_topn(&memo),
             "pushed join must stay hash-join implementable before post-explore stats derivation"
         );
-        crate::optimizer::stats::derive_group_statistics(&mut memo, &stats_input);
+        crate::optimizer::stats::derive_group_statistics(
+            &mut memo,
+            &stats_input,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
 
         let required = PhysicalPropertySet::gather();
-        let mut ctx =
-            crate::optimizer::search::SearchContext::new(stats_input, options.cost_options.clone());
+        let mut ctx = crate::optimizer::search::SearchContext::new_with_options_for_test(
+            stats_input,
+            options.cost_options.clone(),
+        );
         let total_cost = ctx
             .optimize_group(&memo, root, &required)
             .expect("search should finish");
@@ -965,25 +1080,24 @@ mod tests {
         policy: novarocks_type_contract::DecimalOverflowPolicy,
     ) -> crate::optimizer::scalar::ScalarId {
         let equality = eq_condition(memo, 1, 2);
-        let source = memo
-            .scalars
-            .intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, true);
+        let source = memo.scalars.intern(
+            ScalarNode::ColumnRef(ColumnId(1)),
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        );
         let cast = memo.scalars.intern(
             ScalarNode::Cast {
                 child: source,
                 target: DataType::Decimal128(2, 0),
                 decimal_overflow_policy: policy,
             },
-            DataType::Decimal128(2, 0),
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Decimal128(2, 0), true),
         );
         let checked = memo.scalars.intern(
             ScalarNode::IsNull {
                 child: cast,
                 negated: true,
             },
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
         memo.scalars.intern(
             ScalarNode::BinaryOp {
@@ -992,8 +1106,7 @@ mod tests {
                 right: checked,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            DataType::Boolean,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         )
     }
 
@@ -1023,7 +1136,13 @@ mod tests {
                 join,
             );
             let groups_before = memo.groups.len();
-            let out = PushTopNThroughJoin.apply(&topn, &mut memo);
+            let out = PushTopNThroughJoin
+                .apply(
+                    &topn,
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
             if policy == Policy::ReportError {
                 assert!(out.is_empty());
                 assert_eq!(
@@ -1063,10 +1182,23 @@ mod tests {
                 false,
                 join,
             );
-            let bindings = bind(&PushTopNThroughJoin.pattern(), &memo, topn, 0);
+            let bindings = bind(
+                &PushTopNThroughJoin.pattern(),
+                &memo,
+                topn,
+                0,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
             assert_eq!(bindings.len(), 1);
             let groups_before = memo.groups.len();
-            let out = PushTopNThroughJoin.apply_bound(&bindings[0], &mut memo);
+            let out = PushTopNThroughJoin
+                .apply_bound(
+                    &bindings[0],
+                    &mut memo,
+                    &crate::compiler::SqlCompileControl::unbounded(),
+                )
+                .unwrap();
             if policy == Policy::ReportError {
                 assert!(out.is_empty());
                 assert_eq!(memo.groups.len(), groups_before);

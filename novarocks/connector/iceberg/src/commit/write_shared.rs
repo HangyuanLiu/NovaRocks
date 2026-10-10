@@ -21,10 +21,9 @@
 //! facts before they diverge into their own field-signing rules. Keeping the
 //! shared resolution here stops the two paths from drifting apart.
 
-use arrow::datatypes::{DataType, Field, TimeUnit};
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorWriteFieldRequest};
 
-use crate::iceberg::spec::{PrimitiveType, Schema, TableMetadata, Type};
+use crate::iceberg::spec::{Schema, TableMetadata};
 
 /// Resolve the snapshot a write against `target_ref` will be based on.
 ///
@@ -51,10 +50,9 @@ pub(crate) fn snapshot_token(target_snapshot_id: Option<i64>) -> String {
 /// Resolve each requested write column against the frozen target schema and
 /// restate it with the Arrow type the Iceberg writers actually consume.
 ///
-/// The Variant/Binary/Timestamptz overrides exist because
-/// `schema_to_arrow_schema` widens those Iceberg types beyond what the data
-/// writers accept; keeping the override here stops each write path from
-/// re-deciding it.
+/// The shared metadata schema owner authors Variant/Binary/Timestamptz
+/// carriers and every declared logical domain. Both write paths consume those
+/// complete fields instead of reconstructing an untagged carrier.
 pub(crate) fn exact_requested_write_fields(
     metadata: &TableMetadata,
     requested: &[ConnectorWriteFieldRequest],
@@ -68,17 +66,7 @@ pub(crate) fn exact_requested_write_fields_at_schema(
     iceberg_schema: &Schema,
     requested: &[ConnectorWriteFieldRequest],
 ) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
-    let arrow_schema =
-        crate::iceberg::arrow::schema_to_arrow_schema(iceberg_schema).map_err(|error| {
-            invalid_write_activation(format!(
-                "convert frozen Iceberg write schema to Arrow: {error}"
-            ))
-        })?;
-    let arrow_schema = crate::scalar_integer_domain::apply_schema(
-        std::sync::Arc::new(arrow_schema),
-        iceberg_schema,
-        &crate::scalar_integer_domain::metadata_declarations(metadata)?,
-    )?;
+    let arrow_schema = crate::scalar_integer_domain::metadata_sql_schema(metadata, iceberg_schema)?;
     requested
         .iter()
         .map(|request| {
@@ -95,22 +83,13 @@ pub(crate) fn exact_requested_write_fields_at_schema(
                     ))
                 })?;
             let arrow_field = arrow_schema.field(ordinal);
-            let data_type = match iceberg_field.field_type.as_ref() {
-                Type::Primitive(PrimitiveType::Variant) => DataType::LargeBinary,
-                Type::Primitive(PrimitiveType::Binary) => DataType::Binary,
-                Type::Primitive(PrimitiveType::Timestamptz) => {
-                    DataType::Timestamp(TimeUnit::Microsecond, None)
-                }
-                Type::Primitive(PrimitiveType::TimestamptzNs) => {
-                    DataType::Timestamp(TimeUnit::Nanosecond, None)
-                }
-                _ => arrow_field.data_type().clone(),
-            };
-            Ok(ConnectorWriteFieldRequest::new(Field::new(
-                &iceberg_field.name,
-                data_type,
-                !iceberg_field.required,
-            )))
+            novarocks_type_contract::FunctionValueType::try_from_field(arrow_field).map_err(|error| {
+                invalid_write_activation(format!("invalid frozen Iceberg write field `{}`: {error}", iceberg_field.name))
+            })?;
+            // Preserve the exact provider field, including nested domains,
+            // dictionary identity and annotations; requested fields select
+            // names and never author the target's logical type.
+            Ok(ConnectorWriteFieldRequest::new(arrow_field.clone()))
         })
         .collect()
 }
@@ -146,4 +125,125 @@ pub(crate) fn write_target_schema(
 
 pub(crate) fn invalid_write_activation(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use crate::iceberg::spec::{
+        FormatVersion, NestedField, PartitionSpec, PrimitiveType, SortOrder, TableMetadataBuilder,
+        Type,
+    };
+    use arrow::datatypes::{DataType, Field};
+    use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+
+    fn metadata(properties: HashMap<String, String>) -> TableMetadata {
+        let fields = [
+            (1, "uuid", PrimitiveType::Uuid),
+            (2, "variant", PrimitiveType::Variant),
+            (3, "hll", PrimitiveType::Binary),
+            (4, "bitmap", PrimitiveType::Binary),
+            (5, "largeint", PrimitiveType::Fixed(16)),
+            (6, "plain_fixed", PrimitiveType::Fixed(16)),
+            (7, "plain_binary", PrimitiveType::Binary),
+        ]
+        .into_iter()
+        .map(|(id, name, primitive)| {
+            Arc::new(NestedField::optional(id, name, Type::Primitive(primitive)))
+        })
+        .collect::<Vec<_>>();
+        TableMetadataBuilder::new(
+            Schema::builder()
+                .with_fields(fields)
+                .build()
+                .expect("schema"),
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "memory://warehouse/db/write_domain_test".to_string(),
+            FormatVersion::V3,
+            properties,
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata
+    }
+
+    #[test]
+    fn frozen_write_fields_keep_provider_uuid_variant_and_declared_opaque_domains() {
+        let metadata = metadata(HashMap::from([
+            ("novarocks.logical_type.hll".into(), "hll".into()),
+            ("novarocks.logical_type.bitmap".into(), "bitmap".into()),
+            ("novarocks.logical_type.largeint".into(), "largeint".into()),
+        ]));
+        let expected = [
+            (
+                "uuid",
+                DataType::FixedSizeBinary(16),
+                ValueLogicalType::Uuid,
+            ),
+            ("variant", DataType::LargeBinary, ValueLogicalType::Variant),
+            ("hll", DataType::Binary, ValueLogicalType::Hll),
+            ("bitmap", DataType::Binary, ValueLogicalType::Bitmap),
+            (
+                "largeint",
+                DataType::FixedSizeBinary(16),
+                ValueLogicalType::LargeInt,
+            ),
+            (
+                "plain_fixed",
+                DataType::FixedSizeBinary(16),
+                ValueLogicalType::Physical,
+            ),
+            ("plain_binary", DataType::Binary, ValueLogicalType::Physical),
+        ];
+        // Names select the frozen provider fields. A caller's placeholder
+        // carrier cannot author their target type or logical domain.
+        let requests = expected
+            .iter()
+            .map(|(name, _, _)| {
+                ConnectorWriteFieldRequest::new(Field::new(
+                    name.to_uppercase(),
+                    DataType::Null,
+                    true,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let fields =
+            exact_requested_write_fields(&metadata, &requests).expect("exact write fields");
+        let authored =
+            crate::scalar_integer_domain::metadata_sql_schema(&metadata, metadata.current_schema())
+                .expect("provider schema");
+        for (ordinal, (request, (name, carrier, domain))) in fields.iter().zip(expected).enumerate()
+        {
+            assert_eq!(request.field(), authored.field(ordinal));
+            assert_eq!(request.field().name(), name);
+            assert_eq!(
+                FunctionValueType::try_from_field(request.field()).expect("exact frozen type"),
+                FunctionValueType::try_with_logical_type(carrier, true, domain)
+                    .expect("expected provider type")
+            );
+        }
+    }
+
+    #[test]
+    fn frozen_write_fields_reject_conflicting_provider_domain_declarations() {
+        for (name, domain) in [
+            ("plain_fixed", "hll"),
+            ("plain_binary", "largeint"),
+            ("uuid", "largeint"),
+        ] {
+            let metadata = metadata(HashMap::from([(
+                format!("novarocks.logical_type.{name}"),
+                domain.to_string(),
+            )]));
+            let request = ConnectorWriteFieldRequest::new(Field::new(name, DataType::Null, true));
+            let error = exact_requested_write_fields(&metadata, &[request])
+                .expect_err("a conflicting provider declaration cannot be silently erased");
+            assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
+        }
+    }
 }

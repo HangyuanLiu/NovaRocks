@@ -36,9 +36,7 @@ use crate::exec::node::analytic::{
     WindowType as RuntimeWindowType,
 };
 use crate::exec::node::assert::{AssertNumRowsMode, Assertion};
-use crate::exec::node::change_event_expand::{
-    ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
-};
+use crate::exec::node::change_event_expand::{ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec};
 use crate::exec::node::exchange_source::ExchangeSourceNode;
 use crate::exec::node::join::{
     JoinDistributionMode as RuntimeJoinDistributionMode, JoinRuntimeFilterProducerBinding,
@@ -71,7 +69,7 @@ use crate::exec::node::unpivot::{
     reason = "Native runtime dependencies are explicit"
 )]
 pub(crate) fn build_native_pipeline_graph_for_local_program_with_runtime_settings(
-    program: &lp::LocalProgram,
+    program: &lp::LocalProgramGraph,
     bindings: &LocalRuntimeBindings,
     _debug: bool,
     dep_manager: DependencyManager,
@@ -88,7 +86,7 @@ pub(crate) fn build_native_pipeline_graph_for_local_program_with_runtime_setting
     local_exchange_max_buffered_rows: i64,
 ) -> Result<PipelineGraph, String> {
     validate_runtime_binding_shape(program, bindings)?;
-    let mut arena = ExprArena::from_immutable(program.expressions());
+    let mut arena = ExprArena::from_immutable(program.expressions())?;
     arena.bind_runtime_error(runtime_error);
     let mut ctx = PipelineBuildContext {
         arena: Arc::new(arena),
@@ -99,6 +97,7 @@ pub(crate) fn build_native_pipeline_graph_for_local_program_with_runtime_setting
         },
         exchange_bindings,
         scan_bindings,
+        compiled_writers: Default::default(),
         next_pipeline_id: 0,
         pipeline_dop: pipeline_dop.max(1),
         operator_buffer_chunks: operator_buffer_chunks.max(1),
@@ -118,8 +117,12 @@ pub(crate) fn build_native_pipeline_graph_for_local_program_with_runtime_setting
         {
             let layout = program.nodes()[input.index()].output_layout();
             let keys = keyed_assert_distribution_keys_from_layout(&mut ctx, layout, key_slots)?;
-            ctx.precomputed_keyed_assert_keys
-                .insert(node.native_node_id(), keys);
+            ctx.precomputed_keyed_assert_keys.insert(
+                node.legacy_native_node_id().ok_or_else(|| {
+                    "compiled local nodes cannot enter the legacy pipeline bridge".to_string()
+                })?,
+                keys,
+            );
         }
     }
     let mut build = build_pipeline_for_program_node(program, bindings, program.root(), &mut ctx)?;
@@ -142,9 +145,21 @@ pub(crate) fn build_native_pipeline_graph_for_local_program_with_runtime_setting
 }
 
 fn validate_runtime_binding_shape(
-    program: &lp::LocalProgram,
+    program: &lp::LocalProgramGraph,
     bindings: &LocalRuntimeBindings,
 ) -> Result<(), String> {
+    if program.nodes().iter().any(|node| {
+        node.legacy_native_node_id().is_none()
+            || matches!(
+                node.kind(),
+                lp::ProgramNodeKind::Scan {
+                    source: lp::ProgramScanSource::Compiled(_),
+                    ..
+                }
+            )
+    }) {
+        return Err("compiled local nodes cannot enter the legacy pipeline bridge".to_string());
+    }
     let mut expected_scans = BTreeSet::new();
     let mut expected_writers = BTreeSet::new();
     let mut expected_finishers = BTreeSet::new();
@@ -184,7 +199,9 @@ fn validate_runtime_binding_shape(
         if effectful && !seen_effectful.insert(id) {
             return Err(format!(
                 "local program reuses runtime-capability node {} in its expanded execution graph",
-                node.native_node_id()
+                node.legacy_native_node_id().ok_or_else(|| {
+                    "compiled local nodes cannot enter the legacy pipeline bridge".to_string()
+                })?
             ));
         }
         match node.kind() {
@@ -203,7 +220,8 @@ fn validate_runtime_binding_shape(
             | lp::ProgramNodeKind::RuntimeFilterConsumer { input, .. }
             | lp::ProgramNodeKind::TableWriter { input, .. }
             | lp::ProgramNodeKind::Sort { input, .. }
-            | lp::ProgramNodeKind::TableFunction { input, .. } => stack.push(*input),
+            | lp::ProgramNodeKind::TableFunction { input, .. }
+            | lp::ProgramNodeKind::GenerateSeries { input, .. } => stack.push(*input),
             lp::ProgramNodeKind::Join { left, right, .. }
             | lp::ProgramNodeKind::NestedLoopJoin { left, right, .. } => {
                 stack.push(*left);
@@ -240,31 +258,25 @@ fn thaw_window_boundary(boundary: lp::WindowBoundary) -> RuntimeWindowBoundary {
     }
 }
 
-fn thaw_window_function_kind(kind: &lp::WindowFunctionKind) -> RuntimeWindowFunctionKind {
+/// `None` for the compiled-only prepared kind, which has no legacy operator.
+fn thaw_window_function_kind(
+    kind: &lp::WindowFunctionKind,
+    ignore_nulls: bool,
+) -> Option<RuntimeWindowFunctionKind> {
     use RuntimeWindowFunctionKind as R;
     use lp::WindowFunctionKind as S;
-    match kind {
+    Some(match kind {
         S::RowNumber => R::RowNumber,
         S::Rank => R::Rank,
         S::DenseRank => R::DenseRank,
         S::CumeDist => R::CumeDist,
         S::PercentRank => R::PercentRank,
         S::Ntile => R::Ntile,
-        S::FirstValue { ignore_nulls } => R::FirstValue {
-            ignore_nulls: *ignore_nulls,
-        },
-        S::FirstValueRewrite { ignore_nulls } => R::FirstValueRewrite {
-            ignore_nulls: *ignore_nulls,
-        },
-        S::LastValue { ignore_nulls } => R::LastValue {
-            ignore_nulls: *ignore_nulls,
-        },
-        S::Lead { ignore_nulls } => R::Lead {
-            ignore_nulls: *ignore_nulls,
-        },
-        S::Lag { ignore_nulls } => R::Lag {
-            ignore_nulls: *ignore_nulls,
-        },
+        S::FirstValue => R::FirstValue { ignore_nulls },
+        S::FirstValueRewrite => R::FirstValueRewrite { ignore_nulls },
+        S::LastValue => R::LastValue { ignore_nulls },
+        S::Lead => R::Lead { ignore_nulls },
+        S::Lag => R::Lag { ignore_nulls },
         S::SessionNumber => R::SessionNumber,
         S::Count => R::Count,
         S::Sum => R::Sum,
@@ -291,7 +303,8 @@ fn thaw_window_function_kind(kind: &lp::WindowFunctionKind) -> RuntimeWindowFunc
             nulls_first: nulls_first.clone(),
         },
         S::ApproxTopK => R::ApproxTopK,
-    }
+        S::Prepared => return None,
+    })
 }
 
 fn runtime_filter_contract(
@@ -365,7 +378,17 @@ fn runtime_filter_contract(
 fn runtime_filter_consumer(
     binding: &lp::FilterConsumerAtExpr,
 ) -> Result<RuntimeFilterConsumerBinding, String> {
-    let static_consumer = &binding.consumer;
+    Ok(RuntimeFilterConsumerBinding::new(
+        expr(binding.expr_id),
+        runtime_filter_consumer_contract(&binding.consumer)?,
+    ))
+}
+
+/// The runtime contract of one static consumer. Its membership digest is
+/// checked against the canonical schema of its key type.
+pub(super) fn runtime_filter_consumer_contract(
+    static_consumer: &lp::StaticFilterConsumer,
+) -> Result<execution::RuntimeFilterConsumerContract, String> {
     let id = execution::RuntimeFilterBindingId::new(static_consumer.binding_id());
     let channel = execution::RuntimeFilterChannelId::new(static_consumer.channel_id());
     let contract = runtime_filter_contract(static_consumer.contract())?;
@@ -420,10 +443,7 @@ fn runtime_filter_consumer(
         }
     }
     .map_err(|error| error.to_string())?;
-    Ok(RuntimeFilterConsumerBinding::new(
-        expr(binding.expr_id),
-        runtime_contract,
-    ))
+    Ok(runtime_contract)
 }
 
 fn runtime_filter_consumers(
@@ -432,7 +452,9 @@ fn runtime_filter_consumers(
     bindings.iter().map(runtime_filter_consumer).collect()
 }
 
-fn runtime_filter_producer(
+/// The runtime contract of one static producer. Its membership digest is
+/// checked against the canonical schema of its key type.
+pub(super) fn runtime_filter_producer(
     producer: &lp::StaticFilterProducer,
 ) -> Result<execution::RuntimeFilterProducerContract, String> {
     let id = execution::RuntimeFilterBindingId::new(producer.binding_id());
@@ -619,7 +641,7 @@ fn keyed_assert_distribution_keys_from_layout(
     reason = "Typed set operators share physical stage construction"
 )]
 fn build_distinct_set_op_pipeline_for_program<S, MakeShared, MakeSink, MakeSource>(
-    program: &lp::LocalProgram,
+    program: &lp::LocalProgramGraph,
     bindings: &LocalRuntimeBindings,
     inputs: &[lp::ProgramNodeId],
     node_id: i32,
@@ -672,7 +694,7 @@ where
 }
 
 fn build_pipeline_for_program_node(
-    program: &lp::LocalProgram,
+    program: &lp::LocalProgramGraph,
     bindings: &LocalRuntimeBindings,
     id: lp::ProgramNodeId,
     ctx: &mut PipelineBuildContext,
@@ -681,7 +703,9 @@ fn build_pipeline_for_program_node(
         .nodes()
         .get(id.index())
         .ok_or_else(|| format!("missing local program node {}", id.index()))?;
-    let node_id = node.native_node_id();
+    let node_id = node.legacy_native_node_id().ok_or_else(|| {
+        "compiled local nodes cannot enter the legacy pipeline bridge".to_string()
+    })?;
     match node.kind() {
         lp::ProgramNodeKind::RuntimeFilterConsumer {
             input,
@@ -762,7 +786,12 @@ fn build_pipeline_for_program_node(
         }
         lp::ProgramNodeKind::Values { values } => {
             let chunk_schema = ChunkSchema::from_static_layout(values.layout())?;
-            let chunk = Chunk::new_with_chunk_schema(values.batch().clone(), chunk_schema);
+            // Dynamic cells are compiled roots; only the compiled pipeline
+            // evaluates them.
+            let batch = values
+                .batch()
+                .ok_or_else(|| format!("legacy Values node {node_id} has dynamic cells"))?;
+            let chunk = Chunk::new_with_chunk_schema(batch.clone(), chunk_schema);
             let source: Box<dyn OperatorFactory> =
                 Box::new(ValuesSourceFactory::new(chunk, node_id));
             let pipeline = new_source_pipeline_with_dop(ctx, source, 1);
@@ -802,10 +831,19 @@ fn build_pipeline_for_program_node(
         }
         lp::ProgramNodeKind::Scan {
             runtime_filters,
-            conjunct_predicate,
+            residuals,
             limit,
             ..
         } => {
+            let predicate =
+                match residuals.as_slice() {
+                    [] => None,
+                    [predicate] => Some(*predicate),
+                    _ => return Err(
+                        "legacy scan construction cannot consume multiple compiled residual roots"
+                            .into(),
+                    ),
+                };
             let consumers = runtime_filter_consumers(runtime_filters)?;
             validate_native_consumer_specs(&consumers, ctx)?;
             let source = bindings
@@ -820,7 +858,7 @@ fn build_pipeline_for_program_node(
                 .with_node_id(node_id)
                 .with_runtime_filter_consumers(consumers)
                 .with_output_chunk_schema(ChunkSchema::from_static_layout(node.output_layout())?)
-                .with_conjunct_predicate(conjunct_predicate.map(expr))
+                .with_conjunct_predicate(predicate.map(expr))
                 .with_limit(*limit);
             // One driver owns the scan stream; the shared handoff restores the
             // downstream DOP without duplicating the Task's reader capability.
@@ -1047,28 +1085,39 @@ fn build_pipeline_for_program_node(
             eq_null_safe,
             residual_predicate,
             runtime_filters,
-        } => build_join_pipeline(
-            program,
-            bindings,
-            *left,
-            *right,
-            node_id,
-            runtime_join_type(*join_type),
-            match distribution_mode {
-                lp::JoinDistributionMode::Broadcast => RuntimeJoinDistributionMode::Broadcast,
-                lp::JoinDistributionMode::Partitioned => RuntimeJoinDistributionMode::Partitioned,
-            },
-            left_layout,
-            right_layout,
-            join_scope_layout,
-            probe_keys,
-            build_keys,
-            eq_null_safe,
-            *residual_predicate,
-            runtime_filters,
-            ctx,
-        ),
-        lp::ProgramNodeKind::Filter { input, predicate } => {
+            runtime_filter_consumers,
+        } => {
+            if !runtime_filter_consumers.is_empty() {
+                return Err("compiled join probe consumers require the compiled pipeline".into());
+            }
+            build_join_pipeline(
+                program,
+                bindings,
+                *left,
+                *right,
+                node_id,
+                runtime_join_type(*join_type),
+                match distribution_mode {
+                    lp::JoinDistributionMode::Broadcast => RuntimeJoinDistributionMode::Broadcast,
+                    lp::JoinDistributionMode::Partitioned => {
+                        RuntimeJoinDistributionMode::Partitioned
+                    }
+                },
+                left_layout,
+                right_layout,
+                join_scope_layout,
+                probe_keys,
+                build_keys,
+                eq_null_safe,
+                *residual_predicate,
+                runtime_filters,
+                ctx,
+            )
+        }
+        lp::ProgramNodeKind::Filter { input, predicates } => {
+            let [predicate] = predicates.as_ref() else {
+                return Err("legacy Filter adapter requires its one original predicate".into());
+            };
             let mut build = build_pipeline_for_program_node(program, bindings, *input, ctx)?;
             build
                 .pipeline
@@ -1289,6 +1338,9 @@ fn build_pipeline_for_program_node(
             build.stream = StreamDesc::single();
             Ok(build)
         }
+        lp::ProgramNodeKind::GenerateSeries { .. } => {
+            Err("compiled GenerateSeries cannot enter the legacy pipeline bridge".to_string())
+        }
         lp::ProgramNodeKind::TableFunction {
             input,
             function_name,
@@ -1337,9 +1389,21 @@ fn build_pipeline_for_program_node(
             partition_exprs,
             order_by_exprs,
             functions,
-            window,
             output_columns,
         } => {
+            // The legacy operator owns one node frame: every legacy call
+            // carries that same frame, and a compiled call never enters here.
+            let window = match functions.split_first() {
+                Some((first, rest)) => {
+                    if rest.iter().any(|function| function.frame != first.frame) {
+                        return Err(format!(
+                            "legacy analytic node {node_id} has calls with different frames"
+                        ));
+                    }
+                    first.frame
+                }
+                None => None,
+            };
             let build = build_pipeline_for_program_node(program, bindings, *input, ctx)?;
             let mut build = gather_to_one(build, ctx, node_id);
             let window = window.as_ref().map(|frame| RuntimeWindowFrame {
@@ -1352,18 +1416,25 @@ fn build_pipeline_for_program_node(
             });
             let functions = functions
                 .iter()
-                .map(|function| WindowFunctionSpec {
-                    kind: thaw_window_function_kind(&function.kind),
-                    args: function.args.iter().copied().map(expr).collect(),
-                    return_type: function.return_type.clone(),
-                    aggregate_binding: function.aggregate_binding.as_ref().map(
-                        |(name, resolved)| WindowAggregateBinding {
-                            function_name: name.to_string(),
-                            resolved: resolved.clone(),
-                        },
-                    ),
+                .map(|function| {
+                    Ok(WindowFunctionSpec {
+                        kind: thaw_window_function_kind(&function.kind, function.ignore_nulls)
+                            .ok_or_else(|| {
+                                format!(
+                                    "legacy analytic node {node_id} received a compiled-only prepared window call"
+                                )
+                            })?,
+                        args: function.args.iter().copied().map(expr).collect(),
+                        return_type: function.return_type.clone(),
+                        aggregate_binding: function.aggregate_binding.as_ref().map(
+                            |(name, resolved)| WindowAggregateBinding {
+                                function_name: name.to_string(),
+                                resolved: resolved.clone(),
+                            },
+                        ),
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, String>>()?;
             let output_columns = output_columns
                 .iter()
                 .map(|column| match column {
@@ -1520,7 +1591,7 @@ fn build_pipeline_for_program_node(
     reason = "Aggregate kernel receives its complete frozen static and runtime contract"
 )]
 fn build_aggregate_pipeline(
-    program: &lp::LocalProgram,
+    program: &lp::LocalProgramGraph,
     bindings: &LocalRuntimeBindings,
     input: lp::ProgramNodeId,
     node_id: i32,
@@ -1911,7 +1982,7 @@ fn build_aggregate_pipeline(
     reason = "Join kernel receives the complete frozen node contract"
 )]
 fn build_join_pipeline(
-    program: &lp::LocalProgram,
+    program: &lp::LocalProgramGraph,
     bindings: &LocalRuntimeBindings,
     left: lp::ProgramNodeId,
     right: lp::ProgramNodeId,
@@ -2316,6 +2387,105 @@ mod tests {
     }
 
     #[test]
+    fn legacy_pipeline_bridge_rejects_compiled_read_before_runtime_binding_shape() {
+        let recipe = crate::runtime::fragment::submission::tests::compiled_scan_contract_for_test();
+        let layout = lp::StaticLayout::try_new(
+            Arc::new(recipe.frozen().public_facts().schema().clone()),
+            Arc::from([SlotId::new(1)]),
+        )
+        .unwrap();
+        let relation = recipe
+            .frozen()
+            .scan()
+            .recipe()
+            .relation()
+            .table()
+            .header()
+            .clone();
+        let graph = lp::LocalProgramGraph::try_new(
+            vec![lp::ProgramNode::new(
+                7,
+                lp::ProgramNodeKind::Scan {
+                    source: recipe.into(),
+                    runtime_filters: vec![],
+                    residuals: Vec::new(),
+                    limit: None,
+                },
+                layout.clone(),
+            )],
+            lp::ProgramNodeId::new(0),
+            Arc::new(
+                lp::ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap(),
+            ),
+            lp::CompileProfile::new(
+                NonZeroUsize::new(1).unwrap(),
+                None,
+                layout.identity().unwrap(),
+                lp::KernelAbiVersion::CURRENT,
+            ),
+            lp::BindingRequirements::try_new(vec![lp::BindingRequirement::Scan {
+                node: lp::ProgramNodeId::new(0),
+                kind: lp::ScanSourceKind::TypedConnector { relation },
+                layout,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        let bindings = LocalRuntimeBindings {
+            scans: BTreeMap::new(),
+            writers: BTreeMap::new(),
+            finishers: BTreeMap::new(),
+        };
+        assert_eq!(
+            validate_runtime_binding_shape(&graph, &bindings).unwrap_err(),
+            "compiled local nodes cannot enter the legacy pipeline bridge"
+        );
+    }
+
+    #[test]
+    fn legacy_pipeline_bridge_rejects_local_identity_before_runtime_binding_shape() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let layout = lp::StaticLayout::try_new(schema, Arc::from([SlotId::new(1)])).unwrap();
+        let graph = lp::LocalProgramGraph::try_new(
+            vec![lp::ProgramNode::new_local(
+                lp::ProgramNodeId::new(0),
+                vec![lp::DiagnosticSourceNodeId::new(u32::MAX)],
+                lp::ProgramNodeKind::ExchangeSource {
+                    timeout: Duration::from_secs(1),
+                    runtime_filters: vec![],
+                    hash_partition_exprs: vec![],
+                },
+                layout.clone(),
+            )],
+            lp::ProgramNodeId::new(0),
+            Arc::new(
+                lp::ImmutableExpressions::try_new(vec![], false, HashMap::new(), None).unwrap(),
+            ),
+            lp::CompileProfile::new(
+                NonZeroUsize::new(1).unwrap(),
+                None,
+                layout.identity().unwrap(),
+                lp::KernelAbiVersion::CURRENT,
+            ),
+            lp::BindingRequirements::try_new(vec![lp::BindingRequirement::ExchangeInput {
+                node: lp::ProgramNodeId::new(0),
+                layout,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        let bindings = LocalRuntimeBindings {
+            scans: BTreeMap::new(),
+            writers: BTreeMap::new(),
+            finishers: BTreeMap::new(),
+        };
+        assert_eq!(
+            validate_runtime_binding_shape(&graph, &bindings).unwrap_err(),
+            "compiled local nodes cannot enter the legacy pipeline bridge"
+        );
+    }
+
+    #[test]
     fn shared_exchange_source_is_rejected_before_binding_a_receiver() {
         let slot = SlotId::new(1);
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
@@ -2327,7 +2497,7 @@ mod tests {
         .unwrap();
         let source_id = lp::ProgramNodeId::new(0);
         let root_id = lp::ProgramNodeId::new(1);
-        let program = lp::LocalProgram::try_new(
+        let program = lp::LocalProgramGraph::try_new(
             vec![
                 lp::ProgramNode::new(
                     10,
@@ -2392,7 +2562,7 @@ mod tests {
         .unwrap();
         let values = lp::StaticValues::try_new(batch, layout.clone()).unwrap();
         let values_id = lp::ProgramNodeId::new(0);
-        let program = lp::LocalProgram::try_new(
+        let program = lp::LocalProgramGraph::try_new(
             vec![
                 lp::ProgramNode::new(10, lp::ProgramNodeKind::Values { values }, layout.clone()),
                 lp::ProgramNode::new(

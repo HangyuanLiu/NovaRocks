@@ -23,6 +23,7 @@
 //!
 //! Migrated to `OptExpr` / `LogicalRewriteRule`.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use crate::optimizer::operator::Operator;
@@ -63,7 +64,11 @@ impl LogicalRewriteRule for PushDownPredicateScan {
         true
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             mut children,
@@ -147,8 +152,12 @@ impl LogicalRewriteRule for PushDownPredicateScan {
             required_output_columns,
         };
 
-        let result =
-            wrap_remaining_filter_opt_scalar(new_scan, remaining, &mut arena_rc.borrow_mut());
+        let result = wrap_remaining_filter_opt_scalar(
+            new_scan,
+            remaining,
+            &mut arena_rc.borrow_mut(),
+            &ctx.control_view(),
+        )?;
         Ok(RewriteResult::Changed(result))
     }
 }
@@ -189,8 +198,8 @@ mod tests {
 
     fn col_with_id(name: &str, column_id: ColumnId) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             kind: ExprKind::ColumnRef {
                 column_id,
                 qualifier: None,
@@ -205,16 +214,16 @@ mod tests {
 
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             kind: ExprKind::Literal(LiteralValue::Int(v)),
         }
     }
 
     fn eq(a: TypedExpr, b: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(a),
                 op: BinOp::Eq,
@@ -226,8 +235,8 @@ mod tests {
 
     fn and(a: TypedExpr, b: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::BinaryOp {
                 left: Box::new(a),
                 op: BinOp::And,
@@ -239,8 +248,8 @@ mod tests {
 
     fn is_not_null(e: TypedExpr) -> TypedExpr {
         TypedExpr {
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+
             kind: ExprKind::IsNull {
                 expr: Box::new(e),
                 negated: true,
@@ -279,8 +288,11 @@ mod tests {
                 .map(|n| OutputColumn {
                     column_id: test_col_id(n),
                     name: (*n).into(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: false,
                 })
                 .collect(),
@@ -292,14 +304,19 @@ mod tests {
     }
 
     fn filter_opt(arena: &mut ScalarArena, predicate: TypedExpr, child: OptExpr) -> OptExpr {
-        let pred_id = crate::planner::optimizer_bridge::scalar::intern_typed(arena, &predicate);
+        let pred_id = crate::planner::optimizer_bridge::scalar::intern_typed(
+            arena,
+            &predicate,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         OptExpr::new(
             Operator::LogicalFilter(FilterOp { predicate: pred_id }),
             vec![child],
         )
     }
 
-    fn make_ctx(arena: ScalarArena) -> RewriteContext {
+    fn make_ctx(arena: ScalarArena) -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(std::iter::empty::<String>());
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));
         ctx
@@ -312,7 +329,15 @@ mod tests {
         let filter = filter_opt(&mut arena, eq(col("a"), int_lit(1)), scan);
         let rule = PushDownPredicateScan;
         let mut ctx = make_ctx(arena);
-        assert!(bind_tree(&rule.pattern(), &filter).is_some());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &filter,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
         let result = rule.apply(filter, &mut ctx).unwrap();
         match result {
             RewriteResult::Changed(out) => match &out.op {
@@ -330,7 +355,15 @@ mod tests {
         let mut arena = ScalarArena::new();
         let scan = scan_opt(&mut arena, &["a"]);
         let rule = PushDownPredicateScan;
-        assert!(bind_tree(&rule.pattern(), &scan).is_none());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &scan,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -346,7 +379,15 @@ mod tests {
         );
         let filter = filter_opt(&mut arena, eq(col("a"), int_lit(1)), project);
         let rule = PushDownPredicateScan;
-        assert!(bind_tree(&rule.pattern(), &filter).is_none());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &filter,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -430,7 +471,9 @@ mod tests {
             crate::planner::optimizer_bridge::scalar::intern_typed(
                 &mut arena,
                 &is_not_null(col("a")),
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
             )
+            .unwrap()
         };
         let filter2 = OptExpr::new(
             Operator::LogicalFilter(FilterOp { predicate: pred_id }),

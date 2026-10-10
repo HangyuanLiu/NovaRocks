@@ -14,18 +14,22 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+#[cfg(test)]
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, Int8Array, Int16Array, Int32Array,
-    Int64Array, Int64Builder, LargeBinaryArray, LargeStringArray, StringArray, UInt8Array,
-    UInt16Array, UInt32Array, UInt64Array,
+    Array, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
+use arrow::array::{ArrayRef, BinaryArray, BinaryBuilder, Int64Builder};
 use arrow::datatypes::DataType;
 #[cfg(test)]
 use novarocks_types::value::bitmap::BITMAP_TYPE_EMPTY;
-use novarocks_types::value::bitmap::{decode_bitmap, encode_bitmap_aggregate as encode_bitmap};
+#[cfg(test)]
+use novarocks_types::value::bitmap::decode_bitmap;
+use novarocks_types::value::bitmap::encode_bitmap_aggregate as encode_bitmap;
 
 use super::super::*;
 use super::AggregateFunction;
@@ -34,53 +38,7 @@ use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 
 pub(super) struct BitmapUnionIntAgg;
 
-type BitmapValues = BTreeSet<u64>;
-
-struct BitmapState {
-    allocator: AggregateAllocator,
-    values: AggregateHashSet<u64>,
-    /// Whether this state has observed at least one non-null input row.
-    /// SQL aggregate semantics: a group whose inputs are all NULL must
-    /// finalize to NULL, not to the per-element identity (empty bitmap / 0).
-    /// Tracked separately from `values` because a non-null empty BITMAP input
-    /// (e.g. `bitmap_empty()`) still marks the group as non-NULL.
-    has_value: bool,
-}
-
-impl BitmapState {
-    fn new(tracker: Arc<MemTracker>) -> Self {
-        let allocator = AggregateAllocator::new(tracker);
-        Self {
-            values: aggregate_hash_set(allocator.clone()),
-            allocator,
-            has_value: false,
-        }
-    }
-}
-
-impl BitmapState {
-    fn insert(&mut self, value: u64) -> Result<(), String> {
-        if self.values.contains(&value) {
-            return Ok(());
-        }
-        self.values
-            .try_reserve(1)
-            .map_err(|_| self.allocator.allocation_error("reserve bitmap hash set"))?;
-        self.values.insert(value);
-        Ok(())
-    }
-
-    fn extend(&mut self, values: impl IntoIterator<Item = u64>) -> Result<(), String> {
-        for value in values {
-            self.insert(value)?;
-        }
-        Ok(())
-    }
-
-    fn encoded_values(&self) -> BitmapValues {
-        self.values.iter().copied().collect()
-    }
-}
+type BitmapState = novarocks_functions::bitmap_aggregate_core::BitmapState<AggregateAllocator>;
 
 fn canonical_agg_name(name: &str) -> &str {
     name.split_once('|').map(|(base, _)| base).unwrap_or(name)
@@ -95,18 +53,11 @@ fn kind_from_name(name: &str) -> Option<AggKind> {
     }
 }
 
-/// Get or initialize the BitmapState for this aggregate slot, marking that
-/// the group has observed at least one non-null input.
-///
-/// Every caller already gates on `arr.is_null(row)`, so reaching this function
-/// implies a non-null input row was successfully consumed. Centralizing the
-/// `has_value = true` write here keeps the dozen-plus type-specific update
-/// arms consistent and ensures finalize emits NULL only when no non-null
-/// input was seen.
-unsafe fn get_or_init_state<'a>(ptr: *mut u8) -> &'a mut BitmapState {
-    let state = unsafe { &mut *ptr.cast::<BitmapState>() };
-    state.has_value = true;
-    state
+fn legacy_state_error(error: novarocks_functions::aggregate_scalar::ScalarStateError) -> String {
+    match error {
+        novarocks_functions::aggregate_scalar::ScalarStateError::Legacy(message) => message,
+        _ => unreachable!("the original bitmap allocator authors only its legacy rejection"),
+    }
 }
 
 unsafe fn get_state<'a>(ptr: *mut u8) -> Option<&'a BitmapState> {
@@ -199,7 +150,9 @@ impl AggregateFunction for BitmapUnionIntAgg {
     fn init_state(&self, _spec: &AggSpec, ptr: *mut u8) {
         unsafe {
             ptr.cast::<BitmapState>()
-                .write(BitmapState::new(process_mem_tracker()))
+                .write(BitmapState::new(AggregateAllocator::new(
+                    process_mem_tracker(),
+                )))
         };
     }
 
@@ -212,7 +165,10 @@ impl AggregateFunction for BitmapUnionIntAgg {
         let tracker = tracker.ok_or_else(|| {
             "allocation-tracked bitmap state requires a memory tracker".to_string()
         })?;
-        unsafe { ptr.cast::<BitmapState>().write(BitmapState::new(tracker)) };
+        unsafe {
+            ptr.cast::<BitmapState>()
+                .write(BitmapState::new(AggregateAllocator::new(tracker)))
+        };
         Ok(())
     }
 
@@ -238,263 +194,30 @@ impl AggregateFunction for BitmapUnionIntAgg {
         let AggInputView::Any(array) = input else {
             return Err("bitmap_union_int batch input type mismatch".to_string());
         };
-        let include_negative = matches!(spec.kind, AggKind::BitmapUnionInt);
-
-        macro_rules! update_signed {
-            ($arr_ty:ty) => {{
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<$arr_ty>()
-                    .ok_or_else(|| "failed to downcast signed integer array".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let raw = i64::from(arr.value(row));
-                    if !include_negative && raw < 0 {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
-                    state.insert(raw as u64)?;
+        use novarocks_functions::bitmap_aggregate_core::{
+            BitmapOperation, LegacyRows, StateMutation,
+        };
+        let operation = match spec.kind {
+            AggKind::BitmapUnionInt => BitmapOperation::Count,
+            _ => BitmapOperation::BitmapProjection,
+        };
+        let mut port = LegacyRows::new(|ordinal, mutation| {
+            let ptr = unsafe { (state_ptrs[ordinal] as *mut u8).add(offset) };
+            let state = unsafe { &mut *ptr.cast::<BitmapState>() };
+            match mutation {
+                StateMutation::Observe => {
+                    state.observe();
+                    Ok(())
                 }
-                Ok(())
-            }};
-        }
-
-        match array.data_type() {
-            DataType::Boolean => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
-                    state.insert(if arr.value(row) { 1 } else { 0 })?;
-                }
-                Ok(())
+                StateMutation::Insert(value) => state.insert(value).map_err(legacy_state_error),
             }
-            DataType::Int8 => update_signed!(Int8Array),
-            DataType::Int16 => update_signed!(Int16Array),
-            DataType::Int32 => update_signed!(Int32Array),
-            DataType::Int64 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .ok_or_else(|| "failed to downcast to Int64Array".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let raw = arr.value(row);
-                    if !include_negative && raw < 0 {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
-                    state.insert(raw as u64)?;
-                }
-                Ok(())
-            }
-            DataType::UInt8 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<UInt8Array>()
-                    .ok_or_else(|| "failed to downcast to UInt8Array".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
-                    state.insert(u64::from(arr.value(row)))?;
-                }
-                Ok(())
-            }
-            DataType::UInt16 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<UInt16Array>()
-                    .ok_or_else(|| "failed to downcast to UInt16Array".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
-                    state.insert(u64::from(arr.value(row)))?;
-                }
-                Ok(())
-            }
-            DataType::UInt32 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<UInt32Array>()
-                    .ok_or_else(|| "failed to downcast to UInt32Array".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
-                    state.insert(u64::from(arr.value(row)))?;
-                }
-                Ok(())
-            }
-            DataType::UInt64 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| "failed to downcast to UInt64Array".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
-                    state.insert(arr.value(row))?;
-                }
-                Ok(())
-            }
-            DataType::Utf8 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let Ok(value) = arr.value(row).trim().parse::<i128>() else {
-                        continue;
-                    };
-                    if !include_negative && value < 0 {
-                        continue;
-                    }
-                    if value < i64::MIN as i128 || value > u64::MAX as i128 {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
-                    if value < 0 {
-                        state.insert((value as i64) as u64)?;
-                    } else {
-                        state.insert(value as u64)?;
-                    }
-                }
-                Ok(())
-            }
-            DataType::LargeUtf8 => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<LargeStringArray>()
-                    .ok_or_else(|| "failed to downcast to LargeStringArray".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    let Ok(value) = arr.value(row).trim().parse::<i128>() else {
-                        continue;
-                    };
-                    if !include_negative && value < 0 {
-                        continue;
-                    }
-                    if value < i64::MIN as i128 || value > u64::MAX as i128 {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
-                    if value < 0 {
-                        state.insert((value as i64) as u64)?;
-                    } else {
-                        state.insert(value as u64)?;
-                    }
-                }
-                Ok(())
-            }
-            DataType::Binary => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<BinaryArray>()
-                    .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    if let Ok(decoded) = decode_bitmap(arr.value(row)) {
-                        let ptr = unsafe { (base as *mut u8).add(offset) };
-                        let state = unsafe { get_or_init_state(ptr) };
-                        state.extend(decoded.into_iter())?;
-                        continue;
-                    }
-                    let Ok(text) = std::str::from_utf8(arr.value(row)) else {
-                        continue;
-                    };
-                    let Ok(value) = text.trim().parse::<i128>() else {
-                        continue;
-                    };
-                    if !include_negative && value < 0 {
-                        continue;
-                    }
-                    if value < i64::MIN as i128 || value > u64::MAX as i128 {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
-                    if value < 0 {
-                        state.insert((value as i64) as u64)?;
-                    } else {
-                        state.insert(value as u64)?;
-                    }
-                }
-                Ok(())
-            }
-            DataType::LargeBinary => {
-                let arr = array
-                    .as_any()
-                    .downcast_ref::<LargeBinaryArray>()
-                    .ok_or_else(|| "failed to downcast to LargeBinaryArray".to_string())?;
-                for (row, &base) in state_ptrs.iter().enumerate() {
-                    if arr.is_null(row) {
-                        continue;
-                    }
-                    if let Ok(decoded) = decode_bitmap(arr.value(row)) {
-                        let ptr = unsafe { (base as *mut u8).add(offset) };
-                        let state = unsafe { get_or_init_state(ptr) };
-                        state.extend(decoded.into_iter())?;
-                        continue;
-                    }
-                    let Ok(text) = std::str::from_utf8(arr.value(row)) else {
-                        continue;
-                    };
-                    let Ok(value) = text.trim().parse::<i128>() else {
-                        continue;
-                    };
-                    if !include_negative && value < 0 {
-                        continue;
-                    }
-                    if value < i64::MIN as i128 || value > u64::MAX as i128 {
-                        continue;
-                    }
-                    let ptr = unsafe { (base as *mut u8).add(offset) };
-                    let state = unsafe { get_or_init_state(ptr) };
-                    if value < 0 {
-                        state.insert((value as i64) as u64)?;
-                    } else {
-                        state.insert(value as u64)?;
-                    }
-                }
-                Ok(())
-            }
-            other => Err(format!(
-                "bitmap aggregate expects BOOLEAN/INTEGER/VARCHAR/BINARY input, got {:?}",
-                other
-            )),
-        }
+        });
+        novarocks_functions::bitmap_aggregate_core::update(
+            operation,
+            array,
+            0..state_ptrs.len(),
+            &mut port,
+        )
     }
 
     fn merge_batch(
@@ -504,19 +227,22 @@ impl AggregateFunction for BitmapUnionIntAgg {
         state_ptrs: &[AggStatePtr],
         input: &AggInputView,
     ) -> Result<(), String> {
-        let AggInputView::Binary(arr) = input else {
+        let AggInputView::Binary(array) = input else {
             return Err("bitmap_union_int merge input type mismatch".to_string());
         };
-        for (row, &base) in state_ptrs.iter().enumerate() {
-            if arr.is_null(row) {
-                continue;
+        use novarocks_functions::bitmap_aggregate_core::{LegacyRows, StateMutation};
+        let mut port = LegacyRows::new(|ordinal, mutation| {
+            let ptr = unsafe { (state_ptrs[ordinal] as *mut u8).add(offset) };
+            let state = unsafe { &mut *ptr.cast::<BitmapState>() };
+            match mutation {
+                StateMutation::Observe => {
+                    state.observe();
+                    Ok(())
+                }
+                StateMutation::Insert(value) => state.insert(value).map_err(legacy_state_error),
             }
-            let decoded = decode_bitmap(arr.value(row))?;
-            let ptr = unsafe { (base as *mut u8).add(offset) };
-            let state = unsafe { get_or_init_state(ptr) };
-            state.extend(decoded.into_iter())?;
-        }
-        Ok(())
+        });
+        novarocks_functions::bitmap_aggregate_core::merge(array, 0..state_ptrs.len(), &mut port)
     }
 
     fn build_array(
@@ -551,12 +277,10 @@ impl AggregateFunction for BitmapUnionIntAgg {
                     let ptr = unsafe { (base as *mut u8).add(offset) };
                     match unsafe { get_state(ptr) } {
                         Some(state) if state.has_value => {
-                            let value = i64::try_from(state.values.len()).map_err(|_| {
-                                format!(
-                                    "bitmap_union_int cardinality overflow: {}",
-                                    state.values.len()
-                                )
-                            })?;
+                            let value = state
+                                .cardinality()
+                                .map_err(|failure| failure.to_string())?
+                                .expect("original has_value branch");
                             builder.append_value(value);
                         }
                         // All-null group: SQL semantics say bitmap_union_count
@@ -809,3 +533,7 @@ mod tests {
         assert!(arr.is_null(0));
     }
 }
+
+#[cfg(test)]
+#[path = "bitmap_union_int_original_baseline_tests.rs"]
+mod original_baseline;

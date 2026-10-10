@@ -47,7 +47,9 @@ use tonic::body::BoxBody;
 use tonic::codegen::{Body as HttpBody, Service, StdError};
 use tonic::transport::Channel;
 
-use crate::native_transport_admission::{NativeTransportAdmission, TransportClass};
+use crate::native_transport_admission::{
+    FrontendOutgoingCallExit, NativeTransportAdmission, TransportClass, TransportRole,
+};
 
 /// One physical Native transport owner from the frozen method manifest.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -243,6 +245,14 @@ impl NativeLaneStreamGate {
     }
 
     fn permit(&self, permit: OwnedSemaphorePermit) -> NativeLaneStreamPermit {
+        self.permit_with_exit(permit, None)
+    }
+
+    fn permit_with_exit(
+        &self,
+        permit: OwnedSemaphorePermit,
+        outgoing_exit: Option<FrontendOutgoingCallExit>,
+    ) -> NativeLaneStreamPermit {
         if let Some(observer) = &self.observer {
             observer.lane_streams(self.lane, self.direction, 1);
         }
@@ -251,6 +261,7 @@ impl NativeLaneStreamGate {
             lane: self.lane,
             direction: self.direction,
             observer: self.observer.clone(),
+            _outgoing_exit: outgoing_exit,
         }
     }
 }
@@ -261,6 +272,8 @@ pub struct NativeLaneStreamPermit {
     lane: NativeLane,
     direction: StreamDirection,
     observer: SharedObserver,
+    // Last: a body/future and its original permit exit before this observation.
+    _outgoing_exit: Option<FrontendOutgoingCallExit>,
 }
 
 impl fmt::Debug for NativeLaneStreamPermit {
@@ -339,6 +352,8 @@ pub struct NativeLaneChannel {
     gate: NativeLaneStreamGate,
     poll: PollSemaphore,
     reserved: Option<OwnedSemaphorePermit>,
+    outgoing_admission: Option<NativeTransportAdmission>,
+    outgoing_changed: Option<Pin<Box<tokio::sync::futures::OwnedNotified>>>,
 }
 
 impl fmt::Debug for NativeLaneChannel {
@@ -356,6 +371,8 @@ impl Clone for NativeLaneChannel {
             gate: self.gate.clone(),
             poll: PollSemaphore::new(Arc::clone(&self.gate.semaphore)),
             reserved: None,
+            outgoing_admission: self.outgoing_admission.clone(),
+            outgoing_changed: None,
         }
     }
 }
@@ -368,12 +385,16 @@ impl NativeLaneChannel {
         lane: NativeLane,
         admission: Option<&NativeTransportAdmission>,
     ) -> Self {
-        Self::with_streams(
+        let mut channel = Self::with_streams(
             channel,
             lane,
             client_streams_per_connection(),
             admission.and_then(NativeTransportAdmission::observer),
-        )
+        );
+        channel.outgoing_admission = admission
+            .filter(|admission| admission.role() == TransportRole::Frontend && lane.index() < 4)
+            .cloned();
+        channel
     }
 
     pub(crate) fn with_streams(
@@ -388,6 +409,8 @@ impl NativeLaneChannel {
             poll: PollSemaphore::new(Arc::clone(&gate.semaphore)),
             gate,
             reserved: None,
+            outgoing_admission: None,
+            outgoing_changed: None,
         }
     }
 
@@ -410,6 +433,24 @@ impl Service<hyper::http::Request<BoxBody>> for NativeLaneChannel {
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        if let Some(admission) = &self.outgoing_admission {
+            // Register before checking closed. The same Notify wakes a waiter
+            // already blocked on this clone's original stream reservation.
+            let changed = self
+                .outgoing_changed
+                .get_or_insert_with(|| Box::pin(admission.frontend_outgoing_notified()));
+            if changed.as_mut().poll(cx).is_ready() {
+                *changed = Box::pin(admission.frontend_outgoing_notified());
+                let _ = changed.as_mut().poll(cx);
+            }
+            if admission.frontend_outgoing_is_closed() {
+                drop(self.reserved.take());
+                // A pending acquire future may already own an assigned
+                // qualification even though poll_acquire returned Pending.
+                self.poll = PollSemaphore::new(Arc::clone(&self.gate.semaphore));
+                return Poll::Ready(Err("frontend outgoing native transport closed".into()));
+            }
+        }
         if self.reserved.is_none() {
             // The semaphore is never closed; a closed gate is a broken owner.
             let Some(permit) = ready!(self.poll.poll_acquire(cx)) else {
@@ -421,14 +462,56 @@ impl Service<hyper::http::Request<BoxBody>> for NativeLaneChannel {
     }
 
     fn call(&mut self, request: hyper::http::Request<BoxBody>) -> Self::Future {
-        let permit = self.reserved.take().map(|permit| self.gate.permit(permit));
+        let Some(reserved) = self.reserved.take() else {
+            return Box::pin(async { Err("native lane request was not ready".into()) });
+        };
+        // This check also covers a clone whose poll_ready succeeded before
+        // role close. Registration and close share the original Core lock.
+        let outgoing_exit = match self
+            .outgoing_admission
+            .as_ref()
+            .map(|admission| admission.register_frontend_outgoing_call(self.gate.lane))
+            .transpose()
+        {
+            Ok(exit) => exit,
+            Err(error) => {
+                self.poll = PollSemaphore::new(Arc::clone(&self.gate.semaphore));
+                return Box::pin(async move { Err(error.into()) });
+            }
+        };
+        let permit = self.gate.permit_with_exit(reserved, outgoing_exit);
         let response = Service::call(&mut self.channel, request);
-        Box::pin(async move {
-            // The position also covers the time Tonic holds the request
-            // before its stream opens; a failed call returns it here.
-            let response = response.await.map_err(StdError::from)?;
-            Ok(response.map(|body| NativeLaneStreamBody::boxed(body, permit)))
+        Box::pin(NativeLaneResponseFuture {
+            inner: response,
+            permit: Some(permit),
         })
+    }
+}
+
+// The actual response future drops before the original stream holder if a
+// caller abandons it. Headers hand that holder to the original response body.
+struct NativeLaneResponseFuture {
+    inner: <Channel as Service<hyper::http::Request<BoxBody>>>::Future,
+    permit: Option<NativeLaneStreamPermit>,
+}
+
+impl Future for NativeLaneResponseFuture {
+    type Output = Result<hyper::http::Response<BoxBody>, StdError>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.inner).poll(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(response)) => {
+                let permit = self.permit.take();
+                Poll::Ready(Ok(
+                    response.map(|body| NativeLaneStreamBody::boxed(body, permit))
+                ))
+            }
+            Poll::Ready(Err(error)) => {
+                drop(self.permit.take());
+                Poll::Ready(Err(error.into()))
+            }
+        }
     }
 }
 
@@ -564,3 +647,7 @@ pub fn frontend_lane_connector(
 #[cfg(test)]
 #[path = "native_lane_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "native_lane_outgoing_exit_tests.rs"]
+mod outgoing_exit_tests;

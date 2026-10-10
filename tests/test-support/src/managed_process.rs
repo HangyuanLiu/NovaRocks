@@ -604,6 +604,23 @@ pub struct ManagedProcessLogTail {
 }
 
 impl ManagedProcessLogSource {
+    /// Copies the identity captured from the actual log writer before spawn.
+    /// This scalar observation grants no read right and never samples a new path.
+    pub fn original_durable_log_identity(&self) -> Result<(u64, u64)> {
+        #[cfg(unix)]
+        {
+            let original = self
+                .original_log_generation
+                .context("original durable log has no spawn-time file identity")?;
+            if original.inode == 0 {
+                bail!("original durable log inode is zero");
+            }
+            Ok((original.device, original.inode))
+        }
+        #[cfg(not(unix))]
+        bail!("original durable log identity requires Unix");
+    }
+
     /// Visits a complete point-in-time original durable log with bounded reads.
     /// The callback gets one Take<File>, never a Vec/String or history concatenation.
     pub fn with_bounded_snapshot_reader<T>(
@@ -2123,6 +2140,7 @@ mod tests {
     use anyhow::Result;
     use std::fs::{self, File};
     use std::io::{self, Cursor, Write};
+    use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -2210,8 +2228,21 @@ mod tests {
         let mut actual = File::create(&path).unwrap();
         actual.write_all(b"original\n").unwrap();
         let source = original_file_source(path.clone(), &actual);
+        let original_identity = source.original_durable_log_identity().unwrap();
+        assert_eq!(
+            original_identity,
+            (
+                actual.metadata().unwrap().dev(),
+                actual.metadata().unwrap().ino()
+            )
+        );
         fs::rename(&path, temp.path().join("retained-original.log")).unwrap();
         fs::write(&path, b"forged regular log\n").unwrap();
+        assert_eq!(
+            source.original_durable_log_identity().unwrap(),
+            original_identity
+        );
+        assert_ne!(fs::metadata(&path).unwrap().ino(), original_identity.1);
         assert!(
             source
                 .with_bounded_snapshot_reader(128, |_, _| -> Result<()> {
@@ -2221,6 +2252,7 @@ mod tests {
         );
         let mut unpinned = source;
         unpinned.original_log_generation = None;
+        assert!(unpinned.original_durable_log_identity().is_err());
         assert!(
             unpinned
                 .with_bounded_snapshot_reader(128, |_, _| -> Result<()> {

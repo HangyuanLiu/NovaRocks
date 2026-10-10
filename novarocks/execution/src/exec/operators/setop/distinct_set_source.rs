@@ -28,6 +28,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -123,11 +125,11 @@ impl<S: DistinctSetSemantics> ProcessorOperator for DistinctSetSourceOperator<S>
         self.state.controller().is_stage_ready(output_stage)
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
-        Err(S::SOURCE_REJECT_INPUT_ERROR.to_string())
+    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
+        Err(S::SOURCE_REJECT_INPUT_ERROR.to_string().into())
     }
 
-    fn pull_chunk(&mut self, state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         if self.finished {
             return Ok(None);
         }
@@ -174,7 +176,8 @@ impl<S: DistinctSetSemantics> ProcessorOperator for DistinctSetSourceOperator<S>
                 S::SOURCE_SLOT_MISMATCH_PREFIX,
                 self.output_chunk_schema.slot_ids().len(),
                 out_arrays.len()
-            ));
+            )
+            .into());
         }
 
         Ok(Some(Chunk::try_new_with_columns(
@@ -183,7 +186,7 @@ impl<S: DistinctSetSemantics> ProcessorOperator for DistinctSetSourceOperator<S>
         )?))
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         Ok(())
     }
 

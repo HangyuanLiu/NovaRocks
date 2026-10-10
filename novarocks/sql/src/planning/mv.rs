@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::analyze_error::AnalyzeError;
+use crate::compiler::SqlCompileError;
 pub use crate::mv_refresh::{
     AggregateFunctionKind, MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget,
     VisibleAggregateOutput, first_refresh,
@@ -25,6 +26,9 @@ use novarocks_parser::{
     Span,
     ast::{self as ast, Expr, ObjectName, Query, Select, SelectItem, SetExpr, TableFactor},
     printer,
+};
+use novarocks_type_contract::{
+    CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl,
 };
 
 pub use super::mv_persistence::{
@@ -51,7 +55,7 @@ pub(crate) fn validate_persistable_output(
         if let Some(logical) = factory.borrowed_logical_type(column.column_id) {
             PersistenceOutputInspection::logical(logical)?;
         }
-        PersistenceOutputInspection::data_type(&column.data_type)?;
+        PersistenceOutputInspection::data_type(&column.value_type.data_type)?;
     }
     Ok(())
 }
@@ -398,11 +402,37 @@ mod refresh_property_facade_tests {
         ) -> Result<ResolvedAnalyzerTable, String> {
             let planner = TableDef {
                 name: table.to_string(),
-                columns: vec![
-                    column("id", DataType::Int64, false),
-                    column("region", DataType::Utf8, true),
-                    column("amount", DataType::Int64, true),
-                ],
+                columns: if table == "logical_domains" {
+                    use novarocks_types::schema::SqlType;
+                    [
+                        ("doc", DataType::Utf8, Some(SqlType::Json)),
+                        (
+                            "variant_value",
+                            DataType::LargeBinary,
+                            Some(SqlType::Variant),
+                        ),
+                        ("hll_value", DataType::Binary, Some(SqlType::Hll)),
+                        ("bitmap_value", DataType::Binary, Some(SqlType::Bitmap)),
+                        (
+                            "large_value",
+                            DataType::FixedSizeBinary(16),
+                            Some(SqlType::LargeInt),
+                        ),
+                        ("fixed_value", DataType::FixedSizeBinary(16), None),
+                    ]
+                    .into_iter()
+                    .map(|(name, data_type, logical_type)| ColumnDef {
+                        logical_type,
+                        ..column(name, data_type, true)
+                    })
+                    .collect()
+                } else {
+                    vec![
+                        column("id", DataType::Int64, false),
+                        column("region", DataType::Utf8, true),
+                        column("amount", DataType::Int64, true),
+                    ]
+                },
                 iceberg_row_lineage_metadata_columns: Vec::new(),
                 source: ScanSource::Sql(SqlScanSource::new(
                     crate::compiler::mv_rewrite::test_target_binding(),
@@ -461,7 +491,7 @@ mod refresh_property_facade_tests {
             parse_query("SELECT bitmap_to_binary(to_bitmap(id)) AS external FROM fact_east");
         let (resolved, _, factory) =
             crate::analyzer::analyze(&query, &TestIcebergCatalog, "sales").unwrap();
-        assert_eq!(resolved.output_columns[0].data_type, DataType::Binary);
+        assert_eq!(resolved.output_columns[0].value_type.data_type, DataType::Binary);
         validate_persistable_output(&resolved, &factory)
             .expect("ordinary external Binary is not an opaque domain");
     }
@@ -599,7 +629,7 @@ mod refresh_property_facade_tests {
         let projection = analyzed_refresh_input(
             "SELECT region, amount + 1 AS adjusted_amount FROM fact_east WHERE amount > 0",
         )
-        .refresh_contract()
+        .refresh_contract(crate::optimizer::test_optimizer_control())
         .expect("projection contract");
         assert_eq!(projection.base_refs[0].table.fqn(), "ice.sales.fact_east");
         assert_eq!(projection.apply_key, SqlImvApplyKeyFacts::ProjectionFilter);
@@ -608,7 +638,7 @@ mod refresh_property_facade_tests {
         let union = analyzed_refresh_input(
             "SELECT region, amount FROM fact_east UNION ALL SELECT region, amount FROM fact_west",
         )
-        .refresh_contract()
+        .refresh_contract(crate::optimizer::test_optimizer_control())
         .expect("union contract");
         assert_eq!(union.apply_key, SqlImvApplyKeyFacts::UnionProjectionFilter);
         assert_eq!(union.branch, Some(SqlImvBranchFacts { branch_count: 2 }));
@@ -620,7 +650,7 @@ mod refresh_property_facade_tests {
             "SELECT l.region, count(*) AS c, sum(r.amount) AS s \
              FROM fact_east l JOIN fact_west r ON l.id = r.id GROUP BY l.region",
         )
-        .refresh_contract()
+        .refresh_contract(crate::optimizer::test_optimizer_control())
         .expect("join aggregate contract");
         assert_eq!(facts.apply_key, SqlImvApplyKeyFacts::JoinAggregateGroupRow);
         assert_eq!(
@@ -634,16 +664,45 @@ mod refresh_property_facade_tests {
     }
 
     #[test]
+    fn mv_output_facade_preserves_actual_catalog_root_domains() {
+        use novarocks_type_contract::ValueLogicalType;
+        let facts = analyzed_refresh_input("SELECT doc, variant_value, hll_value, bitmap_value, large_value, fixed_value FROM logical_domains").analysis_facts();
+        let expected = [
+            ValueLogicalType::Json,
+            ValueLogicalType::Variant,
+            ValueLogicalType::Hll,
+            ValueLogicalType::Bitmap,
+            ValueLogicalType::LargeInt,
+            ValueLogicalType::Physical,
+        ];
+        for (column, logical_type) in facts.output_columns.iter().zip(expected) {
+            assert_eq!(column.value_type.logical_type, logical_type);
+            assert!(column.value_type.nullable);
+        }
+        assert_eq!(
+            facts.output_columns[4].value_type.data_type,
+            facts.output_columns[5].value_type.data_type
+        );
+        assert_ne!(
+            facts.output_columns[4].value_type,
+            facts.output_columns[5].value_type
+        );
+    }
+
+    #[test]
     fn opaque_refresh_input_projects_only_output_schema_facts() {
         let facts =
             analyzed_refresh_input("SELECT id AS order_id, region FROM fact_east").analysis_facts();
 
         assert_eq!(facts.output_columns.len(), 2);
         assert_eq!(facts.output_columns[0].name, "order_id");
-        assert_eq!(facts.output_columns[0].data_type, DataType::Int64);
-        assert!(!facts.output_columns[0].nullable);
+        assert_eq!(
+            facts.output_columns[0].value_type.data_type,
+            DataType::Int64
+        );
+        assert!(!facts.output_columns[0].value_type.nullable);
         assert_eq!(facts.output_columns[1].name, "region");
-        assert!(facts.output_columns[1].nullable);
+        assert!(facts.output_columns[1].value_type.nullable);
     }
 
     #[test]
@@ -871,12 +930,291 @@ mod refresh_property_facade_tests {
             "SELECT region FROM fact_east ORDER BY region",
         ] {
             let error = analyzed_refresh_input(sql)
-                .refresh_contract()
+                .refresh_contract(crate::optimizer::test_optimizer_control())
                 .expect_err("unsupported shape must fail closed");
             assert!(
-                error.contains("SELECT DISTINCT") || error.contains("ORDER BY, LIMIT, or OFFSET"),
+                error.to_string().contains("SELECT DISTINCT")
+                    || error.to_string().contains("ORDER BY, LIMIT, or OFFSET"),
                 "unexpected error for {sql}: {error}"
             );
+        }
+    }
+
+    fn cv_i64(values: Vec<Option<i64>>, ordinal: u32, nullable: bool) -> TypedExpr {
+        use arrow::array::{Array, Int64Array};
+        let ty = FunctionValueType::new(DataType::Int64, nullable);
+        let pool = novarocks_functions::ConstantPool::try_new(
+            std::sync::Arc::new(arrow::datatypes::Field::new(
+                "selected",
+                DataType::Int64,
+                nullable,
+            )),
+            ty.clone(),
+            Int64Array::from(values).to_data(),
+            crate::constant::test_constant_policy(),
+            CompilePhase::LowerProgram,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        TypedExpr {
+            kind: ExprKind::Constant(pool.value(ordinal).unwrap()),
+            value_type: ty,
+        }
+    }
+
+    fn cv_refresh_input(group: TypedExpr, projection: TypedExpr) -> SqlResolvedMvRefreshInput {
+        let mut input = analyzed_refresh_input(
+            "SELECT region AS selected_key, count(*) AS c FROM fact_east GROUP BY region",
+        );
+        let crate::analysis::QueryBody::Select(select) = &mut input.0.body else {
+            panic!("actual analyzer select fixture");
+        };
+        select.group_by[0] = group;
+        select.projection[0].expr = projection;
+        input
+    }
+
+    #[test]
+    fn refresh_identity_matches_selected_cv_across_pools_without_debug_or_address_keys() {
+        let left = cv_i64(vec![Some(99), Some(7), Some(-2)], 1, false);
+        let right = cv_i64(vec![Some(7), Some(111)], 0, false);
+        let (ExprKind::Constant(l), ExprKind::Constant(r)) = (&left.kind, &right.kind) else {
+            panic!("checked CV fixtures");
+        };
+        assert_ne!(l.pool().backing_identity(), r.pool().backing_identity());
+        assert_ne!(l.ordinal(), r.ordinal());
+        let input = cv_refresh_input(left.clone(), right);
+        let property = input
+            .refresh_property(crate::optimizer::test_optimizer_control())
+            .unwrap();
+        assert_eq!(
+            property.identity,
+            TargetIdentity::GroupRowId(vec!["selected_key".into()])
+        );
+        let contract = input
+            .refresh_contract(crate::optimizer::test_optimizer_control())
+            .unwrap();
+        assert_eq!(
+            contract.aggregate,
+            Some(SqlImvAggregateFacts {
+                group_key_count: 1,
+                aggregate_count: 1
+            })
+        );
+        let crate::analysis::QueryBody::Select(select) = &input.0.body else {
+            unreachable!()
+        };
+        let ExprKind::Constant(retained) = &select.group_by[0].kind else {
+            unreachable!()
+        };
+        assert_eq!(
+            retained.pool().backing_identity(),
+            l.pool().backing_identity()
+        );
+        assert_eq!(retained.ordinal(), 1);
+
+        let different = cv_refresh_input(left.clone(), cv_i64(vec![Some(7), Some(8)], 1, false));
+        assert!(matches!(
+            different.refresh_property(crate::optimizer::test_optimizer_control()),
+            Err(SqlCompileError::Compilation(_))
+        ));
+        let nullable = cv_refresh_input(left, cv_i64(vec![Some(7)], 0, true));
+        assert!(matches!(
+            nullable.refresh_contract(crate::optimizer::test_optimizer_control()),
+            Err(SqlCompileError::Compilation(_))
+        ));
+    }
+
+    fn cv_utf8(logical: novarocks_type_contract::ValueLogicalType, metadata: &str) -> TypedExpr {
+        use arrow::array::{Array, StringArray};
+        let ty = FunctionValueType {
+            data_type: DataType::Utf8,
+            nullable: false,
+            logical_type: logical,
+        };
+        let field = arrow::datatypes::Field::new("selected", DataType::Utf8, false).with_metadata(
+            std::collections::HashMap::from([("source".into(), metadata.into())]),
+        );
+        let pool = novarocks_functions::ConstantPool::try_new(
+            std::sync::Arc::new(field),
+            ty.clone(),
+            StringArray::from(vec!["\"same\""]).to_data(),
+            crate::constant::test_constant_policy(),
+            CompilePhase::LowerProgram,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        TypedExpr {
+            kind: ExprKind::Constant(pool.value(0).unwrap()),
+            value_type: ty,
+        }
+    }
+
+    #[test]
+    fn refresh_identity_rejects_full_cv_root_field_metadata_and_logical_disagreement() {
+        use novarocks_type_contract::ValueLogicalType;
+        for (left, right) in [
+            (
+                cv_utf8(ValueLogicalType::Physical, "a"),
+                cv_utf8(ValueLogicalType::Physical, "b"),
+            ),
+            (
+                cv_utf8(ValueLogicalType::Physical, "a"),
+                cv_utf8(ValueLogicalType::Json, "a"),
+            ),
+        ] {
+            let input = cv_refresh_input(left, right);
+            assert!(matches!(
+                input.refresh_property(crate::optimizer::test_optimizer_control()),
+                Err(SqlCompileError::Compilation(_))
+            ));
+            assert!(matches!(
+                input.refresh_contract(crate::optimizer::test_optimizer_control()),
+                Err(SqlCompileError::Compilation(_))
+            ));
+        }
+        let input = cv_refresh_input(
+            cv_i64(vec![None], 0, true),
+            cv_i64(vec![Some(1), None], 1, true),
+        );
+        assert!(
+            input
+                .refresh_contract(crate::optimizer::test_optimizer_control())
+                .is_ok()
+        );
+    }
+
+    fn wide_cv() -> TypedExpr {
+        use arrow::array::{Array, ArrayRef, Int64Array, StructArray};
+        use arrow::datatypes::{Field, Fields};
+        let fields: Fields = (0..320)
+            .map(|i| {
+                std::sync::Arc::new(
+                    Field::new(format!("field_{i}"), DataType::Int64, false).with_metadata(
+                        std::collections::HashMap::from([("source".into(), format!("value_{i}"))]),
+                    ),
+                )
+            })
+            .collect();
+        let children: Vec<ArrayRef> = (0..320)
+            .map(|i| std::sync::Arc::new(Int64Array::from(vec![i as i64])) as ArrayRef)
+            .collect();
+        let array = StructArray::new(fields.clone(), children, None);
+        let ty = FunctionValueType::new(DataType::Struct(fields), false);
+        let pool = novarocks_functions::ConstantPool::try_new(
+            std::sync::Arc::new(Field::new("selected", ty.data_type.clone(), false)),
+            ty.clone(),
+            array.to_data(),
+            crate::constant::test_constant_policy(),
+            CompilePhase::LowerProgram,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        TypedExpr {
+            kind: ExprKind::Constant(pool.value(0).unwrap()),
+            value_type: ty,
+        }
+    }
+
+    struct IdentityControl {
+        trace: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
+        refuse: Option<usize>,
+        cause: novarocks_type_contract::CompileControlError,
+    }
+    impl IdentityControl {
+        fn new(refuse: Option<usize>, cause: novarocks_type_contract::CompileControlError) -> Self {
+            Self {
+                trace: std::sync::Mutex::new(Vec::new()),
+                refuse,
+                cause,
+            }
+        }
+    }
+    impl PureCompileControl for IdentityControl {
+        fn checkpoint(
+            &self,
+            phase: CompilePhase,
+            units: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            let mut trace = self.trace.lock().unwrap();
+            trace.push((phase, units));
+            if self.refuse == Some(trace.len() - 1) {
+                return Err(self.cause);
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn refresh_identity_keeps_three_original_causes_at_every_real_cv_boundary_and_ordinary_tail() {
+        use novarocks_type_contract::CompileControlError;
+        let input = cv_refresh_input(wide_cv(), wide_cv());
+        for contract in [false, true] {
+            let run = |control: &IdentityControl| -> Result<(), SqlCompileError> {
+                if contract {
+                    input.refresh_contract(control).map(|_| ())
+                } else {
+                    input.refresh_property(control).map(|_| ())
+                }
+            };
+            let good = IdentityControl::new(None, CompileControlError::Cancelled);
+            run(&good).unwrap();
+            let trace = good.trace.into_inner().unwrap();
+            assert!(trace.iter().any(|(_, n)| *n == 256));
+            for index in 0..trace.len() {
+                for cause in [
+                    CompileControlError::Cancelled,
+                    CompileControlError::DeadlineExceeded,
+                    CompileControlError::ResourceExhausted,
+                ] {
+                    let refusing = IdentityControl::new(Some(index), cause);
+                    let error = run(&refusing).unwrap_err();
+                    assert!(matches!(
+                        (cause, error),
+                        (CompileControlError::Cancelled, SqlCompileError::Cancelled)
+                            | (
+                                CompileControlError::DeadlineExceeded,
+                                SqlCompileError::DeadlineExceeded
+                            )
+                            | (
+                                CompileControlError::ResourceExhausted,
+                                SqlCompileError::ResourceExhausted
+                            )
+                    ));
+                    assert_eq!(*refusing.trace.lock().unwrap(), trace[..=index]);
+                }
+            }
+        }
+        let invalid = cv_refresh_input(
+            cv_i64(vec![Some(1)], 0, false),
+            cv_i64(vec![Some(2)], 0, false),
+        );
+        let good = IdentityControl::new(None, CompileControlError::Cancelled);
+        assert!(matches!(
+            invalid.refresh_property(&good),
+            Err(SqlCompileError::Compilation(_))
+        ));
+        let trace = good.trace.into_inner().unwrap();
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let refusing = IdentityControl::new(Some(trace.len() - 1), cause);
+            let error = invalid.refresh_property(&refusing).unwrap_err();
+            assert!(matches!(
+                (cause, error),
+                (CompileControlError::Cancelled, SqlCompileError::Cancelled)
+                    | (
+                        CompileControlError::DeadlineExceeded,
+                        SqlCompileError::DeadlineExceeded
+                    )
+                    | (
+                        CompileControlError::ResourceExhausted,
+                        SqlCompileError::ResourceExhausted
+                    )
+            ));
+            assert_eq!(*refusing.trace.lock().unwrap(), trace);
         }
     }
 }
@@ -899,12 +1237,31 @@ impl SqlResolvedMvRefreshInput {
         source.into_sql_resolved_mv_refresh_input()
     }
 
-    pub fn refresh_property(&self) -> Result<RefreshFragmentProperty, String> {
-        derive_fragment_property(&self.0)
+    pub fn refresh_property(
+        &self,
+        control: &dyn PureCompileControl,
+    ) -> Result<RefreshFragmentProperty, SqlCompileError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+        let result = derive_fragment_property(&self.0, &mut work);
+        finish_refresh_identity(result, work)
     }
 
-    pub fn refresh_contract(&self) -> Result<SqlImvRefreshContractFacts, String> {
-        self.refresh_property()?.into_refresh_contract()
+    pub fn refresh_contract(
+        &self,
+        control: &dyn PureCompileControl,
+    ) -> Result<SqlImvRefreshContractFacts, SqlCompileError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+        let result = (|| {
+            let property = derive_fragment_property(&self.0, &mut work)?;
+            // The existing contract projection remains an opaque ordinary owner.
+            work.flush()?;
+            let contract = property
+                .into_refresh_contract()
+                .map_err(SqlCompileError::from);
+            work.flush()?;
+            contract
+        })();
+        finish_refresh_identity(result, work)
     }
 
     /// Project only the MV output facts application code needs to construct its
@@ -1074,8 +1431,7 @@ pub struct SqlMvAnalysisFacts {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqlMvOutputColumnFacts {
     pub name: String,
-    pub data_type: arrow::datatypes::DataType,
-    pub nullable: bool,
+    pub value_type: FunctionValueType,
 }
 
 /// Selects the output whose aggregate layout is being derived.
@@ -1676,7 +2032,7 @@ fn aggregate_input_types_from_resolved_query(
         let slot = input_types.get_mut(*aggregate_index).ok_or_else(|| {
             format!("aggregate MV aggregate index out of range: aggregate_index={aggregate_index}")
         })?;
-        *slot = args.first().map(|arg| arg.data_type.clone());
+        *slot = args.first().map(|arg| arg.value_type.data_type.clone());
     }
     Ok(input_types)
 }
@@ -1738,8 +2094,7 @@ fn output_column_facts(resolved: &crate::analysis::ResolvedQuery) -> Vec<SqlMvOu
                 .iter()
                 .map(|item| SqlMvOutputColumnFacts {
                     name: item.output_name.clone(),
-                    data_type: item.expr.data_type.clone(),
-                    nullable: item.expr.nullable,
+                    value_type: item.expr.value_type.clone(),
                 })
                 .collect(),
             _ => Vec::new(),
@@ -1750,8 +2105,7 @@ fn output_column_facts(resolved: &crate::analysis::ResolvedQuery) -> Vec<SqlMvOu
             .iter()
             .map(|column| SqlMvOutputColumnFacts {
                 name: column.name.clone(),
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
+                value_type: column.value_type.clone(),
             })
             .collect()
     }
@@ -5519,15 +5873,36 @@ fn validate_relation_occurrence_arity(
     Ok(())
 }
 
+fn finish_refresh_identity<T>(
+    result: Result<T, SqlCompileError>,
+    work: CompileCheckpoints<'_>,
+) -> Result<T, SqlCompileError> {
+    if matches!(
+        &result,
+        Err(SqlCompileError::Cancelled
+            | SqlCompileError::DeadlineExceeded
+            | SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
+}
+
 /// Synthesize the refresh-fragment property for an analyzed MV query.
 ///
 /// Recursively walks the query mirroring the structural validation of the flat
 /// classifier (`derive_from_query` and friends) while emitting a compositional
-/// property instead of a named strategy enum. Returns a precise `Err(String)`
+/// property instead of a named strategy enum. Preserves ordinary shape errors
 /// for every shape the classifier rejects.
-fn derive_fragment_property(query: &ResolvedQuery) -> Result<RefreshFragmentProperty, String> {
+fn derive_fragment_property(
+    query: &ResolvedQuery,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<RefreshFragmentProperty, SqlCompileError> {
+    work.flush()?;
     validate_query_wrapper(query)?;
-    derive_from_query_body(&query.body)
+    work.step()?;
+    derive_from_query_body(&query.body, work)
 }
 
 fn validate_query_wrapper(query: &ResolvedQuery) -> Result<(), String> {
@@ -5542,51 +5917,60 @@ fn validate_query_wrapper(query: &ResolvedQuery) -> Result<(), String> {
     Ok(())
 }
 
-fn derive_from_query_body(body: &QueryBody) -> Result<RefreshFragmentProperty, String> {
+fn derive_from_query_body(
+    body: &QueryBody,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<RefreshFragmentProperty, SqlCompileError> {
     match body {
-        QueryBody::Select(select) => derive_from_select(select),
-        QueryBody::SetOperation(set_op) => derive_from_set_operation(set_op),
+        QueryBody::Select(select) => derive_from_select(select, work),
+        QueryBody::SetOperation(set_op) => derive_from_set_operation(set_op, work),
         QueryBody::Values(_) => {
-            Err("Iceberg IMV refresh contract does not support VALUES queries".to_string())
+            Err(("Iceberg IMV refresh contract does not support VALUES queries".to_string()).into())
         }
     }
 }
 
-fn derive_from_select(select: &ResolvedSelect) -> Result<RefreshFragmentProperty, String> {
+fn derive_from_select(
+    select: &ResolvedSelect,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<RefreshFragmentProperty, SqlCompileError> {
     if select.distinct {
-        return Err("Iceberg IMV refresh contract does not support SELECT DISTINCT".to_string());
+        return Err(
+            ("Iceberg IMV refresh contract does not support SELECT DISTINCT".to_string()).into(),
+        );
     }
     if select.having.is_some() || select.repeat.is_some() {
-        return Err(
-            "Iceberg IMV refresh contract does not support HAVING, ROLLUP, CUBE, or GROUPING SETS"
-                .to_string(),
-        );
+        return Err(("Iceberg IMV refresh contract does not support HAVING, ROLLUP, CUBE, or GROUPING SETS"
+                .to_string()).into());
     }
 
     let has_aggregate = select.has_aggregation || !select.group_by.is_empty();
     if has_aggregate {
         let group_key_count = select.group_by.len();
         if group_key_count == 0 {
-            return Err(
-                "Iceberg IMV refresh contract requires aggregate queries to use a non-empty GROUP BY"
-                    .to_string(),
-            );
+            return Err(("Iceberg IMV refresh contract requires aggregate queries to use a non-empty GROUP BY"
+                    .to_string()).into());
         }
         if let Some(filter) = &select.filter {
             validate_projection_filter_expr(filter)?;
         }
         for group_key in &select.group_by {
+            work.flush()?;
             validate_projection_filter_expr(group_key)?;
+            work.step()?;
         }
-        let aggregate_count = count_aggregate_projection_outputs(select)?;
+        let aggregate_count = count_aggregate_projection_outputs(select, work)?;
         if aggregate_count == 0 {
             return Err(
-                "Iceberg IMV refresh contract requires at least one aggregate output".to_string(),
+                ("Iceberg IMV refresh contract requires at least one aggregate output".to_string())
+                    .into(),
             );
         }
-        let child = derive_from_optional_relation(select.from.as_ref())?;
+        let child = derive_from_optional_relation(select.from.as_ref(), work)?;
+        work.flush()?;
         let aggregate_input_shape = classify_aggregate_input_shape(select.from.as_ref(), &child)?;
-        let group_key_output_names = group_key_output_names(select);
+        work.flush()?;
+        let group_key_output_names = group_key_output_names(select, work)?;
         Ok(RefreshFragmentProperty {
             identity: TargetIdentity::GroupRowId(group_key_output_names),
             state: StateContract::AggregateState {
@@ -5607,16 +5991,16 @@ fn derive_from_select(select: &ResolvedSelect) -> Result<RefreshFragmentProperty
             aggregate_input_shape: Some(aggregate_input_shape),
         })
     } else {
+        work.flush()?;
         validate_projection_filter_exprs(select)?;
-        let child = derive_from_optional_relation(select.from.as_ref())?;
+        work.flush()?;
+        let child = derive_from_optional_relation(select.from.as_ref(), work)?;
         // Mirror refresh_contract.rs:382-392: projection/filter over an
         // aggregate subquery is rejected. In the property world every aggregate
         // subquery synthesizes AggregateState, so key on that.
         if matches!(child.state, StateContract::AggregateState { .. }) {
-            return Err(
-                "Iceberg IMV refresh contract does not support projection/filter over aggregate subqueries"
-                    .to_string(),
-            );
+            return Err(("Iceberg IMV refresh contract does not support projection/filter over aggregate subqueries"
+                    .to_string()).into());
         }
         // Projection / filter passthrough: identity, state, refs, and branch
         // count are inherited unchanged from the child relation.
@@ -5626,14 +6010,16 @@ fn derive_from_select(select: &ResolvedSelect) -> Result<RefreshFragmentProperty
 
 fn derive_from_optional_relation(
     relation: Option<&Relation>,
-) -> Result<RefreshFragmentProperty, String> {
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<RefreshFragmentProperty, SqlCompileError> {
     let Some(relation) = relation else {
         return Err(
-            "Iceberg IMV refresh contract requires a SELECT with at least one base relation"
-                .to_string(),
+            ("Iceberg IMV refresh contract requires a SELECT with at least one base relation"
+                .to_string())
+            .into(),
         );
     };
-    derive_from_relation(relation)
+    derive_from_relation(relation, work)
 }
 
 fn classify_aggregate_input_shape(
@@ -5667,10 +6053,15 @@ fn classify_aggregate_input_shape(
     }
 }
 
-fn derive_from_relation(relation: &Relation) -> Result<RefreshFragmentProperty, String> {
+fn derive_from_relation(
+    relation: &Relation,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<RefreshFragmentProperty, SqlCompileError> {
     match relation {
         Relation::Scan(scan) => {
+            work.flush()?;
             let base_ref = iceberg_ref_from_scan(scan)?;
+            work.step()?;
             Ok(RefreshFragmentProperty {
                 identity: TargetIdentity::BaseRowId,
                 state: StateContract::Stateless,
@@ -5681,12 +6072,13 @@ fn derive_from_relation(relation: &Relation) -> Result<RefreshFragmentProperty, 
                 aggregate_input_shape: None,
             })
         }
-        Relation::Subquery { query, .. } => derive_fragment_property(query),
+        Relation::Subquery { query, .. } => derive_fragment_property(query, work),
         Relation::Join(join) => {
             if !matches!(join.join_type, JoinKind::Inner | JoinKind::Cross) {
                 return Err(
-                    "Iceberg IMV refresh contract supports only inner/cross join shapes"
-                        .to_string(),
+                    ("Iceberg IMV refresh contract supports only inner/cross join shapes"
+                        .to_string())
+                    .into(),
                 );
             }
             let join_key_count = match join.join_type {
@@ -5700,18 +6092,16 @@ fn derive_from_relation(relation: &Relation) -> Result<RefreshFragmentProperty, 
                     let count =
                         count_equality_join_keys(condition, &left_qualifiers, &right_qualifiers)?;
                     if count == 0 {
-                        return Err(
-                            "Iceberg IMV refresh contract requires at least one equi-join predicate"
-                                .to_string(),
-                        );
+                        return Err(("Iceberg IMV refresh contract requires at least one equi-join predicate"
+                                .to_string()).into());
                     }
                     count
                 }
                 JoinKind::Cross => 0,
                 _ => unreachable!("join kind checked above"),
             };
-            let left = derive_from_relation(&join.left)?;
-            let right = derive_from_relation(&join.right)?;
+            let left = derive_from_relation(&join.left, work)?;
+            let right = derive_from_relation(&join.right, work)?;
             let mut base_refs = left.base_refs;
             base_refs.extend(right.base_refs);
             Ok(RefreshFragmentProperty {
@@ -5733,24 +6123,31 @@ fn derive_from_relation(relation: &Relation) -> Result<RefreshFragmentProperty, 
         | Relation::IcebergDeltaScan(_)
         | Relation::GenerateSeries(_)
         | Relation::Unnest(_)
-        | Relation::CTEConsume { .. } => Err(format!(
+        | Relation::CTEConsume { .. } => Err((format!(
             "Iceberg IMV refresh contract does not support relation {relation:?}"
-        )),
+        ))
+        .into()),
     }
 }
 
-fn derive_from_set_operation(set_op: &ResolvedSetOp) -> Result<RefreshFragmentProperty, String> {
+fn derive_from_set_operation(
+    set_op: &ResolvedSetOp,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<RefreshFragmentProperty, SqlCompileError> {
     let mut branches = Vec::new();
+    work.flush()?;
     collect_union_all_branches(set_op, &mut branches)?;
+    work.flush()?;
     if branches.len() < 2 {
         return Err(
-            "Iceberg IMV refresh contract requires UNION ALL with at least two branches"
-                .to_string(),
+            ("Iceberg IMV refresh contract requires UNION ALL with at least two branches"
+                .to_string())
+            .into(),
         );
     }
     let derived = branches
         .iter()
-        .map(|query| derive_fragment_property(query))
+        .map(|query| derive_fragment_property(query, work))
         .collect::<Result<Vec<_>, _>>()?;
     let branch_count = derived.len();
 
@@ -5767,12 +6164,13 @@ fn derive_from_set_operation(set_op: &ResolvedSetOp) -> Result<RefreshFragmentPr
         let branch_identity_kind = branch.identity.kind_label();
         let branch_state_kind = branch.state.kind_label();
         if branch_identity_kind != first_identity_kind || branch_state_kind != first_state_kind {
-            return Err(format!(
+            return Err((format!(
                 "Iceberg IMV refresh contract requires homogeneous UNION ALL branches: branch {index} \
                  synthesizes ({branch_identity_kind}, {branch_state_kind}) but branch 0 synthesizes \
                  ({first_identity_kind}, {first_state_kind})"
-            ));
+            )).into());
         }
+        work.step()?;
     }
 
     // Aggregate branch arity compatibility. The kind label intentionally omits
@@ -5796,8 +6194,9 @@ fn derive_from_set_operation(set_op: &ResolvedSetOp) -> Result<RefreshFragmentPr
             if other_group_key_count != group_key_count || other_aggregate_count != aggregate_count
             {
                 return Err(
-                    "Iceberg IMV refresh contract requires compatible aggregate branch contracts"
-                        .to_string(),
+                    ("Iceberg IMV refresh contract requires compatible aggregate branch contracts"
+                        .to_string())
+                    .into(),
                 );
             }
         }
@@ -5805,7 +6204,10 @@ fn derive_from_set_operation(set_op: &ResolvedSetOp) -> Result<RefreshFragmentPr
 
     let mut base_refs = Vec::new();
     for branch in &derived {
+        work.flush()?;
         base_refs.extend(branch.base_refs.iter().cloned());
+        work.flush()?;
+        work.step()?;
     }
 
     // Classify the branches' shared shape so the contract mapping can re-narrow
@@ -5858,12 +6260,13 @@ fn derive_from_set_operation(set_op: &ResolvedSetOp) -> Result<RefreshFragmentPr
                 || branch.branch_count != first.branch_count
                 || group_row_id_names(&branch.identity) != first_group_keys
             {
-                return Err(format!(
+                return Err((format!(
                     "Iceberg IMV refresh contract requires homogeneous UNION ALL aggregate \
                      branches: branch {index} has a different base set, join structure, fan-in \
                      arity, or group-key layout than branch 0; a composed UNION ALL of aggregates \
                      is only supported when every branch shares the same base tables and structure"
-                ));
+                ))
+                .into());
             }
         }
     }
@@ -5965,18 +6368,31 @@ fn iceberg_ref_from_scan(scan: &crate::analysis::ScanRelation) -> Result<TableId
 /// of the projection items that are themselves GROUP BY keys, in projection
 /// order. `count_aggregate_projection_outputs` separately guarantees every
 /// GROUP BY key is projected, so this captures the full group-key output set.
-fn group_key_output_names(select: &ResolvedSelect) -> Vec<String> {
-    select
-        .projection
-        .iter()
-        .filter(|item| {
-            select
-                .group_by
-                .iter()
-                .any(|group_key| typed_expr_eq(group_key, &item.expr))
-        })
-        .map(|item| item.output_name.clone())
-        .collect()
+fn group_key_output_names(
+    select: &ResolvedSelect,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<Vec<String>, SqlCompileError> {
+    let mut names = Vec::new();
+    for item in &select.projection {
+        let mut matched = false;
+        for group_key in &select.group_by {
+            work.flush()?;
+            matched = crate::analysis::expr_identity::typed_expr_semantically_eq(
+                group_key,
+                &item.expr,
+                work.control(),
+            )?;
+            work.step()?;
+            if matched {
+                break;
+            }
+        }
+        if matched {
+            names.push(item.output_name.clone());
+        }
+        work.step()?;
+    }
+    Ok(names)
 }
 
 // ---------------------------------------------------------------------------
@@ -5989,16 +6405,30 @@ fn group_key_output_names(select: &ResolvedSelect) -> Vec<String> {
 // projection/filter, aggregate, and join-key shapes a refresh fragment admits.
 // ---------------------------------------------------------------------------
 
-fn count_aggregate_projection_outputs(select: &ResolvedSelect) -> Result<usize, String> {
+fn count_aggregate_projection_outputs(
+    select: &ResolvedSelect,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<usize, SqlCompileError> {
     let mut aggregate_count = 0;
     let mut projected_group_keys = vec![false; select.group_by.len()];
     for item in &select.projection {
-        if let Some(index) = select
-            .group_by
-            .iter()
-            .position(|group_key| typed_expr_eq(group_key, &item.expr))
-        {
+        let mut matched = None;
+        for (index, group_key) in select.group_by.iter().enumerate() {
+            work.flush()?;
+            let equal = crate::analysis::expr_identity::typed_expr_semantically_eq(
+                group_key,
+                &item.expr,
+                work.control(),
+            )?;
+            work.step()?;
+            if equal {
+                matched = Some(index);
+                break;
+            }
+        }
+        if let Some(index) = matched {
             projected_group_keys[index] = true;
+            work.step()?;
             continue;
         }
 
@@ -6010,9 +6440,11 @@ fn count_aggregate_projection_outputs(select: &ResolvedSelect) -> Result<usize, 
                 order_by,
                 ..
             } => {
+                work.flush()?;
                 validate_supported_aggregate_call(name, args.len(), *distinct, order_by)?;
                 validate_aggregate_argument_exprs(args)?;
                 aggregate_count += 1;
+                work.step()?;
                 continue;
             }
             ExprKind::FunctionCall {
@@ -6021,25 +6453,33 @@ fn count_aggregate_projection_outputs(select: &ResolvedSelect) -> Result<usize, 
                 distinct,
                 ..
             } if is_legacy_unresolved_aggregate_function_name(name) => {
+                work.flush()?;
                 validate_supported_aggregate_call(name, args.len(), *distinct, &[])?;
                 validate_aggregate_argument_exprs(args)?;
                 aggregate_count += 1;
+                work.step()?;
                 continue;
             }
             _ => {}
         }
 
+        work.flush()?;
         validate_non_contract_aggregate_projection_expr(&item.expr)?;
         return Err(
             "Iceberg IMV refresh contract aggregate projections must be GROUP BY keys or direct aggregate calls"
-                .to_string(),
+                .to_string().into(),
         );
     }
-    if projected_group_keys.iter().any(|projected| !projected) {
-        return Err(
-            "Iceberg IMV refresh contract aggregate projection must include every GROUP BY key"
-                .to_string(),
-        );
+    for projected in projected_group_keys {
+        let missing = !projected;
+        work.step()?;
+        if missing {
+            return Err(
+                "Iceberg IMV refresh contract aggregate projection must include every GROUP BY key"
+                    .to_string()
+                    .into(),
+            );
+        }
     }
     Ok(aggregate_count)
 }
@@ -6136,7 +6576,7 @@ fn validate_non_contract_aggregate_projection_expr(expr: &TypedExpr) -> Result<(
             "Iceberg IMV refresh contract does not support subquery expressions in aggregate projections"
                 .to_string(),
         ),
-        ExprKind::ColumnRef { .. } | ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => {
+        ExprKind::ColumnRef { .. } | ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) | ExprKind::Constant(_) => {
             Ok(())
         }
     }
@@ -6202,218 +6642,6 @@ fn is_legacy_unresolved_aggregate_function_name(name: &str) -> bool {
         name.to_ascii_lowercase().as_str(),
         "count_distinct" | "hll_ndv"
     )
-}
-
-fn typed_expr_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
-    left.data_type == right.data_type
-        && left.nullable == right.nullable
-        && expr_kind_eq(&left.kind, &right.kind)
-}
-
-fn typed_exprs_eq(left: &[TypedExpr], right: &[TypedExpr]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right.iter())
-            .all(|(left, right)| typed_expr_eq(left, right))
-}
-
-fn expr_kind_eq(left: &ExprKind, right: &ExprKind) -> bool {
-    match (left, right) {
-        (
-            ExprKind::ColumnRef {
-                column_id: left_id,
-                qualifier: left_qualifier,
-                column: left_column,
-            },
-            ExprKind::ColumnRef {
-                column_id: right_id,
-                qualifier: right_qualifier,
-                column: right_column,
-            },
-        ) => {
-            left_id == right_id
-                && left_qualifier == right_qualifier
-                && left_column.eq_ignore_ascii_case(right_column)
-        }
-        (
-            ExprKind::LambdaParamRef {
-                name: left_name,
-                slot_id: left_slot,
-            },
-            ExprKind::LambdaParamRef {
-                name: right_name,
-                slot_id: right_slot,
-            },
-        ) => left_name == right_name && left_slot == right_slot,
-        (ExprKind::Literal(left), ExprKind::Literal(right)) => left == right,
-        (
-            ExprKind::BinaryOp {
-                left: left_left,
-                op: left_op,
-                right: left_right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            ExprKind::BinaryOp {
-                left: right_left,
-                op: right_op,
-                right: right_right,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-        ) => {
-            left_op == right_op
-                && typed_expr_eq(left_left, right_left)
-                && typed_expr_eq(left_right, right_right)
-        }
-        (
-            ExprKind::UnaryOp {
-                op: left_op,
-                expr: left_expr,
-            },
-            ExprKind::UnaryOp {
-                op: right_op,
-                expr: right_expr,
-            },
-        ) => left_op == right_op && typed_expr_eq(left_expr, right_expr),
-        (
-            ExprKind::FunctionCall {
-                name: left_name,
-                args: left_args,
-                distinct: left_distinct,
-                ..
-            },
-            ExprKind::FunctionCall {
-                name: right_name,
-                args: right_args,
-                distinct: right_distinct,
-                ..
-            },
-        ) => {
-            left_name.eq_ignore_ascii_case(right_name)
-                && left_distinct == right_distinct
-                && typed_exprs_eq(left_args, right_args)
-        }
-        (
-            ExprKind::Cast {
-                expr: left_expr,
-                target: left_target,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            ExprKind::Cast {
-                expr: right_expr,
-                target: right_target,
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-        ) => left_target == right_target && typed_expr_eq(left_expr, right_expr),
-        (
-            ExprKind::IsNull {
-                expr: left_expr,
-                negated: left_negated,
-            },
-            ExprKind::IsNull {
-                expr: right_expr,
-                negated: right_negated,
-            },
-        ) => left_negated == right_negated && typed_expr_eq(left_expr, right_expr),
-        (
-            ExprKind::InList {
-                expr: left_expr,
-                list: left_list,
-                negated: left_negated,
-            },
-            ExprKind::InList {
-                expr: right_expr,
-                list: right_list,
-                negated: right_negated,
-            },
-        ) => {
-            left_negated == right_negated
-                && typed_expr_eq(left_expr, right_expr)
-                && typed_exprs_eq(left_list, right_list)
-        }
-        (
-            ExprKind::Between {
-                expr: left_expr,
-                low: left_low,
-                high: left_high,
-                negated: left_negated,
-            },
-            ExprKind::Between {
-                expr: right_expr,
-                low: right_low,
-                high: right_high,
-                negated: right_negated,
-            },
-        ) => {
-            left_negated == right_negated
-                && typed_expr_eq(left_expr, right_expr)
-                && typed_expr_eq(left_low, right_low)
-                && typed_expr_eq(left_high, right_high)
-        }
-        (
-            ExprKind::Like {
-                expr: left_expr,
-                pattern: left_pattern,
-                negated: left_negated,
-            },
-            ExprKind::Like {
-                expr: right_expr,
-                pattern: right_pattern,
-                negated: right_negated,
-            },
-        ) => {
-            left_negated == right_negated
-                && typed_expr_eq(left_expr, right_expr)
-                && typed_expr_eq(left_pattern, right_pattern)
-        }
-        (
-            ExprKind::Case {
-                operand: left_operand,
-                when_then: left_when_then,
-                else_expr: left_else,
-            },
-            ExprKind::Case {
-                operand: right_operand,
-                when_then: right_when_then,
-                else_expr: right_else,
-            },
-        ) => {
-            option_typed_expr_eq(left_operand.as_deref(), right_operand.as_deref())
-                && left_when_then.len() == right_when_then.len()
-                && left_when_then.iter().zip(right_when_then.iter()).all(
-                    |((left_when, left_then), (right_when, right_then))| {
-                        typed_expr_eq(left_when, right_when) && typed_expr_eq(left_then, right_then)
-                    },
-                )
-                && option_typed_expr_eq(left_else.as_deref(), right_else.as_deref())
-        }
-        (
-            ExprKind::IsTruthValue {
-                expr: left_expr,
-                value: left_value,
-                negated: left_negated,
-            },
-            ExprKind::IsTruthValue {
-                expr: right_expr,
-                value: right_value,
-                negated: right_negated,
-            },
-        ) => {
-            left_value == right_value
-                && left_negated == right_negated
-                && typed_expr_eq(left_expr, right_expr)
-        }
-        (ExprKind::Nested(left), ExprKind::Nested(right)) => typed_expr_eq(left, right),
-        _ => false,
-    }
-}
-
-fn option_typed_expr_eq(left: Option<&TypedExpr>, right: Option<&TypedExpr>) -> bool {
-    match (left, right) {
-        (Some(left), Some(right)) => typed_expr_eq(left, right),
-        (None, None) => true,
-        _ => false,
-    }
 }
 
 fn validate_projection_filter_exprs(select: &ResolvedSelect) -> Result<(), String> {
@@ -6507,7 +6735,7 @@ fn validate_projection_filter_expr(expr: &TypedExpr) -> Result<(), String> {
             }
             Ok(())
         }
-        ExprKind::ColumnRef { .. } | ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => {
+        ExprKind::ColumnRef { .. } | ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) | ExprKind::Constant(_) => {
             Ok(())
         }
     }

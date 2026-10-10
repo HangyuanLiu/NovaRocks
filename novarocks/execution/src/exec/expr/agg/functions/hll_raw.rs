@@ -14,36 +14,62 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryBuilder, BooleanArray, Date32Array, Decimal128Array,
-    FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, Int64Builder, LargeBinaryArray, LargeStringArray, StringArray,
-    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-    TimestampSecondArray,
-};
-use arrow::datatypes::{DataType, TimeUnit};
-use novarocks_types::value::hll::{
-    HLL_DATA_EMPTY, HLL_DATA_EXPLICIT, MURMUR_SEED, encode_hll_empty, murmur_hash64a,
-};
-
-use crate::exec::node::aggregate::AggFunction;
-
 use super::super::*;
 use super::AggregateFunction;
-
+use crate::exec::node::aggregate::AggFunction;
+#[cfg(test)]
+use arrow::array::Int64Array;
+use arrow::array::{
+    Array, ArrayRef, BinaryArray, BinaryBuilder, Int64Builder, LargeBinaryArray, LargeStringArray,
+    StringArray,
+};
+use arrow::datatypes::DataType;
+#[cfg(test)]
+use core::{HLL_DATA_FULL, HLL_DATA_SPARSE};
+pub use core::{HLL_REGISTERS_COUNT, update_register_from_hash};
+use novarocks_functions::builtin::aggregate_hll_core::{self as core, HllWork};
+#[cfg(test)]
+use novarocks_functions::hll::{HLL_DATA_EMPTY, HLL_DATA_EXPLICIT};
 pub(super) struct HllRawAgg;
+type HllRawState = core::HllRawState;
 
-const HLL_DATA_SPARSE: u8 = 2;
-const HLL_DATA_FULL: u8 = 3;
-
-const HLL_COLUMN_PRECISION: usize = 14;
-pub const HLL_REGISTERS_COUNT: usize = 16 * 1024;
-const HLL_SPARSE_THRESHOLD: usize = 4096;
-
-#[derive(Default)]
-struct HllRawState {
-    has_value: bool,
-    registers: Option<Box<[u8; HLL_REGISTERS_COUNT]>>,
+fn update_state_register_from_hash(state: &mut HllRawState, hash_value: u64) {
+    core::update_state_register_from_hash(state, hash_value, &mut HllWork::new(None))
+        .expect("no-control legacy register allocation is infallible");
+}
+fn merge_hll_bytes(state: &mut HllRawState, bytes: &[u8]) -> Result<(), String> {
+    core::merge_hll_bytes(state, bytes, &mut HllWork::new(None)).map_err(|error| error.to_string())
+}
+fn serialize_hll_state(state: &HllRawState) -> Option<Vec<u8>> {
+    core::serialize_hll_state(state, &mut HllWork::new(None))
+        .expect("no-control legacy serialization is infallible")
+}
+pub fn hash_bytes_for_hll(bytes: &[u8]) -> u64 {
+    novarocks_functions::hll::murmur_hash64a(bytes, novarocks_functions::hll::MURMUR_SEED)
+}
+fn canonical_agg_name(name: &str) -> &str {
+    name.split_once('|').map(|(base, _)| base).unwrap_or(name)
+}
+fn estimate_cardinality(state: &HllRawState) -> i64 {
+    core::estimate_cardinality(state, &mut HllWork::new(None))
+        .expect("no-control legacy estimate is infallible")
+}
+pub fn cardinality_from_serialized_hll(bytes: &[u8]) -> Result<i64, String> {
+    core::cardinality_from_serialized_hll(bytes, &mut HllWork::new(None))
+        .map_err(|error| error.to_string())
+}
+pub fn estimate_cardinality_from_registers(registers: &[u8; HLL_REGISTERS_COUNT]) -> i64 {
+    core::estimate_cardinality_from_registers_observed(registers, &mut HllWork::new(None))
+        .expect("no-control legacy estimate is infallible")
+}
+pub fn hash_array_value_for_hll(array: &ArrayRef, row: usize) -> Result<Option<u64>, String> {
+    core::hash_array_value_for_hll_observed(array, row, &mut HllWork::new(None))
+        .map_err(|error| error.to_string())
+}
+#[cfg(test)]
+fn ensure_registers(state: &mut HllRawState) -> &mut [u8; HLL_REGISTERS_COUNT] {
+    core::ensure_registers(state, &mut HllWork::new(None))
+        .expect("no-control legacy allocation is infallible")
 }
 
 fn state_slot(ptr: *mut u8) -> *mut *mut HllRawState {
@@ -97,416 +123,17 @@ unsafe fn take_state(ptr: *mut u8) -> Option<Box<HllRawState>> {
     }
 }
 
-fn ensure_registers(state: &mut HllRawState) -> &mut [u8; HLL_REGISTERS_COUNT] {
-    state
-        .registers
-        .get_or_insert_with(|| Box::new([0u8; HLL_REGISTERS_COUNT]))
-}
-
-fn update_state_register_from_hash(state: &mut HllRawState, hash_value: u64) {
-    if hash_value == 0 {
-        return;
-    }
-    state.has_value = true;
-    let registers = ensure_registers(state);
-    update_register_from_hash(registers, hash_value);
-}
-
-pub fn update_register_from_hash(registers: &mut [u8; HLL_REGISTERS_COUNT], hash_value: u64) {
-    if hash_value == 0 {
-        return;
-    }
-    let idx = (hash_value % HLL_REGISTERS_COUNT as u64) as usize;
-    let mut shifted = hash_value >> HLL_COLUMN_PRECISION;
-    shifted |= 1_u64 << (64 - HLL_COLUMN_PRECISION);
-    let rank = shifted.trailing_zeros() as u8 + 1;
-    if registers[idx] < rank {
-        registers[idx] = rank;
-    }
-}
-
-fn merge_as_opaque_payload(state: &mut HllRawState, bytes: &[u8]) {
-    let hash = murmur_hash64a(bytes, MURMUR_SEED);
-    update_state_register_from_hash(state, hash);
-}
-
-fn merge_hll_bytes(state: &mut HllRawState, bytes: &[u8]) -> Result<(), String> {
-    if bytes.is_empty() {
-        return Err("hll_raw merge payload is empty".to_string());
-    }
-    match bytes[0] {
-        HLL_DATA_EMPTY => Ok(()),
-        HLL_DATA_EXPLICIT => {
-            if bytes.len() < 2 {
-                return Err("hll_raw EXPLICIT payload is malformed".to_string());
-            }
-            let count = bytes[1] as usize;
-            let expected = 2 + count * 8;
-            if bytes.len() != expected {
-                // Keep query running for non-standard HLL payloads (for example ds_hll states)
-                // by folding unknown bytes into a deterministic hash bucket.
-                merge_as_opaque_payload(state, bytes);
-                return Ok(());
-            }
-            let mut pos = 2usize;
-            for _ in 0..count {
-                let hash = u64::from_le_bytes(
-                    bytes[pos..pos + 8]
-                        .try_into()
-                        .map_err(|_| "hll_raw decode EXPLICIT hash failed".to_string())?,
-                );
-                pos += 8;
-                update_state_register_from_hash(state, hash);
-            }
-            Ok(())
-        }
-        HLL_DATA_SPARSE => {
-            if bytes.len() < 5 {
-                return Err("hll_raw SPARSE payload is malformed".to_string());
-            }
-            let count = u32::from_le_bytes(
-                bytes[1..5]
-                    .try_into()
-                    .map_err(|_| "hll_raw decode SPARSE count failed".to_string())?,
-            ) as usize;
-            let expected = 5 + count * 3;
-            if bytes.len() != expected {
-                merge_as_opaque_payload(state, bytes);
-                return Ok(());
-            }
-            let mut pos = 5usize;
-            let mut has_non_zero = false;
-            for _ in 0..count {
-                let idx = u16::from_le_bytes(
-                    bytes[pos..pos + 2]
-                        .try_into()
-                        .map_err(|_| "hll_raw decode SPARSE index failed".to_string())?,
-                ) as usize;
-                pos += 2;
-                if idx >= HLL_REGISTERS_COUNT {
-                    merge_as_opaque_payload(state, bytes);
-                    return Ok(());
-                }
-                let value = bytes[pos];
-                pos += 1;
-                if value > 0 {
-                    has_non_zero = true;
-                    let registers = ensure_registers(state);
-                    if registers[idx] < value {
-                        registers[idx] = value;
-                    }
-                }
-            }
-            if has_non_zero {
-                state.has_value = true;
-            }
-            Ok(())
-        }
-        HLL_DATA_FULL => {
-            let expected = 1 + HLL_REGISTERS_COUNT;
-            if bytes.len() != expected {
-                merge_as_opaque_payload(state, bytes);
-                return Ok(());
-            }
-            let mut has_non_zero = false;
-            for (idx, value) in bytes[1..].iter().enumerate() {
-                if *value > 0 {
-                    has_non_zero = true;
-                    let registers = ensure_registers(state);
-                    if registers[idx] < *value {
-                        registers[idx] = *value;
-                    }
-                }
-            }
-            if has_non_zero {
-                state.has_value = true;
-            }
-            Ok(())
-        }
-        _ => {
-            merge_as_opaque_payload(state, bytes);
-            Ok(())
-        }
-    }
-}
-
-fn serialize_hll_state(state: &HllRawState) -> Option<Vec<u8>> {
-    if !state.has_value {
-        return None;
-    }
-    // A non-null input that contributed no register updates (e.g. merging an
-    // HLL_DATA_EMPTY payload) is still a non-null observation, so emit a
-    // valid empty HLL payload rather than NULL.
-    let Some(registers) = state.registers.as_ref() else {
-        return Some(encode_hll_empty());
-    };
-    let non_zero = registers.iter().filter(|v| **v > 0).count();
-    if non_zero == 0 {
-        return Some(encode_hll_empty());
-    }
-
-    if non_zero > HLL_SPARSE_THRESHOLD {
-        let mut out = Vec::with_capacity(1 + HLL_REGISTERS_COUNT);
-        out.push(HLL_DATA_FULL);
-        out.extend_from_slice(&registers[..]);
-        return Some(out);
-    }
-
-    let mut out = Vec::with_capacity(5 + non_zero * 3);
-    out.push(HLL_DATA_SPARSE);
-    out.extend_from_slice(&(non_zero as u32).to_le_bytes());
-    for (idx, value) in registers.iter().enumerate() {
-        if *value > 0 {
-            out.extend_from_slice(&(idx as u16).to_le_bytes());
-            out.push(*value);
-        }
-    }
-    Some(out)
-}
-
-pub fn hash_bytes_for_hll(bytes: &[u8]) -> u64 {
-    murmur_hash64a(bytes, MURMUR_SEED)
-}
-
-fn canonical_agg_name(name: &str) -> &str {
-    name.split_once('|').map(|(base, _)| base).unwrap_or(name)
-}
-
-fn estimate_cardinality(state: &HllRawState) -> i64 {
-    if !state.has_value {
-        return 0;
-    }
-    let Some(registers) = state.registers.as_ref() else {
-        return 0;
-    };
-
-    estimate_cardinality_from_registers(registers)
-}
-
-pub fn cardinality_from_serialized_hll(bytes: &[u8]) -> Result<i64, String> {
-    let mut state = HllRawState {
-        has_value: true,
-        ..HllRawState::default()
-    };
-    merge_hll_bytes(&mut state, bytes)?;
-    Ok(estimate_cardinality(&state))
-}
-
-pub fn estimate_cardinality_from_registers(registers: &[u8; HLL_REGISTERS_COUNT]) -> i64 {
-    let num_streams = HLL_REGISTERS_COUNT as f64;
-    let alpha = match HLL_REGISTERS_COUNT {
-        16 => 0.673,
-        32 => 0.697,
-        64 => 0.709,
-        _ => 0.7213 / (1.0 + 1.079 / num_streams),
-    };
-
-    let mut harmonic_mean = 0.0f64;
-    let mut zero_registers = 0usize;
-    for register in registers.iter() {
-        harmonic_mean += 2_f64.powi(-(*register as i32));
-        if *register == 0 {
-            zero_registers += 1;
-        }
-    }
-
-    if harmonic_mean == 0.0 {
-        return 0;
-    }
-
-    let mut estimate = alpha * num_streams * num_streams / harmonic_mean;
-    if estimate <= num_streams * 2.5 && zero_registers != 0 {
-        estimate = num_streams * (num_streams / zero_registers as f64).ln();
-    } else if HLL_REGISTERS_COUNT == 16 * 1024 && estimate < 72_000.0 {
-        // Keep parity with StarRocks' correction in be/src/types/hll.cpp.
-        let bias = 5.9119e-18 * estimate.powi(4) - 1.4253e-12 * estimate.powi(3)
-            + 1.2940e-7 * estimate.powi(2)
-            - 5.2921e-3 * estimate
-            + 83.3216;
-        estimate -= estimate * (bias / 100.0);
-    }
-
-    estimate.max(0.0).round() as i64
-}
-
-pub fn hash_array_value_for_hll(array: &ArrayRef, row: usize) -> Result<Option<u64>, String> {
-    if row >= array.len() {
-        return Err(format!(
-            "hll_raw row {row} out of bounds for len {}",
-            array.len()
-        ));
-    }
-    if array.is_null(row) {
-        return Ok(None);
-    }
-
-    macro_rules! hash_primitive_value {
-        ($array_ty:ty, $name:literal) => {{
-            let arr = array
-                .as_any()
-                .downcast_ref::<$array_ty>()
-                .ok_or_else(|| format!("failed to downcast to {}", $name))?;
-            Ok(Some(hash_bytes_for_hll(&arr.value(row).to_le_bytes())))
-        }};
-    }
-
-    match array.data_type() {
-        DataType::Boolean => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
-            let value = if arr.value(row) { 1u8 } else { 0u8 };
-            Ok(Some(hash_bytes_for_hll(&[value])))
-        }
-        DataType::Int8 => hash_primitive_value!(Int8Array, "Int8Array"),
-        DataType::Int16 => hash_primitive_value!(Int16Array, "Int16Array"),
-        DataType::Int32 => hash_primitive_value!(Int32Array, "Int32Array"),
-        DataType::Int64 => hash_primitive_value!(Int64Array, "Int64Array"),
-        DataType::Float32 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float32Array>()
-                .ok_or_else(|| "failed to downcast to Float32Array".to_string())?;
-            Ok(Some(hash_bytes_for_hll(
-                &canonical_f32_bits_for_hll(arr.value(row)).to_le_bytes(),
-            )))
-        }
-        DataType::Float64 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .ok_or_else(|| "failed to downcast to Float64Array".to_string())?;
-            Ok(Some(hash_bytes_for_hll(
-                &canonical_f64_bits_for_hll(arr.value(row)).to_le_bytes(),
-            )))
-        }
-        DataType::Date32 => hash_primitive_value!(Date32Array, "Date32Array"),
-        DataType::Timestamp(unit, _) => match unit {
-            TimeUnit::Second => hash_primitive_value!(TimestampSecondArray, "TimestampSecondArray"),
-            TimeUnit::Millisecond => {
-                hash_primitive_value!(TimestampMillisecondArray, "TimestampMillisecondArray")
-            }
-            TimeUnit::Microsecond => {
-                hash_primitive_value!(TimestampMicrosecondArray, "TimestampMicrosecondArray")
-            }
-            TimeUnit::Nanosecond => {
-                hash_primitive_value!(TimestampNanosecondArray, "TimestampNanosecondArray")
-            }
-        },
-        DataType::Decimal128(_, _) => hash_primitive_value!(Decimal128Array, "Decimal128Array"),
-        DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
-            Ok(Some(hash_bytes_for_hll(arr.value(row).as_bytes())))
-        }
-        DataType::LargeUtf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| "failed to downcast to LargeStringArray".to_string())?;
-            Ok(Some(hash_bytes_for_hll(arr.value(row).as_bytes())))
-        }
-        DataType::Binary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
-            Ok(Some(hash_bytes_for_hll(arr.value(row))))
-        }
-        DataType::FixedSizeBinary(_) => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<FixedSizeBinaryArray>()
-                .ok_or_else(|| "failed to downcast to FixedSizeBinaryArray".to_string())?;
-            Ok(Some(hash_bytes_for_hll(arr.value(row))))
-        }
-        DataType::LargeBinary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| "failed to downcast to LargeBinaryArray".to_string())?;
-            Ok(Some(hash_bytes_for_hll(arr.value(row))))
-        }
-        other => Err(format!("hll_raw does not support input type {:?}", other)),
-    }
-}
-
-fn canonical_f32_bits_for_hll(value: f32) -> u32 {
-    if value.is_nan() {
-        0x7FC0_0000
-    } else if value == 0.0 {
-        0.0f32.to_bits()
-    } else {
-        value.to_bits()
-    }
-}
-
-fn canonical_f64_bits_for_hll(value: f64) -> u64 {
-    if value.is_nan() {
-        0x7FF8_0000_0000_0000
-    } else if value == 0.0 {
-        0.0f64.to_bits()
-    } else {
-        value.to_bits()
-    }
-}
-
 fn merge_input_array(
     array: &ArrayRef,
     offset: usize,
     state_ptrs: &[AggStatePtr],
 ) -> Result<(), String> {
-    macro_rules! merge_payload {
-        ($arr:expr, $row:ident => $bytes:expr) => {{
-            for ($row, &base) in state_ptrs.iter().enumerate() {
-                if $arr.is_null($row) {
-                    continue;
-                }
-                let ptr = unsafe { (base as *mut u8).add(offset) };
-                let state = unsafe { get_or_init_state(ptr) };
-                merge_hll_bytes(state, $bytes)?;
-            }
-            Ok(())
-        }};
-    }
-
-    match array.data_type() {
-        DataType::Binary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| "failed to downcast to BinaryArray".to_string())?;
-            merge_payload!(arr, row => arr.value(row))
-        }
-        DataType::Utf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast to StringArray".to_string())?;
-            merge_payload!(arr, row => arr.value(row).as_bytes())
-        }
-        DataType::LargeBinary => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| "failed to downcast to LargeBinaryArray".to_string())?;
-            merge_payload!(arr, row => arr.value(row))
-        }
-        DataType::LargeUtf8 => {
-            let arr = array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| "failed to downcast to LargeStringArray".to_string())?;
-            merge_payload!(arr, row => arr.value(row).as_bytes())
-        }
-        other => Err(format!(
-            "hll aggregate expects HLL/BINARY payload input, got {:?}",
-            other
-        )),
-    }
+    let input = core::HllPayloadInput::try_new(array).map_err(|failure| failure.to_string())?;
+    core::merge_payload_rows(&input, 0..state_ptrs.len(), |row, bytes| {
+        let ptr = unsafe { (state_ptrs[row] as *mut u8).add(offset) };
+        let state = unsafe { get_or_init_state(ptr) };
+        merge_hll_bytes(state, bytes)
+    })
 }
 
 fn hash_update_input_array(
@@ -691,14 +318,12 @@ impl AggregateFunction for HllRawAgg {
                     let state = unsafe { get_state(ptr) };
                     // Value-counting NDV aggregates return zero for empty or all-null
                     // groups. HLL union cardinality retains its nullable result.
-                    match state {
-                        Some(s) if s.has_value => {
-                            builder.append_value(estimate_cardinality(s));
-                        }
-                        _ if matches!(spec.kind, AggKind::HllRawHash) => {
-                            builder.append_value(0);
-                        }
-                        _ => builder.append_null(),
+                    match core::nullable_payload_cardinality(state, &mut HllWork::new(None))
+                        .expect("no-control legacy estimate is infallible")
+                    {
+                        Some(value) => builder.append_value(value),
+                        None if matches!(spec.kind, AggKind::HllRawHash) => builder.append_value(0),
+                        None => builder.append_null(),
                     }
                 }
                 Ok(std::sync::Arc::new(builder.finish()) as ArrayRef)
@@ -1154,3 +779,11 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "legacy_ndv_hll_baseline_tests.rs"]
+mod legacy_ndv_hll_baseline_tests;
+
+#[cfg(test)]
+#[path = "hll_payload_aggregate_original_tests.rs"]
+mod original_payload_aggregate_tests;

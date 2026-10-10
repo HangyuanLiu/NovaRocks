@@ -16,7 +16,8 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, StringArray};
+use arrow::array::{Array, ArrayRef, BinaryArray, StringArray};
+use novarocks_functions::builtin::string_extended::{StringOperation, evaluate_legacy};
 
 pub fn eval_to_binary(
     arena: &ExprArena,
@@ -29,51 +30,28 @@ pub fn eval_to_binary(
     }
 
     let input = arena.eval(args[0], chunk)?;
-    let input = input
+    input
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| "to_binary expects VARCHAR as first argument".to_string())?;
-
-    let format = if args.len() == 2 {
-        Some(
-            arena
-                .eval(args[1], chunk)?
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .cloned()
-                .ok_or_else(|| "to_binary expects VARCHAR format argument".to_string())?,
-        )
-    } else {
-        None
-    };
-
-    let mut out = Vec::with_capacity(chunk.len());
-    for row in 0..chunk.len() {
-        if input.is_null(row) {
-            out.push(None);
-            continue;
-        }
-
-        let fmt = format
-            .as_ref()
-            .and_then(|arr| (!arr.is_null(row)).then_some(arr.value(row)));
-        let format = super::common::parse_binary_format(fmt);
-        let value = input.value(row);
-
-        let bytes = match format {
-            super::common::BinaryFormatType::Hex => hex::decode(value).ok(),
-            super::common::BinaryFormatType::Encode64 => {
-                if value.is_empty() {
-                    None
-                } else {
-                    super::common::decode_base64(value.as_bytes())
-                }
-            }
-            super::common::BinaryFormatType::Utf8 => Some(value.as_bytes().to_vec()),
-        };
-
-        out.push(bytes);
+    let mut inputs = vec![input];
+    if args.len() == 2 {
+        let format = arena.eval(args[1], chunk)?;
+        format
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| "to_binary expects VARCHAR format argument".to_string())?;
+        inputs.push(format);
     }
-
-    super::common::build_bytes_output_latin1(out, arena.data_type(expr))
+    let output = evaluate_legacy(StringOperation::ToBinary, &inputs, chunk.len())?;
+    // The v1 shell's declared carrier controls its Latin1 projection.
+    let binary = output
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .expect("shared TO_BINARY output is Binary");
+    let values = binary
+        .iter()
+        .map(|value| value.map(<[u8]>::to_vec))
+        .collect();
+    super::common::build_bytes_output_latin1(values, arena.data_type(expr))
 }

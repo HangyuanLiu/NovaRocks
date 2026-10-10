@@ -804,3 +804,7 @@ fn start_create_table_transaction(
         dispatch,
     )))
 }
+
+#[cfg(all(test, feature = "mem-1-m07-hms-listing-observe"))]
+#[path = "../hms_listing_probe_tests.rs"]
+mod hms_listing_probe_tests;

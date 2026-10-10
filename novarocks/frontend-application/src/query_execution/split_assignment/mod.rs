@@ -24,7 +24,10 @@
 
 mod driver;
 mod round;
+mod supervised_source;
 mod transport;
+
+pub(crate) use supervised_source::SupervisedSplitSource;
 
 pub(crate) use driver::{
     AssignmentTarget, ScanNodeKey, SplitAssignmentDriver, SplitAssignmentDriverError,

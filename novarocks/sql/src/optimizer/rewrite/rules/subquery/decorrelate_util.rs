@@ -138,8 +138,7 @@ mod tests {
                 qualifier: None,
                 column: format!("col_{}", id.0),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -151,8 +150,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -167,8 +165,7 @@ mod tests {
 
         let lit_5 = TypedExpr {
             kind: ExprKind::Literal(crate::analysis::LiteralValue::Int(5)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         };
 
         // inner.k == OUTER  (correlated)

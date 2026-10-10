@@ -16,12 +16,17 @@
 // under the License.
 
 use crate::exec::pipeline::binding::{ExchangeBinding, ExchangeBindings};
-use crate::runtime::fragment::instance::FragmentInstanceSpec;
+use crate::runtime::fragment::instance::{ExchangeInputAssignments, FragmentInstanceSpec};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::exec::fragment::program::FragmentProgram;
-use crate::runtime::exchange::ExchangeKey;
-use crate::runtime::fragment::io::ExchangeReceiverPort;
+use crate::exec::chunk::ChunkSchema;
+use crate::exec::fragment::program::{FragmentNodeId, FragmentProgram};
+use crate::runtime::exchange::{ExchangeColumnBinding, ExchangeKey};
+use crate::runtime::fragment::io::{
+    ExchangeReceiverKey, ExchangeReceiverPort, ExchangeReceiverRegistration,
+};
+use novarocks_types::UniqueId;
 
 /// Materialize per-node exchange bindings from the validated instance spec.
 /// Program exchange contracts (schema) were already cross-checked by
@@ -54,6 +59,103 @@ pub(crate) fn materialize_exchange_bindings(
         );
     }
     bindings
+}
+
+/// The receivers one compiled fragment instance registers before it runs,
+/// and the pipeline bindings its exchange sources pull from.
+pub(crate) struct CompiledExchangeReceivers {
+    pub(crate) registrations: Vec<ExchangeReceiverRegistration>,
+    pub(crate) bindings: ExchangeBindings,
+}
+
+/// Project a compiled program's exchange inputs into receiver registrations
+/// and pipeline bindings for one fragment instance.
+///
+/// A compiled receiver is addressed by its edge's physical destination node,
+/// the same id the sender routes to, so `assignments` is keyed by that node
+/// and must cover exactly the program's receivers. Its expected schema is the
+/// compiled ExchangeSource layout, and it binds wire columns by position:
+/// compiled sender and receiver slot ids are allocated per fragment and are
+/// never comparable.
+pub(crate) fn materialize_compiled_exchange_receivers(
+    program: &novarocks_local_program::LocalProgram,
+    fragment_instance_id: UniqueId,
+    assignments: &ExchangeInputAssignments,
+    receiver_port: Arc<dyn ExchangeReceiverPort>,
+) -> Result<CompiledExchangeReceivers, String> {
+    let nodes = program.graph().nodes();
+    let mut receivers = BTreeSet::new();
+    let mut registrations = Vec::with_capacity(program.exchange_inputs().len());
+    let mut bindings = ExchangeBindings::default();
+    for (id, input) in program.exchange_inputs() {
+        let node = nodes.get(id.index()).ok_or_else(|| {
+            format!(
+                "compiled exchange input names missing local node {}",
+                id.index()
+            )
+        })?;
+        if !matches!(
+            node.kind(),
+            novarocks_local_program::ProgramNodeKind::ExchangeSource { .. }
+        ) {
+            return Err(format!(
+                "compiled exchange input at local node {} is not an exchange source",
+                id.index()
+            ));
+        }
+        let receiver = i32::try_from(input.receiver_node).map_err(|_| {
+            format!(
+                "compiled exchange receiver node {} exceeds i32",
+                input.receiver_node
+            )
+        })?;
+        if !receivers.insert(receiver) {
+            return Err(format!(
+                "compiled exchange receiver node {receiver} is addressed by more than one source"
+            ));
+        }
+        let assignment = assignments
+            .get(&FragmentNodeId::new(receiver))
+            .ok_or_else(|| {
+                format!("missing exchange assignment for compiled receiver node {receiver}")
+            })?;
+        let expected_senders = assignment.sender_count().get();
+        let key = ExchangeReceiverKey {
+            fragment_instance_id,
+            node_id: receiver,
+        };
+        registrations.push(ExchangeReceiverRegistration {
+            key,
+            expected_senders,
+            expected_chunk_schema: ChunkSchema::from_compiled_layout(node.output_layout())?,
+            column_binding: ExchangeColumnBinding::Positional,
+        });
+        bindings.insert(
+            receiver,
+            ExchangeBinding {
+                key: ExchangeKey {
+                    finst_id_hi: fragment_instance_id.high(),
+                    finst_id_lo: fragment_instance_id.low(),
+                    node_id: receiver,
+                },
+                expected_senders,
+                receiver_port: Arc::clone(&receiver_port),
+            },
+        );
+    }
+    if let Some((extra, _)) = assignments
+        .iter()
+        .find(|(node_id, _)| !receivers.contains(&node_id.get()))
+    {
+        return Err(format!(
+            "exchange assignment for node {} has no compiled exchange source",
+            extra.get()
+        ));
+    }
+    Ok(CompiledExchangeReceivers {
+        registrations,
+        bindings,
+    })
 }
 
 #[cfg(test)]

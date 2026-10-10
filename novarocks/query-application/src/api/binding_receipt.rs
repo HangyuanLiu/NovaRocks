@@ -472,7 +472,7 @@ impl ExactBindingReceiptStore {
         let receipts = match &state.sealed {
             Some(receipts) => Arc::clone(receipts),
             None => {
-                let receipts = Arc::new(state.receipts.clone());
+                let receipts = Arc::new(std::mem::take(&mut state.receipts));
                 state.sealed = Some(Arc::clone(&receipts));
                 receipts
             }
@@ -515,5 +515,129 @@ impl SealedExactBindingReceipts {
             .get(&binding)
             .cloned()
             .ok_or_else(|| "exact binding receipt is missing from this query".to_string())
+    }
+}
+
+#[cfg(test)]
+mod seal_transfer_tests {
+    use super::*;
+
+    fn receipt(table: &str) -> ExactObjectBinding {
+        let format = ProviderFactFormat::try_new("iceberg", "connector-control-runtime/v1")
+            .expect("valid typed fact format");
+        let generation = CatalogGeneration::try_new(format, Arc::<[u8]>::from([7_u8; 16]))
+            .expect("valid typed generation");
+        ExactObjectBinding::new_without_semantic_revision_for_test(
+            ObjectPath::try_new(["catalog", "database", table]).expect("valid object path"),
+            generation,
+        )
+    }
+
+    #[test]
+    fn seal_transfers_original_map_storage_and_repeated_views_share_arc() {
+        let mut allocator = SqlTableBindingAllocator::new_unique().expect("unique scope");
+        let binding = allocator.allocate().expect("binding token");
+        let store = ExactBindingReceiptStore::new(&allocator);
+        let original = receipt("table");
+        store
+            .register_receipt(binding, original.clone())
+            .expect("first registration");
+        store
+            .register_receipt(binding, original.clone())
+            .expect("identical registration is idempotent before sealing");
+        let (value_address, original_capacity) = {
+            let state = store.state.lock().expect("receipt state");
+            (
+                state.receipts.get(&binding).expect("registered value")
+                    as *const ExactObjectBinding,
+                state.receipts.capacity(),
+            )
+        };
+        assert!(original_capacity > 0);
+        let first = store.seal();
+        // The old implementation keeps the original allocation live and copies
+        // this value into another bucket allocation, so this assertion fails.
+        assert!(std::ptr::eq(
+            first.receipts.get(&binding).expect("sealed value"),
+            value_address,
+        ));
+        assert_eq!(first.receipts.capacity(), original_capacity);
+        {
+            let state = store.state.lock().expect("receipt state");
+            assert!(state.receipts.is_empty());
+            assert_eq!(state.receipts.capacity(), 0);
+            assert!(Arc::ptr_eq(
+                state.sealed.as_ref().expect("stored sealed map"),
+                &first.receipts,
+            ));
+        }
+        let second = store.seal();
+        let view = store.sealed_view().expect("sealed view");
+        assert!(Arc::ptr_eq(&first.receipts, &second.receipts));
+        assert!(Arc::ptr_eq(&first.receipts, &view.receipts));
+        assert_eq!(first.resolve(binding), Ok(original));
+    }
+
+    #[test]
+    fn sealing_preserves_registration_and_resolution_error_precedence() {
+        let mut allocator = SqlTableBindingAllocator::new_unique().expect("unique scope");
+        let binding = allocator.allocate().expect("binding token");
+        let missing = allocator.allocate().expect("missing token in same scope");
+        let mut foreign = SqlTableBindingAllocator::new_unique().expect("foreign scope");
+        let foreign_binding = foreign.allocate().expect("foreign token");
+        let store = ExactBindingReceiptStore::new(&allocator);
+        let original = receipt("table");
+        let conflicting = receipt("other_table");
+        store.register_receipt(binding, original.clone()).unwrap();
+        store.register_receipt(binding, original.clone()).unwrap();
+        assert_eq!(
+            store
+                .register_receipt(binding, conflicting.clone())
+                .unwrap_err(),
+            "exact binding receipt token was registered with conflicting facts",
+        );
+        let sealed = store.seal();
+        for candidate in [original.clone(), conflicting] {
+            assert_eq!(
+                store.register_receipt(binding, candidate).unwrap_err(),
+                "exact binding receipt store is semantically sealed",
+            );
+        }
+        assert_eq!(sealed.resolve(binding), Ok(original));
+        assert_eq!(
+            sealed.resolve(missing).unwrap_err(),
+            "exact binding receipt is missing from this query",
+        );
+        assert_eq!(
+            sealed.resolve(foreign_binding).unwrap_err(),
+            "exact binding receipt token belongs to another query",
+        );
+        assert!(Arc::ptr_eq(&sealed.receipts, &store.seal().receipts));
+    }
+
+    #[test]
+    fn empty_seal_is_irreversible_and_repeated_views_share_arc() {
+        let mut allocator = SqlTableBindingAllocator::new_unique().expect("unique scope");
+        let binding = allocator.allocate().expect("binding token");
+        let store = ExactBindingReceiptStore::new(&allocator);
+        assert!(store.sealed_view().is_none());
+        let first = store.seal();
+        assert!(first.receipts.is_empty());
+        assert_eq!(first.receipts.capacity(), 0);
+        assert!(Arc::ptr_eq(&first.receipts, &store.seal().receipts));
+        assert!(Arc::ptr_eq(
+            &first.receipts,
+            &store.sealed_view().expect("empty sealed view").receipts,
+        ));
+        assert_eq!(
+            store
+                .register_receipt(binding, receipt("table"))
+                .unwrap_err(),
+            "exact binding receipt store is semantically sealed",
+        );
+        assert_eq!(
+            first.resolve(binding).unwrap_err(),
+            "exact binding receipt is missing from this query",
+        );
     }
 }

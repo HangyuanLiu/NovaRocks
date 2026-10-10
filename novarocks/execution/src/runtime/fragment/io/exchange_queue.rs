@@ -1145,7 +1145,7 @@ mod tests {
         assert!(
             error_state
                 .error()
-                .is_some_and(|error| error.contains("receiver unavailable"))
+                .is_some_and(|error| error.detail().contains("receiver unavailable"))
         );
         assert!(tracker.is_idle());
     }
@@ -1210,9 +1210,9 @@ mod tests {
         );
 
         assert!(
-            error_state
-                .error()
-                .is_some_and(|error| error.contains("no matching gated outbound destination")),
+            error_state.error().is_some_and(|error| error
+                .detail()
+                .contains("no matching gated outbound destination")),
             "an unattributable cancellation cannot be told apart from a failure"
         );
     }

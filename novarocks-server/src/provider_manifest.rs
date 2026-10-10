@@ -21,12 +21,17 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use anyhow::Context;
+use novarocks_connector_contract::{
+    PureProviderManifestEntry, PureProviderProgramCatalog, PureProviderProgramDefinition,
+};
+use novarocks_connector_iceberg::commit::write_stack::IcebergWriteRecipeCompiler;
 use novarocks_connector_iceberg::resources::IcebergMetadataResources;
+use novarocks_connector_iceberg::typed_read::codec::IcebergReadRecipeCompiler;
 use novarocks_connector_iceberg::{
     IcebergControlRoleBindingFactory, IcebergExecutionRoleBindingFactory,
 };
 use novarocks_connector_paimon::role_binding::{
-    PaimonControlRoleBindingFactory, PaimonExecutionRoleBindingFactory,
+    PaimonControlRoleBindingFactory, PaimonExecutionRoleBindingFactory, PaimonReadRecipeCompiler,
 };
 use novarocks_spi::connector::provider::{ProviderContractDefinition, SealedProviderRegistry};
 use novarocks_spi::connector::{
@@ -36,6 +41,7 @@ use novarocks_spi::connector::{
 
 use crate::app_config::NovaRocksConfig;
 use crate::scan_io::ScanIoServices;
+use crate::static_plan::CompositionControl;
 
 type ContractBuilder = fn() -> Result<ProviderContractDefinition, ConnectorCodecError>;
 type ControlFactoryBuilder = fn(
@@ -47,18 +53,24 @@ type ExecutionFactoryBuilder = fn(
     tokio::runtime::Handle,
     &ScanIoServices,
 ) -> anyhow::Result<Arc<dyn ConnectorExecutionRoleBindingFactory>>;
+/// A provider's installed pure program ports, addressed by its sealed
+/// contract identity. They compile frozen facts only and bind no instance.
+type PureProgramBuilder =
+    fn(ConnectorProviderId) -> PureProviderProgramDefinition<ConnectorCodecError>;
 
 #[derive(Clone, Copy)]
 struct ProviderBuilderDefinition {
     contract: ContractBuilder,
     control: Option<ControlFactoryBuilder>,
     execution: Option<ExecutionFactoryBuilder>,
+    pure: PureProgramBuilder,
 }
 
 struct SealedProviderBuilder {
     provider_id: ConnectorProviderId,
     control: ControlFactoryBuilder,
     execution: ExecutionFactoryBuilder,
+    pure: PureProgramBuilder,
 }
 
 // Design: ADR-0139 (docs/adr/ADR-0139-sealed-active-provider-manifest.md)
@@ -67,11 +79,13 @@ const PROVIDER_BUILDERS: &[ProviderBuilderDefinition] = &[
         contract: novarocks_connector_iceberg::iceberg_contract_definition,
         control: Some(build_iceberg_control_factory),
         execution: Some(build_iceberg_execution_factory),
+        pure: iceberg_pure_program,
     },
     ProviderBuilderDefinition {
         contract: novarocks_connector_paimon::definition::paimon_contract_definition,
         control: Some(build_paimon_control_factory),
         execution: Some(build_paimon_execution_factory),
+        pure: paimon_pure_program,
     },
 ];
 
@@ -82,6 +96,8 @@ const PROVIDER_BUILDERS: &[ProviderBuilderDefinition] = &[
 /// execution resources and BE never constructs FE credentials or control
 /// resources.
 pub struct ServerProviderManifest {
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    hms_listing_probe: Option<Arc<novarocks_connector_iceberg::hms_listing_probe::HmsListingProbe>>,
     contracts: SealedProviderRegistry,
     builders: Arc<[SealedProviderBuilder]>,
 }
@@ -114,6 +130,7 @@ impl ServerProviderManifest {
                 provider_id,
                 control,
                 execution,
+                pure: definition.pure,
             });
         }
 
@@ -131,9 +148,27 @@ impl ServerProviderManifest {
             );
         }
         Ok(Self {
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            hms_listing_probe: None,
             contracts,
             builders: Arc::from(builders),
         })
+    }
+
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub fn with_hms_listing_probe(
+        mut self,
+        probe: Arc<novarocks_connector_iceberg::hms_listing_probe::HmsListingProbe>,
+    ) -> Self {
+        self.hms_listing_probe = Some(probe);
+        self
+    }
+
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub fn hms_listing_probe(
+        &self,
+    ) -> Option<Arc<novarocks_connector_iceberg::hms_listing_probe::HmsListingProbe>> {
+        self.hms_listing_probe.clone()
     }
 
     pub const fn contracts(&self) -> &SealedProviderRegistry {
@@ -148,9 +183,29 @@ impl ServerProviderManifest {
         self.builders
             .iter()
             .map(|builder| {
-                let factory = (builder.control)(config, runtime.clone()).with_context(|| {
-                    format!("compose `{}` FE factory", builder.provider_id.as_str())
-                })?;
+                #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+                let observed = builder.provider_id.as_str()
+                    == novarocks_connector_iceberg::PROVIDER_ID
+                    && self.hms_listing_probe.is_some();
+                #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
+                let observed = false;
+                let factory = if observed {
+                    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+                    {
+                        Arc::new(
+                            compose_iceberg_control_factory(config, runtime.clone())?
+                                .with_hms_listing_probe(Arc::clone(
+                                    self.hms_listing_probe.as_ref().expect("selected probe"),
+                                )),
+                        ) as Arc<dyn ConnectorControlRoleBindingFactory>
+                    }
+                    #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
+                    unreachable!("observation is feature-only")
+                } else {
+                    (builder.control)(config, runtime.clone()).with_context(|| {
+                        format!("compose `{}` FE factory", builder.provider_id.as_str())
+                    })?
+                };
                 validate_factory_identity(
                     "FE control",
                     &builder.provider_id,
@@ -159,6 +214,38 @@ impl ServerProviderManifest {
                 Ok(factory)
             })
             .collect()
+    }
+
+    /// Composes the installed pure provider program catalogue.
+    ///
+    /// The manifest half comes from the sealed contracts alone: every
+    /// provider reads, and writes exactly when its contract declares a write
+    /// contract. The installed half is each provider's own pure ports, so a
+    /// provider whose ports disagree with its contract fails composition
+    /// instead of being admitted with a missing or extra facet. No runtime
+    /// instance, split or credential is bound.
+    pub fn compose_pure_program_catalog(
+        &self,
+    ) -> anyhow::Result<PureProviderProgramCatalog<ConnectorCodecError>> {
+        let manifest = self
+            .contracts
+            .definitions()
+            .iter()
+            .map(|contract| {
+                PureProviderManifestEntry::new(
+                    contract.provider_id().clone(),
+                    true,
+                    contract.write().is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let definitions = self
+            .builders
+            .iter()
+            .map(|builder| (builder.pure)(builder.provider_id.clone()))
+            .collect();
+        PureProviderProgramCatalog::try_new(&manifest, definitions, &CompositionControl)
+            .map_err(|error| anyhow::anyhow!("compose pure provider program catalogue: {error}"))
     }
 
     pub fn compose_execution_factories(
@@ -203,14 +290,21 @@ fn build_iceberg_control_factory(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>> {
+    Ok(Arc::new(compose_iceberg_control_factory(config, runtime)?))
+}
+
+fn compose_iceberg_control_factory(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+) -> anyhow::Result<IcebergControlRoleBindingFactory> {
     let metadata_binding =
         crate::composition::compose_iceberg_metadata_access_template(config, runtime.clone())?;
     let max_inflight = NonZeroUsize::new(config.runtime.catalog_materialization_max_inflight)
         .ok_or_else(|| anyhow::anyhow!("catalog materialization max inflight must be nonzero"))?;
-    Ok(Arc::new(IcebergControlRoleBindingFactory::new(
+    Ok(IcebergControlRoleBindingFactory::new(
         IcebergMetadataResources::new(metadata_binding, runtime),
         max_inflight,
-    )))
+    ))
 }
 
 fn build_iceberg_execution_factory(
@@ -235,6 +329,22 @@ fn iceberg_execution_reader_options(
     options.reader_options.coalesce_max_bytes = config.runtime.io_coalesce_read_max_buffer_size;
     options.reader_options.coalesce_max_gap = config.runtime.io_coalesce_read_max_distance_size;
     options
+}
+
+fn iceberg_pure_program(
+    provider: ConnectorProviderId,
+) -> PureProviderProgramDefinition<ConnectorCodecError> {
+    PureProviderProgramDefinition::new(
+        provider,
+        Some(Arc::new(IcebergReadRecipeCompiler)),
+        Some(Arc::new(IcebergWriteRecipeCompiler)),
+    )
+}
+
+fn paimon_pure_program(
+    provider: ConnectorProviderId,
+) -> PureProviderProgramDefinition<ConnectorCodecError> {
+    PureProviderProgramDefinition::new(provider, Some(Arc::new(PaimonReadRecipeCompiler)), None)
 }
 
 fn build_paimon_control_factory(
@@ -381,6 +491,13 @@ mod tests {
         }))
     }
 
+    /// A fixture with no pure facet; these cases never compose a catalogue.
+    fn fixture_pure_program(
+        provider: ConnectorProviderId,
+    ) -> PureProviderProgramDefinition<ConnectorCodecError> {
+        PureProviderProgramDefinition::new(provider, None, None)
+    }
+
     fn counted_control_factory(
         config: &NovaRocksConfig,
         runtime: tokio::runtime::Handle,
@@ -404,6 +521,7 @@ mod tests {
             contract: fixture_contract,
             control: Some(fixture_control_factory),
             execution: None,
+            pure: fixture_pure_program,
         }])
         .err()
         .expect("missing BE factory must fail")
@@ -418,11 +536,13 @@ mod tests {
                 contract: fixture_contract,
                 control: Some(fixture_control_factory),
                 execution: Some(fixture_execution_factory),
+                pure: fixture_pure_program,
             },
             ProviderBuilderDefinition {
                 contract: duplicate_fixture_contract,
                 control: Some(fixture_control_factory),
                 execution: Some(fixture_execution_factory),
+                pure: fixture_pure_program,
             },
         ])
         .err()
@@ -437,6 +557,7 @@ mod tests {
             contract: fixture_contract,
             control: Some(drifted_control_factory),
             execution: Some(fixture_execution_factory),
+            pure: fixture_pure_program,
         }])
         .expect("contract-only sealing must not invoke factories");
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -456,6 +577,7 @@ mod tests {
             contract: fixture_contract,
             control: Some(counted_control_factory),
             execution: Some(counted_execution_factory),
+            pure: fixture_pure_program,
         }])
         .expect("manifest");
         assert_eq!(CONTROL_BUILDS.load(Ordering::Acquire), 0);
@@ -520,5 +642,54 @@ mod tests {
         assert!(!options.reader_options.coalesce_reads);
         assert_eq!(options.reader_options.coalesce_max_bytes, 2 * 1024 * 1024);
         assert_eq!(options.reader_options.coalesce_max_gap, 16 * 1024);
+    }
+
+    /// The Server manifest installs Iceberg read and write ports and the
+    /// read-only Paimon port, exactly the facets each sealed contract
+    /// declares.
+    #[test]
+    fn the_server_manifest_composes_its_pure_program_catalogue() {
+        let manifest = ServerProviderManifest::seal().expect("server provider manifest");
+        let catalog = manifest
+            .compose_pure_program_catalog()
+            .expect("pure provider program catalogue");
+        assert_eq!(catalog.provider_count(), 2);
+        let facets = manifest
+            .contracts()
+            .definitions()
+            .iter()
+            .map(|contract| {
+                (
+                    contract.provider_id().as_str().to_owned(),
+                    contract.write().is_some(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            facets,
+            vec![("iceberg".to_owned(), true), ("paimon".to_owned(), false)]
+        );
+    }
+
+    /// Installed ports that disagree with the sealed contract fail
+    /// composition rather than admitting a provider with a missing facet.
+    #[test]
+    fn pure_ports_that_disagree_with_their_contract_fail_composition() {
+        let manifest = ServerProviderManifest::seal_definitions(&[ProviderBuilderDefinition {
+            contract: fixture_contract,
+            control: Some(fixture_control_factory),
+            execution: Some(fixture_execution_factory),
+            pure: fixture_pure_program,
+        }])
+        .expect("manifest");
+        let error = manifest
+            .compose_pure_program_catalog()
+            .err()
+            .expect("a read contract without a pure read port must fail")
+            .to_string();
+        assert!(
+            error.contains("installed pure facets differ from the manifest"),
+            "{error}"
+        );
     }
 }

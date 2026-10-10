@@ -141,10 +141,33 @@ impl fmt::Debug for RootObservationIoSource {
     }
 }
 
+#[cfg(feature = "mem-1-m07-closing-pressure")]
+enum ClosingPressureRoleSource {
+    Fixture(novarocks_mysql_adapter::closing_pressure_fixture::ClosingPressureFixtureError),
+    OriginalIo(std::io::Error),
+}
+#[cfg(feature = "mem-1-m07-closing-pressure")]
+impl fmt::Debug for ClosingPressureRoleSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("OriginalClosingPressureSource { source_retained: true }")
+    }
+}
+#[cfg(feature = "mem-1-m07-closing-pressure")]
+impl ClosingPressureRoleSource {
+    fn original(&self) -> &(dyn std::error::Error + 'static) {
+        match self {
+            Self::Fixture(source) => source,
+            Self::OriginalIo(source) => source,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct FrontendApplicationError {
     kind: FrontendApplicationErrorKind,
     message: String,
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    pressure_failures: [Option<Box<ClosingPressureRoleSource>>; 4],
     #[cfg(feature = "mem-1-m07-root-observation")]
     root_observation_io: Option<Box<RootObservationIoSource>>,
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
@@ -158,6 +181,8 @@ impl FrontendApplicationError {
         Self {
             kind,
             message: error.to_string(),
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            pressure_failures: std::array::from_fn(|_| None),
             #[cfg(feature = "mem-1-m07-root-observation")]
             root_observation_io: None,
             #[cfg(feature = "mem-1-m07-exact-mysql-write")]
@@ -177,6 +202,26 @@ impl FrontendApplicationError {
         result.fixture_failures[0] = Some(Box::new(error));
         result
     }
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    pub(crate) fn server_pressure(
+        error: novarocks_mysql_adapter::closing_pressure_fixture::ClosingPressureFixtureError,
+    ) -> Self {
+        let mut result = Self::server("original Closing pressure fixture failed");
+        result.pressure_failures[0] = Some(Box::new(ClosingPressureRoleSource::Fixture(error)));
+        result
+    }
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    pub(crate) fn server_pressure_registry(error: std::io::Error) -> Self {
+        let mut result = Self::server("original Closing pressure connection drain failed");
+        result.pressure_failures[0] = Some(Box::new(ClosingPressureRoleSource::OriginalIo(error)));
+        result
+    }
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    pub(crate) fn server_pressure_binding(error: std::io::Error) -> Self {
+        let mut result = Self::server("original Closing pressure listener binding failed");
+        result.pressure_failures[0] = Some(Box::new(ClosingPressureRoleSource::OriginalIo(error)));
+        result
+    }
     #[cfg(feature = "mem-1-m07-root-observation")]
     pub(crate) fn server_root_observation(error: std::io::Error) -> Self {
         let mut result = Self::server("root observation stdout IO failed");
@@ -185,9 +230,10 @@ impl FrontendApplicationError {
     }
     #[cfg(any(
         feature = "mem-1-m07-exact-mysql-write",
-        feature = "mem-1-m07-root-observation"
+        feature = "mem-1-m07-root-observation",
+        feature = "mem-1-m07-closing-pressure"
     ))]
-    pub(crate) fn with_role_cleanup(mut self, cleanup: Self) -> Self {
+    pub fn with_role_cleanup(mut self, cleanup: Self) -> Self {
         self.message
             .push_str(&format!("; cleanup failed: {cleanup}"));
         #[cfg(feature = "mem-1-m07-root-observation")]
@@ -195,6 +241,17 @@ impl FrontendApplicationError {
             // Only the one startup emission can supply this original IO source.
             assert!(self.root_observation_io.is_none());
             self.root_observation_io = Some(source);
+        }
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
+        for source in cleanup.pressure_failures.into_iter().flatten() {
+            // Startup is mutually exclusive with the four serving verdict stages:
+            // control, socket close, registry verification and original-owner finish.
+            let slot = self
+                .pressure_failures
+                .iter_mut()
+                .find(|slot| slot.is_none())
+                .expect("fixed Closing pressure verdict stages");
+            *slot = Some(source);
         }
         #[cfg(feature = "mem-1-m07-exact-mysql-write")]
         for source in cleanup.fixture_failures.into_iter().flatten() {
@@ -234,6 +291,10 @@ impl std::error::Error for FrontendApplicationError {
         if let Some(error) = &self.root_observation_io {
             return Some(&error.0);
         }
+        #[cfg(feature = "mem-1-m07-closing-pressure")]
+        if let Some(error) = self.pressure_failures.iter().flatten().next() {
+            return Some(error.original());
+        }
         #[cfg(feature = "mem-1-m07-exact-mysql-write")]
         if let Some(error) = self.fixture_failures.iter().flatten().next() {
             return Some(error.as_ref());
@@ -249,6 +310,7 @@ impl std::error::Error for FrontendApplicationError {
 /// supervisor, Registry, workload control, or decode join handles.
 // Design: ADR-0147 (docs/adr/ADR-0147-process-local-work-governance-separates-responsibility-and-resources.md)
 struct FrontendExecutionRuntimeOwner {
+    connector_blocking_io: ConnectorBlockingIoSupervisor,
     supervisor: LogicalExecutionSupervisor,
     logical_execution_client: QueryExecutionClient,
     lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
@@ -276,7 +338,7 @@ struct FrontendExecutionRuntimeOwner {
 /// admit, complete, or release business work.
 struct FrontendWorkloadDeadlineSupervisor {
     stop: tokio::sync::watch::Sender<bool>,
-    worker: tokio::task::JoinHandle<()>,
+    worker: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl FrontendWorkloadDeadlineSupervisor {
@@ -303,23 +365,35 @@ impl FrontendWorkloadDeadlineSupervisor {
                 }
             }
         });
-        Self { stop, worker }
+        Self {
+            stop,
+            worker: Some(worker),
+        }
     }
 
     async fn shutdown(&mut self) {
         self.stop.send_replace(true);
-        let _ = (&mut self.worker).await;
+        if let Some(worker) = self.worker.as_mut() {
+            let _ = worker.await;
+            // Keep the original handle on a cancelled await; consume it only
+            // after actual join, before a later Host owner can time out.
+            self.worker.take();
+        }
     }
 
     fn abort_for_process_exit(&self) {
         self.stop.send_replace(true);
-        self.worker.abort();
+        if let Some(worker) = &self.worker {
+            worker.abort();
+        }
     }
 }
 
 impl Drop for FrontendWorkloadDeadlineSupervisor {
     fn drop(&mut self) {
-        self.worker.abort();
+        if let Some(worker) = &self.worker {
+            worker.abort();
+        }
     }
 }
 
@@ -343,6 +417,7 @@ struct FrontendQueryRuntimeConfig {
 impl FrontendExecutionRuntimeOwner {
     fn try_new(
         runtime: Handle,
+        connector_blocking_io: ConnectorBlockingIoSupervisor,
         frontend_process_id: FrontendProcessId,
         supervisor_config: LogicalExecutionSupervisorConfig,
         workload_config: WorkloadConfig,
@@ -410,6 +485,7 @@ impl FrontendExecutionRuntimeOwner {
             workload.owner.deadline_expiry_handle(),
         );
         Ok(Self {
+            connector_blocking_io,
             supervisor,
             logical_execution_client,
             lifecycle_diagnostics,
@@ -530,6 +606,12 @@ impl FrontendExecutionRuntimeOwner {
 
     async fn shutdown_workload_until(&mut self, deadline: Instant) -> Result<(), String> {
         loop {
+            if let Some(error) = self.connector_blocking_io.take_original_failure() {
+                // Keep arbitrary provider payload destruction off the Host
+                // future and hold its original backing until actual join.
+                self.record_terminal_error(error.to_string());
+                self.connector_blocking_io.retire_original_failure(error);
+            }
             let revision = self
                 .workload
                 .as_ref()
@@ -576,16 +658,22 @@ impl FrontendExecutionRuntimeOwner {
                 control.acknowledge();
             }
 
+            // Control traversal can advance the revision even when the next
+            // wait is immediately ready. Yield so the SAME Host can poll its
+            // original failed-subscription recovery alongside this drain.
+            tokio::task::yield_now().await;
+
             let wait = self
                 .workload
                 .as_ref()
                 .expect("failed workload shutdown returns the exact owner")
                 .wait_progress(revision);
-            if tokio::time::timeout_at(deadline.into(), wait)
-                .await
-                .is_err()
-            {
-                return Err("frontend workload shutdown deadline exceeded before drain".to_string());
+            tokio::select! {
+                _ = wait => {},
+                _ = self.connector_blocking_io.wait_failure() => {},
+                _ = tokio::time::sleep_until(deadline.into()) => {
+                    return Err("frontend workload shutdown deadline exceeded before drain".to_string());
+                }
             }
         }
     }
@@ -742,6 +830,8 @@ pub struct FrontendApplicationHost {
     mv_management_audit: Option<Arc<dyn novarocks_mv_application::management::ManagementAuditSink>>,
     mv_startup_isolation: Option<crate::mv::startup_isolation_file::StartupIsolationSource>,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    static_plan_carrier: crate::query_execution::package_freeze::StaticPlanCarrier,
 }
 
 /// Matches the historical `[runtime] optimizer_query_mem_limit_bytes` default.
@@ -809,6 +899,11 @@ pub struct FrontendExecutionConfig {
     runtime_filter_worker_count: NonZeroUsize,
     native_compatibility_id: NativeCompatibilityId,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    /// The one static carrier every completed plan of this process is frozen
+    /// into. It travels with the function catalog to every owner that
+    /// encodes a plan, and is never chosen per statement.
+    static_plan_carrier: crate::query_execution::package_freeze::StaticPlanCarrier,
     mv_scheduler: MvSchedulerConfig,
     mv_maintenance: MaintenanceCoordinatorConfig,
     mv_remote_effect_policy: novarocks_mv_application::management::RemoteEffectPolicy,
@@ -862,11 +957,17 @@ impl FrontendExecutionConfig {
         native_compatibility_id: NativeCompatibilityId,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
         logical_runtime: FrontendLogicalExecutionRuntimeConfig,
+        constant_policy: novarocks_functions::ConstantPolicy,
     ) -> Self {
         Self {
             runtime_filter_worker_count,
             native_compatibility_id,
             function_catalog,
+            constant_policy,
+            // Production freezes plan trees; a compiled-package composition
+            // selects its carrier explicitly.
+            static_plan_carrier:
+                crate::query_execution::package_freeze::StaticPlanCarrier::PlanTree,
             mv_scheduler: MvSchedulerConfig::default(),
             mv_maintenance: MaintenanceCoordinatorConfig::default(),
             mv_remote_effect_policy:
@@ -921,17 +1022,35 @@ impl FrontendExecutionConfig {
         runtime_filter_worker_count: NonZeroUsize,
         native_compatibility_id: NativeCompatibilityId,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+        constant_policy: novarocks_functions::ConstantPolicy,
     ) -> Self {
         Self::new(
             runtime_filter_worker_count,
             native_compatibility_id,
             function_catalog,
             FrontendLogicalExecutionRuntimeConfig::for_test(),
+            constant_policy,
         )
     }
 
     pub(crate) fn function_catalog(&self) -> Arc<novarocks_functions::EngineFunctionCatalog> {
         Arc::clone(&self.function_catalog)
+    }
+
+    pub const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
+    }
+
+    /// Select the static carrier this process freezes every completed plan
+    /// into. The composition that selects the compiled package carrier must
+    /// also compose a backend that interprets it; nothing here falls back to
+    /// the plan tree.
+    pub fn with_static_plan_carrier(
+        mut self,
+        carrier: crate::query_execution::package_freeze::StaticPlanCarrier,
+    ) -> Self {
+        self.static_plan_carrier = carrier;
+        self
     }
 
     pub fn with_query_control_timeouts(mut self, timeouts: FrontendQueryControlTimeouts) -> Self {
@@ -1165,17 +1284,25 @@ impl FrontendApplicationHost {
                 FrontendApplicationError::new(FrontendApplicationErrorKind::CoordinatorOpen, error)
             })?;
         let query_runtime = data_runtime.clone();
+        execution.workload.validate().map_err(|error| {
+            FrontendApplicationError::new(
+                FrontendApplicationErrorKind::CoordinatorOpen,
+                error.to_string(),
+            )
+        })?;
         let data_runtime = FrontendDataRuntime::new_with_native_trust(
             data_runtime,
             native_trust,
             native_transport,
             execution.transport_budget.into_codec(),
+            execution.workload.scope_records_limit,
         )
         .map_err(|error| {
             FrontendApplicationError::new(FrontendApplicationErrorKind::CoordinatorOpen, error)
         })?;
         let execution_runtime_owner = FrontendExecutionRuntimeOwner::try_new(
             query_runtime,
+            data_runtime.connector_blocking_io().clone(),
             frontend_process_id,
             execution.logical_execution_supervisor,
             execution.workload.clone(),
@@ -1202,7 +1329,7 @@ impl FrontendApplicationHost {
             },
             execution_runtime_owner,
             execution_role: backend.role(),
-            data_runtime: data_runtime.clone(),
+            data_runtime,
             topology: None,
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
             lake_publication_runtime_policy: execution.lake_publication_runtime_policy(),
@@ -1212,7 +1339,24 @@ impl FrontendApplicationHost {
             mv_management_audit: execution.mv_management_audit.clone(),
             mv_startup_isolation: execution.mv_startup_isolation.clone(),
             function_catalog: execution.function_catalog(),
+            constant_policy: execution.constant_policy,
+            static_plan_carrier: execution.static_plan_carrier,
         };
+
+        // Unique original Apply owner is now in Host. No Native caller has
+        // received a projection yet; early try_new failure had no reaper.
+        if let Err(error) = host
+            .data_runtime
+            .start_original_apply_reaper()
+            .and_then(|()| host.data_runtime.start_original_subscription_reaper())
+        {
+            return Err(host
+                .cleanup_open_error(FrontendApplicationError::new(
+                    FrontendApplicationErrorKind::CoordinatorOpen,
+                    error,
+                ))
+                .await);
+        }
 
         if let Some(state_store) = state_store
             && let Err(error) = host
@@ -1357,8 +1501,12 @@ impl FrontendApplicationHost {
                 }
             }
         }
-        match ClusterBackendService::open(backend, tokio::runtime::Handle::current(), data_runtime)
-            .await
+        match ClusterBackendService::open(
+            backend,
+            tokio::runtime::Handle::current(),
+            host.data_runtime.clone(),
+        )
+        .await
         {
             Ok(topology) => host.topology = Some(topology),
             Err(error) => {
@@ -1623,8 +1771,22 @@ impl FrontendApplicationHost {
         self.lake_publication_runtime_policy
     }
 
+    /// The immutable deployment profile used by every FE constant author.
+    /// This is an admission ceiling, not a memory allocation capability.
+    pub const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
+    }
+
     pub fn function_catalog(&self) -> Arc<novarocks_functions::EngineFunctionCatalog> {
         Arc::clone(&self.function_catalog)
+    }
+
+    /// The static carrier every owner that encodes a completed plan receives
+    /// beside the function catalog.
+    pub(crate) const fn static_plan_carrier(
+        &self,
+    ) -> crate::query_execution::package_freeze::StaticPlanCarrier {
+        self.static_plan_carrier
     }
 
     pub fn connector_control_registry(
@@ -1889,7 +2051,21 @@ impl FrontendApplicationHost {
         self.serving_lifecycle.mark_stopping();
         self.execution_runtime_owner.close_admission();
         let mut primary_error: Option<String> = None;
-        if let Err(error) = self.execution_runtime_owner.shutdown_until(deadline).await {
+        let execution_result = {
+            let shutdown = self.execution_runtime_owner.shutdown_until(deadline);
+            tokio::pin!(shutdown);
+            // The healthy continuous reaper stays active throughout logical
+            // teardown. If it fails, borrow the SAME owner here so its original
+            // children cannot strand the Workload drain that precedes the tail.
+            tokio::select! {
+                result = &mut shutdown => result,
+                recovery = self.data_runtime.recover_failed_subscription_reaper_until(deadline) => {
+                    if let Err(error) = recovery { primary_error = Some(error); }
+                    shutdown.await
+                }
+            }
+        };
+        if let Err(error) = execution_result {
             if !self.execution_runtime_owner.is_shutdown_complete() {
                 return match primary_error {
                     Some(primary) => Err(format!("{primary}; cleanup failed: {error}")),
@@ -1937,6 +2113,54 @@ impl FrontendApplicationHost {
             }
             return Err(primary_error.expect("catalog role runtime shutdown error is retained"));
         }
+        // Execution and heartbeat shutdown precede Apply close. Retain this
+        // original role owner in Host on timeout so a shutdown retry joins
+        // the SAME records and handles.
+        if let Err(error) = self.data_runtime.drain_original_apply_until(deadline).await {
+            if !self.data_runtime.original_apply_joined() {
+                return Err(match primary_error {
+                    Some(primary) => format!("{primary}; cleanup failed: {error}"),
+                    None => error,
+                });
+            }
+            if let Some(primary) = primary_error.as_mut() {
+                primary.push_str(&format!("; cleanup failed: {error}"));
+            } else {
+                primary_error = Some(error);
+            }
+        }
+        if let Err(error) = self
+            .data_runtime
+            .drain_original_subscriptions_until(deadline)
+            .await
+        {
+            if !self.data_runtime.original_subscriptions_joined() {
+                return Err(match primary_error {
+                    Some(primary) => format!("{primary}; cleanup failed: {error}"),
+                    None => error,
+                });
+            }
+            if let Some(primary) = primary_error.as_mut() {
+                primary.push_str(&format!("; cleanup failed: {error}"));
+            } else {
+                primary_error = Some(error);
+            }
+        }
+        // Role-owned callers have reached the Native tail. Close future calls,
+        // retire cache aliases and wait for the original public IO/body exits
+        // before StateStore, using the same absolute Host deadline.
+        // This observation does not replace original caller task/F joins or
+        // prove every escaped clone's undispatched stream reservation exited.
+        if let Err(error) = self
+            .data_runtime
+            .drain_native_outgoing_until(deadline)
+            .await
+        {
+            return Err(match primary_error {
+                Some(primary) => format!("{primary}; cleanup failed: {error}"),
+                None => error,
+            });
+        }
         if let Some(host) = self.state_store_host.as_mut() {
             match host.shutdown(deadline).await {
                 Ok(()) => {
@@ -1962,6 +2186,23 @@ impl FrontendApplicationHost {
     }
 }
 
+/// Finite constant admission used only by explicit Frontend unit fixtures.
+#[cfg(test)]
+pub(crate) fn test_constant_policy() -> novarocks_functions::ConstantPolicy {
+    novarocks_functions::ConstantPolicy {
+        max_rows: 1 << 20,
+        max_array_nodes: 1 << 20,
+        max_logical_elements: 1 << 24,
+        max_retained_buffer_bytes: 1 << 30,
+        max_type_depth: 64,
+        max_type_nodes: 4096,
+        max_dictionary_depth: 64,
+        max_metadata_bytes: 1 << 20,
+        max_library_validation_work: 1 << 30,
+        max_library_validation_bytes: 1 << 32,
+    }
+}
+
 #[cfg(test)]
 #[path = "application/tests_host.rs"]
 mod host_tests;
@@ -1979,6 +2220,7 @@ mod tests {
         TEST_STATE_STORE_PROVIDER_ID, input as test_state_store_input,
         registry as test_state_store_registry,
     };
+    use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
     use async_trait::async_trait;
     use novarocks_query_application::cpu::{QueryBlockingExecutorConfig, QueryCpuExecutorConfig};
     use novarocks_state_store_api::{
@@ -2005,9 +2247,27 @@ mod tests {
     struct FailingFactory;
 
     #[tokio::test]
+    async fn deadline_supervisor_keeps_an_observed_join_terminal_on_shutdown_retry() {
+        let workload =
+            novarocks_workload_control::WorkloadControl::try_new_counted(WorkloadConfig::default())
+                .unwrap();
+        let mut supervisor = super::FrontendWorkloadDeadlineSupervisor::start(
+            &tokio::runtime::Handle::current(),
+            workload.owner.deadline_expiry_handle(),
+        );
+        supervisor.shutdown().await;
+        // A later owner can exhaust the Host deadline after this original join
+        // has completed. Retrying teardown must not poll that handle again.
+        supervisor.shutdown().await;
+        workload.owner.close_admission();
+        assert!(workload.owner.shutdown().is_ok());
+    }
+
+    #[tokio::test]
     async fn execution_runtime_shutdown_deadline_retains_the_same_workload_owner_for_retry() {
         let mut runtime = FrontendExecutionRuntimeOwner::try_new(
             tokio::runtime::Handle::current(),
+            ConnectorBlockingIoSupervisor::new(tokio::runtime::Handle::current()),
             novarocks_types::FrontendProcessId::new_v7(),
             LogicalExecutionSupervisorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
@@ -2051,6 +2311,7 @@ mod tests {
     async fn execution_runtime_supervises_admitted_statement_deadlines() {
         let mut runtime = FrontendExecutionRuntimeOwner::try_new(
             tokio::runtime::Handle::current(),
+            ConnectorBlockingIoSupervisor::new(tokio::runtime::Handle::current()),
             novarocks_types::FrontendProcessId::new_v7(),
             LogicalExecutionSupervisorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
@@ -2104,6 +2365,7 @@ mod tests {
     async fn execution_runtime_shutdown_consumes_terminal_control_notifications() {
         let mut runtime = FrontendExecutionRuntimeOwner::try_new(
             tokio::runtime::Handle::current(),
+            ConnectorBlockingIoSupervisor::new(tokio::runtime::Handle::current()),
             novarocks_types::FrontendProcessId::new_v7(),
             LogicalExecutionSupervisorConfig::new(
                 NonZeroUsize::new(1).unwrap(),
@@ -2193,6 +2455,216 @@ mod tests {
         assert!(diagnostic.contains("injected provider cleanup failure"));
     }
 
+    async fn blocking_test_host(name: &str) -> FrontendApplicationHost {
+        let registry = test_state_store_registry();
+        let backend = crate::topology::ClusterBackendOpenConfig::new(
+            novarocks_types::ClusterRole::Fe,
+            novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+            Duration::from_secs(1),
+            1,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let host = FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+            Some(test_state_store_input(name)),
+            &registry,
+            FrontendExecutionConfig::new_for_test(
+                NonZeroUsize::new(1).unwrap(),
+                novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                std::sync::Arc::new(
+                    novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap(),
+                ),
+                crate::application::test_constant_policy(),
+            ),
+            backend,
+            Vec::new(),
+            tokio::runtime::Handle::current(),
+            test_native_trust(),
+            FrontendNativeTransport::plaintext(),
+        )
+        .await
+        .unwrap();
+        host.mark_ready()
+            .expect("original Host admission becomes ready");
+        host
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_drain_retains_the_same_admitted_connector_call_until_actual_join() {
+        use crate::task_execution::blocking_io::ConnectorBlockingIoResponsibility;
+        let mut host = blocking_test_host("connector-held-host").await;
+        let (root, window) = host
+            .execution_runtime_owner
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                novarocks_workload_control::ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let responsibility =
+            ConnectorBlockingIoResponsibility::admit(&root.owner.scope(), &window.retain_alias())
+                .unwrap();
+        let pin = responsibility.join_pin();
+        let (release, held) = std::sync::mpsc::channel();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let (returned, exited) = tokio::sync::oneshot::channel();
+        let job = host
+            .connector_blocking_io_supervisor()
+            .spawn_pinned(vec![pin], move || {
+                let _responsibility = responsibility;
+                let _ = started.send(());
+                held.recv().expect("release original Connector call");
+                let _ = returned.send(());
+            });
+        tokio::time::timeout(Duration::from_secs(1), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        drop(job);
+        let first = host
+            .shutdown_until(Instant::now() + Duration::from_millis(40))
+            .await;
+        let remained_held = exited.is_empty();
+        let retained = host.execution_runtime_owner.workload_observation.snapshot();
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), exited)
+            .await
+            .unwrap()
+            .unwrap();
+        let retry = host
+            .shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        assert!(first.is_err() && remained_held);
+        assert_eq!(retained.root_responsibilities, 1);
+        assert_eq!(retained.result_windows.held_positions, [0, 0, 1, 0]);
+        retry.expect("same Host drains after original join");
+        assert!(
+            host.execution_runtime_owner
+                .workload_observation
+                .snapshot()
+                .scopes
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_drain_consumes_an_unclaimed_original_panic_before_releasing_its_window() {
+        use crate::task_execution::blocking_io::ConnectorBlockingIoResponsibility;
+        struct Payload {
+            destroyed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            started: Option<tokio::sync::oneshot::Sender<()>>,
+            release: std::sync::mpsc::Receiver<()>,
+        }
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                let _ = self.started.take().unwrap().send(());
+                self.release
+                    .recv()
+                    .expect("release original panic payload destructor");
+                self.destroyed
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let mut host = blocking_test_host("connector-panic-host").await;
+        let (root, window) = host
+            .execution_runtime_owner
+            .root_admission()
+            .try_begin_root_with_result(
+                WorkRequest::new(WorkClass::Management),
+                novarocks_workload_control::ResultWindowClass::Internal,
+            )
+            .unwrap();
+        let responsibility =
+            ConnectorBlockingIoResponsibility::admit(&root.owner.scope(), &window.retain_alias())
+                .unwrap();
+        let pin = responsibility.join_pin();
+        let destroyed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (payload_started, payload_entered) = tokio::sync::oneshot::channel();
+        let (release_payload, payload_held) = std::sync::mpsc::channel();
+        let payload = Payload {
+            destroyed: std::sync::Arc::clone(&destroyed),
+            started: Some(payload_started),
+            release: payload_held,
+        };
+        let (started, entered) = tokio::sync::oneshot::channel();
+        let job = host
+            .connector_blocking_io_supervisor()
+            .spawn_pinned(vec![pin], move || {
+                let _responsibility = responsibility;
+                let _ = started.send(());
+                std::panic::panic_any(payload);
+            });
+        // Arm rescue before any prerequisite can fail. Capture the facts and
+        // settle the actual Host before asserting, including when an earlier
+        // shutdown phase consumes the short fixture deadline.
+        let (disarm_watchdog, watch) = std::sync::mpsc::channel();
+        let rescue = release_payload.clone();
+        let watchdog = std::thread::spawn(move || {
+            if watch.recv_timeout(Duration::from_millis(500)).is_err() {
+                let _ = rescue.send(());
+            }
+        });
+        let callback_entered = matches!(
+            tokio::time::timeout(Duration::from_secs(1), entered).await,
+            Ok(Ok(()))
+        );
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        drop(job);
+        // The callback's start precedes its original blocking join. Establish
+        // the actual unclaimed failure before testing Host payload retirement,
+        // so another shutdown phase cannot consume this fixture's deadline.
+        let failure_published = tokio::time::timeout(
+            Duration::from_secs(1),
+            host.connector_blocking_io_supervisor().wait_failure(),
+        )
+        .await
+        .is_ok();
+        let began = Instant::now();
+        let blocked = host
+            .shutdown_until(Instant::now() + Duration::from_millis(40))
+            .await;
+        let shutdown_elapsed = began.elapsed();
+        let payload_started_by_deadline = !payload_entered.is_empty();
+        let held = host.execution_runtime_owner.workload_observation.snapshot();
+        let _ = release_payload.send(());
+        let _ = disarm_watchdog.send(());
+        let watchdog_joined = watchdog.join().is_ok();
+        let verdict = host
+            .shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await;
+        let payload_entered = matches!(
+            tokio::time::timeout(Duration::from_secs(1), payload_entered).await,
+            Ok(Ok(()))
+        );
+        let after = host.execution_runtime_owner.workload_observation.snapshot();
+        let cleanup_complete = host.execution_runtime_owner.is_shutdown_complete();
+        host.shutdown_until(Instant::now() + Duration::from_secs(2))
+            .await
+            .expect("cleaned Host remains closed");
+        assert!(callback_entered && failure_published && payload_entered && watchdog_joined);
+        assert!(blocked.is_err() && payload_started_by_deadline);
+        assert!(
+            shutdown_elapsed < Duration::from_millis(500),
+            "Host deadline blocked on its original panic payload destructor: {shutdown_elapsed:?}"
+        );
+        assert_eq!(held.result_windows.held_positions, [0, 0, 1, 0]);
+        assert_eq!(held.root_responsibilities, 1);
+        assert!(
+            verdict
+                .expect_err("original unclaimed panic must be reported")
+                .to_string()
+                .contains("panicked")
+        );
+        assert!(destroyed.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(after.result_windows.held_positions, [0; 4]);
+        assert!(after.scopes.is_empty() && cleanup_complete);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn host_bootstraps_and_stops_catalog_projection_with_state_store() {
         let state_store = test_state_store_input("catalog-controller-host-test");
@@ -2215,6 +2687,7 @@ mod tests {
                     novarocks_sql::compiler::build_builtin_engine_function_catalog()
                         .expect("builtin function catalog"),
                 ),
+                crate::application::test_constant_policy(),
             ),
             backend,
             Vec::new(),
@@ -2234,5 +2707,44 @@ mod tests {
             novarocks_catalog_application::CatalogAdmission::Absent
         ));
         host.shutdown().await.expect("host shutdown");
+    }
+}
+
+#[cfg(all(test, feature = "mem-1-m07-closing-pressure"))]
+mod closing_pressure_role_error_tests {
+    use super::*;
+
+    #[test]
+    fn four_original_verdict_boxes_preserve_primary_and_each_cleanup_source() {
+        let sources: [std::sync::Arc<()>; 4] = std::array::from_fn(|_| std::sync::Arc::new(()));
+        #[derive(Debug)]
+        struct Actual(std::sync::Arc<()>);
+        impl fmt::Display for Actual {
+            fn fmt(&self, _: &mut fmt::Formatter<'_>) -> fmt::Result {
+                panic!("unknown original source cannot be formatted");
+            }
+        }
+        impl std::error::Error for Actual {}
+        let mut primary = FrontendApplicationError::server("original primary");
+        for source in &sources {
+            primary =
+                primary.with_role_cleanup(FrontendApplicationError::server_pressure_registry(
+                    std::io::Error::other(Actual(source.clone())),
+                ));
+        }
+        assert!(primary.message.starts_with("original primary"));
+        assert_eq!(primary.pressure_failures.iter().flatten().count(), 4);
+        for (slot, expected) in primary.pressure_failures.iter().flatten().zip(&sources) {
+            let actual = slot
+                .original()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<Actual>()
+                .unwrap();
+            assert!(std::sync::Arc::ptr_eq(&actual.0, expected));
+        }
+        let _finite = format!("{primary:?} {primary}");
     }
 }

@@ -16,9 +16,7 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, ListArray};
-use arrow::datatypes::Field;
-use std::sync::Arc;
+use arrow::array::ArrayRef;
 
 pub fn eval_map_entries(
     arena: &ExprArena,
@@ -27,22 +25,5 @@ pub fn eval_map_entries(
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
     let map_arr = arena.eval(args[0], chunk)?;
-    let map = map_arr
-        .as_any()
-        .downcast_ref::<arrow::array::MapArray>()
-        .ok_or_else(|| {
-            format!(
-                "map_entries expects MapArray, got {:?}",
-                map_arr.data_type()
-            )
-        })?;
-    let entries = Arc::new(map.entries().clone()) as ArrayRef;
-    let list = ListArray::new(
-        Arc::new(Field::new("item", map.entries().data_type().clone(), true)),
-        map.offsets().clone(),
-        entries,
-        map.nulls().cloned(),
-    );
-    let out = Arc::new(list) as ArrayRef;
-    super::common::cast_output(out, arena.data_type(expr), "map_entries")
+    novarocks_functions::builtin::map_entries_core::project(&map_arr, arena.data_type(expr))
 }

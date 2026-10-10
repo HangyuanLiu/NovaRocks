@@ -101,3 +101,14 @@ pub(crate) fn test_read_domain(
         .expect("fixture endpoint"),
     ))
 }
+
+/// Internal construction preserves original scope failures without formatting.
+pub(crate) enum ConstructionFailure<E> {
+    Semantic(DeleteSemanticsError),
+    Original(E),
+}
+impl<E> From<DeleteSemanticsError> for ConstructionFailure<E> {
+    fn from(error: DeleteSemanticsError) -> Self {
+        Self::Semantic(error)
+    }
+}

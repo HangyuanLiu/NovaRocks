@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::sync::Arc;
 
 use crate::runtime_filter::RuntimeFilterProducerFailure;
@@ -316,16 +318,16 @@ impl Operator for HashJoinBuildSinkOperator {
         self.profiles = Some(profiles);
     }
 
-    fn bind_runtime_state(&mut self, _state: &RuntimeState) -> Result<(), String> {
-        self.bind_native_runtime_filters()
+    fn bind_runtime_state(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
+        Ok(self.bind_native_runtime_filters()?)
     }
 
     fn cancel(&mut self) {
         let _ = self.fail_native_runtime_filters(RuntimeFilterProducerFailure::Cancelled);
     }
 
-    fn close(&mut self) -> Result<(), String> {
-        self.fail_native_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed)
+    fn close(&mut self) -> ExecutionResult<()> {
+        Ok(self.fail_native_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed)?)
     }
 
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -350,7 +352,7 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         false
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, mut chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, mut chunk: Chunk) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }
@@ -456,14 +458,14 @@ impl ProcessorOperator for HashJoinBuildSinkOperator {
         if result.is_err() {
             let _ = self.fail_native_runtime_filters(RuntimeFilterProducerFailure::ExecutionFailed);
         }
-        result
+        Ok(result?)
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         Ok(None)
     }
 
-    fn set_finishing(&mut self, state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }
@@ -1075,7 +1077,10 @@ mod tests {
         let error = operator
             .push_chunk(&RuntimeState::default(), int32_chunk(vec![1, 2, 3]))
             .expect_err("null-safe key mismatch must fail");
-        assert!(error.contains("null-safe key count mismatch"), "{error}");
+        assert!(
+            error.detail().contains("null-safe key count mismatch"),
+            "{error}"
+        );
         operator.close().expect("duplicate close is idempotent");
 
         assert_eq!(
@@ -1109,7 +1114,10 @@ mod tests {
         let error = operator
             .set_finishing(&RuntimeState::default())
             .expect_err("set_build failure must propagate");
-        assert!(error.contains("injected set_build failure"), "{error}");
+        assert!(
+            error.detail().contains("injected set_build failure"),
+            "{error}"
+        );
 
         assert_eq!(
             producer.events(),
@@ -1192,7 +1200,8 @@ mod tests {
             .expect_err("DOP drift must fail before execution");
 
         assert!(
-            error.contains("DOP drifted") && error.contains("expected=2 actual=3"),
+            error.detail().contains("DOP drifted")
+                && error.detail().contains("expected=2 actual=3"),
             "{error}"
         );
     }

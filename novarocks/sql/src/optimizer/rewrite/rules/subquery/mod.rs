@@ -96,7 +96,7 @@ mod tests {
     use crate::planner::optimizer_bridge::logical::to_optimizer_expr;
     use crate::planner::payload::{PlanLimitNode, PlanValuesNode};
 
-    fn ctx_with_arena() -> RewriteContext {
+    fn ctx_with_arena() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
         ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_query_stats_input(OptimizerStatsInput::from_test_table_statistics(
@@ -131,14 +131,19 @@ mod tests {
                         qualifier: None,
                         column: "sq".to_string(),
                     },
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                 },
                 output_column: OutputColumn {
                     column_id: ColumnId(5),
                     name: "sq".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: ColumnId(5),
@@ -160,14 +165,19 @@ mod tests {
                 kind: ApplyKind::Exists { negated: false },
                 subquery_expr: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
                 output_column: OutputColumn {
                     column_id: ColumnId(6),
                     name: "exists".to_string(),
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: ColumnId(7),
@@ -187,8 +197,8 @@ mod tests {
         OutputColumn {
             column_id: id,
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -200,8 +210,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -216,8 +225,11 @@ mod tests {
                 output_column: OutputColumn {
                     column_id: ColumnId(10),
                     name: "in_result".to_string(),
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
+
                     is_internal: true,
                 },
                 inner_output_column_id: inner_col.column_id,

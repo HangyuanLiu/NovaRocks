@@ -27,6 +27,7 @@ use crate::catalog_application::query_catalog::QueryCatalogService;
 use crate::connector::unified_statistics::UnifiedStatisticsResolver;
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::query_execution::maintenance::TableMaintenanceService;
+use crate::query_execution::package_freeze::StaticPlanCarrier;
 use crate::query_execution::service::QueryExecutionService;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use novarocks_catalog_application::CatalogApplicationPort;
@@ -47,6 +48,8 @@ use novarocks_spi::connector::MvStorageObservationPort;
 #[derive(Clone)]
 pub struct QueryPreparationKernel {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    static_plan_carrier: StaticPlanCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -109,9 +112,13 @@ impl QueryPreparationKernel {
         query_execution: QueryExecutionService,
         backend_topology: BackendTopologyService,
         exchange_port: u16,
+        constant_policy: novarocks_functions::ConstantPolicy,
+        static_plan_carrier: StaticPlanCarrier,
     ) -> Self {
         Self {
             functions,
+            constant_policy,
+            static_plan_carrier,
             catalog_service,
             catalog_application,
             connector_control,
@@ -123,8 +130,17 @@ impl QueryPreparationKernel {
         }
     }
 
+    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
+    }
+
     pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
         &self.functions
+    }
+
+    /// The static carrier this kernel freezes completed plans into.
+    pub(crate) const fn static_plan_carrier(&self) -> &StaticPlanCarrier {
+        &self.static_plan_carrier
     }
 
     /// The typed connector controls this statement may resolve, frozen with
@@ -173,6 +189,8 @@ impl QueryPreparationKernel {
 #[derive(Clone)]
 pub struct DmlExecutionKernel {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    static_plan_carrier: StaticPlanCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -189,6 +207,8 @@ pub struct DmlExecutionKernel {
 #[derive(Clone)]
 pub struct DmlPlanningServices {
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    static_plan_carrier: StaticPlanCarrier,
     catalog_service: Arc<QueryCatalogService>,
 }
 
@@ -196,11 +216,19 @@ impl DmlPlanningServices {
     pub fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         catalog_service: Arc<QueryCatalogService>,
+        constant_policy: novarocks_functions::ConstantPolicy,
+        static_plan_carrier: StaticPlanCarrier,
     ) -> Self {
         Self {
             functions,
+            constant_policy,
+            static_plan_carrier,
             catalog_service,
         }
+    }
+
+    pub const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
     }
 }
 
@@ -216,10 +244,14 @@ impl DmlExecutionKernel {
     ) -> Self {
         let DmlPlanningServices {
             functions,
+            constant_policy,
+            static_plan_carrier,
             catalog_service,
         } = planning;
         Self {
             functions,
+            constant_policy,
+            static_plan_carrier,
             catalog_service,
             catalog_application,
             connector_control,
@@ -254,8 +286,17 @@ impl DmlExecutionKernel {
         }
     }
 
+    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
+    }
+
     pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
         &self.functions
+    }
+
+    /// The static carrier this kernel freezes completed plans into.
+    pub(crate) const fn static_plan_carrier(&self) -> &StaticPlanCarrier {
+        &self.static_plan_carrier
     }
 
     /// The typed connector controls this statement may resolve.
@@ -365,6 +406,7 @@ impl CatalogCommandKernel {
 /// View command dependencies.
 #[derive(Clone)]
 pub struct ViewExecutionKernel {
+    constant_policy: novarocks_functions::ConstantPolicy,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
@@ -379,8 +421,10 @@ impl ViewExecutionKernel {
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
         view_service: Arc<dyn ViewService>,
+        constant_policy: novarocks_functions::ConstantPolicy,
     ) -> Self {
         Self {
+            constant_policy,
             functions,
             catalog_service,
             catalog_application,
@@ -408,12 +452,17 @@ impl ViewExecutionKernel {
     pub fn view_service(&self) -> &Arc<dyn ViewService> {
         &self.view_service
     }
+    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
+    }
 }
 
 /// Table-maintenance command dependencies.
 #[derive(Clone)]
 pub struct MaintenanceExecutionKernel {
+    constant_policy: novarocks_functions::ConstantPolicy,
     functions: Arc<novarocks_functions::EngineFunctionCatalog>,
+    static_plan_carrier: StaticPlanCarrier,
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
@@ -434,9 +483,13 @@ impl MaintenanceExecutionKernel {
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
         service: Arc<dyn TableMaintenanceService>,
+        constant_policy: novarocks_functions::ConstantPolicy,
+        static_plan_carrier: StaticPlanCarrier,
     ) -> Self {
         Self {
+            constant_policy,
             functions,
+            static_plan_carrier,
             catalog_service,
             catalog_application,
             connector_control,
@@ -449,6 +502,11 @@ impl MaintenanceExecutionKernel {
 
     pub(crate) fn function_catalog(&self) -> &Arc<novarocks_functions::EngineFunctionCatalog> {
         &self.functions
+    }
+
+    /// The static carrier this kernel freezes completed plans into.
+    pub(crate) const fn static_plan_carrier(&self) -> &StaticPlanCarrier {
+        &self.static_plan_carrier
     }
 
     /// The typed connector controls a maintenance-owned read may resolve.
@@ -478,6 +536,9 @@ impl MaintenanceExecutionKernel {
 
     pub(crate) fn service(&self) -> &Arc<dyn TableMaintenanceService> {
         &self.service
+    }
+    pub(crate) const fn constant_policy(&self) -> novarocks_functions::ConstantPolicy {
+        self.constant_policy
     }
 }
 
@@ -576,6 +637,7 @@ impl SessionCatalogPort for SessionCatalogResolver {
     async fn external_namespace_exists(
         &self,
         request: novarocks_spi::connector::ConnectorRequestContext,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
         catalog_name: &str,
         namespace_name: &str,
     ) -> Result<bool, QueryServiceError> {
@@ -583,7 +645,7 @@ impl SessionCatalogPort for SessionCatalogResolver {
         let catalog_name = catalog_name.to_owned();
         let namespace_name = namespace_name.to_owned();
         self.connector_blocking_io
-            .spawn_ordinary(move || {
+            .spawn_admitted(capacity.scope(), &capacity.window_alias(), move || {
                 crate::connector::validate_request_context(&request)?;
                 crate::connector::metadata_namespace_exists(
                     connector_control.as_ref(),
@@ -592,10 +654,16 @@ impl SessionCatalogPort for SessionCatalogResolver {
                     &namespace_name,
                 )
             })
+            .map_err(|error| {
+                QueryServiceError::new(QueryServiceErrorKind::Unavailable, error.to_string())
+            })?
             .finish()
             .await
             .map_err(|error| {
-                QueryServiceError::new(QueryServiceErrorKind::Internal, error.to_string())
+                QueryServiceError::new(
+                    QueryServiceErrorKind::Internal,
+                    self.connector_blocking_io.present_and_retire_failure(error),
+                )
             })?
             .map_err(|error| QueryServiceError::new(QueryServiceErrorKind::Internal, error))
     }
@@ -663,12 +731,25 @@ mod session_catalog_tests {
         let request = crate::connector::connector_request_context(None, cancellation.view())
             .expect("connector request context");
         cancellation.request_stop();
+        let (control, root, window) = crate::task_execution::blocking_io::tests::admitted_class(
+            novarocks_workload_control::ResultWindowClass::Local,
+        );
+        let capacity = novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(
+            &root.owner.scope(), window.retain_alias(),
+        ).unwrap();
         let error = resolver
-            .external_namespace_exists(request, "warehouse", "analytics")
+            .external_namespace_exists(request, &capacity, "warehouse", "analytics")
             .await
             .expect_err("cancelled request must not reach the provider");
         release.send(()).expect("release held call");
         held.finish().await.expect("held call completes");
+        drop(capacity);
+        root.owner.complete();
+        root.business.release();
+        drop(window);
+        crate::task_execution::blocking_io::tests::until(|| control.snapshot().scopes.is_empty());
+        control.close_admission();
+        assert!(control.shutdown().is_ok());
         assert_eq!(error.kind(), QueryServiceErrorKind::Internal);
         assert!(error.message().contains("connector request was cancelled"));
     }

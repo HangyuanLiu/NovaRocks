@@ -28,7 +28,7 @@ use crate::query_execution::dml::delete::{
 use crate::query_execution::kernels::DmlExecutionKernel;
 use crate::query_execution::outcome::QueryExecutionResult;
 use crate::query_execution::planning::write_sink::{
-    admit_prepared_frozen_connector_write_target, dml_write_plan_input_for_admitted_target,
+    admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
 use novarocks_parser::ast::{AddEqualityDelete, LiteralKind, ObjectName, Query, Statement};
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
@@ -264,15 +264,6 @@ fn prepare_equality_delete_distributed_write(
             .map(|column| ConnectorWriteFieldRequest::new(column.clone()))
             .collect(),
     };
-    let preparation = crate::query_execution::dml::iceberg_writer::prepare_iceberg_connector_write(
-        &write_lease,
-        target,
-        "main",
-        ConnectorWriteIntent::RowDelta,
-        input.clone(),
-        ConnectorWriteAdmissionPurpose::OrdinaryDml,
-        connector_context.clone(),
-    )?;
     // One logical equality-delete branch on the generation that resolved the
     // target. ADD EQUALITY DELETE appends delete files rather than mutating
     // rows in place, so it is an ordinary write, not a row mutation.
@@ -292,14 +283,16 @@ fn prepare_equality_delete_distributed_write(
             connector_context.clone(),
         )?,
     )?;
-    let target_binding = admit_prepared_frozen_connector_write_target(
+    // The plan's target is the one the session sealed, so the plan and the
+    // writer's recipe carry the same signed input.
+    let target_binding = admit_session_connector_write_target(
         table_bindings.as_ref(),
         FrozenConnectorScanIdentity::new(
             target.catalog.clone(),
             target.namespace.clone(),
             target.table.clone(),
         ),
-        preparation,
+        crate::query_execution::dml::iceberg_writer::sole_session_write_target(&write_session)?,
         planning_lease.clone(),
     )?;
     let sql_write_input = dml_write_plan_input_for_admitted_target(

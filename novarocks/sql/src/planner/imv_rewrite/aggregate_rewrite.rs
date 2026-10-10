@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compiler::SqlCompileError;
 use arrow::datatypes::DataType;
 use std::collections::HashSet;
 
-use crate::analysis::expr_display::typed_expr_display_name;
 use crate::analysis::{
     BinOp, ExprKind, JoinKind, LiteralValue, OutputColumn, ProjectItem, TypedExpr, UnOp,
 };
@@ -32,10 +32,12 @@ use crate::optimizer::rewrite::result::RewriteResult;
 use crate::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::planner::imv_rewrite::action_column::ImvActionColumn;
 use crate::planner::imv_rewrite::annotation::ImvExtension;
-use crate::planner::imv_rewrite::column_alloc::{allocate_imv_column, allocate_imv_output_column};
+use crate::planner::imv_rewrite::column_alloc::{
+    allocate_imv_column, allocate_imv_output_column, declared_imv_column_value_type,
+};
 use crate::planner::imv_rewrite::marker::plan_contains_imv_marker;
 use crate::planner::imv_rewrite::target_state::build_target_state_scan_source;
-use crate::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
+use crate::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result_typed, opt_expr_to_plan};
 use crate::planner::logical::{
     LogicalAggregateNode, LogicalImvDeltaNode, LogicalJoinNode, LogicalPlanKind, LogicalPlanNode,
 };
@@ -88,8 +90,12 @@ impl LogicalRewriteRule for RewriteAggregateStateRule {
         )
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
-        bridge_apply_result(expr, ctx, |plan, ctx| {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
+        bridge_apply_result_typed(expr, ctx, |plan, ctx| {
             let LogicalPlanNode {
                 kind, mut children, ..
             } = plan;
@@ -114,7 +120,9 @@ impl LogicalRewriteRule for RewriteAggregateStateRule {
             let ext = ctx
                 .extension::<ImvExtension>()
                 .ok_or_else(|| {
-                    "RewriteAggregateState requires ImvExtension in RewriteContext".to_string()
+                    SqlCompileError::Compilation(
+                        "RewriteAggregateState requires ImvExtension in RewriteContext".to_string(),
+                    )
                 })?
                 .clone();
             let merge = build_aggregate_state_merge(
@@ -139,20 +147,27 @@ pub(crate) fn build_aggregate_state_merge(
     branch_scope: Option<crate::planner::table::BranchScope>,
     ctx: &RewriteContext,
     ext: &ImvExtension,
-) -> Result<LogicalPlanNode, String> {
+) -> Result<LogicalPlanNode, SqlCompileError> {
     if aggregate.group_by.is_empty() {
-        return Err("Iceberg IMV aggregate rewrite requires at least one GROUP BY key".to_string());
+        return Err(SqlCompileError::Compilation(
+            "Iceberg IMV aggregate rewrite requires at least one GROUP BY key".to_string(),
+        ));
     }
     if aggregate.aggregates.iter().any(|call| call.distinct) {
-        return Err("Iceberg IMV aggregate rewrite does not support SELECT DISTINCT".to_string());
+        return Err(SqlCompileError::Compilation(
+            "Iceberg IMV aggregate rewrite does not support SELECT DISTINCT".to_string(),
+        ));
     }
 
-    let (aggregate_calls, aggregate_layout) =
-        ext.snapshot.aggregate_shape_and_layout_for_execution()?;
-    let group_key_names = group_key_names(&aggregate)?;
-    let aggregate_state_names = aggregate_state_names(ext, &aggregate, &aggregate_layout)?;
-    let row_id_column_name = aggregate_row_id_column_name(ext)?;
-    let target_columns = target_columns(ext)?;
+    let (aggregate_calls, aggregate_layout) = ext
+        .snapshot
+        .aggregate_shape_and_layout_for_execution()
+        .map_err(SqlCompileError::from)?;
+    let group_key_names = group_key_names(&aggregate, &ctx.control_view())?;
+    let aggregate_state_names =
+        aggregate_state_names(ext, &aggregate, &aggregate_layout).map_err(SqlCompileError::from)?;
+    let row_id_column_name = aggregate_row_id_column_name(ext).map_err(SqlCompileError::from)?;
+    let target_columns = target_columns(ext).map_err(SqlCompileError::from)?;
     let target = &ext.snapshot.target;
     let aggregate_contract = ext
         .snapshot
@@ -161,7 +176,8 @@ pub(crate) fn build_aggregate_state_merge(
         .as_ref()
         .ok_or_else(|| {
             "Iceberg IMV aggregate rewrite requires aggregate state contract".to_string()
-        })?;
+        })
+        .map_err(SqlCompileError::from)?;
     let physical_column_names = aggregate_layout.physical_column_names.clone();
     let partition_constraint = if is_unpartitioned_target_contract(&ext.snapshot.schema_contract) {
         SqlMvTargetStatePartitionConstraint::Unpartitioned
@@ -200,14 +216,22 @@ pub(crate) fn build_aggregate_state_merge(
         old_source,
         ctx,
     )?;
-    let old_input = branch_scoped_old_input(old_scan, branch_scope.clone(), &aggregate_layout)?;
+    let old_input = branch_scoped_old_input(old_scan, branch_scope.clone(), &aggregate_layout)
+        .map_err(SqlCompileError::from)?;
 
     let action_column = match action_column {
         Some(action_column) => action_column,
-        None => match existing_delta_action_column(&aggregate_input)? {
-            Some(action_column) => action_column,
-            None => allocate_imv_column(ctx, ImvActionColumn::NAME, DataType::Int8, false)?,
-        },
+        None => {
+            match existing_delta_action_column(&aggregate_input).map_err(SqlCompileError::from)? {
+                Some(action_column) => action_column,
+                None => allocate_imv_column(
+                    ctx,
+                    ImvActionColumn::NAME,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+                )
+                .map_err(SqlCompileError::from)?,
+            }
+        }
     };
     let signed_aggregate = signed_aggregate(
         aggregate,
@@ -217,7 +241,8 @@ pub(crate) fn build_aggregate_state_merge(
         ctx,
         &aggregate_calls,
         &aggregate_layout,
-    )?;
+    )
+    .map_err(SqlCompileError::from)?;
 
     build_relational_aggregate_change_stream(
         old_input,
@@ -226,6 +251,7 @@ pub(crate) fn build_aggregate_state_merge(
         ctx,
         &aggregate_layout,
     )
+    .map_err(SqlCompileError::from)
 }
 
 #[expect(
@@ -241,7 +267,7 @@ fn target_state_old_scan(
     branch_scope: Option<&crate::planner::table::BranchScope>,
     old_source: crate::planner::table::ScanSource,
     ctx: &RewriteContext,
-) -> Result<LogicalPlanNode, String> {
+) -> Result<LogicalPlanNode, SqlCompileError> {
     let locator_metadata_columns = target_state_locator_metadata_columns();
     let old_columns = if branch_scope.is_some() {
         target_state_branch_scoped_old_scan_columns(
@@ -292,19 +318,21 @@ fn target_state_branch_scoped_old_scan_columns(
     locator_metadata_columns: &[ColumnDef],
     aggregate_state_names: &[String],
     row_id_column_name: &str,
-) -> Result<Vec<OutputColumn>, String> {
+) -> Result<Vec<OutputColumn>, SqlCompileError> {
     let mut old_columns = Vec::with_capacity(target_columns.len() + locator_metadata_columns.len());
     for column in target_columns {
-        old_columns.push(allocate_imv_output_column(
-            ctx,
-            &column.name,
-            column.data_type.clone(),
-            column.nullable,
-            aggregate_state_names
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(&column.name))
-                || column.name.eq_ignore_ascii_case(row_id_column_name),
-        )?);
+        old_columns.push(
+            allocate_imv_output_column(
+                ctx,
+                &column.name,
+                declared_imv_column_value_type(column, ctx)?,
+                aggregate_state_names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&column.name))
+                    || column.name.eq_ignore_ascii_case(row_id_column_name),
+            )
+            .map_err(SqlCompileError::from)?,
+        );
     }
     for column in locator_metadata_columns {
         if old_columns
@@ -313,13 +341,15 @@ fn target_state_branch_scoped_old_scan_columns(
         {
             continue;
         }
-        old_columns.push(allocate_imv_output_column(
-            ctx,
-            &column.name,
-            column.data_type.clone(),
-            column.nullable,
-            true,
-        )?);
+        old_columns.push(
+            allocate_imv_output_column(
+                ctx,
+                &column.name,
+                declared_imv_column_value_type(column, ctx)?,
+                true,
+            )
+            .map_err(SqlCompileError::from)?,
+        );
     }
     Ok(old_columns)
 }
@@ -331,7 +361,7 @@ fn target_state_compact_old_scan_columns(
     group_key_names: &[String],
     aggregate_state_names: &[String],
     row_id_column_name: &str,
-) -> Result<Vec<OutputColumn>, String> {
+) -> Result<Vec<OutputColumn>, SqlCompileError> {
     let mut names = Vec::with_capacity(
         1 + group_key_names.len() + aggregate_state_names.len() + locator_metadata_columns.len(),
     );
@@ -363,18 +393,12 @@ fn target_state_compact_old_scan_columns(
                     format!(
                         "Iceberg IMV aggregate rewrite target-state old input cannot resolve public column {name}"
                     )
-                })?;
-            allocate_imv_output_column(
-                ctx,
-                &column.0.name,
-                column.0.data_type.clone(),
-                column.0.nullable,
-                column.1
+                }).map_err(SqlCompileError::from)?;
+            allocate_imv_output_column(ctx, &column.0.name, declared_imv_column_value_type(column.0, ctx)?, column.1
                     || aggregate_state_names
                         .iter()
                         .any(|state| state.eq_ignore_ascii_case(&column.0.name))
-                    || column.0.name.eq_ignore_ascii_case(row_id_column_name),
-            )
+                    || column.0.name.eq_ignore_ascii_case(row_id_column_name)).map_err(SqlCompileError::from)
         })
         .collect()
 }
@@ -453,7 +477,7 @@ fn build_relational_aggregate_change_stream(
     branch_scope: Option<crate::planner::table::BranchScope>,
     ctx: &RewriteContext,
     layout: &crate::compiler::mv_rewrite::SqlImvAggregateLayout,
-) -> Result<LogicalPlanNode, String> {
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let old_outputs = plan_output_columns(&old_input)?;
     let delta_with_row_id = delta_state_with_row_id(signed_delta, layout, ctx)?;
     let delta_outputs = plan_output_columns(&delta_with_row_id)?;
@@ -472,8 +496,10 @@ fn build_relational_aggregate_change_stream(
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
-                data_type: DataType::Boolean,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Boolean,
+                    false,
+                ),
             }),
         }),
         vec![delta_with_row_id, old_input],
@@ -509,8 +535,7 @@ fn build_relational_aggregate_change_stream(
                 expr: Box::new(column_ref(old_row_id_join)),
                 negated: true,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         },
     );
     let state_all_zero_args = vec![merged_count];
@@ -518,6 +543,9 @@ fn build_relational_aggregate_change_stream(
         ctx.function_catalog(),
         "state_all_zero",
         &state_all_zero_args,
+        ctx.decimal_overflow_policy(),
+        ctx.scalar_arena().borrow().constant_policy(),
+        &ctx.control_view(),
     )?;
     let insert_predicate = bool_and(
         branch_marker_eq(branch_marker, CHANGE_BRANCH_INSERT),
@@ -532,12 +560,13 @@ fn build_relational_aggregate_change_stream(
                         distinct: false,
                         binding: state_all_zero_binding,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 }),
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         },
     );
     let filtered = LogicalPlanNode::new(
@@ -566,7 +595,12 @@ const CHANGE_BRANCH_DELETE: i8 = 0;
 const CHANGE_BRANCH_INSERT: i8 = 1;
 
 fn change_branch_column(ctx: &RewriteContext) -> Result<OutputColumn, String> {
-    allocate_imv_output_column(ctx, "__imv_change_branch", DataType::Int8, false, true)
+    allocate_imv_output_column(
+        ctx,
+        "__imv_change_branch",
+        novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+        true,
+    )
 }
 
 fn change_branch_values(column: OutputColumn) -> LogicalPlanNode {
@@ -591,8 +625,7 @@ fn branch_marker_eq(branch_marker: &OutputColumn, branch: i8) -> TypedExpr {
             right: Box::new(tinyint_literal(branch)),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        data_type: DataType::Boolean,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     }
 }
 
@@ -601,14 +634,12 @@ fn tinyint_literal(value: i8) -> TypedExpr {
         kind: ExprKind::Cast {
             expr: Box::new(TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::Int(value as i64)),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             }),
             target: DataType::Int8,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        data_type: DataType::Int8,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
     }
 }
 
@@ -620,8 +651,7 @@ fn bool_and(left: TypedExpr, right: TypedExpr) -> TypedExpr {
             right: Box::new(right),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        data_type: DataType::Boolean,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     }
 }
 
@@ -633,8 +663,7 @@ fn bool_or(left: TypedExpr, right: TypedExpr) -> TypedExpr {
             right: Box::new(right),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        data_type: DataType::Boolean,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     }
 }
 
@@ -642,7 +671,7 @@ fn delta_state_with_row_id(
     signed_delta: LogicalPlanNode,
     layout: &crate::compiler::mv_rewrite::SqlImvAggregateLayout,
     ctx: &RewriteContext,
-) -> Result<LogicalPlanNode, String> {
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let delta_outputs = plan_output_columns(&signed_delta)?;
     let mut row_id_args = Vec::with_capacity(layout.group_key_source_indexes.len());
     for &visible_source_index in &layout.group_key_source_indexes {
@@ -658,12 +687,19 @@ fn delta_state_with_row_id(
     }
 
     let row_id_name = layout.row_id_column_name.clone();
-    let row_id_column_id = allocate_imv_column(ctx, &row_id_name, DataType::Utf8, false)?;
+    let row_id_column_id = allocate_imv_column(
+        ctx,
+        &row_id_name,
+        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+    )?;
     let mut items = Vec::with_capacity(delta_outputs.len() + 1);
     let row_id_binding = crate::analysis::resolve_function_binding(
         ctx.function_catalog(),
         "mv_group_row_id",
         &row_id_args,
+        ctx.decimal_overflow_policy(),
+        ctx.scalar_arena().borrow().constant_policy(),
+        &ctx.control_view(),
     )?;
     items.push(ProjectItem {
         expr: TypedExpr {
@@ -674,8 +710,7 @@ fn delta_state_with_row_id(
                 args: row_id_args,
                 distinct: false,
             },
-            data_type: DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         },
         output_name: row_id_name,
         output_column_id: row_id_column_id,
@@ -704,7 +739,7 @@ fn merged_state_expr(
     join_outputs: &[OutputColumn],
     delta_outputs: &[OutputColumn],
     old_outputs: &[OutputColumn],
-) -> Result<TypedExpr, String> {
+) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let delta = find_output_column_by_name(delta_outputs, &state_column.name)?;
     let delta = find_output_column_by_id(join_outputs, delta.column_id)?;
     let old = find_output_column_by_name(old_outputs, &state_column.name)?;
@@ -715,8 +750,14 @@ fn merged_state_expr(
         | SqlImvAggregateStateRole::AvgCount => {
             let name = state_union_function(state_column)?;
             let args = vec![column_ref(old), column_ref(delta)];
-            let binding =
-                crate::analysis::resolve_function_binding(ctx.function_catalog(), name, &args)?;
+            let binding = crate::analysis::resolve_function_binding(
+                ctx.function_catalog(),
+                name,
+                &args,
+                ctx.decimal_overflow_policy(),
+                ctx.scalar_arena().borrow().constant_policy(),
+                &ctx.control_view(),
+            )?;
             Ok(TypedExpr {
                 kind: ExprKind::FunctionCall {
                     volatility: crate::functions::builtin_function_volatility(name),
@@ -725,9 +766,11 @@ fn merged_state_expr(
                     distinct: false,
                     binding,
                 },
-                data_type: DataType::Binary,
-                nullable: state_column.state_role == SqlImvAggregateStateRole::Single
-                    && state_column.nullable,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Binary,
+                    state_column.state_role == SqlImvAggregateStateRole::Single
+                        && state_column.value_type.nullable,
+                ),
             })
         }
         SqlImvAggregateStateRole::RetractionCount => Ok(TypedExpr {
@@ -739,8 +782,10 @@ fn merged_state_expr(
                             expr: Box::new(column_ref(old)),
                             negated: false,
                         },
-                        data_type: DataType::Boolean,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Boolean,
+                            false,
+                        ),
                     },
                     column_ref(delta),
                 )],
@@ -752,12 +797,16 @@ fn merged_state_expr(
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: state_column.data_type.clone(),
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType {
+                        nullable: false,
+                        ..state_column.value_type.clone()
+                    },
                 })),
             },
-            data_type: state_column.data_type.clone(),
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType {
+                nullable: false,
+                ..state_column.value_type.clone()
+            },
         }),
     }
 }
@@ -775,7 +824,7 @@ fn aggregate_change_stream_project(
     ctx: &RewriteContext,
     input: LogicalPlanNode,
     projection: AggregateChangeStreamProjection<'_>,
-) -> Result<LogicalPlanNode, String> {
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let AggregateChangeStreamProjection {
         input_outputs,
         delta_outputs,
@@ -793,8 +842,7 @@ fn aggregate_change_stream_project(
                     branch_marker,
                     tinyint_literal(ImvActionColumn::DELETE_VALUE),
                     tinyint_literal(ImvActionColumn::INSERT_VALUE),
-                    DataType::Int8,
-                    false,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
                 ),
                 output_name: output.name.clone(),
                 output_column_id: output.column_id,
@@ -809,8 +857,10 @@ fn aggregate_change_stream_project(
             items.push(ProjectItem {
                 expr: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(scope.branch_id as i64)),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
                 },
                 output_name: output.name.clone(),
                 output_column_id: output.column_id,
@@ -833,8 +883,7 @@ fn aggregate_change_stream_project(
                 branch_marker,
                 delete_expr,
                 insert_expr,
-                output.data_type.clone(),
-                output.nullable,
+                output.value_type.clone(),
             ),
             output_name: output.name.clone(),
             output_column_id: output.column_id,
@@ -869,7 +918,7 @@ fn aggregate_delete_expr_for_output(
         if layout.group_key_source_indexes.contains(&visible_index) {
             return source_expr_by_name(input_outputs, old_outputs, &visible.name);
         }
-        return Ok(typed_null(output.data_type.clone()));
+        return Ok(typed_null(output.value_type.clone()));
     }
 
     for state_column in &layout.state_columns {
@@ -895,10 +944,11 @@ fn aggregate_insert_expr_for_output(
     old_outputs: &[OutputColumn],
     output: &OutputColumn,
     layout: &crate::compiler::mv_rewrite::SqlImvAggregateLayout,
-) -> Result<TypedExpr, String> {
+) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let row_id_name = &layout.row_id_column_name;
     if output.name.eq_ignore_ascii_case(row_id_name) {
-        return source_expr_by_name(input_outputs, delta_outputs, row_id_name);
+        return source_expr_by_name(input_outputs, delta_outputs, row_id_name)
+            .map_err(SqlCompileError::from);
     }
 
     for (visible_index, visible) in layout.visible_columns.iter().enumerate() {
@@ -906,7 +956,8 @@ fn aggregate_insert_expr_for_output(
             continue;
         }
         if layout.group_key_source_indexes.contains(&visible_index) {
-            return source_expr_by_name(input_outputs, delta_outputs, &visible.name);
+            return source_expr_by_name(input_outputs, delta_outputs, &visible.name)
+                .map_err(SqlCompileError::from);
         }
         let state_column = single_state_column_for_visible(layout, visible_index)?;
         let args = if state_column.function == AggregateFunctionKind::Avg {
@@ -929,11 +980,34 @@ fn aggregate_insert_expr_for_output(
         } else {
             let merged_state =
                 merged_state_expr(ctx, state_column, input_outputs, delta_outputs, old_outputs)?;
-            visible_state_args(state_column, merged_state, &visible.data_type)?
+            visible_state_args(state_column, merged_state, &visible.value_type)?
         };
         let name = visible_state_function(state_column.function)?;
-        let binding =
-            crate::analysis::resolve_function_binding(ctx.function_catalog(), name, &args)?;
+        let binding = crate::analysis::resolve_function_binding(
+            ctx.function_catalog(),
+            name,
+            &args,
+            ctx.decimal_overflow_policy(),
+            ctx.scalar_arena().borrow().constant_policy(),
+            &ctx.control_view(),
+        )?;
+        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+        else {
+            return Err(format!("Iceberg IMV {name} must return a scalar value").into());
+        };
+        if result.logical_type != visible.value_type.logical_type
+            || !novarocks_type_contract::arrow_data_types_exact(
+                &result.data_type,
+                &visible.value_type.data_type,
+            )
+            || (result.nullable && !visible.value_type.nullable)
+        {
+            return Err(format!(
+                "Iceberg IMV {name} result domain {result:?} does not match admitted visible column {} domain {:?}",
+                visible.name, visible.value_type
+            ).into());
+        }
+        let value_type = result.clone();
         return Ok(TypedExpr {
             kind: ExprKind::FunctionCall {
                 volatility: crate::functions::builtin_function_volatility(name),
@@ -942,8 +1016,7 @@ fn aggregate_insert_expr_for_output(
                 distinct: false,
                 binding,
             },
-            data_type: visible.data_type.clone(),
-            nullable: visible.nullable,
+            value_type,
         });
     }
 
@@ -958,24 +1031,26 @@ fn aggregate_insert_expr_for_output(
         .name
         .eq_ignore_ascii_case(crate::common::ICEBERG_ROW_ID_COL)
     {
-        return source_expr_by_name(input_outputs, old_outputs, &output.name);
+        return source_expr_by_name(input_outputs, old_outputs, &output.name)
+            .map_err(SqlCompileError::from);
     }
 
     if is_locator_metadata_column(&output.name) {
-        return Ok(typed_null(output.data_type.clone()));
+        return Ok(typed_null(output.value_type.clone()));
     }
 
     Err(format!(
         "Iceberg IMV aggregate rewrite cannot project change-stream output column {}",
         output.name
-    ))
+    )
+    .into())
 }
 
-fn typed_null(data_type: DataType) -> TypedExpr {
+fn typed_null(mut value_type: novarocks_type_contract::FunctionValueType) -> TypedExpr {
+    value_type.nullable = true;
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Null),
-        data_type,
-        nullable: true,
+        value_type,
     }
 }
 
@@ -993,11 +1068,10 @@ fn branch_case_expr(
     branch_marker: &OutputColumn,
     delete_expr: TypedExpr,
     insert_expr: TypedExpr,
-    data_type: DataType,
-    nullable: bool,
+    value_type: novarocks_type_contract::FunctionValueType,
 ) -> TypedExpr {
-    let delete_expr = branch_case_arm_expr(delete_expr, &data_type);
-    let insert_expr = branch_case_arm_expr(insert_expr, &data_type);
+    let delete_expr = branch_case_arm_expr(delete_expr, &value_type);
+    let insert_expr = branch_case_arm_expr(insert_expr, &value_type);
     TypedExpr {
         kind: ExprKind::Case {
             operand: None,
@@ -1007,24 +1081,34 @@ fn branch_case_expr(
             )],
             else_expr: Some(Box::new(insert_expr)),
         },
-        data_type,
-        nullable,
+        value_type,
     }
 }
 
-fn branch_case_arm_expr(expr: TypedExpr, target: &DataType) -> TypedExpr {
-    if !branch_case_requires_runtime_cast(target) && expr.data_type == *target {
+fn branch_case_arm_expr(
+    expr: TypedExpr,
+    target: &novarocks_type_contract::FunctionValueType,
+) -> TypedExpr {
+    if !branch_case_requires_runtime_cast(&target.data_type)
+        && expr.value_type.logical_type == target.logical_type
+        && novarocks_type_contract::arrow_data_types_exact(
+            &expr.value_type.data_type,
+            &target.data_type,
+        )
+    {
         return expr;
     }
-    let nullable = expr.nullable;
+    let nullable = expr.value_type.nullable;
     TypedExpr {
         kind: ExprKind::Cast {
             expr: Box::new(expr),
-            target: target.clone(),
+            target: target.data_type.clone(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        data_type: target.clone(),
-        nullable,
+        value_type: novarocks_type_contract::FunctionValueType {
+            nullable,
+            ..target.clone()
+        },
     }
 }
 
@@ -1047,16 +1131,14 @@ fn aggregate_change_stream_output_columns(
     columns.push(allocate_imv_output_column(
         ctx,
         &layout.row_id_column_name,
-        DataType::Utf8,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
         true,
     )?);
     for column in &layout.visible_columns {
         columns.push(allocate_imv_output_column(
             ctx,
             &column.name,
-            column.data_type.clone(),
-            column.nullable,
+            column.value_type.clone(),
             false,
         )?);
     }
@@ -1064,8 +1146,7 @@ fn aggregate_change_stream_output_columns(
         columns.push(allocate_imv_output_column(
             ctx,
             &column.name,
-            state_shaped_state_data_type(column),
-            column.nullable,
+            state_shaped_state_value_type(column),
             true,
         )?);
     }
@@ -1073,8 +1154,7 @@ fn aggregate_change_stream_output_columns(
         columns.push(allocate_imv_output_column(
             ctx,
             &scope.branch_id_column_name,
-            DataType::Int32,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
             true,
         )?);
     }
@@ -1087,36 +1167,31 @@ fn aggregate_change_stream_output_columns(
     columns.push(allocate_imv_output_column(
         ctx,
         crate::common::ICEBERG_ROW_ID_COL,
-        DataType::Int64,
-        true,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         true,
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
         crate::common::ICEBERG_LAST_UPDATED_SEQ_COL,
-        DataType::Int64,
-        true,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         true,
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
         crate::common::ICEBERG_FILE_PATH_COL,
-        DataType::Utf8,
-        true,
+        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
         true,
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
         crate::common::ICEBERG_ROW_POS_COL,
-        DataType::Int64,
-        true,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         true,
     )?);
     columns.push(allocate_imv_output_column(
         ctx,
         ImvActionColumn::NAME,
-        DataType::Int8,
-        false,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
         true,
     )?);
     Ok(columns)
@@ -1140,8 +1215,7 @@ fn column_ref(column: &OutputColumn) -> TypedExpr {
             qualifier: None,
             column: column.name.clone(),
         },
-        data_type: column.data_type.clone(),
-        nullable: column.nullable,
+        value_type: column.value_type.clone(),
     }
 }
 
@@ -1278,7 +1352,7 @@ fn visible_state_function(
 fn visible_state_args(
     state_column: &crate::compiler::mv_rewrite::SqlImvAggregateStateColumn,
     merged_state: TypedExpr,
-    visible_type: &DataType,
+    visible_type: &novarocks_type_contract::FunctionValueType,
 ) -> Result<Vec<TypedExpr>, String> {
     use crate::mv_refresh::AggregateFunctionKind;
 
@@ -1290,8 +1364,10 @@ fn visible_state_args(
             merged_state,
             TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::Null),
-                data_type: visible_type.clone(),
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType {
+                    nullable: true,
+                    ..visible_type.clone()
+                },
             },
         ]);
     }
@@ -1319,7 +1395,7 @@ fn visible_avg_state_args(
                 state_column.visible_source_index
             )
         })?;
-    if !matches!(visible.data_type, DataType::Decimal128(_, _)) {
+    if !matches!(visible.value_type.data_type, DataType::Decimal128(_, _)) {
         return Ok(vec![sum_state, count_state]);
     }
     let Some(DataType::Decimal128(_, input_scale)) = layout
@@ -1338,8 +1414,10 @@ fn visible_avg_state_args(
         int64_literal(i64::from(*input_scale)),
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Null),
-            data_type: visible.data_type.clone(),
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType {
+                nullable: true,
+                ..visible.value_type.clone()
+            },
         },
     ])
 }
@@ -1347,8 +1425,7 @@ fn visible_avg_state_args(
 fn int64_literal(value: i64) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Int(value)),
-        data_type: DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
     }
 }
 
@@ -1365,19 +1442,19 @@ fn branch_scope_predicate(
                     qualifier: None,
                     column: branch_column.name.clone(),
                 },
-                data_type: branch_column.data_type.clone(),
-                nullable: branch_column.nullable,
+                value_type: branch_column.value_type.clone(),
             }),
             op: BinOp::Eq,
             right: Box::new(TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::Int(scope.branch_id as i64)),
-                data_type: branch_column.data_type.clone(),
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType {
+                    nullable: false,
+                    ..branch_column.value_type.clone()
+                },
             }),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        data_type: DataType::Boolean,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     })
 }
 
@@ -1444,48 +1521,98 @@ fn is_unpartitioned_target_contract(
         .is_none_or(|partition| partition.fields.is_empty())
 }
 
-fn group_key_names(aggregate: &LogicalAggregateNode) -> Result<Vec<String>, String> {
-    aggregate
-        .group_by
-        .iter()
-        .map(|expr| group_key_output_name(expr, &aggregate.output_columns))
-        .collect()
-}
-
-fn group_key_output_name(
-    expr: &TypedExpr,
-    output_columns: &[crate::analysis::OutputColumn],
-) -> Result<String, String> {
-    if let ExprKind::ColumnRef { column_id, .. } = &expr.kind {
-        let matches = output_columns
-            .iter()
-            .filter(|column| column.column_id == *column_id)
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [column] => return Ok(column.name.clone()),
-            [] => {}
-            _ => {
-                return Err(format!(
-                    "Iceberg IMV aggregate rewrite found ambiguous GROUP BY output column id {column_id:?}"
+fn group_key_names(
+    aggregate: &LogicalAggregateNode,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<String>, SqlCompileError> {
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::Validate)?;
+    let result = (|| {
+        let mut aggregate_ids = HashSet::new();
+        for call in &aggregate.aggregates {
+            aggregate_ids.insert(call.output_column_id);
+            work.step()?;
+        }
+        // The logical aggregate builder publishes group outputs in group_by
+        // order, independently of their names, then appends aggregate outputs.
+        // Filtering aggregate IDs also preserves that association when only
+        // aggregate outputs have been moved ahead of the group outputs.
+        let mut group_outputs = Vec::new();
+        for column in &aggregate.output_columns {
+            if !aggregate_ids.contains(&column.column_id) {
+                group_outputs.push(column);
+            }
+            work.step()?;
+        }
+        if group_outputs.len() != aggregate.group_by.len() {
+            return Err(SqlCompileError::Compilation(
+                "Iceberg IMV aggregate rewrite GROUP BY/output association has inconsistent cardinality"
+                    .to_string(),
+            ));
+        }
+        let mut names = Vec::new();
+        let mut selected_outputs = HashSet::new();
+        for (index, expr) in aggregate.group_by.iter().enumerate() {
+            let output_index = if let ExprKind::ColumnRef { column_id, .. } = &expr.kind {
+                let mut matched = None;
+                for (candidate_index, column) in group_outputs.iter().enumerate() {
+                    let same = column.column_id == *column_id;
+                    work.step()?;
+                    if same {
+                        if matched.replace(candidate_index).is_some() {
+                            return Err(SqlCompileError::Compilation(
+                                "Iceberg IMV aggregate rewrite found ambiguous GROUP BY output column id"
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                }
+                // A rewritten input reference may have a different ID from
+                // its published group output. The original ordinal binding
+                // remains authoritative when no exact output ID exists.
+                matched.unwrap_or(index)
+            } else {
+                index
+            };
+            let output = group_outputs[output_index];
+            if !selected_outputs.insert(output_index) {
+                return Err(SqlCompileError::Compilation(
+                    "Iceberg IMV aggregate rewrite GROUP BY output associations overlap"
+                        .to_string(),
                 ));
             }
+            let same_type = expr
+                .value_type
+                .exactly_equals_observed::<novarocks_functions::ConstantError>(
+                    &output.value_type,
+                    || work.step().map_err(Into::into),
+                )
+                .map_err(SqlCompileError::from)?;
+            if !same_type {
+                return Err(SqlCompileError::Compilation(
+                    "Iceberg IMV aggregate rewrite GROUP BY output type differs from its expression"
+                        .to_string(),
+                ));
+            }
+            work.step()?;
+            // String cloning remains an opaque library operation. The name is
+            // the published output fact, never evidence of expression identity.
+            work.flush()?;
+            names.push(output.name.clone());
+            work.flush()?;
         }
+        Ok(names)
+    })();
+    if matches!(
+        &result,
+        Err(SqlCompileError::Cancelled
+            | SqlCompileError::DeadlineExceeded
+            | SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
     }
-
-    let display_name = typed_expr_display_name(expr);
-    let matches = output_columns
-        .iter()
-        .filter(|column| column.name.eq_ignore_ascii_case(&display_name))
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [column] => Ok(column.name.clone()),
-        [] => Err(format!(
-            "Iceberg IMV aggregate rewrite cannot map GROUP BY expression {display_name} to aggregate output column"
-        )),
-        _ => Err(format!(
-            "Iceberg IMV aggregate rewrite found ambiguous GROUP BY output column name {display_name}"
-        )),
-    }
+    work.finish()?;
+    result
 }
 
 fn aggregate_state_names(
@@ -1659,7 +1786,7 @@ fn signed_aggregate(
     ctx: &RewriteContext,
     shape: &crate::compiler::mv_rewrite::SqlImvAggregateShape,
     layout: &crate::compiler::mv_rewrite::SqlImvAggregateLayout,
-) -> Result<LogicalPlanNode, String> {
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let input_columns = plan_output_columns(&aggregate_input)?;
     let mut signed_calls = layout
         .state_columns
@@ -1673,9 +1800,10 @@ fn signed_aggregate(
                 )
             })?;
             let call = align_aggregate_call_inputs_to_child(call, &input_columns)?;
-            signed_aggregate_call(&call, state_column, action_column, ctx.function_catalog())
+            signed_aggregate_call(&call, state_column, action_column, ctx.function_catalog(), ctx.scalar_arena().borrow().constant_policy(),
+        &ctx.control_view())
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
     let hidden_retraction_call = layout.state_columns.iter().any(|column| {
         column.state_role == crate::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount
     });
@@ -1683,6 +1811,9 @@ fn signed_aggregate(
         signed_calls.push(retraction_count_aggregate_call(
             action_column,
             ctx.function_catalog(),
+            ctx.decimal_overflow_policy(),
+            ctx.scalar_arena().borrow().constant_policy(),
+            &ctx.control_view(),
         )?);
     }
     let input = if plan_contains_imv_marker(&aggregate_input) {
@@ -1797,12 +1928,15 @@ fn align_aggregate_call_inputs_to_child(
     input_columns: &[crate::analysis::OutputColumn],
 ) -> Result<AggregateCall, String> {
     let mut call = call.clone();
-    for arg in &mut call.args {
-        align_expr_column_refs_to_child(arg, input_columns)?;
-    }
-    for sort in &mut call.order_by {
-        align_expr_column_refs_to_child(&mut sort.expr, input_columns)?;
-    }
+    call.source.rewrite_channels(|arguments, order_by| {
+        for arg in arguments {
+            align_expr_column_refs_to_child(arg, input_columns)?;
+        }
+        for sort in order_by {
+            align_expr_column_refs_to_child(&mut sort.expr, input_columns)?;
+        }
+        Ok::<_, String>(())
+    })?;
     Ok(call)
 }
 
@@ -1819,8 +1953,7 @@ fn align_expr_column_refs_to_child(
             if let Some(input) = unique_input_column_by_id(input_columns, *column_id)? {
                 *qualifier = None;
                 *column = input.name.clone();
-                expr.data_type = input.data_type.clone();
-                expr.nullable = input.nullable;
+                expr.value_type = input.value_type.clone();
                 return Ok(());
             }
             if qualifier.is_some() {
@@ -1828,8 +1961,7 @@ fn align_expr_column_refs_to_child(
                 *column_id = input.column_id;
                 *qualifier = None;
                 *column = input.name.clone();
-                expr.data_type = input.data_type.clone();
-                expr.nullable = input.nullable;
+                expr.value_type = input.value_type.clone();
             }
             Ok(())
         }
@@ -1907,6 +2039,7 @@ fn align_expr_column_refs_to_child(
         }
         ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. } => Ok(()),
     }
 }
@@ -1971,23 +2104,19 @@ fn signed_aggregate_output_columns(
         })?;
         let column_id = match &group_expr.kind {
             ExprKind::ColumnRef { column_id, .. } => *column_id,
-            _ => allocate_imv_column(
-                ctx,
-                &visible.name,
-                visible.data_type.clone(),
-                visible.nullable,
-            )?,
+            _ => allocate_imv_column(ctx, &visible.name, visible.value_type.clone())?,
         };
         output_columns.push(crate::analysis::OutputColumn {
             column_id,
             name: visible.name.clone(),
-            data_type: visible.data_type.clone(),
-            nullable: visible.nullable,
+            value_type: visible.value_type.clone(),
+
             is_internal: false,
         });
     }
     for (state_index, state_column) in layout.state_columns.iter().enumerate() {
-        let data_type = state_shaped_state_data_type(state_column);
+        let value_type = state_shaped_state_value_type(state_column);
+        let data_type = value_type.data_type.clone();
         let call = signed_calls.get_mut(state_index).ok_or_else(|| {
             format!(
                 "Iceberg IMV aggregate rewrite missing signed state call for {}",
@@ -1995,26 +2124,23 @@ fn signed_aggregate_output_columns(
             )
         })?;
         let novarocks_functions::FunctionResultType::Scalar(result_type) =
-            &call.resolved.selected.result_type
+            &call.source.binding().selected.result_type
         else {
             return Err(format!(
                 "Iceberg IMV signed state {} did not bind a scalar aggregate",
                 state_column.name
             ));
         };
-        if result_type.data_type != data_type {
+        if result_type.logical_type != value_type.logical_type
+            || !novarocks_type_contract::arrow_data_types_exact(&result_type.data_type, &data_type)
+        {
             return Err(format!(
                 "Iceberg IMV signed state {} produces {:?}, expected {data_type:?}",
                 state_column.name, result_type.data_type
             ));
         }
-        let output = allocate_imv_output_column(
-            ctx,
-            &state_column.name,
-            data_type,
-            result_type.nullable,
-            true,
-        )?;
+        let output =
+            allocate_imv_output_column(ctx, &state_column.name, result_type.clone(), true)?;
         let column_id = output.column_id;
         call.output_column_id = column_id;
         output_columns.push(output);
@@ -2069,15 +2195,13 @@ fn signed_aggregate_project_items(
                             qualifier: None,
                             column: child_output.name.clone(),
                         },
-                        data_type: visible.data_type.clone(),
-                        nullable: visible.nullable,
+                        value_type: visible.value_type.clone(),
                     },
                     output_name: visible.name.clone(),
                     output_column_id: allocate_imv_column(
                         ctx,
                         &visible.name,
-                        visible.data_type.clone(),
-                        visible.nullable,
+                        visible.value_type.clone(),
                     )?,
                 });
             }
@@ -2116,15 +2240,19 @@ fn signed_aggregate_project_items(
                                 qualifier: None,
                                 column: child_output.name.clone(),
                             },
-                            data_type: state_shaped_state_data_type(state_column),
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType {
+                                nullable: false,
+                                ..state_shaped_state_value_type(state_column)
+                            },
                         },
                         output_name: state_column.name.clone(),
                         output_column_id: allocate_imv_column(
                             ctx,
                             &state_column.name,
-                            state_shaped_state_data_type(state_column),
-                            false,
+                            novarocks_type_contract::FunctionValueType {
+                                nullable: false,
+                                ..state_shaped_state_value_type(state_column)
+                            },
                         )?,
                     });
                 }
@@ -2144,7 +2272,7 @@ fn signed_aggregate_project_items(
         if call.output_column_id != child_output.column_id {
             return Err("Iceberg IMV retraction count call and output identity differ".to_string());
         }
-        if child_output.data_type != DataType::Int64 {
+        if child_output.value_type.data_type != DataType::Int64 {
             return Err(
                 "Iceberg IMV retraction count aggregate did not produce BIGINT".to_string(),
             );
@@ -2155,8 +2283,10 @@ fn signed_aggregate_project_items(
             output_column_id: allocate_imv_column(
                 ctx,
                 &state_column.name,
-                state_shaped_state_data_type(state_column),
-                false,
+                novarocks_type_contract::FunctionValueType {
+                    nullable: false,
+                    ..state_shaped_state_value_type(state_column)
+                },
             )?,
         });
     }
@@ -2170,8 +2300,7 @@ fn nonnull_retraction_count_expr(child: &OutputColumn, column_id: ColumnId) -> T
             qualifier: None,
             column: child.name.clone(),
         },
-        data_type: child.data_type.clone(),
-        nullable: child.nullable,
+        value_type: child.value_type.clone(),
     };
     TypedExpr {
         kind: ExprKind::Case {
@@ -2182,19 +2311,25 @@ fn nonnull_retraction_count_expr(child: &OutputColumn, column_id: ColumnId) -> T
                         expr: Box::new(value.clone()),
                         negated: false,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
                 TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(0)),
-                    data_type: child.data_type.clone(),
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType {
+                        nullable: false,
+                        ..child.value_type.clone()
+                    },
                 },
             )],
             else_expr: Some(Box::new(value)),
         },
-        data_type: child.data_type.clone(),
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType {
+            nullable: false,
+            ..child.value_type.clone()
+        },
     }
 }
 
@@ -2213,15 +2348,20 @@ fn signed_aggregate_child_output<'a>(
         })
 }
 
-fn state_shaped_state_data_type(
+fn state_shaped_state_value_type(
     state_column: &crate::compiler::mv_rewrite::SqlImvAggregateStateColumn,
-) -> DataType {
+) -> novarocks_type_contract::FunctionValueType {
     match state_column.state_role {
         crate::compiler::mv_rewrite::SqlImvAggregateStateRole::Single
         | crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgSum
-        | crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgCount => DataType::Binary,
+        | crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgCount => {
+            novarocks_type_contract::FunctionValueType::new(
+                DataType::Binary,
+                state_column.value_type.nullable,
+            )
+        }
         crate::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount => {
-            state_column.data_type.clone()
+            state_column.value_type.clone()
         }
     }
 }
@@ -2229,27 +2369,48 @@ fn state_shaped_state_data_type(
 fn retraction_count_aggregate_call(
     action_column: ColumnId,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<AggregateCall, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<AggregateCall, crate::compiler::SqlCompileError> {
     let args = vec![TypedExpr {
         kind: ExprKind::ColumnRef {
             column_id: action_column,
             qualifier: None,
             column: ImvActionColumn::NAME.to_string(),
         },
-        data_type: DataType::Int8,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
     }];
-    let resolved =
-        crate::functions::resolve_sql_aggregate_binding(function_catalog, "sum", &args, &[], true)
-            .map_err(|error| format!("failed to resolve IMV retraction aggregate: {error}"))?;
+    let resolved = crate::functions::resolve_sql_aggregate_binding(
+        function_catalog,
+        "sum",
+        &args,
+        &[],
+        true,
+        constant_policy,
+        control,
+    )
+    .map_err(|error| match error {
+        novarocks_functions::FunctionBindingError::Control(error) => {
+            crate::compiler::SqlCompileError::from(error)
+        }
+        other => {
+            let error = other;
+            crate::compiler::SqlCompileError::Compilation(format!(
+                "failed to resolve IMV retraction aggregate: {error}"
+            ))
+        }
+    })?;
     Ok(AggregateCall {
         name: "sum".to_string(),
-        args,
         distinct: false,
         result_type: DataType::Int64,
-        order_by: Vec::new(),
         output_column_id: ColumnId::UNSET,
-        resolved: resolved.into(),
+        source: crate::binding::AggregateArgumentSource::logical_update(
+            args,
+            Vec::new(),
+            crate::binding::SqlFunctionBinding::new(resolved, policy),
+        ),
     })
 }
 
@@ -2258,7 +2419,9 @@ fn signed_aggregate_call(
     state_column: &crate::compiler::mv_rewrite::SqlImvAggregateStateColumn,
     action_column: ColumnId,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<AggregateCall, String> {
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<AggregateCall, crate::compiler::SqlCompileError> {
     let signed_name = match state_column.state_role {
         SqlImvAggregateStateRole::AvgSum => "sum_state_signed",
         SqlImvAggregateStateRole::AvgCount => "count_state_signed",
@@ -2266,37 +2429,60 @@ fn signed_aggregate_call(
         SqlImvAggregateStateRole::RetractionCount => {
             return Err(
                 "Iceberg IMV aggregate rewrite cannot build retraction count as a state call"
-                    .to_string(),
+                    .into(),
             );
         }
     };
     let value = signed_value_arg(call)?;
-    let input = signed_state_input(value, action_column, function_catalog)?;
+    let input = signed_state_input(
+        value,
+        action_column,
+        function_catalog,
+        call.source.binding().decimal_overflow_policy(),
+        constant_policy,
+        control,
+    )?;
     let resolved = crate::functions::resolve_sql_aggregate_binding(
         function_catalog,
         signed_name,
         std::slice::from_ref(&input),
-        &call.order_by,
+        call.source.order_by(),
         true,
+        constant_policy,
+        control,
     )
-    .map_err(|error| format!("failed to resolve IMV signed aggregate `{signed_name}`: {error}"))?;
+    .map_err(|error| match error {
+        novarocks_functions::FunctionBindingError::Control(error) => {
+            crate::compiler::SqlCompileError::from(error)
+        }
+        other => {
+            let error = other;
+            crate::compiler::SqlCompileError::Compilation(format!(
+                "failed to resolve IMV signed aggregate `{signed_name}`: {error}"
+            ))
+        }
+    })?;
     Ok(AggregateCall {
         name: signed_name.to_string(),
-        args: vec![input],
         distinct: false,
         result_type: DataType::Binary,
-        order_by: call.order_by.clone(),
         output_column_id: ColumnId::UNSET,
-        resolved: resolved.into(),
+        source: crate::binding::AggregateArgumentSource::logical_update(
+            vec![input],
+            call.source.order_by().to_vec(),
+            crate::binding::SqlFunctionBinding::new(
+                resolved,
+                call.source.binding().decimal_overflow_policy(),
+            ),
+        ),
     })
 }
 
 fn signed_value_arg(call: &AggregateCall) -> Result<TypedExpr, String> {
-    match call.args.as_slice() {
+    match call.source.arguments() {
         [] if call.name.eq_ignore_ascii_case("count") => Ok(TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(1)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }),
         [arg] => Ok(arg.clone()),
         [] => Err(format!(
@@ -2314,7 +2500,10 @@ fn signed_state_input(
     value: TypedExpr,
     action_column: ColumnId,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<TypedExpr, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![
         string_literal("value"),
         value,
@@ -2325,18 +2514,22 @@ fn signed_state_input(
                 qualifier: None,
                 column: ImvActionColumn::NAME.to_string(),
             },
-            data_type: DataType::Int8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
         },
     ];
-    let binding =
-        crate::analysis::resolve_function_binding(function_catalog, "named_struct", &args)?;
+    let binding = crate::analysis::resolve_function_binding(
+        function_catalog,
+        "named_struct",
+        &args,
+        policy,
+        constant_policy,
+        control,
+    )?;
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
     else {
-        return Err("named_struct must return a scalar value".to_string());
+        return Err("named_struct must return a scalar value".to_string().into());
     };
-    let data_type = result.data_type.clone();
-    let nullable = result.nullable;
+    let value_type = result.clone();
     Ok(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
@@ -2345,16 +2538,14 @@ fn signed_state_input(
             distinct: false,
             binding,
         },
-        data_type,
-        nullable,
+        value_type,
     })
 }
 
 fn string_literal(value: &str) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::String(value.to_string())),
-        data_type: DataType::Utf8,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
     }
 }
 
@@ -2413,7 +2604,8 @@ mod tests {
     fn signed_state_function_rejects_unsupported_aggregate() {
         let err = signed_state_function("median").expect_err("median must be unsupported");
         assert!(
-            err.contains("unsupported IMV aggregate function median"),
+            err.to_string()
+                .contains("unsupported IMV aggregate function median"),
             "{err}"
         );
     }
@@ -2434,7 +2626,7 @@ mod tests {
         }
     }
 
-    fn build_ctx() -> RewriteContext {
+    fn build_ctx() -> RewriteContext<'static> {
         build_ctx_with_state_columns(vec![
             single_state_column("binary"),
             retraction_count_state_column(),
@@ -2443,14 +2635,14 @@ mod tests {
 
     fn build_ctx_with_state_columns(
         state_columns: Vec<SqlImvAggregateStateColumnContract>,
-    ) -> RewriteContext {
+    ) -> RewriteContext<'static> {
         build_ctx_with_state_columns_and_target_partition(state_columns, None)
     }
 
     fn build_ctx_with_state_columns_and_target_partition(
         state_columns: Vec<SqlImvAggregateStateColumnContract>,
         target_partition: Option<SqlImvPartitionContract>,
-    ) -> RewriteContext {
+    ) -> RewriteContext<'static> {
         build_ctx_with_state_columns_target_partition_and_branch(
             state_columns,
             target_partition,
@@ -2458,7 +2650,7 @@ mod tests {
         )
     }
 
-    fn build_branch_ctx() -> RewriteContext {
+    fn build_branch_ctx() -> RewriteContext<'static> {
         build_ctx_with_state_columns_target_partition_and_branch(
             vec![
                 single_state_column("binary"),
@@ -2476,7 +2668,7 @@ mod tests {
         state_columns: Vec<SqlImvAggregateStateColumnContract>,
         target_partition: Option<SqlImvPartitionContract>,
         branch_contract: Option<SqlImvBranchContract>,
-    ) -> RewriteContext {
+    ) -> RewriteContext<'static> {
         let snapshot = crate::compiler::mv_rewrite::test_aggregate_snapshot(
             state_columns,
             target_partition,
@@ -2499,7 +2691,7 @@ mod tests {
     }
 
     fn aggregate_rewrite_test_context_with_factory() -> (
-        RewriteContext,
+        RewriteContext<'static>,
         ImvExtension,
         crate::compiler::mv_rewrite::SqlImvAggregateLayout,
     ) {
@@ -2539,8 +2731,8 @@ mod tests {
         for column in columns {
             let meta = factory.borrow().get(column.column_id).clone();
             assert_eq!(meta.name, column.name);
-            assert_eq!(meta.data_type, column.data_type);
-            assert_eq!(meta.nullable, column.nullable);
+            assert_eq!(meta.value_type, column.value_type);
+            assert_eq!(meta.value_type.nullable, column.value_type.nullable);
         }
 
         assert_eq!(ext.annotation.partition, None);
@@ -2556,8 +2748,10 @@ mod tests {
         ] {
             let state_column = crate::compiler::mv_rewrite::SqlImvAggregateStateColumn {
                 name: "avg_component".to_string(),
-                data_type: DataType::Binary,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(
+                    DataType::Binary,
+                    false,
+                ),
                 visible_source_index: 0,
                 aggregate_index: 0,
                 function: AggregateFunctionKind::Avg,
@@ -2567,13 +2761,16 @@ mod tests {
             let old = OutputColumn {
                 column_id: ColumnId::new_for_test(10),
                 name: state_column.name.clone(),
-                data_type: DataType::Binary,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Binary, true),
+
                 is_internal: true,
             };
             let delta = OutputColumn {
                 column_id: ColumnId::new_for_test(11),
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType {
+                    nullable: false,
+                    ..old.value_type.clone()
+                },
                 ..old.clone()
             };
             let merged = merged_state_expr(
@@ -2597,8 +2794,8 @@ mod tests {
             assert_eq!(args.len(), 2);
             assert_eq!(binding.logical_argument_count, 2);
             assert_eq!(binding.selected.argument_types.len(), 2);
-            assert_eq!(merged.data_type, DataType::Binary);
-            assert!(!merged.nullable);
+            assert_eq!(merged.value_type.data_type, DataType::Binary);
+            assert!(!merged.value_type.nullable);
             bindings.push(binding.function_id.clone());
         }
         assert_ne!(bindings[0], bindings[1]);
@@ -2611,20 +2808,26 @@ mod tests {
             visible_columns: vec![
                 crate::compiler::mv_rewrite::SqlImvAggregateVisibleColumn {
                     name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
                 },
                 crate::compiler::mv_rewrite::SqlImvAggregateVisibleColumn {
                     name: "a".to_string(),
-                    data_type: DataType::Decimal128(38, 10),
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Decimal128(38, 10),
+                        true,
+                    ),
                 },
             ],
             state_columns: vec![
                 crate::compiler::mv_rewrite::SqlImvAggregateStateColumn {
                     name: "a__state_avg_sum".to_string(),
-                    data_type: DataType::Binary,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Binary,
+                        false,
+                    ),
                     visible_source_index: 1,
                     aggregate_index: 0,
                     function: crate::mv_refresh::AggregateFunctionKind::Avg,
@@ -2633,8 +2836,10 @@ mod tests {
                 },
                 crate::compiler::mv_rewrite::SqlImvAggregateStateColumn {
                     name: "a__state_avg_count".to_string(),
-                    data_type: DataType::Binary,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Binary,
+                        false,
+                    ),
                     visible_source_index: 1,
                     aggregate_index: 0,
                     function: crate::mv_refresh::AggregateFunctionKind::Avg,
@@ -2663,8 +2868,7 @@ mod tests {
                 qualifier: None,
                 column: state_column.name.clone(),
             },
-            data_type: DataType::Binary,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Binary, false),
         };
 
         let count_state = TypedExpr {
@@ -2673,8 +2877,7 @@ mod tests {
                 qualifier: None,
                 column: "a__state_avg_count".to_string(),
             },
-            data_type: DataType::Binary,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Binary, false),
         };
 
         let args = visible_avg_state_args(state_column, sum_state, count_state, &layout)
@@ -2685,14 +2888,14 @@ mod tests {
             &args[2].kind,
             ExprKind::Literal(LiteralValue::Int(4))
         ));
-        assert_eq!(args[2].data_type, DataType::Int64);
-        assert!(!args[2].nullable);
+        assert_eq!(args[2].value_type.data_type, DataType::Int64);
+        assert!(!args[2].value_type.nullable);
         assert!(matches!(
             &args[3].kind,
             ExprKind::Literal(LiteralValue::Null)
         ));
-        assert_eq!(args[3].data_type, DataType::Decimal128(38, 10));
-        assert!(args[3].nullable);
+        assert_eq!(args[3].value_type.data_type, DataType::Decimal128(38, 10));
+        assert!(args[3].value_type.nullable);
     }
 
     fn col_expr(id: u32, name: &str) -> TypedExpr {
@@ -2702,8 +2905,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -2738,15 +2940,21 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId::new_for_test(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::new_for_test(2),
                         name: "v".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -2766,30 +2974,34 @@ mod tests {
                 group_by: vec![col_expr(1, "k")],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![col_expr(2, "v")],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: Vec::new(),
                     output_column_id: ColumnId::new_for_test(3),
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_expr(2, "v")],
+                        Vec::new(),
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![
                     OutputColumn {
                         column_id: ColumnId::new_for_test(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::new_for_test(3),
                         name: "s".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -2806,30 +3018,34 @@ mod tests {
                 group_by: vec![col_expr(1, "k")],
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![col_expr(2, "v")],
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: Vec::new(),
                     output_column_id: ColumnId::new_for_test(3),
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![col_expr(2, "v")],
+                        Vec::new(),
+                        crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
                     ),
                 }],
                 output_columns: vec![
                     OutputColumn {
                         column_id: ColumnId::new_for_test(3),
                         name: "s".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::new_for_test(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -2847,18 +3063,20 @@ mod tests {
         };
         node.aggregates.push(AggregateCall {
             name: "count".to_string(),
-            args: Vec::new(),
             distinct: false,
             result_type: DataType::Int64,
-            order_by: Vec::new(),
             output_column_id: ColumnId::new_for_test(4),
-            resolved: crate::functions::test_resolved_aggregate("count", &[], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                Vec::new(),
+                Vec::new(),
+                crate::functions::test_resolved_aggregate("count", &[], false),
+            ),
         });
         node.output_columns.push(OutputColumn {
             column_id: ColumnId::new_for_test(4),
             name: "c".to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         });
         plan
@@ -3017,15 +3235,21 @@ mod tests {
                     OutputColumn {
                         column_id: ColumnId::new_for_test(1),
                         name: "k".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
+
                         is_internal: false,
                     },
                     OutputColumn {
                         column_id: ColumnId::new_for_test(2),
                         name: "v".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: true,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            true,
+                        ),
+
                         is_internal: false,
                     },
                 ],
@@ -3094,6 +3318,9 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("empty GROUP BY must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert_eq!(
             err,
             "Iceberg IMV aggregate rewrite requires at least one GROUP BY key"
@@ -3114,6 +3341,9 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("distinct aggregate must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert_eq!(
             err,
             "Iceberg IMV aggregate rewrite does not support SELECT DISTINCT"
@@ -3230,7 +3460,7 @@ mod tests {
         );
         for item in &project.items {
             let child_expr = if item.output_name == "__agg_state___ivm_row_count" {
-                assert!(!item.expr.nullable);
+                assert!(!item.expr.value_type.nullable);
                 let ExprKind::Case {
                     when_then,
                     else_expr: Some(value),
@@ -3265,11 +3495,11 @@ mod tests {
         }
         assert_eq!(signed_aggregate.output_columns[1].name, "__agg_state_s");
         assert_eq!(
-            signed_aggregate.output_columns[1].data_type,
+            signed_aggregate.output_columns[1].value_type.data_type,
             DataType::Binary
         );
-        assert!(signed_aggregate.output_columns[2].nullable);
-        let args = &signed_aggregate.aggregates[0].args;
+        assert!(signed_aggregate.output_columns[2].value_type.nullable);
+        let args = signed_aggregate.aggregates[0].source.arguments();
         assert_eq!(args.len(), 1);
         let ExprKind::FunctionCall {
             name,
@@ -3381,7 +3611,7 @@ mod tests {
             ]
         );
         for item in &project.items {
-            if branch_case_requires_runtime_cast(&item.expr.data_type) {
+            if branch_case_requires_runtime_cast(&item.expr.value_type.data_type) {
                 assert_branch_case_arms_cast_to_output_type(item);
             }
         }
@@ -3443,7 +3673,7 @@ mod tests {
             ),
             "INSERT file locator must be NULL"
         );
-        assert!(file_item.expr.nullable);
+        assert!(file_item.expr.value_type.nullable);
 
         let (delete_pos, insert_pos) = case_arm_exprs(&pos_item.expr);
         let ExprKind::ColumnRef { column_id, .. } = uncast_expr(delete_pos).kind else {
@@ -3457,7 +3687,7 @@ mod tests {
             ),
             "INSERT row position locator must be NULL"
         );
-        assert!(pos_item.expr.nullable);
+        assert!(pos_item.expr.value_type.nullable);
     }
 
     #[test]
@@ -3507,8 +3737,8 @@ mod tests {
             ),
             "updated MV target rows must inherit their actual commit sequence"
         );
-        assert!(insert_sequence.nullable);
-        assert_eq!(insert_sequence.data_type, DataType::Int64);
+        assert!(insert_sequence.value_type.nullable);
+        assert_eq!(insert_sequence.value_type.data_type, DataType::Int64);
     }
 
     #[test]
@@ -3639,12 +3869,20 @@ mod tests {
             );
         };
         for (_, then_expr) in when_then {
-            assert_cast_target(then_expr, &item.expr.data_type, &item.output_name);
+            assert_cast_target(
+                then_expr,
+                &item.expr.value_type.data_type,
+                &item.output_name,
+            );
         }
         let else_expr = else_expr
             .as_deref()
             .unwrap_or_else(|| panic!("expected CASE ELSE for {}", item.output_name));
-        assert_cast_target(else_expr, &item.expr.data_type, &item.output_name);
+        assert_cast_target(
+            else_expr,
+            &item.expr.value_type.data_type,
+            &item.output_name,
+        );
     }
 
     fn assert_cast_target(expr: &TypedExpr, expected: &DataType, output_name: &str) {
@@ -3707,6 +3945,7 @@ mod tests {
             ExprKind::ColumnRef { .. }
             | ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::SubqueryPlaceholder { .. } => false,
         }
     }
@@ -3931,7 +4170,7 @@ mod tests {
             assert_eq!(action_column, existing_action);
         }
 
-        let signed_arg = &signed_aggregate.aggregates[0].args[0];
+        let signed_arg = &signed_aggregate.aggregates[0].source.arguments()[0];
         let ExprKind::FunctionCall {
             args: struct_args, ..
         } = &signed_arg.kind
@@ -3947,7 +4186,7 @@ mod tests {
         assert_eq!(column, ImvActionColumn::NAME);
         assert_eq!(*column_id, action_column);
 
-        let retraction_arg = &signed_aggregate.aggregates[1].args[0];
+        let retraction_arg = &signed_aggregate.aggregates[1].source.arguments()[0];
         let ExprKind::ColumnRef {
             column_id, column, ..
         } = &retraction_arg.kind
@@ -3990,8 +4229,11 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("state column count mismatch must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(
-            err.contains("aggregate state column count"),
+            err.to_string().contains("aggregate state column count"),
             "unexpected error: {err}"
         );
     }
@@ -4011,8 +4253,11 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("non-binary state column must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(
-            err.contains("must have binary type signature"),
+            err.to_string().contains("must have binary type signature"),
             "unexpected error: {err}"
         );
     }
@@ -4029,9 +4274,184 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("missing hidden retraction count state must fail");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert!(
-            err.contains("requires a retraction-count or COUNT(*) state column"),
+            err.to_string()
+                .contains("requires a retraction-count or COUNT(*) state column"),
             "unexpected error: {err}"
         );
+    }
+
+    fn materialized_group_key(value: i64) -> TypedExpr {
+        let value_type = novarocks_type_contract::FunctionValueType::new(DataType::Int64, false);
+        let value = novarocks_functions::ConstantValue::from_i64(
+            std::sync::Arc::new(arrow::datatypes::Field::new(
+                "literal",
+                DataType::Int64,
+                false,
+            )),
+            value_type.clone(),
+            value,
+            crate::constant::test_constant_policy(),
+            novarocks_type_contract::CompilePhase::Validate,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        TypedExpr {
+            kind: ExprKind::Constant(value),
+            value_type,
+        }
+    }
+
+    #[test]
+    fn materialized_group_key_mapping_uses_authored_order_and_published_aliases_not_payload_names()
+    {
+        let mut plan = aggregate_over(leaf_scan());
+        let LogicalPlanKind::Aggregate(aggregate) = &mut plan.kind else {
+            unreachable!()
+        };
+        aggregate.group_by = vec![materialized_group_key(7), materialized_group_key(9)];
+        let ty = aggregate.group_by[0].value_type.clone();
+        // Aggregate output has a misleading literal-looking name and comes
+        // first; group aliases deliberately resemble the opposite key value.
+        aggregate.output_columns = vec![
+            OutputColumn {
+                name: "7".into(),
+                ..aggregate.output_columns[1].clone()
+            },
+            OutputColumn {
+                column_id: ColumnId::new_for_test(10),
+                name: "9".into(),
+                value_type: ty.clone(),
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: ColumnId::new_for_test(11),
+                name: "7".into(),
+                value_type: ty,
+                is_internal: false,
+            },
+        ];
+        assert_eq!(
+            group_key_names(aggregate, crate::optimizer::test_optimizer_control()).unwrap(),
+            vec!["9", "7"]
+        );
+        aggregate.output_columns[1].value_type.nullable = true;
+        assert!(matches!(
+            group_key_names(aggregate, crate::optimizer::test_optimizer_control()),
+            Err(SqlCompileError::Compilation(_))
+        ));
+        aggregate.output_columns.pop();
+        assert!(matches!(
+            group_key_names(aggregate, crate::optimizer::test_optimizer_control()),
+            Err(SqlCompileError::Compilation(_))
+        ));
+    }
+
+    #[test]
+    fn rewrite_aggregate_state_accepts_non_column_cv_group_key_with_published_target_alias() {
+        let mut ctx = build_ctx();
+        let mut aggregate_plan = aggregate_first_output_over(leaf_scan());
+        let LogicalPlanKind::Aggregate(aggregate) = &mut aggregate_plan.kind else {
+            unreachable!()
+        };
+        aggregate.group_by[0] = materialized_group_key(7);
+        // This is the actual target's published alias, unrelated to rendering
+        // the selected materialized value or its pool.
+        aggregate.output_columns[1].name = "k".into();
+        let arena = ctx.scalar_arena();
+        let expr = to_optimizer_expr(&delta(aggregate_plan), &mut arena.borrow_mut());
+        let result = RewriteAggregateStateRule.apply(expr, &mut ctx).unwrap();
+        let changed = expect_changed_merge(result, &arena.borrow());
+        let old_scan = find_target_state_scan(&changed);
+        let target_state = sql_mv_target_state_scan(&old_scan.table.source).unwrap();
+        assert_eq!(target_state.group_key_names, vec!["k"]);
+        let signed = find_signed_delta_project(&changed).unary_input();
+        let LogicalPlanKind::Aggregate(aggregate) = &signed.kind else {
+            unreachable!()
+        };
+        assert!(
+            matches!(&aggregate.group_by[0].kind, ExprKind::Constant(value) if value.try_i64().unwrap() == Some(7))
+        );
+    }
+
+    #[test]
+    fn materialized_group_output_mapping_observes_real_loops_and_all_typed_failure_tails() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Control {
+            trace: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
+            refuse: Option<usize>,
+            cause: CompileControlError,
+        }
+        impl PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                let mut trace = self.trace.lock().unwrap();
+                trace.push((phase, units));
+                if self.refuse == Some(trace.len() - 1) {
+                    Err(self.cause)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        let mut plan = aggregate_over(leaf_scan());
+        let LogicalPlanKind::Aggregate(aggregate) = &mut plan.kind else {
+            unreachable!()
+        };
+        let key = materialized_group_key(7);
+        aggregate.group_by = vec![key.clone(); 320];
+        aggregate.output_columns = (0..320)
+            .map(|index| OutputColumn {
+                column_id: ColumnId::new_for_test(1000 + index),
+                name: format!("published_{index}"),
+                value_type: key.value_type.clone(),
+                is_internal: false,
+            })
+            .chain([aggregate.output_columns[1].clone()])
+            .collect();
+        for ordinary in [false, true] {
+            if ordinary {
+                aggregate.output_columns.last_mut().unwrap().column_id =
+                    ColumnId::new_for_test(9999);
+            }
+            let good = Control {
+                trace: Default::default(),
+                refuse: None,
+                cause: CompileControlError::Cancelled,
+            };
+            let result = group_key_names(aggregate, &good);
+            if ordinary {
+                assert!(matches!(result, Err(SqlCompileError::Compilation(_))));
+            } else {
+                assert_eq!(result.unwrap().len(), 320);
+            }
+            let trace = good.trace.into_inner().unwrap();
+            assert_eq!(trace.first(), Some(&(CompilePhase::Validate, 0)));
+            assert!(trace.iter().any(|(_, units)| *units == 256));
+            assert!(trace.iter().all(|(_, units)| *units <= 256));
+            for index in 0..trace.len() {
+                for cause in [
+                    CompileControlError::Cancelled,
+                    CompileControlError::DeadlineExceeded,
+                    CompileControlError::ResourceExhausted,
+                ] {
+                    let control = Control {
+                        trace: Default::default(),
+                        refuse: Some(index),
+                        cause,
+                    };
+                    assert!(
+                        matches!(group_key_names(aggregate, &control), Err(error) if error == SqlCompileError::from(cause))
+                    );
+                    assert_eq!(*control.trace.lock().unwrap(), trace[..=index]);
+                }
+            }
+        }
     }
 }

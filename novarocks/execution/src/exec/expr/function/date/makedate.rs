@@ -20,7 +20,6 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{Array, ArrayRef, Date32Array, Int64Array};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
-use chrono::{Days, NaiveDate};
 use std::sync::Arc;
 
 pub fn eval_makedate(
@@ -47,21 +46,10 @@ pub fn eval_makedate(
             out.push(None);
             continue;
         }
-        let year = i32::try_from(year_arr.value(i)).ok();
-        let day = i32::try_from(day_arr.value(i)).ok();
-        let date = match (year, day) {
-            (Some(year), Some(day)) if day > 0 && (0..=9999).contains(&year) => {
-                let base = NaiveDate::from_ymd_opt(year, 1, 1);
-                let leap = NaiveDate::from_ymd_opt(year, 2, 29).is_some();
-                let max_day = if leap { 366 } else { 365 };
-                if day > max_day {
-                    None
-                } else {
-                    base.and_then(|d| d.checked_add_days(Days::new((day - 1) as u64)))
-                }
-            }
-            _ => None,
-        };
+        let date = novarocks_functions::calendar_numeric::makedate_from_year_day(
+            year_arr.value(i),
+            day_arr.value(i),
+        );
         out.push(date.map(naive_to_date32));
     }
     Ok(Arc::new(Date32Array::from(out)) as ArrayRef)

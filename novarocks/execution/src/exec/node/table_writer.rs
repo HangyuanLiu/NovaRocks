@@ -110,7 +110,7 @@ impl TableWriterInputProjection {
         projection: &novarocks_local_program::StaticWriterProjection,
         runtime_error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
     ) -> Result<Self, String> {
-        let mut arena = ExprArena::from_immutable(&projection.arena);
+        let mut arena = ExprArena::from_immutable(&projection.arena)?;
         arena.bind_runtime_error(runtime_error);
         let exprs = projection
             .expressions
@@ -275,14 +275,59 @@ pub struct TableWriterNode {
 
 /// Provider and attempt capabilities moved out of the transient decoder node.
 /// A pure local program never owns any of these values.
-pub(crate) struct TableWriterRuntimeBinding {
-    pub handle: ConnectorWriterHandle,
-    pub execution: Arc<dyn ConnectorWriteExecution>,
-    pub physical_template: TableWriterPhysicalContextTemplate,
-    pub request_context: ConnectorRequestContext,
-    pub fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
+pub struct TableWriterRuntimeBinding {
+    pub(crate) handle: ConnectorWriterHandle,
+    pub(crate) execution: Arc<dyn ConnectorWriteExecution>,
+    pub(crate) physical_template: TableWriterPhysicalContextTemplate,
+    pub(crate) request_context: ConnectorRequestContext,
+    pub(crate) fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
     #[cfg(debug_assertions)]
-    pub aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
+    pub(crate) aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
+}
+
+impl TableWriterRuntimeBinding {
+    /// One Task's write capability for one compiled writer: the decoded
+    /// handle, the query-leased execution of the handle's own catalog, the
+    /// attempt-local physical template, the request context and the
+    /// commit-fragment encoder.
+    pub fn try_new(
+        handle: ConnectorWriterHandle,
+        execution: Arc<dyn ConnectorWriteExecution>,
+        physical_template: TableWriterPhysicalContextTemplate,
+        request_context: ConnectorRequestContext,
+        fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
+    ) -> Result<Self, ExecPlanBuildError> {
+        if execution.catalog_handle() != handle.binding().catalog_handle() {
+            return Err(ExecPlanBuildError::new(
+                ExecPlanInvariant::Node,
+                "table writer catalog handle does not match its query-leased write execution",
+            ));
+        }
+        Ok(Self {
+            handle,
+            execution,
+            physical_template,
+            request_context,
+            fragment_encoder,
+            #[cfg(debug_assertions)]
+            aggregate_guard: Arc::new(AllowTableWriteAggregates),
+        })
+    }
+
+    /// Bind the application-owned, query-scoped aggregate rejection guard.
+    #[cfg(debug_assertions)]
+    pub fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateGuard>) -> Self {
+        self.aggregate_guard = guard;
+        self
+    }
+
+    pub const fn handle(&self) -> &ConnectorWriterHandle {
+        &self.handle
+    }
+
+    pub const fn physical_template(&self) -> TableWriterPhysicalContextTemplate {
+        self.physical_template
+    }
 }
 
 impl TableWriterNode {

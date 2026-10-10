@@ -122,7 +122,9 @@ impl WriterMultiplexRelationSchema {
             .zip(layout.schema().fields())
             .skip(WRITE_RELATION_FRAGMENT_INDEX + 1)
             .map(|(slot, field)| {
-                WriterAuxiliaryChannel::try_new(slot.0, field.name(), field.data_type().clone())
+                let value_type = novarocks_type_contract::FunctionValueType::try_from_field(field)
+                    .map_err(|error| error.to_string())?;
+                WriterAuxiliaryChannel::try_new(slot.0, field.name(), value_type)
                     .map_err(|error| error.to_string())
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -143,6 +145,39 @@ impl WriterMultiplexRelationSchema {
         Ok(Self {
             contract,
             chunk_schema: ChunkSchema::from_static_layout(layout)?,
+        })
+    }
+
+    /// Bind a compiled program's positional writer relation: the layout is the
+    /// exact SPI relation by Arrow schema, and every column, the fixed prefix
+    /// included, is carried by its compiler-allocated layout slot. An
+    /// auxiliary channel is identified by its layout slot.
+    pub(crate) fn try_from_compiled_layout(
+        layout: &novarocks_local_program::StaticLayout,
+    ) -> Result<Self, String> {
+        if layout.slots().len() < WRITE_RELATION_FRAGMENT_INDEX + 1 {
+            return Err("compiled writer multiplex layout lacks fixed prefix".to_string());
+        }
+        let auxiliary = layout
+            .slots()
+            .iter()
+            .zip(layout.schema().fields())
+            .skip(WRITE_RELATION_FRAGMENT_INDEX + 1)
+            .map(|(slot, field)| {
+                let value_type = novarocks_type_contract::FunctionValueType::try_from_field(field)
+                    .map_err(|error| error.to_string())?;
+                WriterAuxiliaryChannel::try_new(slot.0, field.name(), value_type)
+                    .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let contract =
+            WriterMultiplexSchema::try_new(auxiliary).map_err(|error| error.to_string())?;
+        contract
+            .validate_exact_arrow_schema(layout.schema())
+            .map_err(|error| format!("compiled writer multiplex layout: {error}"))?;
+        Ok(Self {
+            contract,
+            chunk_schema: ChunkSchema::from_compiled_layout(layout)?,
         })
     }
 
@@ -197,6 +232,22 @@ impl RootWriteResultRelationSchema {
         Ok(Self {
             contract,
             chunk_schema: ChunkSchema::from_static_layout(layout)?,
+        })
+    }
+
+    /// Bind a compiled program's positional Root relation: the layout is the
+    /// exact fixed SPI relation by Arrow schema, nested child names included,
+    /// and every column is carried by its compiler-allocated layout slot.
+    pub(crate) fn try_from_compiled_layout(
+        layout: &novarocks_local_program::StaticLayout,
+    ) -> Result<Self, String> {
+        let contract = RootWriteResultSchema::new();
+        contract
+            .validate_exact_arrow_schema(layout.schema())
+            .map_err(|error| format!("compiled root write result layout: {error}"))?;
+        Ok(Self {
+            contract,
+            chunk_schema: ChunkSchema::from_compiled_layout(layout)?,
         })
     }
 
@@ -311,6 +362,77 @@ mod tests {
         }
     }
 
+    /// A compiled layout carries the exact SPI relation under its own slots;
+    /// any drift of names, nesting or nullability is refused.
+    #[test]
+    fn compiled_layouts_bind_the_exact_relations_under_their_own_slots() {
+        use std::sync::Arc;
+
+        use arrow::datatypes::{DataType, Field, Schema};
+        use novarocks_local_program::StaticLayout;
+
+        let layout = |schema: arrow::datatypes::SchemaRef, first: u32| {
+            let slots = (0..schema.fields().len() as u32)
+                .map(|offset| SlotId::new(first + offset))
+                .collect::<Vec<_>>();
+            StaticLayout::try_new(schema, Arc::from(slots)).expect("layout")
+        };
+        let writer = WriterMultiplexRelationSchema::try_from_compiled_layout(&layout(
+            novarocks_spi::connector::write_stack::writer_output_schema(),
+            3,
+        ))
+        .expect("writer relation");
+        assert_eq!(
+            writer.chunk_schema().slot_ids(),
+            [3, 4, 5, 6].map(SlotId::new).as_slice()
+        );
+        assert!(writer.contract().auxiliary_channels().is_empty());
+        let root = RootWriteResultRelationSchema::try_from_compiled_layout(&layout(
+            RootWriteResultSchema::new().arrow_schema(),
+            20,
+        ))
+        .expect("root relation");
+        assert_eq!(root.chunk_schema().slot_ids()[0], SlotId::new(20));
+        assert_eq!(
+            root.chunk_schema().arrow_schema_ref().as_ref(),
+            RootWriteResultSchema::new().arrow_schema().as_ref()
+        );
+
+        // A list child named other than `item` is a different relation.
+        let mut drifted = RootWriteResultSchema::new()
+            .arrow_schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        drifted[4] = Field::new(
+            "input_fields",
+            DataType::List(Arc::new(Field::new("element", DataType::Int32, false))),
+            true,
+        );
+        assert!(
+            RootWriteResultRelationSchema::try_from_compiled_layout(&layout(
+                Arc::new(Schema::new(drifted)),
+                20,
+            ))
+            .is_err()
+        );
+        // A nullable kind is a different writer relation.
+        let mut nullable_kind = novarocks_spi::connector::write_stack::writer_output_schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        nullable_kind[0] = nullable_kind[0].clone().with_nullable(true);
+        assert!(
+            WriterMultiplexRelationSchema::try_from_compiled_layout(&layout(
+                Arc::new(Schema::new(nullable_kind)),
+                3,
+            ))
+            .is_err()
+        );
+    }
+
     #[test]
     fn typed_relation_carriers_bind_every_generic_slot() {
         let writer = WriterMultiplexRelationSchema::try_new(
@@ -318,9 +440,16 @@ mod tests {
                 novarocks_spi::connector::write_stack::WriterAuxiliaryChannel::try_new(
                     7,
                     "opaque_aux",
-                    arrow::datatypes::DataType::Struct(arrow::datatypes::Fields::from(vec![
-                        arrow::datatypes::Field::new("v", arrow::datatypes::DataType::Utf8, true),
-                    ])),
+                    novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Struct(arrow::datatypes::Fields::from(vec![
+                            arrow::datatypes::Field::new(
+                                "v",
+                                arrow::datatypes::DataType::Utf8,
+                                true,
+                            ),
+                        ])),
+                        true,
+                    ),
                 )
                 .expect("channel"),
             ])

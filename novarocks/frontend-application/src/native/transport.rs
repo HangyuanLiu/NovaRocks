@@ -799,3 +799,7 @@ mod routing_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "eager_tls_reconnect_tests.rs"]
+mod eager_tls_reconnect_tests;

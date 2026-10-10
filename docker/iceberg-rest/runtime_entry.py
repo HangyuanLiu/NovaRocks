@@ -248,6 +248,21 @@ mv_refresh_scheduler_max_concurrent = 1
 mv_refresh_scheduler_failure_backoff_ms = 500
 mv_refresh_scheduler_max_failure_backoff_ms = 2000
 '''
+        if role == "fe":
+            value += '''
+[runtime.frontend_constant_policy]
+# Explicit author limits; these are not allocation grants or inferred defaults.
+max_rows = 1048576
+max_array_nodes = 1048576
+max_logical_elements = 16777216
+max_retained_buffer_bytes = 1073741824
+max_type_depth = 64
+max_type_nodes = 4096
+max_dictionary_depth = 64
+max_metadata_bytes = 1048576
+max_library_validation_work = 1073741824
+max_library_validation_bytes = 4294967296
+'''
         purpose = "metadata" if role == "fe" else "data"
         value += f'''\n[[connector.credentials]]
 purpose = "object-store-{purpose}"

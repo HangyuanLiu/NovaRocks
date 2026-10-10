@@ -18,7 +18,8 @@ use arrow_buffer::i256;
 
 #[derive(Clone, Debug)]
 pub(super) struct SumIntState {
-    pub(super) sum: i64,
+    /// Exact: an i64 SUM only overflows when its result is built.
+    pub(super) sum: i128,
     pub(super) has_value: bool,
 }
 

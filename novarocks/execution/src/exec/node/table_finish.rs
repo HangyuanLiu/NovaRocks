@@ -61,10 +61,28 @@ pub struct TableFinishNode {
 }
 
 /// Runtime validation authority for a single Task instance of TableFinish.
-pub(crate) struct TableFinishRuntimeBinding {
-    pub fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
+pub struct TableFinishRuntimeBinding {
+    pub(crate) fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>,
     #[cfg(debug_assertions)]
-    pub aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
+    pub(crate) aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
+}
+
+impl TableFinishRuntimeBinding {
+    /// One Task's validation authority for one compiled finish.
+    pub fn new(fragment_validator: Arc<dyn ConnectorCommitFragmentCarrierValidator>) -> Self {
+        Self {
+            fragment_validator,
+            #[cfg(debug_assertions)]
+            aggregate_guard: Arc::new(AllowTableWriteAggregates),
+        }
+    }
+
+    /// Bind the application-owned, query-scoped aggregate rejection guard.
+    #[cfg(debug_assertions)]
+    pub fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateGuard>) -> Self {
+        self.aggregate_guard = guard;
+        self
+    }
 }
 
 impl TableFinishNode {

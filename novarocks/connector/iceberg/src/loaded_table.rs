@@ -980,6 +980,57 @@ impl IcebergAttemptTableAccess {
         }
     }
 
+    /// The COW author borrows the loaded SDK table and shares its metadata.
+    /// Every new identifier/renewal buffer is admitted before its clone.
+    pub(crate) fn freeze_with_original_scope(
+        table: &IcebergPhysicalTable,
+        scope: &crate::commit::write_stack::control::cow_begin::CowBeginScope<'_>,
+    ) -> Result<Arc<Self>, novarocks_spi::connector::ConnectorCowBeginCause> {
+        use crate::commit::write_stack::control::cow_begin::{add, mul};
+        use std::mem::size_of;
+        let id = table.table.identifier();
+        let mut upper = (size_of::<Self>() + 2 * size_of::<usize>()) as u64;
+        upper = add(upper, id.name.len() as u64)?;
+        upper = add(
+            upper,
+            mul(
+                id.namespace.as_ref().len() as u64,
+                size_of::<String>() as u64,
+            )?,
+        )?;
+        for name in id.namespace.as_ref() {
+            scope.active()?;
+            upper = add(upper, name.len() as u64)?;
+        }
+        if let Some(location) = table.table.metadata_location() {
+            upper = add(upper, location.len() as u64)?;
+        }
+        let prefixes = match &table.attempt_access {
+            Some(IcebergVendedS3RenewalCapability::CredentialsEndpoint(scope)) => {
+                scope.prefixes.len()
+            }
+            Some(IcebergVendedS3RenewalCapability::LoadTableDelegation(scope)) => {
+                scope.prefixes.len()
+            }
+            None => 0,
+        };
+        upper = add(
+            upper,
+            mul(
+                prefixes as u64,
+                size_of::<StorageCredentialScopePrefix>() as u64,
+            )?,
+        )?;
+        scope.reserve(upper)?;
+        Ok(Arc::new(Self {
+            identifier: id.clone(),
+            metadata: table.table.metadata_ref(),
+            metadata_location: table.table.metadata_location().map(str::to_owned),
+            readonly: table.table.readonly(),
+            renewal: table.attempt_access_if_vended(),
+        }))
+    }
+
     pub(crate) fn identifier(&self) -> &crate::iceberg::TableIdent {
         &self.identifier
     }

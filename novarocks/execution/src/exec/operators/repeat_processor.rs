@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -171,9 +173,11 @@ impl ProcessorOperator for RepeatProcessorOperator {
         self.input.is_some() && self.repeat_idx < self.repeat_times
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if !self.need_input() {
-            return Err("repeat push_chunk called when operator does not need input".to_string());
+            return Err("repeat push_chunk called when operator does not need input"
+                .to_string()
+                .into());
         }
         self.validate_config()?;
 
@@ -200,7 +204,7 @@ impl ProcessorOperator for RepeatProcessorOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         if !self.has_output() {
             return Ok(None);
         }
@@ -267,7 +271,7 @@ impl ProcessorOperator for RepeatProcessorOperator {
         ))
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         self.finishing = true;
         if self.input.is_none() && !self.emit_empty_once {
             self.finished = true;

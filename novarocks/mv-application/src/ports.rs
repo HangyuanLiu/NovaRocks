@@ -41,6 +41,7 @@ pub enum MvProviderFailureKind {
 pub struct MvProviderFailure {
     kind: MvProviderFailureKind,
     message: String,
+    compile_control: Option<novarocks_type_contract::CompileControlError>,
 }
 
 impl MvProviderFailure {
@@ -48,7 +49,21 @@ impl MvProviderFailure {
         Self {
             kind,
             message: message.into(),
+            compile_control: None,
         }
+    }
+
+    pub fn with_compile_control(
+        mut self,
+        error: Option<novarocks_type_contract::CompileControlError>,
+    ) -> Self {
+        self.compile_control = error;
+        self
+    }
+    pub const fn compile_control_error(
+        &self,
+    ) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control
     }
 
     pub const fn kind(&self) -> MvProviderFailureKind {
@@ -73,7 +88,7 @@ impl MvProviderFailure {
             MvProviderFailureKind::TargetReplaced => MvProductErrorKind::TargetReplaced,
             MvProviderFailureKind::Corruption => MvProductErrorKind::Corruption,
         };
-        MvProductError::new(kind, self.message)
+        MvProductError::new(kind, self.message).with_compile_control(self.compile_control)
     }
 }
 
@@ -225,5 +240,28 @@ mod tests {
             .into_product_error();
         assert_eq!(error.kind(), MvProductErrorKind::CommitUnknown);
         assert_eq!(error.message(), "lost reply");
+    }
+    #[test]
+    fn provider_control_cause_does_not_replace_commit_disposition() {
+        use novarocks_type_contract::CompileControlError;
+        for control in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for kind in [
+                MvProviderFailureKind::CommitUnknown,
+                MvProviderFailureKind::InvalidRequest,
+            ] {
+                let ordinary =
+                    MvProviderFailure::new(kind, control.to_string()).into_product_error();
+                let typed = MvProviderFailure::new(kind, control.to_string())
+                    .with_compile_control(Some(control))
+                    .into_product_error();
+                assert_eq!(typed.kind(), ordinary.kind());
+                assert_eq!(typed.compile_control_error(), Some(control));
+                assert_eq!(ordinary.compile_control_error(), None);
+            }
+        }
     }
 }

@@ -45,20 +45,10 @@ pub fn eval_append_trailing_char_if_absent(
         }
         let s = s_arr.value(i);
         let ch = c_arr.value(i);
-        if ch.len() != 1 {
-            out.push(None);
-            continue;
-        }
-        let trailing = ch.as_bytes()[0];
-        let s_bytes = s.as_bytes();
-        if s_bytes.is_empty() || s_bytes[s_bytes.len() - 1] == trailing {
-            out.push(Some(s.to_string()));
-        } else {
-            let mut v = String::with_capacity(s.len() + 1);
-            v.push_str(s);
-            v.push_str(ch);
-            out.push(Some(v));
-        }
+        out.push(
+            novarocks_functions::append_trailing_core::plan(s, ch)
+                .map(novarocks_functions::append_trailing_core::render_original),
+        );
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }

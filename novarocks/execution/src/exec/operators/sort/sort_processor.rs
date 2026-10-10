@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::sync::Arc;
 
 use crate::exec::chunk::Chunk;
@@ -254,13 +256,15 @@ impl ProcessorOperator for SortProcessorOperator {
         self.pending_output.is_some()
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }
         self.init_profile_if_needed();
         if self.pending_output.is_some() {
-            return Err("sort received input while output buffer is full".to_string());
+            return Err("sort received input while output buffer is full"
+                .to_string()
+                .into());
         }
         if !chunk.is_empty() {
             let chunk_bytes = i64::try_from(chunk.estimated_bytes()).unwrap_or(i64::MAX);
@@ -273,7 +277,7 @@ impl ProcessorOperator for SortProcessorOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         let out = self.pending_output.take();
         if self.finishing && self.pending_output.is_none() {
             self.finished = true;
@@ -281,7 +285,7 @@ impl ProcessorOperator for SortProcessorOperator {
         Ok(out)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         if self.finishing || self.finished {
             return Ok(());
         }

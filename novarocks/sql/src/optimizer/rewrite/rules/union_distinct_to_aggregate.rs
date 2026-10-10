@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compiler::SqlCompileError;
 use crate::optimizer::logical_props::make_column_ref_expr;
 use crate::optimizer::operator::{AggregateOutputLayout, LogicalAggregateOp, Operator, UnionOp};
 use crate::optimizer::opt_expr::OptExpr;
@@ -46,7 +47,11 @@ impl LogicalRewriteRule for UnionDistinctToAggregate {
         matches!(&expr.op, Operator::LogicalUnion(op) if !op.all)
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             children,
@@ -69,8 +74,8 @@ impl LogicalRewriteRule for UnionDistinctToAggregate {
             let mut arena = arena.borrow_mut();
             output_columns
                 .iter()
-                .map(|column| make_column_ref_expr(&mut arena, column))
-                .collect()
+                .map(|column| make_column_ref_expr(&mut arena, column, &ctx.control_view()))
+                .collect::<Result<Vec<_>, _>>()?
         };
         let aggregate = LogicalAggregateOp::single(
             group_by,
@@ -116,8 +121,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             is_internal: false,
         }
     }

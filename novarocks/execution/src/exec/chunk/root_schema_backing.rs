@@ -27,6 +27,92 @@ use std::sync::atomic::AtomicUsize;
 use arrow::datatypes::{DataType, FieldRef, Fields, SchemaRef, TimeUnit};
 use novarocks_result_contract::RootProfileV1;
 use novarocks_types::arrow_metadata_owner::{FieldMetadataOrigins, MetadataOwnedSchema};
+use novarocks_type_contract::owned_resources::metadata_materialization::{
+    MetadataFieldLoan, MetadataMaterializationError, SharedMaterializedSchema,
+};
+
+/// Borrowed, positively authored namespaces. No content equality or numerical
+/// conversion between independent construction receipts establishes identity.
+#[derive(Clone, Copy)]
+pub(crate) enum RootFieldSource<'a> {
+    M07(&'a FieldMetadataOrigins),
+    Original {
+        index: &'a [MetadataFieldLoan],
+        attached: Option<&'a FieldMetadataOrigins>,
+    },
+}
+impl RootFieldSource<'_> {
+    fn metadata_bytes_for(
+        self,
+        field: &FieldRef,
+        observe: &mut impl FnMut() -> Result<(), RootSchemaBackingError>,
+    ) -> Result<usize, RootSchemaBackingError> {
+        match self {
+            Self::M07(origins) => origins
+                .metadata_bytes_for(field)
+                .ok_or(RootSchemaBackingError::UnknownFieldMetadataOwner),
+            Self::Original { index, attached } => {
+                let pointer = std::sync::Arc::as_ptr(field) as usize;
+                if let Ok(at) =
+                    index.binary_search_by_key(&pointer, MetadataFieldLoan::original_address)
+                {
+                    return index[at]
+                        .original_backing_observed(field, observe)
+                        .ok_or(RootSchemaBackingError::UnknownFieldMetadataOwner)?;
+                }
+                // This is a second explicitly attached positive namespace, not
+                // a reconstruction from equal contents or an unknown table.
+                attached
+                    .and_then(|origins| origins.metadata_bytes_for(field))
+                    .ok_or(RootSchemaBackingError::UnknownFieldMetadataOwner)
+            }
+        }
+    }
+    fn same_index(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::M07(a), Self::M07(b)) => {
+                a.owners().as_ptr() == b.owners().as_ptr() && a.owners().len() == b.owners().len()
+            }
+            (
+                Self::Original {
+                    index: a,
+                    attached: x,
+                },
+                Self::Original {
+                    index: b,
+                    attached: y,
+                },
+            ) => {
+                a.as_ptr() == b.as_ptr()
+                    && a.len() == b.len()
+                    && match (x, y) {
+                        (None, None) => true,
+                        (Some(x), Some(y)) => {
+                            x.owners().as_ptr() == y.owners().as_ptr()
+                                && x.owners().len() == y.owners().len()
+                        }
+                        _ => false,
+                    }
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RootSchemaSource<'a> {
+    M07(&'a MetadataOwnedSchema),
+    Original(&'a SharedMaterializedSchema),
+}
+
+impl From<MetadataMaterializationError> for RootSchemaBackingError {
+    fn from(error: MetadataMaterializationError) -> Self {
+        match error {
+            MetadataMaterializationError::Arithmetic => Self::CapacityExceeded,
+            _ => Self::UnknownFieldMetadataOwner,
+        }
+    }
+}
 
 const MAX_BYTES: usize = 96 * 1024 * 1024;
 const MAX_AUXILIARY_NODES: usize = 65_536;
@@ -42,7 +128,7 @@ pub(crate) enum RootSchemaBackingError {
     WorkExceeded,
 }
 
-/// The exact header layout used by pinned Rust 1.92's ArcInner<T>:
+/// The exact header layout used by pinned Rust 1.98.1's ArcInner<T>:
 /// alloc/src/sync.rs, repr(C, align(2)), strong + weak + data. Layout extension
 /// also covers tail alignment and final padding, rather than guessing a size.
 #[repr(C, align(2))]
@@ -64,7 +150,7 @@ pub(crate) struct RootSchemaInspection<'a> {
     auxiliary_nodes: usize,
     // Keep the checked immutable backing alive by borrowing its owner. A raw
     // cached pointer alone could accept a later allocator address reuse.
-    inspected_origin_index: Option<&'a FieldMetadataOrigins>,
+    inspected_origin_index: Option<RootFieldSource<'a>>,
 }
 
 impl<'a> RootSchemaInspection<'a> {
@@ -140,10 +226,10 @@ impl<'a> RootSchemaInspection<'a> {
         self.charge_arc(owners)?;
         for owner in owners {
             self.enter_auxiliary_node(0)?;
-            self.field_own_heap(owner.field(), origins)?;
-            self.type_own_heap(owner.field().data_type(), origins, 0)?;
+            self.field_own_heap(owner.field(), RootFieldSource::M07(origins))?;
+            self.type_own_heap(owner.field().data_type(), RootFieldSource::M07(origins), 0)?;
         }
-        self.inspected_origin_index = Some(origins);
+        self.inspected_origin_index = Some(RootFieldSource::M07(origins));
         Ok(())
     }
 
@@ -156,9 +242,54 @@ impl<'a> RootSchemaInspection<'a> {
         owner: &MetadataOwnedSchema,
         origins: &FieldMetadataOrigins,
     ) -> Result<(), RootSchemaBackingError> {
-        let metadata = owner
-            .backing_bytes_for(schema)
-            .ok_or(RootSchemaBackingError::UnknownSchemaMetadataOwner)?;
+        self.inspect_schema_source(
+            schema,
+            RootSchemaSource::M07(owner),
+            RootFieldSource::M07(origins),
+        )
+    }
+
+    pub(crate) fn inspect_original_index(
+        &mut self,
+        index: &'a [MetadataFieldLoan],
+        attached: Option<&'a FieldMetadataOrigins>,
+    ) -> Result<(), RootSchemaBackingError> {
+        self.inspected_origin_index = None;
+        self.preflight_auxiliary(index.len())?;
+        if !index.is_sorted_by_key(MetadataFieldLoan::original_address) {
+            return Err(RootSchemaBackingError::UninspectedOriginIndex);
+        }
+        self.charge_arc(index)?;
+        let source = RootFieldSource::Original { index, attached };
+        for loan in index {
+            self.enter_auxiliary_node(0)?;
+            if let Some(field) = loan.borrow_original_field() {
+                self.field_own_heap(&field, source)?;
+                self.type_own_heap(field.data_type(), source, 0)?;
+            } else {
+                // Weak pins the complete ArcInner allocation after payload
+                // destruction, but no destroyed String/map/type heap remains.
+                self.charge_arc_layout(Layout::new::<arrow::datatypes::Field>())?;
+            }
+        }
+        self.inspected_origin_index = Some(source);
+        Ok(())
+    }
+
+    pub(crate) fn inspect_schema_source(
+        &mut self,
+        schema: &SchemaRef,
+        owner: RootSchemaSource<'_>,
+        origins: RootFieldSource<'_>,
+    ) -> Result<(), RootSchemaBackingError> {
+        let metadata = match owner {
+            RootSchemaSource::M07(owner) => owner
+                .backing_bytes_for(schema)
+                .ok_or(RootSchemaBackingError::UnknownSchemaMetadataOwner)?,
+            RootSchemaSource::Original(owner) => owner
+                .original_backing_observed(schema, &mut || self.enter_auxiliary_node(0))
+                .ok_or(RootSchemaBackingError::UnknownSchemaMetadataOwner)??,
+        };
         if schema.fields.len() > RootProfileV1::MAX_COLUMNS {
             return Err(RootSchemaBackingError::WorkExceeded);
         }
@@ -167,7 +298,7 @@ impl<'a> RootSchemaInspection<'a> {
         self.charge(metadata)?;
         self.charge_arc(&schema.fields[..])?;
         for field in &schema.fields {
-            self.inspect_field(field, origins)?;
+            self.inspect_field_at(field, origins, 0)?;
         }
         Ok(())
     }
@@ -177,7 +308,7 @@ impl<'a> RootSchemaInspection<'a> {
         field: &FieldRef,
         origins: &FieldMetadataOrigins,
     ) -> Result<(), RootSchemaBackingError> {
-        self.inspect_field_at(field, origins, 0)
+        self.inspect_field_at(field, RootFieldSource::M07(origins), 0)
     }
 
     /// Inspect only the borrowed DataType's own variable heaps and direct
@@ -190,11 +321,18 @@ impl<'a> RootSchemaInspection<'a> {
         data_type: &DataType,
         origins: &FieldMetadataOrigins,
     ) -> Result<(), RootSchemaBackingError> {
-        let owners = origins.owners();
-        if !self.inspected_origin_index.is_some_and(|inspected| {
-            let checked = inspected.owners();
-            checked.as_ptr() == owners.as_ptr() && checked.len() == owners.len()
-        }) {
+        self.inspect_data_type_source(data_type, RootFieldSource::M07(origins))
+    }
+
+    pub(crate) fn inspect_data_type_source(
+        &mut self,
+        data_type: &DataType,
+        origins: RootFieldSource<'_>,
+    ) -> Result<(), RootSchemaBackingError> {
+        if !self
+            .inspected_origin_index
+            .is_some_and(|checked| checked.same_index(origins))
+        {
             return Err(RootSchemaBackingError::UninspectedOriginIndex);
         }
         self.type_own_heap(data_type, origins, 0)
@@ -212,11 +350,9 @@ impl<'a> RootSchemaInspection<'a> {
     fn field_own_heap(
         &mut self,
         field: &FieldRef,
-        origins: &FieldMetadataOrigins,
+        origins: RootFieldSource<'_>,
     ) -> Result<(), RootSchemaBackingError> {
-        let metadata = origins
-            .metadata_bytes_for(field)
-            .ok_or(RootSchemaBackingError::UnknownFieldMetadataOwner)?;
+        let metadata = origins.metadata_bytes_for(field, &mut || self.enter_auxiliary_node(0))?;
         self.charge_arc(field.as_ref())?;
         self.charge(field.name().capacity())?;
         self.charge(metadata)
@@ -225,7 +361,7 @@ impl<'a> RootSchemaInspection<'a> {
     fn inspect_field_at(
         &mut self,
         field: &FieldRef,
-        origins: &FieldMetadataOrigins,
+        origins: RootFieldSource<'_>,
         depth: usize,
     ) -> Result<(), RootSchemaBackingError> {
         self.enter_tree_node(depth)?;
@@ -264,7 +400,7 @@ impl<'a> RootSchemaInspection<'a> {
     fn type_own_heap(
         &mut self,
         data_type: &DataType,
-        origins: &FieldMetadataOrigins,
+        origins: RootFieldSource<'_>,
         depth: usize,
     ) -> Result<(), RootSchemaBackingError> {
         self.enter_auxiliary_node(depth)?;
@@ -325,12 +461,28 @@ impl<'a> RootSchemaInspection<'a> {
     fn require_child(
         &mut self,
         child: &FieldRef,
-        origins: &FieldMetadataOrigins,
+        origins: RootFieldSource<'_>,
         depth: usize,
     ) -> Result<(), RootSchemaBackingError> {
         self.enter_auxiliary_node(depth)?;
-        if origins.metadata_bytes_for(child).is_none() {
-            return Err(RootSchemaBackingError::UnknownFieldMetadataOwner);
+        // Membership does not iterate or format unknown metadata. Exact
+        // source lookup alone proves the child's independent construction.
+        match origins {
+            RootFieldSource::M07(origins) => {
+                if origins.metadata_bytes_for(child).is_none() {
+                    return Err(RootSchemaBackingError::UnknownFieldMetadataOwner);
+                }
+            }
+            RootFieldSource::Original { index, attached } => {
+                let pointer = std::sync::Arc::as_ptr(child) as usize;
+                if index
+                    .binary_search_by_key(&pointer, MetadataFieldLoan::original_address)
+                    .is_err()
+                    && attached.and_then(|v| v.metadata_bytes_for(child)).is_none()
+                {
+                    return Err(RootSchemaBackingError::UnknownFieldMetadataOwner);
+                }
+            }
         }
         Ok(())
     }

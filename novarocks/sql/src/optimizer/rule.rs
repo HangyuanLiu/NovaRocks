@@ -54,7 +54,12 @@ pub(crate) trait Rule: Send + Sync {
     ///
     /// Takes `&mut Memo` so that rules creating intermediate groups (e.g. two-phase
     /// aggregation) can allocate new groups for their internal structure.
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr>;
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError>;
 
     /// Declarative match shape for the Memo binder. Default = root-only wildcard
     /// (`Pattern::Leaf`), so un-migrated rules behave exactly as today: the binder
@@ -75,9 +80,10 @@ pub(crate) trait Rule: Send + Sync {
         &self,
         binding: &crate::optimizer::binder::Binding,
         memo: &mut Memo,
-    ) -> Vec<NewExpr> {
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
         let root = binding.root_mexpr(memo).clone();
-        self.apply(&root, memo)
+        self.apply(&root, memo, control)
     }
 }
 
@@ -95,8 +101,15 @@ mod trait_default_tests {
         fn matches(&self, _op: &Operator) -> bool {
             true
         }
-        fn apply(&self, _expr: &MExpr, _memo: &mut Memo) -> Vec<NewExpr> {
-            vec![]
+        fn apply(
+            &self,
+            _expr: &MExpr,
+            _memo: &mut Memo,
+            control: &dyn novarocks_type_contract::PureCompileControl,
+        ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+            let _ = control;
+
+            Ok(vec![])
         }
     }
     #[test]

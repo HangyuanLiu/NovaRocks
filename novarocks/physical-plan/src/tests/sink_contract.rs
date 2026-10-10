@@ -385,6 +385,7 @@ fn finish_router_writer_fixture(
                     input: Box::from([imported]),
                     required_distribution: edge_distribution.clone(),
                     target_fields: Box::from([WriterTargetField {
+                        provider_name: "v".into(),
                         token: writer_token,
                         input: imported,
                         ty: ty(DataType::Int64, false),
@@ -546,6 +547,7 @@ fn finish_router_writer_fixture(
                         input: Box::from([local_input_value]),
                         required_distribution: Distribution::Singleton,
                         target_fields: Box::from([WriterTargetField {
+                            provider_name: "v".into(),
                             token: ConnectorWriteFieldToken::from_bytes([8; 32]),
                             input: local_input_value,
                             ty: ty(DataType::Int64, false),
@@ -1242,6 +1244,7 @@ fn independent_fragment_rejects_router_cut_projection_drift() {
             edge,
             kind: EdgeKind::ChangeStreamRouter,
             destination_fragment: FragmentId::new(722),
+            destination_node: NodeId::new(722),
             projection: Box::from([CutValue {
                 value: effect,
                 ty: ty(DataType::Int8, false),
@@ -1261,8 +1264,6 @@ fn independent_fragment_rejects_router_cut_projection_drift() {
             },
             change_stream_writer: None,
             writer_result: None,
-            source_bindings: Box::default(),
-            has_source_free_rows: false,
         }]),
         ..FragmentCuts::default()
     };

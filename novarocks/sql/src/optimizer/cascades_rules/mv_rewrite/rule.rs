@@ -87,9 +87,14 @@ impl Rule for MvRewriteRule {
         )
     }
 
-    fn apply(&self, expr: &MExpr, memo: &mut Memo) -> Vec<NewExpr> {
-        let Some((query, shape)) = SpjgDescriptor::from_memo(expr, memo) else {
-            return vec![];
+    fn apply(
+        &self,
+        expr: &MExpr,
+        memo: &mut Memo,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Vec<NewExpr>, crate::compiler::SqlCompileError> {
+        let Some((query, shape)) = SpjgDescriptor::from_memo(expr, memo, control)? else {
+            return Ok(vec![]);
         };
         let mut out = Vec::new();
         for (idx, cand) in self.candidates.iter().enumerate() {
@@ -99,11 +104,11 @@ impl Rule for MvRewriteRule {
                     continue;
                 }
             }
-            if let Some(alt) = try_rewrite(&query, &shape, cand, memo) {
+            if let Some(alt) = try_rewrite(&query, &shape, cand, memo, control)? {
                 out.push(alt);
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -155,32 +160,81 @@ fn remap_visible_outputs_to_layout(
         .collect()
 }
 
+macro_rules! candidate {
+    ($value:expr) => {
+        match $value {
+            Some(value) => value,
+            None => return Ok(None),
+        }
+    };
+}
+
 fn try_rewrite(
     query: &SpjgDescriptor,
     shape: &MatchedShape,
     cand: &MvRewriteCandidate,
     memo: &mut Memo,
-) -> Option<NewExpr> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<NewExpr>, crate::compiler::SqlCompileError> {
+    use crate::compiler::SqlCompileError;
+    use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+    let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
+    let result = try_rewrite_candidate(query, shape, cand, memo, control);
+    if matches!(
+        &result,
+        Err(SqlCompileError::Cancelled
+            | SqlCompileError::DeadlineExceeded
+            | SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
+    }
+    work.step()?;
+    work.finish()?;
+    result
+}
+
+fn try_rewrite_candidate(
+    query: &SpjgDescriptor,
+    shape: &MatchedShape,
+    cand: &MvRewriteCandidate,
+    memo: &mut Memo,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<NewExpr>, crate::compiler::SqlCompileError> {
+    macro_rules! binding_candidate {
+        ($value:expr) => {
+            match $value {
+                Ok(value) => value,
+                Err(
+                    error @ (crate::compiler::SqlCompileError::Cancelled
+                    | crate::compiler::SqlCompileError::DeadlineExceeded
+                    | crate::compiler::SqlCompileError::ResourceExhausted),
+                ) => return Err(error),
+                Err(_) => return Ok(None),
+            }
+        };
+    }
+
     if query.joins.is_some() || cand.mv.joins.is_some() {
-        return None;
+        return Ok(None);
     }
 
     // 1. Same physical base table (compare Iceberg identity, not names).
     if !same_iceberg_table(&query.table, &cand.mv.table) {
-        return None;
+        return Ok(None);
     }
     let q_names = query.base_name_of();
     let m_names = cand.mv.base_name_of();
 
     // 2. Predicate containment + compensation (still over base columns).
-    let containment = check_containment(
+    let containment = candidate!(check_containment(
         &query.predicates,
         &memo.scalars,
         &cand.mv.predicates,
         &cand.mv_scalars,
         &q_names,
         &m_names,
-    )?;
+        control,
+    )?);
 
     // 3. Allocate the MV scan: one new ColumnId per MV visible output,
     //    bound by NAME to the target table columns.
@@ -188,44 +242,71 @@ fn try_rewrite(
     let mut dims: Vec<(NormExpr, OutputColumn)> = Vec::new();
     let mut agg_cols: Vec<Option<OutputColumn>> = vec![None; cand.mv.outputs.len()];
     for (i, mv_out) in cand.mv.outputs.iter().enumerate() {
-        let col_def = cand
-            .target_table
-            .columns
-            .iter()
-            .find(|c| c.name == mv_out.name)?; // visible-by-name mapping (spec §5)
+        let col_def = candidate!(
+            cand.target_table
+                .columns
+                .iter()
+                .find(|c| c.name == mv_out.name)
+        ); // visible-by-name mapping (spec §5)
+        let value_type = candidate!(col_def.declared_value_type().ok());
+        let source_type = match &mv_out.expr {
+            SpjgOutputExpr::Dimension(expr) => cand.mv_scalars.value_type(*expr),
+            SpjgOutputExpr::Aggregate(call) => match &call.source.binding().selected.result_type {
+                novarocks_functions::FunctionResultType::Scalar(ty) => ty,
+                novarocks_functions::FunctionResultType::Relation(_) => return Ok(None),
+            },
+        };
+        let mut type_work = novarocks_type_contract::CompileCheckpoints::try_new(
+            control,
+            novarocks_type_contract::CompilePhase::LowerProgram,
+        )?;
+        let same_type = source_type
+            .exactly_equals_observed::<novarocks_functions::ConstantError>(&value_type, || {
+                type_work.step().map_err(Into::into)
+            })?;
+        type_work.finish()?;
+        if !same_type {
+            return Ok(None);
+        }
         let id = memo.factory.create(
             Some(cand.target_table.name.clone()),
             col_def.name.clone(),
-            col_def.data_type.clone(),
-            col_def.nullable,
+            value_type.clone(),
         );
         let oc = OutputColumn {
             column_id: id,
             name: col_def.name.clone(),
-            data_type: col_def.data_type.clone(),
-            nullable: col_def.nullable,
+            value_type,
+
             is_internal: false,
         };
         scan_columns.push(oc.clone());
         match &mv_out.expr {
             SpjgOutputExpr::Dimension(e) => {
-                dims.push((normalize(&cand.mv_scalars, *e, &m_names)?, oc));
+                dims.push((
+                    candidate!(normalize(&cand.mv_scalars, *e, &m_names, control)?),
+                    oc,
+                ));
             }
             SpjgOutputExpr::Aggregate(_) => agg_cols[i] = Some(oc),
         }
     }
-    let col_map = MvColumnMap::new(dims);
+    let col_map = candidate!(MvColumnMap::try_new(dims, control)?);
 
     // 4. Compensation predicates rewritten onto MV columns. For SPJG MVs
     //    they may only land on group-key columns (spec §6.3): aggregate
     //    columns are not row-filterable. MvColumnMap only contains
     //    Dimension outputs, so any compensation touching an aggregate
     //    column simply fails to rewrite -> candidate dropped.
-    let compensation: Vec<ScalarId> = containment
-        .compensation
-        .iter()
-        .map(|p| col_map.rewrite(&mut memo.scalars, *p, &q_names))
-        .collect::<Option<Vec<_>>>()?;
+    let compensation: Vec<ScalarId> = candidate!(
+        containment
+            .compensation
+            .iter()
+            .map(|p| col_map.rewrite(&mut memo.scalars, *p, &q_names, control))
+            .map(Result::transpose)
+            .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+            .transpose()?
+    );
     let mut compensation_required_columns = HashSet::new();
     for predicate in &compensation {
         collect_required_columns(
@@ -236,13 +317,13 @@ fn try_rewrite(
     }
 
     // 5. Build the operator chain bottom-up.
-    let rewrite_selection = selected_candidate_marker(
+    let rewrite_selection = candidate!(selected_candidate_marker(
         &cand.mv_name,
         query,
         cand.selection
             .as_ref()
             .expect("MV rewrite rule retains only publication-proven candidates"),
-    )?;
+    ));
     let scan_group = memo.new_group(MExpr {
         id: memo.next_expr_id(),
         op: Operator::LogicalScan(ScanOp {
@@ -260,7 +341,11 @@ fn try_rewrite(
     });
     let mut child_group = scan_group;
     if !compensation.is_empty() {
-        let predicate = scalar_expr::combine_conjuncts(&mut memo.scalars, compensation)?;
+        let predicate = candidate!(scalar_expr::combine_conjuncts(
+            &mut memo.scalars,
+            compensation,
+            control
+        )?);
         child_group = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::LogicalFilter(FilterOp { predicate }),
@@ -269,25 +354,34 @@ fn try_rewrite(
     }
 
     // 6. Top operator: reproduce the matched group's output ColumnIds.
-    match (shape, &cand.mv.aggregate) {
+    Ok(match (shape, &cand.mv.aggregate) {
         // SPJ query on SPJ MV: Project binding original output ids.
         (MatchedShape::Spj, None) => {
-            let items = query
-                .outputs
-                .iter()
-                .map(|o| {
-                    let SpjgOutputExpr::Dimension(e) = &o.expr else {
-                        return None;
-                    };
-                    let expr = col_map.rewrite(&mut memo.scalars, *e, &q_names)?;
-                    Some(project_item(
-                        &mut memo.scalars,
-                        expr,
-                        o.name.clone(),
-                        o.column_id,
-                    ))
-                })
-                .collect::<Option<Vec<_>>>()?;
+            let items = candidate!(
+                query
+                    .outputs
+                    .iter()
+                    .map(|o| {
+                        let SpjgOutputExpr::Dimension(e) = &o.expr else {
+                            return Ok(None);
+                        };
+                        let expr = candidate!(col_map.rewrite(
+                            &mut memo.scalars,
+                            *e,
+                            &q_names,
+                            control
+                        )?);
+                        Ok(Some(project_item(
+                            &mut memo.scalars,
+                            expr,
+                            o.name.clone(),
+                            o.column_id,
+                        )))
+                    })
+                    .map(Result::transpose)
+                    .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                    .transpose()?
+            );
             let mut required_columns = compensation_required_columns.clone();
             collect_project_required_columns(&memo.scalars, &items, &mut required_columns);
             set_mv_scan_required_columns(memo, scan_group, &scan_columns, &required_columns);
@@ -303,16 +397,30 @@ fn try_rewrite(
         (MatchedShape::Spj, Some(_)) => None,
         // SPJG query on SPJ MV: keep the query aggregate, args rewritten.
         (MatchedShape::Spjg { original_agg }, None) => {
-            let group_by = original_agg
-                .group_by
-                .iter()
-                .map(|expr| col_map.rewrite(&mut memo.scalars, *expr, &q_names))
-                .collect::<Option<Vec<_>>>()?;
-            let aggregates = original_agg
-                .aggregates
-                .iter()
-                .map(|c| rewrite_aggregate_to_mv(&mut memo.scalars, c, &col_map, &q_names))
-                .collect::<Option<Vec<_>>>()?;
+            let group_by = candidate!(
+                original_agg
+                    .group_by
+                    .iter()
+                    .map(|expr| col_map.rewrite(&mut memo.scalars, *expr, &q_names, control))
+                    .map(Result::transpose)
+                    .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                    .transpose()?
+            );
+            let aggregates = candidate!(
+                original_agg
+                    .aggregates
+                    .iter()
+                    .map(|c| rewrite_aggregate_to_mv(
+                        &mut memo.scalars,
+                        c,
+                        &col_map,
+                        &q_names,
+                        control
+                    ))
+                    .map(Result::transpose)
+                    .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                    .transpose()?
+            );
             let mut required_columns = compensation_required_columns.clone();
             for expr in &group_by {
                 collect_required_columns(&memo.scalars, *expr, &mut required_columns);
@@ -335,7 +443,7 @@ fn try_rewrite(
         }
         // SPJG query on SPJG MV: direct mapping or rollup.
         (MatchedShape::Spjg { original_agg }, Some(mv_agg)) => {
-            let plan = plan_rollup(
+            let plan = candidate!(plan_rollup(
                 &original_agg.group_by,
                 &original_agg.aggregates,
                 &memo.scalars,
@@ -344,28 +452,45 @@ fn try_rewrite(
                 &cand.mv.outputs,
                 &cand.mv_scalars,
                 &m_names,
-            )?;
+                control,
+            )?);
             match plan.kind {
                 RollupKind::Direct => {
                     // One row per group already: Project binding the original
                     // visible output ids.
                     let mut items: Vec<ScalarProjectItem> = Vec::new();
                     for oc in &original_agg.output_columns {
-                        let expr = match aggregate_output_position(
+                        let expr = match candidate!(aggregate_output_position(
                             &original_agg.output_layout,
                             oc.column_id,
-                        )? {
-                            AggregateOutputPosition::GroupKey(idx) => col_map.rewrite(
+                        )) {
+                            AggregateOutputPosition::GroupKey(idx) => candidate!(col_map.rewrite(
                                 &mut memo.scalars,
                                 original_agg.group_by[idx],
                                 &q_names,
-                            )?,
+                                control
+                            )?),
                             AggregateOutputPosition::Aggregate(idx) => {
                                 let item = &plan.items[idx];
-                                let mv_col = agg_cols[item.mv_output_index].clone()?;
-                                column_ref(&mut memo.scalars, &mv_col)
+                                let mv_col = candidate!(agg_cols[item.mv_output_index].clone());
+                                column_ref(&mut memo.scalars, &mv_col, control)?
                             }
                         };
+                        let mut type_work = novarocks_type_contract::CompileCheckpoints::try_new(
+                            control,
+                            novarocks_type_contract::CompilePhase::LowerProgram,
+                        )?;
+                        let same_type = memo
+                            .scalars
+                            .value_type(expr)
+                            .exactly_equals_observed::<novarocks_functions::ConstantError>(
+                            &oc.value_type,
+                            || type_work.step().map_err(Into::into),
+                        )?;
+                        type_work.finish()?;
+                        if !same_type {
+                            return Ok(None);
+                        }
                         items.push(project_item(
                             &mut memo.scalars,
                             expr,
@@ -390,57 +515,111 @@ fn try_rewrite(
                     })
                 }
                 RollupKind::Rollup => {
-                    let group_by = original_agg
-                        .group_by
-                        .iter()
-                        .map(|expr| col_map.rewrite(&mut memo.scalars, *expr, &q_names))
-                        .collect::<Option<Vec<_>>>()?;
+                    let group_by = candidate!(
+                        original_agg
+                            .group_by
+                            .iter()
+                            .map(|expr| col_map.rewrite(
+                                &mut memo.scalars,
+                                *expr,
+                                &q_names,
+                                control
+                            ))
+                            .map(Result::transpose)
+                            .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                            .transpose()?
+                    );
                     let needs_coalesce = plan.items.iter().any(|i| i.needs_coalesce);
-                    // Aggregate outputs: reuse original ids directly unless a
-                    // COALESCE wrapper project is needed (then mint fresh ids
-                    // for the aggregate and bind originals in the project).
-                    let mut aggregate_columns =
-                        original_agg.output_layout.aggregate_columns.clone();
-                    if needs_coalesce {
-                        for oc in &mut aggregate_columns {
-                            oc.column_id = memo.factory.create(
-                                None,
-                                oc.name.clone(),
-                                oc.data_type.clone(),
-                                oc.nullable,
-                            );
+                    // The visible query layout must already describe its
+                    // exact expression/binding sources. A rollup cannot repair
+                    // a foreign published type by retaining its column id.
+                    for (expr, output) in group_by
+                        .iter()
+                        .zip(&original_agg.output_layout.group_key_columns)
+                    {
+                        if !same_output_type(
+                            memo.scalars.value_type(*expr),
+                            &output.value_type,
+                            control,
+                        )? {
+                            return Ok(None);
                         }
                     }
-                    let output_layout = AggregateOutputLayout::new(
-                        original_agg.output_layout.group_key_columns.clone(),
-                        aggregate_columns,
-                    );
-                    let aggregates = plan
-                        .items
-                        .iter()
-                        .enumerate()
-                        .map(|(idx, item)| {
-                            let mv_col = agg_cols[item.mv_output_index].clone()?;
-                            let arg = column_ref(&mut memo.scalars, &mv_col);
-                            let resolved = crate::optimizer::scalar::resolve_aggregate_binding(
+                    let mut aggregate_columns = Vec::new();
+                    let mut aggregates = Vec::new();
+                    for (idx, item) in plan.items.iter().enumerate() {
+                        let original_column = &original_agg.output_layout.aggregate_columns[idx];
+                        let original_result = match &original_agg.aggregates[idx]
+                            .source
+                            .binding()
+                            .selected
+                            .result_type
+                        {
+                            novarocks_functions::FunctionResultType::Scalar(ty) => ty,
+                            novarocks_functions::FunctionResultType::Relation(_) => {
+                                return Ok(None);
+                            }
+                        };
+                        if !same_output_type(original_result, &original_column.value_type, control)?
+                        {
+                            return Ok(None);
+                        }
+                        let mv_col = candidate!(agg_cols[item.mv_output_index].clone());
+                        let arg = column_ref(&mut memo.scalars, &mv_col, control)?;
+                        let resolved = binding_candidate!(
+                            crate::optimizer::scalar::resolve_aggregate_binding(
                                 memo.function_catalog(),
                                 &memo.scalars,
                                 item.rollup_fn,
                                 &[arg],
                                 &[],
                                 true,
+                                original_agg.aggregates[idx]
+                                    .source
+                                    .binding()
+                                    .decimal_overflow_policy(),
+                                control,
                             )
-                            .ok()?;
-                            Some(ScalarAggregateSpec {
-                                output_column_id: output_layout.aggregate_columns[idx].column_id,
-                                name: item.rollup_fn.to_string(),
-                                args: vec![arg],
-                                distinct: false,
-                                order_by: vec![],
+                        );
+                        let result_type = match &resolved.selected.result_type {
+                            novarocks_functions::FunctionResultType::Scalar(ty) => ty,
+                            novarocks_functions::FunctionResultType::Relation(_) => {
+                                return Ok(None);
+                            }
+                        };
+                        // SUM used for scalar COUNT may produce successful
+                        // NULL before COALESCE. Only its selected owner can
+                        // author that temporary column's complete value type.
+                        if !item.needs_coalesce
+                            && !same_output_type(result_type, &original_column.value_type, control)?
+                        {
+                            return Ok(None);
+                        }
+                        let mut column = original_column.clone();
+                        column.value_type = result_type.clone();
+                        if needs_coalesce {
+                            column.column_id = memo.factory.create(
+                                None,
+                                column.name.clone(),
+                                column.value_type.clone(),
+                            );
+                        }
+                        aggregates.push(ScalarAggregateSpec {
+                            output_column_id: column.column_id,
+                            name: item.rollup_fn.to_string(),
+                            distinct: false,
+                            source: crate::binding::AggregateArgumentSource::logical_update(
+                                vec![arg],
+                                vec![],
                                 resolved,
-                            })
-                        })
-                        .collect::<Option<Vec<_>>>()?;
+                            ),
+                        });
+                        aggregate_columns.push(column);
+                    }
+                    let output_layout = AggregateOutputLayout::new(
+                        original_agg.output_layout.group_key_columns.clone(),
+                        aggregate_columns,
+                    );
                     let mut required_columns = compensation_required_columns.clone();
                     for expr in &group_by {
                         collect_required_columns(&memo.scalars, *expr, &mut required_columns);
@@ -458,11 +637,34 @@ fn try_rewrite(
                         &scan_columns,
                         &required_columns,
                     );
-                    let aggregate_visible_outputs = remap_visible_outputs_to_layout(
-                        &original_agg.output_columns,
-                        &original_agg.output_layout,
-                        &output_layout,
-                    )?;
+                    let mut aggregate_visible_outputs =
+                        candidate!(remap_visible_outputs_to_layout(
+                            &original_agg.output_columns,
+                            &original_agg.output_layout,
+                            &output_layout,
+                        ));
+                    for (output, original) in aggregate_visible_outputs
+                        .iter_mut()
+                        .zip(&original_agg.output_columns)
+                    {
+                        let (source, target) = match candidate!(aggregate_output_position(
+                            &original_agg.output_layout,
+                            original.column_id,
+                        )) {
+                            AggregateOutputPosition::GroupKey(idx) => (
+                                &original_agg.output_layout.group_key_columns[idx],
+                                &output_layout.group_key_columns[idx],
+                            ),
+                            AggregateOutputPosition::Aggregate(idx) => (
+                                &original_agg.output_layout.aggregate_columns[idx],
+                                &output_layout.aggregate_columns[idx],
+                            ),
+                        };
+                        if !same_output_type(&original.value_type, &source.value_type, control)? {
+                            return Ok(None);
+                        }
+                        output.value_type = target.value_type.clone();
+                    }
                     let agg_op = Operator::LogicalAggregate(LogicalAggregateOp::single(
                         group_by,
                         aggregates,
@@ -470,10 +672,10 @@ fn try_rewrite(
                         aggregate_visible_outputs,
                     ));
                     if !needs_coalesce {
-                        return Some(NewExpr {
+                        return Ok(Some(NewExpr {
                             op: agg_op,
                             children: vec![child_group],
-                        });
+                        }));
                     }
                     // Scalar COUNT rollup: wrap with COALESCE(sum, 0).
                     let agg_group = memo.new_group(MExpr {
@@ -482,44 +684,59 @@ fn try_rewrite(
                         children: vec![child_group],
                     });
                     let function_catalog = memo.function_catalog().snapshot();
-                    let items: Vec<ScalarProjectItem> = original_agg
-                        .output_columns
-                        .iter()
-                        .map(|oc| {
-                            let expr = match aggregate_output_position(
-                                &original_agg.output_layout,
-                                oc.column_id,
-                            )? {
-                                AggregateOutputPosition::GroupKey(idx) => column_ref(
-                                    &mut memo.scalars,
-                                    &output_layout.group_key_columns[idx],
-                                ),
-                                AggregateOutputPosition::Aggregate(idx) => {
-                                    let inner = column_ref(
+                    let items: Vec<ScalarProjectItem> =
+                        candidate!(
+                        original_agg
+                            .output_columns
+                            .iter()
+                            .map(|oc| {
+                                let expr = match candidate!(aggregate_output_position(
+                                    &original_agg.output_layout,
+                                    oc.column_id,
+                                )) {
+                                    AggregateOutputPosition::GroupKey(idx) => column_ref(
                                         &mut memo.scalars,
-                                        &output_layout.aggregate_columns[idx],
-                                    );
-                                    if plan.items[idx].needs_coalesce {
-                                        coalesce_zero(
-                                            function_catalog.as_ref(),
+                                        &output_layout.group_key_columns[idx],
+                                        control,
+                                    )?,
+                                    AggregateOutputPosition::Aggregate(idx) => {
+                                        let inner = column_ref(
                                             &mut memo.scalars,
-                                            inner,
-                                            oc,
-                                        )
-                                        .ok()?
-                                    } else {
-                                        inner
+                                            &output_layout.aggregate_columns[idx],
+                                            control,
+                                        )?;
+                                        if plan.items[idx].needs_coalesce {
+                                            binding_candidate!(coalesce_zero(
+                                                function_catalog.as_ref(),
+                                                &mut memo.scalars,
+                                                inner,
+                                                oc,
+                                                original_agg.aggregates[idx].source.binding()
+                                                    .decimal_overflow_policy(),
+                                                control,
+                                            ))
+                                        } else {
+                                            inner
+                                        }
                                     }
+                                };
+                                if !same_output_type(
+                                    memo.scalars.value_type(expr),
+                                    &oc.value_type,
+                                    control,
+                                )? {
+                                    return Ok(None);
                                 }
-                            };
-                            Some(project_item(
-                                &mut memo.scalars,
-                                expr,
-                                oc.name.clone(),
-                                oc.column_id,
-                            ))
-                        })
-                        .collect::<Option<Vec<_>>>()?;
+                                Ok(Some(project_item(
+                                    &mut memo.scalars,
+                                    expr,
+                                    oc.name.clone(),
+                                    oc.column_id,
+                                )))
+                            })
+                            .map(Result::transpose)
+                            .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+                    )?;
                     Some(NewExpr {
                         op: Operator::LogicalProject(ProjectOp {
                             items,
@@ -530,7 +747,7 @@ fn try_rewrite(
                 }
             }
         }
-    }
+    })
 }
 
 fn selected_candidate_marker(
@@ -568,12 +785,16 @@ fn selected_candidate_marker(
     ))
 }
 
-fn column_ref(arena: &mut ScalarArena, c: &OutputColumn) -> ScalarId {
+fn column_ref(
+    arena: &mut ScalarArena,
+    c: &OutputColumn,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     arena.remember_project_output_display(c.column_id, None, c.name.clone());
-    arena.intern(
+    arena.intern_observed(
         ScalarNode::ColumnRef(c.column_id),
-        c.data_type.clone(),
-        c.nullable,
+        c.value_type.clone(),
+        control,
     )
 }
 
@@ -619,10 +840,10 @@ fn collect_aggregate_required_columns(
     aggregate: &ScalarAggregateSpec,
     out: &mut HashSet<ColumnId>,
 ) {
-    for arg in &aggregate.args {
+    for arg in aggregate.source.arguments() {
         collect_required_columns(arena, *arg, out);
     }
-    for key in &aggregate.order_by {
+    for key in aggregate.source.order_by() {
         collect_required_columns(arena, key.expr, out);
     }
 }
@@ -652,23 +873,35 @@ fn rewrite_aggregate_to_mv(
     call: &ScalarAggregateSpec,
     col_map: &MvColumnMap,
     query_base_names: &std::collections::HashMap<crate::column_id::ColumnId, String>,
-) -> Option<ScalarAggregateSpec> {
-    Some(ScalarAggregateSpec {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<ScalarAggregateSpec>, crate::compiler::SqlCompileError> {
+    let arguments = candidate!(
+        call.source
+            .arguments()
+            .iter()
+            .map(|arg| col_map.rewrite(arena, *arg, query_base_names, control))
+            .map(Result::transpose)
+            .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+            .transpose()?
+    );
+    let order_by = candidate!(
+        call.source
+            .order_by()
+            .iter()
+            .map(|key| rewrite_sort_key(arena, key, col_map, query_base_names, control))
+            .map(Result::transpose)
+            .collect::<Option<Result<Vec<_>, crate::compiler::SqlCompileError>>>()
+            .transpose()?
+    );
+    Ok(Some(ScalarAggregateSpec {
         output_column_id: call.output_column_id,
         name: call.name.clone(),
-        args: call
-            .args
-            .iter()
-            .map(|arg| col_map.rewrite(arena, *arg, query_base_names))
-            .collect::<Option<Vec<_>>>()?,
         distinct: call.distinct,
-        order_by: call
-            .order_by
-            .iter()
-            .map(|key| rewrite_sort_key(arena, key, col_map, query_base_names))
-            .collect::<Option<Vec<_>>>()?,
-        resolved: call.resolved.clone(),
-    })
+        source: call.source.try_rewrite_parts(
+            |_| Ok::<_, crate::compiler::SqlCompileError>(arguments),
+            |_| Ok::<_, crate::compiler::SqlCompileError>(order_by),
+        )?,
+    }))
 }
 
 fn rewrite_sort_key(
@@ -676,13 +909,40 @@ fn rewrite_sort_key(
     key: &SortKey,
     col_map: &MvColumnMap,
     query_base_names: &std::collections::HashMap<crate::column_id::ColumnId, String>,
-) -> Option<SortKey> {
-    Some(SortKey {
-        expr: col_map.rewrite(arena, key.expr, query_base_names)?,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<SortKey>, crate::compiler::SqlCompileError> {
+    Ok(Some(SortKey {
+        expr: candidate!(col_map.rewrite(arena, key.expr, query_base_names, control)?),
         asc: key.asc,
         nulls_first: key.nulls_first,
         display: key.display.clone(),
-    })
+    }))
+}
+
+fn same_output_type(
+    source: &novarocks_type_contract::FunctionValueType,
+    output: &novarocks_type_contract::FunctionValueType,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<bool, crate::compiler::SqlCompileError> {
+    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+        control,
+        novarocks_type_contract::CompilePhase::LowerProgram,
+    )?;
+    let result = source
+        .exactly_equals_observed::<novarocks_functions::ConstantError>(output, || {
+            work.step().map_err(Into::into)
+        })
+        .map_err(crate::compiler::SqlCompileError::from);
+    if matches!(
+        &result,
+        Err(crate::compiler::SqlCompileError::Cancelled
+            | crate::compiler::SqlCompileError::DeadlineExceeded
+            | crate::compiler::SqlCompileError::ResourceExhausted)
+    ) {
+        return result;
+    }
+    work.finish()?;
+    result
 }
 
 fn coalesce_zero(
@@ -690,20 +950,35 @@ fn coalesce_zero(
     arena: &mut ScalarArena,
     value: ScalarId,
     output: &OutputColumn,
-) -> Result<ScalarId, String> {
-    let zero = arena.intern(
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
+    let zero = arena.intern_observed(
         ScalarNode::Literal(HashableLiteral(LiteralValue::Int(0))),
-        output.data_type.clone(),
-        false,
-    );
+        novarocks_type_contract::FunctionValueType {
+            nullable: false,
+            ..output.value_type.clone()
+        },
+        control,
+    )?;
     let args = vec![value, zero];
     let binding = crate::optimizer::scalar::resolve_function_binding(
         function_catalog,
         arena,
         "coalesce",
         &args,
+        policy,
+        control,
     )?;
-    Ok(arena.intern(
+    let result_type = match &binding.selected.result_type {
+        novarocks_functions::FunctionResultType::Scalar(ty) => ty.clone(),
+        novarocks_functions::FunctionResultType::Relation(_) => {
+            return Err(crate::compiler::SqlCompileError::InvalidRequest(
+                "COUNT rollup COALESCE selected a relational result".into(),
+            ));
+        }
+    };
+    arena.intern_observed(
         ScalarNode::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
             name: "coalesce".to_string(),
@@ -711,9 +986,9 @@ fn coalesce_zero(
             distinct: false,
             binding,
         },
-        output.data_type.clone(),
-        false,
-    ))
+        result_type,
+        control,
+    )
 }
 
 /// Identity match on `(catalog, namespace, table)` only. `table_uuid` and the
@@ -768,17 +1043,31 @@ mod tests {
         let opt_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
             plan,
             &mut memo.scalars,
+            crate::optimizer::test_optimizer_control(),
         )
         .expect("logical plan to opt expr");
-        crate::optimizer::memo_copy::opt_expr_to_memo(&opt_expr, memo)
+        crate::optimizer::memo_copy::opt_expr_to_memo(
+            &opt_expr,
+            memo,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
     }
 
     fn spjg_descriptor_for_test(plan: &LogicalPlanNode) -> (SpjgDescriptor, ScalarArena) {
         let mut arena = ScalarArena::new();
-        let opt_expr =
-            crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(plan, &mut arena)
-                .expect("logical plan to opt expr");
-        let descriptor = SpjgDescriptor::from_opt_expr(&opt_expr, &mut arena).expect("mv spjg");
+        let opt_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
+            plan,
+            &mut arena,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("logical plan to opt expr");
+        let descriptor = SpjgDescriptor::from_opt_expr(
+            &opt_expr,
+            &mut arena,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("mv spjg");
         (descriptor, arena)
     }
 
@@ -786,8 +1075,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
             is_internal: false,
         }
     }
@@ -799,16 +1088,14 @@ mod tests {
                 qualifier: None,
                 column: c.name.clone(),
             },
-            data_type: c.data_type.clone(),
-            nullable: c.nullable,
+            value_type: c.value_type.clone(),
         }
     }
 
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -820,8 +1107,7 @@ mod tests {
                 right: Box::new(int_lit(v)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -833,8 +1119,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -846,8 +1131,7 @@ mod tests {
                 right: Box::new(int_lit(v)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -859,8 +1143,7 @@ mod tests {
                 right: Box::new(int_lit(v)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -872,8 +1155,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -954,24 +1236,28 @@ mod tests {
     fn sum_call(arg: &OutputColumn, out: &OutputColumn) -> AggregateCall {
         AggregateCall {
             name: "sum".to_string(),
-            args: vec![col_ref(arg)],
             distinct: false,
             result_type: DataType::Int64,
-            order_by: vec![],
             output_column_id: out.column_id,
-            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![col_ref(arg)],
+                vec![],
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            ),
         }
     }
 
     fn count_star(out: &OutputColumn) -> AggregateCall {
         AggregateCall {
             name: "count".to_string(),
-            args: vec![],
             distinct: false,
             result_type: DataType::Int64,
-            order_by: vec![],
             output_column_id: out.column_id,
-            resolved: crate::functions::test_resolved_aggregate("count", &[], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[], false),
+            ),
         }
     }
 
@@ -982,7 +1268,11 @@ mod tests {
     fn advance_factory(memo: &mut Memo, up_to: u32) {
         while memo
             .factory
-            .create(None, "pad".to_string(), DataType::Int64, true)
+            .create(
+                None,
+                "pad".to_string(),
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            )
             .0
             <= up_to
         {}
@@ -1112,6 +1402,157 @@ mod tests {
 
     // --- tests ------------------------------------------------------------
 
+    struct RefusingMvBindingControl(novarocks_type_contract::CompileControlError);
+    impl novarocks_type_contract::PureCompileControl for RefusingMvBindingControl {
+        fn checkpoint(
+            &self,
+            phase: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            if phase == novarocks_type_contract::CompilePhase::FunctionSpecialization {
+                Err(self.0)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn rollup_binding_control_is_fatal_instead_of_an_optional_candidate_miss() {
+        use novarocks_type_contract::CompileControlError;
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let s = col(3, "s");
+        let query_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&a)],
+                aggregates: vec![sum_call(&v, &s)],
+                output_columns: vec![a.clone(), s],
+                already_pushed: false,
+            }),
+            vec![LogicalPlanNode::new(
+                LogicalPlanKind::Filter(PlanFilterNode {
+                    predicate: ge(col_ref(&a), 10),
+                }),
+                vec![base_scan(&[a, v])],
+                None,
+            )],
+            None,
+        );
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let mut memo = test_memo();
+            let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+            advance_factory(&mut memo, 200);
+            let root_expr = memo.groups[root].logical_exprs[0].clone();
+            let rule = MvRewriteRule::new(vec![agg_candidate(0)]);
+            let result = rule.apply(&root_expr, &mut memo, &RefusingMvBindingControl(error));
+            assert!(
+                matches!(result, Err(ref actual) if actual == &crate::compiler::SqlCompileError::from(error)),
+                "the actual selected rollup owner must preserve {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rollup_candidate_miss_stops_before_a_later_binding_control_failure() {
+        use novarocks_functions::{EngineFunctionCatalogBuilder, FunctionKind};
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct AfterMissingOwnerControl {
+            checkpoints: AtomicUsize,
+            error: CompileControlError,
+        }
+        impl PureCompileControl for AfterMissingOwnerControl {
+            fn checkpoint(&self, phase: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                if phase == CompilePhase::FunctionSpecialization
+                    && self.checkpoints.fetch_add(1, Ordering::SeqCst) >= 2
+                {
+                    return Err(self.error);
+                }
+                Ok(())
+            }
+        }
+
+        let a = col(1, "a");
+        let v = col(2, "v");
+        let first = col(3, "first_sum");
+        let second = col(4, "second_sum");
+        let query_plan = LogicalPlanNode::new(
+            LogicalPlanKind::Aggregate(LogicalAggregateNode {
+                group_by: vec![col_ref(&a)],
+                aggregates: vec![sum_call(&v, &first), sum_call(&v, &second)],
+                output_columns: vec![a.clone(), first, second],
+                already_pushed: false,
+            }),
+            vec![base_scan(&[a, v])],
+            None,
+        );
+        // Both query channels can use the same actual materialized SUM output.
+        // This fixture isolates aggregate-owner lookup. Predicate syntax
+        // admission has its own specialization checkpoints and coverage.
+        let candidate = || {
+            let mut candidate = agg_candidate(0);
+            candidate.mv.predicates.clear();
+            candidate
+        };
+        let make_memo = || {
+            let mut memo = test_memo();
+            let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
+            advance_factory(&mut memo, 200);
+            (memo, root)
+        };
+        let (mut admitted, root) = make_memo();
+        let expression = admitted.groups[root].logical_exprs[0].clone();
+        assert_eq!(
+            MvRewriteRule::new(vec![candidate()])
+                .apply(
+                    &expression,
+                    &mut admitted,
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .unwrap()
+                .len(),
+            1,
+        );
+
+        let mut builder = EngineFunctionCatalogBuilder::new();
+        for definition in crate::functions::builtin_engine_function_catalog().definitions() {
+            if definition.canonical_name() != "sum" || definition.kind() != FunctionKind::Aggregate
+            {
+                builder.register(definition.clone()).unwrap();
+            }
+        }
+        let missing_sum = Arc::new(builder.seal().unwrap());
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let (mut memo, root) = make_memo();
+            memo.function_catalog = Some(missing_sum.clone());
+            let expression = memo.groups[root].logical_exprs[0].clone();
+            let control = AfterMissingOwnerControl {
+                checkpoints: AtomicUsize::new(0),
+                error,
+            };
+            let alternatives = MvRewriteRule::new(vec![candidate()])
+                .apply(&expression, &mut memo, &control)
+                .expect(
+                    "the first ordinary owner miss ends this candidate before the next binding",
+                );
+            assert!(alternatives.is_empty());
+            // Missing-owner lookup observes its entry and completed one-unit
+            // exit. A third specialization checkpoint would reject the next
+            // channel; it must never run after this candidate has missed.
+            assert_eq!(control.checkpoints.load(Ordering::SeqCst), 2);
+        }
+    }
+
     #[test]
     fn injects_rollup_alternative() {
         // Query: SELECT a, sum(v) FROM t WHERE a >= 10 GROUP BY a.
@@ -1143,7 +1584,13 @@ mod tests {
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
         let rule = MvRewriteRule::new(vec![agg_candidate(0)]);
-        let alts = rule.apply(&root_expr, &mut memo);
+        let alts = rule
+            .apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alts.len(), 1, "exactly one rollup alternative");
 
         // Top must be a LogicalAggregate reusing the ORIGINAL output ids.
@@ -1166,7 +1613,13 @@ mod tests {
 
         // Idempotency: a second apply on the same expr injects nothing.
         assert!(
-            rule.apply(&root_expr, &mut memo).is_empty(),
+            rule.apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_empty(),
             "second apply must be a no-op"
         );
     }
@@ -1201,7 +1654,15 @@ mod tests {
 
         let rule = MvRewriteRule::new(vec![candidate]);
 
-        assert!(rule.apply(&root_expr, &mut memo).is_empty());
+        assert!(
+            rule.apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[test]
@@ -1236,7 +1697,13 @@ mod tests {
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
         let rule = MvRewriteRule::new(vec![direct_agg_candidate(0)]);
-        let alts = rule.apply(&root_expr, &mut memo);
+        let alts = rule
+            .apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alts.len(), 1);
 
         let Operator::LogicalProject(project) = &alts[0].op else {
@@ -1286,7 +1753,13 @@ mod tests {
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
         let rule = MvRewriteRule::new(vec![agg_candidate(0)]);
-        let alts = rule.apply(&root_expr, &mut memo);
+        let alts = rule
+            .apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alts.len(), 1);
 
         let Operator::LogicalAggregate(aggregate) = &alts[0].op else {
@@ -1355,7 +1828,13 @@ mod tests {
 
         let rule = MvRewriteRule::new(vec![candidate]);
         assert!(
-            rule.apply(&root_expr, &mut memo).is_empty(),
+            rule.apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_empty(),
             "multi-table MV descriptor must not rewrite before join matching exists"
         );
     }
@@ -1416,14 +1895,25 @@ mod tests {
             rule.matches(&root_expr.op),
             "test must exercise a production rule entry op"
         );
-        let (query, _) =
-            SpjgDescriptor::from_memo(&root_expr, &mut memo).expect("query descriptor");
+        let (query, _) = SpjgDescriptor::from_memo(
+            &root_expr,
+            &mut memo,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap()
+        .expect("query descriptor");
         assert!(
             query.joins.is_some(),
             "test must exercise the query-side join descriptor path"
         );
         assert!(
-            rule.apply(&root_expr, &mut memo).is_empty(),
+            rule.apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_empty(),
             "multi-table query descriptor must not rewrite against a single-table candidate yet"
         );
     }
@@ -1458,7 +1948,13 @@ mod tests {
 
         let rule = MvRewriteRule::new(vec![agg_candidate(100)]);
         assert!(
-            rule.apply(&root_expr, &mut memo).is_empty(),
+            rule.apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .unwrap()
+            .is_empty(),
             "predicate not contained -> no alternative"
         );
     }
@@ -1512,7 +2008,13 @@ mod tests {
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
         let rule = MvRewriteRule::new(vec![candidate]);
-        let alts = rule.apply(&root_expr, &mut memo);
+        let alts = rule
+            .apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alts.len(), 1);
 
         // Top must be a LogicalProject binding the ORIGINAL scan output ids.
@@ -1583,7 +2085,13 @@ mod tests {
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
         let rule = MvRewriteRule::new(vec![candidate]);
-        let alts = rule.apply(&root_expr, &mut memo);
+        let alts = rule
+            .apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alts.len(), 1);
 
         let scan = find_scan(&memo, alts[0].children[0]);
@@ -1637,7 +2145,13 @@ mod tests {
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
         let rule = MvRewriteRule::new(vec![candidate]);
-        let alts = rule.apply(&root_expr, &mut memo);
+        let alts = rule
+            .apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alts.len(), 1);
         assert!(
             !has_filter(&memo, alts[0].children[0]),
@@ -1701,7 +2215,13 @@ mod tests {
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
         let rule = MvRewriteRule::new(vec![candidate]);
-        let alts = rule.apply(&root_expr, &mut memo);
+        let alts = rule
+            .apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alts.len(), 1);
         let scan = find_scan(&memo, alts[0].children[0]);
         assert_eq!(scan.table.name, "or_mv");
@@ -1712,14 +2232,19 @@ mod tests {
     }
 
     #[test]
-    fn scalar_count_rollup_wraps_with_coalesce() {
+    fn scalar_count_rollup_and_coalesce_keep_original_decimal_policy() {
         // MV:    SELECT a, count(*) c FROM t WHERE a >= 0 GROUP BY a.
         // Query: SELECT count(*) FROM t WHERE a >= 0  (scalar, no group-by).
         // {} ⊂ {a} -> Rollup; count -> SUM over MV `c`; scalar count over an
         // empty MV result is NULL where COUNT must be 0 -> COALESCE(sum, 0).
         let mv_a = col(100, "a");
-        let mv_c = col(110, "c");
-        let mv_plan = LogicalPlanNode::new(
+        let mut mv_c = col(110, "c");
+        let count_type = match &count_star(&mv_c).source.binding().selected.result_type {
+            novarocks_functions::FunctionResultType::Scalar(ty) => ty.clone(),
+            _ => panic!("COUNT must select a scalar result"),
+        };
+        mv_c.value_type = count_type.clone();
+        let mut mv_plan = LogicalPlanNode::new(
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![col_ref(&mv_a)],
                 aggregates: vec![count_star(&mv_c)],
@@ -1735,23 +2260,53 @@ mod tests {
             )],
             None,
         );
-        let (mv, mv_scalars) = spjg_descriptor_for_test(&mv_plan);
-        let candidate = MvRewriteCandidate {
-            mv_name: "cnt_mv".to_string(),
-            mv,
-            mv_scalars,
-            target_database: "ns".to_string(),
-            target_table: iceberg_table("cat", "ns", "cnt_mv", &["a", "c"]),
-            target_stats_ref: stats_ref_for_test(702),
-            selection: Some(selection_facts()),
+        // Freeze the negative descriptor from the actual OutputNull call
+        // before authoring the matching ReportError candidate.
+        let candidate_for = |plan: &LogicalPlanNode| {
+            let (mv, mv_scalars) = spjg_descriptor_for_test(plan);
+            let mut target_table = iceberg_table("cat", "ns", "cnt_mv", &["a", "c"]);
+            target_table.columns[1].nullable = count_type.nullable;
+            MvRewriteCandidate {
+                mv_name: "cnt_mv".to_string(),
+                mv,
+                mv_scalars,
+                target_database: "ns".to_string(),
+                target_table,
+                target_stats_ref: stats_ref_for_test(702),
+                selection: Some(selection_facts()),
+            }
         };
+        let cross_policy_candidate = candidate_for(&mv_plan);
+        let LogicalPlanKind::Aggregate(mv_aggregate) = &mut mv_plan.kind else {
+            panic!("expected MV aggregate");
+        };
+        let mv_count = &mut mv_aggregate.aggregates[0];
+        mv_count.source = crate::binding::AggregateArgumentSource::uncertified(
+            mv_count.source.arguments().to_vec(),
+            mv_count.source.order_by().to_vec(),
+            crate::binding::SqlFunctionBinding::new(
+                mv_count.source.binding().resolved().clone(),
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+            ),
+        );
+        let candidate = candidate_for(&mv_plan);
 
         let a = col(1, "a");
-        let cnt = col(3, "cnt"); // original scalar count output id
+        let mut cnt = col(3, "cnt"); // original scalar count output id
+        cnt.value_type = count_type;
+        let mut count = count_star(&cnt);
+        count.source = crate::binding::AggregateArgumentSource::uncertified(
+            count.source.arguments().to_vec(),
+            count.source.order_by().to_vec(),
+            crate::binding::SqlFunctionBinding::new(
+                count.source.binding().resolved().clone(),
+                novarocks_type_contract::DecimalOverflowPolicy::ReportError,
+            ),
+        );
         let query_plan = LogicalPlanNode::new(
             LogicalPlanKind::Aggregate(LogicalAggregateNode {
                 group_by: vec![],
-                aggregates: vec![count_star(&cnt)],
+                aggregates: vec![count],
                 output_columns: vec![cnt.clone()],
                 already_pushed: false,
             }),
@@ -1765,13 +2320,35 @@ mod tests {
             None,
         );
 
+        // Whole-rule matching must refuse the same COUNT shape when the MV
+        // call retains OutputNull and the query call requires ReportError.
+        let mut cross_policy_memo = test_memo();
+        let cross_policy_root = logical_plan_to_memo_for_test(&query_plan, &mut cross_policy_memo);
+        advance_factory(&mut cross_policy_memo, 200);
+        let cross_policy_expr =
+            cross_policy_memo.groups[cross_policy_root].logical_exprs[0].clone();
+        let cross_policy_alts = MvRewriteRule::new(vec![cross_policy_candidate])
+            .apply(
+                &cross_policy_expr,
+                &mut cross_policy_memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+        assert!(cross_policy_alts.is_empty());
+
         let mut memo = test_memo();
         let root = logical_plan_to_memo_for_test(&query_plan, &mut memo);
         advance_factory(&mut memo, 200);
         let root_expr = memo.groups[root].logical_exprs[0].clone();
 
         let rule = MvRewriteRule::new(vec![candidate]);
-        let alts = rule.apply(&root_expr, &mut memo);
+        let alts = rule
+            .apply(
+                &root_expr,
+                &mut memo,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap();
         assert_eq!(alts.len(), 1);
 
         // Top must be a LogicalProject whose sole item is COALESCE(_, 0) bound
@@ -1782,10 +2359,20 @@ mod tests {
         assert_eq!(p.items.len(), 1);
         assert_eq!(p.items[0].output_column_id, cnt.column_id);
         let project_expr = materialize(&memo.scalars, p.items[0].expr);
-        let ExprKind::FunctionCall { name, args, .. } = &project_expr.kind else {
+        let ExprKind::FunctionCall {
+            name,
+            args,
+            binding,
+            ..
+        } = &project_expr.kind
+        else {
             panic!("expected coalesce call, got {:?}", project_expr.kind);
         };
         assert_eq!(name, "coalesce");
+        assert_eq!(
+            binding.decimal_overflow_policy(),
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError
+        );
         assert_eq!(args.len(), 2);
         // arg0 references the inner aggregate output (a freshly-minted id, NOT
         // the original cnt id — the original id is reused only at the project).
@@ -1807,6 +2394,13 @@ mod tests {
         assert!(inner.group_by.is_empty());
         assert_eq!(inner.aggregates.len(), 1);
         assert_eq!(inner.aggregates[0].name, "sum");
+        assert_eq!(
+            inner.aggregates[0]
+                .source
+                .binding()
+                .decimal_overflow_policy(),
+            novarocks_type_contract::DecimalOverflowPolicy::ReportError
+        );
         // The inner aggregate's output id is the freshly-minted one used by the
         // coalesce arg, confirming the original id is not duplicated mid-tree.
         assert_eq!(inner.output_columns[0].column_id, *column_id);
@@ -1815,5 +2409,154 @@ mod tests {
         let scan = find_scan(&memo, agg_group);
         assert_eq!(scan.table.name, "cnt_mv");
         assert_eq!(scan.mv_rewritten_from.as_deref(), Some("cnt_mv"));
+    }
+
+    // These tests share the real logical-plan and catalogue fixture authors.
+    include!("rule_output_type_tests.rs");
+
+    #[test]
+    fn aggregate_mv_column_mapping_renews_actual_revision_and_keeps_original_binding() {
+        let control = crate::optimizer::test_optimizer_control();
+        let mut arena = ScalarArena::new();
+        let column = col(91, "original_input");
+        let input = crate::planner::optimizer_bridge::scalar::intern_exprs(
+            &mut arena,
+            &[col_ref(&column)],
+            control,
+        )
+        .unwrap()[0];
+        let names = std::collections::HashMap::from([(column.column_id, column.name.clone())]);
+        let key = normalize(&arena, input, &names, control).unwrap().unwrap();
+        let mv_column = col(901, "actual_mv_input");
+        let map = MvColumnMap::try_new(vec![(key, mv_column.clone())], control)
+            .unwrap()
+            .unwrap();
+        for certified in [true, false] {
+            let binding =
+                crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false);
+            let source = if certified {
+                crate::binding::AggregateArgumentSource::logical_update(
+                    vec![input],
+                    vec![],
+                    binding,
+                )
+            } else {
+                crate::binding::AggregateArgumentSource::uncertified(vec![input], vec![], binding)
+            };
+            let call = ScalarAggregateSpec {
+                name: "count".into(),
+                output_column_id: ColumnId(92),
+                distinct: false,
+                source,
+            };
+            let before = call.source.clone();
+            let rewritten = rewrite_aggregate_to_mv(&mut arena, &call, &map, &names, control)
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(arena.node(rewritten.source.arguments()[0]), ScalarNode::ColumnRef(id) if *id == mv_column.column_id)
+            );
+            assert_eq!(
+                arena.value_type(rewritten.source.arguments()[0]),
+                &mv_column.value_type
+            );
+            assert_eq!(call.source.arguments(), &[input]);
+            assert_eq!(rewritten.output_column_id, call.output_column_id);
+            assert!(std::ptr::eq(
+                before.binding().resolved(),
+                rewritten.source.binding().resolved()
+            ));
+            match (
+                before.logical_identity(),
+                rewritten.source.logical_identity(),
+            ) {
+                (Some(old), Some(new)) => {
+                    assert!(old.same_revision(call.source.logical_identity().unwrap()));
+                    assert!(old.same_lineage(new));
+                    assert!(!old.same_revision(new));
+                }
+                (None, None) => assert!(rewritten.source.logical_parts().is_none()),
+                _ => panic!("MV mapping cannot upgrade source certification"),
+            }
+        }
+    }
+
+    #[test]
+    fn aggregate_mv_column_mapping_refusal_preserves_original_revision_and_first_control_cause() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Refuse {
+            cause: CompileControlError,
+            calls: AtomicUsize,
+        }
+        impl PureCompileControl for Refuse {
+            fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                assert_eq!(
+                    self.calls.fetch_add(1, Ordering::SeqCst),
+                    0,
+                    "callback after first cause"
+                );
+                Err(self.cause)
+            }
+        }
+        let control = crate::optimizer::test_optimizer_control();
+        let mut arena = ScalarArena::new();
+        let column = col(101, "original_input");
+        let input = crate::planner::optimizer_bridge::scalar::intern_exprs(
+            &mut arena,
+            &[col_ref(&column)],
+            control,
+        )
+        .unwrap()[0];
+        let names = std::collections::HashMap::from([(column.column_id, column.name.clone())]);
+        let map = MvColumnMap::try_new(vec![], control).unwrap().unwrap();
+        let call = ScalarAggregateSpec {
+            name: "count".into(),
+            output_column_id: ColumnId(102),
+            distinct: false,
+            source: crate::binding::AggregateArgumentSource::logical_update(
+                vec![input],
+                vec![],
+                crate::functions::test_resolved_aggregate("count", &[DataType::Int64], false),
+            ),
+        };
+        let before = call.source.clone();
+        assert!(
+            rewrite_aggregate_to_mv(&mut arena, &call, &map, &names, control)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            before
+                .logical_identity()
+                .unwrap()
+                .same_revision(call.source.logical_identity().unwrap())
+        );
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let refusal = Refuse {
+                cause,
+                calls: AtomicUsize::new(0),
+            };
+            assert_eq!(
+                rewrite_aggregate_to_mv(&mut arena, &call, &map, &names, &refusal).unwrap_err(),
+                crate::compiler::SqlCompileError::from(cause)
+            );
+            assert_eq!(refusal.calls.load(Ordering::SeqCst), 1);
+            assert!(
+                before
+                    .logical_identity()
+                    .unwrap()
+                    .same_revision(call.source.logical_identity().unwrap())
+            );
+            assert_eq!(call.source.arguments(), &[input]);
+            assert!(std::ptr::eq(
+                before.binding().resolved(),
+                call.source.binding().resolved()
+            ));
+        }
     }
 }

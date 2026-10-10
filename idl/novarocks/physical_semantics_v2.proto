@@ -1,0 +1,272 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package novarocks.physical_semantics_v2;
+
+import "physical_control_v2.proto";
+
+// Complete frozen semantic component, not a fragment envelope or an owner
+// capability proof. IDs are sparse; zero/MAX are valid. Required references
+// have presence. Typed decode rejects missing/unknown variants and duplicates.
+message SemanticParameters {
+  repeated SemanticParameter entries = 1;
+}
+message SemanticParameter {
+  uint32 id = 1;
+  // The value variant determines the one stable key. No separate key or type
+  // may override it; runtime settings and process defaults do not fill gaps.
+  oneof value {
+    sint64 statement_start_utc_micros = 2;
+    string time_zone = 3;
+    bool allow_throw_exception = 4;
+    bool decimal_overflow_to_double = 5;
+    bool group_concat_legacy = 6;
+    sint64 group_concat_max_len = 7;
+  }
+}
+enum SemanticParameterKey {
+  SEMANTIC_PARAMETER_KEY_UNSPECIFIED = 0;
+  SEMANTIC_PARAMETER_KEY_STATEMENT_START_UTC = 1;
+  SEMANTIC_PARAMETER_KEY_TIME_ZONE = 2;
+  SEMANTIC_PARAMETER_KEY_ALLOW_THROW_EXCEPTION = 3;
+  SEMANTIC_PARAMETER_KEY_DECIMAL_OVERFLOW_TO_DOUBLE = 4;
+  SEMANTIC_PARAMETER_KEY_GROUP_CONCAT_LEGACY = 5;
+  SEMANTIC_PARAMETER_KEY_GROUP_CONCAT_MAX_LEN = 6;
+}
+message SemanticParameterRef {
+  optional uint32 id = 1;
+  SemanticParameterKey expected_key = 2;
+}
+
+message FrozenCalls {
+  repeated FrozenCall entries = 1;
+}
+message FrozenCall {
+  CallSite site = 1;
+  EffectContext context = 2;
+  CallEffects effects = 3;
+  // Required for every real call. It belongs to the original SQL scope, not
+  // to CallEffects, ALLOW_THROW_EXCEPTION or DecimalOverflowToDouble. Typed
+  // decode rejects absence, UNSPECIFIED and unknown values without a default.
+  optional DecimalOverflowPolicy decimal_overflow_policy = 4;
+  TemporalSourcePlan temporal_source = 5;
+  // Explicit presence preserves proved dynamic versus missing source facts.
+  optional RegexpCountPatternSource regexp_count_pattern_source = 6;
+  // Required positive source receipt only for exact TO_BASE64 calls.
+  optional ToBase64ByteSource to_base64_byte_source = 7;
+}
+
+// One shared semantic policy for actual function calls and Binary/Cast nodes.
+// The numeric wire values remain identical across both use sites.
+enum DecimalOverflowPolicy {
+  DECIMAL_OVERFLOW_POLICY_UNSPECIFIED = 0;
+  DECIMAL_OVERFLOW_POLICY_OUTPUT_NULL = 1;
+  DECIMAL_OVERFLOW_POLICY_REPORT_ERROR = 2;
+}
+
+message NodeCallSite {
+  optional uint32 node_id = 1;
+  // This is an actual field ordinal, not an AggregateCallId or a signature ID.
+  uint32 call = 2;
+}
+message CallSite {
+  oneof kind {
+    uint32 expression_use_id = 1;
+    NodeCallSite aggregate = 2;
+    NodeCallSite top_n_state = 3;
+    NodeCallSite writer_partial = 4;
+    NodeCallSite writer_final = 5;
+    uint32 table_node_id = 6;
+  }
+}
+message EffectContext {
+  optional uint32 use_id = 1;
+  optional uint32 domain_id = 2;
+  novarocks.physical_control_v2.EvaluationDemand demand = 3;
+}
+
+// Claims belong to each real call occurrence. Exact signature/identity remain
+// in the referenced physical definition. Admission recomputes all nine fields
+// with the installed exact overload; there is no old-four-field fallback.
+message CallEffects {
+  ValueStability value_stability = 1;
+  OwnRowError own_row_error = 2;
+  FailureBehavior failure_behavior = 3;
+  NullBehavior null_behavior = 4;
+  ArgumentControl argument_control = 5;
+  InstanceState instance_state = 6;
+  ObservableEffects observable_effects = 7;
+  repeated SemanticParameterRef environment = 8;
+  ProofScope proof_scope = 9;
+}
+enum ValueStability {
+  VALUE_STABILITY_UNSPECIFIED = 0;
+  VALUE_STABILITY_IMMUTABLE = 1;
+  VALUE_STABILITY_STABLE = 2;
+  VALUE_STABILITY_VOLATILE = 3;
+}
+enum OwnRowError {
+  OWN_ROW_ERROR_UNSPECIFIED = 0;
+  OWN_ROW_ERROR_NO_ROW_ERROR = 1;
+  OWN_ROW_ERROR_MAY_RAISE = 2;
+  OWN_ROW_ERROR_NOT_ROW_EVALUATED = 3;
+}
+enum FailureBehavior {
+  FAILURE_BEHAVIOR_UNSPECIFIED = 0;
+  FAILURE_BEHAVIOR_PROPAGATE = 1;
+  FAILURE_BEHAVIOR_RETURNS_NULL = 2;
+}
+enum NullBehavior {
+  NULL_BEHAVIOR_UNSPECIFIED = 0;
+  NULL_BEHAVIOR_STRICT = 1;
+  NULL_BEHAVIOR_CALLED_ON_NULL = 2;
+  NULL_BEHAVIOR_CONTROL_DEFINED = 3;
+}
+message ArgumentControl {
+  oneof kind {
+    SimpleArgumentControl simple = 1;
+    novarocks.physical_control_v2.HigherOrderControl higher_order = 2;
+    TemporalSourceKind temporal_source = 3;
+  }
+}
+enum SimpleArgumentControl {
+  SIMPLE_ARGUMENT_CONTROL_UNSPECIFIED = 0;
+  SIMPLE_ARGUMENT_CONTROL_EAGER = 1;
+  SIMPLE_ARGUMENT_CONTROL_TYPE_ONLY = 2;
+  SIMPLE_ARGUMENT_CONTROL_IF = 3;
+  SIMPLE_ARGUMENT_CONTROL_COALESCE = 4;
+  SIMPLE_ARGUMENT_CONTROL_SIMPLE_CASE = 5;
+  SIMPLE_ARGUMENT_CONTROL_SEARCHED_CASE = 6;
+  SIMPLE_ARGUMENT_CONTROL_AGGREGATE = 7;
+  SIMPLE_ARGUMENT_CONTROL_WINDOW = 8;
+  SIMPLE_ARGUMENT_CONTROL_TABLE = 9;
+  SIMPLE_ARGUMENT_CONTROL_NO_ARGUMENTS = 10;
+}
+enum InstanceState {
+  INSTANCE_STATE_UNSPECIFIED = 0;
+  INSTANCE_STATE_NONE = 1;
+  INSTANCE_STATE_SCALAR_INSTANCE = 2;
+  INSTANCE_STATE_AGGREGATE_INSTANCE = 3;
+  INSTANCE_STATE_WINDOW_PARTITION = 4;
+  INSTANCE_STATE_TABLE_INSTANCE = 5;
+}
+message ObservableEffects {
+  bool rng_sampling = 1;
+  bool warnings = 2;
+  bool controlled_wait = 3;
+}
+message ProofScope {
+  oneof kind {
+    novarocks.physical_control_v2.Empty unconditional = 1;
+    uint32 domain_id = 2;
+  }
+}
+
+// Mandatory local pruning declarations from the actual frozen scan fields.
+// Paths and roots are identities in this package, never a safe/implication
+// assertion. Exact effects, legal transforms and FE global consumer coverage
+// remain separate admission obligations; these messages mint no permission.
+message FrozenPruning {
+  repeated PruningDomainWitness witnesses = 1;
+}
+message PruningDomainWitness {
+  PruningDomainSite target = 1;
+  repeated PruningSourceWitness sources = 2;
+}
+message PruningDomainSite {
+  optional uint32 fragment_id = 1;
+  optional uint32 scan_id = 2;
+  optional uint32 occurrence_id = 3;
+  PruningDomainField field = 4;
+}
+enum PruningDomainField {
+  PRUNING_DOMAIN_FIELD_UNSPECIFIED = 0;
+  PRUNING_DOMAIN_FIELD_ENFORCED = 1;
+  PRUNING_DOMAIN_FIELD_UNENFORCED = 2;
+}
+message PredicateResponsibilityRef {
+  optional uint32 fragment_id = 1;
+  novarocks.physical_control_v2.RootSite site = 2;
+  optional uint32 use_id = 3;
+}
+message PruningSourceWitness {
+  PredicateResponsibilityRef responsibility = 1;
+  EffectContext context = 2;
+  // Ordered child positions in the original positive conjunction occurrence.
+  repeated uint32 conjunct_path = 3;
+  repeated PruningInputEdge input_path = 4;
+  repeated PruningColumnTrace columns = 5;
+}
+message PruningInputEdge {
+  optional uint32 consumer_id = 1;
+  // Real consumer input position. Zero is valid; presence is not an identity.
+  uint32 input_ordinal = 2;
+  optional uint32 producer_id = 3;
+}
+message PruningColumnTrace {
+  // ScanColumnId is an ordinal in the exact canonical assignment table.
+  // Encoding its host usize requires checked conversion and column bounds.
+  uint32 column_ordinal = 1;
+  // Source-to-scan path order, including repeated/zero/MAX sparse values.
+  repeated uint32 value_ids = 2;
+}
+
+enum TemporalSourceKind {
+  TEMPORAL_SOURCE_KIND_UNSPECIFIED = 0;
+  TEMPORAL_SOURCE_KIND_TIME_TO_SEC = 1;
+  TEMPORAL_SOURCE_KIND_TIME_FORMAT = 2;
+}
+enum TemporalCastKind {
+  TEMPORAL_CAST_KIND_UNSPECIFIED = 0;
+  TEMPORAL_CAST_KIND_ORDINARY = 1;
+  TEMPORAL_CAST_KIND_TIME = 2;
+  TEMPORAL_CAST_KIND_TIME_FROM_DATETIME = 3;
+}
+enum TemporalSourceRole {
+  TEMPORAL_SOURCE_ROLE_UNSPECIFIED = 0;
+  TEMPORAL_SOURCE_ROLE_NORMAL = 1;
+  TEMPORAL_SOURCE_ROLE_FORMAT = 2;
+  TEMPORAL_SOURCE_ROLE_RAW_OVERRIDE = 3;
+  TEMPORAL_SOURCE_ROLE_ORIGINAL_SECONDS = 4;
+  TEMPORAL_SOURCE_ROLE_IMMEDIATE_CAST_SOURCE = 5;
+  TEMPORAL_SOURCE_ROLE_DEEPEST_CAST_SOURCE = 6;
+}
+message TemporalSourceOccurrence {
+  TemporalSourceRole role = 1;
+  optional uint32 use_id = 2;
+  optional uint32 definition_id = 3;
+}
+// Every source is an invocation edge, not a reusable materialized SQL argument.
+message TemporalSourcePlan {
+  novarocks.physical_control_v2.TemporalSourceShape shape = 1;
+  repeated TemporalCastKind cast_chain = 2;
+  repeated TemporalSourceOccurrence sources = 3;
+}
+
+// Actual emitted native-v1 source; no lexical Literal/known-constant inference.
+enum RegexpCountPatternSource {
+  REGEXP_COUNT_DYNAMIC = 0;
+  REGEXP_COUNT_NATIVE_V1_UTF8_LITERAL_WHEN_PRESENT = 1;
+}
+
+// Ordinary and missing source facts are distinct.
+enum ToBase64ByteSource {
+  TO_BASE64_ORDINARY = 0;
+  TO_BASE64_NATIVE_V1_ENCRYPTION_LATIN1 = 1;
+}

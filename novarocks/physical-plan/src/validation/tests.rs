@@ -17,16 +17,14 @@
 
 use super::*;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use arrow_schema::DataType;
 
-use crate::resource::MAX_PLAN_DERIVED_CUT_ITEMS;
 use crate::{
     AggregatePhase, Distribution, EdgeId, ExprId, ExprKind, FragmentCuts, FragmentId, FragmentSink,
-    NodeId, NodeKind, PhysicalNode, PhysicalPlan, RequiredContracts, RowMultiplicity, ValueId,
-    ValueOrigin, ValueType,
+    NodeId, NodeKind, PhysicalNode, RowMultiplicity, ValueId, ValueOrigin, ValueType,
 };
 
 #[cfg(test)]
@@ -34,22 +32,120 @@ mod validation_error_tests {
     use super::*;
 
     #[test]
-    fn mixed_decimal_largeint_validates_only_exact_new_add_sub_output() {
-        let expression = |id, data_type| crate::ExprNode {
+    fn uuid_is_not_a_numeric_largeint_domain() {
+        use novarocks_type_contract::ValueLogicalType;
+        let expression = |id, logical_type| crate::ExprNode {
             id: ExprId::new(id),
             owner: NodeId::new(1),
             lambda_scope: None,
-            ty: ValueType::new(data_type, true),
+            ty: ValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                false,
+                logical_type,
+            )
+            .unwrap(),
+            kind: ExprKind::Literal(crate::LiteralValue::LargeInt(1)),
+        };
+        let uuid = expression(1, ValueLogicalType::Uuid);
+        for op in [crate::BinaryOperator::Add, crate::BinaryOperator::BitAnd] {
+            let mut errors = ValidationContext::new();
+            validate_binary_types(&uuid, op, &uuid, &uuid, "uuid", &mut errors);
+            assert!(!errors.is_empty());
+        }
+        let mut errors = ValidationContext::new();
+        validate_literal_type(
+            &crate::LiteralValue::LargeInt(1),
+            &uuid.ty,
+            "uuid",
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
+        let integer = expression(2, ValueLogicalType::LargeInt);
+        let plain = expression(3, ValueLogicalType::Physical);
+        for (input, output, valid) in [
+            (&integer, &integer, true),
+            (&integer, &plain, false),
+            (&plain, &integer, false),
+        ] {
+            let mut errors = ValidationContext::new();
+            validate_binary_types(
+                input,
+                crate::BinaryOperator::Add,
+                input,
+                output,
+                "largeint",
+                &mut errors,
+            );
+            assert_eq!(errors.is_empty(), valid);
+        }
+    }
+
+    #[test]
+    fn comparison_refuses_equal_carriers_with_different_root_domains() {
+        use novarocks_type_contract::ValueLogicalType;
+        let expression = |id, logical_type| crate::ExprNode {
+            id: ExprId::new(id),
+            owner: NodeId::new(1),
+            lambda_scope: None,
+            ty: ValueType::try_with_logical_type(DataType::Utf8, true, logical_type).unwrap(),
             kind: ExprKind::Literal(crate::LiteralValue::Null),
         };
-        let decimal = expression(1, DataType::Decimal128(38, 15));
-        let integer = expression(2, DataType::FixedSizeBinary(16));
+        let json = expression(1, ValueLogicalType::Json);
+        let plain = expression(2, ValueLogicalType::Physical);
+        let output = crate::ExprNode {
+            id: ExprId::new(3),
+            owner: NodeId::new(1),
+            lambda_scope: None,
+            ty: ValueType::new(DataType::Boolean, true),
+            kind: ExprKind::Literal(crate::LiteralValue::Null),
+        };
+        let mut errors = ValidationContext::new();
+        validate_binary_types(
+            &json,
+            crate::BinaryOperator::Eq,
+            &plain,
+            &output,
+            "comparison",
+            &mut errors,
+        );
+        assert!(!errors.is_empty());
+        let mut errors = ValidationContext::new();
+        validate_binary_types(
+            &json,
+            crate::BinaryOperator::Eq,
+            &json,
+            &output,
+            "comparison",
+            &mut errors,
+        );
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn mixed_decimal_largeint_validates_only_exact_new_add_sub_output() {
+        let expression = |id, value_type| crate::ExprNode {
+            id: ExprId::new(id),
+            owner: NodeId::new(1),
+            lambda_scope: None,
+            ty: value_type,
+            kind: ExprKind::Literal(crate::LiteralValue::Null),
+        };
+        let decimal = expression(1, ValueType::new(DataType::Decimal128(38, 15), true));
+        let integer = expression(
+            2,
+            ValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                true,
+                novarocks_type_contract::ValueLogicalType::LargeInt,
+            )
+            .unwrap(),
+        );
         for op in [crate::BinaryOperator::Add, crate::BinaryOperator::Subtract] {
-            let exact = expression(3, DataType::Decimal256(55, 15));
+            let exact = expression(3, ValueType::new(DataType::Decimal256(55, 15), true));
             let mut errors = ValidationContext::new();
             validate_binary_types(&decimal, op, &integer, &exact, "binary", &mut errors);
             assert!(errors.is_empty());
-            let wrong = expression(3, DataType::Decimal128(38, 15));
+            let wrong = expression(3, ValueType::new(DataType::Decimal128(38, 15), true));
             let mut errors = ValidationContext::new();
             validate_binary_types(&decimal, op, &integer, &wrong, "binary", &mut errors);
             assert!(!errors.is_empty());
@@ -59,7 +155,7 @@ mod validation_error_tests {
             crate::BinaryOperator::Divide,
             crate::BinaryOperator::Modulo,
         ] {
-            let exact = expression(3, DataType::Decimal256(55, 15));
+            let exact = expression(3, ValueType::new(DataType::Decimal256(55, 15), true));
             let mut errors = ValidationContext::new();
             validate_binary_types(&decimal, op, &integer, &exact, "binary", &mut errors);
             assert!(!errors.is_empty());
@@ -90,17 +186,23 @@ mod validation_error_tests {
 
     #[test]
     fn binary_arithmetic_uses_the_type_contract_largeint_domain() {
-        let expression = |id, data_type| crate::ExprNode {
+        let expression = |id, value_type| crate::ExprNode {
             id: ExprId::new(id),
             owner: NodeId::new(1),
             lambda_scope: None,
-            ty: ValueType::new(data_type, false),
+            ty: value_type,
             kind: ExprKind::Literal(crate::LiteralValue::Null),
         };
         let largeint = DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH);
-        let left = expression(1, largeint.clone());
-        let right = expression(2, DataType::Int64);
-        let output = expression(3, largeint);
+        let largeint_type = ValueType::try_with_logical_type(
+            largeint.clone(),
+            false,
+            novarocks_type_contract::ValueLogicalType::LargeInt,
+        )
+        .unwrap();
+        let left = expression(1, largeint_type.clone());
+        let right = expression(2, ValueType::new(DataType::Int64, false));
+        let output = expression(3, largeint_type);
         let mut errors = ValidationContext::new();
         validate_binary_types(
             &left,
@@ -111,6 +213,20 @@ mod validation_error_tests {
             &mut errors,
         );
         assert!(errors.is_empty());
+
+        let opaque = expression(4, ValueType::new(largeint, false));
+        for (input, result) in [(&opaque, &output), (&left, &opaque)] {
+            let mut errors = ValidationContext::new();
+            validate_binary_types(
+                input,
+                crate::BinaryOperator::Add,
+                &right,
+                result,
+                "binary",
+                &mut errors,
+            );
+            assert!(!errors.is_empty());
+        }
     }
 
     #[test]
@@ -158,25 +274,6 @@ mod validation_error_tests {
                 .is_some()
         );
         assert_eq!(after_first - budget.remaining, expected.len());
-    }
-
-    #[test]
-    fn source_provenance_fanout_shares_the_complete_binding_set() {
-        let source = CompactSourceBindingSet::from_ids(&(0..4096).collect::<Vec<_>>()).unwrap();
-        let empty = CompactSourceBindingSet::from_ids(&[]).unwrap();
-
-        let fanout = (0..1024)
-            .map(|_| CompactSourceBindingSet::union(&empty, [source.clone()]))
-            .collect::<Vec<_>>();
-
-        assert!(fanout.iter().all(|set| Arc::ptr_eq(&set.ids, &source.ids)));
-    }
-
-    #[test]
-    fn source_provenance_rejects_high_fanout_before_destination_materialization() {
-        let mut items = 0;
-        assert!(charge_provenance_cut_items(&mut items, 4096, 8193).is_none());
-        assert!(items > MAX_PLAN_DERIVED_CUT_ITEMS);
     }
 
     #[test]
@@ -442,7 +539,18 @@ mod validation_error_tests {
     #[test]
     fn aggregate_sequence_index_builds_once_for_many_distinct_lookups_and_ambiguity() {
         let binding = |sequence| crate::AggregateBinding {
+            state_interpretation: None,
+            state_argument_contract:
+                novarocks_type_contract::AggregateStateArgumentContract::ExactSignature,
             function: crate::BoundFunction {
+                legacy_metadata: Some(crate::LegacyBindingMetadata {
+                    semantic_parameters: Box::default(),
+                    volatility: crate::FunctionVolatility::Immutable,
+                    argument_evaluation: crate::FunctionArgumentEvaluation::Eager,
+                    failure_behavior: crate::FunctionFailureBehavior::Propagate,
+                    intrinsic_row_error:
+                        novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
+                }),
                 function_id: crate::FunctionId::try_new("builtin/test_sum/v1").unwrap(),
                 overload: crate::FunctionOverloadId::try_new("i64").unwrap(),
                 kind: crate::FunctionKind::Aggregate,
@@ -451,11 +559,6 @@ mod validation_error_tests {
                     false,
                 ))]),
                 result_type: ValueType::new(DataType::Int64, false),
-                volatility: crate::FunctionVolatility::Immutable,
-                argument_evaluation: crate::FunctionArgumentEvaluation::Eager,
-                failure_behavior: crate::FunctionFailureBehavior::Propagate,
-                intrinsic_row_error:
-                    novarocks_type_contract::FunctionIntrinsicRowError::NotRowEvaluated,
             },
             phase: AggregatePhase::Partial { sequence },
             logical_argument_count: 1,
@@ -510,87 +613,6 @@ mod validation_error_tests {
         );
         assert_eq!(indexes.aggregate_sequences.len(), 1);
         assert_eq!(initial_work - budget.remaining, calls.len());
-    }
-
-    #[test]
-    fn overlapping_runtime_filter_hulls_charge_each_revisited_static_contribution() {
-        let runtime_filter = |id, witness_count| crate::RuntimeFilter {
-            id: crate::RuntimeFilterId::new(id),
-            kind: crate::RuntimeFilterKind::InList,
-            domain: crate::RuntimeFilterDomain::Membership {
-                ty: ValueType::new(DataType::Int64, false),
-                null_semantics: crate::RuntimeFilterNullSemantics::NeverMatches,
-            },
-            lifecycle: crate::RuntimeFilterLifecycle::CompleteOnce,
-            reduction: crate::RuntimeFilterReduction::SetUnion,
-            availability_coverage: crate::RuntimeFilterCoverage {
-                nodes: Box::default(),
-                root: 0,
-            },
-            terminal_coverage: crate::RuntimeFilterCoverage {
-                nodes: Box::default(),
-                root: 0,
-            },
-            equality_witnesses: (0..witness_count)
-                .map(|ordinal| crate::RuntimeFilterEqualityWitness {
-                    id: crate::RuntimeFilterEqualityWitnessId::new(ordinal + 1),
-                    fragment: FragmentId::new(1),
-                    join: NodeId::new(1),
-                    key_ordinal: ordinal,
-                    domain_side: crate::JoinSide::Right,
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            producers: Box::default(),
-            consumers: Box::default(),
-            policy: crate::RuntimeFilterPolicy {
-                max_contribution_bytes: 1,
-                max_artifact_bytes: 1,
-                deadline_ms: 1,
-                max_retries: 1,
-            },
-        };
-        let common = crate::RuntimeFilterId::new(1);
-        let mut filters = BTreeMap::from([(common, runtime_filter(1, 4096))]);
-        for id in 2..=257 {
-            filters.insert(crate::RuntimeFilterId::new(id), runtime_filter(id, 0));
-        }
-        let plan = PhysicalPlan::from(crate::PhysicalPlanParts {
-            version: crate::PlanVersionId::try_new([1; 16]).unwrap(),
-            fragments: BTreeMap::new(),
-            edges: BTreeMap::new(),
-            runtime_filters: filters,
-            result_port: None,
-            artifact_refs: BTreeMap::new(),
-            required: RequiredContracts::default(),
-            annotations: Box::default(),
-        });
-        let mut cache = RuntimeFilterBuildDependencyCache::default();
-        let mut budget = SemanticTraceWorkBudget::new(&PlanLimits::FROZEN);
-        let mut rejected = false;
-
-        for id in 2..=257 {
-            let mut fragments = BTreeSet::new();
-            let mut edges = BTreeSet::new();
-            if extend_runtime_filter_proof_hull(
-                &plan,
-                [common, crate::RuntimeFilterId::new(id)],
-                &mut fragments,
-                &mut edges,
-                &mut cache,
-                &mut budget,
-            )
-            .is_none()
-            {
-                rejected = true;
-                break;
-            }
-        }
-
-        assert!(
-            rejected,
-            "overlapping but distinct proof hulls must not rescan a wide shared filter beyond the work budget"
-        );
     }
 
     #[test]

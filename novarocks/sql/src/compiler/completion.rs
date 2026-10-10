@@ -27,9 +27,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 
 use novarocks_physical_plan::{
-    ArtifactInputRequirement, ArtifactRefId, NullOrdering, PlanBuilder, PlanVersionId,
-    PredicateGuaranteeKind, ProviderColumnReference, ProviderReadOccurrenceId,
-    ProviderReadReference, SealedArtifactRef, SortDirection, ValueType,
+    NullOrdering, PlanVersionId, PredicateGuaranteeKind, ProviderColumnReference,
+    ProviderReadOccurrenceId, ProviderReadReference, SortDirection, ValueType,
 };
 use novarocks_spi::connector::read_stack::{
     ConnectorExpression, ConnectorFunctionName, ConnectorReadBinding, ConnectorReadRelationKind,
@@ -39,11 +38,15 @@ use novarocks_spi::connector::{ConnectorCodecCategory, ConnectorEncodedPayload, 
 use novarocks_type_contract::{BucketLayoutAlgorithm, PartitionHashAlgorithm};
 use novarocks_types::naming::TableIdentity;
 
-use super::{SqlCompileError, SqlCompiler};
+#[cfg(test)]
+use novarocks_physical_plan::PlanBuilder;
+
+use super::{SqlAuthoredPhysicalPlan, SqlCompileError, SqlCompiler};
 use crate::binding::SqlTableBindingId;
 use crate::catalog::{ResolvedAnalyzerTable, TableLookupMode};
 use crate::compiler::mv_rewrite::SqlMvRewriteDefinitionFacts;
 use crate::explain::ExplainLevel;
+use crate::planner::distributed::build::LoweredSqlPhysicalDraft;
 use crate::planner::table::{SqlScanKind, SqlTableVersionSelector};
 use crate::planning::catalog::MetadataTableKind;
 use crate::planning::dml::DmlStatisticsEvidence;
@@ -278,7 +281,10 @@ impl ProviderReadColumnNeed {
         if name.trim().is_empty() {
             return Err(CompletionProtocolError::InvalidProviderReadColumn { ordinal });
         }
-        if provider_connector_type_for_engine(&engine_type.data_type) != Some(connector_type) {
+        if !novarocks_connector_contract::connector_type_accepts_value_type(
+            connector_type,
+            &engine_type,
+        ) {
             return Err(CompletionProtocolError::ProviderReadColumnTypeMismatch { ordinal });
         }
         Ok(Self {
@@ -317,61 +323,7 @@ impl ProviderReadColumnNeed {
     }
 }
 
-pub(super) fn provider_connector_type_for_engine(
-    data_type: &arrow::datatypes::DataType,
-) -> Option<ConnectorValueType> {
-    use arrow::datatypes::{DataType, TimeUnit};
-    match data_type {
-        DataType::Boolean => Some(ConnectorValueType::Boolean),
-        DataType::Int8 => Some(ConnectorValueType::TinyInt),
-        DataType::Int16 => Some(ConnectorValueType::SmallInt),
-        DataType::Int32 => Some(ConnectorValueType::Integer),
-        DataType::Int64 => Some(ConnectorValueType::BigInt),
-        DataType::Float32 => Some(ConnectorValueType::Real),
-        DataType::Float64 => Some(ConnectorValueType::Double),
-        DataType::Decimal128(precision, scale) if *precision <= 38 => {
-            Some(ConnectorValueType::Decimal {
-                precision: *precision,
-                scale: *scale,
-            })
-        }
-        DataType::Date32 => Some(ConnectorValueType::Date),
-        DataType::Time64(TimeUnit::Microsecond) => Some(ConnectorValueType::TimeMicros),
-        DataType::Timestamp(TimeUnit::Millisecond, None) => {
-            Some(ConnectorValueType::TimestampMillis)
-        }
-        DataType::Timestamp(TimeUnit::Microsecond, None) => {
-            Some(ConnectorValueType::TimestampMicros)
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, None) => Some(ConnectorValueType::TimestampNanos),
-        DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => {
-            Some(ConnectorValueType::TimestampTzMicros)
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => {
-            Some(ConnectorValueType::TimestampTzNanos)
-        }
-        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
-            Some(ConnectorValueType::Varchar)
-        }
-        DataType::Binary | DataType::BinaryView => Some(ConnectorValueType::Varbinary),
-        // A variant's encoded value is the one thing carried in a large
-        // binary, and the connector's own vocabulary already puts it beside
-        // ROW/ARRAY/MAP: it is not a binary anyone compares, and a predicate
-        // over it is not a predicate over bytes.
-        DataType::LargeBinary => Some(ConnectorValueType::NonComparable),
-        DataType::FixedSizeBinary(length) if *length >= 0 => Some(ConnectorValueType::Fixed {
-            length: *length as u32,
-        }),
-        DataType::List(_)
-        | DataType::LargeList(_)
-        | DataType::ListView(_)
-        | DataType::LargeListView(_)
-        | DataType::FixedSizeList(_, _)
-        | DataType::Struct(_)
-        | DataType::Map(_, _) => Some(ConnectorValueType::NonComparable),
-        _ => None,
-    }
-}
+pub(super) use novarocks_connector_contract::connector_type_for_arrow as provider_connector_type_for_engine;
 
 impl fmt::Debug for ProviderReadColumnNeed {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -689,8 +641,9 @@ impl ProviderReadNeed {
                         id,
                         reason: "program provider read projects more columns than it can address",
                     })?;
-                let connector_type = provider_connector_type_for_engine(&engine_type.data_type)
-                    .ok_or(CompletionProtocolError::InvalidProviderReadColumn { ordinal })?;
+                let connector_type =
+                    novarocks_connector_contract::connector_type_for_value_type(&engine_type)
+                        .ok_or(CompletionProtocolError::InvalidProviderReadColumn { ordinal })?;
                 ProviderReadColumnNeed::try_new(ordinal, name, engine_type, connector_type)
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1427,8 +1380,6 @@ pub struct ProviderReadStaticContract {
     pub predicates: Box<[ProviderReadPredicateFact]>,
     pub limit: ProviderReadLimitFact,
     pub provided_properties: ProviderReadProperties,
-    pub artifact_inputs: Box<[ArtifactInputRequirement]>,
-    pub artifact_refs: Box<[SealedArtifactRef]>,
     pub coverage_evidence: Box<[u8]>,
 }
 
@@ -1444,8 +1395,6 @@ impl fmt::Debug for ProviderReadStaticContract {
             .field("predicate_guarantees", &self.predicates.len())
             .field("limit", &self.limit)
             .field("provided_properties", &self.provided_properties)
-            .field("artifact_inputs", &self.artifact_inputs.len())
-            .field("artifact_refs", &self.artifact_refs.len())
             .field("coverage_evidence_bytes", &self.coverage_evidence.len())
             .finish_non_exhaustive()
     }
@@ -1629,13 +1578,20 @@ impl CompilerContinuation {
 }
 
 /// One private pure-compiler transition. A pending transition cannot contain
-/// a `PlanBuilder`; only `Ready` owns the builder that `finish` will consume.
+/// a lowered draft; only `Ready` owns the source-certified draft to consume.
 pub(crate) enum CompilerStep {
     Need {
         batch: SqlNeedBatch,
         continuation: CompilerContinuation,
     },
     Ready {
+        version: PlanVersionId,
+        draft: LoweredSqlPhysicalDraft,
+        display_intent: SqlDisplayIntent,
+        display_annotations: Box<[SqlDisplayAnnotation]>,
+    },
+    #[cfg(test)]
+    TestReady {
         version: PlanVersionId,
         builder: PlanBuilder,
         display_intent: SqlDisplayIntent,
@@ -1653,13 +1609,13 @@ impl CompilerStep {
 
     pub(super) fn ready(
         version: PlanVersionId,
-        builder: PlanBuilder,
+        draft: LoweredSqlPhysicalDraft,
         display_intent: SqlDisplayIntent,
         display_annotations: impl Into<Box<[SqlDisplayAnnotation]>>,
     ) -> Self {
         Self::Ready {
             version,
-            builder,
+            draft,
             display_intent,
             display_annotations: display_annotations.into(),
         }
@@ -1682,7 +1638,12 @@ impl SqlCompileRequest {
         limits: CompletionLimits,
     ) -> Self {
         Self {
-            first_step: CompilerStep::ready(version, builder, display_intent, display_annotations),
+            first_step: CompilerStep::TestReady {
+                version,
+                builder,
+                display_intent,
+                display_annotations: display_annotations.into(),
+            },
             limits,
         }
     }
@@ -1738,15 +1699,41 @@ impl SqlCompileProgress {
     }
 }
 
+enum CompletedPlanSource {
+    Authored(SqlAuthoredPhysicalPlan),
+    #[cfg(test)]
+    StructurallyUntrusted(novarocks_physical_plan::PhysicalPlan),
+}
+
+impl CompletedPlanSource {
+    fn plan(&self) -> &novarocks_physical_plan::PhysicalPlan {
+        match self {
+            Self::Authored(source) => source.plan(),
+            #[cfg(test)]
+            Self::StructurallyUntrusted(plan) => plan,
+        }
+    }
+
+    fn into_authored(self) -> SqlAuthoredPhysicalPlan {
+        match self {
+            Self::Authored(source) => source,
+            #[cfg(test)]
+            Self::StructurallyUntrusted(_) => {
+                panic!("a structural-only test plan has no authored source journal")
+            }
+        }
+    }
+}
+
 pub struct SqlCompletedPlan {
-    plan: novarocks_physical_plan::PhysicalPlan,
+    plan: CompletedPlanSource,
     display_intent: SqlDisplayIntent,
     display_annotations: Box<[SqlDisplayAnnotation]>,
 }
 
 impl SqlCompletedPlan {
-    pub const fn plan(&self) -> &novarocks_physical_plan::PhysicalPlan {
-        &self.plan
+    pub fn plan(&self) -> &novarocks_physical_plan::PhysicalPlan {
+        self.plan.plan()
     }
 
     pub const fn display_intent(&self) -> SqlDisplayIntent {
@@ -1763,7 +1750,7 @@ impl SqlCompletedPlan {
     pub fn scalar_schema(
         &self,
     ) -> Result<novarocks_result_contract::ScalarSchema, SqlCompileError> {
-        let result = self.plan.result_port().ok_or_else(|| {
+        let result = self.plan.plan().result_port().ok_or_else(|| {
             SqlCompileError::InvalidRequest("scalar execution has no result port".into())
         })?;
         result.scalar_schema.clone().ok_or_else(|| SqlCompileError::InvalidRequest(
@@ -1771,18 +1758,22 @@ impl SqlCompletedPlan {
         ))
     }
 
-    pub fn into_plan(self) -> novarocks_physical_plan::PhysicalPlan {
-        self.plan
+    pub fn into_plan(self) -> SqlAuthoredPhysicalPlan {
+        self.plan.into_authored()
     }
 
     pub fn into_parts(
         self,
     ) -> (
-        novarocks_physical_plan::PhysicalPlan,
+        SqlAuthoredPhysicalPlan,
         SqlDisplayIntent,
         Box<[SqlDisplayAnnotation]>,
     ) {
-        (self.plan, self.display_intent, self.display_annotations)
+        (
+            self.plan.into_authored(),
+            self.display_intent,
+            self.display_annotations,
+        )
     }
 }
 
@@ -1791,7 +1782,9 @@ impl SqlCompiler {
     /// batch or validates and returns the completed plan.
     pub fn start(
         request: SqlCompileRequest,
+        control: &super::SqlCompileControl,
     ) -> Result<SqlCompileProgress, SqlCompileProgressError> {
+        control.check()?;
         advance_step(
             request.first_step,
             CompletionTracking {
@@ -1799,6 +1792,7 @@ impl SqlCompiler {
                 limits: request.limits,
                 usage: CompletionUsage::default(),
             },
+            control,
         )
     }
 
@@ -1842,7 +1836,7 @@ impl SqlCompiler {
         // consumes both before publishing the next batch; compiler graph
         // memory belongs to the caller's WorkScope reservation.
         tracking.usage.exchange_bytes = 0;
-        advance_step(step, tracking)
+        advance_step(step, tracking, control)
     }
 }
 
@@ -1967,18 +1961,6 @@ pub enum CompletionProtocolError {
     ProviderPartitionSchemeInvalid {
         id: CompileNeedId,
         reason: &'static str,
-    },
-    ProviderArtifactReferenceMissing {
-        id: CompileNeedId,
-        artifact: ArtifactRefId,
-    },
-    ProviderArtifactReferenceExtra {
-        id: CompileNeedId,
-        artifact: ArtifactRefId,
-    },
-    ProviderArtifactReferenceConflict {
-        id: CompileNeedId,
-        artifact: ArtifactRefId,
     },
     DuplicateMaterializedViewDefinition {
         id: CompileNeedId,
@@ -2187,24 +2169,6 @@ impl fmt::Display for CompletionProtocolError {
                 "provider read fact {} has an invalid partition scheme: {reason}",
                 id.get()
             ),
-            Self::ProviderArtifactReferenceMissing { id, artifact } => write!(
-                formatter,
-                "provider read fact {} is missing sealed artifact reference {}",
-                id.get(),
-                artifact.get()
-            ),
-            Self::ProviderArtifactReferenceExtra { id, artifact } => write!(
-                formatter,
-                "provider read fact {} contains unrequested sealed artifact reference {}",
-                id.get(),
-                artifact.get()
-            ),
-            Self::ProviderArtifactReferenceConflict { id, artifact } => write!(
-                formatter,
-                "provider read fact {} conflicts on sealed artifact reference {}",
-                id.get(),
-                artifact.get()
-            ),
             Self::DuplicateMaterializedViewDefinition { id, mv_id } => write!(
                 formatter,
                 "materialized-view fact {} repeats definition {mv_id}",
@@ -2283,6 +2247,7 @@ impl From<CompletionProtocolError> for SqlCompileProgressError {
 fn advance_step(
     step: CompilerStep,
     mut tracking: CompletionTracking,
+    control: &super::SqlCompileControl,
 ) -> Result<SqlCompileProgress, SqlCompileProgressError> {
     match step {
         CompilerStep::Need {
@@ -2305,10 +2270,27 @@ fn advance_step(
         }
         CompilerStep::Ready {
             version,
+            draft,
+            display_intent,
+            display_annotations,
+        } => complete(version, draft, display_intent, display_annotations, control),
+        #[cfg(test)]
+        CompilerStep::TestReady {
+            version,
             builder,
             display_intent,
             display_annotations,
-        } => complete(version, builder, display_intent, display_annotations),
+        } => {
+            let plan = builder
+                .finish_observed(control)
+                .map_err(completion_plan_construction_error)?;
+            complete_source(
+                version,
+                CompletedPlanSource::StructurallyUntrusted(plan),
+                display_intent,
+                display_annotations,
+            )
+        }
     }
 }
 
@@ -2372,17 +2354,58 @@ fn validate_and_account_facts(
 
 fn complete(
     version: PlanVersionId,
-    builder: PlanBuilder,
+    draft: LoweredSqlPhysicalDraft,
+    display_intent: SqlDisplayIntent,
+    display_annotations: Box<[SqlDisplayAnnotation]>,
+    control: &super::SqlCompileControl,
+) -> Result<SqlCompileProgress, SqlCompileProgressError> {
+    let source = draft
+        .finish_with_dependency_observer_observed(control)
+        .map_err(completion_plan_publication_error)?;
+    complete_source(
+        version,
+        CompletedPlanSource::Authored(source),
+        display_intent,
+        display_annotations,
+    )
+}
+
+fn completion_plan_publication_error(
+    error: crate::planner::distributed::build::SqlPublicationError,
+) -> SqlCompileProgressError {
+    match error {
+        crate::planner::distributed::build::SqlPublicationError::Construction(error) => {
+            completion_plan_construction_error(error)
+        }
+        crate::planner::distributed::build::SqlPublicationError::Support(error) => {
+            SqlCompileProgressError::Compile(error.into_compile_error())
+        }
+    }
+}
+
+fn completion_plan_construction_error(
+    error: novarocks_physical_plan::PlanConstructionError,
+) -> SqlCompileProgressError {
+    match error {
+        novarocks_physical_plan::PlanConstructionError::Constants(
+            novarocks_physical_plan::ConstantReferenceError::Control(error),
+        ) => SqlCompileProgressError::Compile(SqlCompileError::from(error)),
+        error => SqlCompileProgressError::Protocol(CompletionProtocolError::PlanValidation(
+            error.to_string(),
+        )),
+    }
+}
+
+fn complete_source(
+    version: PlanVersionId,
+    plan: CompletedPlanSource,
     display_intent: SqlDisplayIntent,
     display_annotations: Box<[SqlDisplayAnnotation]>,
 ) -> Result<SqlCompileProgress, SqlCompileProgressError> {
-    let plan = builder
-        .finish()
-        .map_err(|error| CompletionProtocolError::PlanValidation(error.to_string()))?;
-    if plan.version() != version {
+    if plan.plan().version() != version {
         return Err(CompletionProtocolError::PlanVersionMismatch {
             expected: version,
-            actual: plan.version(),
+            actual: plan.plan().version(),
         }
         .into());
     }
@@ -2647,7 +2670,6 @@ fn validate_provider_contract(
         return Err(CompletionProtocolError::ProviderLimitMismatch { id: need.id });
     }
     validate_provider_properties(need, &contract.provided_properties)?;
-    validate_provider_artifacts(need, contract)?;
     Ok(())
 }
 
@@ -2763,69 +2785,6 @@ fn validate_provider_properties(
         .map(|key| key.request_ordinal)
         .collect::<Vec<_>>();
     validate_unique("ordering", &ordering)
-}
-
-fn validate_provider_artifacts(
-    need: &ProviderReadNeed,
-    contract: &ProviderReadStaticContract,
-) -> Result<(), CompletionProtocolError> {
-    let mut requirements = BTreeMap::new();
-    for requirement in &contract.artifact_inputs {
-        if requirements
-            .insert(requirement.artifact, requirement)
-            .is_some()
-        {
-            return Err(CompletionProtocolError::ProviderArtifactReferenceConflict {
-                id: need.id,
-                artifact: requirement.artifact,
-            });
-        }
-    }
-    let mut references = BTreeMap::new();
-    for reference in &contract.artifact_refs {
-        if references.insert(reference.id, reference).is_some() {
-            return Err(CompletionProtocolError::ProviderArtifactReferenceConflict {
-                id: need.id,
-                artifact: reference.id,
-            });
-        }
-    }
-    for (&artifact, requirement) in &requirements {
-        let Some(reference) = references.get(&artifact) else {
-            return Err(CompletionProtocolError::ProviderArtifactReferenceMissing {
-                id: need.id,
-                artifact,
-            });
-        };
-        if !provider_artifact_matches(requirement, reference) {
-            return Err(CompletionProtocolError::ProviderArtifactReferenceConflict {
-                id: need.id,
-                artifact,
-            });
-        }
-    }
-    if let Some((&artifact, _)) = references
-        .iter()
-        .find(|(artifact, _)| !requirements.contains_key(artifact))
-    {
-        return Err(CompletionProtocolError::ProviderArtifactReferenceExtra {
-            id: need.id,
-            artifact,
-        });
-    }
-    Ok(())
-}
-
-fn provider_artifact_matches(
-    requirement: &ArtifactInputRequirement,
-    reference: &SealedArtifactRef,
-) -> bool {
-    requirement.artifact == reference.id
-        && requirement.kind == reference.kind
-        && requirement.format == reference.format
-        && requirement.schema == reference.schema
-        && requirement.source == reference.source
-        && requirement.required_coverage == reference.coverage
 }
 
 fn provider_payload_matches_binding(
@@ -3168,18 +3127,6 @@ fn provider_fact_bytes(fact: &ProviderReadFact) -> Result<u64, CompletionProtoco
             contract.predicates.len(),
             std::mem::size_of::<ProviderReadPredicateFact>(),
         )?;
-        let artifacts = checked_sum([
-            checked_mul(
-                contract.artifact_inputs.len(),
-                std::mem::size_of::<ArtifactInputRequirement>(),
-            ),
-            checked_sum(contract.artifact_inputs.iter().map(artifact_bytes)),
-            checked_mul(
-                contract.artifact_refs.len(),
-                std::mem::size_of::<SealedArtifactRef>(),
-            ),
-            checked_sum(contract.artifact_refs.iter().map(sealed_artifact_bytes)),
-        ])?;
         checked_sum([
             provider_request_dynamic_bytes(
                 &contract.request.relation,
@@ -3191,7 +3138,6 @@ fn provider_fact_bytes(fact: &ProviderReadFact) -> Result<u64, CompletionProtoco
             Ok(schema),
             Ok(predicates),
             provider_properties_bytes(&contract.provided_properties),
-            Ok(artifacts),
             checked_size(contract.coverage_evidence.len()),
         ])?
     };
@@ -3226,64 +3172,6 @@ fn provider_column_bytes(column: &ProviderColumnReference) -> Result<u64, Comple
         checked_size(payload.header().catalog().catalog_name().as_str().len()),
         checked_size(payload.payload().len()),
     ])
-}
-
-fn artifact_bytes(artifact: &ArtifactInputRequirement) -> Result<u64, CompletionProtocolError> {
-    let schema = checked_sum([
-        checked_mul(artifact.schema.len(), std::mem::size_of::<ValueType>()),
-        checked_sum(
-            artifact
-                .schema
-                .iter()
-                .map(|value| data_type_dynamic_bytes(&value.data_type)),
-        ),
-    ])?;
-    let coverage = coverage_bytes(&artifact.required_coverage)?;
-    checked_sum([
-        checked_size(artifact.kind.as_str().len()),
-        checked_size(artifact.format.id.as_str().len()),
-        Ok(schema),
-        provider_reference_bytes(&artifact.source.source),
-        Ok(coverage),
-    ])
-}
-
-fn sealed_artifact_bytes(artifact: &SealedArtifactRef) -> Result<u64, CompletionProtocolError> {
-    let schema = checked_sum([
-        checked_mul(artifact.schema.len(), std::mem::size_of::<ValueType>()),
-        checked_sum(
-            artifact
-                .schema
-                .iter()
-                .map(|value| data_type_dynamic_bytes(&value.data_type)),
-        ),
-    ])?;
-    checked_sum([
-        checked_size(artifact.kind.as_str().len()),
-        checked_size(artifact.format.id.as_str().len()),
-        Ok(schema),
-        provider_reference_bytes(&artifact.source.source),
-        coverage_bytes(&artifact.coverage),
-        checked_size(artifact.location.len()),
-    ])
-}
-
-fn coverage_bytes(
-    coverage: &novarocks_physical_plan::CoverageSet,
-) -> Result<u64, CompletionProtocolError> {
-    let ranges = checked_sum([
-        checked_mul(
-            coverage.ranges.len(),
-            std::mem::size_of::<novarocks_physical_plan::CoverageRange>(),
-        ),
-        checked_sum(coverage.ranges.iter().map(|range| {
-            checked_sum([
-                checked_size(range.start.as_deref().map_or(0, <[u8]>::len)),
-                checked_size(range.end.as_deref().map_or(0, <[u8]>::len)),
-            ])
-        })),
-    ])?;
-    checked_add(checked_size(coverage.domain.len())?, ranges)
 }
 
 fn provider_properties_bytes(
@@ -3626,10 +3514,9 @@ mod tests {
     use arrow::datatypes::DataType;
     use bytes::Bytes;
     use novarocks_physical_plan::{
-        ArtifactFormat, ArtifactFormatId, ArtifactKind, ArtifactSourceBinding, CoverageRange,
-        CoverageSet, Distribution, ExactInputVersion, ExprKind, FragmentBuilder, FragmentId,
-        FragmentSink, LiteralValue, NodeKind, OutputPort, PhysicalNode, PhysicalProperties,
-        PipelineDopDomain, ResultField, ResultPort, RowMultiplicity, ValueOrigin,
+        Distribution, ExactInputVersion, ExprKind, FragmentBuilder, FragmentId, FragmentSink,
+        LiteralValue, NodeKind, OutputPort, PhysicalNode, PhysicalProperties, PipelineDopDomain,
+        ResultField, ResultPort, RowMultiplicity, ValueOrigin,
     };
     use novarocks_spi::connector::read_stack::{
         ConnectorReadBinding, ConnectorValue, Domain, TupleDomain,
@@ -3935,8 +3822,6 @@ mod tests {
                 None => ProviderReadLimitFact::NotRequested,
             },
             provided_properties: ProviderReadProperties::unconstrained(),
-            artifact_inputs: Box::default(),
-            artifact_refs: Box::default(),
             coverage_evidence: Box::default(),
         }
     }
@@ -3954,54 +3839,6 @@ mod tests {
         }
     }
 
-    fn artifact_pair(
-        read: ProviderReadReference,
-        artifact: ArtifactRefId,
-    ) -> (ArtifactInputRequirement, SealedArtifactRef) {
-        let kind = ArtifactKind::try_new("split-directory").unwrap();
-        let format = ArtifactFormat {
-            id: ArtifactFormatId::try_new("uea5.provider-artifact").unwrap(),
-            revision: 1,
-        };
-        let schema: Box<[ValueType]> = Box::from([ValueType::new(DataType::Int64, false)]);
-        let source = ArtifactSourceBinding {
-            source: read,
-            selection_digest: [31; 32],
-        };
-        let coverage = CoverageSet {
-            domain: "manifest-entry".into(),
-            selection_digest: [32; 32],
-            ranges: Box::from([CoverageRange {
-                start: None,
-                end: None,
-            }]),
-            complete_input: true,
-        };
-        (
-            ArtifactInputRequirement {
-                artifact,
-                kind: kind.clone(),
-                format: format.clone(),
-                schema: schema.clone(),
-                source: source.clone(),
-                required_coverage: coverage.clone(),
-            },
-            SealedArtifactRef {
-                id: artifact,
-                kind,
-                format,
-                schema,
-                source,
-                coverage,
-                location: "s3://warehouse/artifacts/31".into(),
-                content_digest: [33; 32],
-                schema_digest: [34; 32],
-                object_count: 1,
-                row_count: 7,
-            },
-        )
-    }
-
     #[test]
     fn no_io_plan_completes_during_start() {
         let version = PlanVersionId::try_new([7; 16]).unwrap();
@@ -4015,12 +3852,22 @@ mod tests {
             [SqlDisplayAnnotation::try_new("optimizer", "stable").unwrap()],
             DEFAULT_COMPLETION_LIMITS,
         );
-        let completed = SqlCompiler::start(request)
-            .unwrap()
-            .into_complete()
-            .unwrap();
+        let completed =
+            SqlCompiler::start(request, &crate::compiler::SqlCompileControl::unbounded())
+                .unwrap()
+                .into_complete()
+                .unwrap();
         assert_eq!(completed.plan().version(), version);
         assert_eq!(completed.display_annotations()[0].key(), "optimizer");
+        assert!(matches!(
+            &completed.plan,
+            CompletedPlanSource::StructurallyUntrusted(_)
+        ));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| completed.into_plan()))
+                .is_err(),
+            "a raw structural test builder cannot publish an authored source owner"
+        );
     }
 
     #[test]
@@ -4031,8 +3878,11 @@ mod tests {
                 mode: TableLookupMode::ExplainStats,
             },
         );
-        let progress =
-            SqlCompiler::start(catalog_request(need, DEFAULT_COMPLETION_LIMITS)).unwrap();
+        let progress = SqlCompiler::start(
+            catalog_request(need, DEFAULT_COMPLETION_LIMITS),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         let SqlCompileProgress::Incomplete(compilation) = progress else {
             panic!("expected catalog need");
         };
@@ -4131,7 +3981,11 @@ mod tests {
             },
         );
         let compilation = incomplete(
-            SqlCompiler::start(catalog_request(need.clone(), DEFAULT_COMPLETION_LIMITS)).unwrap(),
+            SqlCompiler::start(
+                catalog_request(need.clone(), DEFAULT_COMPLETION_LIMITS),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap(),
         );
         assert!(matches!(
             SqlCompiler::finish(
@@ -4145,7 +3999,11 @@ mod tests {
         ));
 
         let compilation = incomplete(
-            SqlCompiler::start(catalog_request(need.clone(), DEFAULT_COMPLETION_LIMITS)).unwrap(),
+            SqlCompiler::start(
+                catalog_request(need.clone(), DEFAULT_COMPLETION_LIMITS),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap(),
         );
         let fact = || CatalogRelationFact::missing(&need, "missing").unwrap();
         assert!(matches!(
@@ -4174,7 +4032,11 @@ mod tests {
         )
         .unwrap();
         let compilation = incomplete(
-            SqlCompiler::start(catalog_request(need, DEFAULT_COMPLETION_LIMITS)).unwrap(),
+            SqlCompiler::start(
+                catalog_request(need, DEFAULT_COMPLETION_LIMITS),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap(),
         );
         assert!(matches!(
             SqlCompiler::finish(
@@ -4347,8 +4209,13 @@ mod tests {
             },
         );
         let limits = CompletionLimits::try_new(1, 1, 256).unwrap();
-        let compilation =
-            incomplete(SqlCompiler::start(catalog_request(need.clone(), limits)).unwrap());
+        let compilation = incomplete(
+            SqlCompiler::start(
+                catalog_request(need.clone(), limits),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap(),
+        );
         let fact = CatalogRelationFact::missing(&need, "x".repeat(1024)).unwrap();
         assert!(matches!(
             SqlCompiler::finish(
@@ -4374,8 +4241,13 @@ mod tests {
             },
         );
         let limits = CompletionLimits::try_new(1, 1, 64 * 1024).unwrap();
-        let compilation =
-            incomplete(SqlCompiler::start(catalog_request(need.clone(), limits)).unwrap());
+        let compilation = incomplete(
+            SqlCompiler::start(
+                catalog_request(need.clone(), limits),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap(),
+        );
         let planner = TableDef {
             name: "orders".to_string(),
             columns: Vec::new(),
@@ -4867,49 +4739,6 @@ mod tests {
                 ordinal: 0,
                 ..
             })
-        ));
-    }
-
-    #[test]
-    fn provider_artifacts_require_one_exact_reference_per_requirement() {
-        let need = provider_need(1, DataType::Int64, &[], None);
-        let mut exact = provider_contract(&need, b"private");
-        let (requirement, reference) = artifact_pair(exact.read.clone(), ArtifactRefId::new(7));
-        exact.artifact_inputs = Box::from([requirement.clone()]);
-        exact.artifact_refs = Box::from([reference.clone()]);
-        ProviderReadFact::negotiated(&need, exact).expect("exact artifact pair must be accepted");
-
-        let mut missing = provider_contract(&need, b"private");
-        missing.artifact_inputs = Box::from([requirement.clone()]);
-        assert!(matches!(
-            ProviderReadFact::negotiated(&need, missing),
-            Err(CompletionProtocolError::ProviderArtifactReferenceMissing {
-                artifact,
-                ..
-            }) if artifact == ArtifactRefId::new(7)
-        ));
-
-        let mut extra = provider_contract(&need, b"private");
-        extra.artifact_refs = Box::from([reference.clone()]);
-        assert!(matches!(
-            ProviderReadFact::negotiated(&need, extra),
-            Err(CompletionProtocolError::ProviderArtifactReferenceExtra {
-                artifact,
-                ..
-            }) if artifact == ArtifactRefId::new(7)
-        ));
-
-        let mut conflict = provider_contract(&need, b"private");
-        let mut conflicting_reference = reference;
-        conflicting_reference.schema = Box::from([ValueType::new(DataType::Int32, false)]);
-        conflict.artifact_inputs = Box::from([requirement]);
-        conflict.artifact_refs = Box::from([conflicting_reference]);
-        assert!(matches!(
-            ProviderReadFact::negotiated(&need, conflict),
-            Err(CompletionProtocolError::ProviderArtifactReferenceConflict {
-                artifact,
-                ..
-            }) if artifact == ArtifactRefId::new(7)
         ));
     }
 }

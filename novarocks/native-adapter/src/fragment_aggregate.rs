@@ -34,12 +34,12 @@ use novarocks_execution::exec::node::aggregate::{
     AggFunction, AggOrderSpec, AggTypeSignature, AggregateNode, AggregateRuntimeFilterSpec,
 };
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_functions::aggregate_types::mangle_distinct_aggregate_name;
 use novarocks_functions::{
     AggregateOverloadIdentity, AggregateStateFormatIdentity, ResolvedAggregateSignature,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
-use novarocks_types::aggregate::mangle_distinct_aggregate_name;
 
 #[expect(
     clippy::too_many_arguments,

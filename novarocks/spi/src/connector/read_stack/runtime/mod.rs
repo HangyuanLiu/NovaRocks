@@ -100,6 +100,47 @@ opaque_handle!(
 );
 opaque_handle!(ConnectorReadTransactionHandle);
 
+/// Provider-owned source waiting for adoption by an admitted read generation.
+///
+/// This process-local receipt is not a read binding or a native wire handle.
+/// Roles can retain it but cannot recover its provider-private source facts.
+#[derive(Clone)]
+pub struct ConnectorFrozenReadSource {
+    owner: crate::connector::ConnectorProviderBindingKey,
+    payload: OpaquePayload,
+}
+
+impl ConnectorFrozenReadSource {
+    pub const fn owner(&self) -> &crate::connector::ConnectorProviderBindingKey {
+        &self.owner
+    }
+}
+
+impl Debug for ConnectorFrozenReadSource {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConnectorFrozenReadSource")
+            .field("owner", &self.owner)
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) fn frozen_read_source<T: Send + Sync + 'static>(
+    owner: crate::connector::ConnectorProviderBindingKey,
+    value: T,
+) -> ConnectorFrozenReadSource {
+    ConnectorFrozenReadSource {
+        owner,
+        payload: OpaquePayload::new(value),
+    }
+}
+
+pub(crate) fn frozen_read_source_value<T: 'static>(
+    source: &ConnectorFrozenReadSource,
+) -> Option<&T> {
+    source.payload.downcast_ref()
+}
+
 #[derive(Clone)]
 pub struct ConnectorReadSplit {
     binding: ConnectorReadBinding,
@@ -515,6 +556,19 @@ pub trait ConnectorReadMetadata: Send + Sync {
         reference: Option<&str>,
     ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError>;
 
+    /// Adopt a provider-frozen source without reopening or widening it.
+    /// The installed provider must validate its source owner and observation.
+    fn adopt_frozen_source(
+        &self,
+        _session: &ConnectorSession,
+        _source: &ConnectorFrozenReadSource,
+    ) -> Result<ConnectorReadTableHandle, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "provider read generation does not adopt frozen write sources",
+        ))
+    }
+
     fn get_pinned_file_set_handle(
         &self,
         session: &ConnectorSession,
@@ -559,6 +613,27 @@ pub trait ConnectorReadMetadata: Send + Sync {
         Err(ConnectorError::new(
             crate::connector::ConnectorErrorKind::Unsupported,
             "connector read generation does not publish final static facts",
+        ))
+    }
+
+    /// The exact public schema of a frozen read's assignment columns.
+    ///
+    /// Asked at freeze, with the frozen handle and the assignment columns in
+    /// assignment order, repeats included. The answer has one field per column
+    /// and is an immutable fact of that read: the provider's pure read compiler
+    /// later checks the frozen public schema against this same author, so a
+    /// caller carries it unchanged and never derives one from SQL names or
+    /// engine types. Like `freeze`, this enumerates no splits and returns no
+    /// runtime capability.
+    fn read_public_schema(
+        &self,
+        _session: &ConnectorSession,
+        _table: &ConnectorReadTableHandle,
+        _columns: &[ConnectorReadColumnHandle],
+    ) -> Result<super::ConnectorReadPublicSchema, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "connector read generation does not publish a public read schema",
         ))
     }
 

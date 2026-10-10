@@ -20,6 +20,9 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 use arrow_schema::{DataType, IntervalUnit, TimeUnit};
+use novarocks_type_contract::{
+    arithmetic_result_value_type_with_op, is_integer_value_type, is_numeric_value_type,
+};
 
 use crate::{
     AggregatePhase, ExprId, ExprKind, Fragment, FunctionKind, NodeId, NodeKind, ValueOrigin,
@@ -182,6 +185,8 @@ pub(crate) fn validate_expression(
             )),
         },
         ExprKind::Literal(literal) => validate_literal_type(literal, &expression.ty, &path, errors),
+        // Exact table/address/value checks are mandatory at plan/package publication.
+        ExprKind::Constant(_) => {}
         ExprKind::LambdaParameter { lambda, ordinal } => {
             match fragment.expressions().get(*lambda) {
                 Some(crate::ExprNode {
@@ -257,10 +262,16 @@ pub(crate) fn validate_expression(
                 // answer, and a plan's nullability widens on the way out. It
                 // may not admit less.
                 let widens = expression.ty.nullable || !input.ty.nullable;
+                // Strict unary NULL preserves the actual nullable NULL domain
+                // and its child evaluation; it is not a numeric coercion.
+                let strict_null = input.ty.logical_type
+                    == novarocks_type_contract::ValueLogicalType::Physical
+                    && input.ty.data_type == DataType::Null
+                    && input.ty.nullable;
                 let valid = match op {
                     crate::UnaryOperator::Plus | crate::UnaryOperator::Minus => {
-                        is_numeric(&input.ty.data_type)
-                            && input.ty.data_type == expression.ty.data_type
+                        (is_numeric_value_type(&input.ty) || strict_null)
+                            && input.ty.same_value_domain(&expression.ty)
                             && widens
                     }
                     crate::UnaryOperator::Not => {
@@ -269,8 +280,8 @@ pub(crate) fn validate_expression(
                             && widens
                     }
                     crate::UnaryOperator::BitwiseNot => {
-                        is_integer(&input.ty.data_type)
-                            && input.ty.data_type == expression.ty.data_type
+                        (is_integer_value_type(&input.ty) || strict_null)
+                            && input.ty.same_value_domain(&expression.ty)
                             && widens
                     }
                 };
@@ -287,7 +298,27 @@ pub(crate) fn validate_expression(
             op,
             right,
             decimal_overflow_policy,
+            allow_throw_exception,
         } => {
+            let arithmetic = matches!(
+                op,
+                crate::BinaryOperator::Add
+                    | crate::BinaryOperator::Subtract
+                    | crate::BinaryOperator::Multiply
+                    | crate::BinaryOperator::Divide
+                    | crate::BinaryOperator::Modulo
+            );
+            if arithmetic != allow_throw_exception.is_some()
+                || allow_throw_exception.is_some_and(|reference| {
+                    reference.expected_key
+                        != novarocks_type_contract::SemanticParameterKey::AllowThrowException
+                })
+            {
+                errors.push(ValidationError::new(
+                    &path,
+                    "binary ALLOW_THROW_EXCEPTION reference differs from its operator profile",
+                ));
+            }
             if !matches!(
                 op,
                 crate::BinaryOperator::Add
@@ -357,7 +388,7 @@ pub(crate) fn validate_expression(
                 }
                 FunctionKind::Aggregate => match aggregate_binding {
                     Some(binding)
-                        if binding.function == *function
+                        if binding.function.signature_matches(function)
                             && binding.phase == AggregatePhase::Single =>
                     {
                         validate_aggregate_arguments(
@@ -393,7 +424,28 @@ pub(crate) fn validate_expression(
             expr,
             target,
             decimal_overflow_policy,
+            allow_throw_exception,
         } => {
+            if allow_throw_exception.expected_key
+                != novarocks_type_contract::SemanticParameterKey::AllowThrowException
+            {
+                errors.push(ValidationError::new(
+                    &path,
+                    "CAST requires an ALLOW_THROW_EXCEPTION semantic reference",
+                ));
+            }
+            if let Some(input) = fragment.expressions().get(*expr)
+                && (input.ty.logical_type != expression.ty.logical_type
+                    || !novarocks_type_contract::preserves_nested_logical_identity(
+                        &input.ty.data_type,
+                        target,
+                    ))
+            {
+                errors.push(ValidationError::new(
+                    &path,
+                    "carrier CAST cannot establish or erase a logical identity",
+                ));
+            }
             if let Some(input) = fragment.expressions().get(*expr)
                 && !novarocks_type_contract::decimal_error_policy_cast_supported(
                     &input.ty.data_type,
@@ -411,7 +463,7 @@ pub(crate) fn validate_expression(
             // statement may stand this value where null is admitted. It may
             // not claim the reverse: a null-admitting input does not stop
             // admitting null by being converted.
-            if &expression.ty.data_type != target {
+            if !novarocks_type_contract::arrow_data_types_exact(&expression.ty.data_type, target) {
                 // Both types, because which half drifted is the diagnosis.
                 errors.push(ValidationError::new(
                     &path,
@@ -454,7 +506,7 @@ pub(crate) fn validate_expression(
                     if fragment
                         .expressions()
                         .get(*candidate)
-                        .is_some_and(|candidate| candidate.ty.data_type != input.ty.data_type)
+                        .is_some_and(|candidate| !candidate.ty.same_value_domain(&input.ty))
                     {
                         errors.push(ValidationError::new(
                             &path,
@@ -485,7 +537,7 @@ pub(crate) fn validate_expression(
                     if fragment
                         .expressions()
                         .get(bound)
-                        .is_some_and(|bound| bound.ty.data_type != input.ty.data_type)
+                        .is_some_and(|bound| !bound.ty.same_value_domain(&input.ty))
                     {
                         errors.push(ValidationError::new(
                             &path,
@@ -552,6 +604,7 @@ pub(crate) fn validate_literal_type(
         crate::LiteralValue::Float64Bits(_) => ty.data_type == DataType::Float64,
         crate::LiteralValue::LargeInt(_) => {
             novarocks_type_contract::is_largeint_data_type(&ty.data_type)
+                && is_numeric_value_type(ty)
         }
         crate::LiteralValue::Decimal128(_) => {
             matches!(ty.data_type, DataType::Decimal128(_, _))
@@ -576,7 +629,7 @@ pub(crate) fn validate_literal_type(
         crate::LiteralValue::Timestamp(_) => {
             matches!(ty.data_type, DataType::Timestamp(_, _))
         }
-        crate::LiteralValue::IntervalMonthDayNano(_) => {
+        crate::LiteralValue::IntervalMonthDayNano { .. } => {
             ty.data_type == DataType::Interval(IntervalUnit::MonthDayNano)
         }
     };
@@ -610,7 +663,7 @@ const fn literal_kind_name(literal: &crate::LiteralValue) -> &'static str {
         crate::LiteralValue::Date32(_) => "date32",
         crate::LiteralValue::Time64(_) => "time64",
         crate::LiteralValue::Timestamp(_) => "timestamp",
-        crate::LiteralValue::IntervalMonthDayNano(_) => "interval",
+        crate::LiteralValue::IntervalMonthDayNano { .. } => "interval",
     }
 }
 
@@ -701,7 +754,7 @@ pub(crate) fn validate_binary_types(
     path: &str,
     errors: &mut ValidationContext,
 ) {
-    let same_inputs = left.ty.data_type == right.ty.data_type;
+    let same_inputs = left.ty.same_value_domain(&right.ty);
     // An operator may admit null neither operand does -- arithmetic answers
     // with null where it cannot answer with a number, and a plan's nullability
     // widens on the way out. It may not admit less than its operands do.
@@ -729,14 +782,11 @@ pub(crate) fn validate_binary_types(
                 }
                 _ => unreachable!(),
             };
-            novarocks_type_contract::arithmetic_result_type_with_op(
-                &left.ty.data_type,
-                &right.ty.data_type,
-                operation,
+            arithmetic_result_value_type_with_op(&left.ty, &right.ty, operation).is_some_and(
+                |expected| {
+                    output.ty.same_value_domain(&expected) && nullability_widens(output.ty.nullable)
+                },
             )
-            .as_ref()
-            .is_some_and(|expected| expected == &output.ty.data_type)
-                && nullability_widens(output.ty.nullable)
         }
         crate::BinaryOperator::Eq
         | crate::BinaryOperator::NotEq
@@ -755,8 +805,8 @@ pub(crate) fn validate_binary_types(
         | crate::BinaryOperator::BitOr
         | crate::BinaryOperator::BitXor => {
             same_inputs
-                && is_integer(&left.ty.data_type)
-                && output.ty.data_type == left.ty.data_type
+                && is_integer_value_type(&left.ty)
+                && output.ty.same_value_domain(&left.ty)
                 && nullability_widens(output.ty.nullable)
         }
     };
@@ -787,7 +837,7 @@ pub(crate) fn validate_case_types(
     for (when, then) in when_then {
         if let Some(when) = fragment.expressions().get(*when) {
             let valid = operand_type
-                .map(|operand| operand.data_type == when.ty.data_type)
+                .map(|operand| operand.same_value_domain(&when.ty))
                 .unwrap_or(when.ty.data_type == DataType::Boolean);
             if !valid {
                 errors.push(ValidationError::new(
@@ -805,7 +855,7 @@ pub(crate) fn validate_case_types(
         if fragment
             .expressions()
             .get(*then)
-            .is_some_and(|then| then.ty.data_type != expression.ty.data_type)
+            .is_some_and(|then| !then.ty.same_value_domain(&expression.ty))
         {
             errors.push(ValidationError::new(
                 path,
@@ -817,7 +867,7 @@ pub(crate) fn validate_case_types(
         && fragment
             .expressions()
             .get(else_expr)
-            .is_some_and(|otherwise| otherwise.ty.data_type != expression.ty.data_type)
+            .is_some_and(|otherwise| !otherwise.ty.same_value_domain(&expression.ty))
     {
         errors.push(ValidationError::new(
             path,
@@ -956,6 +1006,10 @@ pub(crate) fn window_offset_literal_is_valid(
     match (units, kind) {
         (
             crate::WindowFrameUnits::Rows | crate::WindowFrameUnits::Groups,
+            ExprKind::Constant(_),
+        ) => true,
+        (
+            crate::WindowFrameUnits::Rows | crate::WindowFrameUnits::Groups,
             ExprKind::Literal(crate::LiteralValue::UInt64(_)),
         ) => true,
         (
@@ -1003,36 +1057,29 @@ pub(crate) fn is_utf8(ty: &DataType) -> bool {
     )
 }
 
-pub(crate) fn is_integer(ty: &DataType) -> bool {
-    // LARGEINT is an integer that happens to need sixteen bytes; it is stored
-    // as fixed-size binary, and a rule that reads the storage instead of the
-    // type refuses `-x` and `~x` on it.
-    novarocks_type_contract::is_largeint_data_type(ty)
-        || matches!(
-            ty,
-            DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UInt8
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64
-        )
-}
-
-pub(crate) fn is_numeric(ty: &DataType) -> bool {
-    is_integer(ty)
-        || matches!(
-            ty,
-            DataType::Float16
-                | DataType::Float32
-                | DataType::Float64
-                | DataType::Decimal32(_, _)
-                | DataType::Decimal64(_, _)
-                | DataType::Decimal128(_, _)
-                | DataType::Decimal256(_, _)
-        )
+/// Only the legacy publication path requires original legacy provenance.
+/// Package construction separately checks actual FrozenFragmentCalls and never
+/// substitutes these projections for the occurrence's complete effect facts.
+pub(crate) fn validate_legacy_binding_metadata(
+    metadata: Option<&crate::LegacyBindingMetadata>,
+    kind: crate::FunctionKind,
+    path: &str,
+    invalid_kind_message: &'static str,
+    errors: &mut ValidationContext,
+) {
+    if !errors.checks_output_and_effect_proofs() {
+        return;
+    }
+    match metadata {
+        None => errors.push(ValidationError::unsupported_capability(
+            path,
+            "legacy publication requires original binding metadata; use frozen package admission for an exact signature",
+        )),
+        Some(metadata) if !metadata.intrinsic_row_error.is_valid_for_kind(kind) => {
+            errors.push(ValidationError::new(path, invalid_kind_message));
+        }
+        Some(_) => {}
+    }
 }
 
 pub(crate) fn validate_function_call(
@@ -1043,15 +1090,13 @@ pub(crate) fn validate_function_call(
     path: &str,
     errors: &mut ValidationContext,
 ) {
-    if !function
-        .intrinsic_row_error
-        .is_valid_for_kind(function.kind)
-    {
-        errors.push(ValidationError::new(
-            path,
-            "bound function intrinsic row-error fact differs from its kind",
-        ));
-    }
+    validate_legacy_binding_metadata(
+        function.legacy_metadata.as_ref(),
+        function.kind,
+        path,
+        "bound function intrinsic row-error fact differs from its kind",
+        errors,
+    );
     validate_function_arguments(
         fragment,
         &function.function_id,
@@ -1094,10 +1139,7 @@ pub(crate) fn validate_function_arguments(
                 // A parameter that accepts null accepts a value that never
                 // writes one; the mismatch is the other way round.
                 (crate::FunctionArgumentType::Value(expected), _) => {
-                    novarocks_type_contract::fits_nested_nullability(
-                        &actual.ty.data_type,
-                        &expected.data_type,
-                    ) && (expected.nullable || !actual.ty.nullable)
+                    actual.ty.fits_value_type(expected)
                 }
                 (
                     crate::FunctionArgumentType::Lambda {
@@ -1263,16 +1305,13 @@ pub(crate) fn validate_aggregate_arguments(
     path: &str,
     errors: &mut ValidationContext,
 ) {
-    if !binding
-        .function
-        .intrinsic_row_error
-        .is_valid_for_kind(binding.function.kind)
-    {
-        errors.push(ValidationError::new(
-            path,
-            "bound aggregate intrinsic row-error fact differs from its kind",
-        ));
-    }
+    validate_legacy_binding_metadata(
+        binding.function.legacy_metadata.as_ref(),
+        binding.function.kind,
+        path,
+        "bound aggregate intrinsic row-error fact differs from its kind",
+        errors,
+    );
     match binding.phase {
         AggregatePhase::Single | AggregatePhase::Partial { .. } => {
             let logical_count =
@@ -1316,7 +1355,7 @@ pub(crate) fn validate_aggregate_arguments(
                     "state-consuming aggregate phase requires exactly one state input",
                 ));
             } else if let Some(argument) = fragment.expressions().get(args[0])
-                && (argument.ty.data_type != binding.intermediate_type.data_type
+                && (!argument.ty.same_value_domain(&binding.intermediate_type)
                     || (binding.intermediate_type.nullable && !argument.ty.nullable))
             {
                 // The carrier the state travelled in may admit null the
@@ -1360,5 +1399,254 @@ pub(crate) fn validate_expression_values_on_port(
             ));
         }
         expression.kind.expression_references(&mut pending);
+    }
+}
+
+#[cfg(test)]
+mod value_arithmetic_tests {
+    use super::*;
+    use crate::{
+        BinaryOperator, FragmentBuilder, FragmentId, FragmentSink, PipelineDopDomain, UnaryOperator,
+    };
+    use novarocks_type_contract::ValueLogicalType;
+
+    fn largeint(nullable: bool) -> ValueType {
+        ValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            nullable,
+            ValueLogicalType::LargeInt,
+        )
+        .unwrap()
+    }
+
+    // Exercise the actual local binary gate, independently of literal encoding
+    // and whole-plan topology. No owner refinement or runtime claim is made.
+    fn binary_valid(
+        left: ValueType,
+        op: BinaryOperator,
+        right: ValueType,
+        output: ValueType,
+    ) -> bool {
+        let node = |id, ty| crate::ExprNode {
+            id: ExprId::new(id),
+            owner: NodeId::new(0),
+            lambda_scope: None,
+            ty,
+            kind: ExprKind::Literal(crate::LiteralValue::Null),
+        };
+        let mut errors = ValidationContext::new();
+        validate_binary_types(
+            &node(0, left),
+            op,
+            &node(1, right),
+            &node(2, output),
+            "binary",
+            &mut errors,
+        );
+        errors.is_empty()
+    }
+
+    #[test]
+    fn arithmetic_gate_preserves_exact_domain_and_only_root_nullable_widening() {
+        assert!(binary_valid(
+            largeint(false),
+            BinaryOperator::Add,
+            ValueType::new(DataType::Int64, false),
+            largeint(false)
+        ));
+        assert!(binary_valid(
+            largeint(false),
+            BinaryOperator::Add,
+            ValueType::new(DataType::Int64, false),
+            largeint(true)
+        ));
+        assert!(!binary_valid(
+            largeint(true),
+            BinaryOperator::Add,
+            ValueType::new(DataType::Int64, false),
+            largeint(false)
+        ));
+        assert!(!binary_valid(
+            largeint(false),
+            BinaryOperator::Add,
+            ValueType::new(DataType::Int64, false),
+            ValueType::new(DataType::FixedSizeBinary(16), true)
+        ));
+        assert!(binary_valid(
+            largeint(false),
+            BinaryOperator::Divide,
+            largeint(false),
+            ValueType::new(DataType::Float64, true)
+        ));
+        assert!(!binary_valid(
+            largeint(false),
+            BinaryOperator::Divide,
+            largeint(false),
+            largeint(true)
+        ));
+        assert!(binary_valid(
+            ValueType::new(DataType::Decimal128(38, 15), true),
+            BinaryOperator::Subtract,
+            largeint(false),
+            ValueType::new(DataType::Decimal256(55, 15), true)
+        ));
+        assert!(!binary_valid(
+            ValueType::new(DataType::Decimal128(38, 15), true),
+            BinaryOperator::Multiply,
+            largeint(false),
+            ValueType::new(DataType::Decimal256(55, 15), true)
+        ));
+    }
+
+    #[test]
+    fn binary_numeric_gates_reject_opaque_fixed16_and_preserve_unsigned_bitwise() {
+        for opaque in [
+            ValueType::new(DataType::FixedSizeBinary(16), false),
+            ValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                false,
+                ValueLogicalType::Uuid,
+            )
+            .unwrap(),
+        ] {
+            assert!(!binary_valid(
+                opaque.clone(),
+                BinaryOperator::Add,
+                largeint(false),
+                largeint(true)
+            ));
+            assert!(!binary_valid(
+                opaque.clone(),
+                BinaryOperator::BitAnd,
+                opaque.clone(),
+                opaque
+            ));
+        }
+        for dtype in [
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+        ] {
+            assert!(binary_valid(
+                ValueType::new(dtype.clone(), false),
+                BinaryOperator::BitXor,
+                ValueType::new(dtype.clone(), true),
+                ValueType::new(dtype, true)
+            ));
+        }
+    }
+
+    fn unary_fragment(
+        input: ValueType,
+        output: ValueType,
+        op: UnaryOperator,
+        nonliteral_null_child: bool,
+    ) -> Result<Fragment, ValidationErrors> {
+        let mut builder = FragmentBuilder::new(FragmentId::new(0));
+        let node = builder.reserve_node_id().unwrap();
+        let mut child = builder
+            .add_expression(
+                node,
+                input.clone(),
+                ExprKind::Literal(crate::LiteralValue::Null),
+            )
+            .unwrap();
+        if nonliteral_null_child {
+            child = builder
+                .add_expression(
+                    node,
+                    input,
+                    ExprKind::Unary {
+                        op: UnaryOperator::Plus,
+                        expr: child,
+                    },
+                )
+                .unwrap();
+        }
+        let root = builder
+            .add_expression(node, output.clone(), ExprKind::Unary { op, expr: child })
+            .unwrap();
+        let value = builder
+            .add_value(
+                output,
+                ValueOrigin::NodeOutput {
+                    node,
+                    output_ordinal: 0,
+                },
+            )
+            .unwrap();
+        builder
+            .add_values(
+                node,
+                vec![vec![root].into_boxed_slice()].into_boxed_slice(),
+                vec![value].into_boxed_slice(),
+            )
+            .unwrap();
+        builder.finish_definition(
+            node,
+            FragmentSink::Noop,
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+        )
+    }
+
+    #[test]
+    fn checked_unary_fragments_preserve_decimal_uint_largeint_and_strict_null() {
+        for dtype in [
+            DataType::Float16,
+            DataType::Decimal32(7, 2),
+            DataType::Decimal64(10, 2),
+            DataType::Decimal128(38, 2),
+            DataType::Decimal256(76, 2),
+            DataType::UInt64,
+        ] {
+            let ty = ValueType::new(dtype, true);
+            unary_fragment(ty.clone(), ty, UnaryOperator::Minus, false).unwrap();
+        }
+        unary_fragment(
+            largeint(true),
+            largeint(true),
+            UnaryOperator::BitwiseNot,
+            false,
+        )
+        .unwrap();
+        for op in [
+            UnaryOperator::Plus,
+            UnaryOperator::Minus,
+            UnaryOperator::BitwiseNot,
+        ] {
+            let ty = ValueType::new(DataType::Null, true);
+            let fragment = unary_fragment(ty.clone(), ty.clone(), op, true).unwrap();
+            assert_eq!(fragment.expressions().len(), 3);
+            assert!(fragment.expressions().iter().all(|(_, expr)| expr.ty == ty));
+        }
+        for opaque in [
+            ValueType::new(DataType::FixedSizeBinary(16), true),
+            ValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                true,
+                ValueLogicalType::Uuid,
+            )
+            .unwrap(),
+        ] {
+            for op in [UnaryOperator::Minus, UnaryOperator::BitwiseNot] {
+                let errors = unary_fragment(opaque.clone(), opaque.clone(), op, false).unwrap_err();
+                assert!(errors.errors().iter().any(|error| error.message()
+                    == "unary expression types are inconsistent with its operator"));
+            }
+        }
+        assert!(
+            unary_fragment(
+                ValueType::new(DataType::Null, true),
+                ValueType::new(DataType::Int64, true),
+                UnaryOperator::Minus,
+                false
+            )
+            .is_err()
+        );
     }
 }

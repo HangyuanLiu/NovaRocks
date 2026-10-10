@@ -687,11 +687,13 @@ mod admission_and_conclusion_tests {
             scope.stage_scope().check().map_err(|error| {
                 StatisticsAttemptError::Cancelled(StatisticsFailure {
                     message: Arc::from(error.to_string()),
+                    compile_control: None,
                 })
             })?;
             if self.fail {
                 Err(StatisticsAttemptError::Failed(StatisticsFailure {
                     message: Arc::from("controlled statistics failure"),
+                    compile_control: None,
                 }))
             } else {
                 Ok(())

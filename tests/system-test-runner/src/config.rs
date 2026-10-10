@@ -16,6 +16,8 @@ pub struct RunnerConfig {
     pub launch_profile: LaunchProfile,
     pub uea1_workload_manifest: Option<PathBuf>,
     pub exact_mysql_execution_binding: Option<PathBuf>,
+    pub held_native_execution_binding: Option<PathBuf>,
+    pub held_live_collector_fences: bool,
 }
 
 impl RunnerConfig {
@@ -56,6 +58,8 @@ impl RunnerConfig {
             launch_profile: cli.launch_profile,
             uea1_workload_manifest: cli.uea1_workload_manifest.clone(),
             exact_mysql_execution_binding: cli.exact_mysql_execution_binding.clone(),
+            held_native_execution_binding: cli.held_native_execution_binding.clone(),
+            held_live_collector_fences: cli.held_live_collector_fences,
         })
     }
 }

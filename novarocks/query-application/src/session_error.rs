@@ -44,6 +44,7 @@ pub struct QueryServiceError {
     message: String,
     user_error: Option<UserError>,
     publication_terminal: Option<LakePublicationTerminal>,
+    compile_control: Option<novarocks_type_contract::CompileControlError>,
 }
 
 impl QueryServiceError {
@@ -63,6 +64,7 @@ impl QueryServiceError {
             message: message.into(),
             user_error: None,
             publication_terminal: None,
+            compile_control: None,
         }
     }
 
@@ -73,6 +75,7 @@ impl QueryServiceError {
             message: error.to_string(),
             user_error: Some(error),
             publication_terminal: None,
+            compile_control: None,
         }
     }
 
@@ -85,7 +88,30 @@ impl QueryServiceError {
             message: message.into(),
             user_error: None,
             publication_terminal: Some(terminal),
+            compile_control: None,
         }
+    }
+
+    pub fn from_compile_control(error: novarocks_type_contract::CompileControlError) -> Self {
+        let kind = match error {
+            novarocks_type_contract::CompileControlError::Cancelled => {
+                QueryServiceErrorKind::Interrupted
+            }
+            novarocks_type_contract::CompileControlError::DeadlineExceeded => {
+                QueryServiceErrorKind::Timeout
+            }
+            novarocks_type_contract::CompileControlError::ResourceExhausted => {
+                QueryServiceErrorKind::Internal
+            }
+        };
+        let mut failure = Self::new(kind, error.to_string());
+        failure.compile_control = Some(error);
+        failure
+    }
+    pub const fn compile_control_error(
+        &self,
+    ) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control
     }
 
     pub const fn kind(&self) -> QueryServiceErrorKind {
@@ -145,5 +171,37 @@ mod tests {
         assert_eq!(error.kind(), QueryServiceErrorKind::Parse);
         assert_eq!(error.user_error(), Some(&parser_error));
         assert_eq!(error.message(), parser_error.to_string());
+    }
+}
+
+#[cfg(test)]
+mod compile_control_tests {
+    use super::*;
+    use novarocks_type_contract::CompileControlError;
+
+    #[test]
+    fn service_terminal_preserves_control_and_existing_client_classes() {
+        for (control, kind) in [
+            (
+                CompileControlError::Cancelled,
+                QueryServiceErrorKind::Interrupted,
+            ),
+            (
+                CompileControlError::DeadlineExceeded,
+                QueryServiceErrorKind::Timeout,
+            ),
+            (
+                CompileControlError::ResourceExhausted,
+                QueryServiceErrorKind::Internal,
+            ),
+        ] {
+            let error = QueryServiceError::from_compile_control(control);
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.compile_control_error(), Some(control));
+            assert_eq!(
+                QueryServiceError::new(kind, control.to_string()).compile_control_error(),
+                None
+            );
+        }
     }
 }

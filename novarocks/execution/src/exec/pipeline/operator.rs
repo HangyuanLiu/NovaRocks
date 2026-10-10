@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::schedule::observer::Observable;
@@ -115,23 +117,23 @@ pub trait Operator: Send {
         let _ = profiles;
     }
 
-    fn prepare(&mut self) -> Result<(), String> {
+    fn prepare(&mut self) -> ExecutionResult<()> {
         Ok(())
     }
 
-    fn bind_runtime_state(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn bind_runtime_state(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         Ok(())
     }
 
     /// Start task-owned activity after the driver has been admitted for execution.
     /// Preparation and binding must leave providers and subscriptions dormant.
-    fn activate(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn activate(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         Ok(())
     }
 
     fn set_fragment_event_sink(&mut self, _sink: Arc<dyn FragmentEventSink>) {}
 
-    fn close(&mut self) -> Result<(), String> {
+    fn close(&mut self) -> ExecutionResult<()> {
         Ok(())
     }
 
@@ -230,7 +232,7 @@ pub trait ProcessorOperator: Operator {
     /// Admission before the upstream owner can materialize its next output.
     /// Ordinary operators use readiness; bounded root sinks retain one exact
     /// input/hydration overlap position through the final edge and producer.
-    fn prepare_upstream_pull(&self) -> Result<bool, String> {
+    fn prepare_upstream_pull(&self) -> ExecutionResult<bool> {
         Ok(self.need_input())
     }
 
@@ -256,7 +258,7 @@ pub trait ProcessorOperator: Operator {
         &mut self,
         state: &RuntimeState,
         _input: &RootInputPermit,
-    ) -> Result<RootPreparedPull, String> {
+    ) -> ExecutionResult<RootPreparedPull> {
         self.pull_chunk(state).map(|chunk| match chunk {
             Some(chunk) => RootPreparedPull::Chunk(chunk),
             None => RootPreparedPull::Empty,
@@ -271,7 +273,7 @@ pub trait ProcessorOperator: Operator {
         &self,
         chunk: &Chunk,
         _input: &RootInputPermit,
-    ) -> Result<bool, String> {
+    ) -> ExecutionResult<bool> {
         self.can_accept_input(chunk)
     }
 
@@ -280,16 +282,18 @@ pub trait ProcessorOperator: Operator {
         _state: &RuntimeState,
         chunk: Chunk,
         input: RootInputPermit,
-    ) -> Result<(), String> {
+    ) -> ExecutionResult<()> {
         drop(chunk);
         drop(input);
-        Err("processor cannot consume an original root input grant".to_string())
+        Err("processor cannot consume an original root input grant"
+            .to_string()
+            .into())
     }
 
     /// A host-owned asynchronous terminal processor can fail while its source is
     /// parked. The driver observes that failure before deciding completion;
     /// the processor also supplies its stable early-finish wake observable.
-    fn execution_error(&self) -> Option<String> {
+    fn execution_error(&self) -> Option<crate::runtime::fragment::ExecutionFailure> {
         None
     }
 
@@ -299,7 +303,7 @@ pub trait ProcessorOperator: Operator {
     /// Most operators use their ordinary `need_input` decision. A bounded
     /// terminal sink may reserve byte credit here before the driver transfers
     /// ownership to `push_chunk`.
-    fn can_accept_input(&self, _chunk: &Chunk) -> Result<bool, String> {
+    fn can_accept_input(&self, _chunk: &Chunk) -> ExecutionResult<bool> {
         Ok(self.need_input())
     }
 
@@ -313,11 +317,11 @@ pub trait ProcessorOperator: Operator {
 
     fn has_output(&self) -> bool;
 
-    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> Result<(), String>;
+    fn push_chunk(&mut self, state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()>;
 
-    fn pull_chunk(&mut self, state: &RuntimeState) -> Result<Option<Chunk>, String>;
+    fn pull_chunk(&mut self, state: &RuntimeState) -> ExecutionResult<Option<Chunk>>;
 
-    fn set_finishing(&mut self, state: &RuntimeState) -> Result<(), String>;
+    fn set_finishing(&mut self, state: &RuntimeState) -> ExecutionResult<()>;
 
     /// What `set_finishing` could not complete, and whether another turn
     /// would complete it.
@@ -478,6 +482,7 @@ pub(crate) fn dictionary_carrier_stats(
 
 #[cfg(test)]
 mod tests {
+    use crate::runtime::fragment::ExecutionResult;
     use std::sync::Arc;
 
     use super::{
@@ -509,15 +514,15 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
     }
@@ -539,15 +544,15 @@ mod tests {
             false
         }
 
-        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
             Ok(())
         }
 
-        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
             Ok(None)
         }
 
-        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+        fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
             Ok(())
         }
 

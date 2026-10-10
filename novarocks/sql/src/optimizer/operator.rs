@@ -142,10 +142,8 @@ pub(crate) struct ScalarProjectItem {
 pub(crate) struct ScalarAggregateSpec {
     pub output_column_id: ColumnId,
     pub name: String,
-    pub args: Vec<ScalarId>,
     pub distinct: bool,
-    pub order_by: Vec<SortKey>,
-    pub resolved: crate::binding::SqlFunctionBinding,
+    pub source: crate::binding::AggregateArgumentSource<ScalarId, SortKey>,
 }
 
 #[derive(Clone, Debug)]
@@ -793,8 +791,11 @@ mod aggregate_stage_tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
+
             is_internal: false,
         }
     }
@@ -806,26 +807,35 @@ mod aggregate_stage_tests {
                 qualifier: Some("t".to_string()),
                 column: name.to_string(),
             },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         }
     }
 
     fn scalar_col_ref(arena: &mut ScalarArena, id: u32, name: &str) -> ScalarId {
-        intern_typed(arena, &col_ref(id, name))
+        intern_typed(
+            arena,
+            &col_ref(id, name),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap()
     }
 
     fn count_call(arena: &mut ScalarArena) -> ScalarAggregateSpec {
         ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(3),
             name: "count".to_string(),
-            args: vec![scalar_col_ref(arena, 2, "v")],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate(
-                "count",
-                &[arrow::datatypes::DataType::Int64],
-                false,
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![scalar_col_ref(arena, 2, "v")],
+                vec![],
+                crate::functions::test_resolved_aggregate(
+                    "count",
+                    &[arrow::datatypes::DataType::Int64],
+                    false,
+                ),
             ),
         }
     }
@@ -834,17 +844,19 @@ mod aggregate_stage_tests {
         ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            args: vec![],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate(
-                name,
-                if name == "count" {
-                    &[]
-                } else {
-                    &[arrow::datatypes::DataType::Int64]
-                },
-                false,
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![],
+                vec![],
+                crate::functions::test_resolved_aggregate(
+                    name,
+                    if name == "count" {
+                        &[]
+                    } else {
+                        &[arrow::datatypes::DataType::Int64]
+                    },
+                    false,
+                ),
             ),
         }
     }

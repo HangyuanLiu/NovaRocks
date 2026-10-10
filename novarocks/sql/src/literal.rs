@@ -510,37 +510,16 @@ pub(crate) fn function_to_literal(func: &ast::FunctionCall) -> Result<Literal, S
                     );
                 }
             }
-            use novarocks_types::value::hll::{
-                MURMUR_SEED, encode_hll_empty, encode_hll_single, murmur_hash64a,
-            };
+            use novarocks_functions::hll_hash_core::encode_scalar_bytes;
             let arg = expr_to_literal(args[0])?;
-            // Mirror the runtime `eval_hll_hash` byte conversion exactly:
-            //   - NULL  → encode_hll_empty()
-            //   - Int   → Int64 little-endian (analyzer types integer literals as Int64)
-            //   - Float → Float64 little-endian
-            //   - String → raw UTF-8 bytes
-            //   - Bool  → single byte 0/1
+            // Preserve this INSERT author's original byte projection. SELECT
+            // analyzer coercion is a distinct source contract, not a default here.
             let bytes = match arg {
-                Literal::Null => encode_hll_empty(),
-                Literal::Int(v) => {
-                    let buf = v.to_le_bytes();
-                    let hash = murmur_hash64a(&buf, MURMUR_SEED);
-                    encode_hll_single(hash)
-                }
-                Literal::Float(v) => {
-                    let buf = v.to_le_bytes();
-                    let hash = murmur_hash64a(&buf, MURMUR_SEED);
-                    encode_hll_single(hash)
-                }
-                Literal::String(s) => {
-                    let hash = murmur_hash64a(s.as_bytes(), MURMUR_SEED);
-                    encode_hll_single(hash)
-                }
-                Literal::Bool(b) => {
-                    let buf = [if b { 1u8 } else { 0u8 }];
-                    let hash = murmur_hash64a(&buf, MURMUR_SEED);
-                    encode_hll_single(hash)
-                }
+                Literal::Null => encode_scalar_bytes(None),
+                Literal::Int(v) => encode_scalar_bytes(Some(&v.to_le_bytes())),
+                Literal::Float(v) => encode_scalar_bytes(Some(&v.to_le_bytes())),
+                Literal::String(s) => encode_scalar_bytes(Some(s.as_bytes())),
+                Literal::Bool(b) => encode_scalar_bytes(Some(&[if b { 1u8 } else { 0u8 }])),
                 other => return Err(format!("hll_hash unsupported literal: {other:?}")),
             };
             Ok(Literal::String(bytes_to_latin1_string(&bytes)))
@@ -954,6 +933,7 @@ pub fn sql_type_to_arrow_type(sql_type: &SqlType) -> Result<DataType, String> {
                 .into(),
         )),
         SqlType::Variant => Ok(DataType::LargeBinary),
+        SqlType::Uuid => Ok(DataType::FixedSizeBinary(16)),
     }
 }
 
@@ -1069,52 +1049,7 @@ pub fn arrow_data_type_to_sql_type(dt: &DataType) -> Result<SqlType, String> {
 /// Callers that need top-level column nullability enforcement must keep
 /// their own `Field::is_nullable()` check; this helper deliberately operates
 /// on `DataType` only.
-pub fn arrow_type_equals_ignoring_metadata(a: &DataType, b: &DataType) -> bool {
-    use DataType::*;
-    match (a, b) {
-        (List(a), List(b))
-        | (LargeList(a), LargeList(b))
-        | (ListView(a), ListView(b))
-        | (LargeListView(a), LargeListView(b)) => {
-            arrow_type_equals_ignoring_metadata(a.data_type(), b.data_type())
-        }
-        (FixedSizeList(a, a_size), FixedSizeList(b, b_size)) => {
-            a_size == b_size && arrow_type_equals_ignoring_metadata(a.data_type(), b.data_type())
-        }
-        (Struct(a), Struct(b)) => {
-            a.len() == b.len()
-                && a.iter().zip(b.iter()).all(|(af, bf)| {
-                    arrow_type_equals_ignoring_metadata(af.data_type(), bf.data_type())
-                })
-        }
-        (Map(a_field, a_sorted), Map(b_field, b_sorted)) => {
-            a_sorted == b_sorted
-                && arrow_type_equals_ignoring_metadata(a_field.data_type(), b_field.data_type())
-        }
-        (Dictionary(a_key, a_value), Dictionary(b_key, b_value)) => {
-            arrow_type_equals_ignoring_metadata(a_key, b_key)
-                && arrow_type_equals_ignoring_metadata(a_value, b_value)
-        }
-        (RunEndEncoded(a_run_ends, a_values), RunEndEncoded(b_run_ends, b_values)) => {
-            arrow_type_equals_ignoring_metadata(a_run_ends.data_type(), b_run_ends.data_type())
-                && arrow_type_equals_ignoring_metadata(a_values.data_type(), b_values.data_type())
-        }
-        (Union(a_fields, a_mode), Union(b_fields, b_mode)) => {
-            a_mode == b_mode
-                && a_fields.len() == b_fields.len()
-                && a_fields.iter().all(|(a_tag, a_field)| {
-                    b_fields.iter().any(|(b_tag, b_field)| {
-                        a_tag == b_tag
-                            && arrow_type_equals_ignoring_metadata(
-                                a_field.data_type(),
-                                b_field.data_type(),
-                            )
-                    })
-                })
-        }
-        _ => a == b,
-    }
-}
+pub use novarocks_type_contract::arrow_type_equals_ignoring_metadata;
 
 pub fn compare_literals(left: &Literal, right: &Literal) -> Result<std::cmp::Ordering, String> {
     use std::cmp::Ordering;

@@ -30,6 +30,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::sync::Arc;
 
 use crate::runtime_filter as execution;
@@ -273,18 +275,18 @@ impl Operator for AggregateStreamingSinkOperator {
         }
     }
 
-    fn prepare(&mut self) -> Result<(), String> {
+    fn prepare(&mut self) -> ExecutionResult<()> {
         if let Some(error) = self.memory_bind_error.clone() {
-            return Err(error);
+            return Err(error.into());
         }
         self.operator_vectors_memory
             .ensure_bound(&mut self.group_states, &mut self.state_ptrs)?;
-        self.init_from_plan()
+        Ok(self.init_from_plan()?)
     }
 
-    fn bind_runtime_state(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn bind_runtime_state(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         if let Some(error) = self.native_topn_bind_error.take() {
-            return Err(error);
+            return Err(error.into());
         }
         if let Some(session) = self.native_topn_session.as_mut() {
             session.bind()?;
@@ -300,8 +302,8 @@ impl Operator for AggregateStreamingSinkOperator {
         let _ = self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed);
     }
 
-    fn close(&mut self) -> Result<(), String> {
-        self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed)
+    fn close(&mut self) -> ExecutionResult<()> {
+        Ok(self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed)?)
     }
 
     fn is_finished(&self) -> bool {
@@ -1077,7 +1079,7 @@ impl ProcessorOperator for AggregateStreamingSinkOperator {
         false
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         let result = (|| {
             if self.finished {
                 return Ok(());
@@ -1096,14 +1098,14 @@ impl ProcessorOperator for AggregateStreamingSinkOperator {
         if result.is_err() {
             let _ = self.fail_native_topn_producers(RuntimeFilterProducerFailure::ExecutionFailed);
         }
-        result
+        Ok(result?)
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         Ok(None)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         let result = (|| {
             if self.finished {
                 return Ok(());
@@ -1378,7 +1380,7 @@ mod retained_memory_tests {
             .expect("streaming aggregate processor")
             .push_chunk(&RuntimeState::default(), int64_chunk(VALUE_SLOT, [4]))
             .expect_err("new distinct value must require tracked allocation");
-        assert!(error.contains("ResourceExhausted"), "{error}");
+        assert!(error.detail().contains("ResourceExhausted"), "{error}");
         assert_eq!(tracker.current(), before_oom);
 
         let output = finish_and_take_output(&mut operator, &state);

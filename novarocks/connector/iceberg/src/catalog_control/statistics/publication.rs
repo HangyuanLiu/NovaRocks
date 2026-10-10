@@ -351,8 +351,8 @@ mod tests {
     use crate::commit::operation::IcebergCommitAttempt;
     use crate::commit::staging::StagingBase;
     use crate::iceberg::spec::{
-        FormatVersion, NestedField, Operation, PartitionSpec, Schema, Snapshot, SortOrder, Summary,
-        TableMetadata, TableMetadataBuilder,
+        FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
+        SortOrder, Summary, TableMetadata, TableMetadataBuilder,
     };
     use crate::resources::IcebergCatalogRuntime;
     use novarocks_spi::connector::{

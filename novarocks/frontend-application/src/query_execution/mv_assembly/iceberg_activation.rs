@@ -72,7 +72,7 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
         exact_lease: &ConnectorWriteLease,
         execution: &QueryExecutionContext,
         connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<PreparedMvNativeWriteAssembly, String> {
+    ) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
         match prepared.into_assembly_artifact() {
             PreparedMvRefreshWriteArtifact::FirstRefresh(prepared) => {
                 super::first_refresh_staging::bind_prepared_mv_first_refresh_staging(

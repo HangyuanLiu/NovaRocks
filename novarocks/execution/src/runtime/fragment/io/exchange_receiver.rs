@@ -1,7 +1,9 @@
 //! Application-hosted ingress for one exchange receiver.
 
 use crate::exec::chunk::ChunkSchemaRef;
-use crate::runtime::exchange::{ExchangeKey, ExchangeReceiverHandle, ExchangeSenderIdentity};
+use crate::runtime::exchange::{
+    ExchangeColumnBinding, ExchangeKey, ExchangeReceiverHandle, ExchangeSenderIdentity,
+};
 use crate::runtime::execution_runtime::ExecutionRuntime;
 use crate::runtime::mem_tracker::MemTracker;
 use novarocks_types::UniqueId;
@@ -31,6 +33,9 @@ pub struct ExchangeReceiverRegistration {
     pub key: ExchangeReceiverKey,
     pub expected_senders: usize,
     pub expected_chunk_schema: ChunkSchemaRef,
+    /// How decoded wire columns bind to `expected_chunk_schema`. Legacy
+    /// fragments bind by slot id; compiled fragments bind by position.
+    pub column_binding: ExchangeColumnBinding,
 }
 
 /// Application-hosted receiver registry and ingress boundary.
@@ -96,10 +101,11 @@ impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
     fn register(&self, registration: ExchangeReceiverRegistration) -> Result<(), String> {
         self.runtime
             .exchange_registry()
-            .try_register_expected_chunk_schema(
+            .try_register_expected_chunk_schema_with_binding(
                 Self::key(registration.key),
                 registration.expected_senders,
                 registration.expected_chunk_schema,
+                registration.column_binding,
             )
     }
 

@@ -1337,6 +1337,7 @@ mod tests {
                 &metadata.schema,
                 &metadata.planning_facts,
             )
+            .expect("SQL schema columns")
             .iter()
             .any(|column| column.name == FIXTURE_HIDDEN_KEY_COLUMN),
             "a hidden column must not reach SQL"

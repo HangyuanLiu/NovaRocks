@@ -395,6 +395,7 @@ pub(crate) fn connector_data_type(data_type: &SqlType) -> Result<ConnectorDataTy
                 .collect::<Result<_, String>>()?,
         ),
         SqlType::Variant => ConnectorDataType::Variant,
+        SqlType::Uuid => return Err("UUID is an external source domain, not a SQL DDL type".into()),
     })
 }
 
@@ -2546,18 +2547,22 @@ pub(crate) mod external_listing_tests {
     }
 
     impl ConnectorCatalogMutation for ListingProvider {
-        fn admit(&self, _: &ConnectorCatalogMutationRequest) -> Result<(), ConnectorError> {
-            // This test provider admits the statement without I/O. Its listing
-            // failures must then prevent every destructive execute call.
-            Ok(())
-        }
-
         fn descriptor(&self) -> &ConnectorInstanceDescriptor {
             &self.descriptor
         }
 
         fn incarnation(&self) -> ProviderBindingEpoch {
             self.incarnation
+        }
+
+        fn admit(&self, request: &ConnectorCatalogMutationRequest) -> Result<(), ConnectorError> {
+            request.context.check_active()?;
+            assert!(
+                matches!(&request.operation, ConnectorCatalogMutationOperation::DropNamespace { namespace, .. }
+                    if namespace.instance_id == self.descriptor.instance_id && namespace.namespace.as_ref() == "db")
+            );
+            self.call("admit");
+            Ok(())
         }
 
         fn execute(
@@ -2585,11 +2590,17 @@ pub(crate) mod external_listing_tests {
     fn drop_database_force_listing_errors_precede_every_destructive_mutation() {
         for kind in error_kinds() {
             for (point, calls) in [
-                (FailurePoint::NamespaceExists, vec!["namespace_exists"]),
-                (FailurePoint::Tables, vec!["namespace_exists", "tables:db"]),
+                (
+                    FailurePoint::NamespaceExists,
+                    vec!["admit", "namespace_exists"],
+                ),
+                (
+                    FailurePoint::Tables,
+                    vec!["admit", "namespace_exists", "tables:db"],
+                ),
                 (
                     FailurePoint::Views,
-                    vec!["namespace_exists", "tables:db", "views"],
+                    vec!["admit", "namespace_exists", "tables:db", "views"],
                 ),
             ] {
                 let fixture = ListingFixture::new(point, kind);

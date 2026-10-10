@@ -125,8 +125,7 @@ mod tests {
     fn bool_literal_scalar(arena: &mut ScalarArena) -> ScalarId {
         arena.intern(
             ScalarNode::Literal(HashableLiteral(LiteralValue::Bool(true))),
-            DataType::Boolean,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         )
     }
 
@@ -134,8 +133,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }

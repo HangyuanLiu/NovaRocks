@@ -16,78 +16,9 @@
 // under the License.
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{Array, ArrayRef, BooleanArray, StringArray};
-use std::sync::Arc;
-
-// Export like_match for use in constant evaluation
-pub fn like_match(text: &str, pattern: &str) -> bool {
-    let text_chars: Vec<char> = text.chars().collect();
-    let pattern_chars: Vec<char> = pattern.chars().collect();
-    like_match_recursive(&text_chars, 0, &pattern_chars, 0)
-}
-
-fn match_literal(
-    text: &[char],
-    text_idx: usize,
-    pattern: &[char],
-    next_pattern_idx: usize,
-    literal: char,
-) -> bool {
-    if text_idx >= text.len() || text[text_idx] != literal {
-        return false;
-    }
-    like_match_recursive(text, text_idx + 1, pattern, next_pattern_idx)
-}
-
-// Simple LIKE pattern matching algorithm (handles %, _, and backslash escapes)
-fn like_match_recursive(
-    text: &[char],
-    text_idx: usize,
-    pattern: &[char],
-    pattern_idx: usize,
-) -> bool {
-    // If we've consumed all pattern characters, check if we've consumed all text
-    if pattern_idx >= pattern.len() {
-        return text_idx >= text.len();
-    }
-
-    match pattern[pattern_idx] {
-        '%' => {
-            // % matches zero or more characters
-            // Try matching zero characters first (skip %)
-            if like_match_recursive(text, text_idx, pattern, pattern_idx + 1) {
-                return true;
-            }
-            // Try matching one or more characters
-            for i in text_idx..text.len() {
-                if like_match_recursive(text, i + 1, pattern, pattern_idx + 1) {
-                    return true;
-                }
-            }
-            false
-        }
-        '_' => {
-            // _ matches exactly one character
-            if text_idx >= text.len() {
-                return false;
-            }
-            like_match_recursive(text, text_idx + 1, pattern, pattern_idx + 1)
-        }
-        '\\' => {
-            if pattern_idx + 1 >= pattern.len() {
-                return match_literal(text, text_idx, pattern, pattern_idx + 1, '\\');
-            }
-            let escaped = pattern[pattern_idx + 1];
-            match_literal(text, text_idx, pattern, pattern_idx + 2, escaped)
-        }
-        c => {
-            // Literal character must match
-            match_literal(text, text_idx, pattern, pattern_idx + 1, c)
-        }
-    }
-}
-
-// LIKE function for Arrow arrays
+use arrow::array::ArrayRef;
+// The original ilike consumer borrows the same sole matcher.
+pub use novarocks_functions::native_like::like_match;
 pub fn eval_like(
     arena: &ExprArena,
     str_expr: ExprId,
@@ -96,34 +27,5 @@ pub fn eval_like(
 ) -> Result<ArrayRef, String> {
     let str_array = arena.eval(str_expr, chunk)?;
     let pattern_array = arena.eval(pattern_expr, chunk)?;
-
-    let len = str_array.len();
-
-    // Downcast arrays
-    let str_arr = str_array
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "like: first argument must be a string array".to_string())?;
-
-    let pattern_arr = pattern_array
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| "like: second argument must be a string array".to_string())?;
-
-    // Process each row
-    let result_values: Vec<Option<bool>> = (0..len)
-        .map(|i| {
-            if str_arr.is_null(i) || pattern_arr.is_null(i) {
-                return None;
-            }
-
-            let s = str_arr.value(i);
-            let pattern = pattern_arr.value(i);
-
-            Some(like_match(s, pattern))
-        })
-        .collect();
-
-    let result_array = BooleanArray::from_iter(result_values);
-    Ok(Arc::new(result_array))
+    novarocks_functions::native_like::evaluate_legacy(&str_array, &pattern_array)
 }

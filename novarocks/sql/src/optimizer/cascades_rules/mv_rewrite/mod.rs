@@ -25,6 +25,7 @@ pub(crate) mod column_mapping;
 pub(crate) mod descriptor;
 pub(crate) mod predicate_split;
 pub(crate) mod rule;
+mod semantic_norm;
 
 use crate::compiler::SqlMvRewriteSelectionFacts;
 use crate::optimizer::scalar::ScalarArena;

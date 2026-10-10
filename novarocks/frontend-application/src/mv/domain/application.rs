@@ -284,6 +284,7 @@ pub enum MvApplicationErrorKind {
 pub struct MvApplicationError {
     kind: MvApplicationErrorKind,
     message: String,
+    compile_control: Option<novarocks_type_contract::CompileControlError>,
 }
 
 impl MvApplicationError {
@@ -291,7 +292,37 @@ impl MvApplicationError {
         Self {
             kind,
             message: message.into(),
+            compile_control: None,
         }
+    }
+
+    pub(crate) fn from_compile(error: novarocks_sql::compiler::SqlCompileError) -> Self {
+        let control = match &error {
+            novarocks_sql::compiler::SqlCompileError::Cancelled => {
+                Some(novarocks_type_contract::CompileControlError::Cancelled)
+            }
+            novarocks_sql::compiler::SqlCompileError::DeadlineExceeded => {
+                Some(novarocks_type_contract::CompileControlError::DeadlineExceeded)
+            }
+            novarocks_sql::compiler::SqlCompileError::ResourceExhausted => {
+                Some(novarocks_type_contract::CompileControlError::ResourceExhausted)
+            }
+            novarocks_sql::compiler::SqlCompileError::Analyze(error) => error.control_error(),
+            _ => None,
+        };
+        let mut failure = Self::new(MvApplicationErrorKind::InvalidRequest, error.to_string());
+        failure.compile_control = control;
+        failure
+    }
+    pub(crate) fn with_compile_control(
+        mut self,
+        error: Option<novarocks_type_contract::CompileControlError>,
+    ) -> Self {
+        self.compile_control = error;
+        self
+    }
+    pub fn compile_control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control
     }
 
     pub fn kind(&self) -> MvApplicationErrorKind {
@@ -330,6 +361,7 @@ pub enum MvCreateProviderErrorKind {
 pub struct MvCreateProviderError {
     kind: MvCreateProviderErrorKind,
     message: String,
+    compile_control: Option<novarocks_type_contract::CompileControlError>,
 }
 
 impl MvCreateProviderError {
@@ -337,7 +369,20 @@ impl MvCreateProviderError {
         Self {
             kind,
             message: message.into(),
+            compile_control: None,
         }
+    }
+
+    pub(crate) fn from_compile(error: novarocks_sql::compiler::SqlCompileError) -> Self {
+        let failure = MvApplicationError::from_compile(error);
+        let mut result = Self::new(MvCreateProviderErrorKind::Analysis, failure.message());
+        result.compile_control = failure.compile_control_error();
+        result
+    }
+    pub const fn compile_control_error(
+        &self,
+    ) -> Option<novarocks_type_contract::CompileControlError> {
+        self.compile_control
     }
 
     pub fn kind(&self) -> MvCreateProviderErrorKind {

@@ -21,6 +21,7 @@
 //! rules for downstream consumers that need to know whether the rewritten
 //! plan contains an aggregate change stream.
 
+use crate::compiler::SqlCompileError;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::analysis::{ExprKind, JoinKind, OutputColumn, TypedExpr};
@@ -160,14 +161,19 @@ impl LogicalRewriteRule for BuildChangeStreamDescriptorRule {
                 .is_some_and(|ext| ext.annotation.change_stream.aggregate.is_none())
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         self.fired.store(true, Ordering::SeqCst);
         let plan = opt_expr_to_plan(expr, ctx);
         let descriptor = build_change_stream_descriptor(&plan);
         if descriptor.has_aggregate() {
             let ext = ctx
                 .extension::<ImvExtension>()
-                .ok_or("BuildChangeStreamDescriptor requires ImvExtension")?
+                .ok_or_else(|| "BuildChangeStreamDescriptor requires ImvExtension".to_string())
+                .map_err(SqlCompileError::Compilation)?
                 .clone();
             let mut annotation = ext.annotation.clone();
             annotation.change_stream.aggregate = descriptor.aggregate;
@@ -209,12 +215,17 @@ impl LogicalRewriteRule for ValidateChangeStreamDescriptorRule {
                 .is_some_and(|ext| ext.annotation.change_stream.has_aggregate())
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         self.fired.store(true, Ordering::SeqCst);
         let plan = opt_expr_to_plan(expr, ctx);
         let ext = ctx
             .extension::<ImvExtension>()
-            .ok_or("ValidateChangeStreamDescriptor requires ImvExtension")?;
+            .ok_or_else(|| "ValidateChangeStreamDescriptor requires ImvExtension".to_string())
+            .map_err(SqlCompileError::Compilation)?;
         match ext.annotation.change_stream.validate_against_plan(&plan) {
             Ok(()) => Ok(RewriteResult::Unchanged),
             Err(message) => Ok(RewriteResult::Rejected(RewriteDiagnostic::rejected(
@@ -349,8 +360,8 @@ fn change_stream_project_output_column(project: &PlanProjectNode) -> Option<Outp
         .map(|item| OutputColumn {
             column_id: item.output_column_id,
             name: item.output_name.clone(),
-            data_type: item.expr.data_type.clone(),
-            nullable: item.expr.nullable,
+            value_type: item.expr.value_type.clone(),
+
             is_internal: true,
         })
 }
@@ -437,6 +448,7 @@ fn expr_contains_function(expr: &TypedExpr, name: &str) -> bool {
         ExprKind::ColumnRef { .. }
         | ExprKind::LambdaParamRef { .. }
         | ExprKind::Literal(_)
+        | ExprKind::Constant(_)
         | ExprKind::SubqueryPlaceholder { .. } => false,
     }
 }
@@ -534,8 +546,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId::new_for_test(id),
             name: name.to_string(),
-            data_type,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
+
             is_internal,
         }
     }
@@ -606,19 +618,23 @@ mod tests {
                 group_by: Vec::new(),
                 aggregates: vec![AggregateCall {
                     name: "sum_state_signed".to_string(),
-                    args: vec![TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::Int(1)),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                    }],
                     distinct: false,
                     result_type: DataType::Binary,
-                    order_by: Vec::new(),
                     output_column_id: ColumnId::new_for_test(20),
-                    resolved: crate::functions::test_resolved_aggregate(
-                        "sum_state_signed",
-                        &[DataType::Int64],
-                        false,
+                    source: crate::binding::AggregateArgumentSource::uncertified(
+                        vec![TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::Int(1)),
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int64,
+                                false,
+                            ),
+                        }],
+                        Vec::new(),
+                        crate::functions::test_resolved_aggregate(
+                            "sum_state_signed",
+                            &[DataType::Int64],
+                            false,
+                        ),
                     ),
                 }],
                 output_columns: Vec::new(),
@@ -689,8 +705,10 @@ mod tests {
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Bool(true)),
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![union],
@@ -782,8 +800,10 @@ mod tests {
                         args: Vec::new(),
                         distinct: false,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![expanded],
@@ -794,8 +814,10 @@ mod tests {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),
-                        data_type: DataType::Int8,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int8,
+                            false,
+                        ),
                     },
                     output_name: ImvActionColumn::NAME.to_string(),
                     output_column_id: action_id,

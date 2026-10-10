@@ -254,6 +254,7 @@ fn file_scan_range_survives_proto_roundtrip() {
 #[test]
 fn create_task_carriers_separate_frozen_plan_from_task_assignment() {
     let fragment = novarocks::FrozenFragment {
+        package: Default::default(),
         plan_version: vec![1; 16].into(),
         plan_contract_revision: 1,
         fragment_contract_version: 1,

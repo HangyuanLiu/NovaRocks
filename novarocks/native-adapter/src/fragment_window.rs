@@ -38,10 +38,10 @@ use novarocks_execution::exec::node::analytic::{
 };
 use novarocks_execution::exec::node::sort::{SortExpression, SortNode, SortTopNType};
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
+use novarocks_functions::aggregate_types::mangle_distinct_aggregate_name;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{expr, plan};
 use novarocks_types::SlotId;
-use novarocks_types::aggregate::mangle_distinct_aggregate_name;
 
 #[expect(
     clippy::too_many_arguments,

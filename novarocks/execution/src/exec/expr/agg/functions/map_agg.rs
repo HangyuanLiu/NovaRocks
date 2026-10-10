@@ -15,65 +15,52 @@
 // specific language governing permissions and limitations
 // under the License.
 use arrow::array::{ArrayRef, MapArray, StructArray};
-use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field};
-use arrow_buffer::OffsetBuffer;
 use std::sync::Arc;
 
-use crate::exec::expr::agg::{
-    AggregateAllocator, AggregateHashSet, AggregateVec, aggregate_hash_set,
-};
+use crate::exec::expr::agg::AggregateAllocator;
 use crate::exec::node::aggregate::AggFunction;
 use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
+use novarocks_functions::aggregate_scalar::ScalarWork;
+use novarocks_functions::builtin::aggregate_map_core as map_core;
 
 use super::super::*;
 use super::AggregateFunction;
-use super::common::{
-    TrackedAggScalarValue, build_scalar_array, tracked_key_fingerprint, tracked_scalar_from_array,
-    tracked_scalar_to_output,
-};
+use super::common::TrackedAggScalarValue;
+
+#[cfg(test)]
+use super::common::{build_scalar_array, tracked_scalar_from_array};
+#[cfg(test)]
+use arrow_buffer::OffsetBuffer;
 
 pub(super) struct MapAggAgg;
 
+#[repr(transparent)]
 #[derive(Debug)]
-struct MapAggState {
-    allocator: AggregateAllocator,
-    seen_keys: AggregateHashSet<AggregateVec<u8>>,
-    entries: AggregateVec<(TrackedAggScalarValue, Option<TrackedAggScalarValue>)>,
-}
-
-impl MapAggState {
-    fn new(tracker: Arc<MemTracker>) -> Self {
-        let allocator = AggregateAllocator::new(tracker);
-        Self {
-            seen_keys: aggregate_hash_set(allocator.clone()),
-            entries: AggregateVec::new_in(allocator.clone()),
-            allocator,
-        }
+struct MapAggState(map_core::MapAggState<AggregateAllocator>);
+impl std::ops::Deref for MapAggState {
+    type Target = map_core::MapAggState<AggregateAllocator>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
-
+impl std::ops::DerefMut for MapAggState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl MapAggState {
+    fn new(tracker: Arc<MemTracker>) -> Self {
+        Self(map_core::MapAggState::new(AggregateAllocator::new(tracker)))
+    }
+}
 fn append_entry(
     state: &mut MapAggState,
     key: TrackedAggScalarValue,
     value: Option<TrackedAggScalarValue>,
 ) -> Result<(), String> {
-    let key_fp = tracked_key_fingerprint(&key, &state.allocator)?;
-    if state.seen_keys.contains(&key_fp) {
-        return Ok(());
-    }
-    state
-        .seen_keys
-        .try_reserve(1)
-        .map_err(|_| state.allocator.allocation_error("reserve map_agg key set"))?;
-    state
-        .entries
-        .try_reserve(1)
-        .map_err(|_| state.allocator.allocation_error("reserve map_agg entries"))?;
-    let inserted = state.seen_keys.insert(key_fp);
-    debug_assert!(inserted);
-    state.entries.push((key, value));
-    Ok(())
+    map_core::append_entry(&mut state.0, key, value, &mut ScalarWork::new(None))
+        .map_err(|error| error.to_string())
 }
 
 impl AggregateFunction for MapAggAgg {
@@ -214,23 +201,12 @@ impl AggregateFunction for MapAggAgg {
         let AggInputView::Any(array) = input else {
             return Err("map_agg batch input type mismatch".to_string());
         };
-        let struct_arr = array
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .ok_or_else(|| "map_agg expects struct input".to_string())?;
-        if struct_arr.num_columns() != 2 {
-            return Err("map_agg expects 2 arguments".to_string());
-        }
-
-        let key_arr = struct_arr.column(0).clone();
-        let value_arr = struct_arr.column(1).clone();
+        let input = map_core::update_input(array).map_err(|error| error.to_string())?;
+        let mut work = ScalarWork::new(None);
         for (row, &base) in state_ptrs.iter().enumerate() {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MapAggState) };
-            let Some(key) = tracked_scalar_from_array(&key_arr, row, &state.allocator)? else {
-                continue;
-            };
-            let value = tracked_scalar_from_array(&value_arr, row, &state.allocator)?;
-            append_entry(state, key, value)?;
+            map_core::update_row(&mut state.0, &input, row, &mut work)
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -245,28 +221,16 @@ impl AggregateFunction for MapAggAgg {
         let AggInputView::Any(array) = input else {
             return Err("map_agg merge input type mismatch".to_string());
         };
-        let map_arr = array
-            .as_any()
-            .downcast_ref::<MapArray>()
-            .ok_or_else(|| "map_agg merge input must be MapArray".to_string())?;
-        let key_arr = map_arr.keys().clone();
-        let value_arr = map_arr.values().clone();
-        let offsets = map_arr.value_offsets();
-
+        let input = map_core::merge_input(array).map_err(|error| error.to_string())?;
+        let mut work = ScalarWork::new(None);
         for (row, &base) in state_ptrs.iter().enumerate() {
-            if map_arr.is_null(row) {
+            // Do not dereference a mapped state for an original NULL partial row.
+            if array.is_null(row) {
                 continue;
             }
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MapAggState) };
-            let start = offsets[row] as usize;
-            let end = offsets[row + 1] as usize;
-            for idx in start..end {
-                let Some(key) = tracked_scalar_from_array(&key_arr, idx, &state.allocator)? else {
-                    continue;
-                };
-                let value = tracked_scalar_from_array(&value_arr, idx, &state.allocator)?;
-                append_entry(state, key, value)?;
-            }
+            map_core::merge_row(&mut state.0, &input, row, &mut work)
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -283,49 +247,12 @@ impl AggregateFunction for MapAggAgg {
         } else {
             &spec.output_type
         };
-        let (map_field, field_defs, ordered) = parse_map_type(target_type)?;
-        let key_type = field_defs[0].data_type();
-        let value_type = field_defs[1].data_type();
-
-        let mut key_values = Vec::<Option<AggScalarValue>>::new();
-        let mut value_values = Vec::<Option<AggScalarValue>>::new();
-        let mut offsets = Vec::with_capacity(group_states.len() + 1);
-        offsets.push(0_i32);
-        let mut current: i64 = 0;
-        for &base in group_states {
+        let states = group_states.iter().map(|&base| {
             let state = unsafe { &*((base as *mut u8).add(offset) as *const MapAggState) };
-            for (key, value) in &state.entries {
-                key_values.push(Some(tracked_scalar_to_output(key)?));
-                value_values.push(value.as_ref().map(tracked_scalar_to_output).transpose()?);
-                current += 1;
-                if current > i32::MAX as i64 {
-                    return Err("map_agg offset overflow".to_string());
-                }
-            }
-            offsets.push(current as i32);
-        }
-
-        let mut out_keys = build_scalar_array(key_type, key_values)?;
-        let mut out_values = build_scalar_array(value_type, value_values)?;
-        if out_keys.data_type() != field_defs[0].data_type() {
-            out_keys = cast(&out_keys, field_defs[0].data_type())
-                .map_err(|e| format!("map_agg failed to cast output key: {}", e))?;
-        }
-        if out_values.data_type() != field_defs[1].data_type() {
-            out_values = cast(&out_values, field_defs[1].data_type())
-                .map_err(|e| format!("map_agg failed to cast output value: {}", e))?;
-        }
-
-        let entries = StructArray::new(field_defs, vec![out_keys, out_values], None);
-        let out = MapArray::try_new(
-            map_field,
-            OffsetBuffer::new(offsets.into()),
-            entries,
-            None,
-            ordered,
-        )
-        .map_err(|e| format!("map_agg: {}", e))?;
-        Ok(Arc::new(out))
+            &state.0
+        });
+        map_core::build_array(target_type, states, &mut ScalarWork::new(None))
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -336,17 +263,9 @@ fn kind_from_name(name: &str) -> Option<AggKind> {
     }
 }
 
+#[cfg(test)]
 fn parse_map_type(ty: &DataType) -> Result<(Arc<Field>, arrow::datatypes::Fields, bool), String> {
-    let DataType::Map(field, ordered) = ty else {
-        return Err(format!("map_agg output type must be MAP, got {:?}", ty));
-    };
-    let DataType::Struct(fields) = field.data_type().clone() else {
-        return Err("map_agg map entries type must be STRUCT".to_string());
-    };
-    if fields.len() != 2 {
-        return Err("map_agg map entries type must have 2 fields".to_string());
-    }
-    Ok((field.clone(), fields, *ordered))
+    map_core::parse_map_type(ty).map_err(|error| error.to_string())
 }
 
 fn build_default_map_type(key_field: Arc<Field>, value_field: Arc<Field>) -> DataType {
@@ -565,3 +484,7 @@ mod tests {
         assert_eq!(tracker.current(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "legacy_map_agg_baseline_tests.rs"]
+mod legacy_map_agg_baseline_tests;

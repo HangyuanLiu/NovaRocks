@@ -102,6 +102,8 @@ pub enum AnalyzeErrorKind {
     InvalidArgument,
     InvalidQueryShape,
     UnsupportedExpression,
+    /// Candidate-carrier implementation admission; the public code remains unsupported_expression.
+    UnavailableImplementation,
     UnsupportedQueryShape,
     Internal,
 }
@@ -117,7 +119,7 @@ impl AnalyzeErrorKind {
             Self::InvalidLiteral => INVALID_LITERAL,
             Self::InvalidArgument => INVALID_ARGUMENT,
             Self::InvalidQueryShape => INVALID_QUERY_SHAPE,
-            Self::UnsupportedExpression => UNSUPPORTED_EXPRESSION,
+            Self::UnsupportedExpression | Self::UnavailableImplementation => UNSUPPORTED_EXPRESSION,
             Self::UnsupportedQueryShape => UNSUPPORTED_QUERY_SHAPE,
             Self::Internal => INTERNAL,
         }
@@ -133,6 +135,7 @@ pub struct AnalyzeError {
     kind: AnalyzeErrorKind,
     message: String,
     span: Option<Span>,
+    control: Option<novarocks_type_contract::CompileControlError>,
 }
 
 impl AnalyzeError {
@@ -141,6 +144,7 @@ impl AnalyzeError {
             kind,
             message: message.into(),
             span: Some(span),
+            control: None,
         }
     }
 
@@ -187,7 +191,73 @@ impl AnalyzeError {
             kind: AnalyzeErrorKind::Internal,
             message: message.into(),
             span: None,
+            control: None,
         }
+    }
+
+    /// Preserve outer compilation control across the analyzer boundary.
+    /// Compiler callers extract this category before user-error projection.
+    pub fn control(error: novarocks_type_contract::CompileControlError) -> Self {
+        Self {
+            kind: AnalyzeErrorKind::Internal,
+            message: error.to_string(),
+            span: None,
+            control: Some(error),
+        }
+    }
+
+    pub(crate) fn function_binding(error: novarocks_functions::FunctionBindingError) -> Self {
+        match error {
+            novarocks_functions::FunctionBindingError::Control(error) => Self::control(error),
+            error @ novarocks_functions::FunctionBindingError::UnavailableImplementation(_) => {
+                Self {
+                    kind: AnalyzeErrorKind::UnavailableImplementation,
+                    message: error.to_string(),
+                    span: None,
+                    control: None,
+                }
+            }
+            error => Self::internal(error.to_string()),
+        }
+    }
+
+    pub(crate) fn function_resolution(error: novarocks_functions::FunctionResolutionError) -> Self {
+        match error {
+            novarocks_functions::FunctionResolutionError::Control(error) => Self::control(error),
+            error => Self::internal(error.to_string()),
+        }
+    }
+
+    /// Attach the existing user type-error context without reclassifying an
+    /// outer control failure as a user expression error.
+    pub(crate) fn at_type_mismatch(self, span: Span) -> Self {
+        if self.control.is_some() {
+            self
+        } else if self.kind == AnalyzeErrorKind::UnavailableImplementation {
+            Self {
+                span: Some(span),
+                ..self
+            }
+        } else {
+            Self::type_mismatch(self.message, span)
+        }
+    }
+
+    pub(crate) fn at_invalid_argument(self, span: Span) -> Self {
+        if self.control.is_some() {
+            self
+        } else if self.kind == AnalyzeErrorKind::UnavailableImplementation {
+            Self {
+                span: Some(span),
+                ..self
+            }
+        } else {
+            Self::invalid_argument(self.message, span)
+        }
+    }
+
+    pub const fn control_error(&self) -> Option<novarocks_type_contract::CompileControlError> {
+        self.control
     }
 
     pub const fn kind(&self) -> AnalyzeErrorKind {

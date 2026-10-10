@@ -383,7 +383,8 @@ fn settle_unpublished_stage(
         Err(abort) => MvProductError::new(
             primary.kind(),
             format!("{}; staged target abort failed: {abort}", primary.message()),
-        ),
+        )
+        .with_compile_control(primary.compile_control_error()),
     }
 }
 
@@ -392,6 +393,7 @@ fn known_committed_finalize_failure(failure: MvProviderFailure) -> MvProductErro
         MvProductErrorKind::KnownCommittedFinalizeFailed,
         failure.message(),
     )
+    .with_compile_control(failure.compile_control_error())
 }
 
 fn validate_published_refresh(

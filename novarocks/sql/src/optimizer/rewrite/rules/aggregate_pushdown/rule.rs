@@ -17,6 +17,7 @@
 
 //! AggregatePushdownRule entry point.
 
+use crate::compiler::SqlCompileError;
 use crate::optimizer::operator::Operator;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{OpKind, Pattern};
@@ -48,7 +49,11 @@ impl RewriteRule for AggregatePushdownRule {
         true
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         // Extract the aggregate op; return Unchanged if shape doesn't match.
         let agg = match expr.op {
             Operator::LogicalAggregate(ref a) => a.clone(),
@@ -59,14 +64,15 @@ impl RewriteRule for AggregatePushdownRule {
         let stats_input = ctx
             .query_stats_input()
             .cloned()
-            .ok_or_else(|| "AggregatePushdown requires OptimizerStatsInput".to_string())?;
+            .ok_or_else(|| "AggregatePushdown requires OptimizerStatsInput".to_string())
+            .map_err(SqlCompileError::Compilation)?;
 
         // Phase 1: read-only borrow for collection and cost gating.
         let push = {
             let arena = arena_rc.borrow();
             let push = super::collector::collect_push_plan(&agg, expr.unary_input(), &arena);
             if let Some(ref p) = push
-                && !super::cost::should_push(p, &arena, &stats_input)
+                && !super::cost::should_push(p, &arena, &stats_input, &ctx.control_view())?
             {
                 return Ok(RewriteResult::Unchanged);
             }
@@ -79,7 +85,8 @@ impl RewriteRule for AggregatePushdownRule {
         // Phase 2: mutable borrow for rewriting.
         let factory = ctx
             .column_ref_factory()
-            .ok_or_else(|| "AggregatePushdown requires ColumnRefFactory".to_string())?;
+            .ok_or_else(|| "AggregatePushdown requires ColumnRefFactory".to_string())
+            .map_err(SqlCompileError::Compilation)?;
         let mut factory = factory.borrow_mut();
         let mut arena = arena_rc.borrow_mut();
 
@@ -90,6 +97,7 @@ impl RewriteRule for AggregatePushdownRule {
             &mut factory,
             &mut arena,
             ctx.function_catalog(),
+            &ctx.control_view(),
         )?))
     }
 }
@@ -134,8 +142,11 @@ mod tests {
                 .map(|n| OutputColumn {
                     column_id: ColumnId::UNSET,
                     name: (*n).into(),
-                    data_type: DataType::Int32,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int32,
+                        false,
+                    ),
+
                     is_internal: false,
                 })
                 .collect(),
@@ -167,8 +178,24 @@ mod tests {
         use crate::optimizer::rewrite::tree_binder::bind_tree;
 
         let rule = AggregatePushdownRule;
-        assert!(bind_tree(&rule.pattern(), &dummy_aggregate()).is_some());
-        assert!(bind_tree(&rule.pattern(), &dummy_scan("t", &["id"])).is_none());
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &dummy_aggregate(),
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            bind_tree(
+                &rule.pattern(),
+                &dummy_scan("t", &["id"]),
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 
     #[test]
@@ -181,11 +208,19 @@ mod tests {
         let mut ctx = RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         );
         set_empty_stats_input(&mut ctx);
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         assert!(
-            crate::optimizer::rewrite::tree_binder::bind_tree(&rule.pattern(), &plan).is_some()
+            crate::optimizer::rewrite::tree_binder::bind_tree(
+                &rule.pattern(),
+                &plan,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
         );
         assert!(matches!(
             rule.apply(plan, &mut ctx).unwrap(),
@@ -217,8 +252,7 @@ mod tests {
                     qualifier: None,
                     column: name.into(),
                 },
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             }
         }
 
@@ -233,29 +267,41 @@ mod tests {
             unreachable!("col_typed must build a ColumnRef");
         };
         let gb_output_id = *gb_output_id;
-        let gb_id = intern_typed(&mut arena, &gb_typed);
-        let sum_arg = intern_typed(&mut arena, &col_typed("v"));
+        let gb_id = intern_typed(
+            &mut arena,
+            &gb_typed,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
+        let sum_arg = intern_typed(
+            &mut arena,
+            &col_typed("v"),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let sum_spec = ScalarAggregateSpec {
             output_column_id: ColumnId::new_for_test(9001),
             name: "sum".into(),
-            args: vec![sum_arg],
             distinct: false,
-            order_by: vec![],
-            resolved: crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![sum_arg],
+                vec![],
+                crate::functions::test_resolved_aggregate("sum", &[DataType::Int64], false),
+            ),
         };
         let output_layout = AggregateOutputLayout::new(
             vec![OutputColumn {
                 column_id: gb_output_id,
                 name: "k".into(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: false,
             }],
             vec![OutputColumn {
                 column_id: sum_spec.output_column_id,
                 name: "sum".into(),
-                data_type: DataType::Int64,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+
                 is_internal: false,
             }],
         );
@@ -267,10 +313,14 @@ mod tests {
                 right: Box::new(col_typed("k")),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         };
-        let cond_id = intern_typed(&mut arena, &cond_typed);
+        let cond_id = intern_typed(
+            &mut arena,
+            &cond_typed,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
 
         let join = OptExpr::new(
             Operator::LogicalJoin(LogicalJoinOp {
@@ -298,6 +348,8 @@ mod tests {
         let mut ctx = RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         );
         set_empty_stats_input(&mut ctx);
         ctx.set_scalar_arena(Rc::new(RefCell::new(arena)));

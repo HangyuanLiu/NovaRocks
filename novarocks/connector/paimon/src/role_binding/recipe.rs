@@ -231,6 +231,9 @@ fn spi_facts(
 }
 
 fn indexed(error: ConnectorCodecError, root: &str, index: usize) -> ConnectorCodecError {
+    if error.compile_control_error().is_some() {
+        return error.with_path(ConnectorFieldPath::root(root).index(index));
+    }
     ConnectorCodecError::new(
         ConnectorFieldPath::root(root).index(index),
         error.kind(),

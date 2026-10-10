@@ -20,34 +20,9 @@ use novarocks_connector_contract::{
     ConnectorReadWorkSource,
 };
 
-use crate::{
-    ArtifactInputRequirement, ArtifactSourceBinding, ExprId, IdentityError, PhysicalProperties,
-    ValueType, stable_identity,
-};
+use crate::{ExprId, IdentityError, PhysicalProperties, ValueType, stable_identity};
 
-/// Exact, provider-owned identity of the frozen input version.
-///
-/// This is deliberately separate from request forms such as `Current` or a
-/// mutable reference name. The bytes are provider-defined, immutable and
-/// validated by the provider codec before execution resources are created.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ExactInputVersion(Box<[u8]>);
-
-impl ExactInputVersion {
-    pub fn try_new(bytes: impl Into<Box<[u8]>>) -> Result<Self, RelationValueError> {
-        let bytes = bytes.into();
-        if bytes.is_empty() || bytes.len() > 4096 {
-            return Err(RelationValueError::InvalidInputVersionLength {
-                actual: bytes.len(),
-            });
-        }
-        Ok(Self(bytes))
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
+pub use novarocks_connector_contract::ConnectorReadInputVersion as ExactInputVersion;
 
 /// Frozen, no-I/O provider relation reference.
 ///
@@ -60,33 +35,6 @@ pub struct ProviderReadReference {
     pub binding: ConnectorReadBinding,
     pub input_version: ExactInputVersion,
     pub relation: ConnectorReadRelationPayload,
-}
-
-/// Exact source provenance borrowed from its immutable plan owner.
-/// Comparison has the same source-then-selection ordering as
-/// [`ArtifactSourceBinding`], without copying provider-private payloads.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct SourceBindingRef<'a> {
-    pub source: &'a ProviderReadReference,
-    pub selection_digest: &'a [u8; 32],
-}
-
-impl SourceBindingRef<'_> {
-    pub fn to_owned(self) -> ArtifactSourceBinding {
-        ArtifactSourceBinding {
-            source: self.source.clone(),
-            selection_digest: *self.selection_digest,
-        }
-    }
-}
-
-impl<'a> From<&'a ArtifactSourceBinding> for SourceBindingRef<'a> {
-    fn from(binding: &'a ArtifactSourceBinding) -> Self {
-        Self {
-            source: &binding.source,
-            selection_digest: &binding.selection_digest,
-        }
-    }
 }
 
 /// Exact provider column identity associated with the same frozen relation.
@@ -127,7 +75,6 @@ pub struct DataRelation {
     /// `PruningOnly` never transfers row-level evaluation responsibility.
     pub predicate_guarantees: Box<[PredicateGuarantee]>,
     pub provided_properties: PhysicalProperties,
-    pub artifact_inputs: Box<[ArtifactInputRequirement]>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -162,7 +109,6 @@ pub struct MetadataRelation {
     pub predicate_guarantees: Box<[PredicateGuarantee]>,
     pub provided_properties: PhysicalProperties,
     pub coverage_evidence: Box<[u8]>,
-    pub artifact_inputs: Box<[ArtifactInputRequirement]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -204,49 +150,18 @@ impl Relation {
         }
     }
 
+    /// Digest of the exact frozen selection represented by this scan.
+    pub const fn selection_digest(&self) -> [u8; 32] {
+        match self {
+            Self::Data(relation) => relation.selection_digest,
+            Self::Metadata(relation) => relation.selection_digest,
+        }
+    }
+
     pub fn provided_properties(&self) -> &PhysicalProperties {
         match self {
             Self::Data(relation) => &relation.provided_properties,
             Self::Metadata(relation) => &relation.provided_properties,
         }
     }
-
-    pub fn artifact_inputs(&self) -> &[ArtifactInputRequirement] {
-        match self {
-            Self::Data(relation) => &relation.artifact_inputs,
-            Self::Metadata(relation) => &relation.artifact_inputs,
-        }
-    }
-
-    pub fn source_binding(&self) -> ArtifactSourceBinding {
-        self.source_binding_ref().to_owned()
-    }
-
-    pub fn source_binding_ref(&self) -> SourceBindingRef<'_> {
-        SourceBindingRef {
-            source: self.read(),
-            selection_digest: match self {
-                Self::Data(relation) => &relation.selection_digest,
-                Self::Metadata(relation) => &relation.selection_digest,
-            },
-        }
-    }
 }
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RelationValueError {
-    InvalidInputVersionLength { actual: usize },
-}
-
-impl std::fmt::Display for RelationValueError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InvalidInputVersionLength { actual } => write!(
-                formatter,
-                "exact input version is {actual} bytes; expected 1..=4096"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for RelationValueError {}

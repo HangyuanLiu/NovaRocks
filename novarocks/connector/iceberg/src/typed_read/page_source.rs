@@ -2975,12 +2975,13 @@ mod tests {
     }
 
     /// The handle a scan names a hidden metadata column with. It mirrors what
-    /// the boundary publishes: optional, and typed by the column itself.
+    /// the boundary publishes: typed and NULL-contracted by the column itself.
     fn metadata_handle(metadata: IcebergMetadataColumn) -> IcebergColumnHandle {
-        IcebergColumnHandle::base_column(&NestedField::optional(
+        IcebergColumnHandle::base_column(&NestedField::new(
             metadata.field_id(),
             metadata.column_name(),
             Type::Primitive(metadata.declared_type()),
+            !metadata.nullable(),
         ))
         .expect("metadata column handle")
     }

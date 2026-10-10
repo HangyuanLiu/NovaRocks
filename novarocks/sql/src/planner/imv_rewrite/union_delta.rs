@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::compiler::SqlCompileError;
 use arrow::datatypes::DataType;
 
 use crate::analysis::{ExprKind, OutputColumn, ProjectItem, TypedExpr};
@@ -64,7 +65,11 @@ impl LogicalRewriteRule for RewriteUnionAggregateDeltaRule {
             )
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         bridge_apply_result(expr, ctx, |plan, ctx| {
             let LogicalPlanNode {
                 kind, mut children, ..
@@ -97,7 +102,11 @@ impl LogicalRewriteRule for RewriteUnionAggregateDeltaRule {
 
             let action_column = match delta.action_column {
                 Some(action_column) => action_column,
-                None => allocate_imv_column(ctx, ImvActionColumn::NAME, DataType::Int8, false)?,
+                None => allocate_imv_column(
+                    ctx,
+                    ImvActionColumn::NAME,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+                )?,
             };
             let action_output = ImvActionColumn::output_column(action_column);
 
@@ -220,8 +229,7 @@ fn action_passthrough_item(action_output: &OutputColumn) -> ProjectItem {
                 qualifier: None,
                 column: action_output.name.clone(),
             },
-            data_type: action_output.data_type.clone(),
-            nullable: action_output.nullable,
+            value_type: action_output.value_type.clone(),
         },
         output_name: action_output.name.clone(),
         output_column_id: action_output.column_id,
@@ -255,7 +263,11 @@ impl LogicalRewriteRule for RewriteTopLevelUnionDeltaRule {
         )
     }
 
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         bridge_apply_result(expr, ctx, |plan, ctx| {
             let LogicalPlanNode {
                 kind, mut children, ..
@@ -286,10 +298,17 @@ impl LogicalRewriteRule for RewriteTopLevelUnionDeltaRule {
 
             let action_column = match delta.action_column {
                 Some(action_column) => action_column,
-                None => allocate_imv_column(ctx, ImvActionColumn::NAME, DataType::Int8, false)?,
+                None => allocate_imv_column(
+                    ctx,
+                    ImvActionColumn::NAME,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+                )?,
             };
-            let branch_id_column =
-                allocate_imv_column(ctx, BRANCH_ID_COLUMN_NAME, DataType::Int32, false)?;
+            let branch_id_column = allocate_imv_column(
+                ctx,
+                BRANCH_ID_COLUMN_NAME,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+            )?;
 
             let action_output = ImvActionColumn::output_column(action_column);
             let branch_output = branch_id_output_column(branch_id_column);
@@ -336,8 +355,11 @@ fn branch_id_output_column(column_id: crate::column_id::ColumnId) -> crate::anal
     crate::analysis::OutputColumn {
         column_id,
         name: BRANCH_ID_COLUMN_NAME.to_string(),
-        data_type: arrow::datatypes::DataType::Int32,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int32,
+            false,
+        ),
+
         is_internal: true,
     }
 }
@@ -360,8 +382,7 @@ fn normalize_top_level_union_branch_output(
                     qualifier: None,
                     column: branch_column.name.clone(),
                 },
-                data_type: branch_column.data_type.clone(),
-                nullable: branch_column.nullable,
+                value_type: branch_column.value_type.clone(),
             },
             output_name: union_column.name.clone(),
             output_column_id: union_column.column_id,
@@ -374,8 +395,7 @@ fn normalize_top_level_union_branch_output(
                 qualifier: None,
                 column: action_output.name.clone(),
             },
-            data_type: action_output.data_type.clone(),
-            nullable: action_output.nullable,
+            value_type: action_output.value_type.clone(),
         },
         output_name: action_output.name.clone(),
         output_column_id: action_output.column_id,
@@ -387,14 +407,18 @@ fn normalize_top_level_union_branch_output(
                     kind: crate::analysis::ExprKind::Literal(crate::analysis::LiteralValue::Int(
                         branch_idx as i64,
                     )),
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        false,
+                    ),
                 }),
                 target: arrow::datatypes::DataType::Int32,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: branch_output.data_type.clone(),
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType {
+                nullable: false,
+                ..branch_output.value_type.clone()
+            },
         },
         output_name: branch_output.name.clone(),
         output_column_id: branch_output.column_id,
@@ -583,8 +607,8 @@ mod tests {
                 .map(|column| (
                     column.column_id,
                     column.name.as_str(),
-                    column.data_type.clone(),
-                    column.nullable,
+                    column.value_type.data_type.clone(),
+                    column.value_type.nullable,
                     column.is_internal
                 ))
                 .collect::<Vec<_>>(),
@@ -668,6 +692,9 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("aggregate branch must be rejected");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert_eq!(
             err,
             "Iceberg IMV top-level UNION ALL delta rewrite supports only Scan/Project/Filter branches, got Aggregate"
@@ -693,6 +720,9 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("join branch must be rejected");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert_eq!(
             err,
             "Iceberg IMV top-level UNION ALL delta rewrite supports only Scan/Project/Filter branches, got Join"
@@ -711,13 +741,16 @@ mod tests {
         let err = rule
             .apply(expr, &mut ctx)
             .expect_err("UNION DISTINCT must not be rewritten as UNION ALL");
+        let SqlCompileError::Compilation(err) = err else {
+            panic!("expected an ordinary rewrite error");
+        };
         assert_eq!(
             err,
             "Iceberg IMV top-level union delta rewrite supports UNION ALL only"
         );
     }
 
-    fn build_ctx() -> RewriteContext {
+    fn build_ctx() -> RewriteContext<'static> {
         let mut ctx = RewriteContext::for_mv_refresh(Vec::<String>::new());
         ctx.set_scalar_arena(std::rc::Rc::new(
             std::cell::RefCell::new(ScalarArena::new()),
@@ -814,8 +847,10 @@ mod tests {
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 }),
             }),
             vec![scan("j1", 20), scan("j2", 30)],
@@ -832,14 +867,18 @@ mod tests {
                         op: BinOp::Ge,
                         right: Box::new(TypedExpr {
                             kind: ExprKind::Literal(LiteralValue::Int(0)),
-                            data_type: DataType::Int32,
-                            nullable: false,
+                            value_type: novarocks_type_contract::FunctionValueType::new(
+                                DataType::Int32,
+                                false,
+                            ),
                         }),
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Boolean,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![input],
@@ -913,8 +952,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         }
     }
@@ -926,8 +965,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -1015,8 +1053,8 @@ mod tests {
             .find(|item| item.output_name.eq_ignore_ascii_case("__branch_id__"))
             .expect("branch Project must expose branch id column");
         assert_eq!(branch.output_column_id, branch_column);
-        assert_eq!(branch.expr.data_type, DataType::Int32);
-        assert!(!branch.expr.nullable);
+        assert_eq!(branch.expr.value_type.data_type, DataType::Int32);
+        assert!(!branch.expr.value_type.nullable);
         assert!(matches!(
             &branch.expr.kind,
             ExprKind::Cast { expr, target , .. }

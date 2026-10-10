@@ -295,12 +295,16 @@ pub struct CtasFailure {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CtasUserError {
     Analyze(novarocks_sql::analyze_error::AnalyzeError),
+    Control(novarocks_type_contract::CompileControlError),
 }
 
 impl CtasFailure {
     /// Retains the typed failure until the CTAS statement boundary can render
     /// its parser-owned span against the original SQL source.
     fn analyze(error: novarocks_sql::analyze_error::AnalyzeError) -> Self {
+        if let Some(control) = error.control_error() {
+            return Self::control(control);
+        }
         Self {
             kind: CtasFailureKind::InvalidRequest,
             message: error.message().to_string(),
@@ -308,9 +312,47 @@ impl CtasFailure {
         }
     }
 
+    fn from_compile(error: novarocks_sql::compiler::SqlCompileError) -> Self {
+        use novarocks_sql::compiler::SqlCompileError;
+        use novarocks_type_contract::CompileControlError;
+        match error {
+            SqlCompileError::Cancelled => Self::control(CompileControlError::Cancelled),
+            SqlCompileError::DeadlineExceeded => {
+                Self::control(CompileControlError::DeadlineExceeded)
+            }
+            SqlCompileError::ResourceExhausted => {
+                Self::control(CompileControlError::ResourceExhausted)
+            }
+            SqlCompileError::Analyze(error) => match error.control_error() {
+                Some(error) => Self::control(error),
+                None => Self::analyze(error),
+            },
+            error @ (SqlCompileError::InvalidRequest(_) | SqlCompileError::Compilation(_)) => {
+                internal_failure(error.to_string())
+            }
+        }
+    }
+    fn control(error: novarocks_type_contract::CompileControlError) -> Self {
+        Self {
+            kind: CtasFailureKind::Internal,
+            message: error.to_string(),
+            user_error: Some(CtasUserError::Control(error)),
+        }
+    }
+    pub(crate) fn compile_control_error(
+        &self,
+    ) -> Option<novarocks_type_contract::CompileControlError> {
+        match self.user_error.as_ref() {
+            Some(CtasUserError::Control(error)) => Some(*error),
+            Some(CtasUserError::Analyze(error)) => error.control_error(),
+            None => None,
+        }
+    }
+
     pub(crate) fn user_error(&self, source: Option<&str>) -> Option<UserError> {
         match self.user_error.as_ref()? {
             CtasUserError::Analyze(error) => Some(error.to_user_error(source)),
+            CtasUserError::Control(_) => None,
         }
     }
 }
@@ -555,6 +597,7 @@ pub(crate) struct CtasSourceExecutionGate {
 /// scan bindings produced by analysis so target preparation cannot trigger a
 /// second SQL compilation or a current-generation metadata lookup.
 pub(crate) struct PlannedCtasSourceQuery {
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
     source: novarocks_sql::planning::dml::DmlCtasSourcePlan,
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings,
@@ -601,12 +644,8 @@ fn plan_query_for_ctas_source(
     let table_bindings = analyzer_provider.query_table_bindings();
     let catalog_snapshot =
         novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
-    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-        execution.deadline(),
-        crate::query_execution::planning::sql_cancellation_observation(
-            execution.cancellation().clone(),
-        ),
-    );
+    let compile_control =
+        crate::query_execution::planning::sql_compile_control_from_execution(execution);
     let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlCompileIntent::IcebergWrite {
@@ -623,13 +662,12 @@ fn plan_query_for_ctas_source(
         state.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
+        state.constant_policy(),
+        state.static_plan_carrier().sql_emission_mode(),
         compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
-        .map_err(|error| match error {
-            novarocks_sql::compiler::SqlCompileError::Analyze(error) => CtasFailure::analyze(error),
-            error => internal_failure(error.to_string()),
-        })?
+        .map_err(CtasFailure::from_compile)?
         .into_pending()
         .map_err(|error| internal_failure(error.to_string()))?;
     let statistics =
@@ -639,11 +677,16 @@ fn plan_query_for_ctas_source(
             connector_context,
         )
         .map_err(internal_failure)?;
+    let optimize_request =
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control);
+    let decimal_overflow_policy = optimize_request.decimal_overflow_policy();
     let source = novarocks_sql::planning::dml::compile_ctas_source(
-        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control),
+        optimize_request,
+        state.static_plan_carrier().sql_emission_mode(),
     )
-    .map_err(internal_failure)?;
+    .map_err(CtasFailure::from_compile)?;
     Ok(PlannedCtasSourceQuery {
+        decimal_overflow_policy,
         source,
         table_bindings,
         optimizer_settings: execution.optimizer_settings().clone(),
@@ -658,7 +701,12 @@ fn prepare_planned_ctas_connector_write(
     query_options: Option<QueryOptions>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-) -> Result<crate::query_execution::compiler::PreparedDmlWriteAssembly, String> {
+) -> Result<
+    crate::query_execution::compiler::PreparedDmlWriteAssembly,
+    crate::dml::error::DmlExecutionError,
+> {
+    let completion_control =
+        crate::query_execution::planning::sql_compile_control_from_execution(execution);
     // The session both selects this plan shape and owns the writer recipes it
     // carries, so the two are sealed together rather than by two independent
     // choices that could disagree. Sealing first also means the plan's write
@@ -702,6 +750,8 @@ fn prepare_planned_ctas_connector_write(
             .statistics_requirements(write_target_ordinal)
             .map_err(|error| error.to_string())?,
         &planned.optimizer_settings,
+        planned.decimal_overflow_policy,
+        &completion_control,
     )?;
     let connector_session = crate::query_execution::compiler::typed_connector_session()?;
     let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
@@ -745,17 +795,21 @@ fn prepare_planned_ctas_connector_write(
         crate::query_execution::contract::completed_plan_dop_domain(query_options.as_ref())?,
         reads,
         targets,
+        &completion_control,
     )?;
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
-            .and_then(|candidate| {
-                candidate.freeze_root_output(
-                    novarocks_result_contract::FrozenRootOutput::InternalFacts(
-                        novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
-                    ),
-                )
-            })
-            .map_err(|error| error.to_string())?;
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
+            plan,
+            &completion_control,
+        )
+        .and_then(|candidate| {
+            candidate.freeze_root_output(
+                novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                    novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+                ),
+            )
+        })
+        .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
     )
@@ -763,20 +817,27 @@ fn prepare_planned_ctas_connector_write(
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
         state.function_catalog().as_ref(),
+        state.static_plan_carrier(),
+        state.constant_policy(),
         Some(
             &crate::query_execution::physical_encoding::WriteTargetFacts {
                 sealed: &sealed,
                 field_names,
+                session: session.as_ref(),
             },
         ),
+        execution.sql_semantics().sql_mode().allow_throw_exception(),
+        &completion_control,
     )?;
-    crate::query_execution::compiler::PreparedDmlWriteAssembly::new(
-        encoded,
-        version,
-        query_options,
-        execution.clone(),
-        state.query_execution().clone(),
-        session,
+    Ok(
+        crate::query_execution::compiler::PreparedDmlWriteAssembly::new(
+            encoded,
+            version,
+            query_options,
+            execution.clone(),
+            state.query_execution().clone(),
+            session,
+        )?,
     )
 }
 
@@ -1851,7 +1912,23 @@ impl CtasEngine for DmlExecutionKernel {
             &source.connector_context,
             session,
         )
-        .map_err(internal_failure)?;
+        .map_err(|error| match error {
+            crate::dml::error::DmlExecutionError::Control(error) => CtasFailure::control(error),
+            crate::dml::error::DmlExecutionError::Analyze(error) => CtasFailure::analyze(error),
+            crate::dml::error::DmlExecutionError::Engine(error) => internal_failure(error),
+            crate::dml::error::DmlExecutionError::Cow(error) => {
+                // This private CTAS planner never opens a COW session. Reject
+                // any future violation while still on the original synchronous
+                // command worker, retiring its raw cause under its own holder.
+                let detail = error.retire_on_original_worker(None);
+                let mut failure = internal_failure(
+                    "standard CTAS planning unexpectedly returned a copy-on-write failure",
+                );
+                failure.message.push_str(": ");
+                failure.message.push_str(&detail);
+                failure
+            }
+        })?;
         let attempt_reservation = source
             .attempt_reservation
             .lock()

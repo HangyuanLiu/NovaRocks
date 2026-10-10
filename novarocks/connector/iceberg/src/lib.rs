@@ -48,6 +48,8 @@ pub mod file_pruning;
 pub mod file_reader;
 pub mod fs_io;
 pub mod hadoop_catalog;
+#[cfg(feature = "mem-1-m07-hms-listing-observe")]
+pub mod hms_listing_probe;
 pub mod loaded_table;
 pub mod manifest;
 pub mod metadata;
@@ -74,6 +76,7 @@ pub mod schema_mapping;
 pub mod statistics_ancestry;
 pub mod statistics_basis;
 pub mod statistics_codec;
+mod statistics_value_type;
 pub mod stats_assembler;
 pub mod stats_loader;
 pub mod storage_inspector;

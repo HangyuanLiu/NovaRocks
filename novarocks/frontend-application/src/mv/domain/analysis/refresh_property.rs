@@ -27,16 +27,18 @@ use novarocks_sql::planning::mv::{SqlImvApplyKeyFacts, SqlImvRefreshContractFact
 
 pub(crate) fn derive_imv_refresh_contract(
     analysis: &crate::mv::domain::analysis::MvAnalysis,
-) -> Result<ImvRefreshContract, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ImvRefreshContract, novarocks_sql::compiler::SqlCompileError> {
     Ok(map_sql_imv_refresh_contract(
-        analysis.refresh_input.refresh_contract()?,
+        analysis.refresh_input.refresh_contract(control)?,
     ))
 }
 
 pub fn derive_fragment_property(
     analysis: &crate::mv::domain::analysis::MvAnalysis,
-) -> Result<RefreshFragmentProperty, String> {
-    analysis.refresh_input.refresh_property()
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<RefreshFragmentProperty, novarocks_sql::compiler::SqlCompileError> {
+    analysis.refresh_input.refresh_property(control)
 }
 
 pub(crate) fn map_sql_imv_refresh_contract(

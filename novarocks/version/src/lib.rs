@@ -27,10 +27,51 @@ const NATIVE_BUILD_IDENTITY: &str = env!("NOVAROCKS_NATIVE_BUILD_IDENTITY");
 
 // Design: ADR-0124 (docs/adr/ADR-0124-native-compatibility-islands-and-ingress-admission.md)
 /// Domain separator for the immutable Native compatibility identity encoding.
-pub const NATIVE_COMPATIBILITY_DOMAIN: &[u8] = b"novarocks.native-compatibility-id/v5\0";
+///
+/// Version 6 adds the static plan interpreter component.
+pub const NATIVE_COMPATIBILITY_DOMAIN: &[u8] = b"novarocks.native-compatibility-id/v6\0";
 
 /// Domain separator for the pure physical-plan contract component.
 const PLAN_CONTRACT_DOMAIN: &[u8] = b"novarocks.physical-plan-contract/v1\0";
+
+/// Domain separator for the static plan interpreter component.
+const STATIC_PLAN_INTERPRETER_DOMAIN: &[u8] = b"novarocks.static-plan-interpreter/v1\0";
+
+/// The one static plan interpreter a process composes.
+///
+/// The descriptor digest is identical for every binary built from one tree,
+/// whichever interpreter it composed, so the interpreter enters the
+/// compatibility material explicitly: two processes that read different
+/// static carriers never share an island.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StaticPlanInterpreter {
+    /// Reads the plan-tree carrier and interprets it with the plan decoder.
+    PlanTree,
+    /// Reads the physical package carrier and compiles it with the sealed
+    /// pure function catalogue this digest identifies.
+    CompiledPackage {
+        pure_function_catalog_digest: [u8; 32],
+    },
+}
+
+impl StaticPlanInterpreter {
+    /// Exact component evidence: the domain, a fixed tag, and the sealed
+    /// pure catalogue digest a compiled-package interpreter executes with.
+    fn component_digest(self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(STATIC_PLAN_INTERPRETER_DOMAIN);
+        match self {
+            Self::PlanTree => hasher.update([1]),
+            Self::CompiledPackage {
+                pure_function_catalog_digest,
+            } => {
+                hasher.update([2]);
+                hasher.update(pure_function_catalog_digest);
+            }
+        }
+        hasher.finalize().into()
+    }
+}
 
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
@@ -132,6 +173,8 @@ pub struct NativeCompatibilityMaterial {
     execution_implementation_manifest_digest: [u8; 32],
     plan_contract_revision: u32,
     plan_contract_digest: [u8; 32],
+    static_plan_interpreter: StaticPlanInterpreter,
+    static_plan_interpreter_digest: [u8; 32],
     epoch: u64,
     carriers: Box<[NativeCarrierDeclaration]>,
 }
@@ -162,6 +205,17 @@ impl NativeCompatibilityMaterial {
     /// Admission still compares the complete Native compatibility identity.
     pub const fn plan_contract_digest(&self) -> [u8; 32] {
         self.plan_contract_digest
+    }
+
+    /// The static plan interpreter Server composed for this process.
+    pub const fn static_plan_interpreter(&self) -> StaticPlanInterpreter {
+        self.static_plan_interpreter
+    }
+
+    /// Exact component evidence for diagnosing an interpreter mismatch.
+    /// Admission still compares the complete Native compatibility identity.
+    pub const fn static_plan_interpreter_digest(&self) -> [u8; 32] {
+        self.static_plan_interpreter_digest
     }
 
     pub const fn epoch(&self) -> u64 {
@@ -246,15 +300,17 @@ impl fmt::Display for NativeCompatibilityError {
 impl std::error::Error for NativeCompatibilityError {}
 
 /// Derives exact compatibility material from a descriptor set and a Server-owned
-/// static carrier manifest and plan contract revision. The input order is part
-/// of the validation contract: callers must provide an already strictly sorted
-/// declaration set. This crate never selects a plan contract on Server's behalf.
+/// static carrier manifest, plan contract revision and static plan
+/// interpreter. The input order is part of the validation contract: callers
+/// must provide an already strictly sorted declaration set. This crate never
+/// selects a plan contract or an interpreter on Server's behalf.
 pub fn derive_native_compatibility_material(
     descriptor_set: &[u8],
     carriers: impl IntoIterator<Item = NativeCarrierDeclaration>,
     function_catalog_digest: [u8; 32],
     execution_implementation_manifest_digest: [u8; 32],
     plan_contract_revision: u32,
+    static_plan_interpreter: StaticPlanInterpreter,
     epoch: u64,
 ) -> Result<NativeCompatibilityMaterial, NativeCompatibilityError> {
     if descriptor_set.is_empty() {
@@ -288,12 +344,14 @@ pub fn derive_native_compatibility_material(
         hasher.update(plan_contract_revision.to_be_bytes());
         hasher.finalize().into()
     };
+    let static_plan_interpreter_digest = static_plan_interpreter.component_digest();
     let mut hasher = Sha256::new();
     hasher.update(NATIVE_COMPATIBILITY_DOMAIN);
     hasher.update(descriptor_digest);
     hasher.update(function_catalog_digest);
     hasher.update(execution_implementation_manifest_digest);
     hasher.update(plan_contract_digest);
+    hasher.update(static_plan_interpreter_digest);
     hasher.update(
         u32::try_from(carriers.len())
             .expect("carrier count was checked against u32")
@@ -319,6 +377,8 @@ pub fn derive_native_compatibility_material(
         execution_implementation_manifest_digest,
         plan_contract_revision,
         plan_contract_digest,
+        static_plan_interpreter,
+        static_plan_interpreter_digest,
         epoch,
         carriers: carriers.into_boxed_slice(),
     })
@@ -330,6 +390,7 @@ pub fn derive_repository_native_compatibility_material(
     function_catalog_digest: [u8; 32],
     execution_implementation_manifest_digest: [u8; 32],
     plan_contract_revision: u32,
+    static_plan_interpreter: StaticPlanInterpreter,
 ) -> Result<NativeCompatibilityMaterial, NativeCompatibilityError> {
     derive_native_compatibility_material(
         FILE_DESCRIPTOR_SET,
@@ -337,6 +398,7 @@ pub fn derive_repository_native_compatibility_material(
         function_catalog_digest,
         execution_implementation_manifest_digest,
         plan_contract_revision,
+        static_plan_interpreter,
         NATIVE_COMPAT_EPOCH,
     )
 }
@@ -372,8 +434,10 @@ pub fn full_version() -> &'static str {
 mod tests {
     use super::{
         NATIVE_COMPAT_EPOCH, NativeCarrierDeclaration, NativeCompatibilityError,
-        derive_native_compatibility_material, native_build_identity,
+        StaticPlanInterpreter, derive_native_compatibility_material, native_build_identity,
     };
+
+    const PLAN_TREE: StaticPlanInterpreter = StaticPlanInterpreter::PlanTree;
 
     fn carriers() -> [NativeCarrierDeclaration; 2] {
         [
@@ -401,13 +465,14 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
+            PLAN_TREE,
             1,
         )
         .expect("valid material");
 
         assert_eq!(
             material.id().to_string(),
-            "f7966eb8ccdf6b851ce864a7516573d52c196c8edb046918f0615e0bcfc9aaba"
+            "ad892639393a541593b57ae066813530c2bd23725ab2a9535baac75dc52322a2"
         );
         assert_eq!(material.function_catalog_digest(), [0x31; 32]);
         assert_eq!(
@@ -435,6 +500,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
+            PLAN_TREE,
             1,
         )
         .expect("original material");
@@ -444,6 +510,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
+            PLAN_TREE,
             1,
         )
         .expect("descriptor material");
@@ -456,6 +523,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
+            PLAN_TREE,
             1,
         )
         .expect("provider revision material");
@@ -473,6 +541,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
+            PLAN_TREE,
             1,
         )
         .expect("private descriptor material");
@@ -482,6 +551,7 @@ mod tests {
             [0x32; 32],
             [0x41; 32],
             1,
+            PLAN_TREE,
             1,
         )
         .expect("catalog-only material");
@@ -491,6 +561,7 @@ mod tests {
             [0x31; 32],
             [0x42; 32],
             1,
+            PLAN_TREE,
             1,
         )
         .expect("implementation-only material");
@@ -500,6 +571,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
+            PLAN_TREE,
             2,
         )
         .expect("epoch material");
@@ -509,6 +581,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             2,
+            PLAN_TREE,
             1,
         )
         .expect("plan contract material");
@@ -549,6 +622,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             0,
+            PLAN_TREE,
             1,
         )
         .expect_err("a plan contract revision must be explicit and nonzero");
@@ -565,6 +639,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
+            PLAN_TREE,
             1,
         )
         .expect_err("duplicate provider ids must fail");
@@ -582,6 +657,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
+            PLAN_TREE,
             1,
         )
         .expect_err("reordered provider ids must fail");
@@ -606,6 +682,7 @@ mod tests {
                 [0x31; 32],
                 [0x41; 32],
                 1,
+                PLAN_TREE,
                 epoch,
             )
             .expect("valid material")
@@ -631,6 +708,7 @@ mod tests {
                 [0x31; 32],
                 [0x41; 32],
                 1,
+                PLAN_TREE,
                 epoch,
             )
             .expect("valid material")
@@ -657,6 +735,7 @@ mod tests {
                 [0x31; 32],
                 [0x41; 32],
                 1,
+                PLAN_TREE,
                 epoch,
             )
             .unwrap()
@@ -673,11 +752,95 @@ mod tests {
                 [0x31; 32],
                 [0x41; 32],
                 1,
+                PLAN_TREE,
                 epoch,
             )
             .unwrap()
         };
         assert_ne!(NATIVE_COMPAT_EPOCH, 4);
         assert_ne!(at(NATIVE_COMPAT_EPOCH).id(), at(4).id());
+    }
+
+    fn with_interpreter(interpreter: StaticPlanInterpreter) -> super::NativeCompatibilityMaterial {
+        derive_native_compatibility_material(
+            b"descriptor-v1",
+            carriers(),
+            [0x31; 32],
+            [0x41; 32],
+            1,
+            interpreter,
+            1,
+        )
+        .expect("valid material")
+    }
+
+    #[test]
+    fn a_compiled_package_interpreter_matches_its_frozen_golden_vector() {
+        let material = with_interpreter(StaticPlanInterpreter::CompiledPackage {
+            pure_function_catalog_digest: [0x51; 32],
+        });
+        assert_eq!(
+            material.id().to_string(),
+            "75500bcc71f4993afd30d08e60cd09da95ad15aa0e8b6817951b641d17cd5d2f"
+        );
+        assert_eq!(
+            material.static_plan_interpreter(),
+            StaticPlanInterpreter::CompiledPackage {
+                pure_function_catalog_digest: [0x51; 32],
+            }
+        );
+    }
+
+    /// Two binaries built from one tree share every descriptor, catalogue,
+    /// implementation and plan digest. The interpreter each composed is the
+    /// only input that tells their islands apart, and it alone must.
+    #[test]
+    fn the_static_plan_interpreter_alone_separates_islands_built_from_one_tree() {
+        let plan_tree = with_interpreter(StaticPlanInterpreter::PlanTree);
+        let compiled = with_interpreter(StaticPlanInterpreter::CompiledPackage {
+            pure_function_catalog_digest: [0x51; 32],
+        });
+        let other_catalog = with_interpreter(StaticPlanInterpreter::CompiledPackage {
+            pure_function_catalog_digest: [0x52; 32],
+        });
+
+        assert_ne!(plan_tree.id(), compiled.id());
+        assert_ne!(compiled.id(), other_catalog.id());
+        assert_ne!(plan_tree.id(), other_catalog.id());
+        assert_ne!(
+            plan_tree.static_plan_interpreter_digest(),
+            compiled.static_plan_interpreter_digest()
+        );
+        for material in [&compiled, &other_catalog] {
+            assert_eq!(material.descriptor_digest(), plan_tree.descriptor_digest());
+            assert_eq!(
+                material.function_catalog_digest(),
+                plan_tree.function_catalog_digest()
+            );
+            assert_eq!(
+                material.execution_implementation_manifest_digest(),
+                plan_tree.execution_implementation_manifest_digest()
+            );
+            assert_eq!(
+                material.plan_contract_digest(),
+                plan_tree.plan_contract_digest()
+            );
+            assert_eq!(material.epoch(), plan_tree.epoch());
+            assert_eq!(material.carriers(), plan_tree.carriers());
+        }
+    }
+
+    /// Production identity is a pure function of its inputs: deriving it
+    /// again yields the same island, never a per-process value.
+    #[test]
+    fn a_plan_tree_identity_is_deterministic() {
+        assert_eq!(
+            with_interpreter(StaticPlanInterpreter::PlanTree).id(),
+            with_interpreter(StaticPlanInterpreter::PlanTree).id()
+        );
+        assert_eq!(
+            with_interpreter(StaticPlanInterpreter::PlanTree).static_plan_interpreter(),
+            StaticPlanInterpreter::PlanTree
+        );
     }
 }

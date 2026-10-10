@@ -6,6 +6,7 @@
 //! structurally, and only the provider that produced it interprets it.
 // Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
 
+mod domain_resources;
 mod handle;
 mod predicate;
 mod runtime_codec;
@@ -14,6 +15,12 @@ mod split;
 mod task_update;
 mod value;
 
+pub use domain_resources::{
+    DomainCodecError, DomainResourceFacts, decode_domain_observed, domain_decode_resource_facts,
+    domain_decode_resource_facts_admitted, domain_encode_resource_facts,
+    domain_encode_resource_facts_admitted, encode_domain_observed, value_decode_resource_facts,
+    value_type_decode_resource_facts,
+};
 pub use handle::{
     CatalogTableHandle, ConnectorRelation, ConnectorRelationKind, TableExecuteProcedure,
     ValidatedConnectorChangeWindowHandle, ValidatedConnectorMergeTableHandle,
@@ -22,8 +29,8 @@ pub use handle::{
     ValidatedTransactionHandle,
 };
 pub use predicate::{
-    ValidatedColumnHandle, decode_connector_expression, decode_tuple_domain,
-    encode_connector_expression, encode_tuple_domain,
+    ValidatedColumnHandle, decode_connector_expression, decode_domain, decode_tuple_domain,
+    encode_connector_expression, encode_domain, encode_tuple_domain,
 };
 pub use runtime_codec::{
     ConnectorReadCodecError, ConnectorReadDecoder, ConnectorReadEncoder, DecodedConnectorReadScan,

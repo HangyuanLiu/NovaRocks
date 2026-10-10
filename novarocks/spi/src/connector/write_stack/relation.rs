@@ -59,15 +59,12 @@ pub const ROOT_WRITE_RESULT_COLUMN_COUNT: usize = 8;
 /// The typed tail is intentionally wide, but still bounded before allocations
 /// at every plan boundary.
 pub const MAX_WRITER_AUXILIARY_CHANNELS: usize = 4_096;
-pub const MAX_WRITE_RELATION_FIELD_NAME_BYTES: usize = 1_024;
-pub const MAX_WRITE_RELATION_TYPE_DEPTH: usize = 32;
-pub const MAX_WRITE_RELATION_METADATA_ENTRIES_PER_FIELD: usize = 64;
-pub const MAX_WRITE_RELATION_METADATA_KEY_BYTES: usize = 1_024;
-pub const MAX_WRITE_RELATION_METADATA_VALUE_BYTES: usize = 64 * 1_024;
-pub const MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES: usize = 16 * 1_024 * 1_024;
-
-const FIELD_ALLOCATION_CHARGE: usize = 128;
-const TYPE_ALLOCATION_CHARGE: usize = 64;
+pub use novarocks_connector_contract::{
+    MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES, MAX_WRITE_RELATION_FIELD_NAME_BYTES,
+    MAX_WRITE_RELATION_METADATA_ENTRIES_PER_FIELD, MAX_WRITE_RELATION_METADATA_KEY_BYTES,
+    MAX_WRITE_RELATION_METADATA_VALUE_BYTES, MAX_WRITE_RELATION_TYPE_DEPTH,
+    WRITE_FIELD_ALLOCATION_CHARGE,
+};
 
 /// The first reserved id of the write relation's columns.
 ///
@@ -135,14 +132,14 @@ pub const fn root_write_result_column_id(index: usize) -> u32 {
 pub struct WriterAuxiliaryChannel {
     slot_id: u32,
     name: String,
-    data_type: DataType,
+    value_type: novarocks_type_contract::FunctionValueType,
 }
 
 impl WriterAuxiliaryChannel {
     pub fn try_new(
         slot_id: u32,
         name: impl Into<String>,
-        data_type: DataType,
+        value_type: novarocks_type_contract::FunctionValueType,
     ) -> Result<Self, ConnectorError> {
         let name = name.into();
         if slot_id >= ROOT_WRITE_RESULT_FIRST_COLUMN_ID {
@@ -154,15 +151,23 @@ impl WriterAuxiliaryChannel {
             return Err(corrupt("writer auxiliary channel name is empty"));
         }
         validate_field_name(&name)?;
-        if data_type == DataType::Null {
+        if value_type.data_type == DataType::Null {
             return Err(corrupt("writer auxiliary channel cannot have Null type"));
         }
-        let mut decoded_bytes = name.len();
-        validate_data_type(&data_type, 1, &mut decoded_bytes)?;
+        if !value_type.nullable {
+            return Err(corrupt(
+                "writer auxiliary transport type must admit sparse NULL padding",
+            ));
+        }
+        let field = value_type.try_to_field(name.clone()).map_err(|error| {
+            ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string())
+        })?;
+        let mut decoded_bytes = 0;
+        novarocks_connector_contract::validate_write_field_schema(&field, 1, &mut decoded_bytes)?;
         Ok(Self {
             slot_id,
             name,
-            data_type,
+            value_type,
         })
     }
 
@@ -174,8 +179,12 @@ impl WriterAuxiliaryChannel {
         &self.name
     }
 
+    pub const fn value_type(&self) -> &novarocks_type_contract::FunctionValueType {
+        &self.value_type
+    }
+
     pub const fn data_type(&self) -> &DataType {
-        &self.data_type
+        &self.value_type.data_type
     }
 }
 
@@ -195,7 +204,7 @@ impl WriterMultiplexSchema {
                 "writer auxiliary schema exceeds the channel limit",
             ));
         }
-        let mut decoded_bytes = WRITE_RELATION_COLUMN_COUNT * FIELD_ALLOCATION_CHARGE;
+        let mut decoded_bytes = WRITE_RELATION_COLUMN_COUNT * WRITE_FIELD_ALLOCATION_CHARGE;
         let mut slot_ids = HashSet::with_capacity(auxiliary_channels.len());
         let mut names =
             HashSet::with_capacity(auxiliary_channels.len() + WRITE_RELATION_COLUMN_COUNT);
@@ -206,12 +215,17 @@ impl WriterMultiplexSchema {
             WRITE_RELATION_FRAGMENT_COLUMN,
         ]);
         for channel in &auxiliary_channels {
-            decoded_bytes = decoded_bytes
-                .checked_add(FIELD_ALLOCATION_CHARGE + channel.name().len())
-                .ok_or_else(|| {
-                    resource_exhausted("writer auxiliary schema allocation charge overflowed")
+            let field = channel
+                .value_type()
+                .try_to_field(channel.name())
+                .map_err(|error| {
+                    ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string())
                 })?;
-            validate_data_type(channel.data_type(), 1, &mut decoded_bytes)?;
+            novarocks_connector_contract::validate_write_field_schema(
+                &field,
+                1,
+                &mut decoded_bytes,
+            )?;
             if !slot_ids.insert(channel.slot_id()) {
                 return Err(corrupt(
                     "writer auxiliary schema contains a duplicate slot id",
@@ -228,7 +242,15 @@ impl WriterMultiplexSchema {
         fields.extend(
             auxiliary_channels
                 .iter()
-                .map(|channel| Field::new(channel.name(), channel.data_type().clone(), true)),
+                .map(|channel| {
+                    channel
+                        .value_type()
+                        .try_to_field(channel.name())
+                        .map_err(|error| {
+                            ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string())
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
         );
         Ok(Self {
             auxiliary_channels: Arc::new(auxiliary_channels),
@@ -316,80 +338,7 @@ impl RootWriteResultSchema {
     }
 }
 
-/// Compare every Arrow physical field attribute recursively. Arrow's built-in
-/// `Field::eq` deliberately ignores dictionary ids and dictionary ordering,
-/// which is appropriate for logical schema compatibility but not for a frozen
-/// internal-relation contract.
-pub fn arrow_schemas_exact(left: &Schema, right: &Schema) -> bool {
-    left.metadata() == right.metadata()
-        && left.fields().len() == right.fields().len()
-        && left
-            .fields()
-            .iter()
-            .zip(right.fields())
-            .all(|(left, right)| arrow_fields_exact(left, right))
-}
-
-fn arrow_fields_exact(left: &Field, right: &Field) -> bool {
-    #[allow(deprecated)]
-    let dictionary_ids_equal = left.dict_id() == right.dict_id();
-    left.name() == right.name()
-        && left.is_nullable() == right.is_nullable()
-        && left.metadata() == right.metadata()
-        && dictionary_ids_equal
-        && left.dict_is_ordered() == right.dict_is_ordered()
-        && arrow_data_types_exact(left.data_type(), right.data_type())
-}
-
-fn arrow_data_types_exact(left: &DataType, right: &DataType) -> bool {
-    match (left, right) {
-        (DataType::List(left), DataType::List(right))
-        | (DataType::ListView(left), DataType::ListView(right))
-        | (DataType::LargeList(left), DataType::LargeList(right))
-        | (DataType::LargeListView(left), DataType::LargeListView(right)) => {
-            arrow_fields_exact(left, right)
-        }
-        (
-            DataType::FixedSizeList(left_field, left_size),
-            DataType::FixedSizeList(right_field, right_size),
-        ) => left_size == right_size && arrow_fields_exact(left_field, right_field),
-        (DataType::Struct(left), DataType::Struct(right)) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(left, right)| arrow_fields_exact(left, right))
-        }
-        (DataType::Union(left_fields, left_mode), DataType::Union(right_fields, right_mode)) => {
-            left_mode == right_mode
-                && left_fields.len() == right_fields.len()
-                && left_fields.iter().zip(right_fields.iter()).all(
-                    |((left_id, left), (right_id, right))| {
-                        left_id == right_id && arrow_fields_exact(left, right)
-                    },
-                )
-        }
-        (
-            DataType::Dictionary(left_key, left_value),
-            DataType::Dictionary(right_key, right_value),
-        ) => {
-            arrow_data_types_exact(left_key, right_key)
-                && arrow_data_types_exact(left_value, right_value)
-        }
-        (
-            DataType::Map(left_entries, left_ordered),
-            DataType::Map(right_entries, right_ordered),
-        ) => left_ordered == right_ordered && arrow_fields_exact(left_entries, right_entries),
-        (
-            DataType::RunEndEncoded(left_runs, left_values),
-            DataType::RunEndEncoded(right_runs, right_values),
-        ) => {
-            arrow_fields_exact(left_runs, right_runs)
-                && arrow_fields_exact(left_values, right_values)
-        }
-        _ => left == right,
-    }
-}
+pub use novarocks_connector_contract::arrow_schemas_exact;
 
 fn corrupt(message: &'static str) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::CorruptData, message)
@@ -399,101 +348,7 @@ fn resource_exhausted(message: &'static str) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message)
 }
 
-fn charge_decoded(decoded_bytes: &mut usize, amount: usize) -> Result<(), ConnectorError> {
-    *decoded_bytes = decoded_bytes
-        .checked_add(amount)
-        .ok_or_else(|| resource_exhausted("write relation schema allocation charge overflowed"))?;
-    if *decoded_bytes > MAX_WRITE_RELATION_DECODED_SCHEMA_BYTES {
-        return Err(resource_exhausted(
-            "write relation schema exceeds the decoded allocation limit",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_field_name(name: &str) -> Result<(), ConnectorError> {
-    if name.len() > MAX_WRITE_RELATION_FIELD_NAME_BYTES {
-        return Err(resource_exhausted(
-            "write relation field name exceeds the byte limit",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_field(
-    field: &Field,
-    depth: usize,
-    decoded_bytes: &mut usize,
-) -> Result<(), ConnectorError> {
-    validate_field_name(field.name())?;
-    if field.metadata().len() > MAX_WRITE_RELATION_METADATA_ENTRIES_PER_FIELD {
-        return Err(resource_exhausted(
-            "write relation field metadata exceeds the entry limit",
-        ));
-    }
-    charge_decoded(decoded_bytes, FIELD_ALLOCATION_CHARGE + field.name().len())?;
-    for (key, value) in field.metadata() {
-        if key.len() > MAX_WRITE_RELATION_METADATA_KEY_BYTES {
-            return Err(resource_exhausted(
-                "write relation field metadata key exceeds the byte limit",
-            ));
-        }
-        if value.len() > MAX_WRITE_RELATION_METADATA_VALUE_BYTES {
-            return Err(resource_exhausted(
-                "write relation field metadata value exceeds the byte limit",
-            ));
-        }
-        charge_decoded(
-            decoded_bytes,
-            key.len() + value.len() + 2 * size_of::<String>(),
-        )?;
-    }
-    validate_data_type(field.data_type(), depth, decoded_bytes)
-}
-
-fn validate_data_type(
-    data_type: &DataType,
-    depth: usize,
-    decoded_bytes: &mut usize,
-) -> Result<(), ConnectorError> {
-    if depth > MAX_WRITE_RELATION_TYPE_DEPTH {
-        return Err(resource_exhausted(
-            "write relation Arrow type exceeds the nesting depth limit",
-        ));
-    }
-    charge_decoded(decoded_bytes, TYPE_ALLOCATION_CHARGE)?;
-    match data_type {
-        DataType::Timestamp(_, Some(timezone)) => {
-            charge_decoded(decoded_bytes, timezone.len())?;
-        }
-        DataType::List(field)
-        | DataType::ListView(field)
-        | DataType::FixedSizeList(field, _)
-        | DataType::LargeList(field)
-        | DataType::LargeListView(field)
-        | DataType::Map(field, _) => validate_field(field, depth + 1, decoded_bytes)?,
-        DataType::Struct(fields) => {
-            for field in fields {
-                validate_field(field, depth + 1, decoded_bytes)?;
-            }
-        }
-        DataType::Union(fields, _) => {
-            for (_, field) in fields.iter() {
-                validate_field(field, depth + 1, decoded_bytes)?;
-            }
-        }
-        DataType::Dictionary(key, value) => {
-            validate_data_type(key, depth + 1, decoded_bytes)?;
-            validate_data_type(value, depth + 1, decoded_bytes)?;
-        }
-        DataType::RunEndEncoded(run_ends, values) => {
-            validate_field(run_ends, depth + 1, decoded_bytes)?;
-            validate_field(values, depth + 1, decoded_bytes)?;
-        }
-        _ => {}
-    }
-    Ok(())
-}
+use novarocks_connector_contract::validate_write_field_name as validate_field_name;
 
 /// A row a `TableWriter` operator emits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -896,6 +751,7 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::*;
+    use novarocks_connector_contract::charge_write_schema as charge_decoded;
 
     #[test]
     fn both_relations_share_the_same_four_primitive_columns() {
@@ -1035,11 +891,14 @@ mod tests {
                 WriterAuxiliaryChannel::try_new(
                     index,
                     format!("aux_{index}"),
-                    if index % 2 == 0 {
-                        DataType::Binary
-                    } else {
-                        DataType::Int64
-                    },
+                    novarocks_type_contract::FunctionValueType::new(
+                        if index % 2 == 0 {
+                            DataType::Binary
+                        } else {
+                            DataType::Int64
+                        },
+                        true,
+                    ),
                 )
                 .expect("channel")
             })
@@ -1071,7 +930,10 @@ mod tests {
             WriterAuxiliaryChannel::try_new(
                 9,
                 "dictionary",
-                DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+                novarocks_type_contract::FunctionValueType::new(
+                    DataType::Dictionary(Box::new(DataType::Int16), Box::new(DataType::Utf8)),
+                    true,
+                ),
             )
             .expect("dictionary channel"),
         ])
@@ -1105,24 +967,106 @@ mod tests {
     }
 
     #[test]
+    fn writer_auxiliary_transport_preserves_authored_domains_and_requires_padding_nulls() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        for (carrier, domain) in [
+            (DataType::Binary, ValueLogicalType::Hll),
+            (DataType::LargeBinary, ValueLogicalType::Bitmap),
+            (DataType::FixedSizeBinary(16), ValueLogicalType::Uuid),
+            (DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt),
+        ] {
+            let transport =
+                FunctionValueType::try_with_logical_type(carrier.clone(), true, domain).unwrap();
+            let channel =
+                WriterAuxiliaryChannel::try_new(77, "exact_state", transport.clone()).unwrap();
+            let schema = WriterMultiplexSchema::try_new(vec![channel.clone()]).unwrap();
+            assert_eq!(channel.value_type(), &transport);
+            assert_eq!(
+                FunctionValueType::try_from_field(schema.arrow_schema().field(4)).unwrap(),
+                transport
+            );
+            let nonnullable =
+                FunctionValueType::try_with_logical_type(carrier, false, domain).unwrap();
+            assert!(WriterAuxiliaryChannel::try_new(77, "exact_state", nonnullable).is_err());
+        }
+        let field = Field::new("exact_item", DataType::Utf8, false).with_metadata(
+            [
+                (
+                    novarocks_type_contract::NR_LOGICAL_TYPE_KEY.into(),
+                    "json".into(),
+                ),
+                ("provider.field-id".into(), "91".into()),
+            ]
+            .into(),
+        );
+        let transport = FunctionValueType::new(DataType::LargeList(Arc::new(field)), true);
+        let channel =
+            WriterAuxiliaryChannel::try_new(77, "exact_state", transport.clone()).unwrap();
+        let schema = WriterMultiplexSchema::try_new(vec![channel]).unwrap();
+        assert_eq!(
+            FunctionValueType::try_from_field(schema.arrow_schema().field(4)).unwrap(),
+            transport
+        );
+        let mut altered = schema
+            .arrow_schema()
+            .fields()
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        altered[4] = Arc::new(Field::new(
+            "exact_state",
+            DataType::LargeList(Arc::new(Field::new("exact_item", DataType::Utf8, false))),
+            true,
+        ));
+        assert!(
+            schema
+                .validate_exact_arrow_schema(&Schema::new(altered))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn writer_multiplex_schema_rejects_ambiguous_channels() {
         let channel = |id, name: &str| {
-            WriterAuxiliaryChannel::try_new(id, name, DataType::Int64).expect("channel")
+            WriterAuxiliaryChannel::try_new(
+                id,
+                name,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            )
+            .expect("channel")
         };
         assert!(WriterMultiplexSchema::try_new(vec![channel(1, "a"), channel(1, "b")]).is_err());
         assert!(WriterMultiplexSchema::try_new(vec![channel(1, "a"), channel(2, "a")]).is_err());
         assert!(
-            WriterAuxiliaryChannel::try_new(1, WRITE_RELATION_KIND_COLUMN, DataType::Int64)
-                .and_then(|channel| WriterMultiplexSchema::try_new(vec![channel]))
-                .is_err()
+            WriterAuxiliaryChannel::try_new(
+                1,
+                WRITE_RELATION_KIND_COLUMN,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true)
+            )
+            .and_then(|channel| WriterMultiplexSchema::try_new(vec![channel]))
+            .is_err()
         );
-        assert!(WriterAuxiliaryChannel::try_new(1, "", DataType::Int64).is_err());
-        assert!(WriterAuxiliaryChannel::try_new(1, "null", DataType::Null).is_err());
+        assert!(
+            WriterAuxiliaryChannel::try_new(
+                1,
+                "",
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true)
+            )
+            .is_err()
+        );
+        assert!(
+            WriterAuxiliaryChannel::try_new(
+                1,
+                "null",
+                novarocks_type_contract::FunctionValueType::new(DataType::Null, true)
+            )
+            .is_err()
+        );
         assert!(
             WriterAuxiliaryChannel::try_new(
                 ROOT_WRITE_RESULT_FIRST_COLUMN_ID,
                 "root_collision",
-                DataType::Int64,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             )
             .is_err()
         );
@@ -1130,7 +1074,7 @@ mod tests {
             WriterAuxiliaryChannel::try_new(
                 WRITE_RELATION_FIRST_COLUMN_ID,
                 "collision",
-                DataType::Int64,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             )
             .is_err()
         );
@@ -1139,8 +1083,18 @@ mod tests {
     #[test]
     fn writer_multiplex_rows_are_sparse_and_kind_exact() {
         let schema = WriterMultiplexSchema::try_new(vec![
-            WriterAuxiliaryChannel::try_new(1, "a", DataType::Int64).expect("a"),
-            WriterAuxiliaryChannel::try_new(2, "b", DataType::Binary).expect("b"),
+            WriterAuxiliaryChannel::try_new(
+                1,
+                "a",
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+            )
+            .expect("a"),
+            WriterAuxiliaryChannel::try_new(
+                2,
+                "b",
+                novarocks_type_contract::FunctionValueType::new(DataType::Binary, true),
+            )
+            .expect("b"),
         ])
         .expect("schema");
         assert!(
@@ -1430,20 +1384,29 @@ mod tests {
     #[test]
     fn relation_limits_accept_boundary_and_reject_plus_one() {
         let max_name = "n".repeat(MAX_WRITE_RELATION_FIELD_NAME_BYTES);
-        WriterAuxiliaryChannel::try_new(1, max_name, DataType::Int64).expect("name boundary");
+        WriterAuxiliaryChannel::try_new(
+            1,
+            max_name,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        )
+        .expect("name boundary");
         assert!(
             WriterAuxiliaryChannel::try_new(
                 1,
                 "n".repeat(MAX_WRITE_RELATION_FIELD_NAME_BYTES + 1),
-                DataType::Int64,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             )
             .is_err()
         );
 
         let channels = (0..MAX_WRITER_AUXILIARY_CHANNELS)
             .map(|index| {
-                WriterAuxiliaryChannel::try_new(index as u32, format!("c{index}"), DataType::Int64)
-                    .expect("channel")
+                WriterAuxiliaryChannel::try_new(
+                    index as u32,
+                    format!("c{index}"),
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+                )
+                .expect("channel")
             })
             .collect::<Vec<_>>();
         WriterMultiplexSchema::try_new(channels.clone()).expect("channel boundary");
@@ -1452,7 +1415,7 @@ mod tests {
             WriterAuxiliaryChannel::try_new(
                 MAX_WRITER_AUXILIARY_CHANNELS as u32,
                 "overflow",
-                DataType::Int64,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             )
             .expect("extra channel"),
         );
@@ -1463,11 +1426,25 @@ mod tests {
                 DataType::List(Arc::new(Field::new(format!("d{index}"), child, false)))
             })
         };
-        WriterAuxiliaryChannel::try_new(1, "depth", nested(MAX_WRITE_RELATION_TYPE_DEPTH))
-            .expect("depth boundary");
+        WriterAuxiliaryChannel::try_new(
+            1,
+            "depth",
+            novarocks_type_contract::FunctionValueType::new(
+                nested(MAX_WRITE_RELATION_TYPE_DEPTH),
+                true,
+            ),
+        )
+        .expect("depth boundary");
         assert!(
-            WriterAuxiliaryChannel::try_new(1, "depth", nested(MAX_WRITE_RELATION_TYPE_DEPTH + 1),)
-                .is_err()
+            WriterAuxiliaryChannel::try_new(
+                1,
+                "depth",
+                novarocks_type_contract::FunctionValueType::new(
+                    nested(MAX_WRITE_RELATION_TYPE_DEPTH + 1),
+                    true
+                ),
+            )
+            .is_err()
         );
 
         let mut bytes = 0;
@@ -1488,8 +1465,12 @@ mod tests {
         ]));
         let channels = (0..5)
             .map(|index| {
-                WriterAuxiliaryChannel::try_new(index, format!("large_{index}"), large_type.clone())
-                    .expect("individual channel remains below the schema budget")
+                WriterAuxiliaryChannel::try_new(
+                    index,
+                    format!("large_{index}"),
+                    novarocks_type_contract::FunctionValueType::new(large_type.clone(), true),
+                )
+                .expect("individual channel remains below the schema budget")
             })
             .collect();
         assert!(WriterMultiplexSchema::try_new(channels).is_err());

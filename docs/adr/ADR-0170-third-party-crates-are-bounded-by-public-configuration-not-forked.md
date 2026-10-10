@@ -9,7 +9,8 @@ date: 2026-10-06
 provenance:
   - "discussion: 2026-10-06 rejection of a vendored Tokio/Hyper/H2/Tonic/Tower/HTTP/Bytes/Arrow stack for bounded result delivery"
   - "discussion: 2026-10-08 accepted MEM-1-M07 revision 7, trusted catalog SDK listing growth with three narrow protocol changes (D15/D16)"
-  - "PR: pending — backfill the number once MEM-1 M07 merges"
+  - "discussion: 2026-10-10 accepted MEM-1-M07 revision 8, retain existing Iceberg serialization without adding APIs (D17)"
+  - "PR: https://github.com/NovaRocks/NovaRocks/pull/1173 (first implementation merged; follow-up verification remains in progress)"
 code-anchors:
   - "Cargo.toml ([patch.crates-io])"
   - "novarocks/native-adapter/src/native_transport_admission.rs (NativeTransportAdmission)"
@@ -17,6 +18,8 @@ code-anchors:
   - "novarocks/execution/src/exec/chunk/root_array_storage.rs (ARROW_BUFFER_OWNER_METADATA_BOUND)"
   - "novarocks/connector/iceberg/src/catalog/listing_admission.rs (ListingAdmission)"
   - "novarocks/fs/src/list_body_limit.rs (ListBodyLimitFetch)"
+  - "novarocks/connector/iceberg/src/metadata.rs (frozen_copy_on_write_source_payload)"
+  - "vendor/iceberg-0.9.0/src/spec/table_metadata.rs (TableMetadata::serialize)"
   - "vendor/iceberg-catalog-rest-0.9.0/PATCH.md (single-page REST protocol extension and upstream exit)"
 ---
 
@@ -33,6 +36,7 @@ NovaRocks 的内存治理分两类对象，保证程度不同：
 | NovaRocks 自有对象 | 结果窗口段、行游标、collector、交给传输层的 payload `Bytes`、自建队列 | 事前精确授权 | 最后一个 NovaRocks owner 被 Drop（payload 用上游 `Bytes::from_owner` 观察第三方持有的最后 alias） |
 | 第三方内部对象 | HPACK 表、帧缓冲、Hyper/Tonic 任务、Tokio socket 注册与 TaskCell、Tower Buffer 内部、错误 Box | 公开配置限定数量和单项尺寸；NovaRocks 在库外持有计数门；字节为结构上界，用 jemalloc 测量验证 | 公开 API 可观察的事件：IO wrapper 被 Drop、JoinHandle 返回、response body EOF/RST/Drop |
 | 受信 catalog SDK 列表内部 | REST/HMS 响应体、反序列化对象及 SDK 跨页累积 | 调用准入、绝对期限、协议分页与观测；没有配置推导的单响应字节上界（D15） | SDK future 返回或取消后 Drop；位置在该 future 退出后归还 |
+| Iceberg 序列化内部临时副本 | COW metadata/schema Serialize 及其内部子序列化创建的临时图 | 原 Internal 调用并发与 scope/绝对期限、实际退出责任和测量；没有构造前堆字节硬界（D17） | 实际同步调用返回/unwind，阻塞 owner 实际退出；timeout 不代替退出 |
 | 第三方内部分配的记账 | 上一行对象的实际字节 | BE 侧由归属 allocator 在执行作用域下分配时归属（见 memory-governance 领域）；FE 侧只有结构上界与测量 | 归属 allocator 的真实 free |
 
 `[patch.crates-io]` 对整个 workspace 全局生效：一旦 patch Tokio，锁文件中所有依赖 Tokio 的包（数十个，包括 AWS SDK、OpenDAL）都跑在私有副本上。path 依赖没有 registry 身份，cargo-deny 对这些包的已知安全公告不再可见，`deny.toml` 中对应的 ignore 条目也会因“未使用”而必须删除，于是公告从治理视野中消失，而不是被修复。
@@ -77,6 +81,16 @@ NovaRocks 的内存治理分两类对象，保证程度不同：
 仓库钉住的 pilota 0.11.10 `thrift/binary.rs::read_string` 先按线上长度 `vec![0; len]`；hive_metastore 0.2.0 的 GetAllTables 生成解码先按声明元素数 `Vec::with_capacity`。误配传输、错端口或流错位也可能触发大分配；该缺口按已接受设计交上游独立修复，M07 不扩大 vendor 范围。
 
 CL 记录条目、名字字节、页数、实际进程身份及调用期间 jemalloc 采样高水位，不进入 `E_FE_result` 结构上界证明。整个 information_schema SQL 还包含自有 AST/规划/wire 工作，lake discovery 还包含单表加载与 request metadata cache；这些整段高水位不能直接归因为 SDK 列表缓冲。HTTP fixture 的 handler 结束也不能代替 SDK future 或后台 job 的退出。受控协议检查不替代真实 REST/HMS/Paimon 跨 provider 验收；测试入口与产物保存边界见 [有界结果交付测试资产](../testing/mem-1-m07/README.md)。
+
+**Iceberg 现有序列化的窄边界（2026-10-10，D17）：**
+
+COW 冻结旧文件读取句柄需要原 snapshot metadata。现有 `TableMetadata::Serialize` 在库内执行 `self.clone().try_into()`，公开 API 不提供私有 metadata 图/Map 容量的准确上界。用户明确选择保留现有序列化、不新增 API；不为计量给 vendor 增加 getter/钩子，也不维护第二套完整 v1/v2/v3 codec。
+
+规则 6、7 对这一项不声称构造前堆字节硬界。调用只能在原 Internal 工作位置内串行，复用原 scope 与原绝对期限；计数和写入阶段也不增加并发位置。调用前、阶段之间与发布前检查取消/期限。同步 Serialize 不可被 deadline 强行抢占；已进入的调用及原阻塞 owner 未实际返回前仍持有责任，晚到输出不得发布。
+
+输出 JSON/String/Bytes、Nova 显式 clone、schema/default 投影、解析 scratch、group/recipe、route 与 compiler 仍是 Nova 自有对象，须增长前检查完整共存上界并持原 guard 到最后 holder 退出。D17 不允许将私有未知容量计为零、不将 wire 长度当 heap 上界、不增加窗口、不因无法证明库私有布局拒绝正常支持的类型/default 或 COW 输入。
+
+P00b/P09 单列格式版本、metadata/schema/default/snapshot 规模、serialized 字节、原调用 owner/并发/期限/实际退出及 jemalloc 高水位；整体 COW 峰值不能直接归因于库内临时副本，测量不进入已证明 `E_FE_result`。测量出现无法解释增长或退出后不回落时重审；升级 Iceberg 重跑正常 frozen-read/default/格式语义和测量。此边界不泛化为所有 SDK 调用或所有显式克隆的豁免，D15 列表规则继续独立适用。
 
 ## 接受的妥协（诚实记录）
 

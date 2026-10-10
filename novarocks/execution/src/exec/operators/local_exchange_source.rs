@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
@@ -135,7 +137,7 @@ impl Operator for LocalExchangeSourceOperator {
         self.finished
     }
 
-    fn close(&mut self) -> Result<(), String> {
+    fn close(&mut self) -> ExecutionResult<()> {
         self.finish();
         Ok(())
     }
@@ -165,11 +167,13 @@ impl ProcessorOperator for LocalExchangeSourceOperator {
         !self.exchanger.is_done(self.partition)
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
-        Err("local exchange source operator does not accept input".to_string())
+    fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> ExecutionResult<()> {
+        Err("local exchange source operator does not accept input"
+            .to_string()
+            .into())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         if self.finished {
             return Ok(None);
         }
@@ -235,7 +239,7 @@ impl ProcessorOperator for LocalExchangeSourceOperator {
         Ok(None)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         self.finish();
         Ok(())
     }

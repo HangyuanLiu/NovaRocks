@@ -31,7 +31,7 @@
 
 use std::fmt::{self, Display, Write as _};
 
-use super::completed::{ExplainRenderBudget, ExplainRenderOutput};
+use super::completed::{ExplainRenderBudget, ExplainRenderOutput, RenderDiagnostic};
 
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
@@ -46,50 +46,77 @@ use crate::explain::ExplainLevel;
 pub fn render_completed_plan_tree(
     plan: &PhysicalPlan,
     level: ExplainLevel,
+    control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<Vec<String>, SqlCompileError> {
-    render_tree_with_budget(plan, level, ExplainRenderBudget::default())
+    render_tree_with_budget_observed(plan, level, ExplainRenderBudget::default(), control)
 }
 
+fn render_tree_with_budget_observed(
+    plan: &PhysicalPlan,
+    level: ExplainLevel,
+    budget: ExplainRenderBudget,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Vec<String>, SqlCompileError> {
+    let mut out = ExplainRenderOutput::new_observed(budget, control)?;
+    let context = TreeContext::new_observed(plan, level, &mut out, Some(control))?;
+    let result: Result<(), SqlCompileError> = (|| {
+        if context.costs() {
+            for annotation in plan.annotations() {
+                if annotation.subject == AnnotationSubject::Plan
+                    && annotation.key.as_ref()
+                        == crate::optimizer::stats_input::TABLE_STATISTICS_ANNOTATION_KEY
+                {
+                    out.push(format_args!("{}", annotation.value))?;
+                }
+            }
+        }
+        context.render_runtime_filters(&mut out)?;
+        for (display_id, fragment_id) in context.fragment_order().enumerate() {
+            let Some(fragment) = plan.fragments().get(&fragment_id) else {
+                continue;
+            };
+            if context.detailed() {
+                out.push(format_args!("PLAN FRAGMENT {display_id}"))?;
+                out.push(format_args!("  OUTPUT EXPRS: *"))?;
+                let distribution = fragment
+                    .nodes()
+                    .get(&fragment.root())
+                    .map_or(&Distribution::Unconstrained, |node| {
+                        &node.output_properties.distribution
+                    });
+                out.push(format_args!(
+                    "  PARTITION: {}",
+                    context.distribution_label(fragment_id, distribution)
+                ))?;
+                context.render_sink(fragment, &mut out)?;
+            }
+            context.render_node(fragment, fragment.root(), 0, &mut out)?;
+        }
+        Ok(())
+    })();
+    if let Some(error) = context
+        .diagnostic
+        .as_ref()
+        .and_then(RenderDiagnostic::take_error)
+    {
+        return Err(error);
+    }
+    result?;
+    out.finish_observed()
+}
+
+#[cfg(test)]
 fn render_tree_with_budget(
     plan: &PhysicalPlan,
     level: ExplainLevel,
     budget: ExplainRenderBudget,
 ) -> Result<Vec<String>, SqlCompileError> {
-    let context = TreeContext::new(plan, level)?;
-    let mut out = ExplainRenderOutput::new(budget);
-    if context.costs() {
-        for annotation in plan.annotations() {
-            if annotation.subject == AnnotationSubject::Plan
-                && annotation.key.as_ref()
-                    == crate::optimizer::stats_input::TABLE_STATISTICS_ANNOTATION_KEY
-            {
-                out.push(format_args!("{}", annotation.value))?;
-            }
-        }
-    }
-    context.render_runtime_filters(&mut out)?;
-    for (display_id, fragment_id) in context.fragment_order().enumerate() {
-        let Some(fragment) = plan.fragments().get(&fragment_id) else {
-            continue;
-        };
-        if context.detailed() {
-            out.push(format_args!("PLAN FRAGMENT {display_id}"))?;
-            out.push(format_args!("  OUTPUT EXPRS: *"))?;
-            let distribution = fragment
-                .nodes()
-                .get(&fragment.root())
-                .map_or(&Distribution::Unconstrained, |node| {
-                    &node.output_properties.distribution
-                });
-            out.push(format_args!(
-                "  PARTITION: {}",
-                context.distribution_label(fragment_id, distribution)
-            ))?;
-            context.render_sink(fragment, &mut out)?;
-        }
-        context.render_node(fragment, fragment.root(), 0, &mut out)?;
-    }
-    Ok(out.finish())
+    render_tree_with_budget_observed(
+        plan,
+        level,
+        budget,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
 }
 
 fn fragment_order(plan: &PhysicalPlan) -> impl Iterator<Item = FragmentId> + '_ {
@@ -281,6 +308,7 @@ struct TreeContext<'a> {
     node_annotations: Vec<&'a PlanAnnotation>,
     value_names: Vec<&'a PlanAnnotation>,
     display_ids: Vec<DisplayNode>,
+    diagnostic: Option<RenderDiagnostic<'a>>,
 }
 
 fn annotation_key(annotation: &PlanAnnotation) -> (FragmentId, u32) {
@@ -339,9 +367,21 @@ fn assign_display_ids<'a>(
 }
 
 impl<'a> TreeContext<'a> {
+    #[cfg(test)]
     fn new(plan: &'a PhysicalPlan, level: ExplainLevel) -> Result<Self, SqlCompileError> {
+        let mut out = ExplainRenderOutput::new(ExplainRenderBudget::default());
+        Self::new_observed(plan, level, &mut out, None)
+    }
+
+    fn new_observed(
+        plan: &'a PhysicalPlan,
+        level: ExplainLevel,
+        out: &mut ExplainRenderOutput<'_>,
+        diagnostic_control: Option<&'a dyn novarocks_type_contract::PureCompileControl>,
+    ) -> Result<Self, SqlCompileError> {
         let mut node_count = 0usize;
         for fragment in plan.fragments().values() {
+            out.observe()?;
             node_count = node_count
                 .checked_add(fragment.nodes().len())
                 .ok_or_else(source_refusal)?;
@@ -349,6 +389,7 @@ impl<'a> TreeContext<'a> {
         let mut nodes = 0usize;
         let mut values = 0usize;
         for annotation in plan.annotations() {
+            out.observe()?;
             match annotation.subject {
                 AnnotationSubject::Node(..) => nodes += 1,
                 AnnotationSubject::Value(..) if annotation.key.as_ref() == "sql.display_name" => {
@@ -377,6 +418,7 @@ impl<'a> TreeContext<'a> {
         let mut node_annotations = reserve_exact(nodes)?;
         let mut value_names = reserve_exact(values)?;
         for annotation in plan.annotations() {
+            out.observe()?;
             match annotation.subject {
                 AnnotationSubject::Node(..) => node_annotations.push(annotation),
                 AnnotationSubject::Value(..) if annotation.key.as_ref() == "sql.display_name" => {
@@ -385,11 +427,14 @@ impl<'a> TreeContext<'a> {
                 _ => {}
             }
         }
+        out.observe()?;
         node_annotations.sort_by_key(|annotation| annotation_key(annotation));
         value_names.sort_by_key(|annotation| annotation_key(annotation));
+        out.observe()?;
         let mut display_ids = reserve_exact(node_count)?;
         for (fragment, definition) in plan.fragments() {
             for node in definition.nodes().keys() {
+                out.observe()?;
                 display_ids.push(DisplayNode {
                     key: (*fragment, *node),
                     display: usize::MAX,
@@ -403,11 +448,13 @@ impl<'a> TreeContext<'a> {
             node_annotations,
             value_names,
             display_ids,
+            diagnostic: diagnostic_control.map(RenderDiagnostic::new),
         };
         let mut next = 0;
         // Iterate the borrowed plan so the context remains mutable while IDs
         // are assigned. No fragment-order Vec or distribution clone exists.
         for fragment_id in fragment_order(plan) {
+            out.observe()?;
             if let Some(fragment) = plan.fragments().get(&fragment_id) {
                 assign_display_ids(
                     &mut context.display_ids,
@@ -565,10 +612,7 @@ impl<'a> TreeContext<'a> {
                     self.render_edge_sink(route.edge, out)?;
                 }
             }
-            FragmentSink::Result
-            | FragmentSink::RootResult(_)
-            | FragmentSink::SealedArtifact(_)
-            | FragmentSink::Noop => {}
+            FragmentSink::Result | FragmentSink::RootResult(_) | FragmentSink::Noop => {}
         }
         Ok(())
     }
@@ -823,6 +867,17 @@ impl ExprText<'_> {
                 .value_name(self.fragment.id(), *value)
                 .fmt(formatter),
             ExprKind::Literal(value) => write!(formatter, "{}", literal_text(value)),
+            ExprKind::Constant(reference) => match &self.context.diagnostic {
+                Some(diagnostic) => {
+                    diagnostic.plan_constant(self.context.plan, *reference, &node.ty, formatter)
+                }
+                None => write!(
+                    formatter,
+                    "constant-reference(pool={}, ordinal={})",
+                    reference.pool.get(),
+                    reference.ordinal
+                ),
+            },
             ExprKind::LambdaParameter { ordinal, .. } => write!(formatter, "arg{ordinal}"),
             ExprKind::Lambda { body, .. } => write!(formatter, "-> {}", inner(*body)),
             ExprKind::Unary { op, expr } => {
@@ -1048,7 +1103,14 @@ impl std::fmt::Display for LiteralText<'_> {
             LiteralValue::Time64(value) | LiteralValue::Timestamp(value) => {
                 write!(formatter, "{value}")
             }
-            LiteralValue::IntervalMonthDayNano(value) => write!(formatter, "{value}"),
+            LiteralValue::IntervalMonthDayNano {
+                months,
+                days,
+                nanoseconds,
+            } => write!(
+                formatter,
+                "interval(months={months}, days={days}, nanoseconds={nanoseconds})"
+            ),
         }
     }
 }
@@ -1307,6 +1369,7 @@ impl TreeContext<'_> {
                 limit,
                 offset,
                 phase,
+                ..
             } => {
                 let label = match phase {
                     novarocks_physical_plan::TopNPhase::Partial { .. } => "LOCAL TOP-N",

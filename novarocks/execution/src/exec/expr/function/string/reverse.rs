@@ -115,7 +115,7 @@ pub fn eval_reverse(
             out.push(None);
             continue;
         }
-        let val: String = s_arr.value(row_idx).chars().rev().collect();
+        let val = novarocks_functions::string_reverse_shared::reverse_utf8(s_arr.value(row_idx));
         out.push(Some(val));
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)

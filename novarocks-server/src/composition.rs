@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use anyhow::anyhow;
+use anyhow::{Context, anyhow};
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
@@ -74,6 +74,31 @@ use novarocks_workload_control::WorkloadConfig;
 use crate::paimon_access::ServerPaimonRoleFileIoFactory;
 use crate::provider_manifest::ServerProviderManifest;
 use crate::scan_io::ScanIoServices;
+use crate::static_plan::{FrontendStaticPlanCarrier, ServerStaticPlan};
+use novarocks_execution::exec::expr::agg::{
+    ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
+    contribute_builtin_aggregate_implementations,
+};
+
+/// Seals the one process-wide engine function set: builtin metadata, builtin
+/// aggregate implementations and the Iceberg function bundle.
+pub fn compose_process_function_set() -> anyhow::Result<std::sync::Arc<SealedExecutionFunctionSet>>
+{
+    let mut builder = ExecutionFunctionSetBuilder::new();
+    novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
+        .map_err(|error| anyhow!("contribute builtin function metadata: {error}"))?;
+    contribute_builtin_aggregate_implementations(&mut builder)
+        .map_err(|error| anyhow!("contribute builtin aggregate implementations: {error}"))?;
+    builder
+        .register_typed_aggregate(
+            novarocks_connector_iceberg_functions::iceberg_theta_registration()
+                .map_err(|error| anyhow!("build Iceberg function bundle: {error}"))?,
+        )
+        .map_err(|error| anyhow!("contribute Iceberg function bundle: {error}"))?;
+    Ok(std::sync::Arc::new(builder.seal().map_err(|error| {
+        anyhow!("seal process engine function set: {error}")
+    })?))
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IcebergMvStorageObservationAdapter {
@@ -432,6 +457,7 @@ pub fn compose_backend_server_config(
     config: &NovaRocksConfig,
     native_trust: &NativeTrustSnapshot,
     native_compatibility_id: NativeCompatibilityId,
+    static_plan: &ServerStaticPlan,
     function_set: std::sync::Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet>,
     provider_manifest: std::sync::Arc<ServerProviderManifest>,
     memory_authority: std::sync::Arc<novarocks_memory::MemoryAuthority>,
@@ -549,6 +575,7 @@ pub fn compose_backend_server_config(
         },
         execution_role_binding_factories: provider_manifest
             .compose_execution_factories(config, runtime, scan_io)?,
+        static_plan_interpreter: static_plan.backend_interpreter()?,
         process_memory: backend_process_memory_observation(memory_authority),
     })
 }
@@ -604,6 +631,7 @@ pub fn compose_frontend_role_config(
     native_trust: &NativeTrustSnapshot,
     port_override: Option<u16>,
     native_compatibility_id: NativeCompatibilityId,
+    static_plan: &ServerStaticPlan,
     function_catalog: std::sync::Arc<novarocks_functions::EngineFunctionCatalog>,
     provider_manifest: std::sync::Arc<ServerProviderManifest>,
     memory_authority: std::sync::Arc<novarocks_memory::MemoryAuthority>,
@@ -611,6 +639,11 @@ pub fn compose_frontend_role_config(
 ) -> anyhow::Result<FrontendRoleConfig> {
     crate::sdk_listing_profile::validate_current()?;
     let runtime_config = &config.runtime;
+    let constant_policy = runtime_config
+        .frontend_constant_policy
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("runtime.frontend_constant_policy is required for FE"))?
+        .policy();
     let runtime_filter_worker_count = NonZeroUsize::new(runtime_config.actual_exec_threads())
         .ok_or_else(|| anyhow::anyhow!("frontend runtime-filter worker count must be nonzero"))?;
     let query_blocking_workers = NonZeroUsize::new(runtime_config.actual_query_blocking_workers())
@@ -636,6 +669,7 @@ pub fn compose_frontend_role_config(
         native_compatibility_id,
         function_catalog,
         logical_runtime,
+        constant_policy,
     )
     .with_catalog_desired_state_source(catalog_source)
     .try_with_catalog_prune_config(
@@ -696,6 +730,21 @@ pub fn compose_frontend_role_config(
         query_blocking_workers,
         query_blocking_queue,
     ));
+    // Static plan carrier hook: the frontend freezes the one carrier this
+    // island's backends interpret, under the same package admission the
+    // backend receiver uses. Production keeps the frontend's plan-tree
+    // carrier untouched.
+    match static_plan.frontend_carrier() {
+        FrontendStaticPlanCarrier::PlanTree => {}
+        #[cfg(feature = "physical-wire-v2-candidate")]
+        FrontendStaticPlanCarrier::CompiledPackage { admission, limits } => {
+            execution = execution.with_static_plan_carrier(
+                novarocks_frontend_application::StaticPlanCarrier::CompiledPackage(
+                    novarocks_frontend_application::CompiledPackageCarrier::new(admission, limits),
+                ),
+            );
+        }
+    }
     let (remote_effect_policy, management_audit, startup_isolation) =
         mv_management_continuation(config)?;
     execution =
@@ -767,6 +816,25 @@ pub fn compose_frontend_role_config(
             native_compatibility_id,
             memory_authority: std::sync::Arc::clone(&memory_authority),
             process_memory: Some(frontend_process_memory_observation()),
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            hms_listing_observation: provider_manifest.hms_listing_probe().map(|probe| {
+                let selected = std::sync::Arc::clone(&probe);
+                novarocks_frontend_application::HmsListingObservationSetup::new(
+                    std::sync::Arc::new(move |body: &[u8]| probe.handle_json(body)),
+                    std::sync::Arc::new(move |observation| {
+                        selected
+                            .captured_admission_owner(&observation.instance_id)
+                            .map(|owner| {
+                                owner.map(|(handle, incarnation)| {
+                                    novarocks_frontend_application::HmsAdmissionInstalledOwner {
+                                        handle,
+                                        incarnation,
+                                    }
+                                })
+                            })
+                    }),
+                )
+            }),
         },
         serving: FrontendServingConfig {
             report_bind_host: config.server.host.clone(),
@@ -801,13 +869,9 @@ struct ComposedTaskExecutionBudgets {
     transport: FrontendTaskTransportBudget,
 }
 
-fn compose_frontend_workload_runtime(
+fn compose_frontend_workload_policy(
     runtime: &crate::app_config::RuntimeConfig,
-) -> anyhow::Result<(
-    LogicalExecutionSupervisorConfig,
-    WorkloadConfig,
-    NonZeroUsize,
-)> {
+) -> anyhow::Result<WorkloadConfig> {
     let input = &runtime.frontend_workload;
     let workload = WorkloadConfig {
         // These generic bookkeeping ceilings protect finite in-process state.
@@ -837,7 +901,32 @@ fn compose_frontend_workload_runtime(
     };
     workload
         .validate()
-        .map_err(|error| anyhow::anyhow!("construct frontend workload policy: {error}"))?;
+        .context("construct frontend workload policy")?;
+    Ok(workload)
+}
+
+/// Pure load-time check over the same policy projection used by composition.
+pub(crate) fn validate_frontend_joint_startup(
+    runtime: &crate::app_config::RuntimeConfig,
+) -> anyhow::Result<crate::joint_startup_report::JointStartupReport> {
+    let workload = compose_frontend_workload_policy(runtime)?;
+    crate::joint_startup_report::validate_current(&workload)
+}
+
+fn compose_frontend_workload_runtime(
+    runtime: &crate::app_config::RuntimeConfig,
+) -> anyhow::Result<(
+    LogicalExecutionSupervisorConfig,
+    WorkloadConfig,
+    NonZeroUsize,
+)> {
+    let input = &runtime.frontend_workload;
+    let workload = compose_frontend_workload_policy(runtime)?;
+    let report = crate::joint_startup_report::validate_current(&workload)?;
+    tracing::debug!(
+        ?report,
+        "Frontend joint startup number checks completed; owner projections remain open"
+    );
     let nonzero = |field: &'static str, value: usize| {
         NonZeroUsize::new(value)
             .ok_or_else(|| anyhow::anyhow!("runtime.frontend_workload.{field} must be nonzero"))
@@ -1512,4 +1601,46 @@ fn remote_effect_guarantee(
     )
     .map(Some)
     .map_err(|error| anyhow!("InvalidMvManagementConfig: [mv_management].{field}: {error}"))
+}
+
+#[cfg(test)]
+mod joint_startup_policy_tests {
+    use super::*;
+
+    #[test]
+    fn load_check_and_composition_use_the_same_original_workload_projection() {
+        let mut runtime = crate::app_config::RuntimeConfig::default();
+        runtime.frontend_workload.concurrency_limit = 16;
+        let projected = compose_frontend_workload_policy(&runtime).expect("original workload");
+        let report = validate_frontend_joint_startup(&runtime).expect("joint number check");
+        let (_, composed, _) =
+            compose_frontend_workload_runtime(&runtime).expect("pure composition");
+        assert_eq!(projected.query_concurrency_limit, 16);
+        assert_eq!(
+            composed.query_concurrency_limit,
+            projected.query_concurrency_limit
+        );
+        assert_eq!(report.computation_positions, 16);
+        assert_eq!(report.result_plus_native_declared_bytes, None);
+    }
+
+    #[test]
+    fn original_policy_projection_failure_preserves_the_owner_error() {
+        let mut runtime = crate::app_config::RuntimeConfig::default();
+        runtime.frontend_workload.waiting_limit = 0;
+        let error = validate_frontend_joint_startup(&runtime).expect_err("invalid actual policy");
+        assert!(
+            error
+                .downcast_ref::<novarocks_workload_control::WorkError>()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn beyond_supported_compute_is_rejected_by_both_pure_callers() {
+        let mut runtime = crate::app_config::RuntimeConfig::default();
+        runtime.frontend_workload.concurrency_limit = 257;
+        assert!(validate_frontend_joint_startup(&runtime).is_err());
+        assert!(compose_frontend_workload_runtime(&runtime).is_err());
+    }
 }

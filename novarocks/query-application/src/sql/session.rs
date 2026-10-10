@@ -109,12 +109,14 @@ impl SessionSqlState {
         SessionOptimizerSettings,
         novarocks_sql::sql_mode::SqlSemanticSettings,
     ) {
+        let group_concat_max_len = self.execution_settings.group_concat_max_len();
         (
             self.current_catalog,
             self.current_database,
             self.execution_settings,
             self.optimizer_settings,
-            self.sql_semantics,
+            self.sql_semantics
+                .with_group_concat_max_len(group_concat_max_len),
         )
     }
 
@@ -1079,3 +1081,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "group_concat_admission_tests.rs"]
+mod group_concat_admission_tests;

@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "task": "MEM-1-M07",
+  "frozen_before_execution": false,
+  "original_input": {
+    "path": "docs/testing/mem-1-m07/inputs/cl-listing-freeze-v3.json",
+    "sha256": "e279724dc4ab2ce34dfdef5f3a939ad3f0f05ed076c36c5c60a7b7d7c6c1a3d3"
+  },
+  "normal": {
+    "namespaces": 32,
+    "tables_per_namespace": 512,
+    "views_per_namespace": 512,
+    "page_size": 256,
+    "namespace_pattern": "cl_ns_%04d",
+    "table_pattern": "cl_table_%06d",
+    "view_pattern": "cl_view_%06d",
+    "concurrency": [
+      1,
+      8,
+      16
+    ]
+  },
+  "bounds": {
+    "request_timeout_seconds": 30,
+    "preflight_deadline_seconds": 300,
+    "bulk_deadline_seconds": 7200,
+    "max_response_bytes": 16777216,
+    "max_request_bytes": 65536,
+    "page_size": 256
+  },
+  "source": {
+    "canonical_lock_sha256": "76512c5eb0aaef5b918c0fb551e32e1d9b3d51cccbf74b9e8ad8364cabc7c25b",
+    "image_source": "apache/iceberg-rest-fixture",
+    "platform": "linux/arm64",
+    "image_digest": "sha256:f7d679d30ac9c640bdeb2c015dff533cd3c8f1c7d491ebcb5d436f9a42db1d6f",
+    "image_alias": "novarocks/fixture-iceberg-rest:f7d679d30ac9",
+    "jar_sha256": "49d01ec8e0995001a92b4c880adfe184d602541ba39d135f105511101da4db7d",
+    "jar_bytes": 211889894,
+    "iceberg_commit": "ccb8bc435062171e64bc8b7e5f56e6aed9c5b934",
+    "iceberg_tag": "apache-iceberg-1.10.1",
+    "iceberg_build_version": "1.11.0-SNAPSHOT"
+  },
+  "producer_sha256": "76759b855ace774c5aa52d66eade61a78586f335d83d90983dc91bedfae0a289",
+  "binding": {
+    "compose_project": null,
+    "fixture_id": null,
+    "owner_manifest_path": null,
+    "owner_manifest_sha256": null,
+    "owner_mode": "task-private",
+    "rest_image_id": null,
+    "rest_uri": null,
+    "server_default_warehouse": null,
+    "warehouse": null
+  },
+  "view_timestamp_ms": 1791504000000,
+  "scope": "external-producer-only; native/SQL deadlines remain independent"
+}

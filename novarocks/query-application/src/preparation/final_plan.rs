@@ -26,11 +26,13 @@
 use std::{fmt, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
-use novarocks_physical_plan::{PhysicalPlan, validate_plan};
+use novarocks_physical_plan::{
+    ConstantReferenceError, PhysicalPlan, PlanConstructionError, validate_plan_observed,
+};
 use novarocks_sql::compiler::{
-    ExplainRenderBudget, SqlCompileProgress, SqlCompiler, SqlDisplayAnnotation, SqlDisplayIntent,
-    SqlFactBatch, SqlFinalPlanCompileRequest, SqlNeedBatch, render_completed_plan,
-    render_completed_plan_tree,
+    ExplainRenderBudget, SqlAuthoredPhysicalPlan, SqlCompileProgress, SqlCompiler,
+    SqlDisplayAnnotation, SqlDisplayIntent, SqlFactBatch, SqlFinalPlanCompileRequest, SqlNeedBatch,
+    render_completed_plan, render_completed_plan_tree,
 };
 use novarocks_workload_control::{CancellationView, WorkScope};
 
@@ -43,73 +45,164 @@ use super::runtime_access::{
 /// unchecked-plan constructor.
 #[derive(Clone, Debug)]
 pub struct CompletedPhysicalPlanCandidate {
-    plan: Arc<PhysicalPlan>,
+    source: CompletedPlanSource,
     display_intent: SqlDisplayIntent,
     display_annotations: Arc<[SqlDisplayAnnotation]>,
+}
+
+/// Keep SQL's original immutable source journal alongside its physical view.
+/// Structural programs carry no SQL source certification.
+#[derive(Clone, Debug)]
+enum CompletedPlanSource {
+    Sql(Arc<SqlAuthoredPhysicalPlan>),
+    Program(Arc<PhysicalPlan>),
 }
 
 impl CompletedPhysicalPlanCandidate {
     fn from_completed(
         completed: novarocks_sql::compiler::SqlCompletedPlan,
+        control: &novarocks_sql::compiler::SqlCompileControl,
     ) -> Result<Self, FinalPlanCompletionError> {
         let (plan, display_intent, display_annotations) = completed.into_parts();
-        Self::try_new(plan, display_intent, display_annotations)
+        Self::try_new_sql(plan, display_intent, display_annotations, control)
     }
 
-    /// Hold a plan an application built for work no statement described.
-    ///
-    /// Statistics collection and the other internal programs are not
-    /// statements: nothing parsed them, so there is no text to explain and no
-    /// display annotation to carry. They are still plans, and they are held to
-    /// the same validation as a compiled one -- this constructor takes the
-    /// plan and nothing else precisely so that it cannot be used to smuggle in
-    /// a statement's display semantics.
-    pub fn for_program(plan: PhysicalPlan) -> Result<Self, FinalPlanCompletionError> {
-        Self::try_new(plan, SqlDisplayIntent::Execute, Box::default())
-    }
-
-    fn try_new(
+    /// Hold an application-authored structural program without a SQL source
+    /// journal. SQL statement and DML results use `for_sql_program` so their
+    /// complete immutable lowering source remains available to later owners.
+    pub fn for_program(
         plan: PhysicalPlan,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Self, FinalPlanCompletionError> {
+        validate_candidate_plan(&plan, control)?;
+        Ok(Self {
+            source: CompletedPlanSource::Program(Arc::new(plan)),
+            display_intent: SqlDisplayIntent::Execute,
+            display_annotations: Arc::from([]),
+        })
+    }
+
+    /// Preserve SQL's complete source owner for an internal statement or DML
+    /// program, including its original aggregate logical-source journal.
+    pub fn for_sql_program(
+        source: SqlAuthoredPhysicalPlan,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<Self, FinalPlanCompletionError> {
+        Self::try_new_sql(source, SqlDisplayIntent::Execute, Box::default(), control)
+    }
+
+    fn try_new_sql(
+        source: SqlAuthoredPhysicalPlan,
         display_intent: SqlDisplayIntent,
         display_annotations: Box<[SqlDisplayAnnotation]>,
+        control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Self, FinalPlanCompletionError> {
-        validate_plan(&plan).map_err(|error| FinalPlanCompletionError::InvalidPlan {
-            message: Arc::from(error.to_string()),
-        })?;
+        validate_candidate_plan(source.plan(), control)?;
         Ok(Self {
-            plan: Arc::new(plan),
+            source: CompletedPlanSource::Sql(Arc::new(source)),
             display_intent,
             display_annotations: display_annotations.into(),
         })
     }
 
-    /// Freeze the application's final output purpose before publishing plan
-    /// aliases to Native projection or execution. Preserve SQL display facts
-    /// and the original plan version; never clone a shared plan to change it.
+    /// Author every fragment's package semantics from SQL's original source
+    /// journal. A structural program has no SQL journal; it is refused rather
+    /// than given fabricated call scopes.
+    pub fn author_package_semantics(
+        &self,
+        statement_constant_policy: novarocks_physical_plan::ConstantPolicy,
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<
+        std::collections::BTreeMap<
+            novarocks_physical_plan::FragmentId,
+            novarocks_sql::compiler::FragmentPackageSemantics,
+        >,
+        novarocks_sql::compiler::PackageSemanticsError,
+    > {
+        match &self.source {
+            CompletedPlanSource::Sql(source) => {
+                novarocks_sql::compiler::author_fragment_package_semantics(
+                    source,
+                    statement_constant_policy,
+                    control,
+                )
+            }
+            CompletedPlanSource::Program(_) => Err(
+                novarocks_sql::compiler::PackageSemanticsError::InvalidSource(
+                    "a structural program has no SQL call source journal",
+                ),
+            ),
+        }
+    }
+
+    /// A structural program has no SQL emission certification. It is never
+    /// assigned a default SQL mode by this projection.
+    pub fn sql_emission_mode(&self) -> Option<novarocks_sql::compiler::SqlPhysicalEmissionMode> {
+        match &self.source {
+            CompletedPlanSource::Sql(source) => Some(source.emission_mode()),
+            CompletedPlanSource::Program(_) => None,
+        }
+    }
+    /// Same immutable source's publication-proved public output obligation.
+    /// No caller can replace it with another plan or supplied result schema.
+    pub fn original_public_result_port(&self) -> Option<&novarocks_physical_plan::ResultPort> {
+        match &self.source {
+            CompletedPlanSource::Sql(source) => source
+                .original_public_result_declaration()
+                .map(|loan| loan.original_port()),
+            CompletedPlanSource::Program(plan) => plan.result_port(),
+        }
+    }
+
+    /// Consume the same source before any plan aliases are published.
     pub fn freeze_root_output(
         self,
         output: novarocks_result_contract::FrozenRootOutput,
     ) -> Result<Self, FinalPlanCompletionError> {
-        let plan = Arc::try_unwrap(self.plan).map_err(|_| FinalPlanCompletionError::Compiler {
-            message: Arc::from("root purpose must be frozen before plan aliases are published"),
-        })?;
-        let plan = plan
-            .with_root_output(novarocks_result_contract::RootOutputContract::new(
-                novarocks_result_contract::RootProfileId::V1,
-                output,
-            ))
-            .map_err(|error| FinalPlanCompletionError::InvalidPlan {
-                message: Arc::from(error.to_string()),
-            })?;
+        let contract = novarocks_result_contract::RootOutputContract::new(
+            novarocks_result_contract::RootProfileId::V1,
+            output,
+        );
+        let source = match self.source {
+            CompletedPlanSource::Sql(source) => {
+                let source =
+                    Arc::try_unwrap(source).map_err(|_| FinalPlanCompletionError::Compiler {
+                        message: Arc::from(
+                            "root purpose must be frozen before plan aliases are published",
+                        ),
+                    })?;
+                CompletedPlanSource::Sql(Arc::new(source.with_root_output(contract).map_err(
+                    |error| FinalPlanCompletionError::InvalidPlan {
+                        message: Arc::from(error.to_string()),
+                    },
+                )?))
+            }
+            CompletedPlanSource::Program(plan) => {
+                let plan =
+                    Arc::try_unwrap(plan).map_err(|_| FinalPlanCompletionError::Compiler {
+                        message: Arc::from(
+                            "root purpose must be frozen before plan aliases are published",
+                        ),
+                    })?;
+                CompletedPlanSource::Program(Arc::new(plan.with_root_output(contract).map_err(
+                    |error| FinalPlanCompletionError::InvalidPlan {
+                        message: Arc::from(error.to_string()),
+                    },
+                )?))
+            }
+        };
         Ok(Self {
-            plan: Arc::new(plan),
+            source,
             display_intent: self.display_intent,
             display_annotations: self.display_annotations,
         })
     }
 
-    pub const fn plan(&self) -> &Arc<PhysicalPlan> {
-        &self.plan
+    pub fn plan(&self) -> &Arc<PhysicalPlan> {
+        match &self.source {
+            CompletedPlanSource::Sql(source) => source.plan_arc(),
+            CompletedPlanSource::Program(plan) => plan,
+        }
     }
 
     /// SQL's completed display semantics are part of the same immutable
@@ -131,6 +224,7 @@ impl CompletedPhysicalPlanCandidate {
     pub fn render_explain_lines(
         &self,
         budget: ExplainRenderBudget,
+        control: &novarocks_sql::compiler::SqlCompileControl,
     ) -> Result<Vec<String>, FinalPlanCompletionError> {
         let SqlDisplayIntent::Explain { level, analyze } = self.display_intent else {
             return Err(FinalPlanCompletionError::Compiler {
@@ -146,14 +240,33 @@ impl CompletedPhysicalPlanCandidate {
         // operator tree. What the plan states to the backend is a different
         // question, and it has its own level.
         let lines = if matches!(level, novarocks_sql::compiler::ExplainLevel::Contract) {
-            render_completed_plan(&self.plan, &self.display_annotations, level, None, budget)
+            render_completed_plan(
+                self.plan(),
+                &self.display_annotations,
+                level,
+                None,
+                budget,
+                control,
+            )
         } else {
-            render_completed_plan_tree(&self.plan, level)
+            render_completed_plan_tree(self.plan(), level, control)
         };
-        lines.map_err(|error| FinalPlanCompletionError::Compiler {
-            message: Arc::from(error.to_string()),
-        })
+        lines.map_err(compiler_error)
     }
+}
+
+fn validate_candidate_plan(
+    plan: &PhysicalPlan,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<(), FinalPlanCompletionError> {
+    validate_plan_observed(plan, control).map_err(|error| match error {
+        PlanConstructionError::Constants(ConstantReferenceError::Control(error)) => {
+            compiler_error(novarocks_sql::compiler::SqlCompileError::from(error))
+        }
+        error => FinalPlanCompletionError::InvalidPlan {
+            message: Arc::from(error.to_string()),
+        },
+    })
 }
 
 /// Role composition supplies the application-owned adapter that resolves the
@@ -230,15 +343,17 @@ impl<A: Send> FinalPlanCompletionDriver<A> {
         let control = request.control().clone();
         scope.check().map_err(governance_error)?;
         let cancellation = scope.cancellation().map_err(governance_error)?;
-        let mut progress =
-            SqlCompiler::start(request.try_into_completion().map_err(compiler_error)?)
-                .map_err(compiler_progress_error)?;
+        let mut progress = SqlCompiler::start(
+            request.try_into_completion().map_err(compiler_error)?,
+            &control,
+        )
+        .map_err(compiler_progress_error)?;
 
         loop {
             scope.check().map_err(governance_error)?;
             progress = match progress {
                 SqlCompileProgress::Complete(completed) => {
-                    return CompletedPhysicalPlanCandidate::from_completed(completed);
+                    return CompletedPhysicalPlanCandidate::from_completed(completed, &control);
                 }
                 SqlCompileProgress::Incomplete(compilation) => {
                     let facts = self
@@ -344,6 +459,7 @@ pub enum FinalPlanCompletionError {
         reason: Arc<str>,
     },
     DeadlineExceeded,
+    ResourceExhausted,
     Compiler {
         message: Arc<str>,
     },
@@ -382,6 +498,9 @@ impl fmt::Display for FinalPlanCompletionError {
             Self::DeadlineExceeded => {
                 formatter.write_str("final plan completion deadline exceeded")
             }
+            Self::ResourceExhausted => {
+                formatter.write_str("final plan completion resource budget was exhausted")
+            }
             Self::Analyze { error } => error.fmt(formatter),
         }
     }
@@ -410,6 +529,9 @@ fn compiler_error(error: novarocks_sql::compiler::SqlCompileError) -> FinalPlanC
         }
         novarocks_sql::compiler::SqlCompileError::DeadlineExceeded => {
             FinalPlanCompletionError::DeadlineExceeded
+        }
+        novarocks_sql::compiler::SqlCompileError::ResourceExhausted => {
+            FinalPlanCompletionError::ResourceExhausted
         }
         novarocks_sql::compiler::SqlCompileError::Analyze(error) => {
             FinalPlanCompletionError::Analyze { error }
@@ -448,6 +570,23 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn compiler_control_errors_keep_their_completion_category() {
+        use novarocks_sql::compiler::SqlCompileError;
+        assert!(matches!(
+            compiler_error(SqlCompileError::Cancelled),
+            FinalPlanCompletionError::Cancelled { .. }
+        ));
+        assert_eq!(
+            compiler_error(SqlCompileError::DeadlineExceeded),
+            FinalPlanCompletionError::DeadlineExceeded
+        );
+        assert_eq!(
+            compiler_error(SqlCompileError::ResourceExhausted),
+            FinalPlanCompletionError::ResourceExhausted
+        );
+    }
 
     struct NoFactSource {
         calls: AtomicUsize,
@@ -503,6 +642,8 @@ mod tests {
             SqlPlanningEnvironment::Distributed,
             builtin_sql_function_catalog().snapshot(),
             noop_constant_evaluator(),
+            crate::completed_plan_fixture::test_constant_policy(),
+            novarocks_sql::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
             control,
             PipelineDopDomain {
                 min: 1,
@@ -551,6 +692,140 @@ mod tests {
         assert_eq!(source.calls.load(Ordering::Relaxed), 0);
     }
 
+    #[tokio::test]
+    async fn sql_candidate_clone_and_internal_publication_retain_the_original_source_owner() {
+        let driver = FinalPlanCompletionDriver::new(Arc::new(NoFactSource {
+            calls: AtomicUsize::new(0),
+        }));
+        let (_root, scope) = scope();
+        let completed = driver
+            .complete(
+                request(
+                    "SELECT COUNT(*)",
+                    SqlCompileControl::unbounded(),
+                    SqlCompileIntent::Query,
+                ),
+                &scope,
+            )
+            .await
+            .unwrap();
+        let candidate = completed.candidate();
+        let CompletedPlanSource::Sql(source) = &candidate.source else {
+            panic!("SQL completion must retain its complete source owner");
+        };
+        assert!(source.plan().fragments().values().any(|fragment| {
+            fragment.nodes().values().any(|node| {
+                matches!(
+                    node.kind,
+                    novarocks_physical_plan::NodeKind::Aggregate { .. }
+                )
+            })
+        }));
+        let original_plan = Arc::clone(source.plan_arc());
+        let weak_source = Arc::downgrade(source);
+        let cloned = candidate.clone();
+        let CompletedPlanSource::Sql(cloned_source) = &cloned.source else {
+            panic!("candidate clone must keep the SQL source variant");
+        };
+        assert!(Arc::ptr_eq(source, cloned_source));
+        let published = CompletedPhysicalPlanCandidate::for_sql_program(
+            source.as_ref().clone(),
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        assert!(matches!(&published.source, CompletedPlanSource::Sql(_)));
+        assert!(Arc::ptr_eq(published.plan(), &original_plan));
+        let structural = CompletedPhysicalPlanCandidate::for_program(
+            original_plan.as_ref().clone(),
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        assert!(matches!(
+            &structural.source,
+            CompletedPlanSource::Program(_)
+        ));
+        drop(completed);
+        assert!(weak_source.upgrade().is_some());
+        drop(cloned);
+        assert!(weak_source.upgrade().is_none());
+        assert!(Arc::ptr_eq(published.plan(), &original_plan));
+    }
+
+    #[tokio::test]
+    async fn program_publication_rechecks_selected_sources_under_every_original_refusal() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Control {
+            events: std::sync::Mutex<Vec<(CompilePhase, u32)>>,
+            refusal: Option<(usize, CompileControlError)>,
+        }
+        impl PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                phase: CompilePhase,
+                units: u32,
+            ) -> Result<(), CompileControlError> {
+                let mut events = self.events.lock().unwrap();
+                let at = events.len();
+                events.push((phase, units));
+                match self.refusal {
+                    Some((stop, cause)) if stop == at => Err(cause),
+                    Some((stop, _)) if at > stop => panic!("callback after originating refusal"),
+                    _ => Ok(()),
+                }
+            }
+        }
+        let driver = FinalPlanCompletionDriver::new(Arc::new(NoFactSource {
+            calls: AtomicUsize::new(0),
+        }));
+        let (_root, scope) = scope();
+        let completed = driver.complete(values_request(), &scope).await.unwrap();
+        let plan = completed.candidate().plan();
+        assert!(!plan.constants().entries().is_empty());
+        assert!(
+            plan.fragments()
+                .values()
+                .flat_map(|fragment| fragment.expressions().iter())
+                .any(|(_, expression)| matches!(
+                    expression.kind,
+                    novarocks_physical_plan::ExprKind::Constant(_)
+                ))
+        );
+        let baseline = Control {
+            events: Default::default(),
+            refusal: None,
+        };
+        let published =
+            CompletedPhysicalPlanCandidate::for_program(plan.as_ref().clone(), &baseline).unwrap();
+        for (key, source) in plan.constants().entries() {
+            assert_eq!(
+                published.plan().constants().entries()[key].backing_identity(),
+                source.backing_identity()
+            );
+        }
+        let trace = baseline.events.lock().unwrap().clone();
+        assert!(!trace.is_empty());
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for at in 0..trace.len() {
+                let control = Control {
+                    events: Default::default(),
+                    refusal: Some((at, cause)),
+                };
+                let error =
+                    CompletedPhysicalPlanCandidate::for_program(plan.as_ref().clone(), &control)
+                        .unwrap_err();
+                assert_eq!(
+                    error,
+                    compiler_error(novarocks_sql::compiler::SqlCompileError::from(cause))
+                );
+                assert_eq!(*control.events.lock().unwrap(), trace[..=at]);
+            }
+        }
+    }
+
     /// A completed plan renders its own EXPLAIN. Nothing is asked of a
     /// catalog, a provider or a backend to produce the text - the plan is
     /// already the answer.
@@ -578,7 +853,10 @@ mod tests {
 
         let lines = completed
             .candidate()
-            .render_explain_lines(ExplainRenderBudget::default())
+            .render_explain_lines(
+                ExplainRenderBudget::default(),
+                &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+            )
             .expect("a completed plan renders its own explain");
         // EXPLAIN answers what the statement will do, so what it prints is
         // the operators, read from the plan alone.
@@ -616,7 +894,10 @@ mod tests {
             let annotations = completed.candidate().display_annotations().to_vec();
             let expected_lines = completed
                 .candidate()
-                .render_explain_lines(ExplainRenderBudget::default())
+                .render_explain_lines(
+                    ExplainRenderBudget::default(),
+                    &SqlCompileControl::unbounded(),
+                )
                 .unwrap();
             let output = if client {
                 FrozenRootOutput::ClientRows(
@@ -633,7 +914,10 @@ mod tests {
             assert_eq!(candidate.display_annotations(), annotations);
             assert_eq!(
                 candidate
-                    .render_explain_lines(ExplainRenderBudget::default())
+                    .render_explain_lines(
+                        ExplainRenderBudget::default(),
+                        &SqlCompileControl::unbounded(),
+                    )
                     .unwrap(),
                 expected_lines
             );
@@ -680,7 +964,10 @@ mod tests {
         assert!(
             completed
                 .candidate()
-                .render_explain_lines(ExplainRenderBudget::default())
+                .render_explain_lines(
+                    ExplainRenderBudget::default(),
+                    &novarocks_sql::compiler::SqlCompileControl::unbounded()
+                )
                 .is_err()
         );
     }

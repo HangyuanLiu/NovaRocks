@@ -14,7 +14,6 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use std::cmp::Ordering;
 use std::sync::Arc;
 
 use arrow::array::{
@@ -22,42 +21,59 @@ use arrow::array::{
     StructArray,
 };
 use arrow::datatypes::{DataType, Field};
-use arrow_buffer::i256;
 
-use crate::exec::expr::agg::{AggregateAllocator, AggregateVec, aggregate_bytes};
+use crate::exec::expr::agg::AggregateAllocator;
+#[cfg(test)]
+use crate::exec::expr::agg::aggregate_bytes;
 use crate::exec::node::aggregate::AggFunction;
 use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 
 use super::super::*;
 use super::AggregateFunction;
-use super::common::{
-    AggScalarValue, TrackedAggScalarValue, aggregate_vec_with_capacity, build_scalar_array,
-    compare_tracked_scalar_values, scalar_from_array, tracked_scalar_from_array,
-    tracked_scalar_to_output,
-};
+#[cfg(test)]
+use super::common::TrackedAggScalarValue;
+use super::common::build_scalar_array;
 
 pub(super) struct MinMaxNAgg;
 
 #[derive(Debug)]
-struct MinMaxNState {
-    allocator: AggregateAllocator,
-    initialized: bool,
-    limit: usize,
-    values: AggregateVec<TrackedAggScalarValue>,
-}
-
+struct MinMaxNState(novarocks_functions::builtin::aggregate_n_core::NState<AggregateAllocator>);
 impl MinMaxNState {
     fn new(tracker: Arc<MemTracker>) -> Self {
-        let allocator = AggregateAllocator::new(tracker);
-        Self {
-            values: AggregateVec::new_in(allocator.clone()),
-            allocator,
-            initialized: false,
-            limit: 0,
-        }
+        Self(novarocks_functions::builtin::aggregate_n_core::NState::new(
+            AggregateAllocator::new(tracker),
+        ))
     }
 }
-
+impl std::ops::Deref for MinMaxNState {
+    type Target = novarocks_functions::builtin::aggregate_n_core::NState<AggregateAllocator>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for MinMaxNState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+struct LegacyNBuffer(Vec<u8>);
+impl novarocks_functions::builtin::aggregate_by_core::ByEncodeBuffer for LegacyNBuffer {
+    fn push(
+        &mut self,
+        byte: u8,
+    ) -> Result<(), novarocks_functions::aggregate_scalar::ScalarStateError> {
+        self.0.push(byte);
+        Ok(())
+    }
+    fn append(
+        &mut self,
+        bytes: &[u8],
+        _work: &mut novarocks_functions::aggregate_scalar::ScalarWork<'_, '_>,
+    ) -> Result<(), novarocks_functions::aggregate_scalar::ScalarStateError> {
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+}
 impl AggregateFunction for MinMaxNAgg {
     fn build_spec_from_type(
         &self,
@@ -206,12 +222,16 @@ impl AggregateFunction for MinMaxNAgg {
 
         for (row, &base) in state_ptrs.iter().enumerate() {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MinMaxNState) };
-            let limit = parse_limit(&limits, row)?;
-            init_limit_if_needed(state, limit)?;
-            let Some(value) = tracked_scalar_from_array(&values, row, &state.allocator)? else {
-                continue;
-            };
-            push_value(state, value, keep_smallest)?;
+            state
+                .update_from_arrays(
+                    &values,
+                    row,
+                    &limits,
+                    row,
+                    keep_smallest,
+                    &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
+                )
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -229,16 +249,14 @@ impl AggregateFunction for MinMaxNAgg {
         let keep_smallest = matches!(spec.kind, AggKind::MinN);
         for (row, &base) in state_ptrs.iter().enumerate() {
             let state = unsafe { &mut *((base as *mut u8).add(offset) as *mut MinMaxNState) };
-            let Some((limit, values)) = decode_payload_at(array, row, &state.allocator)? else {
-                continue;
-            };
-            if limit == 0 {
-                continue;
-            }
-            init_limit_if_needed(state, limit)?;
-            for value in values {
-                push_value(state, value, keep_smallest)?;
-            }
+            state
+                .merge_from_array(
+                    array,
+                    row,
+                    keep_smallest,
+                    &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
+                )
+                .map_err(|error| error.to_string())?;
         }
         Ok(())
     }
@@ -261,7 +279,14 @@ impl AggregateFunction for MinMaxNAgg {
                 let mut builder = BinaryBuilder::new();
                 for &base in group_states {
                     let state = unsafe { &*((base as *mut u8).add(offset) as *const MinMaxNState) };
-                    builder.append_value(encode_state(state)?);
+                    let mut bytes = LegacyNBuffer(Vec::new());
+                    state
+                        .serialize(
+                            &mut bytes,
+                            &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
+                        )
+                        .map_err(|error| error.to_string())?;
+                    builder.append_value(bytes.0);
                 }
                 Ok(Arc::new(builder.finish()) as ArrayRef)
             }
@@ -269,13 +294,13 @@ impl AggregateFunction for MinMaxNAgg {
                 let mut values = Vec::with_capacity(group_states.len());
                 for &base in group_states {
                     let state = unsafe { &*((base as *mut u8).add(offset) as *const MinMaxNState) };
-                    let list = state
-                        .values
-                        .iter()
-                        .map(tracked_scalar_to_output)
-                        .map(|value| value.map(Some))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    values.push(Some(AggScalarValue::List(list)));
+                    values.push(Some(
+                        state
+                            .output(&mut novarocks_functions::aggregate_scalar::ScalarWork::new(
+                                None,
+                            ))
+                            .map_err(|error| error.to_string())?,
+                    ));
                 }
                 build_scalar_array(target_type, values)
             }
@@ -307,292 +332,19 @@ fn default_output_type(input_type: &DataType, input_is_intermediate: bool) -> Da
     DataType::List(Arc::new(Field::new("item", input_type.clone(), true)))
 }
 
-fn parse_limit(array: &ArrayRef, row: usize) -> Result<usize, String> {
-    let Some(value) = scalar_from_array(array, row)? else {
-        return Err("min_n/max_n limit cannot be null".to_string());
-    };
-    let AggScalarValue::Int64(value) = value else {
-        return Err("min_n/max_n limit must be integer".to_string());
-    };
-    if value <= 0 {
-        return Err(format!("min_n/max_n limit must be positive, got {}", value));
-    }
-    usize::try_from(value).map_err(|_| "min_n/max_n limit overflow".to_string())
-}
-
-fn init_limit_if_needed(state: &mut MinMaxNState, limit: usize) -> Result<(), String> {
-    if !state.initialized {
-        state.initialized = true;
-        state.limit = limit;
-        return Ok(());
-    }
-    if state.limit != limit {
-        return Err(format!(
-            "min_n/max_n limit mismatch while merging states: {} vs {}",
-            state.limit, limit
-        ));
-    }
-    Ok(())
-}
-
+#[cfg(test)]
 fn push_value(
     state: &mut MinMaxNState,
     value: TrackedAggScalarValue,
     keep_smallest: bool,
 ) -> Result<(), String> {
-    if state.limit == 0 {
-        return Ok(());
-    }
-    state.values.try_reserve(1).map_err(|_| {
-        state
-            .allocator
-            .allocation_error("reserve min_n/max_n values")
-    })?;
-    state.values.push(value);
-    state.values.sort_by(|left, right| {
-        compare_tracked_scalar_values(left, right).unwrap_or(Ordering::Equal)
-    });
-    if !keep_smallest {
-        state.values.reverse();
-    }
-    if state.values.len() > state.limit {
-        state.values.truncate(state.limit);
-    }
-    state.values.sort_by(|left, right| {
-        compare_tracked_scalar_values(left, right).unwrap_or(Ordering::Equal)
-    });
-    Ok(())
-}
-
-fn encode_state(state: &MinMaxNState) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&(state.limit as u32).to_le_bytes());
-    out.extend_from_slice(&(state.values.len() as u32).to_le_bytes());
-    for value in &state.values {
-        encode_scalar(&mut out, value)?;
-    }
-    Ok(out)
-}
-
-fn decode_payload_at(
-    array: &ArrayRef,
-    row: usize,
-    allocator: &AggregateAllocator,
-) -> Result<Option<(usize, AggregateVec<TrackedAggScalarValue>)>, String> {
-    let payload = match array.data_type() {
-        DataType::Binary => {
-            let array = array
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| "min_n/max_n merge input must be BinaryArray".to_string())?;
-            (!array.is_null(row)).then_some(array.value(row))
-        }
-        DataType::Utf8 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "min_n/max_n merge input must be StringArray".to_string())?;
-            (!array.is_null(row)).then_some(array.value(row).as_bytes())
-        }
-        DataType::LargeBinary => {
-            let array = array
-                .as_any()
-                .downcast_ref::<LargeBinaryArray>()
-                .ok_or_else(|| "min_n/max_n merge input must be LargeBinaryArray".to_string())?;
-            (!array.is_null(row)).then_some(array.value(row))
-        }
-        DataType::LargeUtf8 => {
-            let array = array
-                .as_any()
-                .downcast_ref::<LargeStringArray>()
-                .ok_or_else(|| "min_n/max_n merge input must be LargeStringArray".to_string())?;
-            (!array.is_null(row)).then_some(array.value(row).as_bytes())
-        }
-        other => {
-            return Err(format!(
-                "min_n/max_n merge input must be binary-like, got {:?}",
-                other
-            ));
-        }
-    };
-    let Some(payload) = payload else {
-        return Ok(None);
-    };
-
-    let mut pos = 0usize;
-    let limit = read_u32(payload, &mut pos, "limit")? as usize;
-    let count = read_u32(payload, &mut pos, "count")? as usize;
-    let mut values =
-        aggregate_vec_with_capacity(allocator, count, "reserve decoded min_n/max_n values")?;
-    for _ in 0..count {
-        values.push(decode_scalar(payload, &mut pos, allocator)?);
-    }
-    Ok(Some((limit, values)))
-}
-
-fn read_u32(bytes: &[u8], pos: &mut usize, label: &str) -> Result<u32, String> {
-    need_len(bytes, *pos, 4, label)?;
-    let value = u32::from_le_bytes(
-        bytes[*pos..*pos + 4]
-            .try_into()
-            .map_err(|_| format!("min_n/max_n decode {} failed", label))?,
-    );
-    *pos += 4;
-    Ok(value)
-}
-
-fn need_len(bytes: &[u8], pos: usize, need: usize, label: &str) -> Result<(), String> {
-    if pos + need > bytes.len() {
-        return Err(format!(
-            "min_n/max_n decode {} overflow: pos={} need={} len={}",
-            label,
-            pos,
-            need,
-            bytes.len()
-        ));
-    }
-    Ok(())
-}
-
-fn encode_scalar(out: &mut Vec<u8>, value: &TrackedAggScalarValue) -> Result<(), String> {
-    match value {
-        TrackedAggScalarValue::Bool(v) => {
-            out.push(1);
-            out.push(if *v { 1 } else { 0 });
-        }
-        TrackedAggScalarValue::Int64(v) => {
-            out.push(2);
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        TrackedAggScalarValue::Float64(v) => {
-            out.push(3);
-            out.extend_from_slice(&v.to_bits().to_le_bytes());
-        }
-        TrackedAggScalarValue::Utf8(v) => {
-            out.push(4);
-            let len = u32::try_from(v.len())
-                .map_err(|_| "min_n/max_n utf8 length overflow".to_string())?;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(v);
-        }
-        TrackedAggScalarValue::Date32(v) => {
-            out.push(5);
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        TrackedAggScalarValue::Timestamp(v) => {
-            out.push(6);
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        TrackedAggScalarValue::Decimal128(v) => {
-            out.push(7);
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-        TrackedAggScalarValue::Decimal256(v) => {
-            out.push(11);
-            let text = v.to_string();
-            let len = u32::try_from(text.len())
-                .map_err(|_| "min_n/max_n decimal256 length overflow".to_string())?;
-            out.extend_from_slice(&len.to_le_bytes());
-            out.extend_from_slice(text.as_bytes());
-        }
-        other => {
-            return Err(format!(
-                "min_n/max_n does not support serialized value {:?}",
-                other
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn decode_scalar(
-    bytes: &[u8],
-    pos: &mut usize,
-    allocator: &AggregateAllocator,
-) -> Result<TrackedAggScalarValue, String> {
-    need_len(bytes, *pos, 1, "tag")?;
-    let tag = bytes[*pos];
-    *pos += 1;
-    match tag {
-        1 => {
-            need_len(bytes, *pos, 1, "bool")?;
-            let value = bytes[*pos] != 0;
-            *pos += 1;
-            Ok(TrackedAggScalarValue::Bool(value))
-        }
-        2 => {
-            need_len(bytes, *pos, 8, "int64")?;
-            let value = i64::from_le_bytes(
-                bytes[*pos..*pos + 8]
-                    .try_into()
-                    .map_err(|_| "min_n/max_n int64 decode failed".to_string())?,
-            );
-            *pos += 8;
-            Ok(TrackedAggScalarValue::Int64(value))
-        }
-        3 => {
-            need_len(bytes, *pos, 8, "float64")?;
-            let bits = u64::from_le_bytes(
-                bytes[*pos..*pos + 8]
-                    .try_into()
-                    .map_err(|_| "min_n/max_n float64 decode failed".to_string())?,
-            );
-            *pos += 8;
-            Ok(TrackedAggScalarValue::Float64(f64::from_bits(bits)))
-        }
-        4 => {
-            let len = read_u32(bytes, pos, "utf8_len")? as usize;
-            need_len(bytes, *pos, len, "utf8")?;
-            let raw = &bytes[*pos..*pos + len];
-            std::str::from_utf8(raw)
-                .map_err(|e| format!("min_n/max_n utf8 decode failed: {}", e))?;
-            let value = aggregate_bytes(allocator.clone(), raw)?;
-            *pos += len;
-            Ok(TrackedAggScalarValue::Utf8(value))
-        }
-        5 => {
-            need_len(bytes, *pos, 4, "date32")?;
-            let value = i32::from_le_bytes(
-                bytes[*pos..*pos + 4]
-                    .try_into()
-                    .map_err(|_| "min_n/max_n date32 decode failed".to_string())?,
-            );
-            *pos += 4;
-            Ok(TrackedAggScalarValue::Date32(value))
-        }
-        6 => {
-            need_len(bytes, *pos, 8, "timestamp")?;
-            let value = i64::from_le_bytes(
-                bytes[*pos..*pos + 8]
-                    .try_into()
-                    .map_err(|_| "min_n/max_n timestamp decode failed".to_string())?,
-            );
-            *pos += 8;
-            Ok(TrackedAggScalarValue::Timestamp(value))
-        }
-        7 => {
-            need_len(bytes, *pos, 16, "decimal128")?;
-            let value = i128::from_le_bytes(
-                bytes[*pos..*pos + 16]
-                    .try_into()
-                    .map_err(|_| "min_n/max_n decimal128 decode failed".to_string())?,
-            );
-            *pos += 16;
-            Ok(TrackedAggScalarValue::Decimal128(value))
-        }
-        11 => {
-            let len = read_u32(bytes, pos, "decimal256_len")? as usize;
-            need_len(bytes, *pos, len, "decimal256")?;
-            let text = std::str::from_utf8(&bytes[*pos..*pos + len])
-                .map_err(|e| format!("min_n/max_n decimal256 decode failed: {}", e))?;
-            *pos += len;
-            let value = text
-                .parse::<i256>()
-                .map_err(|_| "min_n/max_n decimal256 parse failed".to_string())?;
-            Ok(TrackedAggScalarValue::Decimal256(value))
-        }
-        other => Err(format!("min_n/max_n decode unknown tag {}", other)),
-    }
+    state
+        .push_value(
+            value,
+            keep_smallest,
+            &mut novarocks_functions::aggregate_scalar::ScalarWork::new(None),
+        )
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -629,3 +381,7 @@ mod retained_bytes_tests {
         assert_eq!(tracker.current(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "minmax_n_baseline_tests.rs"]
+mod minmax_n_baseline_tests;

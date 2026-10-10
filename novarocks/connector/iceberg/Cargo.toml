@@ -51,7 +51,7 @@ rand.workspace = true
 reqwest = { workspace = true, features = ["rustls-tls"] }
 roaring.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
@@ -66,6 +66,7 @@ novarocks-proto-codec.workspace = true
 novarocks-proto-models.workspace = true
 novarocks-spi.workspace = true
 novarocks-types.workspace = true
+novarocks-type-contract.workspace = true
 
 [dev-dependencies]
 faststr = "0.2"

@@ -37,6 +37,31 @@ pub(crate) struct AggregateAllocator {
     tracker: Arc<MemTracker>,
 }
 
+impl novarocks_functions::aggregate_scalar::ScalarStateAllocator for AggregateAllocator {
+    fn scalar_allocation_error(
+        &self,
+        operation: &str,
+    ) -> novarocks_functions::aggregate_scalar::ScalarStateError {
+        novarocks_functions::aggregate_scalar::ScalarStateError::Legacy(
+            self.allocation_error(operation),
+        )
+    }
+}
+
+impl novarocks_functions::exact_percentile_core::ExactPercentileAllocator for AggregateAllocator {
+    type ParserReservation = AggregateTransientReservation;
+    fn reserve_percentile_transient(
+        &self,
+        bytes: usize,
+        operation: &str,
+    ) -> Result<Self::ParserReservation, String> {
+        self.reserve_transient(bytes, operation)
+    }
+    fn percentile_allocation_error(&self, operation: &str) -> String {
+        self.allocation_error(operation)
+    }
+}
+
 impl AggregateAllocator {
     pub(crate) fn new(tracker: Arc<MemTracker>) -> Self {
         Self { tracker }
@@ -131,20 +156,15 @@ impl AggregateRetainedCharge {
         new_bytes: usize,
         reservation: &mut AggregateTransientReservation,
     ) -> Result<(), String> {
-        if new_bytes >= self.bytes {
-            let growth = new_bytes - self.bytes;
-            if growth > reservation.bytes {
-                return Err(format!(
-                    "aggregate allocation preflight underestimated retained growth: reserved={} growth={growth}",
-                    reservation.bytes
-                ));
-            }
-            reservation.bytes -= growth;
-        } else {
-            self.allocator.release_charge(self.bytes - new_bytes);
-        }
-        self.bytes = new_bytes;
-        Ok(())
+        novarocks_functions::opaque_memory::reconcile_opaque_retained(
+            &mut self.bytes,
+            &mut reservation.bytes,
+            new_bytes,
+            |bytes| self.allocator.release_charge(bytes),
+        ).map_err(|error| format!(
+            "aggregate allocation preflight underestimated retained growth: reserved={} growth={}",
+            error.reserved, error.growth,
+        ))
     }
 
     #[cfg(test)]

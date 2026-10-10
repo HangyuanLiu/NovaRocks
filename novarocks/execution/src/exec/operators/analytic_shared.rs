@@ -27,6 +27,9 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+#[path = "analytic_input_stages.rs"]
+mod analytic_input_stages;
+
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -356,21 +359,12 @@ impl AnalyticSharedState {
         }
 
         let input_schema = input[0].schema();
-        let mut ordered_chunk = if input.len() == 1 {
-            // Preserve the input's existing accounting lease instead of
-            // materializing and charging a duplicate concatenation.
-            input[0].clone()
-        } else {
-            let batches: Vec<RecordBatch> = input.iter().map(|c| c.batch.clone()).collect();
-            let batch = concat_batches(&input_schema, &batches)
-                .map_err(|e| format!("concat_batches: {}", e))?;
-            let mut chunk = Chunk::try_new_with_chunk_schema(batch, input[0].chunk_schema_ref())
-                .map_err(|e| format!("build analytic concat chunk: {e}"))?;
+        let mut ordered_chunk = concat_original_analytic_input(input)?;
+        if input.len() > 1 {
             if let Some(tracker) = aggregate_tracker.as_ref() {
-                chunk.try_transfer_to(tracker)?;
+                ordered_chunk.try_transfer_to(tracker)?;
             }
-            chunk
-        };
+        }
         let total_rows = ordered_chunk.len();
         if total_rows == 0 {
             return Ok(VecDeque::new());
@@ -409,7 +403,9 @@ impl AnalyticSharedState {
                 total_rows,
                 aggregate_tracker.clone(),
             )
-            .map_err(|e| format!("window function #{}: {}", func_idx, e))?;
+            .map_err(|e| {
+                novarocks_functions::window_format::window_failure_message(func_idx, &e)
+            })?;
             func_outputs.push(out);
         }
 
@@ -461,32 +457,104 @@ impl AnalyticSharedState {
     }
 }
 
+/// Borrowed result of the ONE original analytic output-layout validator.
+/// The complete carrier handoff uses the exact output column ordinal; it never
+/// parses diagnostics or substitutes a function's source for an input column.
+#[derive(Debug)]
+pub(crate) enum AnalyticOutputValidationFailure<'a> {
+    ColumnCount {
+        expected: usize,
+        actual: usize,
+    },
+    Length {
+        column: usize,
+        expected_rows: usize,
+        actual: usize,
+    },
+    Type {
+        column: usize,
+        expected: &'a DataType,
+        actual: &'a DataType,
+    },
+}
+impl AnalyticOutputValidationFailure<'_> {
+    pub(crate) fn output_ordinal(&self) -> Option<usize> {
+        match self {
+            Self::ColumnCount { .. } => None,
+            Self::Length { column, .. } | Self::Type { column, .. } => Some(*column),
+        }
+    }
+}
+impl std::fmt::Display for AnalyticOutputValidationFailure<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ColumnCount { expected, actual } => write!(
+                f,
+                "analytic output column count mismatch: descriptor={expected} actual={actual}"
+            ),
+            Self::Length {
+                column,
+                expected_rows,
+                actual,
+            } => write!(
+                f,
+                "analytic output length mismatch at column {column}: expected_rows={expected_rows} actual={actual}"
+            ),
+            Self::Type {
+                column,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "analytic output type mismatch at column {column}: descriptor={expected:?} actual={actual:?}"
+            ),
+        }
+    }
+}
+/// ONE original analytic input gathering. The nonempty source proof belongs
+/// to each caller; this helper changes neither Arrow order nor original Data.
+pub(crate) fn concat_original_analytic_input(input: &[Chunk]) -> Result<Chunk, String> {
+    analytic_input_stages::legacy(analytic_input_stages::gather(
+        input,
+        &mut analytic_input_stages::LegacyWork,
+    ))
+}
+
 fn validate_analytic_output_columns(
     columns: &[ArrayRef],
     output_chunk_schema: &crate::exec::chunk::ChunkSchemaRef,
     total_rows: usize,
 ) -> Result<(), String> {
+    validate_analytic_output_columns_typed(columns, output_chunk_schema, total_rows)
+        .map_err(|error| error.to_string())
+}
+pub(crate) fn validate_analytic_output_columns_typed<'a>(
+    columns: &'a [ArrayRef],
+    output_chunk_schema: &'a crate::exec::chunk::ChunkSchemaRef,
+    total_rows: usize,
+) -> Result<(), AnalyticOutputValidationFailure<'a>> {
     let expected_columns = output_chunk_schema.slots().len();
     if columns.len() != expected_columns {
-        return Err(format!(
-            "analytic output column count mismatch: descriptor={expected_columns} actual={}",
-            columns.len()
-        ));
+        return Err(AnalyticOutputValidationFailure::ColumnCount {
+            expected: expected_columns,
+            actual: columns.len(),
+        });
     }
     for (idx, (col, slot)) in columns.iter().zip(output_chunk_schema.slots()).enumerate() {
         if col.len() != total_rows {
-            return Err(format!(
-                "analytic output length mismatch at column {idx}: expected_rows={total_rows} actual={}",
-                col.len()
-            ));
+            return Err(AnalyticOutputValidationFailure::Length {
+                column: idx,
+                expected_rows: total_rows,
+                actual: col.len(),
+            });
         }
         let expected = slot.field();
         if col.data_type() != expected.data_type() {
-            return Err(format!(
-                "analytic output type mismatch at column {idx}: descriptor={:?} actual={:?}",
-                expected.data_type(),
-                col.data_type()
-            ));
+            return Err(AnalyticOutputValidationFailure::Type {
+                column: idx,
+                expected: expected.data_type(),
+                actual: col.data_type(),
+            });
         }
     }
     Ok(())
@@ -561,29 +629,17 @@ impl PartitionWindowContext {
     }
 }
 
-fn split_analytic_output_chunks(
+pub(crate) fn split_analytic_output_chunks(
     output_chunk_schema: ChunkSchemaRef,
     columns: &[ArrayRef],
     input: &[Chunk],
 ) -> Result<VecDeque<Chunk>, String> {
-    let mut out = VecDeque::new();
-    let mut offset = 0usize;
-    for chunk in input {
-        let len = chunk.len();
-        if len == 0 {
-            continue;
-        }
-        let sliced_columns = columns
-            .iter()
-            .map(|column| column.slice(offset, len))
-            .collect::<Vec<_>>();
-        out.push_back(
-            Chunk::try_new_with_columns(Arc::clone(&output_chunk_schema), sliced_columns)
-                .map_err(|e| format!("build analytic output batch: {}", e))?,
-        );
-        offset += len;
-    }
-    Ok(out)
+    analytic_input_stages::legacy(analytic_input_stages::split(
+        output_chunk_schema,
+        columns,
+        input,
+        &mut analytic_input_stages::LegacyWork,
+    ))
 }
 
 fn should_reorder_window_input(
@@ -591,77 +647,43 @@ fn should_reorder_window_input(
     order_keys: &[ArrayRef],
     window: Option<&WindowFrame>,
 ) -> Result<bool, String> {
-    if !order_keys.is_empty() || window.is_some() {
-        return Ok(false);
-    }
-    Ok(functions.iter().all(|func| {
-        matches!(
-            func.kind,
-            WindowFunctionKind::Count
-                | WindowFunctionKind::Sum
-                | WindowFunctionKind::Avg
-                | WindowFunctionKind::Min
-                | WindowFunctionKind::Max
-                | WindowFunctionKind::BitmapUnion
-                | WindowFunctionKind::BitmapUnionCount
-                | WindowFunctionKind::MaxBy
-                | WindowFunctionKind::MinBy
-                | WindowFunctionKind::VarianceSamp
-                | WindowFunctionKind::StddevSamp
-                | WindowFunctionKind::BoolOr
-                | WindowFunctionKind::CovarPop
-                | WindowFunctionKind::CovarSamp
-                | WindowFunctionKind::Corr
-        )
-    }))
+    Ok(
+        novarocks_functions::window_input_order::should_regroup_partition_only(
+            !order_keys.is_empty(),
+            window.is_some(),
+            functions.iter().map(|func| {
+                matches!(
+                    func.kind,
+                    WindowFunctionKind::Count
+                        | WindowFunctionKind::Sum
+                        | WindowFunctionKind::Avg
+                        | WindowFunctionKind::Min
+                        | WindowFunctionKind::Max
+                        | WindowFunctionKind::BitmapUnion
+                        | WindowFunctionKind::BitmapUnionCount
+                        | WindowFunctionKind::MaxBy
+                        | WindowFunctionKind::MinBy
+                        | WindowFunctionKind::VarianceSamp
+                        | WindowFunctionKind::StddevSamp
+                        | WindowFunctionKind::BoolOr
+                        | WindowFunctionKind::CovarPop
+                        | WindowFunctionKind::CovarSamp
+                        | WindowFunctionKind::Corr
+                )
+            }),
+        ),
+    )
 }
 
-fn reorder_chunk_by_partition_keys(chunk: &Chunk, keys: &[ArrayRef]) -> Result<Chunk, String> {
-    let rows = chunk.len();
-    if rows <= 1 || keys.is_empty() {
-        return Ok(chunk.clone());
-    }
-
-    let mut perm: Vec<usize> = (0..rows).collect();
-    let mut sort_err: Option<String> = None;
-    perm.sort_by(|left, right| {
-        if sort_err.is_some() {
-            return Ordering::Equal;
-        }
-        match compare_rows_on_partition_keys(keys, *left, *right) {
-            Ok(ord) => {
-                if ord.is_eq() {
-                    left.cmp(right)
-                } else {
-                    ord
-                }
-            }
-            Err(e) => {
-                sort_err = Some(e);
-                Ordering::Equal
-            }
-        }
-    });
-    if let Some(err) = sort_err {
-        return Err(err);
-    }
-    if perm.iter().enumerate().all(|(idx, row)| idx == *row) {
-        return Ok(chunk.clone());
-    }
-
-    let mut idx_builder = UInt32Builder::with_capacity(rows);
-    for row in perm {
-        idx_builder.append_value(row as u32);
-    }
-    let idx_arr = Arc::new(idx_builder.finish()) as ArrayRef;
-
-    let mut reordered_columns: Vec<ArrayRef> = Vec::with_capacity(chunk.batch.num_columns());
-    for column in chunk.batch.columns() {
-        let reordered = take(column.as_ref(), idx_arr.as_ref(), None).map_err(|e| e.to_string())?;
-        reordered_columns.push(reordered);
-    }
-    Chunk::try_new_with_columns(chunk.chunk_schema_ref(), reordered_columns)
-        .map_err(|e| format!("build reordered analytic batch: {}", e))
+pub(crate) fn reorder_chunk_by_partition_keys(
+    chunk: &Chunk,
+    keys: &[ArrayRef],
+) -> Result<Chunk, String> {
+    analytic_input_stages::legacy(analytic_input_stages::regroup(
+        chunk,
+        keys,
+        &mut analytic_input_stages::LegacyWork,
+    ))
 }
 
 fn compare_rows_on_partition_keys(
@@ -669,20 +691,7 @@ fn compare_rows_on_partition_keys(
     left: usize,
     right: usize,
 ) -> Result<Ordering, String> {
-    for array in keys {
-        match (array.is_null(left), array.is_null(right)) {
-            (true, true) => continue,
-            (true, false) => return Ok(Ordering::Less),
-            (false, true) => return Ok(Ordering::Greater),
-            (false, false) => {
-                let ord = compare_at(array.as_ref(), left, right)?;
-                if !ord.is_eq() {
-                    return Ok(ord);
-                }
-            }
-        }
-    }
-    Ok(Ordering::Equal)
+    analytic_input_stages::legacy_compare(keys, left, right)
 }
 
 fn compute_peer_groups(
@@ -1508,32 +1517,29 @@ fn compute_count(
     window_ctx: &PartitionWindowContext,
     total_rows: usize,
 ) -> Result<ArrayRef, String> {
+    use novarocks_functions::builtin::aggregate_count_core as core;
     let value = args.first().cloned();
-
     let mut b = Int64Builder::with_capacity(total_rows);
-
-    for (part_idx, (p_start, p_end)) in window_ctx.partitions().iter().enumerate() {
+    for (part_idx, (start, end)) in window_ctx.partitions().iter().enumerate() {
         let frames = window_ctx.frames(part_idx)?;
-        let mut prefix_non_null: Vec<i64> = Vec::new();
-        if let Some(v) = value.as_ref() {
-            prefix_non_null = vec![0; (*p_end - *p_start) + 1];
-            for (i, row) in (*p_start..*p_end).enumerate() {
-                prefix_non_null[i + 1] = prefix_non_null[i] + if v.is_null(row) { 0 } else { 1 };
-            }
-        }
-        for (row, (frame_start, frame_end)) in (*p_start..*p_end).zip(frames.iter().copied()) {
-            let cnt = if value.is_none() {
-                (frame_end as i64) - (frame_start as i64)
-            } else {
-                let s = frame_start - *p_start;
-                let e = frame_end - *p_start;
-                prefix_non_null[e] - prefix_non_null[s]
-            };
-            let _ = row;
-            b.append_value(cnt);
-        }
+        let source = |row| core::CountValue {
+            array: value.as_ref().unwrap().as_ref(),
+            row,
+        };
+        let source = value.as_ref().map(|_| &source as _);
+        let result = core::window_partition_observed(
+            source,
+            *start,
+            *end,
+            frames.iter().copied(),
+            &mut |n| {
+                b.append_value(n);
+                Ok::<_, std::convert::Infallible>(())
+            },
+            &mut |_| Ok::<_, std::convert::Infallible>(()),
+        );
+        result.unwrap_or_else(|never| match never {});
     }
-
     Ok(Arc::new(b.finish()))
 }
 
@@ -3705,3 +3711,23 @@ mod tests {
         assert_eq!(actual, vec![10, 10, 10]);
     }
 }
+
+#[cfg(test)]
+#[path = "legacy_analytic_count_baseline_tests.rs"]
+mod original_count_baseline_tests;
+
+#[cfg(test)]
+#[path = "analytic_count_original_diff_tests.rs"]
+mod original_count_window_diff_tests;
+
+#[cfg(test)]
+#[path = "analytic_count_generic_diff_tests.rs"]
+mod original_count_generic_window_diff_tests;
+
+#[cfg(test)]
+#[path = "analytic_by_window_required_baseline_tests.rs"]
+mod by_window_required_original_tests;
+
+#[cfg(test)]
+#[path = "analytic_input_stage_tests.rs"]
+mod analytic_input_stage_tests;

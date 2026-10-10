@@ -3220,7 +3220,14 @@ fn scalar_integer_fields() -> Vec<novarocks_spi::connector::ConnectorWriteFieldR
         Field::new("plain", DataType::Int32, false),
     ]
     .into_iter()
-    .map(novarocks_spi::connector::ConnectorWriteFieldRequest::new)
+    .enumerate()
+    .map(|(ordinal, field)| {
+        // The actual table schema authors field IDs 1/2/3; preparation and
+        // begin must retain these same provider annotations with the carrier.
+        novarocks_spi::connector::ConnectorWriteFieldRequest::new(
+            field.with_metadata([("PARQUET:field_id".into(), (ordinal + 1).to_string())].into()),
+        )
+    })
     .collect()
 }
 

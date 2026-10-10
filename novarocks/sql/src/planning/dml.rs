@@ -459,6 +459,7 @@ impl DmlFinalizedProviderReadSet {
 /// Frozen inputs shared by every SQL-owned final write-plan constructor.
 /// Neither value may be inferred from process state or live topology.
 pub struct DmlFinalPlanContext {
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     version: novarocks_physical_plan::PlanVersionId,
     dop_domain: novarocks_physical_plan::PipelineDopDomain,
     provider_reads: DmlFinalizedProviderReadSet,
@@ -469,11 +470,13 @@ impl DmlFinalPlanContext {
         version: novarocks_physical_plan::PlanVersionId,
         dop_domain: novarocks_physical_plan::PipelineDopDomain,
         provider_reads: DmlFinalizedProviderReadSet,
+        emission_mode: crate::compiler::SqlPhysicalEmissionMode,
     ) -> Self {
         Self {
             version,
             dop_domain,
             provider_reads,
+            emission_mode,
         }
     }
 
@@ -483,11 +486,13 @@ impl DmlFinalPlanContext {
         novarocks_physical_plan::PlanVersionId,
         novarocks_physical_plan::PipelineDopDomain,
         Option<crate::compiler::FinalizedProviderReadSet>,
+        crate::compiler::SqlPhysicalEmissionMode,
     ) {
         (
             self.version,
             self.dop_domain,
             self.provider_reads.into_optional(),
+            self.emission_mode,
         )
     }
 }
@@ -501,6 +506,9 @@ pub struct DmlFinalWritePlanContext {
 }
 
 impl DmlFinalWritePlanContext {
+    pub fn emission_mode(&self) -> crate::compiler::SqlPhysicalEmissionMode {
+        self.plan.emission_mode
+    }
     pub fn new(plan: DmlFinalPlanContext, targets: DmlFinalizedWriteTargetSet) -> Self {
         Self { plan, targets }
     }
@@ -572,21 +580,62 @@ impl DmlWritePlanInput {
     }
 }
 
+fn final_lowering_error(
+    error: crate::planner::distributed::build::ContractLoweringError,
+) -> crate::compiler::SqlCompileError {
+    match error {
+        crate::planner::distributed::build::ContractLoweringError::Control(error) => error.into(),
+        other => crate::compiler::SqlCompileError::Compilation(other.to_string()),
+    }
+}
+
+fn final_plan_publication_error(
+    error: crate::planner::distributed::build::SqlPublicationError,
+) -> crate::compiler::SqlCompileError {
+    match error {
+        crate::planner::distributed::build::SqlPublicationError::Construction(error) => {
+            final_plan_construction_error(error)
+        }
+        crate::planner::distributed::build::SqlPublicationError::Support(error) => {
+            error.into_compile_error()
+        }
+    }
+}
+
+fn final_plan_construction_error(
+    error: novarocks_physical_plan::PlanConstructionError,
+) -> crate::compiler::SqlCompileError {
+    match error {
+        novarocks_physical_plan::PlanConstructionError::Constants(
+            novarocks_physical_plan::ConstantReferenceError::Control(error),
+        ) => error.into(),
+        other => crate::compiler::SqlCompileError::Compilation(other.to_string()),
+    }
+}
+
 /// Build the final write contract for one already-frozen connector source.
 ///
 /// The source reads exactly one provider-frozen cohort, so the occurrence the
 /// plan addresses that scan by is the one occurrence the finalized read set
 /// accounts for. Taking it from anywhere else would let the plan name a read
 /// nothing was frozen for.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Frozen write facts and the request's read-only control remain separate inputs."
+)]
 pub fn build_final_frozen_connector_write_plan(
     source: crate::planning::query_execution::FrozenConnectorScanPlan,
     sink: DmlWritePlanInput,
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
-    functions: &dyn crate::compiler::SqlFunctionCatalog,
+    functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     settings: &crate::compiler::SessionOptimizerSettings,
     final_write: DmlFinalWritePlanContext,
-) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    root_allow_throw_exception: bool,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
     let scan_occurrence = final_write
         .plan
         .provider_reads
@@ -597,7 +646,7 @@ pub fn build_final_frozen_connector_write_plan(
         .finalize_provider_read_occurrence(scan_occurrence)
         .map_err(|error| format!("finalize frozen connector scan occurrence: {error}"))?;
     let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0)?;
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
         &[
             crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
@@ -606,7 +655,10 @@ pub fn build_final_frozen_connector_write_plan(
                 requirements: statistics,
             },
         ],
-        functions,
+        functions.as_ref(),
+        decimal_overflow_policy,
+        constant_policy,
+        control,
     )?;
     complete_connector_write_plan(
         physical,
@@ -616,6 +668,10 @@ pub fn build_final_frozen_connector_write_plan(
         &auxiliary,
         settings,
         final_write,
+        functions,
+        root_allow_throw_exception,
+        constant_policy,
+        control,
     )
 }
 
@@ -627,6 +683,10 @@ pub fn build_final_frozen_connector_write_plan(
 /// accounted for under, so the two halves are separated here -- the needs
 /// leave, the facts come back, and the plan is lowered against them.
 pub struct DmlWriteCompletion {
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    root_allow_throw_exception: bool,
+    functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     physical: crate::planner::physical::PhysicalPlanNode,
     sink: DmlWritePlanInput,
@@ -641,14 +701,20 @@ pub fn begin_final_connector_write_plan(
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     settings: &crate::compiler::SessionOptimizerSettings,
-) -> Result<(DmlWriteCompletion, Box<[crate::compiler::ProviderReadNeed]>), String> {
-    let compiled = crate::compiler::SqlCompiler::optimize(request)
-        .map_err(|error| error.to_string())?
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
+) -> Result<
+    (DmlWriteCompletion, Box<[crate::compiler::ProviderReadNeed]>),
+    crate::compiler::SqlCompileError,
+> {
+    let constant_policy = request.constant_policy();
+    let control = request.control().clone();
+    let compiled = crate::compiler::SqlCompiler::optimize(request)?
         .into_optimized_output()
         .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
     let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0)?;
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
         &[
             crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
@@ -658,6 +724,9 @@ pub fn begin_final_connector_write_plan(
             },
         ],
         compiled.function_catalog.as_ref(),
+        decimal_overflow_policy,
+        constant_policy,
+        &control,
     )?;
     // Runtime filters are placed before the reads are stated, because a filter
     // a scan applies is part of what that scan asks its provider for.
@@ -670,10 +739,14 @@ pub fn begin_final_connector_write_plan(
         physical,
         0,
         settings.connector_static_predicate_pushdown_enabled(),
-    )
-    .map_err(|error| error.to_string())?;
+        &control,
+    )?;
     Ok((
         DmlWriteCompletion {
+            emission_mode,
+            constant_policy,
+            root_allow_throw_exception: compiled.root_allow_throw_exception,
+            functions: compiled.function_catalog,
             query_statistics: compiled.statistics.snapshot,
             physical,
             sink,
@@ -692,8 +765,9 @@ impl DmlWriteCompletion {
         dop_domain: novarocks_physical_plan::PipelineDopDomain,
         reads: DmlFinalizedProviderReadSet,
         targets: DmlFinalizedWriteTargetSet,
-    ) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
-        let mut builder = crate::planner::distributed::build::lower_final_physical_write_plan(
+        control: &crate::compiler::SqlCompileControl,
+    ) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
+        let mut draft = crate::planner::distributed::build::lower_final_physical_write_plan(
             &self.physical,
             version,
             dop_domain,
@@ -704,10 +778,17 @@ impl DmlWriteCompletion {
                 auxiliary: &self.auxiliary,
                 targets: targets.0,
             },
+            self.functions,
+            self.root_allow_throw_exception,
+            self.constant_policy,
+            self.emission_mode,
+            control,
         )
-        .map_err(|error| error.to_string())?;
-        self.query_statistics.annotate_final_plan(&mut builder);
-        builder.finish().map_err(|error| error.to_string())
+        .map_err(final_lowering_error)?;
+        self.query_statistics.annotate_final_plan(&mut draft);
+        draft
+            .finish_with_dependency_observer_observed(control)
+            .map_err(final_plan_publication_error)
     }
 }
 
@@ -719,14 +800,16 @@ pub fn compile_final_connector_write_plan(
     statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     settings: &crate::compiler::SessionOptimizerSettings,
     final_write: DmlFinalWritePlanContext,
-) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
-    let compiled = crate::compiler::SqlCompiler::optimize(request)
-        .map_err(|error| error.to_string())?
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
+    let constant_policy = request.constant_policy();
+    let control = request.control().clone();
+    let compiled = crate::compiler::SqlCompiler::optimize(request)?
         .into_optimized_output()
         .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
     let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0)?;
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
         &[
             crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
@@ -736,6 +819,9 @@ pub fn compile_final_connector_write_plan(
             },
         ],
         compiled.function_catalog.as_ref(),
+        decimal_overflow_policy,
+        constant_policy,
+        &control,
     )?;
     complete_connector_write_plan(
         physical,
@@ -745,6 +831,10 @@ pub fn compile_final_connector_write_plan(
         &auxiliary,
         settings,
         final_write,
+        compiled.function_catalog,
+        compiled.root_allow_throw_exception,
+        constant_policy,
+        &control,
     )
 }
 
@@ -757,14 +847,18 @@ fn complete_connector_write_plan(
     auxiliary: &crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan,
     settings: &crate::compiler::SessionOptimizerSettings,
     final_write: DmlFinalWritePlanContext,
-) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
+    functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
+    root_allow_throw_exception: bool,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
         &mut physical,
         settings,
     );
     let (final_context, finalized_targets) = final_write.into_parts();
-    let (version, dop_domain, reads) = final_context.into_parts();
-    let mut builder = crate::planner::distributed::build::lower_final_physical_write_plan(
+    let (version, dop_domain, reads, emission_mode) = final_context.into_parts();
+    let mut draft = crate::planner::distributed::build::lower_final_physical_write_plan(
         &physical,
         version,
         dop_domain,
@@ -775,14 +869,25 @@ fn complete_connector_write_plan(
             auxiliary,
             targets: finalized_targets.0,
         },
+        functions,
+        root_allow_throw_exception,
+        constant_policy,
+        emission_mode,
+        control,
     )
-    .map_err(|error| error.to_string())?;
-    query_statistics.annotate_final_plan(&mut builder);
-    builder.finish().map_err(|error| error.to_string())
+    .map_err(final_lowering_error)?;
+    query_statistics.annotate_final_plan(&mut draft);
+    draft
+        .finish_with_dependency_observer_observed(control)
+        .map_err(final_plan_publication_error)
 }
 
 /// One internal DML read, optimized and waiting for its provider facts.
 pub struct DmlReadCompletion {
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    root_allow_throw_exception: bool,
+    functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     root_semantics: crate::compiler::root_output::RootOutputSemantics,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     physical: crate::planner::physical::PhysicalPlanNode,
@@ -791,9 +896,14 @@ pub struct DmlReadCompletion {
 pub fn begin_final_dml_read_plan(
     request: crate::compiler::SqlOptimizeRequest<'_>,
     settings: &crate::compiler::SessionOptimizerSettings,
-) -> Result<(DmlReadCompletion, Box<[crate::compiler::ProviderReadNeed]>), String> {
-    let compiled = crate::compiler::SqlCompiler::optimize(request)
-        .map_err(|error| error.to_string())?
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
+) -> Result<
+    (DmlReadCompletion, Box<[crate::compiler::ProviderReadNeed]>),
+    crate::compiler::SqlCompileError,
+> {
+    let constant_policy = request.constant_policy();
+    let control = request.control().clone();
+    let compiled = crate::compiler::SqlCompiler::optimize(request)?
         .into_optimized_output()
         .map_err(|_| "DML read intent did not produce optimized SQL facts".to_string())?;
     let mut physical =
@@ -806,10 +916,14 @@ pub fn begin_final_dml_read_plan(
         physical,
         0,
         settings.connector_static_predicate_pushdown_enabled(),
-    )
-    .map_err(|error| error.to_string())?;
+        &control,
+    )?;
     Ok((
         DmlReadCompletion {
+            emission_mode,
+            constant_policy,
+            root_allow_throw_exception: compiled.root_allow_throw_exception,
+            functions: compiled.function_catalog,
             root_semantics: compiled.root_semantics,
             physical,
             query_statistics: compiled.statistics.snapshot,
@@ -824,18 +938,26 @@ impl DmlReadCompletion {
         version: novarocks_physical_plan::PlanVersionId,
         dop_domain: novarocks_physical_plan::PipelineDopDomain,
         reads: DmlFinalizedProviderReadSet,
-    ) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
-        let mut builder =
+        control: &crate::compiler::SqlCompileControl,
+    ) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
+        let mut draft =
             crate::planner::distributed::build::lower_final_physical_plan_with_root_semantics(
                 &self.physical,
                 version,
                 dop_domain,
                 reads.into_optional(),
                 self.root_semantics,
+                self.functions,
+                self.root_allow_throw_exception,
+                self.constant_policy,
+                self.emission_mode,
+                control,
             )
-            .map_err(|error| error.to_string())?;
-        self.query_statistics.annotate_final_plan(&mut builder);
-        builder.finish().map_err(|error| error.to_string())
+            .map_err(final_lowering_error)?;
+        self.query_statistics.annotate_final_plan(&mut draft);
+        draft
+            .finish_with_dependency_observer_observed(control)
+            .map_err(final_plan_publication_error)
     }
 }
 
@@ -844,6 +966,9 @@ impl DmlReadCompletion {
 /// stable capture fingerprint, and sealed write plan derived from it.
 #[derive(Clone, Debug)]
 pub struct DmlCtasSourcePlan {
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    root_allow_throw_exception: bool,
     private_output_domain: bool,
     output_domains: Box<[novarocks_physical_plan::ResultValueDomain]>,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
@@ -874,8 +999,8 @@ impl DmlCtasSourcePlan {
             .map(|(column, domain)| DmlSourceColumn {
                 domain,
                 name: column.name.clone(),
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
+                data_type: column.value_type.data_type.clone(),
+                nullable: column.value_type.nullable,
             })
             .collect()
     }
@@ -889,10 +1014,12 @@ impl DmlCtasSourcePlan {
             "{:#?}\n{:#?}\n{}",
             self.optimized, self.output_domains, self.private_output_domain
         );
+        let root_allow = [u8::from(self.root_allow_throw_exception)];
         let mut digest = Sha256::new();
         for part in [
-            b"novarocks.ctas-optimized-capture.v1".as_slice(),
+            b"novarocks.ctas-optimized-capture.v2".as_slice(),
             material.as_bytes(),
+            root_allow.as_slice(),
         ] {
             digest.update((part.len() as u64).to_be_bytes());
             digest.update(part);
@@ -906,9 +1033,10 @@ impl DmlCtasSourcePlan {
 /// completed target admission.
 pub fn compile_ctas_source(
     request: crate::compiler::SqlOptimizeRequest<'_>,
-) -> Result<DmlCtasSourcePlan, String> {
-    let compiled = crate::compiler::SqlCompiler::optimize(request)
-        .map_err(|error| error.to_string())?
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
+) -> Result<DmlCtasSourcePlan, crate::compiler::SqlCompileError> {
+    let constant_policy = request.constant_policy();
+    let compiled = crate::compiler::SqlCompiler::optimize(request)?
         .into_optimized_output()
         .map_err(|_| "CTAS source did not produce optimized SQL facts".to_string())?;
     let output_domains = compiled
@@ -917,6 +1045,9 @@ pub fn compile_ctas_source(
         .into_boxed_slice();
     let private_output_domain = compiled.root_semantics.has_private_persistence_domain();
     Ok(DmlCtasSourcePlan {
+        emission_mode,
+        constant_policy,
+        root_allow_throw_exception: compiled.root_allow_throw_exception,
         private_output_domain,
         output_domains,
         query_statistics: compiled.statistics.snapshot,
@@ -933,10 +1064,15 @@ pub fn begin_final_ctas_connector_write_plan(
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     settings: &crate::compiler::SessionOptimizerSettings,
-) -> Result<(DmlWriteCompletion, Box<[crate::compiler::ProviderReadNeed]>), String> {
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<
+    (DmlWriteCompletion, Box<[crate::compiler::ProviderReadNeed]>),
+    crate::compiler::SqlCompileError,
+> {
     let mut physical = crate::planner::optimizer_bridge::to_physical_plan(&source.optimized)?;
     let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0)?;
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
         &[
             crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
@@ -946,6 +1082,9 @@ pub fn begin_final_ctas_connector_write_plan(
             },
         ],
         source.function_catalog.as_ref(),
+        decimal_overflow_policy,
+        source.constant_policy,
+        control,
     )?;
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
         &mut physical,
@@ -955,10 +1094,14 @@ pub fn begin_final_ctas_connector_write_plan(
         physical,
         0,
         settings.connector_static_predicate_pushdown_enabled(),
-    )
-    .map_err(|error| error.to_string())?;
+        control,
+    )?;
     Ok((
         DmlWriteCompletion {
+            emission_mode: source.emission_mode,
+            constant_policy: source.constant_policy,
+            root_allow_throw_exception: source.root_allow_throw_exception,
+            functions: source.function_catalog.clone(),
             query_statistics: source.query_statistics.clone(),
             physical,
             sink,
@@ -1088,13 +1231,17 @@ pub fn optimizer_settings_stable_digest_material(
 
 /// Staged final change-stream contract and its typed writer destinations.
 pub struct DmlFinalChangeStreamPlan {
-    physical_plan: novarocks_physical_plan::PhysicalPlan,
+    physical_plan: crate::compiler::SqlAuthoredPhysicalPlan,
     writer_routes: Vec<DmlFinalChangeStreamWriterRoute>,
 }
 
 /// An optimized change stream whose provider reads have been stated but not
 /// frozen. The application supplies their exact facts before lowering.
 pub struct DmlChangeStreamCompletion {
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    root_allow_throw_exception: bool,
+    functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     physical: crate::planner::physical::PhysicalPlanNode,
     dag: crate::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
@@ -1105,10 +1252,18 @@ impl DmlChangeStreamCompletion {
     pub fn finish(
         self,
         final_write: DmlFinalWritePlanContext,
-    ) -> Result<DmlFinalChangeStreamPlan, String> {
+        control: &crate::compiler::SqlCompileControl,
+    ) -> Result<DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
         let (final_context, finalized_targets) = final_write.into_parts();
-        let (version, dop_domain, reads) = final_context.into_parts();
-        let mut builder = crate::planner::distributed::build::lower_final_change_stream_write_plan(
+        let (version, dop_domain, reads, emission_mode) = final_context.into_parts();
+        if emission_mode != self.emission_mode {
+            return Err(
+                "change-stream completion mode differs from its final write context"
+                    .to_string()
+                    .into(),
+            );
+        }
+        let mut draft = crate::planner::distributed::build::lower_final_change_stream_write_plan(
             &self.physical,
             version,
             dop_domain,
@@ -1118,11 +1273,18 @@ impl DmlChangeStreamCompletion {
                 auxiliary: &self.auxiliary,
                 targets: finalized_targets.0,
             },
+            self.functions,
+            self.root_allow_throw_exception,
+            self.constant_policy,
+            self.emission_mode,
+            control,
         )
-        .map_err(|error| error.to_string())?;
-        self.query_statistics.annotate_final_plan(&mut builder);
-        let physical_plan = builder.finish().map_err(|error| error.to_string())?;
-        let writer_routes = completed_change_stream_writer_routes(&physical_plan)?;
+        .map_err(final_lowering_error)?;
+        self.query_statistics.annotate_final_plan(&mut draft);
+        let physical_plan = draft
+            .finish_with_dependency_observer_observed(control)
+            .map_err(final_plan_publication_error)?;
+        let writer_routes = completed_change_stream_writer_routes(physical_plan.plan())?;
         Ok(DmlFinalChangeStreamPlan {
             physical_plan,
             writer_routes,
@@ -1137,28 +1299,44 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
     routes: Vec<DmlChangeStreamRoute>,
     statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
     effect_output_ordinal: usize,
-    functions: &dyn crate::compiler::SqlFunctionCatalog,
+    functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
     shape: DmlWritePlanShape,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    root_allow_throw_exception: bool,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
+    control: &crate::compiler::SqlCompileControl,
 ) -> Result<
     (
         DmlChangeStreamCompletion,
         Box<[crate::compiler::ProviderReadNeed]>,
     ),
-    String,
+    crate::compiler::SqlCompileError,
 > {
     let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
     else {
-        return Err("change-stream producer root must be the native ChangeEventExpand".to_string());
+        return Err(
+            "change-stream producer root must be the native ChangeEventExpand"
+                .to_string()
+                .into(),
+        );
     };
     let effect_output = producer
         .output_columns
         .get(effect_output_ordinal)
         .ok_or_else(|| "change-stream effect output ordinal is out of bounds".to_string())?;
     if effect_output.column_id != expand.effect_column_id {
-        return Err("change-stream effect output ordinal does not identify the native ChangeEventExpand effect".to_string());
+        return Err("change-stream effect output ordinal does not identify the native ChangeEventExpand effect".to_string().into());
     }
-    let auxiliary = plan_change_stream_writer_statistics(&routes, statistics_targets, functions)?;
+    let auxiliary = plan_change_stream_writer_statistics(
+        &routes,
+        statistics_targets,
+        functions.as_ref(),
+        decimal_overflow_policy,
+        constant_policy,
+        control,
+    )?;
     let dag = bind_route_layout(&producer.output_columns, routes, effect_output_ordinal)?;
     let mut physical = crate::planner::optimizer_bridge::to_physical_plan(&producer)?;
     let settings = dml_change_stream_optimizer_settings();
@@ -1183,10 +1361,14 @@ pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
         physical,
         0,
         settings.connector_static_predicate_pushdown_enabled(),
-    )
-    .map_err(|error| error.to_string())?;
+        control,
+    )?;
     Ok((
         DmlChangeStreamCompletion {
+            emission_mode,
+            constant_policy,
+            root_allow_throw_exception,
+            functions,
             query_statistics,
             physical,
             dag,
@@ -1206,13 +1388,13 @@ pub struct DmlFinalChangeStreamWriterRoute {
 
 impl DmlFinalChangeStreamPlan {
     pub fn physical_plan(&self) -> &novarocks_physical_plan::PhysicalPlan {
-        &self.physical_plan
+        self.physical_plan.plan()
     }
 
     pub fn into_parts(
         self,
     ) -> (
-        novarocks_physical_plan::PhysicalPlan,
+        crate::compiler::SqlAuthoredPhysicalPlan,
         Vec<DmlFinalChangeStreamWriterRoute>,
     ) {
         (self.physical_plan, self.writer_routes)
@@ -1223,20 +1405,23 @@ impl DmlFinalChangeStreamPlan {
 /// its writer graph is lowered against the frozen provider facts.
 pub fn begin_final_dml_change_stream(
     request: DmlChangeStreamCompileRequest<'_>,
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    emission_mode: crate::compiler::SqlPhysicalEmissionMode,
 ) -> Result<
     (
         DmlChangeStreamCompletion,
         Box<[crate::compiler::ProviderReadNeed]>,
     ),
-    String,
+    crate::compiler::SqlCompileError,
 > {
-    let compiled = crate::compiler::SqlCompiler::optimize(request.optimize_request)
-        .map_err(|error| error.to_string())?
+    let constant_policy = request.optimize_request.constant_policy();
+    let control = request.optimize_request.control().clone();
+    let compiled = crate::compiler::SqlCompiler::optimize(request.optimize_request)?
         .into_optimized_output()
         .map_err(|_| "change-stream intent did not produce an optimized SQL plan".to_string())?;
     let producer = match request.kind {
         DmlChangeStreamKind::Update { target_columns } => {
-            build_update_change_event_expand(compiled.optimized_tree, &target_columns)?
+            build_update_change_event_expand(compiled.optimized_tree, &target_columns, &control)?
         }
         DmlChangeStreamKind::Merge {
             target_columns,
@@ -1249,6 +1434,7 @@ pub fn begin_final_dml_change_stream(
             matched_update,
             matched_delete,
             not_matched_insert,
+            &control,
         )?,
     };
     let effect_output_ordinal = producer
@@ -1262,23 +1448,30 @@ pub fn begin_final_dml_change_stream(
         request.routes,
         request.statistics_targets,
         effect_output_ordinal,
-        compiled.function_catalog.as_ref(),
+        compiled.function_catalog,
         request.pre_expand_keyed_assert,
         request.shape,
+        decimal_overflow_policy,
+        compiled.root_allow_throw_exception,
+        constant_policy,
+        emission_mode,
+        &control,
     )
 }
 
 /// Compile a generated change stream into the staged final physical contract.
 pub fn compile_final_dml_change_stream(
     request: DmlFinalChangeStreamCompileRequest<'_>,
-) -> Result<DmlFinalChangeStreamPlan, String> {
-    let compiled = crate::compiler::SqlCompiler::optimize(request.optimize_request)
-        .map_err(|error| error.to_string())?
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+) -> Result<DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
+    let constant_policy = request.optimize_request.constant_policy();
+    let control = request.optimize_request.control().clone();
+    let compiled = crate::compiler::SqlCompiler::optimize(request.optimize_request)?
         .into_optimized_output()
         .map_err(|_| "change-stream intent did not produce an optimized SQL plan".to_string())?;
     let producer = match request.kind {
         DmlChangeStreamKind::Update { target_columns } => {
-            build_update_change_event_expand(compiled.optimized_tree, &target_columns)?
+            build_update_change_event_expand(compiled.optimized_tree, &target_columns, &control)?
         }
         DmlChangeStreamKind::Merge {
             target_columns,
@@ -1291,6 +1484,7 @@ pub fn compile_final_dml_change_stream(
             matched_update,
             matched_delete,
             not_matched_insert,
+            &control,
         )?,
     };
     seal_final_change_stream_producer(
@@ -1298,26 +1492,42 @@ pub fn compile_final_dml_change_stream(
         compiled.statistics.snapshot,
         request.routes,
         request.statistics_targets,
-        compiled.function_catalog.as_ref(),
+        compiled.function_catalog,
         DmlFinalChangeStreamSealContext {
             pre_expand_keyed_assert: request.pre_expand_keyed_assert,
             shape: request.shape,
             final_write: request.final_write,
         },
+        decimal_overflow_policy,
+        compiled.root_allow_throw_exception,
+        constant_policy,
+        &control,
     )
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The producer, signed routes, statistics, authored policy and request control are distinct compiler inputs."
+)]
 pub(crate) fn seal_final_change_stream_producer(
     producer: crate::optimizer::OptimizedOperatorNode,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     routes: Vec<DmlChangeStreamRoute>,
     statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
-    functions: &dyn crate::compiler::SqlFunctionCatalog,
+    functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     context: DmlFinalChangeStreamSealContext,
-) -> Result<DmlFinalChangeStreamPlan, String> {
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    root_allow_throw_exception: bool,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
     let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
     else {
-        return Err("change-stream producer root must be the native ChangeEventExpand".to_string());
+        return Err(
+            "change-stream producer root must be the native ChangeEventExpand"
+                .to_string()
+                .into(),
+        );
     };
     let effect_output_ordinal = producer
         .output_columns
@@ -1326,7 +1536,9 @@ pub(crate) fn seal_final_change_stream_producer(
         .ok_or_else(|| "change-stream producer has no effect output occurrence".to_string())?;
     if producer.output_columns[effect_output_ordinal].column_id != expand.effect_column_id {
         return Err(
-            "change-stream producer effect must be its final ordered output occurrence".to_string(),
+            "change-stream producer effect must be its final ordered output occurrence"
+                .to_string()
+                .into(),
         );
     }
     seal_final_change_stream_producer_with_effect_ordinal(
@@ -1337,21 +1549,34 @@ pub(crate) fn seal_final_change_stream_producer(
         effect_output_ordinal,
         functions,
         context,
+        decimal_overflow_policy,
+        root_allow_throw_exception,
+        constant_policy,
+        control,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     producer: crate::optimizer::OptimizedOperatorNode,
     query_statistics: crate::optimizer::stats_input::QueryStatsSnapshot,
     routes: Vec<DmlChangeStreamRoute>,
     statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
     effect_output_ordinal: usize,
-    functions: &dyn crate::compiler::SqlFunctionCatalog,
+    functions: std::sync::Arc<dyn crate::compiler::SqlFunctionCatalog>,
     context: DmlFinalChangeStreamSealContext,
-) -> Result<DmlFinalChangeStreamPlan, String> {
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    root_allow_throw_exception: bool,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<DmlFinalChangeStreamPlan, crate::compiler::SqlCompileError> {
     let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
     else {
-        return Err("change-stream producer root must be the native ChangeEventExpand".to_string());
+        return Err(
+            "change-stream producer root must be the native ChangeEventExpand"
+                .to_string()
+                .into(),
+        );
     };
     let effect_output = producer
         .output_columns
@@ -1360,10 +1585,16 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
     if effect_output.column_id != expand.effect_column_id {
         return Err(
             "change-stream effect output ordinal does not identify the native ChangeEventExpand effect"
-                .to_string(),
-        );
+                .to_string().into());
     }
-    let auxiliary = plan_change_stream_writer_statistics(&routes, statistics_targets, functions)?;
+    let auxiliary = plan_change_stream_writer_statistics(
+        &routes,
+        statistics_targets,
+        functions.as_ref(),
+        decimal_overflow_policy,
+        constant_policy,
+        control,
+    )?;
     let dag = bind_route_layout(&producer.output_columns, routes, effect_output_ordinal)?;
     let keyed_assert = context.pre_expand_keyed_assert.map(|assertion| {
         crate::planner::physical::PreExpandKeyedAssertSpec {
@@ -1385,8 +1616,8 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
         &settings,
     );
     let (final_context, finalized_targets) = context.final_write.into_parts();
-    let (version, dop_domain, reads) = final_context.into_parts();
-    let mut builder = crate::planner::distributed::build::lower_final_change_stream_write_plan(
+    let (version, dop_domain, reads, emission_mode) = final_context.into_parts();
+    let mut draft = crate::planner::distributed::build::lower_final_change_stream_write_plan(
         &physical,
         version,
         dop_domain,
@@ -1396,11 +1627,18 @@ pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
             auxiliary: &auxiliary,
             targets: finalized_targets.0,
         },
+        functions,
+        root_allow_throw_exception,
+        constant_policy,
+        emission_mode,
+        control,
     )
-    .map_err(|error| error.to_string())?;
-    query_statistics.annotate_final_plan(&mut builder);
-    let physical_plan = builder.finish().map_err(|error| error.to_string())?;
-    let writer_routes = completed_change_stream_writer_routes(&physical_plan)?;
+    .map_err(final_lowering_error)?;
+    query_statistics.annotate_final_plan(&mut draft);
+    let physical_plan = draft
+        .finish_with_dependency_observer_observed(control)
+        .map_err(final_plan_publication_error)?;
+    let writer_routes = completed_change_stream_writer_routes(physical_plan.plan())?;
     Ok(DmlFinalChangeStreamPlan {
         physical_plan,
         writer_routes,
@@ -1445,7 +1683,13 @@ fn plan_change_stream_writer_statistics(
     routes: &[DmlChangeStreamRoute],
     statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan, String> {
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<
+    crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan,
+    crate::compiler::SqlCompileError,
+> {
     use std::collections::{BTreeMap, BTreeSet};
 
     let route_targets = routes
@@ -1465,7 +1709,8 @@ fn plan_change_stream_writer_statistics(
             return Err(format!(
                 "change-stream statistics repeat write target {}",
                 target.write_target_ordinal.get()
-            ));
+            )
+            .into());
         }
     }
     let statistics_target_set = requirements_by_target
@@ -1483,7 +1728,7 @@ fn plan_change_stream_writer_statistics(
             .collect::<Vec<_>>();
         return Err(format!(
             "change-stream statistics target membership differs from routes; missing={missing:?}, extraneous={extraneous:?}"
-        ));
+        ).into());
     }
 
     let target_schemas = routes
@@ -1493,7 +1738,7 @@ fn plan_change_stream_writer_statistics(
                 &route.sink.0,
             )
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     let inputs = routes
         .iter()
         .zip(target_schemas.iter())
@@ -1515,7 +1760,13 @@ fn plan_change_stream_writer_statistics(
             )
         })
         .collect::<Result<Vec<_>, String>>()?;
-    crate::planner::distributed::write::auxiliary::plan_writer_statistics(&inputs, functions)
+    crate::planner::distributed::write::auxiliary::plan_writer_statistics(
+        &inputs,
+        functions,
+        decimal_overflow_policy,
+        constant_policy,
+        control,
+    )
 }
 
 fn bind_route_layout(
@@ -1551,7 +1802,9 @@ fn bind_route_layout(
 fn build_update_change_event_expand(
     optimized_tree: crate::optimizer::OptimizedOperatorNode,
     target_columns: &[novarocks_types::schema::ColumnDef],
-) -> Result<crate::optimizer::OptimizedOperatorNode, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::optimizer::OptimizedOperatorNode, crate::compiler::SqlCompileError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let mut arena = clone_scalar_arena(&optimized_tree, "MOR UPDATE")?;
     let child_outputs = optimized_tree.output_columns.clone();
     let row_id = output_column_by_name(&child_outputs, "__nr_row_id", "UPDATE row id")?;
@@ -1565,6 +1818,7 @@ fn build_update_change_event_expand(
             "__nr_file",
             "UPDATE old file",
             file.column_id,
+            control,
         )?,
         output_expr(
             &mut arena,
@@ -1572,19 +1826,21 @@ fn build_update_change_event_expand(
             "__nr_pos",
             "UPDATE old row position",
             pos.column_id,
+            control,
         )?,
     ];
     for (name, output) in &targets {
         let new_name = format!("__nr_new_{name}");
-        let expr = maybe_output_column_by_name(&child_outputs, &new_name)?
-            .map(|column| intern_column(&mut arena, &column))
-            .transpose()?
-            .unwrap_or(child_expr(
+        let expr = match maybe_output_column_by_name(&child_outputs, &new_name)? {
+            Some(column) => intern_column(&mut arena, &column, control)?,
+            None => child_expr(
                 &mut arena,
                 &child_outputs,
                 name,
                 "UPDATE unchanged target column",
-            )?);
+                control,
+            )?,
+        };
         assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
             output_column_id: output.column_id,
             expr: Some(expr),
@@ -1596,6 +1852,7 @@ fn build_update_change_event_expand(
         "__nr_row_id",
         "UPDATE old row id",
         row_id.column_id,
+        control,
     )?);
     // Unassigned sequence outputs are NULL and inherit the actual commit sequence.
     build_change_expand(
@@ -1609,6 +1866,7 @@ fn build_update_change_event_expand(
             assignments,
         }],
     )
+    .map_err(crate::compiler::SqlCompileError::Compilation)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1618,7 +1876,9 @@ fn build_merge_change_event_expand(
     matched_update: bool,
     matched_delete: bool,
     not_matched_insert: bool,
-) -> Result<crate::optimizer::OptimizedOperatorNode, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::optimizer::OptimizedOperatorNode, crate::compiler::SqlCompileError> {
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
     let mut arena = clone_scalar_arena(&optimized_tree, "MOR MERGE")?;
     let child_outputs = optimized_tree.output_columns.clone();
     let assert_key =
@@ -1633,6 +1893,7 @@ fn build_merge_change_event_expand(
             "__nr_file",
             "MERGE old file",
             file.column_id,
+            control,
         )?,
         output_expr(
             &mut arena,
@@ -1640,6 +1901,7 @@ fn build_merge_change_event_expand(
             "__nr_pos",
             "MERGE old row position",
             pos.column_id,
+            control,
         )?,
     ];
     let mut reuse_assignments = vec![
@@ -1649,6 +1911,7 @@ fn build_merge_change_event_expand(
             "__nr_file",
             "MERGE old file",
             file.column_id,
+            control,
         )?,
         output_expr(
             &mut arena,
@@ -1656,6 +1919,7 @@ fn build_merge_change_event_expand(
             "__nr_pos",
             "MERGE old row position",
             pos.column_id,
+            control,
         )?,
     ];
     let mut fresh_assignments = Vec::with_capacity(targets.len());
@@ -1666,17 +1930,19 @@ fn build_merge_change_event_expand(
             name,
             "MERGE old target column",
             output.column_id,
+            control,
         )?);
         let new_name = format!("__nr_new_{name}");
-        let reuse = maybe_output_column_by_name(&child_outputs, &new_name)?
-            .map(|column| intern_column(&mut arena, &column))
-            .transpose()?
-            .unwrap_or(child_expr(
+        let reuse = match maybe_output_column_by_name(&child_outputs, &new_name)? {
+            Some(column) => intern_column(&mut arena, &column, control)?,
+            None => child_expr(
                 &mut arena,
                 &child_outputs,
                 name,
                 "MERGE unchanged target column",
-            )?);
+                control,
+            )?,
+        };
         reuse_assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
             output_column_id: output.column_id,
             expr: Some(reuse),
@@ -1685,7 +1951,7 @@ fn build_merge_change_event_expand(
         if let Some(column) = maybe_output_column_by_name(&child_outputs, &insert_name)? {
             fresh_assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
                 output_column_id: output.column_id,
-                expr: Some(intern_column(&mut arena, &column)?),
+                expr: Some(intern_column(&mut arena, &column, control)?),
             });
         }
     }
@@ -1695,32 +1961,50 @@ fn build_merge_change_event_expand(
         "__nr_row_id",
         "MERGE old row id",
         row_id.column_id,
+        control,
     )?);
     // Replace and Insert leave the sequence unassigned for commit-time inheritance.
     let mut events = Vec::new();
     if matched_update {
         events.push(crate::optimizer::operator::ChangeEventSpec {
-            predicate: Some(merge_action_predicate(&mut arena, &child_outputs, 1)?),
+            predicate: Some(merge_action_predicate(
+                &mut arena,
+                &child_outputs,
+                1,
+                control,
+            )?),
             effect: novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
             assignments: reuse_assignments,
         });
     }
     if matched_delete {
         events.push(crate::optimizer::operator::ChangeEventSpec {
-            predicate: Some(merge_action_predicate(&mut arena, &child_outputs, 2)?),
+            predicate: Some(merge_action_predicate(
+                &mut arena,
+                &child_outputs,
+                2,
+                control,
+            )?),
             effect: novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
             assignments: delete_assignments,
         });
     }
     if not_matched_insert {
         events.push(crate::optimizer::operator::ChangeEventSpec {
-            predicate: Some(merge_action_predicate(&mut arena, &child_outputs, 3)?),
+            predicate: Some(merge_action_predicate(
+                &mut arena,
+                &child_outputs,
+                3,
+                control,
+            )?),
             effect: novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
             assignments: fresh_assignments,
         });
     }
     if events.is_empty() {
-        return Err("MOR MERGE change-stream expand requires at least one event".to_string());
+        return Err("MOR MERGE change-stream expand requires at least one event"
+            .to_string()
+            .into());
     }
     build_change_expand(
         distributed,
@@ -1729,6 +2013,7 @@ fn build_merge_change_event_expand(
         effect.column_id,
         events,
     )
+    .map_err(crate::compiler::SqlCompileError::Compilation)
 }
 
 fn clone_scalar_arena(
@@ -1782,8 +2067,8 @@ fn allocate_change_outputs(
             let output = crate::analysis::OutputColumn {
                 column_id: crate::column_id::ColumnId(next),
                 name: name.to_string(),
-                data_type,
-                nullable,
+                value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
                 is_internal,
             };
             next += 1;
@@ -1870,22 +2155,24 @@ fn output_expr(
     name: &str,
     label: &str,
     output_column_id: crate::column_id::ColumnId,
-) -> Result<crate::optimizer::operator::ChangeEventOutputExpr, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::optimizer::operator::ChangeEventOutputExpr, crate::compiler::SqlCompileError> {
     Ok(crate::optimizer::operator::ChangeEventOutputExpr {
         output_column_id,
-        expr: Some(child_expr(arena, columns, name, label)?),
+        expr: Some(child_expr(arena, columns, name, label, control)?),
     })
 }
 
 fn intern_column(
     arena: &mut crate::optimizer::scalar::ScalarArena,
     column: &crate::analysis::OutputColumn,
-) -> Result<crate::optimizer::scalar::ScalarId, String> {
-    Ok(arena.intern(
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::optimizer::scalar::ScalarId, crate::compiler::SqlCompileError> {
+    arena.intern_observed(
         crate::optimizer::scalar::ScalarNode::ColumnRef(column.column_id),
-        column.data_type.clone(),
-        column.nullable,
-    ))
+        column.value_type.clone(),
+        control,
+    )
 }
 
 fn child_expr(
@@ -1893,34 +2180,36 @@ fn child_expr(
     columns: &[crate::analysis::OutputColumn],
     name: &str,
     label: &str,
-) -> Result<crate::optimizer::scalar::ScalarId, String> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::optimizer::scalar::ScalarId, crate::compiler::SqlCompileError> {
     let column = output_column_by_name(columns, name, label)?;
-    intern_column(arena, &column)
+    intern_column(arena, &column, control)
 }
 
 fn merge_action_predicate(
     arena: &mut crate::optimizer::scalar::ScalarArena,
     columns: &[crate::analysis::OutputColumn],
     action: i32,
-) -> Result<crate::optimizer::scalar::ScalarId, String> {
-    let action_expr = child_expr(arena, columns, "__nr_merge_action", "MERGE action")?;
-    let literal = arena.intern(
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::optimizer::scalar::ScalarId, crate::compiler::SqlCompileError> {
+    let action_expr = child_expr(arena, columns, "__nr_merge_action", "MERGE action", control)?;
+    let literal = arena.intern_observed(
         crate::optimizer::scalar::ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
             crate::analysis::LiteralValue::Int(i64::from(action)),
         )),
-        arrow::datatypes::DataType::Int64,
-        false,
-    );
-    Ok(arena.intern(
+        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int64, false),
+        control,
+    )?;
+    arena.intern_observed(
         crate::optimizer::scalar::ScalarNode::BinaryOp {
             op: crate::common::BinOp::Eq,
             left: action_expr,
             right: literal,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        arrow::datatypes::DataType::Boolean,
-        false,
-    ))
+        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Boolean, false),
+        control,
+    )
 }
 
 pub(crate) fn build_change_expand(
@@ -2029,15 +2318,9 @@ pub fn statistics_provider_read_need(
             ),
             version: crate::compiler::ProviderReadVersionNeed::Snapshot(scan.version_ordinal),
         },
-        scan.columns.iter().map(|column| {
-            (
-                Box::<str>::from(column.name()),
-                novarocks_physical_plan::ValueType {
-                    data_type: column.data_type().clone(),
-                    nullable: column.nullable(),
-                },
-            )
-        }),
+        scan.columns
+            .iter()
+            .map(|column| (Box::<str>::from(column.name()), column.value_type().clone())),
     )
     .map_err(|error| error.to_string())
 }
@@ -2062,31 +2345,58 @@ pub fn build_final_statistics_connector_plan(
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     settings: &crate::compiler::SessionOptimizerSettings,
     final_context: DmlFinalPlanContext,
-) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    root_allow_throw_exception: bool,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &crate::compiler::SqlCompileControl,
+) -> Result<crate::compiler::SqlAuthoredPhysicalPlan, crate::compiler::SqlCompileError> {
     if required.is_empty() {
         return Err(
-            "empty ANALYZE requirements must bypass distributed planning and execution".to_string(),
+            "empty ANALYZE requirements must bypass distributed planning and execution"
+                .to_string()
+                .into(),
         );
     }
-    let (version, dop_domain, reads) = final_context.into_parts();
+    // This generated source has no preceding analyzed catalog owner. Capture
+    // once before authoring its first binding, and retain that same owner.
+    control.check()?;
+    let functions = functions.snapshot();
+    control.check()?;
+    let (version, dop_domain, reads, emission_mode) = final_context.into_parts();
     let reads = reads.ok_or_else(|| {
         "ANALYZE final planning requires exactly one finalized provider read".to_string()
     })?;
     let scan_occurrence = reads
         .single_occurrence()
         .map_err(|error| error.to_string())?;
-    let mut physical =
-        build_statistics_connector_physical(scan, required, functions, scan_occurrence)?;
+    let mut physical = build_statistics_connector_physical(
+        scan,
+        required,
+        functions.as_ref(),
+        scan_occurrence,
+        decimal_overflow_policy,
+        constant_policy,
+        control,
+    )?;
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
         &mut physical,
         settings,
     );
-    let builder =
-        crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
-            &physical, version, dop_domain, reads,
-        )
-        .map_err(|error| error.to_string())?;
-    builder.finish().map_err(|error| error.to_string())
+    let draft = crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
+        &physical,
+        version,
+        dop_domain,
+        reads,
+        functions,
+        root_allow_throw_exception,
+        constant_policy,
+        emission_mode,
+        control,
+    )
+    .map_err(final_lowering_error)?;
+    draft
+        .finish_with_dependency_observer_observed(control)
+        .map_err(final_plan_publication_error)
 }
 
 fn build_statistics_connector_physical(
@@ -2094,10 +2404,15 @@ fn build_statistics_connector_physical(
     required: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     scan_occurrence: novarocks_physical_plan::ProviderReadOccurrenceId,
-) -> Result<crate::planner::physical::PhysicalPlanNode, String> {
+    decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<crate::planner::physical::PhysicalPlanNode, crate::compiler::SqlCompileError> {
     if required.is_empty() {
         return Err(
-            "empty ANALYZE requirements must bypass distributed planning and execution".to_string(),
+            "empty ANALYZE requirements must bypass distributed planning and execution"
+                .to_string()
+                .into(),
         );
     }
     let mut factory = crate::column_id::ColumnRefFactory::new();
@@ -2105,17 +2420,13 @@ fn build_statistics_connector_physical(
         .columns
         .iter()
         .map(|column| {
-            let column_id = factory.create(
-                None,
-                column.name().to_string(),
-                column.data_type().clone(),
-                column.nullable(),
-            );
+            let column_id =
+                factory.create(None, column.name().to_string(), column.value_type().clone());
             crate::analysis::OutputColumn {
                 column_id,
                 name: column.name().to_string(),
-                data_type: column.data_type().clone(),
-                nullable: column.nullable(),
+                value_type: column.value_type().clone(),
+
                 is_internal: false,
             }
         })
@@ -2127,7 +2438,9 @@ fn build_statistics_connector_physical(
         .map(|(index, column)| (column.ordinal(), index))
         .collect::<std::collections::BTreeMap<_, _>>();
     if scan_index_by_ordinal.len() != scan.columns.len() {
-        return Err("ANALYZE scan contains duplicate provider column ordinals".to_string());
+        return Err("ANALYZE scan contains duplicate provider column ordinals"
+            .to_string()
+            .into());
     }
     let physical_scan: crate::planner::physical::PhysicalScanNode =
         crate::planner::payload::PlanScanNode {
@@ -2137,14 +2450,15 @@ fn build_statistics_connector_physical(
                 columns: scan
                     .columns
                     .iter()
-                    .map(|column| novarocks_types::schema::ColumnDef {
-                        name: column.name().to_string(),
-                        data_type: column.data_type().clone(),
-                        nullable: column.nullable(),
-                        write_default: None,
-                        logical_type: None,
+                    .map(|column| {
+                        novarocks_types::schema::ColumnDef::from_value_type(
+                            column.name().to_string(),
+                            column.value_type().clone(),
+                            None,
+                        )
+                        .map_err(|error| error.to_string())
                     })
-                    .collect(),
+                    .collect::<Result<Vec<_>, _>>()?,
                 iceberg_row_lineage_metadata_columns: Vec::new(),
                 source: crate::planner::table::ScanSource::Sql(
                     crate::planner::table::SqlScanSource::new(
@@ -2218,13 +2532,12 @@ fn build_statistics_connector_physical(
                     requirement.input().name()
                 )
             })?;
-        if input.data_type != *requirement.input().data_type()
-            || input.nullable != requirement.input().nullable()
-        {
+        if &input.value_type != requirement.input().value_type() {
             return Err(format!(
                 "ANALYZE aggregate input `{}` does not match its pinned scan type",
                 requirement.input().name()
-            ));
+            )
+            .into());
         }
         let args = vec![crate::analysis::TypedExpr {
             kind: crate::analysis::ExprKind::ColumnRef {
@@ -2232,8 +2545,7 @@ fn build_statistics_connector_physical(
                 qualifier: None,
                 column: input.name.clone(),
             },
-            data_type: input.data_type.clone(),
-            nullable: input.nullable,
+            value_type: input.value_type.clone(),
         }];
         let resolved = crate::functions::resolve_sql_aggregate_binding(
             functions,
@@ -2241,91 +2553,79 @@ fn build_statistics_connector_physical(
             &args,
             &[],
             true,
+            constant_policy,
+            control,
         )
-        .map_err(|error| {
-            format!(
+        .map_err(|error| match error {
+            novarocks_functions::FunctionBindingError::Control(error) => {
+                crate::compiler::SqlCompileError::from(error)
+            }
+            error => crate::compiler::SqlCompileError::Compilation(format!(
                 "resolve trusted ANALYZE aggregate `{}` for {:?}: {error}",
                 requirement.function_name(),
                 requirement.input().data_type()
-            )
+            )),
         })?;
+        let resolved = crate::binding::SqlFunctionBinding::new(resolved, decimal_overflow_policy);
+        let result_type = crate::functions::aggregate_result_type(&resolved);
+        if result_type.logical_type != novarocks_type_contract::ValueLogicalType::Physical
+            || result_type.data_type != arrow::datatypes::DataType::Binary
+        {
+            return Err(
+                "ANALYZE aggregate must produce an exact Physical Binary artifact body".into(),
+            );
+        }
         let partial_output_id = factory.create(
             None,
             format!("analyze_state_{index}"),
             crate::functions::aggregate_selection(&resolved)
                 .intermediate_type
-                .data_type
                 .clone(),
-            crate::functions::aggregate_selection(&resolved)
-                .intermediate_type
-                .nullable,
         );
         let result_nullable = crate::functions::aggregate_result_type(&resolved).nullable;
         let final_output_id = factory.create(
             None,
             format!("analyze_body_{index}"),
-            crate::functions::aggregate_result_type(&resolved)
-                .data_type
-                .clone(),
-            result_nullable,
+            crate::functions::aggregate_result_type(&resolved).clone(),
         );
         body_nullable |= result_nullable;
         let output_name = format!("analyze_body_{index}");
         final_columns.push(crate::analysis::OutputColumn {
             column_id: final_output_id,
             name: output_name.clone(),
-            data_type: crate::functions::aggregate_result_type(&resolved)
-                .data_type
-                .clone(),
-            nullable: result_nullable,
+            value_type: crate::functions::aggregate_result_type(&resolved).clone(),
+
             is_internal: true,
         });
         partial_columns.push(crate::analysis::OutputColumn {
             column_id: partial_output_id,
             name: format!("analyze_state_{index}"),
-            data_type: crate::functions::aggregate_selection(&resolved)
+            value_type: crate::functions::aggregate_selection(&resolved)
                 .intermediate_type
-                .data_type
                 .clone(),
-            nullable: crate::functions::aggregate_selection(&resolved)
-                .intermediate_type
-                .nullable,
+
             is_internal: true,
         });
+        let result_type = crate::functions::aggregate_result_type(&resolved)
+            .data_type
+            .clone();
+        // Both phases retain the original logical update source. The merge
+        // lowerer selects the materialized state channel independently.
+        let source =
+            crate::binding::AggregateArgumentSource::logical_update(args, Vec::new(), resolved);
         local_calls.push(crate::planner::payload::AggregateCall {
             name: requirement.function_name().to_string(),
-            args,
             distinct: false,
-            result_type: crate::functions::aggregate_result_type(&resolved)
-                .data_type
-                .clone(),
-            order_by: Vec::new(),
+            result_type: result_type.clone(),
+            source: source.clone(),
             output_column_id: partial_output_id,
-            resolved: resolved.clone().into(),
         });
         global_calls.push(crate::planner::payload::AggregateCall {
             name: requirement.function_name().to_string(),
-            args: vec![crate::analysis::TypedExpr {
-                kind: crate::analysis::ExprKind::ColumnRef {
-                    column_id: partial_output_id,
-                    qualifier: None,
-                    column: format!("analyze_state_{index}"),
-                },
-                data_type: crate::functions::aggregate_selection(&resolved)
-                    .intermediate_type
-                    .data_type
-                    .clone(),
-                nullable: crate::functions::aggregate_selection(&resolved)
-                    .intermediate_type
-                    .nullable,
-            }],
             distinct: false,
-            result_type: crate::functions::aggregate_result_type(&resolved)
-                .data_type
-                .clone(),
-            order_by: Vec::new(),
+            result_type,
+            source,
             output_column_id: final_output_id,
-            resolved: resolved.into(),
         });
     }
 
@@ -2395,54 +2695,59 @@ fn build_statistics_connector_physical(
     let input_fields = factory.create(
         None,
         "input_fields".to_string(),
-        input_fields_type.clone(),
-        false,
+        novarocks_type_contract::FunctionValueType::new(input_fields_type.clone(), false),
     );
     let blob_type = factory.create(
         None,
         "blob_type".to_string(),
-        arrow::datatypes::DataType::Utf8,
-        false,
+        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Utf8, false),
     );
     let body = factory.create(
         None,
         "body".to_string(),
-        arrow::datatypes::DataType::Binary,
-        body_nullable,
+        novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Binary,
+            body_nullable,
+        ),
     );
     let properties = factory.create(
         None,
         "properties".to_string(),
-        properties_type.clone(),
-        false,
+        novarocks_type_contract::FunctionValueType::new(properties_type.clone(), false),
     );
     let root_columns = vec![
         crate::analysis::OutputColumn {
             column_id: input_fields,
             name: "input_fields".to_string(),
-            data_type: input_fields_type,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(input_fields_type, false),
+
             is_internal: true,
         },
         crate::analysis::OutputColumn {
             column_id: blob_type,
             name: "blob_type".to_string(),
-            data_type: arrow::datatypes::DataType::Utf8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Utf8,
+                false,
+            ),
+
             is_internal: true,
         },
         crate::analysis::OutputColumn {
             column_id: body,
             name: "body".to_string(),
-            data_type: arrow::datatypes::DataType::Binary,
-            nullable: body_nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Binary,
+                body_nullable,
+            ),
+
             is_internal: true,
         },
         crate::analysis::OutputColumn {
             column_id: properties,
             name: "properties".to_string(),
-            data_type: properties_type,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(properties_type, false),
+
             is_internal: true,
         },
     ];
@@ -2462,8 +2767,10 @@ fn build_statistics_connector_physical(
                                 requirement.artifact().blob_type().to_string(),
                             ),
                         ),
-                        data_type: arrow::datatypes::DataType::Utf8,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            arrow::datatypes::DataType::Utf8,
+                            false,
+                        ),
                     }),
                     crate::analysis::UnpivotConstant::Utf8Map(Vec::new()),
                 ],
@@ -2481,6 +2788,8 @@ fn build_statistics_connector_physical(
         root_columns.clone(),
         4096,
         novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
+        constant_policy,
+        control,
     )?;
     let physical = crate::planner::physical::PhysicalPlanNode {
         kind: crate::planner::physical::PhysicalPlanKind::Unpivot(unpivot),
@@ -2490,6 +2799,11 @@ fn build_statistics_connector_physical(
         probe_runtime_filters: Vec::new(),
     };
     Ok(physical)
+}
+
+#[cfg(test)]
+pub(crate) fn statistics_final_context_for_test() -> DmlFinalPlanContext {
+    tests::statistics_final_context()
 }
 
 #[cfg(test)]
@@ -2527,8 +2841,7 @@ mod tests {
         .map(|(index, (name, data_type))| crate::analysis::OutputColumn {
             column_id: crate::column_id::ColumnId(index as u32 + 1),
             name: name.into(),
-            data_type,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, true),
             is_internal: true,
         })
         .collect::<Vec<_>>();
@@ -2563,7 +2876,7 @@ mod tests {
             .iter()
             .find(|output| output.name == super::ICEBERG_LAST_UPDATED_SEQUENCE_COLUMN)
             .expect("sequence output");
-        assert!(sequence.nullable);
+        assert!(sequence.value_type.nullable);
         let row_id = producer
             .output_columns
             .iter()
@@ -2602,8 +2915,12 @@ mod tests {
             write_default: None,
             logical_type: None,
         }];
-        let producer =
-            super::build_update_change_event_expand(mor_match_producer(), &columns).unwrap();
+        let producer = super::build_update_change_event_expand(
+            mor_match_producer(),
+            &columns,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         assert_replace_inherits_sequence_and_preserves_row_id(&producer);
     }
 
@@ -2622,6 +2939,7 @@ mod tests {
             true,
             true,
             true,
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .unwrap();
         assert_replace_inherits_sequence_and_preserves_row_id(&producer);
@@ -2633,129 +2951,126 @@ mod tests {
     }
 
     #[test]
-    fn m07_ctas_source_keeps_exact_producer_domains_until_target_admission() {
-        use crate::compiler::*;
-        use novarocks_physical_plan::ResultValueDomain as Domain;
-        for (sql, expected) in [
+    fn observed_plan_publication_preserves_control_and_ordinary_diagnostics() {
+        use novarocks_physical_plan::{ConstantReferenceError, PlanConstructionError};
+        use novarocks_type_contract::CompileControlError;
+        for (cause, expected) in [
             (
-                "select percentile_hash(cast(1 as double)) as v",
-                Domain::Percentile,
+                CompileControlError::Cancelled,
+                crate::compiler::SqlCompileError::Cancelled,
             ),
-            ("select to_bitmap(1) as v", Domain::Bitmap),
-            ("select bitmap_to_binary(to_bitmap(1)) as v", Domain::Plain),
+            (
+                CompileControlError::DeadlineExceeded,
+                crate::compiler::SqlCompileError::DeadlineExceeded,
+            ),
+            (
+                CompileControlError::ResourceExhausted,
+                crate::compiler::SqlCompileError::ResourceExhausted,
+            ),
         ] {
-            let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
-            let snapshot = SqlPlannerTableSnapshot::new(&catalog);
-            let control = SqlCompileControl::unbounded();
-            let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-                SqlStatementInput::sql(sql),
-                SqlCompileIntent::IcebergWrite {
-                    root_distribution: RootDistributionRequirement::Any,
-                },
-                SqlSessionContext {
-                    sql_semantics: Default::default(),
-                    current_catalog: None,
-                    current_database: "default".into(),
-                    optimizer_settings: Default::default(),
-                },
-                SqlPlanningEnvironment::Distributed,
-                &snapshot,
-                builtin_sql_function_catalog(),
-                noop_constant_evaluator(),
-                None,
-                control.clone(),
-            ))
-            .unwrap()
-            .into_pending()
-            .unwrap();
-            let source = super::compile_ctas_source(SqlOptimizeRequest::new(
-                analyzed,
-                &DmlStatisticsSnapshot::empty(),
-                control,
-            ))
-            .unwrap();
-            let columns = source.output_columns();
-            assert_eq!(columns.len(), 1, "{sql}");
-            assert_eq!(columns[0].domain, expected, "{sql}");
             assert_eq!(
-                source.has_private_output_domain(),
-                expected == Domain::Percentile
+                super::final_plan_construction_error(PlanConstructionError::Constants(
+                    ConstantReferenceError::Control(cause),
+                )),
+                expected,
             );
-            if expected != Domain::Plain {
-                let mut erased = source.clone();
-                erased.output_domains[0] = Domain::Plain;
-                assert_ne!(source.capture_fingerprint(), erased.capture_fingerprint());
-            }
+        }
+        let ordinary = PlanConstructionError::Constants(ConstantReferenceError::InvalidConsumer(
+            "cancelled is only diagnostic text",
+        ));
+        let expected = ordinary.to_string();
+        assert_eq!(
+            super::final_plan_construction_error(ordinary),
+            crate::compiler::SqlCompileError::Compilation(expected),
+        );
+    }
+
+    fn statistics_scan_with_type(
+        value_type: novarocks_type_contract::FunctionValueType,
+    ) -> super::StatisticsConnectorScan {
+        super::StatisticsConnectorScan {
+            binding: crate::binding::SqlTableBindingId::new_for_test(1),
+            catalog: "iceberg".into(),
+            namespace: "db".into(),
+            table: "t".into(),
+            version_ordinal: 42,
+            columns: vec![
+                novarocks_spi::connector::StatisticsScanColumn::try_new(0, "u", value_type)
+                    .unwrap(),
+            ],
         }
     }
 
     #[test]
-    fn m07_ctas_complete_private_declaration_survives_unmarked_multi_column_source() {
-        use crate::compiler::*;
-        use arrow::datatypes::{DataType as D, Field};
-        use novarocks_types::schema::{ColumnDef, SqlType as T};
-        use std::sync::Arc;
-        for logical in [T::Object, T::Percentile] {
-            let mut catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
-            crate::planning::catalog::register_test_connector_read_table(
-                &mut catalog,
-                "default",
-                "t",
-                vec![ColumnDef {
-                    name: "state".into(),
-                    data_type: D::List(Arc::new(Field::new("item", D::Binary, true))),
-                    nullable: true,
-                    write_default: None,
-                    logical_type: Some(T::Array(Box::new(logical))),
-                }],
-            )
-            .unwrap();
-            let snapshot = SqlPlannerTableSnapshot::new(&catalog);
-            let control = SqlCompileControl::unbounded();
-            let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
-                SqlStatementInput::sql("select state, 1 as plain from t"),
-                SqlCompileIntent::IcebergWrite {
-                    root_distribution: RootDistributionRequirement::Any,
-                },
-                SqlSessionContext {
-                    sql_semantics: Default::default(),
-                    current_catalog: None,
-                    current_database: "default".into(),
-                    optimizer_settings: Default::default(),
-                },
-                SqlPlanningEnvironment::Distributed,
-                &snapshot,
-                builtin_sql_function_catalog(),
-                noop_constant_evaluator(),
-                None,
-                control.clone(),
-            ))
-            .unwrap()
-            .into_pending()
-            .unwrap();
-            let source = super::compile_ctas_source(SqlOptimizeRequest::new(
-                analyzed,
-                &DmlStatisticsSnapshot::from_evidence([super::DmlStatisticsEvidence::Missing {
-                    binding: crate::binding::SqlTableBindingId::new_for_test(1),
-                    label: "test_catalog.test_db.test_table".into(),
-                    reason: "fixture has no published statistics".into(),
-                }]),
-                control,
-            ))
-            .unwrap();
-            assert_eq!(source.output_columns().len(), 2);
-            assert_eq!(
-                source.output_columns()[0].domain,
-                novarocks_physical_plan::ResultValueDomain::Plain
-            );
-            assert!(source.has_private_output_domain());
-            let mut erased = source.clone();
-            erased.private_output_domain = false;
-            assert_ne!(source.capture_fingerprint(), erased.capture_fingerprint());
+    fn statistics_provider_need_preserves_uuid_and_physical_fixed16_identity() {
+        use novarocks_spi::connector::read_stack::value::ConnectorValueType;
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        for (value_type, connector_type) in [
+            (
+                FunctionValueType::new(arrow::datatypes::DataType::FixedSizeBinary(16), true),
+                ConnectorValueType::Fixed { length: 16 },
+            ),
+            (
+                FunctionValueType::try_with_logical_type(
+                    arrow::datatypes::DataType::FixedSizeBinary(16),
+                    true,
+                    ValueLogicalType::Uuid,
+                )
+                .unwrap(),
+                ConnectorValueType::Uuid,
+            ),
+        ] {
+            let scan = statistics_scan_with_type(value_type.clone());
+            let need = super::statistics_provider_read_need(&scan).unwrap();
+            assert_eq!(need.columns()[0].engine_type(), &value_type);
+            assert_eq!(need.columns()[0].connector_type(), connector_type);
         }
     }
 
-    fn statistics_final_context() -> super::DmlFinalPlanContext {
+    #[test]
+    fn statistics_pinned_scan_rejects_equal_carrier_with_different_root_domain() {
+        use novarocks_spi::connector::{
+            StatisticsArtifactIdentity, StatisticsRequiredAggregation, StatisticsScanColumn,
+        };
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        let source = FunctionValueType::try_with_logical_type(
+            arrow::datatypes::DataType::FixedSizeBinary(16),
+            true,
+            ValueLogicalType::Uuid,
+        )
+        .unwrap();
+        let scan = statistics_scan_with_type(source);
+        let requirement = StatisticsRequiredAggregation::try_new(
+            StatisticsScanColumn::try_new(
+                0,
+                "u",
+                FunctionValueType::new(arrow::datatypes::DataType::FixedSizeBinary(16), true),
+            )
+            .unwrap(),
+            "$test",
+            StatisticsArtifactIdentity::try_new(vec![7], "test/blob").unwrap(),
+        )
+        .unwrap();
+        let functions = crate::functions::build_builtin_engine_function_catalog().unwrap();
+        let error = super::build_statistics_connector_physical(
+            scan,
+            &[requirement],
+            &functions,
+            novarocks_physical_plan::ProviderReadOccurrenceId::new(37),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its pinned scan type"),
+            "{error}"
+        );
+    }
+
+    pub(super) fn statistics_final_context() -> super::DmlFinalPlanContext {
         use novarocks_physical_plan::{
             ExactInputVersion, PipelineDopDomain, PlanVersionId, ProviderColumnReference,
             ProviderReadReference, ScanReadBudget, ValueType,
@@ -2779,6 +3094,7 @@ mod tests {
                 0,
                 "id",
                 ValueType {
+                    logical_type: novarocks_type_contract::ValueLogicalType::Physical,
                     data_type: arrow::datatypes::DataType::Int64,
                     nullable: true,
                 },
@@ -2829,8 +3145,6 @@ mod tests {
             predicates: Box::default(),
             limit: crate::compiler::ProviderReadLimitFact::NotRequested,
             provided_properties: crate::compiler::ProviderReadProperties::unconstrained(),
-            artifact_inputs: Box::default(),
-            artifact_refs: Box::default(),
             coverage_evidence: Box::default(),
         };
         super::DmlFinalPlanContext::new(
@@ -2851,6 +3165,7 @@ mod tests {
                     },
                 ),
             ),
+            crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
         )
     }
 
@@ -2875,32 +3190,148 @@ mod tests {
             .expect("aggregate overload")],
         );
         let requirement = StatisticsRequiredAggregation::try_new(
-            StatisticsScanColumn::try_new(0, "id", arrow::datatypes::DataType::Int64, true)
-                .expect("scan column"),
+            StatisticsScanColumn::try_new(
+                0,
+                "id",
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    true,
+                ),
+            )
+            .expect("scan column"),
             "$test_blob_aggregate",
             StatisticsArtifactIdentity::try_new(vec![7], "test-blob-v1")
                 .expect("artifact identity"),
         )
         .expect("requirement");
 
-        let plan = super::build_final_statistics_connector_plan(
-            super::StatisticsConnectorScan {
-                binding: crate::binding::SqlTableBindingId::new_for_test(1),
-                catalog: "iceberg".into(),
-                namespace: "db".into(),
-                table: "t".into(),
-                version_ordinal: 42,
-                columns: vec![
-                    StatisticsScanColumn::try_new(0, "id", arrow::datatypes::DataType::Int64, true)
-                        .expect("scan column"),
-                ],
-            },
-            &[requirement],
+        let scan_source = super::StatisticsConnectorScan {
+            binding: crate::binding::SqlTableBindingId::new_for_test(1),
+            catalog: "iceberg".into(),
+            namespace: "db".into(),
+            table: "t".into(),
+            version_ordinal: 42,
+            columns: vec![
+                StatisticsScanColumn::try_new(
+                    0,
+                    "id",
+                    novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    ),
+                )
+                .expect("scan column"),
+            ],
+        };
+        let physical = super::build_statistics_connector_physical(
+            scan_source.clone(),
+            std::slice::from_ref(&requirement),
+            &functions,
+            novarocks_physical_plan::ProviderReadOccurrenceId::new(37),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("ANALYZE physical source");
+        // Unpivot -> Global -> Gather -> Local -> Scan is the production
+        // two-phase tree. The materializer must remain the direct root.
+        assert!(matches!(
+            &physical.kind,
+            crate::planner::physical::PhysicalPlanKind::Unpivot(_)
+        ));
+        assert_eq!(physical.children.len(), 1);
+        let global_node = &physical.children[0];
+        assert_eq!(global_node.children.len(), 1);
+        let gather_node = &global_node.children[0];
+        let crate::planner::physical::PhysicalPlanKind::Redistribute(gather) = &gather_node.kind
+        else {
+            panic!("expected Gather between aggregate phases");
+        };
+        assert_eq!(
+            gather.mode,
+            crate::planner::physical::RedistributeMode::Gather
+        );
+        assert_eq!(gather_node.children.len(), 1);
+        let local_node = &gather_node.children[0];
+        assert_eq!(local_node.children.len(), 1);
+        assert!(matches!(
+            &local_node.children[0].kind,
+            crate::planner::physical::PhysicalPlanKind::Scan(_)
+        ));
+        let crate::planner::physical::PhysicalPlanKind::HashAggregate(global_source) =
+            &global_node.kind
+        else {
+            panic!("expected Global aggregate");
+        };
+        let crate::planner::physical::PhysicalPlanKind::HashAggregate(local_source) =
+            &local_node.kind
+        else {
+            panic!("expected Local aggregate");
+        };
+        assert_eq!(
+            global_source.mode,
+            crate::planner::physical::AggMode::Global
+        );
+        assert_eq!(local_source.mode, crate::planner::physical::AggMode::Local);
+        assert_eq!(global_source.is_merge, [true]);
+        assert_eq!(local_source.is_merge, [false]);
+        let local_call = &local_source.aggregates[0];
+        let global_call = &global_source.aggregates[0];
+        let (local_args, local_order, local_binding) = local_call
+            .source
+            .logical_parts()
+            .expect("Local authors a certified logical update");
+        let (global_args, global_order, global_binding) = global_call
+            .source
+            .logical_parts()
+            .expect("Global transfers the certified update source");
+        assert!(std::ptr::eq(
+            local_binding.resolved(),
+            global_binding.resolved()
+        ));
+        assert_eq!(
+            local_binding.decimal_overflow_policy(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull
+        );
+        assert!(local_order.is_empty() && global_order.is_empty());
+        assert_eq!(local_args.len(), 1);
+        assert_eq!(global_args.len(), 1);
+        let scan_input = &local_node.children[0].output_columns[0];
+        for argument in [&local_args[0], &global_args[0]] {
+            assert_eq!(argument.value_type, scan_input.value_type);
+            assert_eq!(
+                argument.value_type,
+                requirement.input().value_type().clone()
+            );
+            let crate::analysis::ExprKind::ColumnRef {
+                column_id, column, ..
+            } = &argument.kind
+            else {
+                panic!("logical update must read the original scan column");
+            };
+            assert_eq!(*column_id, scan_input.column_id);
+            assert_eq!(column, "id");
+            assert_ne!(*column_id, local_call.output_column_id);
+        }
+        assert_eq!(
+            local_node.output_columns[0].value_type.data_type,
+            arrow::datatypes::DataType::Binary
+        );
+        assert_eq!(global_call.result_type, arrow::datatypes::DataType::Binary);
+
+        let authored = super::build_final_statistics_connector_plan(
+            scan_source,
+            std::slice::from_ref(&requirement),
             &functions,
             &SessionOptimizerSettings::default(),
             statistics_final_context(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            false,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("ANALYZE plan");
+        let plan = authored.plan();
 
         assert_eq!(plan.fragments().len(), 2);
         assert!(matches!(
@@ -2932,6 +3363,41 @@ mod tests {
         );
         for fragment in plan.fragments().values() {
             for node in fragment.nodes().values() {
+                if let NodeKind::Aggregate { calls, .. } = &node.kind {
+                    let control = crate::compiler::SqlCompileControl::unbounded();
+                    let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+                        &control,
+                        novarocks_type_contract::CompilePhase::Validate,
+                    )
+                    .unwrap();
+                    for (ordinal, call) in calls.iter().enumerate() {
+                        let source = authored
+                            .checked_aggregate_source_observed(
+                                fragment,
+                                node,
+                                novarocks_physical_plan::PhysicalCallSite::Aggregate {
+                                    node: node.id,
+                                    call: u32::try_from(ordinal).unwrap(),
+                                },
+                                call,
+                                &mut work,
+                            )
+                            .expect("ANALYZE retains its exact logical source journal");
+                        assert_eq!(source.phase(), call.binding.phase);
+                        let request = source.captured().request();
+                        assert_eq!(request.logical_argument_count, 1);
+                        let novarocks_functions::FunctionArgument::Value {
+                            value_type,
+                            constant,
+                        } = &request.arguments[0]
+                        else {
+                            panic!("ANALYZE logical input is its original scan value");
+                        };
+                        assert_eq!(value_type, requirement.input().value_type());
+                        assert!(constant.is_none());
+                    }
+                    work.finish().unwrap();
+                }
                 match &node.kind {
                     NodeKind::Scan { occurrence, .. } => {
                         scan += 1;
@@ -2947,6 +3413,16 @@ mod tests {
                         }) =>
                     {
                         local += 1;
+                        assert_eq!(calls[0].arguments.len(), 1);
+                        assert_eq!(
+                            fragment
+                                .expressions()
+                                .get(calls[0].arguments[0])
+                                .unwrap()
+                                .ty,
+                            requirement.input().value_type().clone(),
+                            "Partial runtime channel reads the original logical input"
+                        );
                     }
                     NodeKind::Aggregate { calls, .. }
                         if calls.iter().all(|call| {
@@ -2954,6 +3430,23 @@ mod tests {
                         }) =>
                     {
                         global += 1;
+                        assert_eq!(calls[0].arguments.len(), 1);
+                        assert_eq!(
+                            fragment
+                                .expressions()
+                                .get(calls[0].arguments[0])
+                                .unwrap()
+                                .ty,
+                            calls[0].binding.intermediate_type,
+                            "Final runtime channel reads the actual materialized state"
+                        );
+                        assert_eq!(
+                            calls[0].binding.function.argument_types[0],
+                            novarocks_type_contract::FunctionArgumentType::Value(
+                                requirement.input().value_type().clone()
+                            ),
+                            "Final still carries the original logical signature"
+                        );
                     }
                     NodeKind::ExchangeSource { .. } => exchange += 1,
                     NodeKind::Unpivot { spec } => {
@@ -3317,10 +3810,13 @@ mod tests {
             &[statistics_route(0), statistics_route(1)],
             vec![empty_statistics_target(0)],
             functions,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("missing target must fail");
         assert!(
-            missing.contains("missing=[1], extraneous=[]"),
+            missing.to_string().contains("missing=[1], extraneous=[]"),
             "unexpected error: {missing}"
         );
 
@@ -3328,10 +3824,13 @@ mod tests {
             &[statistics_route(0)],
             vec![empty_statistics_target(0), empty_statistics_target(0)],
             functions,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("duplicate target must fail");
         assert!(
-            duplicate.contains("repeat write target 0"),
+            duplicate.to_string().contains("repeat write target 0"),
             "unexpected error: {duplicate}"
         );
 
@@ -3339,10 +3838,15 @@ mod tests {
             &[statistics_route(0)],
             vec![empty_statistics_target(0), empty_statistics_target(1)],
             functions,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("extraneous target must fail");
         assert!(
-            extraneous.contains("missing=[], extraneous=[1]"),
+            extraneous
+                .to_string()
+                .contains("missing=[], extraneous=[1]"),
             "unexpected error: {extraneous}"
         );
     }
@@ -3353,6 +3857,9 @@ mod tests {
             &[statistics_route(0), statistics_route(1)],
             vec![empty_statistics_target(0), empty_statistics_target(1)],
             crate::functions::builtin_sql_function_catalog(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("exact empty requirements are a valid ordinary mutation plan");
 
@@ -3395,8 +3902,10 @@ mod tests {
                 StatisticsScanColumn::try_new(
                     0,
                     "order_id",
-                    arrow::datatypes::DataType::Int64,
-                    false,
+                    novarocks_type_contract::FunctionValueType::new(
+                        arrow::datatypes::DataType::Int64,
+                        false,
+                    ),
                 )
                 .expect("scan column"),
                 "$test_change_stream_blob",
@@ -3426,6 +3935,9 @@ mod tests {
                 },
             ],
             &functions,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("production helper plans routed statistics");
 
@@ -3453,5 +3965,456 @@ mod tests {
                 .len(),
             2
         );
+    }
+    #[test]
+    fn actual_dml_output_interning_preserves_control_categories() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Refuse {
+            cause: CompileControlError,
+            at_entry: bool,
+            seen: std::sync::atomic::AtomicBool,
+        }
+        impl PureCompileControl for Refuse {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                if (self.at_entry && units == 0) || (!self.at_entry && units == 256) {
+                    self.seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(self.cause);
+                }
+                Ok(())
+            }
+        }
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for at_entry in [true, false] {
+                let control = Refuse {
+                    cause,
+                    at_entry,
+                    seen: std::sync::atomic::AtomicBool::new(false),
+                };
+                let data_type = arrow::datatypes::DataType::Struct(
+                    (0..300)
+                        .map(|i| {
+                            arrow::datatypes::Field::new(
+                                format!("f{i}"),
+                                arrow::datatypes::DataType::Int64,
+                                false,
+                            )
+                        })
+                        .collect(),
+                );
+                let column = crate::analysis::OutputColumn {
+                    column_id: crate::column_id::ColumnId(1),
+                    name: "payload".into(),
+                    value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
+                    is_internal: false,
+                };
+                let mut arena = crate::optimizer::scalar::ScalarArena::new();
+                let result = super::output_expr(
+                    &mut arena,
+                    &[column],
+                    "payload",
+                    "DML payload",
+                    crate::column_id::ColumnId(2),
+                    &control,
+                );
+                let node =
+                    crate::optimizer::scalar::ScalarNode::ColumnRef(crate::column_id::ColumnId(99));
+                let ty = novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                );
+                let first = arena.intern(node.clone(), ty.clone());
+                let expected = crate::optimizer::scalar::ScalarArena::new().intern(node, ty);
+                assert_eq!(first, expected, "refused insertion cannot publish a scalar");
+                assert!(
+                    control.seen.load(std::sync::atomic::Ordering::SeqCst),
+                    "the original control must observe the refused work"
+                );
+                assert!(matches!(
+                    (cause, result),
+                    (
+                        CompileControlError::Cancelled,
+                        Err(crate::compiler::SqlCompileError::Cancelled)
+                    ) | (
+                        CompileControlError::DeadlineExceeded,
+                        Err(crate::compiler::SqlCompileError::DeadlineExceeded)
+                    ) | (
+                        CompileControlError::ResourceExhausted,
+                        Err(crate::compiler::SqlCompileError::ResourceExhausted)
+                    )
+                ));
+            }
+        }
+    }
+    #[test]
+    fn actual_update_selected_new_column_skips_unused_fallback_interning() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct RefuseUnusedWide;
+        impl PureCompileControl for RefuseUnusedWide {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                if units == 256 {
+                    return Err(CompileControlError::ResourceExhausted);
+                }
+                Ok(())
+            }
+        }
+        for include_unused_old in [false, true] {
+            let source = |id, name: &str, ty| crate::analysis::OutputColumn {
+                column_id: crate::column_id::ColumnId(id),
+                name: name.into(),
+                value_type: novarocks_type_contract::FunctionValueType::new(ty, true),
+                is_internal: false,
+            };
+            let mut columns = vec![
+                source(1, "__nr_file", arrow::datatypes::DataType::Utf8),
+                source(2, "__nr_pos", arrow::datatypes::DataType::Int64),
+                source(3, "__nr_row_id", arrow::datatypes::DataType::Int64),
+                source(4, "__nr_new_k", arrow::datatypes::DataType::Int64),
+            ];
+            if include_unused_old {
+                columns.push(source(
+                    5,
+                    "k",
+                    arrow::datatypes::DataType::Struct(
+                        (0..300)
+                            .map(|i| {
+                                arrow::datatypes::Field::new(
+                                    format!("f{i}"),
+                                    arrow::datatypes::DataType::Int64,
+                                    false,
+                                )
+                            })
+                            .collect(),
+                    ),
+                ));
+            }
+            let mut node = crate::optimizer::OptimizedOperatorNode {
+                op: crate::optimizer::operator::Operator::PhysicalValues(
+                    crate::optimizer::operator::ValuesOp {
+                        rows: vec![],
+                        columns: columns.clone(),
+                    },
+                ),
+                children: vec![],
+                output_columns: columns,
+                stats: Default::default(),
+                explain_stats: Default::default(),
+                execution_props: Default::default(),
+            };
+            crate::optimizer::optimized_tree::attach_scalar_arena(
+                &mut node,
+                std::sync::Arc::new(crate::optimizer::scalar::ScalarArena::new()),
+            );
+            let expanded =
+                super::build_update_change_event_expand(node, &[column("k")], &RefuseUnusedWide)
+                    .expect("selected new value skips missing or refused old value");
+            let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) =
+                &expanded.op
+            else {
+                panic!("expected change-event expansion");
+            };
+            let target = expanded
+                .output_columns
+                .iter()
+                .find(|column| column.name == "k")
+                .unwrap();
+            let expression = expand.events[0]
+                .assignments
+                .iter()
+                .find(|assignment| assignment.output_column_id == target.column_id)
+                .unwrap()
+                .expr
+                .unwrap();
+            assert!(matches!(
+                expanded
+                    .execution_props
+                    .scalar_arena
+                    .as_ref()
+                    .unwrap()
+                    .node(expression),
+                crate::optimizer::scalar::ScalarNode::ColumnRef(crate::column_id::ColumnId(4))
+            ));
+        }
+    }
+
+    #[test]
+    fn dml_read_and_ctas_keep_actual_analyzed_root_allow_across_move_handoffs() {
+        use crate::compiler::{
+            SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent, SqlCompiler,
+            SqlOptimizeRequest, SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext,
+            SqlStatementInput,
+        };
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+        let catalog = SqlPlannerTableSnapshot::new(&catalog);
+        let statistics = DmlStatisticsSnapshot::empty();
+        let constant_policy = novarocks_functions::ConstantPolicy {
+            max_rows: 73,
+            ..crate::constant::test_constant_policy()
+        };
+        for (session_mode, sql, expected) in [
+            ("32", "SELECT 1", false),
+            ("ALLOW_THROW_EXCEPTION", "SELECT 1", true),
+            ("ERROR_IF_OVERFLOW", "SELECT 1", false),
+            (
+                "32",
+                "SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ 1",
+                true,
+            ),
+            (
+                "ALLOW_THROW_EXCEPTION",
+                "SELECT /*+ SET_VAR(sql_mode=32) */ 1",
+                false,
+            ),
+            (
+                "32",
+                "SELECT x FROM (SELECT /*+ SET_VAR(sql_mode='ALLOW_THROW_EXCEPTION') */ 1 AS x) s",
+                false,
+            ),
+            (
+                "ALLOW_THROW_EXCEPTION",
+                "SELECT x FROM (SELECT /*+ SET_VAR(sql_mode=32) */ 1 AS x) s",
+                true,
+            ),
+        ] {
+            let request = |intent| {
+                let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
+                    SqlStatementInput::sql(sql),
+                    intent,
+                    SqlSessionContext {
+                        sql_semantics: crate::sql_mode::SqlSemanticSettings::default()
+                            .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode)),
+                        current_catalog: None,
+                        current_database: "default".into(),
+                        optimizer_settings: SessionOptimizerSettings::default(),
+                    },
+                    SqlPlanningEnvironment::Distributed,
+                    &catalog,
+                    crate::functions::builtin_sql_function_catalog(),
+                    crate::compiler::noop_constant_evaluator(),
+                    None,
+                    constant_policy,
+                    crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+                    SqlCompileControl::unbounded(),
+                ))
+                .unwrap()
+                .into_pending()
+                .unwrap();
+                assert_eq!(analyzed.root_allow_throw_exception(), expected);
+                let request =
+                    SqlOptimizeRequest::new(analyzed, &statistics, SqlCompileControl::unbounded());
+                assert_eq!(request.root_allow_throw_exception(), expected);
+                request
+            };
+            let (completion, reads) = super::begin_final_dml_read_plan(
+                request(SqlCompileIntent::DmlInternalRead),
+                &SessionOptimizerSettings::default(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+            )
+            .unwrap();
+            assert!(reads.is_empty());
+            assert_eq!(completion.root_allow_throw_exception, expected);
+            assert_eq!(completion.constant_policy, constant_policy);
+            let source = super::compile_ctas_source(
+                request(SqlCompileIntent::Query),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+            )
+            .unwrap();
+            assert_eq!(source.root_allow_throw_exception, expected);
+            assert_eq!(source.constant_policy, constant_policy);
+            assert_eq!(source.output_columns().len(), 1);
+        }
+    }
+
+    #[test]
+    fn ctas_capture_fingerprint_binds_root_allow_for_identical_actual_optimized_sources() {
+        use crate::compiler::{
+            SqlAnalyzeRequest, SqlCompileControl, SqlCompileIntent, SqlCompiler,
+            SqlOptimizeRequest, SqlPlannerTableSnapshot, SqlPlanningEnvironment, SqlSessionContext,
+            SqlStatementInput,
+        };
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+        let catalog = SqlPlannerTableSnapshot::new(&catalog);
+        let statistics = DmlStatisticsSnapshot::empty();
+        let sources = ["32", "ALLOW_THROW_EXCEPTION"].map(|session_mode| {
+            let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
+                SqlStatementInput::sql("SELECT 1"),
+                SqlCompileIntent::Query,
+                SqlSessionContext {
+                    sql_semantics: crate::sql_mode::SqlSemanticSettings::default()
+                        .with_sql_mode(crate::sql_mode::SqlMode::from_assignment(session_mode)),
+                    current_catalog: None,
+                    current_database: "default".into(),
+                    optimizer_settings: SessionOptimizerSettings::default(),
+                },
+                SqlPlanningEnvironment::Distributed,
+                &catalog,
+                crate::functions::builtin_sql_function_catalog(),
+                crate::compiler::noop_constant_evaluator(),
+                None,
+                crate::constant::test_constant_policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+                SqlCompileControl::unbounded(),
+            ))
+            .unwrap()
+            .into_pending()
+            .unwrap();
+            super::compile_ctas_source(
+                SqlOptimizeRequest::new(analyzed, &statistics, SqlCompileControl::unbounded()),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+            )
+            .unwrap()
+        });
+        assert!(!sources[0].root_allow_throw_exception);
+        assert!(sources[1].root_allow_throw_exception);
+        // The previous capture material was identical for these two admitted
+        // statements, even though their frozen terminal exception modes differ.
+        assert_eq!(
+            format!("{:#?}", sources[0].optimized),
+            format!("{:#?}", sources[1].optimized)
+        );
+        assert_ne!(
+            sources[0].capture_fingerprint(),
+            sources[1].capture_fingerprint()
+        );
+        for source in &sources {
+            assert_eq!(
+                source.capture_fingerprint(),
+                source.clone().capture_fingerprint()
+            );
+        }
+    }
+
+    #[test]
+    fn m07_ctas_source_keeps_exact_producer_domains_until_target_admission() {
+        use crate::compiler::*;
+        use novarocks_physical_plan::ResultValueDomain as Domain;
+        for (sql, expected) in [
+            (
+                "select percentile_hash(cast(1 as double)) as v",
+                Domain::Percentile,
+            ),
+            ("select to_bitmap(1) as v", Domain::Bitmap),
+            ("select bitmap_to_binary(to_bitmap(1)) as v", Domain::Plain),
+        ] {
+            let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+            let snapshot = SqlPlannerTableSnapshot::new(&catalog);
+            let control = SqlCompileControl::unbounded();
+            let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
+                SqlStatementInput::sql(sql),
+                SqlCompileIntent::IcebergWrite {
+                    root_distribution: RootDistributionRequirement::Any,
+                },
+                SqlSessionContext {
+                    sql_semantics: Default::default(),
+                    current_catalog: None,
+                    current_database: "default".into(),
+                    optimizer_settings: Default::default(),
+                },
+                SqlPlanningEnvironment::Distributed,
+                &snapshot,
+                builtin_sql_function_catalog(),
+                noop_constant_evaluator(),
+                None,
+                crate::constant::test_constant_policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+                control.clone(),
+            ))
+            .unwrap()
+            .into_pending()
+            .unwrap();
+            let source = super::compile_ctas_source(
+                SqlOptimizeRequest::new(analyzed, &DmlStatisticsSnapshot::empty(), control),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+            )
+            .unwrap();
+            let columns = source.output_columns();
+            assert_eq!(columns.len(), 1, "{sql}");
+            assert_eq!(columns[0].domain, expected, "{sql}");
+            assert_eq!(
+                source.has_private_output_domain(),
+                expected == Domain::Percentile
+            );
+            if expected != Domain::Plain {
+                let mut erased = source.clone();
+                erased.output_domains[0] = Domain::Plain;
+                assert_ne!(source.capture_fingerprint(), erased.capture_fingerprint());
+            }
+        }
+    }
+
+    #[test]
+    fn m07_ctas_complete_private_declaration_survives_unmarked_multi_column_source() {
+        use crate::compiler::*;
+        use arrow::datatypes::{DataType as D, Field};
+        use novarocks_types::schema::{ColumnDef, SqlType as T};
+        use std::sync::Arc;
+        for logical in [T::Object, T::Percentile] {
+            let mut catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+            crate::planning::catalog::register_test_connector_read_table(
+                &mut catalog,
+                "default",
+                "t",
+                vec![ColumnDef {
+                    name: "state".into(),
+                    data_type: D::List(Arc::new(Field::new("item", D::Binary, true))),
+                    nullable: true,
+                    write_default: None,
+                    logical_type: Some(T::Array(Box::new(logical))),
+                }],
+            )
+            .unwrap();
+            let snapshot = SqlPlannerTableSnapshot::new(&catalog);
+            let control = SqlCompileControl::unbounded();
+            let analyzed = SqlCompiler::analyze(SqlAnalyzeRequest::new(
+                SqlStatementInput::sql("select state, 1 as plain from t"),
+                SqlCompileIntent::IcebergWrite {
+                    root_distribution: RootDistributionRequirement::Any,
+                },
+                SqlSessionContext {
+                    sql_semantics: Default::default(),
+                    current_catalog: None,
+                    current_database: "default".into(),
+                    optimizer_settings: Default::default(),
+                },
+                SqlPlanningEnvironment::Distributed,
+                &snapshot,
+                builtin_sql_function_catalog(),
+                noop_constant_evaluator(),
+                None,
+                crate::constant::test_constant_policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+                control.clone(),
+            ))
+            .unwrap()
+            .into_pending()
+            .unwrap();
+            let source = super::compile_ctas_source(
+                SqlOptimizeRequest::new(
+                    analyzed,
+                    &DmlStatisticsSnapshot::from_evidence([
+                        super::DmlStatisticsEvidence::Missing {
+                            binding: crate::binding::SqlTableBindingId::new_for_test(1),
+                            label: "test_catalog.test_db.test_table".into(),
+                            reason: "fixture has no published statistics".into(),
+                        },
+                    ]),
+                    control,
+                ),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1,
+            )
+            .unwrap();
+            assert_eq!(source.output_columns().len(), 2);
+            assert_eq!(
+                source.output_columns()[0].domain,
+                novarocks_physical_plan::ResultValueDomain::Plain
+            );
+            assert!(source.has_private_output_domain());
+            let mut erased = source.clone();
+            erased.private_output_domain = false;
+            assert_ne!(source.capture_fingerprint(), erased.capture_fingerprint());
+        }
     }
 }

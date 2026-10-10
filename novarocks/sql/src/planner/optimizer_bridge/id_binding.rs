@@ -223,11 +223,11 @@ fn verify_hash_aggregate(
     let aggregates = materialize_aggregate_calls(scalars, &op.aggregates, &op.output_layout);
     for (idx, aggregate) in aggregates.iter().enumerate() {
         if !op.is_merge.get(idx).copied().unwrap_or(false) {
-            for arg in &aggregate.args {
+            for arg in aggregate.source.arguments() {
                 verify_expr(arg, input, "PhysicalHashAggregate aggregate arg")?;
             }
             verify_sort_items(
-                &aggregate.order_by,
+                aggregate.source.order_by(),
                 input,
                 "PhysicalHashAggregate aggregate order-by",
             )?;
@@ -423,7 +423,7 @@ fn verify_expr(expr: &TypedExpr, input: &HashSet<ColumnId>, context: &str) -> Re
             }
             verify_input_id(*column_id, input, &format!("{context} `{column}`"))
         }
-        ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) => Ok(()),
+        ExprKind::LambdaParamRef { .. } | ExprKind::Literal(_) | ExprKind::Constant(_) => Ok(()),
         ExprKind::BinaryOp { left, right, .. } => {
             verify_expr(left, input, context)?;
             verify_expr(right, input, context)
@@ -653,8 +653,8 @@ mod tests {
         OutputColumn {
             column_id,
             name: name.to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
             is_internal: false,
         }
     }
@@ -666,8 +666,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
         }
     }
 
@@ -703,7 +702,12 @@ mod tests {
         }];
         let mut plan = OptimizedOperatorNode {
             op: Operator::PhysicalProject(ProjectOp {
-                items: intern_project_items(&mut scalars, &items),
+                items: intern_project_items(
+                    &mut scalars,
+                    &items,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
                 output_qualifier: None,
             }),
             children: vec![child],
@@ -729,18 +733,25 @@ mod tests {
             .unwrap_or_else(ScalarArena::new);
         let aggregate_calls = vec![AggregateCall {
             name: "max".to_string(),
-            args: vec![column_ref(ColumnId::new_for_test(1), "a")],
             distinct: false,
             result_type: DataType::Int32,
-            order_by: vec![],
             output_column_id: aggregate_output_id,
-            resolved: crate::functions::test_resolved_aggregate("max", &[DataType::Int32], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![column_ref(ColumnId::new_for_test(1), "a")],
+                vec![],
+                crate::functions::test_resolved_aggregate("max", &[DataType::Int32], false),
+            ),
         }];
         let mut plan = OptimizedOperatorNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
                 group_by: vec![],
-                aggregates: intern_aggregate_calls(&mut scalars, &aggregate_calls),
+                aggregates: intern_aggregate_calls(
+                    &mut scalars,
+                    &aggregate_calls,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
                 output_layout: AggregateOutputLayout::new(
                     vec![],
                     vec![int_col(aggregate_output_id, "sum(a)")],
@@ -861,18 +872,30 @@ mod tests {
         let mut scalars = ScalarArena::new();
         let aggregate_calls = vec![AggregateCall {
             name: "max".to_string(),
-            args: vec![column_ref(input_id, "a")],
             distinct: false,
             result_type: DataType::Int32,
-            order_by: vec![],
             output_column_id: aggregate_output_id,
-            resolved: crate::functions::test_resolved_aggregate("max", &[DataType::Int32], false),
+            source: crate::binding::AggregateArgumentSource::uncertified(
+                vec![column_ref(input_id, "a")],
+                vec![],
+                crate::functions::test_resolved_aggregate("max", &[DataType::Int32], false),
+            ),
         }];
         let mut aggregate = OptimizedOperatorNode {
             op: Operator::PhysicalHashAggregate(PhysicalHashAggregateOp {
                 mode: AggMode::Single,
-                group_by: intern_exprs(&mut scalars, &[column_ref(input_id, "a")]),
-                aggregates: intern_aggregate_calls(&mut scalars, &aggregate_calls),
+                group_by: intern_exprs(
+                    &mut scalars,
+                    &[column_ref(input_id, "a")],
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
+                aggregates: intern_aggregate_calls(
+                    &mut scalars,
+                    &aggregate_calls,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
                 output_layout: AggregateOutputLayout::new(
                     vec![int_col(group_output_id, "a")],
                     vec![int_col(aggregate_output_id, "sum(a)")],
@@ -948,7 +971,9 @@ mod tests {
                         column_ref(input_id, "a"),
                         column_ref(grouping_output_id, "__grouping_fn_0"),
                     ],
-                ),
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap(),
                 aggregates: vec![],
                 output_layout: AggregateOutputLayout::new(aggregate_output_columns.clone(), vec![]),
                 output_columns: aggregate_output_columns,

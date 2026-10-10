@@ -22,6 +22,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use novarocks_spi::connector::ConnectorRequestContext;
 
+use crate::admitted_query_context::QueryResultCapacityBinding;
 use crate::session_error::QueryServiceError;
 
 /// Read-only Catalog and connector facts required to resolve `USE` and
@@ -40,6 +41,7 @@ pub trait SessionCatalogPort: Send + Sync + 'static {
     async fn external_namespace_exists(
         &self,
         request: ConnectorRequestContext,
+        capacity: &QueryResultCapacityBinding,
         catalog_name: &str,
         namespace_name: &str,
     ) -> Result<bool, QueryServiceError>;

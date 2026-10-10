@@ -269,7 +269,10 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
         ScalarNode::Lambda { params, body } => {
             format!("Lambda({params:?},{})", canonical_expr_key(arena, *body))
         }
-        ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
+        ScalarNode::ColumnRef(_)
+        | ScalarNode::LambdaParamRef { .. }
+        | ScalarNode::Literal(_)
+        | ScalarNode::Constant(_) => {
             format!("{:?}", arena.node(expr))
         }
     }
@@ -353,16 +356,14 @@ mod tests {
                 qualifier: Some("t".to_string()),
                 column: name.to_string(),
             },
-            data_type: DataType::Int32,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
         }
     }
 
     fn int_lit(v: i64) -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Int(v)),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -374,8 +375,7 @@ mod tests {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         }
     }
 
@@ -394,13 +394,17 @@ mod tests {
                 args,
                 distinct: false,
             },
-            data_type: DataType::Int64,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         }
     }
 
     fn groups_from_typed(arena: &mut ScalarArena, expr: TypedExpr) -> Vec<PredicateGroup> {
-        let id = intern_typed(arena, &expr);
+        let id = intern_typed(
+            arena,
+            &expr,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         PredicateGroup::from_predicate(arena, id, PredicateOrigin::Filter)
     }
 
@@ -410,7 +414,12 @@ mod tests {
         origin: PredicateOrigin,
         derived: PredicateDerivedKind,
     ) -> PredicateGroup {
-        let id = intern_typed(arena, &expr);
+        let id = intern_typed(
+            arena,
+            &expr,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         PredicateGroup::new(arena, id, origin, derived)
     }
 
@@ -455,8 +464,7 @@ mod tests {
                 BinOp::And,
                 bool_expr(col("b", 2), BinOp::Eq, int_lit(2)),
             ))),
-            data_type: DataType::Boolean,
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, true),
         };
 
         let mut arena = ScalarArena::new();
@@ -500,7 +508,12 @@ mod tests {
         );
 
         let mut arena = ScalarArena::new();
-        let id = intern_typed(&mut arena, &expr);
+        let id = intern_typed(
+            &mut arena,
+            &expr,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         let mut branches = Vec::new();
         scalar_expr::split_disjuncts(&arena, id, &mut branches);
         assert_eq!(branches.len(), 3);
@@ -510,11 +523,32 @@ mod tests {
     fn combine_or_round_trips_to_left_to_right_or_branches() {
         let mut arena = ScalarArena::new();
         let exprs = vec![
-            intern_typed(&mut arena, &bool_expr(col("a", 1), BinOp::Eq, int_lit(1))),
-            intern_typed(&mut arena, &bool_expr(col("a", 1), BinOp::Eq, int_lit(2))),
-            intern_typed(&mut arena, &bool_expr(col("a", 1), BinOp::Eq, int_lit(3))),
+            intern_typed(
+                &mut arena,
+                &bool_expr(col("a", 1), BinOp::Eq, int_lit(1)),
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            )
+            .unwrap(),
+            intern_typed(
+                &mut arena,
+                &bool_expr(col("a", 1), BinOp::Eq, int_lit(2)),
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            )
+            .unwrap(),
+            intern_typed(
+                &mut arena,
+                &bool_expr(col("a", 1), BinOp::Eq, int_lit(3)),
+                crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+            )
+            .unwrap(),
         ];
-        let expr = scalar_expr::combine_disjuncts(&mut arena, exprs).unwrap();
+        let expr = scalar_expr::combine_disjuncts(
+            &mut arena,
+            exprs,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap()
+        .unwrap();
         let mut branches = Vec::new();
         scalar_expr::split_disjuncts(&arena, expr, &mut branches);
         let branch_debugs: Vec<String> = branches
@@ -544,12 +578,16 @@ mod tests {
                 args: vec![],
                 distinct: false,
             },
-            data_type: DataType::Float64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Float64, false),
         };
 
         let mut arena = ScalarArena::new();
-        let id = intern_typed(&mut arena, &expr);
+        let id = intern_typed(
+            &mut arena,
+            &expr,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         assert!(scalar_expr::contains_non_deterministic_function(&arena, id));
     }
 
@@ -563,7 +601,9 @@ mod tests {
                 vec![],
                 crate::functions::FunctionVolatility::Volatile,
             ),
-        );
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         assert!(scalar_expr::contains_non_deterministic_function(&arena, id));
     }
 
@@ -584,7 +624,12 @@ mod tests {
         );
 
         let mut arena = ScalarArena::new();
-        let id = intern_typed(&mut arena, &expr);
+        let id = intern_typed(
+            &mut arena,
+            &expr,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
         assert!(scalar_expr::contains_non_deterministic_function(&arena, id));
     }
 }

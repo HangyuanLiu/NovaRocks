@@ -1421,6 +1421,9 @@ async fn unary_actual_large_data_backing_survives_all_nonfinal_clone_and_short_s
     capture.stop();
     let mut body = response.into_body();
     let data = unary_data(&mut body).await;
+    let open = fixture.root.try_ownership_snapshot().unwrap().unwrap();
+    assert_eq!((open.segments, open.deliveries), (1, 1));
+    assert!(open.retained_reservations > 0 && open.metadata_holders > 0 && open.metadata_bytes > 0);
     let before = send_snapshot();
     assert!(!before.invalid);
     assert_eq!(before.used, 1);
@@ -1452,6 +1455,15 @@ async fn unary_actual_large_data_backing_survives_all_nonfinal_clone_and_short_s
     drop(data);
     fixture.seal();
     drop(body);
+    // Encoding already dropped its original segment alias. Seal releases the
+    // queued segment while the independent full-copy DATA remains owned.
+    let sealed = fixture.root.try_ownership_snapshot().unwrap().unwrap();
+    assert_eq!((sealed.segments, sealed.deliveries), (0, 1));
+    assert!(
+        sealed.retained_reservations > 0
+            && sealed.metadata_holders > 0
+            && sealed.metadata_bytes > 0
+    );
     let filler = fixture.fill_process(PROCESS - FIXED - COPY - fixture.header_bytes());
     for alias in [clone, short] {
         drop(alias);
@@ -1459,6 +1471,11 @@ async fn unary_actual_large_data_backing_survives_all_nonfinal_clone_and_short_s
         assert!(!state.invalid);
         assert!(!state.records[allocation].dealloc_returned);
         assert!(!fixture.root.physical_idle());
+        let held = fixture.root.try_ownership_snapshot().unwrap().unwrap();
+        assert_eq!((held.segments, held.deliveries), (0, 1));
+        assert!(
+            held.retained_reservations > 0 && held.metadata_holders > 0 && held.metadata_bytes > 0
+        );
         assert!(matches!(
             fixture.budget.try_reserve_process(1).unwrap(),
             ResultWriteAdmission::Blocked
@@ -1471,6 +1488,16 @@ async fn unary_actual_large_data_backing_survives_all_nonfinal_clone_and_short_s
     assert!(after.records[allocation].dealloc_returned);
     assert!(after.all_deallocated());
     assert!(fixture.root.physical_idle());
+    let exited = fixture.root.try_ownership_snapshot().unwrap().unwrap();
+    assert_eq!(
+        (
+            exited.segments,
+            exited.deliveries,
+            exited.retained_reservations,
+            exited.metadata_holders
+        ),
+        (0, 0, 0, 0)
+    );
     drop(fixture.fill_process(COPY));
     drop(filler);
 }

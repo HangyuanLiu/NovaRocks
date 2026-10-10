@@ -1,0 +1,501 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements. See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership. The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License. You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! A multi-row VALUES keeps each literal at its analyzed type and assigns the
+//! column's common type through an explicit cast cell. Each cast cell stays a
+//! dynamic `ValuesCell` root, prepared exactly as a Project root; each
+//! constant cell is materialized backing and its root use is retired.
+
+use super::*;
+use arrow_array::{Int8Array, Int16Array};
+use novarocks_local_program::{
+    ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramRootInput, ProgramUseRef,
+    StaticValuesBacking, StaticValuesCell, root_input_layout,
+};
+use novarocks_physical_plan::ExprId;
+use novarocks_type_contract::{
+    ControlShape, DecimalOverflowPolicy, EvaluationDemand, ExpressionUseId, SemanticParameterId,
+    SemanticParameterKey, SemanticParameterRef, SemanticParameterValue,
+};
+
+const ALLOW: SemanticParameterRef = SemanticParameterRef {
+    id: SemanticParameterId::new(5),
+    expected_key: SemanticParameterKey::AllowThrowException,
+};
+
+#[derive(Clone, Copy)]
+enum Cell {
+    /// A constant of exactly the column type.
+    Constant(u32, u32),
+    /// A constant of its analyzed type, cast to the column type.
+    Cast(u32, u32),
+}
+
+fn pools() -> Vec<(ConstantPoolId, ConstantPool)> {
+    vec![
+        (
+            ConstantPoolId::new(0),
+            checked_pool(
+                Arc::new(Int64Array::from(vec![None::<i64>])),
+                true,
+                ValueLogicalType::Physical,
+            ),
+        ),
+        (
+            ConstantPoolId::new(1),
+            checked_pool(
+                Arc::new(Int64Array::from(vec![7, 9])),
+                false,
+                ValueLogicalType::Physical,
+            ),
+        ),
+        (
+            ConstantPoolId::new(2),
+            checked_pool(
+                Arc::new(Int8Array::from(vec![1, 2])),
+                false,
+                ValueLogicalType::Physical,
+            ),
+        ),
+        (
+            ConstantPoolId::new(3),
+            checked_pool(
+                Arc::new(Int16Array::from(vec![300])),
+                false,
+                ValueLogicalType::Physical,
+            ),
+        ),
+    ]
+}
+
+/// Column 0 is nullable BIGINT and column 1 non-null BIGINT:
+/// `(CAST(1 AS BIGINT), 7), (NULL, CAST(2 AS BIGINT)), (CAST(300 AS BIGINT), 9)`.
+fn rows() -> Vec<Vec<Cell>> {
+    vec![
+        vec![Cell::Cast(2, 0), Cell::Constant(1, 0)],
+        vec![Cell::Constant(0, 0), Cell::Cast(2, 1)],
+        vec![Cell::Cast(3, 0), Cell::Constant(1, 1)],
+    ]
+}
+
+fn cast_package(chain: bool) -> Arc<FragmentPackage> {
+    let pools = pools();
+    let mut constants = ConstantPools::empty();
+    for (id, pool) in &pools {
+        constants.insert(*id, pool.clone()).unwrap();
+    }
+    let types = [
+        FunctionValueType::new(DataType::Int64, true),
+        FunctionValueType::new(DataType::Int64, false),
+    ];
+    let values_node = NodeId::new(u32::MAX);
+    let mut builder = FragmentBuilder::new(FragmentId::new(172));
+    let outputs = types
+        .iter()
+        .enumerate()
+        .map(|(ordinal, ty)| {
+            builder
+                .add_value(
+                    ty.clone(),
+                    ValueOrigin::NodeOutput {
+                        node: values_node,
+                        output_ordinal: ordinal as u32,
+                    },
+                )
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut cells = Vec::new();
+    for row in rows() {
+        let mut exprs = Vec::new();
+        for (column, cell) in row.into_iter().enumerate() {
+            let (pool, ordinal) = match cell {
+                Cell::Constant(pool, ordinal) | Cell::Cast(pool, ordinal) => (pool, ordinal),
+            };
+            let constant = builder
+                .add_expression(
+                    values_node,
+                    pools[pool as usize].1.value_type().clone(),
+                    ExprKind::Constant(ConstantReference {
+                        pool: ConstantPoolId::new(pool),
+                        ordinal,
+                    }),
+                )
+                .unwrap();
+            exprs.push(match cell {
+                Cell::Constant(..) => constant,
+                Cell::Cast(..) => builder
+                    .add_expression(
+                        values_node,
+                        types[column].clone(),
+                        ExprKind::Cast {
+                            expr: constant,
+                            target: DataType::Int64,
+                            decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
+                            allow_throw_exception: ALLOW,
+                        },
+                    )
+                    .unwrap(),
+            });
+        }
+        cells.push(exprs.into_boxed_slice());
+    }
+    builder
+        .add_values(
+            values_node,
+            cells.into_boxed_slice(),
+            outputs.clone().into_boxed_slice(),
+        )
+        .unwrap();
+    let root = if chain {
+        let project = NodeId::new(7);
+        let mut assignments = Vec::new();
+        let mut projected = Vec::new();
+        for &input in &outputs {
+            let ty = builder.value(input).unwrap().ty.clone();
+            let expr = builder
+                .add_expression(project, ty.clone(), ExprKind::Value(input))
+                .unwrap();
+            let output = builder
+                .add_value(
+                    ty,
+                    ValueOrigin::Expr {
+                        node: project,
+                        expr,
+                    },
+                )
+                .unwrap();
+            assignments.push((expr, output));
+            projected.push(output);
+        }
+        builder
+            .add_project(
+                project,
+                values_node,
+                assignments.into_boxed_slice(),
+                projected.into_boxed_slice(),
+            )
+            .unwrap();
+        project
+    } else {
+        values_node
+    };
+    let fragment = builder
+        .finish_definition(
+            root,
+            FragmentSink::Result,
+            PipelineDopDomain {
+                min: 1,
+                max: 1,
+                requires_power_of_two: false,
+            },
+        )
+        .unwrap();
+    let roots = PhysicalExpressionRoots::try_new(&fragment, &Control::good()).unwrap();
+    let domain = EvaluationDomainId::new(0);
+    let mut invocations = Vec::new();
+    let mut next = 3u32;
+    let mut bindings = Vec::new();
+    for (&site, root) in roots.sites() {
+        let use_id = visit(
+            &fragment,
+            root.expr,
+            domain,
+            root.demand,
+            &mut next,
+            &mut invocations,
+        );
+        bindings.push((site, use_id));
+    }
+    let flow = ExpressionControlFlow::try_new(
+        vec![ExpressionEvaluationDomain {
+            id: domain,
+            parent: None,
+            guard: None,
+        }],
+        invocations,
+        fragment.expressions(),
+        CompilePhase::Validate,
+        &Control::good(),
+    )
+    .unwrap();
+    let expression_uses =
+        PhysicalRootUses::try_new(&fragment, flow, bindings, &Control::good()).unwrap();
+    let calls = FrozenFragmentCalls::try_new(&fragment, &expression_uses, vec![], &Control::good())
+        .unwrap();
+    let pruning = FrozenFragmentPruning::try_new(fragment.id(), vec![], &Control::good()).unwrap();
+    let output = fragment.nodes()[&root].output.clone();
+    let result = ResultPort {
+        scalar_schema: None,
+        fragment: fragment.id(),
+        output: output.clone(),
+        fields: output
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| ResultField {
+                domain: novarocks_physical_plan::ResultValueDomain::Plain,
+                name: format!("v{index}").into(),
+                alias: None,
+                value,
+                ty: fragment.values()[&value].ty.clone(),
+            })
+            .collect(),
+    };
+    Arc::new(
+        FragmentPackage::try_new(
+            FragmentPackageInput {
+                version: PlanVersionId::try_new([172; 16]).unwrap(),
+                required: RequiredContracts::default(),
+                fragment,
+                expression_uses,
+                calls,
+                constants,
+                cuts: FragmentCuts::default(),
+                result: Some(result),
+                parameters: SemanticParameters::try_new([(
+                    ALLOW.id,
+                    SemanticParameterValue::AllowThrowException(false),
+                )])
+                .unwrap(),
+                scans: BTreeMap::new(),
+                writes: BTreeMap::new(),
+                annotations: Box::default(),
+                pruning,
+            },
+            package_admission(),
+            &Control::good(),
+        )
+        .unwrap(),
+    )
+}
+
+/// Author one eager use per actual occurrence; a cast reads its operand.
+fn visit(
+    fragment: &novarocks_physical_plan::Fragment,
+    definition: ExprId,
+    domain: EvaluationDomainId,
+    demand: EvaluationDemand,
+    next: &mut u32,
+    output: &mut Vec<ExpressionInvocation<ExprId>>,
+) -> ExpressionUseId {
+    let use_id = ExpressionUseId::new(*next);
+    *next += 11;
+    let children = match &fragment.expressions().get(definition).unwrap().kind {
+        ExprKind::Cast { expr, .. } => vec![*expr],
+        ExprKind::Constant(_) | ExprKind::Literal(_) | ExprKind::Value(_) => vec![],
+        other => panic!("fixture authors no control for {other:?}"),
+    };
+    let arguments = children
+        .into_iter()
+        .map(|child| {
+            visit(
+                fragment,
+                child,
+                domain,
+                EvaluationDemand::Value,
+                next,
+                output,
+            )
+        })
+        .collect::<Vec<_>>();
+    output.push(ExpressionInvocation {
+        context: ExpressionEffectContext {
+            use_id,
+            domain,
+            demand,
+        },
+        definition,
+        control: ControlShape::Eager,
+        arguments: arguments.into_boxed_slice(),
+    });
+    use_id
+}
+
+fn values_node(program: &LocalProgram) -> &novarocks_local_program::StaticValues {
+    let ProgramNodeKind::Values { values } = program.graph().nodes()[0].kind() else {
+        panic!("Values")
+    };
+    values
+}
+
+fn cell_site(row: u32, column: u32) -> ProgramExpressionRootSite {
+    ProgramExpressionRootSite::Node {
+        node: ProgramNodeId::new(0),
+        role: ProgramNodeExpressionRole::ValuesCell { row, column },
+    }
+}
+
+#[test]
+fn values_cast_cells_compile_as_dynamic_roots_beside_constant_backing() {
+    let program = compile(cast_package(false), &Control::good()).unwrap();
+    let values = values_node(&program);
+    assert!(values.batch().is_none());
+    let StaticValuesBacking::Cells {
+        rows,
+        constants,
+        dynamic,
+    } = values.backing()
+    else {
+        panic!("cast cells keep cell sources")
+    };
+    assert_eq!(rows, 3);
+    // Each column keeps only its constant cells, in row order and exactly in
+    // the column carrier; a cast cell has no placeholder.
+    let nullable = constants[0].as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(nullable.len(), 1);
+    assert!(nullable.is_null(0));
+    assert_eq!(
+        constants[1]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec(),
+        vec![7, 9]
+    );
+    let positions = dynamic
+        .iter()
+        .map(|StaticValuesCell { row, column, .. }| (*row, *column))
+        .collect::<Vec<_>>();
+    assert_eq!(positions, vec![(0, 0), (1, 1), (2, 0)]);
+
+    let snapshot = program
+        .checked()
+        .channels()
+        .expressions()
+        .resolved_calls()
+        .snapshot();
+    // Only dynamic cells are roots; constant-cell root uses are retired.
+    assert_eq!(
+        snapshot.bindings().keys().copied().collect::<Vec<_>>(),
+        vec![cell_site(0, 0), cell_site(1, 1), cell_site(2, 0)]
+    );
+    let flow = &snapshot.flows()[&novarocks_local_program::ProgramExpressionArena::Main];
+    assert_eq!(flow.uses().len(), 6, "three casts and their operands");
+    for cell in dynamic {
+        let site = cell_site(cell.row, cell.column);
+        assert_eq!(
+            root_input_layout(program.graph(), site).unwrap(),
+            ProgramRootInput::Empty
+        );
+        let use_id = snapshot.bindings()[&site];
+        let invocation = &flow.uses()[&use_id];
+        assert_eq!(invocation.definition, cell.definition);
+        assert!(matches!(
+            program
+                .graph()
+                .expressions()
+                .node(cell.definition)
+                .unwrap()
+                .kind(),
+            StaticExprKind::PreparedCast { .. }
+        ));
+        // The cast is prepared exactly as a Project root's cast.
+        let recipe = program
+            .cast_recipe(ProgramUseRef {
+                arena: novarocks_local_program::ProgramExpressionArena::Main,
+                use_id,
+            })
+            .expect("prepared cast recipe");
+        assert_eq!(recipe.result_type().data_type, DataType::Int64);
+        assert_eq!(recipe.result_type().nullable, cell.column == 0);
+        // The operand is the constant at its analyzed type.
+        let operand = &flow.uses()[&invocation.arguments[0]];
+        assert!(matches!(
+            program
+                .graph()
+                .expressions()
+                .node(operand.definition)
+                .unwrap()
+                .kind(),
+            StaticExprKind::Constant(_)
+        ));
+    }
+}
+
+#[test]
+fn values_cast_cells_feed_a_projection_through_ordinary_channels() {
+    let program = compile(cast_package(true), &Control::good()).unwrap();
+    assert_eq!(values_node(&program).dynamic_cells().len(), 3);
+    let snapshot = program
+        .checked()
+        .channels()
+        .expressions()
+        .resolved_calls()
+        .snapshot();
+    let project = |expression| ProgramExpressionRootSite::Node {
+        node: ProgramNodeId::new(1),
+        role: ProgramNodeExpressionRole::ProjectOutput { expression },
+    };
+    assert_eq!(
+        snapshot.bindings().keys().copied().collect::<Vec<_>>(),
+        vec![
+            cell_site(0, 0),
+            cell_site(1, 1),
+            cell_site(2, 0),
+            project(0),
+            project(1),
+        ]
+    );
+}
+
+#[test]
+fn values_cast_cells_observe_every_original_compile_refusal() {
+    let package = cast_package(false);
+    let lowered = lower(&package, &Control::good()).unwrap();
+    let baseline = Control::good();
+    let (kind, _) = direct(&package, &lowered, &baseline).unwrap();
+    assert!(
+        matches!(kind, ProgramNodeKind::Values { values } if values.dynamic_cells().len() == 3)
+    );
+    let trace = baseline.trace();
+    for position in 1..=trace.len() {
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let refused = Control::refusing(position, cause);
+            is_control(direct(&package, &lowered, &refused).unwrap_err(), cause);
+            assert_eq!(refused.trace(), trace[..position]);
+        }
+    }
+}
+
+#[test]
+fn values_constant_cells_keep_one_complete_batch() {
+    // Without a dynamic cell, the Values backing stays one constant batch.
+    let source = checked_pool(
+        Arc::new(Int64Array::from(vec![4, 5])),
+        false,
+        ValueLogicalType::Physical,
+    );
+    let program = compile(
+        build(
+            std::slice::from_ref(&source),
+            &[vec![(0, 1)], vec![(0, 0)]],
+            &[0],
+            false,
+        ),
+        &Control::good(),
+    )
+    .unwrap();
+    let values = values_node(&program);
+    assert!(values.dynamic_cells().is_empty());
+    assert_eq!(values.batch().unwrap().num_rows(), 2);
+}

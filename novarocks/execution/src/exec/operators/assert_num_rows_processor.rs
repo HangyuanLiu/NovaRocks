@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionResult;
+
 use std::collections::HashSet;
 
 use arrow::array::Array;
@@ -399,12 +401,14 @@ impl ProcessorOperator for AssertNumRowsProcessorOperator {
         self.pending_output.is_some()
     }
 
-    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> Result<(), String> {
+    fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
         if self.finished {
             return Ok(());
         }
         if self.pending_output.is_some() {
-            return Err("assert_num_rows received input while output buffer is full".to_string());
+            return Err("assert_num_rows received input while output buffer is full"
+                .to_string()
+                .into());
         }
 
         self.mode.observe_chunk(&chunk)?;
@@ -413,7 +417,7 @@ impl ProcessorOperator for AssertNumRowsProcessorOperator {
         Ok(())
     }
 
-    fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+    fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
         let out = self.pending_output.take();
         if self.finishing && self.pending_output.is_none() {
             self.finished = true;
@@ -421,7 +425,7 @@ impl ProcessorOperator for AssertNumRowsProcessorOperator {
         Ok(out)
     }
 
-    fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+    fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         if self.finishing || self.finished {
             return Ok(());
         }
@@ -481,7 +485,7 @@ mod tests {
         desired: Option<usize>,
         assertion: Assertion,
         chunks: &[usize],
-    ) -> Result<(), String> {
+    ) -> ExecutionResult<()> {
         let rt = RuntimeState::default();
         let mut op = AssertNumRowsProcessorOperator {
             name: "test".to_string(),
@@ -509,7 +513,11 @@ mod tests {
         Ok(())
     }
 
-    fn run_err(desired: Option<usize>, assertion: Assertion, chunks: &[usize]) -> String {
+    fn run_err(
+        desired: Option<usize>,
+        assertion: Assertion,
+        chunks: &[usize],
+    ) -> crate::runtime::fragment::ExecutionFailure {
         let rt = RuntimeState::default();
         let mut op = AssertNumRowsProcessorOperator {
             name: "test".to_string(),
@@ -536,7 +544,7 @@ mod tests {
         }
         match op.set_finishing(&rt) {
             Err(msg) => msg,
-            Ok(()) => "no error".to_string(),
+            Ok(()) => "no error".to_string().into(),
         }
     }
 
@@ -547,8 +555,8 @@ mod tests {
 
         // desired = 1, actual = 2 -> early fail
         let msg = run_err(Some(1), Assertion::Eq, &[1, 1]);
-        assert!(msg.contains("assert_num_rows failed"));
-        assert!(msg.contains("expected = 1 row(s)"));
+        assert!(msg.detail().contains("assert_num_rows failed"));
+        assert!(msg.detail().contains("expected = 1 row(s)"));
     }
 
     #[test]
@@ -556,7 +564,7 @@ mod tests {
         let msg = run_err(Some(1), Assertion::Eq, &[2]);
         assert_eq!(
             msg,
-            "subquery 'select c1 from test' assert_num_rows failed (early): actual=2 row(s), expected = 1 row(s)"
+            "subquery 'select c1 from test' assert_num_rows failed (early): actual=2 row(s), expected = 1 row(s)".into()
         );
     }
 
@@ -567,7 +575,7 @@ mod tests {
 
         // desired <= 2, actual = 3 -> early fail
         let msg = run_err(Some(2), Assertion::Le, &[2, 1]);
-        assert!(msg.contains("failed (early)"));
+        assert!(msg.detail().contains("failed (early)"));
     }
 
     #[test]
@@ -577,7 +585,7 @@ mod tests {
 
         // LT: desired = 2, actual = 2 -> early fail
         let msg = run_err(Some(2), Assertion::Lt, &[1, 1]);
-        assert!(msg.contains("failed (early)"));
+        assert!(msg.detail().contains("failed (early)"));
 
         // GE: desired >= 2, actual = 2 -> ok, checked at finish()
         run_ok(Some(2), Assertion::Ge, &[1, 1]).expect("ge pass");
@@ -588,7 +596,7 @@ mod tests {
         let msg = run_err(Some(2), Assertion::Ge, &[1]);
         assert_eq!(
             msg,
-            "subquery 'select c1 from test' assert_num_rows failed: actual=1 row(s), expected >= 2 row(s)"
+            "subquery 'select c1 from test' assert_num_rows failed: actual=1 row(s), expected >= 2 row(s)".into()
         );
     }
 
@@ -645,7 +653,7 @@ mod tests {
         let err = op
             .push_chunk(&rt, make_key_chunk(vec![7, 7]))
             .expect_err("duplicate key should fail");
-        assert_eq!(err, "assert_num_rows failed: duplicate _row_id=7");
+        assert_eq!(err, "assert_num_rows failed: duplicate _row_id=7".into());
     }
 
     #[test]
@@ -670,7 +678,7 @@ mod tests {
         let err = op
             .push_chunk(&rt, make_key_chunk(vec![7]))
             .expect_err("duplicate key across chunks should fail");
-        assert_eq!(err, "assert_num_rows failed: duplicate _row_id=7");
+        assert_eq!(err, "assert_num_rows failed: duplicate _row_id=7".into());
     }
 
     #[test]

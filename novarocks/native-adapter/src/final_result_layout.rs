@@ -506,7 +506,7 @@ mod tests {
             let processor = operator.as_processor_mut().unwrap();
             let state = RuntimeState::default();
             let error = processor.push_chunk(&state, conflicting_input).unwrap_err();
-            assert!(error.contains("logical domain"));
+            assert!(error.to_string().contains("logical domain"));
             assert!(processor.pull_chunk(&state).unwrap().is_none());
         }
     }

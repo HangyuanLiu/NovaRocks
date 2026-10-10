@@ -41,22 +41,12 @@ fn eval_left_right_impl(
         }
         let s = s_arr.value(i);
         let n = len_arr.value(i);
-        if n <= 0 {
-            out.push(Some(String::new()));
-            continue;
-        }
-        let n = n as usize;
-        let result = if left {
-            s.chars().take(n).collect::<String>()
+        let operation = if left {
+            novarocks_functions::string_left_right_core::LeftRightOp::Left
         } else {
-            s.chars()
-                .rev()
-                .take(n)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect()
+            novarocks_functions::string_left_right_core::LeftRightOp::Right
         };
+        let result = novarocks_functions::string_left_right_core::original(s, n, operation);
         out.push(Some(result));
     }
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)

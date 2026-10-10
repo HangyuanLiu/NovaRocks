@@ -616,8 +616,9 @@ pub(crate) fn output_column_to_table_column(
 ) -> Result<TableColumnDef, String> {
     Ok(TableColumnDef {
         name: column.name.clone(),
-        data_type: novarocks_sql::literal::arrow_data_type_to_sql_type(&column.data_type)?,
-        nullable: column.nullable,
+        data_type: novarocks_types::sql_type_from_value_type(&column.value_type)
+            .map_err(|error| error.to_string())?,
+        nullable: column.value_type.nullable,
         aggregation: None,
         default: None,
     })

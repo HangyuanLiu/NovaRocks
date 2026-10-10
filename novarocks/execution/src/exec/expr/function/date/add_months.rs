@@ -14,40 +14,22 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use super::common::{extract_datetime_array, extract_i64_array, to_timestamp_value};
+use super::common::extract_i64_array;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use arrow::array::{ArrayRef, TimestampMicrosecondArray};
+use arrow::array::{ArrayRef, Int64Array};
 use arrow::datatypes::{DataType, TimeUnit};
-use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime};
+use chrono::NaiveDateTime;
+use novarocks_functions::builtin::calendar_extended_shared::{
+    CalendarOperation, evaluate_legacy_calendar, legacy_validate_datetime_source,
+};
 use std::sync::Arc;
 
-fn add_months_to_date(date: NaiveDate, months: i32) -> NaiveDate {
-    let mut year = date.year();
-    let mut month = date.month() as i32 - 1 + months;
-    year += month.div_euclid(12);
-    month = month.rem_euclid(12) + 1;
-    let last_day = last_day_of_month(year, month as u32);
-    let day = date.day().min(last_day);
-    NaiveDate::from_ymd_opt(year, month as u32, day).unwrap()
+pub(super) fn add_months_to_datetime(date: NaiveDateTime, months: i32) -> NaiveDateTime {
+    novarocks_functions::builtin::calendar_extended_shared::legacy_add_months_to_datetime(
+        date, months,
+    )
 }
-
-pub(super) fn add_months_to_datetime(dt: NaiveDateTime, months: i32) -> NaiveDateTime {
-    let date = add_months_to_date(dt.date(), months);
-    date.and_time(dt.time())
-}
-
-fn last_day_of_month(year: i32, month: u32) -> u32 {
-    let (next_year, next_month) = if month == 12 {
-        (year + 1, 1)
-    } else {
-        (year, month + 1)
-    };
-    let first_next = NaiveDate::from_ymd_opt(next_year, next_month, 1).unwrap();
-    (first_next - Duration::days(1)).day()
-}
-
-#[inline]
 fn eval_with_factor(
     arena: &ExprArena,
     expr: ExprId,
@@ -55,33 +37,22 @@ fn eval_with_factor(
     chunk: &Chunk,
     factor: i32,
 ) -> Result<ArrayRef, String> {
-    let date_arr = arena.eval(args[0], chunk)?;
-    let month_arr = arena.eval(args[1], chunk)?;
-    let dts = extract_datetime_array(&date_arr)?;
-    let months = extract_i64_array(&month_arr, "add_months")?;
+    let date = arena.eval(args[0], chunk)?;
+    let interval = arena.eval(args[1], chunk)?;
+    legacy_validate_datetime_source(&date)?;
+    let intervals = extract_i64_array(&interval, "add_months")?;
+    let rows = date.len().max(intervals.len());
+    let interval: ArrayRef = Arc::new(Int64Array::from(intervals));
     let output_type = arena
         .data_type(expr)
         .cloned()
         .unwrap_or(DataType::Timestamp(TimeUnit::Microsecond, None));
-    let len = dts.len().max(months.len());
-    let mut out = Vec::with_capacity(len);
-    for i in 0..len {
-        let dt = if dts.len() == 1 { dts[0] } else { dts[i] };
-        let month = if months.len() == 1 {
-            months[0]
-        } else {
-            months[i]
-        };
-        let Some(month) = month else {
-            out.push(None);
-            continue;
-        };
-        let m = month as i32 * factor;
-        let v = dt.map(|datetime| add_months_to_datetime(datetime, m));
-        let v = v.and_then(|d| to_timestamp_value(d, &output_type).ok());
-        out.push(v);
-    }
-    Ok(Arc::new(TimestampMicrosecondArray::from(out)) as ArrayRef)
+    evaluate_legacy_calendar(
+        CalendarOperation::MonthsShift(factor),
+        &[date, interval],
+        &output_type,
+        rows,
+    )
 }
 
 pub fn eval_add_months(

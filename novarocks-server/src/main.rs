@@ -19,15 +19,12 @@ use std::env;
 use std::process;
 use std::sync::Arc;
 
-use novarocks_execution::exec::expr::agg::{
-    ExecutionFunctionSetBuilder, SealedExecutionFunctionSet,
-    contribute_builtin_aggregate_implementations,
-};
 use novarocks_memory::MemoryAuthority;
 use novarocks_server::app_config::NovaRocksConfig;
 use novarocks_server::{
     composition, launch, logging, memory_limit, memory_observation, native_compatibility,
     provider_manifest::ServerProviderManifest, scan_io::ScanIoRuntime,
+    static_plan::ServerStaticPlan,
 };
 use novarocks_types::NativeCompatibilityId;
 
@@ -86,24 +83,6 @@ fn init_process(config: &NovaRocksConfig) -> anyhow::Result<tokio::runtime::Runt
         .map_err(|error| anyhow::anyhow!("build data Tokio runtime: {error}"))
 }
 
-fn compose_process_function_set() -> anyhow::Result<Arc<SealedExecutionFunctionSet>> {
-    let mut builder = ExecutionFunctionSetBuilder::new();
-    novarocks_sql::compiler::contribute_builtin_functions(builder.catalog_builder_mut())
-        .map_err(|error| anyhow::anyhow!("contribute builtin function metadata: {error}"))?;
-    contribute_builtin_aggregate_implementations(&mut builder).map_err(|error| {
-        anyhow::anyhow!("contribute builtin aggregate implementations: {error}")
-    })?;
-    builder
-        .register_typed_aggregate(
-            novarocks_connector_iceberg_functions::iceberg_theta_registration()
-                .map_err(|error| anyhow::anyhow!("build Iceberg function bundle: {error}"))?,
-        )
-        .map_err(|error| anyhow::anyhow!("contribute Iceberg function bundle: {error}"))?;
-    Ok(Arc::new(builder.seal().map_err(|error| {
-        anyhow::anyhow!("seal process engine function set: {error}")
-    })?))
-}
-
 /// SIGTERM is the production authority for the one-way FE drain. SIGINT uses
 /// the same path for local operation; neither signal is interpreted as an
 /// immediate process-wide connection cancellation.
@@ -128,6 +107,7 @@ async fn termination_signal() {
 fn run_frontend(
     role: launch::RoleConfig,
     native_compatibility_id: NativeCompatibilityId,
+    static_plan: &ServerStaticPlan,
     function_catalog: std::sync::Arc<novarocks_functions::EngineFunctionCatalog>,
     provider_manifest: Arc<ServerProviderManifest>,
     memory_authority: Arc<MemoryAuthority>,
@@ -138,6 +118,7 @@ fn run_frontend(
         &role.native_trust,
         None,
         native_compatibility_id,
+        static_plan,
         function_catalog,
         provider_manifest,
         memory_authority,
@@ -155,6 +136,7 @@ fn run_frontend(
 fn run_backend(
     role: launch::RoleConfig,
     native_compatibility_id: NativeCompatibilityId,
+    static_plan: &ServerStaticPlan,
     function_set: std::sync::Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet>,
     provider_manifest: Arc<ServerProviderManifest>,
     memory_authority: Arc<MemoryAuthority>,
@@ -166,6 +148,7 @@ fn run_backend(
         &role.config,
         &role.native_trust,
         native_compatibility_id,
+        static_plan,
         function_set,
         provider_manifest,
         memory_authority,
@@ -216,6 +199,7 @@ async fn run_all_in_one(
     fe: launch::RoleConfig,
     be: launch::RoleConfig,
     native_compatibility_id: NativeCompatibilityId,
+    static_plan: &ServerStaticPlan,
     function_set: std::sync::Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet>,
     provider_manifest: Arc<ServerProviderManifest>,
     memory_authority: Arc<MemoryAuthority>,
@@ -227,6 +211,7 @@ async fn run_all_in_one(
         &fe.native_trust,
         None,
         native_compatibility_id,
+        static_plan,
         std::sync::Arc::clone(function_set.catalog()),
         Arc::clone(&provider_manifest),
         // Both roles consume the same authority: one OS process, one bound.
@@ -238,6 +223,7 @@ async fn run_all_in_one(
         &be.config,
         &be.native_trust,
         native_compatibility_id,
+        static_plan,
         function_set,
         provider_manifest,
         memory_authority,
@@ -358,23 +344,39 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
         }
         launch::ResolvedServerLaunch::AllInOne { fe, .. } => &fe.config,
     };
-    let provider_manifest = Arc::new(ServerProviderManifest::seal()?);
+    let provider_manifest = ServerProviderManifest::seal()?;
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    let provider_manifest = match std::env::var("NOVAROCKS_HMS_LISTING_OBSERVATION_CATALOG") {
+        Ok(name) => provider_manifest.with_hms_listing_probe(Arc::new(
+            novarocks_connector_iceberg::hms_listing_probe::HmsListingProbe::new(&name)
+                .map_err(anyhow::Error::msg)?,
+        )),
+        Err(std::env::VarError::NotPresent) => provider_manifest,
+        Err(_) => anyhow::bail!("HMS observation catalog selection is not Unicode"),
+    };
+    let provider_manifest = Arc::new(provider_manifest);
     let runtime = init_process(process_config)?;
     // After `init_process`, because composing the authority is the first thing
     // this process reports about its own memory and logging is not installed
     // until then. It does not depend on the runtime.
     let memory_authority = compose_memory_authority(process_config)?;
-    let function_set = compose_process_function_set()?;
+    let function_set = composition::compose_process_function_set()?;
     let functions = std::sync::Arc::clone(function_set.catalog());
+    // One interpreter per process, chosen by this binary's build and composed
+    // before compatibility material: the choice is part of the island.
+    let static_plan = ServerStaticPlan::compose(&function_set, &provider_manifest)?;
     let native_compatibility = native_compatibility::resolve_native_compatibility_material(
         provider_manifest.contracts(),
         functions.digest(),
         function_set.implementation_manifest_digest(),
+        static_plan.compatibility_component(),
     )?;
     tracing::info!(
         native_compatibility_id = %native_compatibility.id(),
         function_catalog_digest = %hex::encode(functions.digest()),
         execution_implementation_manifest_digest = %hex::encode(function_set.implementation_manifest_digest()),
+        static_plan_interpreter = ?native_compatibility.static_plan_interpreter(),
+        static_plan_interpreter_digest = %hex::encode(native_compatibility.static_plan_interpreter_digest()),
         build_identity = novarocks_version::native_build_identity(),
         "resolved native compatibility material"
     );
@@ -382,6 +384,7 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
         launch::ResolvedServerLaunch::Fe(role) => run_frontend(
             role,
             native_compatibility.id(),
+            &static_plan,
             functions,
             provider_manifest,
             memory_authority,
@@ -390,6 +393,7 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
         launch::ResolvedServerLaunch::Be(role) => run_backend(
             role,
             native_compatibility.id(),
+            &static_plan,
             function_set,
             provider_manifest,
             memory_authority,
@@ -399,6 +403,7 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
             fe,
             be,
             native_compatibility.id(),
+            &static_plan,
             function_set,
             provider_manifest,
             memory_authority,
@@ -409,9 +414,10 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{compose_memory_authority, compose_process_function_set};
+    use super::compose_memory_authority;
     use novarocks_functions::{FunctionKind, FunctionVisibility};
     use novarocks_server::app_config::NovaRocksConfig;
+    use novarocks_server::composition::compose_process_function_set;
     use std::sync::Arc;
 
     /// One OS process gets one authority, and every role that needs capacity
@@ -492,6 +498,58 @@ mod tests {
             .expect("Iceberg hidden aggregate metadata");
 
         assert_eq!(definition.visibility(), FunctionVisibility::Hidden);
+        let declaration = definition
+            .binding_declaration()
+            .expect("Theta binding owner");
+        assert!(std::ptr::eq(
+            catalog.definition_by_id(declaration.function_id()).unwrap(),
+            definition,
+        ));
+        let arguments = [novarocks_functions::FunctionArgument::Value {
+            value_type: novarocks_functions::FunctionValueType::new(
+                arrow_schema::DataType::Int64,
+                false,
+            ),
+            constant: None,
+        }];
+        let selected = catalog
+            .select_exact_overload_observed(
+                declaration.function_id(),
+                FunctionKind::Aggregate,
+                &novarocks_functions::FunctionOverloadId::try_new("iceberg/theta-stat/long/v1")
+                    .unwrap(),
+                novarocks_functions::FunctionBindingRequest {
+                    arguments: &arguments,
+                    logical_argument_count: 1,
+                    expected_result_type: None,
+                },
+                &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+            )
+            .expect("original installed fixed Theta author");
+        assert_eq!(
+            selected.aggregate.as_ref().unwrap().state_format.as_str(),
+            novarocks_connector_iceberg_functions::ICEBERG_THETA_STATE_FORMAT_IDENTITY
+        );
+        for overload in declaration.overloads() {
+            let installed = catalog
+                .pure_overload_declaration_observed(
+                    declaration.function_id(),
+                    FunctionKind::Aggregate,
+                    &overload.identity,
+                    &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+                )
+                .expect("actual process installs the original Theta pure attachment");
+            assert_eq!(installed.implementation().overload, overload.identity);
+            assert_eq!(
+                installed.implementation().abi,
+                novarocks_functions::PureKernelAbi::AggregateV1,
+            );
+            assert_eq!(
+                installed.effects().own_row_error,
+                novarocks_functions::FunctionIntrinsicRowError::NotRowEvaluated,
+            );
+            assert!(installed.effects().environment_dependencies.is_empty());
+        }
         assert_ne!(catalog.digest(), [0; 32]);
         assert_ne!(function_set.implementation_manifest_digest(), [0; 32]);
     }
@@ -499,6 +557,24 @@ mod tests {
 
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    if args.as_slice() == ["--mem-1-m07-hms-listing-build-identity"] {
+        println!(
+            "NOVAROCKS_MEM_1_M07_HMS_LISTING_BUILD commit={} build_identity={} hms_listing_observe=true",
+            novarocks_version::build_git_commit(),
+            novarocks_version::native_build_identity()
+        );
+        return;
+    }
+    #[cfg(feature = "mem-1-m07-closing-pressure")]
+    if args.as_slice() == ["--mem-1-m07-closing-pressure-build-identity"] {
+        println!(
+            "NOVAROCKS_MEM_1_M07_CLOSING_PRESSURE_BUILD commit={} build_identity={} closing_pressure=true",
+            novarocks_version::build_git_commit(),
+            novarocks_version::native_build_identity()
+        );
+        return;
+    }
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
     if args.as_slice() == ["--mem-1-m07-build-identity"] {
         println!(

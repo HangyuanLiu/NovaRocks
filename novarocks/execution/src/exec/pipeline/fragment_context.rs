@@ -27,6 +27,8 @@
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
+use crate::runtime::fragment::ExecutionFailure;
+
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -60,7 +62,7 @@ pub struct FragmentContext {
     runtime_profile_report_interval_ns: Option<i64>,
     legacy_progress_reporting: bool,
     event_sink: Arc<dyn FragmentEventSink>,
-    final_error: Mutex<Option<String>>,
+    final_error: Mutex<Option<ExecutionFailure>>,
     cancelled: AtomicBool,
     event_scheduler: Arc<EventScheduler>,
 }
@@ -183,7 +185,8 @@ impl FragmentContext {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    pub(crate) fn set_final_status(&self, err: String) -> bool {
+    pub(crate) fn set_final_status(&self, err: impl Into<ExecutionFailure>) -> bool {
+        let err = err.into();
         {
             let mut guard = self.final_error.lock().expect("final error lock");
             if guard.is_some() {

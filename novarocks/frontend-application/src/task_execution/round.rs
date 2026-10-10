@@ -244,6 +244,7 @@ pub(crate) struct TaskRound {
 }
 
 impl TaskRound {
+    #[cfg(test)]
     pub(crate) fn new(
         execution: QueryTaskExecution,
         acks: TaskAckIntake,

@@ -29,21 +29,20 @@
 //! faithfully?" (`Ok(None)` when not) and "what did the kernel return?".
 
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
-    FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-    Int64Array, LargeBinaryArray, LargeStringArray, RecordBatch, RecordBatchOptions, StringArray,
+    Array, ArrayRef, Decimal128Array, Decimal256Array, RecordBatch, RecordBatchOptions,
 };
-use arrow::compute::kernels::cast_utils::parse_decimal;
 use arrow::datatypes::{DataType, Decimal128Type, Decimal256Type, DecimalType};
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchema};
 use novarocks_execution::exec::expr::function::lookup_function;
-use novarocks_execution::exec::expr::{
-    ExprArena, ExprId, ExprNode, LiteralValue as ExecLiteralValue,
-};
+use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
+use novarocks_functions::{ConstantPool, ConstantValue, validate_function_value_type_observed};
 use novarocks_sql::compiler::{
-    BinOp, FoldNodeKind, FoldRequest, LiteralValue as SqlLiteralValue, SqlConstantEvaluator, UnOp,
+    BinOp, FoldNodeKind, FoldRequest, SqlConstantEvaluationError, SqlConstantEvaluator, UnOp,
 };
-use novarocks_types::largeint;
+use novarocks_type_contract::{
+    CompileCheckpoints, CompilePhase, FunctionValueType, PureCompileControl, ValueLogicalType,
+    ValueTypeVisit, field_logical_type, validate_value_type_structure_observed,
+};
 use std::sync::Arc;
 
 /// Zero-sized, stateless evaluator: it owns no session, catalog, or runtime
@@ -65,25 +64,226 @@ pub(crate) fn constant_evaluator() -> &'static dyn SqlConstantEvaluator {
 }
 
 impl SqlConstantEvaluator for ExecutionConstantEvaluator {
-    fn eval_scalar(&self, request: &FoldRequest) -> Result<Option<SqlLiteralValue>, String> {
-        let mut arena = ExprArena::default();
-        let mut arg_ids: Vec<ExprId> = Vec::with_capacity(request.args.len());
-        for arg in &request.args {
-            let Some(literal) = sql_literal_to_exec(&arg.value, &arg.data_type) else {
+    fn eval_scalar(
+        &self,
+        request: &FoldRequest,
+        control: &dyn PureCompileControl,
+    ) -> Result<Option<ConstantValue>, SqlConstantEvaluationError> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
+        let evaluated = (|| -> Result<Option<ConstantValue>, SqlConstantEvaluationError> {
+            // Validate all frozen source facts even when a supported-domain
+            // check will decline an earlier argument. No payload enum is read.
+            let mut supported = legacy_value_type_supported(&request.result_type, &mut work)?;
+            for arg in &request.args {
+                supported &= legacy_value_type_supported(&arg.value_type, &mut work)?;
+                if !arg
+                    .value_type
+                    .exactly_equals_observed(arg.value.value_type(), || {
+                        work.step().map_err(SqlConstantEvaluationError::from)
+                    })?
+                {
+                    return Err(novarocks_functions::ConstantError::Invalid(
+                        "fold constant source differs from its exact frozen value type",
+                    )
+                    .into());
+                }
+                work.step()?;
+            }
+            if !supported {
+                return Ok(None);
+            }
+            work.flush()?;
+            let mut arena = ExprArena::default();
+            let mut arg_ids: Vec<ExprId> = Vec::with_capacity(request.args.len());
+            for arg in &request.args {
+                arg_ids.push(arena.push_typed(
+                    ExprNode::Constant(arg.value.clone()),
+                    arg.value_type.data_type.clone(),
+                ));
+                work.step()?;
+            }
+            work.step()?;
+            let Some(root_node) = root_node_for(&request.kind, &arg_ids) else {
                 return Ok(None);
             };
-            arg_ids.push(arena.push_typed(ExprNode::Literal(literal), arg.data_type.clone()));
+            let root = arena.push_typed(root_node, request.result_type.data_type.clone());
+            work.flush()?;
+            let chunk = single_row_chunk()?;
+            work.flush()?;
+            // This staged adapter reuses the legacy runtime. Its opaque
+            // internal loops/allocations are not a pure-kernel or MEM proof.
+            let output = arena.eval(root, &chunk)?;
+            work.flush()?;
+            if output.len() != 1 {
+                return Err(format!(
+                    "constant folding produced {} rows, expected exactly 1",
+                    output.len()
+                )
+                .into());
+            }
+            if !novarocks_type_contract::arrow_data_types_exact_observed::<
+                SqlConstantEvaluationError,
+            >(output.data_type(), &request.result_type.data_type, || {
+                work.step()?;
+                Ok(())
+            })? {
+                return Err("constant folding output differs from its frozen carrier"
+                    .to_owned()
+                    .into());
+            }
+            if output.is_null(0) && !request.result_type.nullable {
+                return Ok(None);
+            }
+            // Preserve the old optional fold refusal for decimal results that
+            // the runtime emits outside their declared precision. CV creation
+            // must not reinterpret that result or truncate a display string.
+            work.flush()?;
+            let utf8_fits = utf8_output_fits(&output, &mut work)?;
+            if !utf8_fits {
+                return Ok(None);
+            }
+            let decimal_fits = decimal_output_fits(&output)?;
+            work.flush()?;
+            if !decimal_fits {
+                return Ok(None);
+            }
+            let field = Arc::new(request.result_type.try_to_field("literal")?);
+            let data = output.to_data();
+            work.flush()?;
+            let pool = ConstantPool::try_new(
+                field,
+                request.result_type.clone(),
+                data,
+                request.constant_policy,
+                CompilePhase::FunctionSpecialization,
+                control,
+            )?;
+            work.step()?;
+            Ok(Some(pool.value(0)?))
+        })();
+        if matches!(
+            &evaluated,
+            Err(SqlConstantEvaluationError::Control(_))
+                | Err(SqlConstantEvaluationError::Constant(
+                    novarocks_functions::ConstantError::Limit(_)
+                ))
+        ) {
+            return evaluated;
         }
-
-        let Some(root_node) = root_node_for(&request.kind, &arg_ids) else {
-            return Ok(None);
-        };
-        let root = arena.push_typed(root_node, request.out_type.clone());
-
-        let chunk = single_row_chunk()?;
-        let output = arena.eval(root, &chunk)?;
-        read_back_row0(&output, &request.out_type)
+        work.finish()?;
+        evaluated
     }
+}
+
+// Inspect bytes before any StringArray::value call can form an invalid &str.
+// Only malformed UTF8 preserves the legacy optional fold decline; invalid
+// layout remains an ordinary evaluation error, not an Arrow-error fallback.
+fn utf8_output_fits(
+    output: &ArrayRef,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, SqlConstantEvaluationError> {
+    if output.is_null(0) {
+        return Ok(true);
+    }
+    macro_rules! inspect {
+        ($array:ty) => {{
+            let array = output.as_any().downcast_ref::<$array>().ok_or_else(|| {
+                SqlConstantEvaluationError::Evaluation("invalid UTF8 output class".into())
+            })?;
+            let offsets = array.value_offsets();
+            let start = usize::try_from(offsets[0]).map_err(|_| {
+                SqlConstantEvaluationError::Evaluation("invalid UTF8 output offset".into())
+            })?;
+            let end = usize::try_from(offsets[1]).map_err(|_| {
+                SqlConstantEvaluationError::Evaluation("invalid UTF8 output offset".into())
+            })?;
+            let bytes = array.value_data().get(start..end).ok_or_else(|| {
+                SqlConstantEvaluationError::Evaluation("invalid UTF8 output range".into())
+            })?;
+            // Account real bounded visits before the opaque UTF8 validator.
+            for byte in bytes {
+                std::hint::black_box(byte);
+                work.step()?;
+            }
+            work.flush()?;
+            let valid = std::str::from_utf8(bytes).is_ok();
+            work.flush()?;
+            Ok(valid)
+        }};
+    }
+    match output.data_type() {
+        DataType::Utf8 => inspect!(arrow::array::StringArray),
+        DataType::LargeUtf8 => inspect!(arrow::array::LargeStringArray),
+        _ => Ok(true),
+    }
+}
+
+fn decimal_output_fits(output: &ArrayRef) -> Result<bool, String> {
+    if output.is_null(0) {
+        return Ok(true);
+    }
+    match output.data_type() {
+        DataType::Decimal128(precision, _) => {
+            let array = output
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .ok_or_else(|| {
+                    "constant folding has an invalid Decimal128 result class".to_owned()
+                })?;
+            Ok(Decimal128Type::is_valid_decimal_precision(
+                array.value(0),
+                *precision,
+            ))
+        }
+        DataType::Decimal256(precision, _) => {
+            let array = output
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .ok_or_else(|| {
+                    "constant folding has an invalid Decimal256 result class".to_owned()
+                })?;
+            Ok(Decimal256Type::is_valid_decimal_precision(
+                array.value(0),
+                *precision,
+            ))
+        }
+        _ => Ok(true),
+    }
+}
+
+/// The legacy arena carries Arrow types only. Its one exact non-Physical
+/// scalar representation is the existing LARGEINT literal/kernel protocol;
+/// all other semantic domains need the full-value evaluator migration.
+fn legacy_value_type_supported(
+    value_type: &FunctionValueType,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<bool, SqlConstantEvaluationError> {
+    work.step()?;
+    value_type
+        .logical_type
+        .validate_carrier(&value_type.data_type)?;
+    // The function owner supplies the actual type/metadata resource limits.
+    // Its borrowed walk observes entries, not opaque cloning or kernel work.
+    validate_function_value_type_observed(value_type, work)?;
+    let mut nested_physical = true;
+    validate_value_type_structure_observed::<SqlConstantEvaluationError>(
+        &value_type.data_type,
+        |visit| {
+            work.step()?;
+            if let ValueTypeVisit::Field(field) = visit {
+                nested_physical &= field_logical_type(field)? == ValueLogicalType::Physical;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(nested_physical
+        && match value_type.logical_type {
+            ValueLogicalType::Physical => {
+                !matches!(value_type.data_type, DataType::FixedSizeBinary(_))
+            }
+            ValueLogicalType::LargeInt => true,
+            _ => false,
+        })
 }
 
 /// A schemaless chunk with exactly one row.
@@ -160,528 +360,6 @@ fn root_node_for(kind: &FoldNodeKind, args: &[ExprId]) -> Option<ExprNode> {
     }
 }
 
-/// Turns one already-folded SQL literal into the execution literal the kernels
-/// expect, driven by the argument's declared Arrow type.
-///
-/// Every arm is exact: a value that cannot round-trip through the target
-/// representation yields `None` so the caller keeps the original expression.
-fn sql_literal_to_exec(value: &SqlLiteralValue, data_type: &DataType) -> Option<ExecLiteralValue> {
-    match (value, data_type) {
-        // A typed NULL literal keeps its declared type: `ExprArena::eval`
-        // materializes `new_null_array(out_type)` for a `Null` literal.
-        (SqlLiteralValue::Null, _) => Some(ExecLiteralValue::Null),
-        (SqlLiteralValue::Bool(v), DataType::Boolean) => Some(ExecLiteralValue::Bool(*v)),
-        (SqlLiteralValue::Int(v), DataType::Int8) => {
-            i8::try_from(*v).ok().map(ExecLiteralValue::Int8)
-        }
-        (SqlLiteralValue::Int(v), DataType::Int16) => {
-            i16::try_from(*v).ok().map(ExecLiteralValue::Int16)
-        }
-        (SqlLiteralValue::Int(v), DataType::Int32) => {
-            i32::try_from(*v).ok().map(ExecLiteralValue::Int32)
-        }
-        (SqlLiteralValue::Int(v), DataType::Int64) => Some(ExecLiteralValue::Int64(*v)),
-        (SqlLiteralValue::Int(v), DataType::Date32) => {
-            i32::try_from(*v).ok().map(ExecLiteralValue::Date32)
-        }
-        (SqlLiteralValue::LargeInt(v), dt) if largeint::is_largeint_data_type(dt) => {
-            Some(ExecLiteralValue::LargeInt(*v))
-        }
-        (SqlLiteralValue::Float(v), DataType::Float64) => Some(ExecLiteralValue::Float64(*v)),
-        (SqlLiteralValue::Float(v), DataType::Float32) => {
-            // Accept only a FLOAT literal that survives the f64 -> f32 round
-            // trip. Everything this adapter reads back from a Float32 column
-            // does survive it, so the guard rejects exactly the widened values
-            // the runtime would never have produced.
-            let narrowed = *v as f32;
-            (f64::from(narrowed).to_bits() == v.to_bits())
-                .then_some(ExecLiteralValue::Float32(narrowed))
-        }
-        (SqlLiteralValue::String(v), DataType::Utf8) => Some(ExecLiteralValue::Utf8(v.clone())),
-        (SqlLiteralValue::Binary(v), DataType::Binary) => Some(ExecLiteralValue::Binary(v.clone())),
-        (SqlLiteralValue::Decimal(text), DataType::Decimal128(precision, scale)) => {
-            exact_decimal_text(text, *scale)?;
-            parse_decimal::<Decimal128Type>(text, *precision, *scale)
-                .ok()
-                .map(|value| ExecLiteralValue::Decimal128 {
-                    value,
-                    precision: *precision,
-                    scale: *scale,
-                })
-        }
-        (SqlLiteralValue::Decimal(text), DataType::Decimal256(precision, scale)) => {
-            exact_decimal_text(text, *scale)?;
-            parse_decimal::<Decimal256Type>(text, *precision, *scale)
-                .ok()
-                .map(|value| ExecLiteralValue::Decimal256 {
-                    value,
-                    precision: *precision,
-                    scale: *scale,
-                })
-        }
-        _ => None,
-    }
-}
-
-/// Guards `parse_decimal`, which silently truncates surplus fraction digits
-/// and accepts e-notation. Both would fold to a value the runtime never
-/// produced, so only plain notation that fits the column scale is accepted.
-fn exact_decimal_text(text: &str, scale: i8) -> Option<()> {
-    let scale = usize::try_from(scale).ok()?;
-    if text.contains(['e', 'E']) {
-        return None;
-    }
-    match text.split_once('.') {
-        Some((_, fraction)) => (fraction.len() <= scale).then_some(()),
-        None => Some(()),
-    }
-}
-
-/// Reads the single produced row back into the SQL literal vocabulary.
-///
-/// `Err` means the kernel produced something that contradicts the frozen node
-/// type; `Ok(None)` means the output type has no faithful SQL literal form.
-fn read_back_row0(
-    output: &ArrayRef,
-    out_type: &DataType,
-) -> Result<Option<SqlLiteralValue>, String> {
-    if output.len() != 1 {
-        return Err(format!(
-            "constant folding produced {} rows, expected exactly 1",
-            output.len()
-        ));
-    }
-    if !is_readable_output_type(out_type) {
-        return Ok(None);
-    }
-    if output.data_type() != out_type {
-        return Err(format!(
-            "constant folding produced {:?}, expected {:?}",
-            output.data_type(),
-            out_type
-        ));
-    }
-    if output.is_null(0) {
-        return Ok(Some(SqlLiteralValue::Null));
-    }
-
-    let literal = match out_type {
-        DataType::Boolean => SqlLiteralValue::Bool(downcast::<BooleanArray>(output)?.value(0)),
-        DataType::Int8 => SqlLiteralValue::Int(i64::from(downcast::<Int8Array>(output)?.value(0))),
-        DataType::Int16 => {
-            SqlLiteralValue::Int(i64::from(downcast::<Int16Array>(output)?.value(0)))
-        }
-        DataType::Int32 => {
-            SqlLiteralValue::Int(i64::from(downcast::<Int32Array>(output)?.value(0)))
-        }
-        DataType::Int64 => SqlLiteralValue::Int(downcast::<Int64Array>(output)?.value(0)),
-        DataType::Date32 => {
-            SqlLiteralValue::Int(i64::from(downcast::<Date32Array>(output)?.value(0)))
-        }
-        DataType::FixedSizeBinary(_) => SqlLiteralValue::LargeInt(largeint::i128_from_be_bytes(
-            downcast::<FixedSizeBinaryArray>(output)?.value(0),
-        )?),
-        DataType::Float32 => {
-            SqlLiteralValue::Float(f64::from(downcast::<Float32Array>(output)?.value(0)))
-        }
-        DataType::Float64 => SqlLiteralValue::Float(downcast::<Float64Array>(output)?.value(0)),
-        // `StringArray::value` converts without revalidating, so a kernel is
-        // able to hand back bytes that are not valid UTF-8. The plan encodes a
-        // literal string as a protobuf string field, which would re-encode
-        // those bytes, so decline rather than fold something the runtime would
-        // not reproduce. (Byte-carrying string families such as `aes_encrypt`
-        // are valid UTF-8 and are excluded by the SQL-side foldable list.)
-        DataType::Utf8 => {
-            let Some(text) = utf8_round_trippable(downcast::<StringArray>(output)?.value(0)) else {
-                return Ok(None);
-            };
-            SqlLiteralValue::String(text)
-        }
-        DataType::LargeUtf8 => {
-            let Some(text) = utf8_round_trippable(downcast::<LargeStringArray>(output)?.value(0))
-            else {
-                return Ok(None);
-            };
-            SqlLiteralValue::String(text)
-        }
-        DataType::Binary => {
-            SqlLiteralValue::Binary(downcast::<BinaryArray>(output)?.value(0).to_vec())
-        }
-        DataType::LargeBinary => {
-            SqlLiteralValue::Binary(downcast::<LargeBinaryArray>(output)?.value(0).to_vec())
-        }
-        // Arrow renders the unscaled value exactly at the column's scale, so
-        // the folded text matches what the runtime would have printed — but
-        // only while the value still fits the declared precision. A decimal
-        // kernel is allowed to return a result wider than its own declared
-        // precision (an overflowed multiply or a rounding cast such as
-        // `CAST(99999.999 AS DECIMAL(7,2))` -> 100000.00), and rendering that
-        // through the declared precision drops the leading digit. Decline the
-        // fold instead, so the runtime keeps producing whatever it produces
-        // today for out-of-range decimals.
-        DataType::Decimal128(precision, _) => {
-            let array = downcast::<Decimal128Array>(output)?;
-            if !Decimal128Type::is_valid_decimal_precision(array.value(0), *precision) {
-                return Ok(None);
-            }
-            SqlLiteralValue::Decimal(array.value_as_string(0))
-        }
-        DataType::Decimal256(precision, _) => {
-            let array = downcast::<Decimal256Array>(output)?;
-            if !Decimal256Type::is_valid_decimal_precision(array.value(0), *precision) {
-                return Ok(None);
-            }
-            SqlLiteralValue::Decimal(array.value_as_string(0))
-        }
-        // `is_readable_output_type` already filtered everything else.
-        _ => return Ok(None),
-    };
-    Ok(Some(literal))
-}
-
-/// Returns the string only when its bytes really are valid UTF-8.
-///
-/// `StringArray::value` converts without revalidating, so a kernel that stores
-/// raw bytes in a Utf8 array yields a `&str` whose bytes would change the first
-/// time they are re-encoded.
-fn utf8_round_trippable(value: &str) -> Option<String> {
-    std::str::from_utf8(value.as_bytes())
-        .ok()
-        .map(str::to_string)
-}
-
-/// Output types with an exact SQL literal representation.
-fn is_readable_output_type(out_type: &DataType) -> bool {
-    match out_type {
-        DataType::Boolean
-        | DataType::Int8
-        | DataType::Int16
-        | DataType::Int32
-        | DataType::Int64
-        | DataType::Date32
-        | DataType::Float32
-        | DataType::Float64
-        | DataType::Utf8
-        | DataType::LargeUtf8
-        | DataType::Binary
-        | DataType::LargeBinary => true,
-        // LARGEINT is the only FixedSizeBinary the SQL literal vocabulary can
-        // express; any other width is opaque bytes with no literal form.
-        DataType::FixedSizeBinary(_) => largeint::is_largeint_data_type(out_type),
-        // A negative scale would render a text this adapter refuses to read
-        // back in, so never fold into one.
-        DataType::Decimal128(_, scale) | DataType::Decimal256(_, scale) => *scale >= 0,
-        _ => false,
-    }
-}
-
-fn downcast<T: 'static>(output: &ArrayRef) -> Result<&T, String> {
-    output.as_any().downcast_ref::<T>().ok_or_else(|| {
-        format!(
-            "constant folding could not read a {:?} result as {}",
-            output.data_type(),
-            std::any::type_name::<T>()
-        )
-    })
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use novarocks_sql::compiler::FoldArg;
-
-    fn arg(value: SqlLiteralValue, data_type: DataType) -> FoldArg {
-        FoldArg {
-            value,
-            data_type,
-            nullable: false,
-        }
-    }
-
-    fn fold(
-        kind: FoldNodeKind,
-        args: Vec<FoldArg>,
-        out_type: DataType,
-    ) -> Result<Option<SqlLiteralValue>, String> {
-        constant_evaluator().eval_scalar(&FoldRequest {
-            kind,
-            args,
-            out_type,
-            out_nullable: true,
-        })
-    }
-
-    #[test]
-    fn folds_int32_addition() {
-        let folded = fold(
-            FoldNodeKind::BinaryOp(
-                BinOp::Add,
-                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            ),
-            vec![
-                arg(SqlLiteralValue::Int(1), DataType::Int32),
-                arg(SqlLiteralValue::Int(1), DataType::Int32),
-            ],
-            DataType::Int32,
-        );
-        assert_eq!(folded, Ok(Some(SqlLiteralValue::Int(2))));
-    }
-
-    #[test]
-    fn folds_date_format_of_date32_literal() {
-        // 18262 is 2020-01-01 in days since the epoch. The kernel translates
-        // the MySQL format through `mysql_format_to_chrono`, so `%Y-%m-%d`
-        // renders as chrono `%Y-%m-%d`.
-        let folded = fold(
-            FoldNodeKind::Function {
-                name: "date_format".to_string(),
-            },
-            vec![
-                arg(SqlLiteralValue::Int(18262), DataType::Date32),
-                arg(
-                    SqlLiteralValue::String("%Y-%m-%d".to_string()),
-                    DataType::Utf8,
-                ),
-            ],
-            DataType::Utf8,
-        );
-        assert_eq!(
-            folded,
-            Ok(Some(SqlLiteralValue::String("2020-01-01".to_string())))
-        );
-    }
-
-    #[test]
-    fn folds_cast_of_utf8_to_date32() {
-        // 1970-01-01 -> 2020-01-01 spans 50 years with 12 leap days
-        // (1972..=2016 step 4, 2000 included), i.e. 50 * 365 + 12 = 18262.
-        let folded = fold(
-            FoldNodeKind::Cast(novarocks_type_contract::DecimalOverflowPolicy::OutputNull),
-            vec![arg(
-                SqlLiteralValue::String("2020-01-01".to_string()),
-                DataType::Utf8,
-            )],
-            DataType::Date32,
-        );
-        assert_eq!(folded, Ok(Some(SqlLiteralValue::Int(18262))));
-    }
-
-    #[test]
-    fn folds_decimal_multiplication_keeping_scale() {
-        // 1.25 * 4.00 with an output scale equal to the sum of the input
-        // scales, so the kernel neither rescales nor rounds: 125 * 400 = 50000
-        // at scale 4.
-        let folded = fold(
-            FoldNodeKind::BinaryOp(
-                BinOp::Mul,
-                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            ),
-            vec![
-                arg(
-                    SqlLiteralValue::Decimal("1.25".to_string()),
-                    DataType::Decimal128(10, 2),
-                ),
-                arg(
-                    SqlLiteralValue::Decimal("4.00".to_string()),
-                    DataType::Decimal128(10, 2),
-                ),
-            ],
-            DataType::Decimal128(20, 4),
-        );
-        assert_eq!(
-            folded,
-            Ok(Some(SqlLiteralValue::Decimal("5.0000".to_string())))
-        );
-    }
-
-    #[test]
-    fn folds_checked_decimal_cast_overflow_to_null() {
-        // Half-up carry produces 100000.00, requiring precision 8; the frozen
-        // (7,2) cast therefore returns NULL under OutputNull.
-        let folded = fold(
-            FoldNodeKind::Cast(novarocks_type_contract::DecimalOverflowPolicy::OutputNull),
-            vec![arg(
-                SqlLiteralValue::Decimal("99999.999".to_string()),
-                DataType::Decimal128(8, 3),
-            )],
-            DataType::Decimal128(7, 2),
-        );
-        assert_eq!(folded, Ok(Some(SqlLiteralValue::Null)));
-    }
-
-    #[test]
-    fn folds_decimal_cast_that_still_fits_its_precision() {
-        // Same rounding shape as above, one digit of headroom: the guard must
-        // not reject a result the declared precision can hold.
-        let folded = fold(
-            FoldNodeKind::Cast(novarocks_type_contract::DecimalOverflowPolicy::OutputNull),
-            vec![arg(
-                SqlLiteralValue::Decimal("99999.999".to_string()),
-                DataType::Decimal128(8, 3),
-            )],
-            DataType::Decimal128(8, 2),
-        );
-        assert_eq!(
-            folded,
-            Ok(Some(SqlLiteralValue::Decimal("100000.00".to_string())))
-        );
-    }
-
-    #[test]
-    fn declines_unknown_function() {
-        let folded = fold(
-            FoldNodeKind::Function {
-                name: "no_such_novarocks_function".to_string(),
-            },
-            vec![arg(SqlLiteralValue::Int(1), DataType::Int32)],
-            DataType::Int32,
-        );
-        assert_eq!(folded, Ok(None));
-    }
-
-    #[test]
-    fn declines_unary_negate() {
-        let folded = fold(
-            FoldNodeKind::UnaryOp(UnOp::Negate),
-            vec![arg(SqlLiteralValue::Int(1), DataType::Int32)],
-            DataType::Int32,
-        );
-        assert_eq!(folded, Ok(None));
-
-        // `NOT` is the one unary op with a direct execution node.
-        let folded_not = fold(
-            FoldNodeKind::UnaryOp(UnOp::Not),
-            vec![arg(SqlLiteralValue::Bool(true), DataType::Boolean)],
-            DataType::Boolean,
-        );
-        assert_eq!(folded_not, Ok(Some(SqlLiteralValue::Bool(false))));
-    }
-
-    #[test]
-    fn declines_unmappable_argument_literal() {
-        // A string value carried on an INT slot has no faithful execution
-        // literal: the adapter must not parse or coerce it.
-        let mismatched_kind = fold(
-            FoldNodeKind::BinaryOp(
-                BinOp::Add,
-                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            ),
-            vec![
-                arg(SqlLiteralValue::String("7".to_string()), DataType::Int32),
-                arg(SqlLiteralValue::Int(1), DataType::Int32),
-            ],
-            DataType::Int32,
-        );
-        assert_eq!(mismatched_kind, Ok(None));
-
-        // An INT literal that does not fit its declared width is equally
-        // unmappable.
-        let out_of_range = fold(
-            FoldNodeKind::BinaryOp(
-                BinOp::Add,
-                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            ),
-            vec![
-                arg(SqlLiteralValue::Int(i64::MAX), DataType::Int32),
-                arg(SqlLiteralValue::Int(1), DataType::Int32),
-            ],
-            DataType::Int32,
-        );
-        assert_eq!(out_of_range, Ok(None));
-
-        // More fraction digits than the column scale would be truncated, so
-        // the decimal is declined rather than folded to a different value.
-        let lossy_decimal = fold(
-            FoldNodeKind::BinaryOp(
-                BinOp::Add,
-                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            ),
-            vec![
-                arg(
-                    SqlLiteralValue::Decimal("1.239".to_string()),
-                    DataType::Decimal128(10, 2),
-                ),
-                arg(
-                    SqlLiteralValue::Decimal("1.00".to_string()),
-                    DataType::Decimal128(10, 2),
-                ),
-            ],
-            DataType::Decimal128(10, 2),
-        );
-        assert_eq!(lossy_decimal, Ok(None));
-    }
-
-    #[test]
-    fn division_by_zero_folds_to_null() {
-        // Observed behavior: `arithmetic::eval_div` nullifies zero divisors
-        // (matching StarRocks), so the kernel yields NULL rather than `Err`.
-        // The adapter therefore folds `1 / 0` to a typed NULL literal instead
-        // of surfacing an evaluation failure.
-        let folded = fold(
-            FoldNodeKind::BinaryOp(
-                BinOp::Div,
-                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            ),
-            vec![
-                arg(SqlLiteralValue::Int(1), DataType::Int32),
-                arg(SqlLiteralValue::Int(0), DataType::Int32),
-            ],
-            DataType::Float64,
-        );
-        assert_eq!(folded, Ok(Some(SqlLiteralValue::Null)));
-    }
-}
-
-#[cfg(test)]
-mod overflow_policy_tests {
-    use super::*;
-    use novarocks_sql::compiler::FoldArg;
-    use novarocks_type_contract::DecimalOverflowPolicy::{OutputNull, ReportError};
-    #[test]
-    fn real_execution_fold_distinguishes_checked_decimal_error_from_null() {
-        let args = vec![
-            FoldArg {
-                value: SqlLiteralValue::Decimal(
-                    "99999999999999999999999999999999999999".to_string(),
-                ),
-                data_type: DataType::Decimal128(38, 0),
-                nullable: false,
-            },
-            FoldArg {
-                value: SqlLiteralValue::Int(1),
-                data_type: DataType::Int64,
-                nullable: false,
-            },
-        ];
-        for policy in [OutputNull, ReportError] {
-            let request = FoldRequest {
-                kind: FoldNodeKind::BinaryOp(BinOp::Add, policy),
-                args: args.clone(),
-                out_type: DataType::Decimal128(38, 0),
-                out_nullable: true,
-            };
-            let result = constant_evaluator().eval_scalar(&request);
-            if policy == OutputNull {
-                assert_eq!(result, Ok(Some(SqlLiteralValue::Null)));
-            } else {
-                assert!(
-                    result
-                        .unwrap_err()
-                        .contains("'add' operation involving decimal values overflows")
-                );
-            }
-            let request = FoldRequest {
-                kind: FoldNodeKind::Cast(policy),
-                args: vec![args[0].clone()],
-                out_type: DataType::Decimal128(9, 0),
-                out_nullable: true,
-            };
-            let result = constant_evaluator().eval_scalar(&request);
-            if policy == OutputNull {
-                assert_eq!(result, Ok(Some(SqlLiteralValue::Null)));
-            } else {
-                assert!(result.unwrap_err().contains("overflows"));
-            }
-        }
-    }
-}
+#[path = "constant_eval/cv_tests.rs"]
+mod cv_tests;

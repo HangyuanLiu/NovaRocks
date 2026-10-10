@@ -406,6 +406,7 @@ enum PreparedQueryFormatter {
 
 struct PreparedProfileFormatter {
     plan: ProfilePlan,
+    control: novarocks_sql::compiler::SqlCompileControl,
     planning_elapsed: std::time::Duration,
     execution_started_at: std::time::Instant,
 }
@@ -429,10 +430,12 @@ impl PreparedQueryCompletion {
         annotations: std::sync::Arc<[novarocks_sql::compiler::SqlDisplayAnnotation]>,
         planning_elapsed: std::time::Duration,
         execution_started_at: std::time::Instant,
+        control: novarocks_sql::compiler::SqlCompileControl,
     ) -> Self {
         Self {
             formatter: PreparedQueryFormatter::Profile(PreparedProfileFormatter {
                 plan: ProfilePlan::Completed { plan, annotations },
+                control,
                 planning_elapsed,
                 execution_started_at,
             }),
@@ -530,7 +533,7 @@ fn complete_profile(
     }
     lines.extend(match formatter.plan {
         ProfilePlan::Completed { plan, annotations } => {
-            render_completed_profile(&plan, &annotations, &actuals, &per_fragment)?
+            render_completed_profile(&plan, &annotations, &actuals, &per_fragment, &formatter.control)?
         }
     });
     build_string_query_result("Explain String", lines).map(StatementResult::Query)
@@ -544,6 +547,7 @@ fn render_completed_profile(
         i32,
         crate::query_execution::profile::DistributedProfileSummary,
     >,
+    control: &novarocks_sql::compiler::SqlCompileControl,
 ) -> Result<Vec<String>, String> {
     use novarocks_sql::compiler::{
         SqlCompletedExplainProfile, SqlExplainFragmentMetrics, SqlExplainNodeKey,
@@ -629,6 +633,7 @@ fn render_completed_profile(
         novarocks_sql::compiler::ExplainLevel::Analyze,
         Some(&profile),
         novarocks_sql::compiler::ExplainRenderBudget::default(),
+        control,
     )
     .map_err(|error| error.to_string())
 }

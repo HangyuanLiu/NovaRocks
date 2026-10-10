@@ -197,13 +197,13 @@ static ARRAY_METADATA: &[FunctionMeta] = &[
     },
     FunctionMeta {
         name: "__array_struct_subfield",
-        min_args: 2,
-        max_args: 2,
+        min_args: novarocks_functions::invocation_arity::ARRAY_STRUCT_SUBFIELD_ARITY.minimum,
+        max_args: novarocks_functions::invocation_arity::ARRAY_STRUCT_SUBFIELD_ARITY.maximum,
     },
     FunctionMeta {
         name: "array_struct_subfield",
-        min_args: 2,
-        max_args: 2,
+        min_args: novarocks_functions::invocation_arity::ARRAY_STRUCT_SUBFIELD_ARITY.minimum,
+        max_args: novarocks_functions::invocation_arity::ARRAY_STRUCT_SUBFIELD_ARITY.maximum,
     },
     FunctionMeta {
         name: "element_at",

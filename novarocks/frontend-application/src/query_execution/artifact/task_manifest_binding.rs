@@ -1497,7 +1497,10 @@ mod tests {
             ),
             FullBindPurpose::CountOnly => FrozenRootOutput::CountOnly,
         };
-        let candidate = CompletedPhysicalPlanCandidate::for_program(plan)
+        let candidate = CompletedPhysicalPlanCandidate::for_program(
+            plan,
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
             .expect("production completed program validation")
             .freeze_root_output(output)
             .expect("freeze the original root purpose");
@@ -1514,7 +1517,13 @@ mod tests {
         let functions = novarocks_sql::compiler::build_builtin_engine_function_catalog()
             .expect("original builtin engine function catalog");
         let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
-            paired, &functions, None,
+            paired,
+            &functions,
+            &crate::query_execution::package_freeze::StaticPlanCarrier::PlanTree,
+            crate::application::test_constant_policy(),
+            None,
+            false,
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
         .expect("production physical-to-native encoding");
         assert_eq!(encoded.native.fragment_ids().count(), 1);

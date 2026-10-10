@@ -21,7 +21,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
     stmt: &MvRefreshRequest,
     level: novarocks_sql::compiler::ExplainLevel,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, novarocks_sql::compiler::SqlCompileError> {
     let (rewrite, target_planning_lease) =
         crate::query_execution::mv_assembly::refresh_preparation::freeze_statement_refresh_rewrite_context(
             ports,
@@ -56,14 +56,16 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
     target_planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     level: novarocks_sql::compiler::ExplainLevel,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, novarocks_sql::compiler::SqlCompileError> {
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name_parts)?;
     if rewrite.target.catalog != target.catalog
         || rewrite.target.namespace != target.namespace
         || rewrite.target.table != target.table
     {
         return Err(
-            "EXPLAIN REFRESH target differs from its canonical rewrite context".to_string(),
+            "EXPLAIN REFRESH target differs from its canonical rewrite context"
+                .to_string()
+                .into(),
         );
     }
     let target_binding =
@@ -75,7 +77,11 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
         )?;
     validate_target_snapshot(&target, &rewrite.mv_definition, &target_binding)?;
     if target_binding.table_uuid() != rewrite.target_table_uuid {
-        return Err("EXPLAIN REFRESH target UUID differs from its rewrite context".to_string());
+        return Err(
+            "EXPLAIN REFRESH target UUID differs from its rewrite context"
+                .to_string()
+                .into(),
+        );
     }
     let bindings = Arc::new(QueryTableBindingStore::try_new()?);
     let target_binding_id = bind_imv_target_query_table_in_store_from_rewrite(
@@ -105,6 +111,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&materializer);
     novarocks_sql::compiler::compile_imv_refresh_explain_lines(
         novarocks_sql::compiler::SqlImvRefreshExplainContext {
+            emission_mode: ports.sql_emission_mode(),
             canonical_query: Box::new((*rewrite.canonical_select_query).clone()),
             imv_rewrite: novarocks_sql::compiler::SqlImvPlanningInput::new(
                 rewrite.to_sql_rewrite_snapshot(target_binding_id)?,
@@ -117,24 +124,11 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
             catalog: &catalog,
             functions: ports.function_catalog().as_ref(),
             constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
-            control: novarocks_sql::compiler::SqlCompileControl::new(
-                Some(connector_context.deadline()),
-                Arc::new(MvRefreshConnectorStopObservation {
-                    stop: connector_context.stop().clone(),
-                }),
+            constant_policy: ports.constant_policy(),
+            control: crate::query_execution::planning::sql_compile_control_from_connector_request(
+                connector_context,
             ),
             level,
         },
     )
-    .map_err(|error| error.to_string())
-}
-
-struct MvRefreshConnectorStopObservation {
-    stop: novarocks_spi::connector::ConnectorStopView,
-}
-
-impl novarocks_sql::compiler::SqlCancellationObservation for MvRefreshConnectorStopObservation {
-    fn is_cancelled(&self) -> bool {
-        self.stop.is_stopped()
-    }
 }

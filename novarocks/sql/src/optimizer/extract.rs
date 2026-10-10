@@ -30,8 +30,10 @@ use super::optimized_tree::{
 use super::property::{OrderingSpec, PhysicalPropertySet};
 use super::search::{EnforcerKind, Winner};
 use crate::common::OutputColumn;
+use crate::compiler::SqlCompileError;
 use crate::optimizer::scalar::{ScalarArena, ScalarNode, SortKey};
 use crate::optimizer::statistics::Statistics;
+use novarocks_type_contract::{CompilePhase, PureCompileControl};
 
 /// Extract the best optimizer physical operator tree from the Memo.
 ///
@@ -45,7 +47,9 @@ pub(crate) fn extract_best(
     root_group: GroupId,
     required: &PhysicalPropertySet,
     winners: &HashMap<(GroupId, PhysicalPropertySet), Winner>,
-) -> Result<OptimizedOperatorNode, String> {
+    control: &dyn PureCompileControl,
+) -> Result<OptimizedOperatorNode, SqlCompileError> {
+    control.checkpoint(CompilePhase::Validate, 0)?;
     let cache_key = (root_group, required.clone());
     let winner = winners.get(&cache_key).ok_or_else(|| {
         format!(
@@ -58,7 +62,8 @@ pub(crate) fn extract_best(
         return Err(format!(
             "no feasible plan for group {} with props {:?}",
             root_group, required
-        ));
+        )
+        .into());
     }
 
     let (group_stats, output_columns, expr) = {
@@ -103,14 +108,15 @@ pub(crate) fn extract_best(
             winner.expr_index,
             expr.children.len(),
             child_reqs.len()
-        ));
+        )
+        .into());
     }
 
     // Recursively extract children.
     let mut children = Vec::with_capacity(expr.children.len());
     for (i, &child_group_id) in expr.children.iter().enumerate() {
         let child_req = child_reqs[i].clone();
-        let child_node = extract_best(memo, child_group_id, &child_req, winners)?;
+        let child_node = extract_best(memo, child_group_id, &child_req, winners, control)?;
         children.push(child_node);
     }
 
@@ -169,6 +175,7 @@ pub(crate) fn extract_best(
                     &mut memo.scalars,
                     ordering,
                     &inner_node.output_columns,
+                    control,
                 )?;
                 // Sort enforcers inserted by the property-derivation pass are
                 // pure ORDER BY enforcers, not analytic precursor sorts —
@@ -288,7 +295,7 @@ fn join_output_columns(
 
 fn nullable_output_columns(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
     for column in &mut columns {
-        column.nullable = true;
+        column.value_type.nullable = true;
     }
     columns
 }
@@ -341,8 +348,8 @@ fn project_output_columns(
             Ok(OutputColumn {
                 column_id: item.output_column_id,
                 name: item.output_name.clone(),
-                data_type: scalars.data_type(item.expr).clone(),
-                nullable: scalars.nullable(item.expr),
+                value_type: scalars.value_type(item.expr).clone(),
+
                 is_internal: inherited
                     .map(|column| column.is_internal)
                     .or(source_internal)
@@ -353,8 +360,8 @@ fn project_output_columns(
 }
 
 fn same_value_metadata(left: &OutputColumn, right: &OutputColumn) -> bool {
-    left.data_type == right.data_type
-        && left.nullable == right.nullable
+    left.value_type.data_type == right.value_type.data_type
+        && left.value_type.nullable == right.value_type.nullable
         && left.is_internal == right.is_internal
 }
 
@@ -390,13 +397,15 @@ fn ordering_spec_to_sort_keys(
     arena: &mut ScalarArena,
     ordering: &OrderingSpec,
     child_outputs: &[OutputColumn],
-) -> Result<Vec<SortKey>, String> {
+    control: &dyn PureCompileControl,
+) -> Result<Vec<SortKey>, SqlCompileError> {
+    control.checkpoint(CompilePhase::Validate, 0)?;
     match ordering {
         OrderingSpec::Any => Ok(Vec::new()),
         OrderingSpec::Required(sort_keys) => sort_keys
             .iter()
             .enumerate()
-            .map(|(ordinal, sk)| {
+            .map(|(ordinal, sk)| -> Result<SortKey, SqlCompileError> {
                 let mut matches = child_outputs
                     .iter()
                     .filter(|column| column.column_id == sk.column);
@@ -410,14 +419,14 @@ fn ordering_spec_to_sort_keys(
                     return Err(format!(
                         "sort enforcer key occurrence {ordinal} ColumnId({}) is ambiguous in the exact child output map",
                         sk.column.0
-                    ));
+                    ).into());
                 }
                 Ok(SortKey {
-                    expr: arena.intern(
+                    expr: arena.intern_observed(
                         ScalarNode::ColumnRef(sk.column),
-                        column.data_type.clone(),
-                        column.nullable,
-                    ),
+                        column.value_type.clone(),
+                        control,
+                    )?,
                     asc: sk.asc,
                     nulls_first: sk.nulls_first,
                     display: None,
@@ -453,8 +462,10 @@ mod tests {
                 qualifier: None,
                 column: format!("c{id}"),
             },
-            data_type: arrow::datatypes::DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
         }
     }
 
@@ -534,14 +545,17 @@ mod tests {
     fn project_output_metadata_preserves_repeated_value_aliases() {
         let mut scalars = ScalarArena::new();
         let source_id = ColumnId(2);
-        let expr = scalars.intern(ScalarNode::ColumnRef(source_id), DataType::Utf8, true);
+        let expr = scalars.intern(
+            ScalarNode::ColumnRef(source_id),
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+        );
         let columns: Vec<_> = ["name", "path"]
             .into_iter()
             .map(|name| OutputColumn {
                 column_id: source_id,
                 name: name.to_string(),
-                data_type: DataType::Utf8,
-                nullable: true,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+
                 is_internal: true,
             })
             .collect();
@@ -577,8 +591,8 @@ mod tests {
             for (output, expected) in outputs.iter().zip(&columns) {
                 assert_eq!(output.column_id, expected.column_id);
                 assert_eq!(output.name, expected.name);
-                assert_eq!(output.data_type, expected.data_type);
-                assert_eq!(output.nullable, expected.nullable);
+                assert_eq!(output.value_type.data_type, expected.value_type.data_type);
+                assert_eq!(output.value_type.nullable, expected.value_type.nullable);
                 assert_eq!(output.is_internal, expected.is_internal);
             }
         }
@@ -587,8 +601,8 @@ mod tests {
             let mut conflicting = columns.clone();
             match mutation {
                 0 => conflicting[1].is_internal = false,
-                1 => conflicting[1].nullable = false,
-                _ => conflicting[1].data_type = DataType::Int64,
+                1 => conflicting[1].value_type.nullable = false,
+                _ => conflicting[1].value_type.data_type = DataType::Int64,
             }
             assert!(project_output_columns(&project, &scalars, &conflicting, &[]).is_err());
             let mut conflicting_child = child.clone();
@@ -603,8 +617,8 @@ mod tests {
         let source_col = OutputColumn {
             column_id: ColumnId(1),
             name: "__change_op_source".to_string(),
-            data_type: DataType::Int8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+
             is_internal: true,
         };
         let child = memo.new_group(MExpr {
@@ -624,8 +638,7 @@ mod tests {
         let stale_id = ColumnId(13);
         let project_expr = memo.scalars.intern(
             ScalarNode::ColumnRef(source_col.column_id),
-            DataType::Int8,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
         );
         let root = memo.new_group(MExpr {
             id: memo.next_expr_id(),
@@ -644,8 +657,8 @@ mod tests {
             vec![OutputColumn {
                 column_id: stale_id,
                 name: "__change_op".to_string(),
-                data_type: DataType::Int8,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+
                 is_internal: true,
             }],
             0.0,
@@ -680,13 +693,20 @@ mod tests {
             ),
         );
 
-        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let plan = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("extract");
 
         assert_eq!(plan.output_columns.len(), 1);
         assert_eq!(plan.output_columns[0].column_id, output_id);
         assert_eq!(plan.output_columns[0].name, "__change_op");
-        assert_eq!(plan.output_columns[0].data_type, DataType::Int8);
-        assert!(!plan.output_columns[0].nullable);
+        assert_eq!(plan.output_columns[0].value_type.data_type, DataType::Int8);
+        assert!(!plan.output_columns[0].value_type.nullable);
         assert!(plan.output_columns[0].is_internal);
     }
 
@@ -696,22 +716,22 @@ mod tests {
         let left_key_col = OutputColumn {
             column_id: ColumnId(1),
             name: "id".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         };
         let action_col = OutputColumn {
             column_id: ColumnId(14),
             name: "__change_op".to_string(),
-            data_type: DataType::Int8,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
+
             is_internal: true,
         };
         let right_key_col = OutputColumn {
             column_id: ColumnId(2),
             name: "id".to_string(),
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
             is_internal: false,
         };
         let left_columns = vec![left_key_col.clone(), action_col.clone()];
@@ -741,8 +761,18 @@ mod tests {
             0.0,
         ));
 
-        let left_key = intern_typed(&mut memo.scalars, &test_col(1));
-        let right_key = intern_typed(&mut memo.scalars, &test_col(2));
+        let left_key = intern_typed(
+            &mut memo.scalars,
+            &test_col(1),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let right_key = intern_typed(
+            &mut memo.scalars,
+            &test_col(2),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let root = memo.new_group(MExpr {
             id: memo.next_expr_id(),
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
@@ -765,8 +795,11 @@ mod tests {
                 OutputColumn {
                     column_id: ColumnId(15),
                     name: "__change_op".to_string(),
-                    data_type: DataType::Int8,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int8,
+                        false,
+                    ),
+
                     is_internal: true,
                 },
             ],
@@ -815,7 +848,14 @@ mod tests {
             ),
         );
 
-        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let plan = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("extract");
         let ids: Vec<_> = plan
             .output_columns
             .iter()
@@ -844,20 +884,20 @@ mod tests {
         let left_outer =
             join_output_columns(JoinKind::LeftOuter, &children).expect("left outer outputs");
         assert_eq!(left_outer.len(), 2);
-        assert!(!left_outer[0].nullable);
-        assert!(left_outer[1].nullable);
+        assert!(!left_outer[0].value_type.nullable);
+        assert!(left_outer[1].value_type.nullable);
 
         let right_outer =
             join_output_columns(JoinKind::RightOuter, &children).expect("right outer outputs");
         assert_eq!(right_outer.len(), 2);
-        assert!(right_outer[0].nullable);
-        assert!(!right_outer[1].nullable);
+        assert!(right_outer[0].value_type.nullable);
+        assert!(!right_outer[1].value_type.nullable);
 
         let full_outer =
             join_output_columns(JoinKind::FullOuter, &children).expect("full outer outputs");
         assert_eq!(full_outer.len(), 2);
-        assert!(full_outer[0].nullable);
-        assert!(full_outer[1].nullable);
+        assert!(full_outer[0].value_type.nullable);
+        assert!(full_outer[1].value_type.nullable);
     }
 
     #[test]
@@ -886,15 +926,15 @@ mod tests {
 
         let error = scan_output_columns(&scan)
             .expect_err("missing scan pruning metadata must fail closed during extraction");
-        assert!(error.contains("has no exact source occurrence"));
+        assert!(error.to_string().contains("has no exact source occurrence"));
     }
 
     fn output_column_for_test(id: u32, name: &str, nullable: bool) -> OutputColumn {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type: DataType::Int64,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, nullable),
+
             is_internal: false,
         }
     }
@@ -927,8 +967,18 @@ mod tests {
         PhysicalPropertySet,
     ) {
         let mut memo = Memo::new();
-        let left_key = intern_typed(&mut memo.scalars, &test_col(10));
-        let right_key = intern_typed(&mut memo.scalars, &test_col(20));
+        let left_key = intern_typed(
+            &mut memo.scalars,
+            &test_col(10),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let right_key = intern_typed(
+            &mut memo.scalars,
+            &test_col(20),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let eq_condition = PhysicalHashJoinEqCondition {
             left: left_key,
             right: right_key,
@@ -1096,8 +1146,18 @@ mod tests {
         PhysicalPropertySet,
     ) {
         let mut memo = Memo::new();
-        let left_key = intern_typed(&mut memo.scalars, &test_col(10));
-        let right_key = intern_typed(&mut memo.scalars, &test_col(20));
+        let left_key = intern_typed(
+            &mut memo.scalars,
+            &test_col(10),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        let right_key = intern_typed(
+            &mut memo.scalars,
+            &test_col(20),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
         let eq_condition = PhysicalHashJoinEqCondition {
             left: left_key,
             right: right_key,
@@ -1171,7 +1231,14 @@ mod tests {
         let (mut memo, root, winners, required) =
             make_hash_join_winner_with_shuffle_child_props_for_test();
 
-        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let plan = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("extract");
         let winner = winners
             .get(&(root, required.clone()))
             .expect("fixture should record root winner");
@@ -1224,7 +1291,14 @@ mod tests {
             ),
         );
 
-        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let plan = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("extract");
         let Operator::PhysicalHashJoin(join) = &plan.op else {
             panic!("expected hash join")
         };
@@ -1242,26 +1316,24 @@ mod tests {
             let left_column = OutputColumn {
                 column_id: ColumnId(10),
                 name: "left_key".to_string(),
-                data_type: DataType::Int64,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+
                 is_internal: false,
             };
             let right_column = OutputColumn {
                 column_id: ColumnId(20),
                 name: "right_key".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
+                value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
                 is_internal: false,
             };
             let left_key = memo.scalars.intern(
                 ScalarNode::ColumnRef(left_column.column_id),
-                DataType::Int64,
-                false,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             );
             let right_input = memo.scalars.intern(
                 ScalarNode::ColumnRef(right_column.column_id),
-                DataType::Int32,
-                false,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
             );
             let right_key = memo.scalars.intern(
                 ScalarNode::Cast {
@@ -1270,8 +1342,7 @@ mod tests {
                     decimal_overflow_policy:
                         novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                 },
-                DataType::Int64,
-                false,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             );
             let left = memo.new_group(MExpr {
                 id: memo.next_expr_id(),
@@ -1312,10 +1383,10 @@ mod tests {
                 crate::optimizer::memo::LogicalProperties::new(vec![right_column.clone()], 0.0),
             );
             let mut output_left = left_column;
-            output_left.nullable = true;
+            output_left.value_type.nullable = true;
             let mut output_right = right_column;
             if join_type == JoinKind::FullOuter {
-                output_right.nullable = true;
+                output_right.value_type.nullable = true;
             }
             memo.groups[root].logical_props = Some(crate::optimizer::memo::LogicalProperties::new(
                 vec![output_left, output_right],
@@ -1354,8 +1425,14 @@ mod tests {
                 ),
             );
 
-            let mut extracted =
-                extract_best(&mut memo, root, &required, &winners).expect("extract");
+            let mut extracted = extract_best(
+                &mut memo,
+                root,
+                &required,
+                &winners,
+                crate::optimizer::test_optimizer_control(),
+            )
+            .expect("extract");
             crate::optimizer::optimized_tree::attach_scalar_arena(
                 &mut extracted,
                 Arc::new(memo.scalars.clone()),
@@ -1369,6 +1446,7 @@ mod tests {
                 join.execution_mode,
                 Some(crate::planner::physical::JoinExecutionMode::Singleton)
             );
+            let control = crate::compiler::SqlCompileControl::unbounded();
             let final_plan = crate::planner::distributed::build::lower_final_physical_plan(
                 &physical,
                 novarocks_physical_plan::PlanVersionId::try_new([seed; 16]).unwrap(),
@@ -1377,11 +1455,17 @@ mod tests {
                     max: 8,
                     requires_power_of_two: true,
                 },
+                crate::functions::builtin_sql_function_catalog().snapshot(),
+                false,
+                crate::constant::test_constant_policy(),
+                crate::compiler::SqlPhysicalEmissionMode::OriginalNativeV1, // This test authors a statement with throwing disabled.
+                &control,
             )
             .expect("lower final physical plan")
-            .finish()
+            .finish_observed(&control)
             .expect("finish final physical plan exactly once");
             let fragment = final_plan
+                .plan()
                 .fragments()
                 .get(&novarocks_physical_plan::FragmentId::new(0))
                 .unwrap();
@@ -1401,7 +1485,14 @@ mod tests {
         let (mut memo, root, winners, required, pre_enforcer_output) =
             make_enforced_limit_winner_for_test();
 
-        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let plan = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("extract");
 
         assert_eq!(plan.execution_props.output_property, required);
         assert_eq!(
@@ -1431,7 +1522,14 @@ mod tests {
             network_cost: 7.0,
         });
 
-        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let plan = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("extract");
 
         assert_eq!(
             plan.explain_stats
@@ -1457,7 +1555,14 @@ mod tests {
     fn extract_keeps_colocate_hash_join_distribution_when_default_metadata() {
         let (mut memo, root, winners, required) = make_colocate_hash_join_winner_for_test();
 
-        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let plan = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("extract");
 
         let Operator::PhysicalHashJoin(join) = &plan.op else {
             panic!("expected hash join");
@@ -1513,10 +1618,18 @@ mod tests {
             ),
         );
 
-        let err = extract_best(&mut memo, root, &required, &winners)
-            .expect_err("extract should reject missing child properties");
+        let err = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect_err("extract should reject missing child properties");
         assert!(
-            err.contains("child_props") && err.contains("expected 1") && err.contains("got 0"),
+            err.to_string().contains("child_props")
+                && err.to_string().contains("expected 1")
+                && err.to_string().contains("got 0"),
             "unexpected error: {err}"
         );
     }
@@ -1547,10 +1660,18 @@ mod tests {
             ),
         )]);
 
-        let error = extract_best(&mut memo, root, &required, &winners)
-            .expect_err("a selected group without logical properties must fail closed");
+        let error = extract_best(
+            &mut memo,
+            root,
+            &required,
+            &winners,
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect_err("a selected group without logical properties must fail closed");
         assert!(
-            error.contains("group 0 has no logical properties"),
+            error
+                .to_string()
+                .contains("group 0 has no logical properties"),
             "unexpected error: {error}"
         );
     }
@@ -1561,8 +1682,11 @@ mod tests {
         let column = OutputColumn {
             column_id: ColumnId(42),
             name: "nullable_decimal".to_string(),
-            data_type: DataType::Decimal128(18, 4),
-            nullable: true,
+            value_type: novarocks_type_contract::FunctionValueType::new(
+                DataType::Decimal128(18, 4),
+                true,
+            ),
+
             is_internal: false,
         };
         let ordering = OrderingSpec::Required(vec![crate::optimizer::property::SortKey {
@@ -1571,8 +1695,13 @@ mod tests {
             nulls_first: true,
         }]);
 
-        let keys = ordering_spec_to_sort_keys(&mut arena, &ordering, &[column])
-            .expect("exact child output should bind the sort enforcer key");
+        let keys = ordering_spec_to_sort_keys(
+            &mut arena,
+            &ordering,
+            &[column],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect("exact child output should bind the sort enforcer key");
 
         assert_eq!(keys.len(), 1);
         assert_eq!(arena.data_type(keys[0].expr), &DataType::Decimal128(18, 4));
@@ -1590,12 +1719,89 @@ mod tests {
             nulls_first: false,
         }]);
 
-        let error = ordering_spec_to_sort_keys(&mut arena, &ordering, &[])
-            .expect_err("an absent sort key must fail closed");
+        let error = ordering_spec_to_sort_keys(
+            &mut arena,
+            &ordering,
+            &[],
+            crate::optimizer::test_optimizer_control(),
+        )
+        .expect_err("an absent sort key must fail closed");
 
         assert!(
-            error.contains("ColumnId(42)") && error.contains("absent"),
+            error.to_string().contains("ColumnId(42)") && error.to_string().contains("absent"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn sort_enforcer_actual_insertion_retains_full_source_and_typed_control_failure() {
+        use novarocks_type_contract::{CompileControlError, FunctionValueType, ValueLogicalType};
+        struct RefusePositive(CompileControlError, std::sync::Mutex<Vec<u32>>);
+        impl PureCompileControl for RefusePositive {
+            fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+                self.1.lock().unwrap().push(units);
+                if units > 0 { Err(self.0) } else { Ok(()) }
+            }
+        }
+        let column = OutputColumn {
+            column_id: ColumnId(77),
+            name: "json_source".to_string(),
+            value_type: FunctionValueType {
+                data_type: DataType::Utf8,
+                nullable: true,
+                logical_type: ValueLogicalType::Json,
+            },
+            is_internal: false,
+        };
+        let ordering = OrderingSpec::Required(vec![crate::optimizer::property::SortKey {
+            column: column.column_id,
+            asc: true,
+            nulls_first: false,
+        }]);
+        let mut arena = ScalarArena::new();
+        let keys = ordering_spec_to_sort_keys(
+            &mut arena,
+            &ordering,
+            std::slice::from_ref(&column),
+            crate::optimizer::test_optimizer_control(),
+        )
+        .unwrap();
+        assert_eq!(arena.value_type(keys[0].expr), &column.value_type);
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let mut arena = ScalarArena::new();
+            let control = RefusePositive(error, Default::default());
+            let failure = ordering_spec_to_sort_keys(
+                &mut arena,
+                &ordering,
+                std::slice::from_ref(&column),
+                &control,
+            )
+            .unwrap_err();
+            assert_eq!(failure, SqlCompileError::from(error));
+            assert!(
+                control
+                    .1
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .is_some_and(|units| *units > 0)
+            );
+            let keys = ordering_spec_to_sort_keys(
+                &mut arena,
+                &ordering,
+                std::slice::from_ref(&column),
+                crate::optimizer::test_optimizer_control(),
+            )
+            .unwrap();
+            let expected = ScalarArena::new().intern(
+                ScalarNode::ColumnRef(column.column_id),
+                column.value_type.clone(),
+            );
+            assert_eq!(keys[0].expr, expected);
+        }
     }
 }

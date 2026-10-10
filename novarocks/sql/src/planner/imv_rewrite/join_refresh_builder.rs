@@ -49,7 +49,10 @@ pub(crate) fn build_join_apply_key_project(
     right_object_id: &ConnectorTableObjectId,
     apply_key_column_id: u32,
     action_column_id: u32,
-) -> Result<LogicalPlanNode, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     build_join_apply_key_project_with_action(
         function_catalog,
         input,
@@ -61,6 +64,9 @@ pub(crate) fn build_join_apply_key_project(
             action_column_id,
             action: JoinApplyActionProjection::InputColumn,
         },
+        policy,
+        constant_policy,
+        control,
     )
 }
 
@@ -76,7 +82,10 @@ pub(crate) fn build_join_apply_key_project_with_constant_insert_action(
     right_object_id: &ConnectorTableObjectId,
     apply_key_column_id: u32,
     action_column_id: u32,
-) -> Result<LogicalPlanNode, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     build_join_apply_key_project_with_action(
         function_catalog,
         input,
@@ -88,6 +97,9 @@ pub(crate) fn build_join_apply_key_project_with_constant_insert_action(
             action_column_id,
             action: JoinApplyActionProjection::ConstantInsert,
         },
+        policy,
+        constant_policy,
+        control,
     )
 }
 
@@ -104,7 +116,10 @@ pub(crate) fn build_join_apply_key_append_project(
     left_object_id: &ConnectorTableObjectId,
     right_object_id: &ConnectorTableObjectId,
     apply_key_column_id: u32,
-) -> Result<LogicalPlanNode, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     desc.validate()?;
     let input_columns = crate::planner::plan_output_columns(&input).map_err(|err| {
         format!("join first-refresh append project cannot derive input columns: {err}")
@@ -114,7 +129,7 @@ pub(crate) fn build_join_apply_key_append_project(
         return Err(format!(
             "join first-refresh append project apply-key output id mismatch: descriptor has {}, builder requested {expected_apply_key}",
             desc.join_apply_key_column.column_id
-        ));
+        ).into());
     }
     let items = desc
         .output_mappings
@@ -129,13 +144,16 @@ pub(crate) fn build_join_apply_key_append_project(
                 left_object_id,
                 right_object_id,
                 JoinApplyActionProjection::InputColumn,
+                policy,
+                constant_policy,
+                control,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
     if items.len() != desc.payload_columns.len() + 1 {
         return Err(
             "join first-refresh append project requires every payload and exactly one apply-key output"
-                .to_string(),
+                .into(),
         );
     }
     Ok(LogicalPlanNode::new(
@@ -165,7 +183,10 @@ fn build_join_apply_key_project_with_action(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     input: LogicalPlanNode,
     projection: JoinApplyKeyProjection<'_>,
-) -> Result<LogicalPlanNode, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let JoinApplyKeyProjection {
         desc,
         left_object_id,
@@ -192,6 +213,9 @@ fn build_join_apply_key_project_with_action(
                 left_object_id,
                 right_object_id,
                 action,
+                policy,
+                constant_policy,
+                control,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -250,12 +274,17 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
     locator_row_id_column_id: u32,
     locator_last_updated_seq_column_id: u32,
     #[cfg(not(test))] function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<LogicalPlanNode, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     #[cfg(test)]
     let function_catalog = crate::functions::builtin_sql_function_catalog();
     desc.validate()?;
     if desc.mode != JoinRefreshMode::Coalesce {
-        return Err("join refresh coalesce builder requires coalesce descriptor".to_string());
+        return Err("join refresh coalesce builder requires coalesce descriptor"
+            .to_string()
+            .into());
     }
 
     let input_columns = crate::planner::plan_output_columns(&branch_union)
@@ -303,33 +332,34 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         ),
     ];
     validate_generated_column_ids(&input_columns, desc, &explicit_generated_ids)?;
-    let net_column = output_column(ColumnId(net_column_id), "net", DataType::Int64, true, true);
+    let net_column = output_column(
+        ColumnId(net_column_id),
+        "net",
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+        true,
+    );
     let key_shape_apply_key = output_column_from_factory(
         column_ref_factory,
         &apply_key_output.name,
-        apply_key_output.data_type.clone(),
-        apply_key_output.nullable,
+        apply_key_output.value_type.clone(),
         apply_key_output.is_internal,
     );
     let pending_insert_count = output_column_from_factory(
         column_ref_factory,
         "__pending_insert_count",
-        DataType::Int64,
-        true,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         true,
     );
     let pending_delete_count = output_column_from_factory(
         column_ref_factory,
         "__pending_delete_count",
-        DataType::Int64,
-        true,
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
         true,
     );
     let locator_apply_key = output_column_from_factory(
         column_ref_factory,
         &apply_key_input.name,
-        apply_key_input.data_type.clone(),
-        apply_key_input.nullable,
+        apply_key_input.value_type.clone(),
         false,
     );
     let aggregate = build_payload_coalesce_aggregate(
@@ -339,9 +369,18 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         &action_input,
         &net_column,
         function_catalog,
+        policy,
+        constant_policy,
+        control,
     )?;
-    let payload_checked =
-        build_payload_coalesce_assert_filter(aggregate, &net_column, function_catalog)?;
+    let payload_checked = build_payload_coalesce_assert_filter(
+        aggregate,
+        &net_column,
+        function_catalog,
+        policy,
+        constant_policy,
+        control,
+    )?;
     let key_shape_checked = build_key_shape_assert_join(
         payload_checked,
         &apply_key_input,
@@ -350,6 +389,9 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         &pending_insert_count,
         &pending_delete_count,
         function_catalog,
+        policy,
+        constant_policy,
+        control,
     )?;
     let locator_join = build_locator_join_shell(
         key_shape_checked,
@@ -369,6 +411,9 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         ColumnId(locator_file_column_id),
         ColumnId(locator_pos_column_id),
         function_catalog,
+        policy,
+        constant_policy,
+        control,
     )?;
     build_final_coalesce_project(
         locator_checked,
@@ -382,6 +427,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         ColumnId(locator_row_id_column_id),
         ColumnId(locator_last_updated_seq_column_id),
     )
+    .map_err(crate::compiler::SqlCompileError::from)
 }
 
 fn build_payload_coalesce_aggregate(
@@ -391,7 +437,10 @@ fn build_payload_coalesce_aggregate(
     action_input: &OutputColumn,
     net_column: &OutputColumn,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<LogicalPlanNode, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let aggregate_args = vec![column_ref(action_input)];
     let resolved = crate::functions::resolve_sql_aggregate_binding(
         function_catalog,
@@ -399,8 +448,20 @@ fn build_payload_coalesce_aggregate(
         &aggregate_args,
         &[],
         true,
+        constant_policy,
+        control,
     )
-    .map_err(|error| format!("failed to resolve join coalesce sum aggregate: {error}"))?;
+    .map_err(|error| match error {
+        novarocks_functions::FunctionBindingError::Control(error) => {
+            crate::compiler::SqlCompileError::from(error)
+        }
+        other => {
+            let error = other;
+            crate::compiler::SqlCompileError::Compilation(format!(
+                "failed to resolve join coalesce sum aggregate: {error}"
+            ))
+        }
+    })?;
     let mut group_by = payload_inputs.iter().map(column_ref).collect::<Vec<_>>();
     group_by.push(column_ref(apply_key_input));
     let output_columns = payload_inputs
@@ -413,12 +474,14 @@ fn build_payload_coalesce_aggregate(
             group_by,
             aggregates: vec![AggregateCall {
                 name: "sum".to_string(),
-                args: aggregate_args,
                 distinct: false,
                 result_type: DataType::Int64,
-                order_by: Vec::new(),
                 output_column_id: net_column.column_id,
-                resolved: resolved.into(),
+                source: crate::binding::AggregateArgumentSource::logical_update(
+                    aggregate_args,
+                    Vec::new(),
+                    crate::binding::SqlFunctionBinding::new(resolved, policy),
+                ),
             }],
             output_columns,
             already_pushed: false,
@@ -484,22 +547,30 @@ fn build_payload_coalesce_assert_filter(
     aggregate: LogicalPlanNode,
     net_column: &OutputColumn,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<LogicalPlanNode, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let net_ne_zero = binary(
         column_ref(net_column),
         BinOp::Ne,
         int_literal(0, DataType::Int64),
     );
     let abs_args = vec![column_ref(net_column)];
-    let abs_binding =
-        crate::analysis::resolve_function_binding(function_catalog, "abs", &abs_args)?;
+    let abs_binding = crate::analysis::resolve_function_binding(
+        function_catalog,
+        "abs",
+        &abs_args,
+        policy,
+        constant_policy,
+        control,
+    )?;
     let novarocks_functions::FunctionResultType::Scalar(abs_result) =
         &abs_binding.selected.result_type
     else {
-        return Err("abs must return a scalar value".to_string());
+        return Err("abs must return a scalar value".to_string().into());
     };
-    let abs_type = abs_result.data_type.clone();
-    let abs_nullable = abs_result.nullable;
+    let value_type = abs_result.clone();
     let abs_net = TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::builtin_function_volatility("abs"),
@@ -508,14 +579,16 @@ fn build_payload_coalesce_assert_filter(
             distinct: false,
             binding: abs_binding,
         },
-        data_type: abs_type,
-        nullable: abs_nullable,
+        value_type,
     };
     let abs_net_le_one = binary(abs_net, BinOp::Le, int_literal(1, DataType::Int64));
     let payload_assert = assert_true_call(
         function_catalog,
         abs_net_le_one,
         "join delta per-payload net change exceeds 1",
+        policy,
+        constant_policy,
+        control,
     )?;
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Filter(PlanFilterNode {
@@ -534,7 +607,10 @@ fn build_key_shape_assert_join(
     pending_insert_count: &OutputColumn,
     pending_delete_count: &OutputColumn,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<LogicalPlanNode, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let insert_args = vec![pending_count_expr(net_column, BinOp::Gt)];
     let delete_args = vec![pending_count_expr(net_column, BinOp::Lt)];
     let resolved = crate::functions::resolve_sql_aggregate_binding(
@@ -543,29 +619,42 @@ fn build_key_shape_assert_join(
         &insert_args,
         &[],
         true,
+        constant_policy,
+        control,
     )
-    .map_err(|error| format!("failed to resolve join key-shape sum aggregate: {error}"))?;
+    .map_err(|error| match error {
+        novarocks_functions::FunctionBindingError::Control(error) => {
+            crate::compiler::SqlCompileError::from(error)
+        }
+        other => crate::compiler::SqlCompileError::Compilation(format!(
+            "failed to resolve join key-shape sum aggregate: {other}"
+        )),
+    })?;
     let key_shape = LogicalPlanNode::new(
         LogicalPlanKind::Aggregate(LogicalAggregateNode {
             group_by: vec![column_ref(apply_key_output)],
             aggregates: vec![
                 AggregateCall {
                     name: "sum".to_string(),
-                    args: insert_args,
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: Vec::new(),
                     output_column_id: pending_insert_count.column_id,
-                    resolved: resolved.clone().into(),
+                    source: crate::binding::AggregateArgumentSource::logical_update(
+                        insert_args,
+                        Vec::new(),
+                        crate::binding::SqlFunctionBinding::new(resolved.clone(), policy),
+                    ),
                 },
                 AggregateCall {
                     name: "sum".to_string(),
-                    args: delete_args,
                     distinct: false,
                     result_type: DataType::Int64,
-                    order_by: Vec::new(),
                     output_column_id: pending_delete_count.column_id,
-                    resolved: resolved.into(),
+                    source: crate::binding::AggregateArgumentSource::logical_update(
+                        delete_args,
+                        Vec::new(),
+                        crate::binding::SqlFunctionBinding::new(resolved, policy),
+                    ),
                 },
             ],
             output_columns: vec![
@@ -594,6 +683,9 @@ fn build_key_shape_assert_join(
             ),
         ),
         "join delta multiple pending payloads for key",
+        policy,
+        constant_policy,
+        control,
     )?;
     let checked_key_shape = LogicalPlanNode::new(
         LogicalPlanKind::Filter(PlanFilterNode {
@@ -627,8 +719,7 @@ fn pending_count_expr(net_column: &OutputColumn, op: BinOp) -> TypedExpr {
             )],
             else_expr: Some(Box::new(int_literal(0, DataType::Int64))),
         },
-        data_type: DataType::Int64,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
     }
 }
 
@@ -657,7 +748,7 @@ fn build_locator_join_shell(
         locator_pos_column_id,
         locator_row_id_column_id,
         locator_last_updated_seq_column_id,
-    );
+    )?;
     let delete_only = binary(
         column_ref(net_column),
         BinOp::Lt,
@@ -672,8 +763,7 @@ fn build_locator_join_shell(
                 qualifier: None,
                 column: left_apply_key.name.clone(),
             },
-            data_type: left_apply_key.data_type.clone(),
-            nullable: left_apply_key.nullable,
+            value_type: left_apply_key.value_type.clone(),
         },
     );
     Ok(LogicalPlanNode::new(
@@ -699,14 +789,11 @@ fn build_target_locator_scan(
     locator_pos_column_id: ColumnId,
     locator_row_id_column_id: ColumnId,
     locator_last_updated_seq_column_id: ColumnId,
-) -> LogicalPlanNode {
-    let columns = vec![ColumnDef {
-        name: apply_key.name.clone(),
-        data_type: apply_key.data_type.clone(),
-        nullable: apply_key.nullable,
-        write_default: None,
-        logical_type: None,
-    }];
+) -> Result<LogicalPlanNode, String> {
+    let columns = vec![
+        ColumnDef::from_value_type(apply_key.name.clone(), apply_key.value_type.clone(), None)
+            .map_err(|error| format!("invalid IMV locator apply-key declaration: {error}"))?,
+    ];
     let metadata_columns = vec![
         ColumnDef {
             name: crate::common::ICEBERG_FILE_PATH_COL.to_string(),
@@ -741,40 +828,35 @@ fn build_target_locator_scan(
         output_column(
             right_apply_key_id,
             &apply_key.name,
-            apply_key.data_type.clone(),
-            apply_key.nullable,
+            apply_key.value_type.clone(),
             false,
         ),
         output_column(
             locator_file_column_id,
             crate::common::ICEBERG_FILE_PATH_COL,
-            DataType::Utf8,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
             true,
         ),
         output_column(
             locator_pos_column_id,
             crate::common::ICEBERG_ROW_POS_COL,
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             true,
         ),
         output_column(
             locator_row_id_column_id,
             crate::common::ICEBERG_ROW_ID_COL,
-            DataType::Int64,
-            false,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             true,
         ),
         output_column(
             locator_last_updated_seq_column_id,
             crate::common::ICEBERG_LAST_UPDATED_SEQ_COL,
-            DataType::Int64,
-            true,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             true,
         ),
     ];
-    LogicalPlanNode::new(
+    Ok(LogicalPlanNode::new(
         LogicalPlanKind::Scan(PlanScanNode {
             database: desc.mv_identity.database.clone(),
             table: TableDef {
@@ -807,7 +889,7 @@ fn build_target_locator_scan(
         }),
         Vec::new(),
         None,
-    )
+    ))
 }
 
 fn build_locator_assert_filter(
@@ -816,7 +898,10 @@ fn build_locator_assert_filter(
     locator_file_column_id: ColumnId,
     locator_pos_column_id: ColumnId,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<LogicalPlanNode, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<LogicalPlanNode, crate::compiler::SqlCompileError> {
     let insert_or_noop = binary(
         column_ref(net_column),
         BinOp::Ge,
@@ -839,6 +924,9 @@ fn build_locator_assert_filter(
         function_catalog,
         binary(insert_or_noop, BinOp::Or, locator_present),
         "join delta DELETE row missing target locator",
+        policy,
+        constant_policy,
+        control,
     )?;
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Filter(PlanFilterNode { predicate }),
@@ -950,8 +1038,7 @@ fn coalesced_action_expr(net_column: &OutputColumn) -> TypedExpr {
                 DataType::Int8,
             ))),
         },
-        data_type: DataType::Int8,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
     };
     TypedExpr {
         kind: ExprKind::Cast {
@@ -959,8 +1046,7 @@ fn coalesced_action_expr(net_column: &OutputColumn) -> TypedExpr {
             target: DataType::Int8,
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        data_type: DataType::Int8,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int8, false),
     }
 }
 
@@ -1048,15 +1134,14 @@ fn project_item_from_source_to_output(source: &OutputColumn, output: &OutputColu
 fn output_column(
     column_id: ColumnId,
     name: &str,
-    data_type: DataType,
-    nullable: bool,
+    value_type: novarocks_type_contract::FunctionValueType,
     is_internal: bool,
 ) -> OutputColumn {
     OutputColumn {
         column_id,
         name: name.to_string(),
-        data_type,
-        nullable,
+        value_type,
+
         is_internal,
     }
 }
@@ -1064,12 +1149,11 @@ fn output_column(
 fn output_column_from_factory(
     factory: &mut ColumnRefFactory,
     name: &str,
-    data_type: DataType,
-    nullable: bool,
+    value_type: novarocks_type_contract::FunctionValueType,
     is_internal: bool,
 ) -> OutputColumn {
-    let column_id = factory.create(None, name.to_string(), data_type.clone(), nullable);
-    output_column(column_id, name, data_type, nullable, is_internal)
+    let column_id = factory.create(None, name.to_string(), value_type.clone());
+    output_column(column_id, name, value_type, is_internal)
 }
 
 fn binary(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
@@ -1080,16 +1164,14 @@ fn binary(left: TypedExpr, op: BinOp, right: TypedExpr) -> TypedExpr {
             right: Box::new(right),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        data_type: DataType::Boolean,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     }
 }
 
 fn int_literal(value: i64, data_type: DataType) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Int(value)),
-        data_type,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
     }
 }
 
@@ -1097,10 +1179,19 @@ fn assert_true_call(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     predicate: TypedExpr,
     message: &str,
-) -> Result<TypedExpr, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![predicate, string_literal(message)];
-    let binding =
-        crate::analysis::resolve_function_binding(function_catalog, "assert_true", &args)?;
+    let binding = crate::analysis::resolve_function_binding(
+        function_catalog,
+        "assert_true",
+        &args,
+        policy,
+        constant_policy,
+        control,
+    )?;
     Ok(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::builtin_function_volatility("assert_true"),
@@ -1109,8 +1200,7 @@ fn assert_true_call(
             distinct: false,
             binding,
         },
-        data_type: DataType::Boolean,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     })
 }
 
@@ -1120,8 +1210,7 @@ fn is_not_null(expr: TypedExpr) -> TypedExpr {
             expr: Box::new(expr),
             negated: true,
         },
-        data_type: DataType::Boolean,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
     }
 }
 
@@ -1132,8 +1221,7 @@ fn locator_column_ref(column_id: ColumnId, name: &str, data_type: DataType) -> T
             qualifier: None,
             column: name.to_string(),
         },
-        data_type,
-        nullable: true,
+        value_type: novarocks_type_contract::FunctionValueType::new(data_type, true),
     }
 }
 
@@ -1191,7 +1279,10 @@ fn project_item_for_mapping(
     left_object_id: &ConnectorTableObjectId,
     right_object_id: &ConnectorTableObjectId,
     action_projection: JoinApplyActionProjection,
-) -> Result<ProjectItem, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ProjectItem, crate::compiler::SqlCompileError> {
     let expr = match mapping.source {
         JoinRefreshOutputSource::Payload(column_id) => {
             let source = desc
@@ -1208,7 +1299,8 @@ fn project_item_for_mapping(
             if column_id != desc.action_column.column_id {
                 return Err(format!(
                     "join refresh apply-key project references unknown action column {column_id}"
-                ));
+                )
+                .into());
             }
             match action_projection {
                 JoinApplyActionProjection::InputColumn => {
@@ -1220,8 +1312,10 @@ fn project_item_for_mapping(
                             decimal_overflow_policy:
                                 novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                         },
-                        data_type: DataType::Int8,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int8,
+                            false,
+                        ),
                     }
                 }
                 JoinApplyActionProjection::ConstantInsert => TypedExpr {
@@ -1234,8 +1328,10 @@ fn project_item_for_mapping(
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    data_type: DataType::Int8,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int8,
+                        false,
+                    ),
                 },
             }
         }
@@ -1243,11 +1339,19 @@ fn project_item_for_mapping(
             if column_id != desc.join_apply_key_column.column_id {
                 return Err(format!(
                     "join refresh apply-key project references unknown join apply-key column {column_id}"
-                ));
+                ).into());
             }
             validate_input_column(input_columns, &desc.left_row_id_column)?;
             validate_input_column(input_columns, &desc.right_row_id_column)?;
-            join_row_key_expr(function_catalog, desc, left_object_id, right_object_id)?
+            join_row_key_expr(
+                function_catalog,
+                desc,
+                left_object_id,
+                right_object_id,
+                policy,
+                constant_policy,
+                control,
+            )?
         }
     };
 
@@ -1279,8 +1383,7 @@ fn validate_input_column(
         ));
     };
     if !actual.name.eq_ignore_ascii_case(&expected.name)
-        || actual.data_type != expected.data_type
-        || actual.nullable != expected.nullable
+        || actual.value_type != expected.value_type
         || !input_internal_matches(actual, expected)
     {
         return Err(format!(
@@ -1288,11 +1391,11 @@ fn validate_input_column(
             expected.column_id,
             expected.name,
             actual.name,
-            actual.data_type,
-            actual.nullable,
+            actual.value_type.data_type,
+            actual.value_type.nullable,
             actual.is_internal,
-            expected.data_type,
-            expected.nullable,
+            expected.value_type.data_type,
+            expected.value_type.nullable,
             expected.is_internal
         ));
     }
@@ -1315,21 +1418,29 @@ fn join_row_key_expr(
     desc: &JoinRefreshDescriptor,
     left_object_id: &ConnectorTableObjectId,
     right_object_id: &ConnectorTableObjectId,
-) -> Result<TypedExpr, String> {
+    policy: novarocks_type_contract::DecimalOverflowPolicy,
+    constant_policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<TypedExpr, crate::compiler::SqlCompileError> {
     let args = vec![
         object_id_binary_literal(left_object_id),
         column_ref(&desc.left_row_id_column),
         object_id_binary_literal(right_object_id),
         column_ref(&desc.right_row_id_column),
     ];
-    let binding =
-        crate::analysis::resolve_function_binding(function_catalog, "join_row_key", &args)?;
+    let binding = crate::analysis::resolve_function_binding(
+        function_catalog,
+        "join_row_key",
+        &args,
+        policy,
+        constant_policy,
+        control,
+    )?;
     let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
     else {
-        return Err("join_row_key must return a scalar value".to_string());
+        return Err("join_row_key must return a scalar value".to_string().into());
     };
-    let data_type = result.data_type.clone();
-    let nullable = result.nullable;
+    let value_type = result.clone();
     Ok(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
@@ -1338,8 +1449,7 @@ fn join_row_key_expr(
             distinct: false,
             binding,
         },
-        data_type,
-        nullable,
+        value_type,
     })
 }
 
@@ -1350,24 +1460,21 @@ fn column_ref(column: &OutputColumn) -> TypedExpr {
             qualifier: None,
             column: column.name.clone(),
         },
-        data_type: column.data_type.clone(),
-        nullable: column.nullable,
+        value_type: column.value_type.clone(),
     }
 }
 
 fn object_id_binary_literal(value: &ConnectorTableObjectId) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Binary(value.as_bytes().to_vec())),
-        data_type: DataType::Binary,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Binary, false),
     }
 }
 
 fn string_literal(value: &str) -> TypedExpr {
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::String(value.to_string())),
-        data_type: DataType::Utf8,
-        nullable: false,
+        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
     }
 }
 
@@ -1432,6 +1539,9 @@ mod tests {
             &right_object_id,
             90,
             91,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("apply-key project");
 
@@ -1475,10 +1585,16 @@ mod tests {
             &right_object_id,
             90,
             91,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("missing right row-id should fail closed");
 
-        assert!(err.contains("missing input column c3"), "err={err}");
+        assert!(
+            err.to_string().contains("missing input column c3"),
+            "err={err}"
+        );
     }
 
     #[test]
@@ -1496,10 +1612,16 @@ mod tests {
             &right_object_id,
             900,
             91,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("apply-key id mismatch should fail closed");
 
-        assert!(err.contains("apply-key output id mismatch"), "err={err}");
+        assert!(
+            err.to_string().contains("apply-key output id mismatch"),
+            "err={err}"
+        );
     }
 
     #[test]
@@ -1533,6 +1655,9 @@ mod tests {
             &right_object_id,
             90,
             91,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("apply-key project with constant insert action");
 
@@ -1543,6 +1668,112 @@ mod tests {
         assert_payload_item(&project.items[0]);
         assert_join_apply_key_item(&project.items[1]);
         assert_constant_insert_action_item(&project.items[2]);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn locator_schema_preserves_admitted_logical_and_nested_domains() {
+        use arrow::datatypes::Field;
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+
+        let domains = [
+            FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                false,
+                ValueLogicalType::Uuid,
+            )
+            .unwrap(),
+            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+                .unwrap(),
+            FunctionValueType::new(
+                DataType::Struct(
+                    vec![
+                        Field::new("payload", DataType::Utf8, false).with_metadata(
+                            [
+                                ("nr_logical_type".into(), "json".into()),
+                                ("provider.field-id".into(), "71".into()),
+                            ]
+                            .into(),
+                        ),
+                        Field::new_dict(
+                            "dictionary",
+                            DataType::Dictionary(
+                                Box::new(DataType::Int16),
+                                Box::new(DataType::Utf8),
+                            ),
+                            true,
+                            73,
+                            true,
+                        ),
+                    ]
+                    .into(),
+                ),
+                false,
+            ),
+        ];
+        for value_type in domains {
+            let key = OutputColumn {
+                column_id: ColumnId(1),
+                name: "apply_key".into(),
+                value_type: value_type.clone(),
+                is_internal: false,
+            };
+            let plan = super::build_target_locator_scan(
+                &test_coalesce_descriptor(),
+                &test_locator_binding(),
+                &key,
+                ColumnId(2),
+                ColumnId(3),
+                ColumnId(4),
+                ColumnId(5),
+                ColumnId(6),
+            )
+            .unwrap();
+            let LogicalPlanKind::Scan(scan) = plan.kind else {
+                panic!("expected locator scan");
+            };
+            assert_eq!(
+                scan.table.columns[0].declared_value_type().unwrap(),
+                value_type
+            );
+            assert_eq!(scan.columns[0].value_type, value_type);
+            assert_eq!(scan.columns[0].column_id, ColumnId(2));
+            assert!(sql_mv_target_locator_scan(&scan.table.source).is_some());
+            assert_eq!(scan.table.iceberg_row_lineage_metadata_columns.len(), 4);
+        }
+    }
+
+    #[test]
+    fn locator_schema_rejects_unrepresentable_object_root_instead_of_plain_binary() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+
+        let key = OutputColumn {
+            column_id: ColumnId(1),
+            name: "apply_key".into(),
+            value_type: FunctionValueType::try_with_logical_type(
+                DataType::Binary,
+                false,
+                ValueLogicalType::Object,
+            )
+            .unwrap(),
+            is_internal: false,
+        };
+        let error = super::build_target_locator_scan(
+            &test_coalesce_descriptor(),
+            &test_locator_binding(),
+            &key,
+            ColumnId(2),
+            ColumnId(3),
+            ColumnId(4),
+            ColumnId(5),
+            ColumnId(6),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("invalid IMV locator apply-key declaration")
+        );
     }
 
     #[test]
@@ -1561,6 +1792,9 @@ mod tests {
             102,
             103,
             104,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("coalesce plan");
 
@@ -1590,6 +1824,9 @@ mod tests {
             102,
             103,
             104,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("coalesce plan");
 
@@ -1602,8 +1839,8 @@ mod tests {
         for column in generated_columns {
             let metadata = factory.get(column.column_id);
             assert_eq!(metadata.name, column.name);
-            assert_eq!(metadata.data_type, column.data_type);
-            assert_eq!(metadata.nullable, column.nullable);
+            assert_eq!(metadata.value_type, column.value_type);
+            assert_eq!(metadata.value_type.nullable, column.value_type.nullable);
         }
     }
 
@@ -1623,6 +1860,9 @@ mod tests {
             102,
             103,
             104,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("coalesce plan");
 
@@ -1647,6 +1887,9 @@ mod tests {
             102,
             103,
             104,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect("coalesce plan");
         let optimized_tree = optimize_for_test(plan);
@@ -1659,7 +1902,8 @@ mod tests {
 
         if let Err(err) = result {
             assert!(
-                !err.contains("ColumnId") && !err.contains("cannot be resolved"),
+                !err.to_string().contains("ColumnId")
+                    && !err.to_string().contains("cannot be resolved"),
                 "coalesce plan must not fail aggregate argument binding after physical optimization: {err}"
             );
         }
@@ -1681,10 +1925,16 @@ mod tests {
             102,
             103,
             104,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("coalesce requires locator");
 
-        assert!(err.contains("requires target locator"), "err={err}");
+        assert!(
+            err.to_string().contains("requires target locator"),
+            "err={err}"
+        );
     }
 
     #[test]
@@ -1701,10 +1951,16 @@ mod tests {
             102,
             103,
             104,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("net id collision should fail closed");
 
-        assert!(err.contains("collides with existing column"), "err={err}");
+        assert!(
+            err.to_string().contains("collides with existing column"),
+            "err={err}"
+        );
     }
 
     #[test]
@@ -1721,10 +1977,13 @@ mod tests {
             102,
             103,
             104,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
         )
         .expect_err("duplicate generated ids should fail closed");
 
-        assert!(err.contains("is duplicated"), "err={err}");
+        assert!(err.to_string().contains("is duplicated"), "err={err}");
     }
 
     #[test]
@@ -1747,11 +2006,15 @@ mod tests {
                 102,
                 103,
                 104,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                crate::constant::test_constant_policy(),
+                &crate::compiler::SqlCompileControl::unbounded(),
             )
             .expect_err("reserved locator payload output should fail closed");
 
             assert!(
-                err.contains("reserved target locator") && err.contains(reserved),
+                err.to_string().contains("reserved target locator")
+                    && err.to_string().contains(reserved),
                 "err={err}"
             );
         }
@@ -1783,7 +2046,7 @@ mod tests {
             LogicalPlanKind::Aggregate(aggregate) => {
                 exprs.extend(aggregate.group_by.iter());
                 for call in &aggregate.aggregates {
-                    exprs.extend(call.args.iter());
+                    exprs.extend(call.source.arguments().iter());
                 }
             }
             LogicalPlanKind::Join(join) => {
@@ -1985,10 +2248,10 @@ mod tests {
                 .collect::<HashSet<_>>();
             for call in &aggregate.aggregates {
                 let mut refs = HashSet::new();
-                for arg in &call.args {
+                for arg in call.source.arguments() {
                     collect_column_refs(arg, &mut refs);
                 }
-                for sort_item in &call.order_by {
+                for sort_item in call.source.order_by() {
                     collect_column_refs(&sort_item.expr, &mut refs);
                 }
                 for column_id in refs {
@@ -2086,6 +2349,7 @@ mod tests {
             ExprKind::IsTruthValue { expr, .. } => collect_column_refs(expr, refs),
             ExprKind::LambdaParamRef { .. }
             | ExprKind::Literal(_)
+            | ExprKind::Constant(_)
             | ExprKind::SubqueryPlaceholder { .. } => {}
         }
     }
@@ -2261,8 +2525,8 @@ mod tests {
         OutputColumn {
             column_id: ColumnId(id),
             name: name.to_string(),
-            data_type,
-            nullable,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+
             is_internal,
         }
     }
@@ -2353,5 +2617,64 @@ mod tests {
         };
         assert_eq!(*column_id, expected_id);
         assert!(column.eq_ignore_ascii_case(expected_name));
+    }
+    #[test]
+    fn real_join_apply_key_binding_preserves_each_request_control_category() {
+        use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+        struct Stop(CompileControlError);
+        impl PureCompileControl for Stop {
+            fn checkpoint(&self, phase: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+                assert_eq!(phase, CompilePhase::FunctionSpecialization);
+                Err(self.0)
+            }
+        }
+        let input = test_values_plan(vec![
+            out(1, "k", DataType::Int64, false, false),
+            out(
+                2,
+                crate::common::ICEBERG_ROW_ID_COL,
+                DataType::Int64,
+                false,
+                true,
+            ),
+            out(
+                3,
+                crate::common::ICEBERG_ROW_ID_COL,
+                DataType::Int64,
+                false,
+                true,
+            ),
+            out(
+                4,
+                crate::common::CHANGE_OP_COLUMN,
+                DataType::Int8,
+                false,
+                true,
+            ),
+        ]);
+        let desc = test_descriptor(JoinRefreshMode::AppendOnly);
+        let left = test_object_id(b"left\x00object");
+        let right = test_object_id(b"right\xffobject");
+        for error in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            let result = super::build_join_apply_key_project(
+                crate::functions::builtin_sql_function_catalog(),
+                input.clone(),
+                &desc,
+                &left,
+                &right,
+                90,
+                91,
+                novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+                crate::constant::test_constant_policy(),
+                &Stop(error),
+            );
+            assert!(
+                matches!(result, Err(actual) if actual == crate::compiler::SqlCompileError::from(error))
+            );
+        }
     }
 }

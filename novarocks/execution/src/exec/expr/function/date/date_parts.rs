@@ -19,25 +19,14 @@ use crate::exec::expr::{ExprArena, ExprId};
 use arrow::array::{ArrayRef, Int64Array, StringArray};
 use arrow::compute::cast;
 use arrow::datatypes::DataType;
-use chrono::{Datelike, Timelike};
 use std::sync::Arc;
 
-enum DatePart {
-    Year,
-    Month,
-    Day,
-    Hour,
-    Minute,
-    Second,
-    DayOfWeek,
-    DayOfWeekIso,
-    WeekDay,
-    DayOfYear,
-    Week,
-    Quarter,
-    DayName,
-    MonthName,
-}
+use novarocks_functions::{
+    Selection,
+    builtin::calendar_parts_shared::{
+        CalendarPartOp as DatePart, legacy_calendar_names, legacy_calendar_parts,
+    },
+};
 
 #[inline]
 fn eval_part_int(
@@ -48,26 +37,7 @@ fn eval_part_int(
     part: DatePart,
 ) -> Result<ArrayRef, String> {
     let arr = arena.eval(args[0], chunk)?;
-    let dts = super::common::extract_datetime_array(&arr)?;
-    let mut out = Vec::with_capacity(dts.len());
-    for dt in dts {
-        let v = dt.map(|d| match part {
-            DatePart::Year => d.year() as i64,
-            DatePart::Month => d.month() as i64,
-            DatePart::Day => d.day() as i64,
-            DatePart::Hour => d.hour() as i64,
-            DatePart::Minute => d.minute() as i64,
-            DatePart::Second => d.second() as i64,
-            DatePart::DayOfWeek => d.weekday().number_from_sunday() as i64,
-            DatePart::DayOfWeekIso => d.weekday().number_from_monday() as i64,
-            DatePart::WeekDay => d.weekday().num_days_from_monday() as i64,
-            DatePart::DayOfYear => d.ordinal() as i64,
-            DatePart::Week => d.iso_week().week() as i64,
-            DatePart::Quarter => ((d.month() - 1) / 3 + 1) as i64,
-            _ => 0,
-        });
-        out.push(v);
-    }
+    let out = legacy_calendar_parts(part, &arr, Selection::all(arr.len()))?;
     let out = Arc::new(Int64Array::from(out)) as ArrayRef;
     let expected_type = arena.data_type(expr).cloned().unwrap_or(DataType::Int64);
     if out.data_type() == &expected_type {
@@ -91,16 +61,7 @@ fn eval_part_string(
     part: DatePart,
 ) -> Result<ArrayRef, String> {
     let arr = arena.eval(args[0], chunk)?;
-    let dts = super::common::extract_datetime_array(&arr)?;
-    let mut out = Vec::with_capacity(dts.len());
-    for dt in dts {
-        let v = dt.map(|d| match part {
-            DatePart::DayName => d.format("%A").to_string(),
-            DatePart::MonthName => d.format("%B").to_string(),
-            _ => "".to_string(),
-        });
-        out.push(v);
-    }
+    let out = legacy_calendar_names(part, &arr, Selection::all(arr.len()))?;
     Ok(Arc::new(StringArray::from(out)) as ArrayRef)
 }
 
@@ -227,7 +188,7 @@ pub fn eval_week(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_part_int(arena, expr, args, chunk, DatePart::Week)
+    eval_part_int(arena, expr, args, chunk, DatePart::WeekOfYear)
 }
 
 pub fn eval_weekofyear(
@@ -236,7 +197,7 @@ pub fn eval_weekofyear(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    eval_part_int(arena, expr, args, chunk, DatePart::Week)
+    eval_part_int(arena, expr, args, chunk, DatePart::WeekOfYear)
 }
 
 pub fn eval_year(
@@ -254,27 +215,5 @@ pub fn eval_yearweek(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    let arr = arena.eval(args[0], chunk)?;
-    let dts = super::common::extract_datetime_array(&arr)?;
-    let mut out = Vec::with_capacity(dts.len());
-    for dt in dts {
-        let v = dt.map(|d| {
-            let iso = d.iso_week();
-            (iso.year() as i64) * 100 + (iso.week() as i64)
-        });
-        out.push(v);
-    }
-    let out = Arc::new(Int64Array::from(out)) as ArrayRef;
-    let expected_type = arena.data_type(expr).cloned().unwrap_or(DataType::Int64);
-    if out.data_type() == &expected_type {
-        return Ok(out);
-    }
-    cast(&out, &expected_type).map_err(|e| {
-        format!(
-            "date part output cast failed from {:?} to {:?}: {}",
-            out.data_type(),
-            expected_type,
-            e
-        )
-    })
+    eval_part_int(arena, expr, args, chunk, DatePart::YearWeek)
 }

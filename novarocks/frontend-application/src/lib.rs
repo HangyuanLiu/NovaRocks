@@ -33,17 +33,24 @@ mod mv;
 pub use mv::management_audit::FileManagementAuditSink;
 pub use mv::startup_isolation_file::StartupIsolationSource;
 mod native;
+pub use query_execution::package_freeze::{CompiledPackageCarrier, StaticPlanCarrier};
 mod preparation_diagnostics;
 pub(crate) mod query;
 mod query_execution;
 pub(crate) mod runtime_filter;
 pub(crate) mod server;
+#[cfg(feature = "mem-1-m07-hms-listing-observe")]
+pub use catalog_application::admission_completion::{
+    InstalledOwner as HmsAdmissionInstalledOwner, OwnerSelector as HmsAdmissionOwnerSelector,
+};
 pub use metrics::FrontendProcessMemoryObservation;
 pub use server::{
     FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig,
     open_frontend_application_for_server, serve_ready_frontend_session_factory,
     shutdown_frontend_application_to_convergence, start_frontend_management_server,
 };
+#[cfg(feature = "mem-1-m07-hms-listing-observe")]
+pub use server::{HmsListingObservationHandler, HmsListingObservationSetup};
 mod state_family;
 pub(crate) mod state_store;
 pub(crate) mod statistics;

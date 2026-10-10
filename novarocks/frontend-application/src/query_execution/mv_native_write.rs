@@ -156,8 +156,12 @@ pub(crate) fn prepare_completed_mv_write(
         novarocks_physical_plan::PipelineDopDomain,
         novarocks_sql::planning::dml::DmlFinalizedProviderReadSet,
         novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet,
-    ) -> Result<novarocks_physical_plan::PhysicalPlan, String>,
-) -> Result<PreparedMvNativeWriteAssembly, String> {
+    ) -> Result<
+        novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
+        novarocks_sql::compiler::SqlCompileError,
+    >,
+    control: &novarocks_sql::compiler::SqlCompileControl,
+) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError> {
     let session = crate::query_execution::compiler::typed_connector_session()?;
     let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
     let mut facts = Vec::with_capacity(needs.len());
@@ -204,15 +208,17 @@ pub(crate) fn prepare_completed_mv_write(
         ))?;
     let plan = finish(version, dop_domain, reads, targets)?;
     let candidate =
-        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
-            .and_then(|candidate| {
-                candidate.freeze_root_output(
-                    novarocks_result_contract::FrozenRootOutput::InternalFacts(
-                        novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
-                    ),
-                )
-            })
-            .map_err(|error| error.to_string())?;
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_sql_program(
+            plan, control,
+        )
+        .and_then(|candidate| {
+            candidate.freeze_root_output(
+                novarocks_result_contract::FrozenRootOutput::InternalFacts(
+                    novarocks_result_contract::InternalResultDomain::PreparedWriteCommitV1,
+                ),
+            )
+        })
+        .map_err(|error| error.to_string())?;
     let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
         candidate, access,
     )
@@ -220,14 +226,36 @@ pub(crate) fn prepare_completed_mv_write(
     let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
         paired,
         kernel.function_catalog().as_ref(),
+        kernel.static_plan_carrier(),
+        kernel.constant_policy(),
         Some(
             &crate::query_execution::physical_encoding::WriteTargetFacts {
                 sealed: &sealed,
                 field_names,
+                session: write_session.as_ref(),
             },
         ),
-    )?;
-    PreparedMvNativeWriteAssembly::session(encoded, version, None, write_session)
+        execution.sql_semantics().sql_mode().allow_throw_exception(),
+        control,
+    )
+    .map_err(encode_compile_error)?;
+    let options = crate::query_execution::contract::synthetic_statement_query_options(execution);
+    PreparedMvNativeWriteAssembly::session(encoded, version, Some(options), write_session)
+        .map_err(novarocks_sql::compiler::SqlCompileError::Compilation)
+}
+
+pub(crate) fn encode_compile_error(
+    error: novarocks_plan_codec::PhysicalEncodeError,
+) -> novarocks_sql::compiler::SqlCompileError {
+    match error {
+        novarocks_plan_codec::PhysicalEncodeError::Control(error) => error.into(),
+        novarocks_plan_codec::PhysicalEncodeError::Invalid(error) => {
+            novarocks_sql::compiler::SqlCompileError::Compilation(error)
+        }
+        novarocks_plan_codec::PhysicalEncodeError::UnsupportedCapability(message) => {
+            novarocks_sql::compiler::SqlCompileError::Compilation(message.into())
+        }
+    }
 }
 
 /// Provider activation and native fragment preparation for a SQL-shaped
@@ -243,7 +271,7 @@ pub trait MvRefreshProviderActivation: Send + Sync {
         exact_lease: &ConnectorWriteLease,
         execution: &QueryExecutionContext,
         connector_context: ConnectorRequestContext,
-    ) -> Result<PreparedMvNativeWriteAssembly, String>;
+    ) -> Result<PreparedMvNativeWriteAssembly, novarocks_sql::compiler::SqlCompileError>;
 
     /// Open the session one metadata-only publication commits through.
     ///

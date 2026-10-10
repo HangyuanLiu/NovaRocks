@@ -27,6 +27,7 @@
 //! position-restricted required set, and the branches' own prune rules handle
 //! their pruning independently.
 
+use crate::compiler::SqlCompileError;
 use std::collections::HashSet;
 
 use arrow::datatypes::DataType;
@@ -65,7 +66,11 @@ impl LogicalRewriteRule for PruneUnionColumns {
         true
     }
 
-    fn apply(&self, expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         let OptExpr {
             op,
             children,
@@ -175,8 +180,11 @@ fn child_output_columns_from_expr(child: &OptExpr, existing: &[OutputColumn]) ->
                 .unwrap_or_else(|| OutputColumn {
                     column_id: id,
                     name: format!("col_{}", idx + 1),
-                    data_type: DataType::Null,
-                    nullable: true,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Null,
+                        true,
+                    ),
+
                     is_internal: false,
                 })
         })
@@ -200,10 +208,12 @@ mod tests {
     use crate::optimizer::opt_expr::OptExpr;
     use crate::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
 
-    fn ctx() -> RewriteContext {
+    fn ctx() -> RewriteContext<'static> {
         RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         )
     }
 
@@ -211,8 +221,8 @@ mod tests {
         OutputColumn {
             column_id: id,
             name: name.to_string(),
-            data_type: DataType::Int32,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int32, false),
+
             is_internal: false,
         }
     }

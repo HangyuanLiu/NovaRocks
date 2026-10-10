@@ -61,22 +61,41 @@ pub(crate) fn bridge_apply_result<F>(
     expr: crate::optimizer::opt_expr::OptExpr,
     ctx: &crate::optimizer::rewrite::context::RewriteContext,
     f: F,
-) -> Result<crate::optimizer::rewrite::result::RewriteResult, String>
+) -> Result<crate::optimizer::rewrite::result::RewriteResult, crate::compiler::SqlCompileError>
 where
     F: FnOnce(
         crate::planner::logical::LogicalPlanNode,
         &crate::optimizer::rewrite::context::RewriteContext,
     ) -> Result<PlanRewriteResult, String>,
 {
+    bridge_apply_result_typed(expr, ctx, |plan, ctx| {
+        f(plan, ctx).map_err(crate::compiler::SqlCompileError::Compilation)
+    })
+}
+
+/// Typed source-control failures pass through without entering the ordinary
+/// legacy helper error facade.
+pub(crate) fn bridge_apply_result_typed<F>(
+    expr: crate::optimizer::opt_expr::OptExpr,
+    ctx: &crate::optimizer::rewrite::context::RewriteContext,
+    f: F,
+) -> Result<crate::optimizer::rewrite::result::RewriteResult, crate::compiler::SqlCompileError>
+where
+    F: FnOnce(
+        crate::planner::logical::LogicalPlanNode,
+        &crate::optimizer::rewrite::context::RewriteContext,
+    ) -> Result<PlanRewriteResult, crate::compiler::SqlCompileError>,
+{
     let plan = opt_expr_to_plan(expr, ctx);
     let result = f(plan, ctx)?;
     let arena = ctx.scalar_arena();
     let converted = match result {
         PlanRewriteResult::Changed(plan_out) => {
-            let opt_out = crate::planner::optimizer_bridge::logical::to_optimizer_expr(
+            let opt_out = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
                 &plan_out,
                 &mut arena.borrow_mut(),
-            );
+                &ctx.control_view(),
+            )?;
             crate::optimizer::rewrite::result::RewriteResult::Changed(opt_out)
         }
         PlanRewriteResult::Unchanged => crate::optimizer::rewrite::result::RewriteResult::Unchanged,
@@ -90,26 +109,27 @@ where
 /// Mutable-context variant of [`bridge_apply_result`] for IMV rules that need
 /// to update [`RewriteContext`] extensions while still using
 /// `LogicalPlanNode` helpers.
-pub(crate) fn bridge_apply_result_mut<F>(
+pub(crate) fn bridge_apply_result_mut_typed<F>(
     expr: crate::optimizer::opt_expr::OptExpr,
     ctx: &mut crate::optimizer::rewrite::context::RewriteContext,
     f: F,
-) -> Result<crate::optimizer::rewrite::result::RewriteResult, String>
+) -> Result<crate::optimizer::rewrite::result::RewriteResult, crate::compiler::SqlCompileError>
 where
     F: FnOnce(
         crate::planner::logical::LogicalPlanNode,
         &mut crate::optimizer::rewrite::context::RewriteContext,
-    ) -> Result<PlanRewriteResult, String>,
+    ) -> Result<PlanRewriteResult, crate::compiler::SqlCompileError>,
 {
     let plan = opt_expr_to_plan(expr, ctx);
     let result = f(plan, ctx)?;
     let arena = ctx.scalar_arena();
     let converted = match result {
         PlanRewriteResult::Changed(plan_out) => {
-            let opt_out = crate::planner::optimizer_bridge::logical::to_optimizer_expr(
+            let opt_out = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
                 &plan_out,
                 &mut arena.borrow_mut(),
-            );
+                &ctx.control_view(),
+            )?;
             crate::optimizer::rewrite::result::RewriteResult::Changed(opt_out)
         }
         PlanRewriteResult::Unchanged => crate::optimizer::rewrite::result::RewriteResult::Unchanged,

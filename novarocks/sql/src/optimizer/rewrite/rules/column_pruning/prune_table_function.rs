@@ -26,6 +26,7 @@
 //! Kept for architectural symmetry and to allow per-operator
 //! `disable_optimizer_rules` control in the future.
 
+use crate::compiler::SqlCompileError;
 use crate::optimizer::opt_expr::OptExpr;
 use crate::optimizer::pattern::{OpKind, Pattern};
 use crate::optimizer::rewrite::context::RewriteContext;
@@ -55,7 +56,11 @@ impl LogicalRewriteRule for PruneTableFunctionColumns {
         true
     }
 
-    fn apply(&self, _expr: OptExpr, _ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+    fn apply(
+        &self,
+        _expr: OptExpr,
+        _ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, SqlCompileError> {
         // No-op: TableFunction was assigned keep-all-child semantics by the
         // Phase-1 tagging pass. Kept for architectural symmetry + per-operator
         // disable_optimizer_rules control.
@@ -73,10 +78,12 @@ mod tests {
     use crate::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
     use arrow::datatypes::DataType;
 
-    fn ctx() -> RewriteContext {
+    fn ctx() -> RewriteContext<'static> {
         RewriteContext::new(
             RewriteConsumer::Query,
             crate::optimizer::options::SessionOptimizerSettings::default(),
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
         )
     }
 
@@ -98,8 +105,11 @@ mod tests {
                 output_columns: vec![OutputColumn {
                     column_id: ColumnId::new_for_test(1),
                     name: "v".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 alias: None,
@@ -115,7 +125,13 @@ mod tests {
 
         // pattern gates the structural operator kind.
         assert!(
-            crate::optimizer::rewrite::tree_binder::bind_tree(&rule.pattern(), &expr).is_some()
+            crate::optimizer::rewrite::tree_binder::bind_tree(
+                &rule.pattern(),
+                &expr,
+                crate::optimizer::test_optimizer_control()
+            )
+            .unwrap()
+            .is_some()
         );
 
         // apply always returns Unchanged

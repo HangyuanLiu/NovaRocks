@@ -34,20 +34,31 @@ pub(super) struct LiftedInnerOpt {
     pub on_predicate: Option<ScalarId>,
 }
 
+// A rejected candidate short-circuits separately from a typed control failure.
+macro_rules! candidate_or_none {
+    ($candidate:expr) => {
+        match $candidate {
+            Some(value) => value,
+            None => return Ok(None),
+        }
+    };
+}
+
 pub(super) fn lift_correlated_inner_opt(
     inner: OptExpr,
     outer_correlation_column_ids: &[ColumnId],
     arena: &mut ScalarArena,
-) -> Option<LiftedInnerOpt> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<LiftedInnerOpt>, crate::compiler::SqlCompileError> {
     let OptExpr {
         op,
         mut children,
         required_output_columns,
     } = inner;
-    match op {
+    Ok(match op {
         Operator::LogicalProject(project) => {
             if children.len() != 1 {
-                return None;
+                return Ok(None);
             }
             let filter_plan = children.remove(0);
             let OptExpr {
@@ -56,24 +67,26 @@ pub(super) fn lift_correlated_inner_opt(
                 required_output_columns: _,
             } = filter_plan;
             let Operator::LogicalFilter(filter) = op else {
-                return None;
+                return Ok(None);
             };
             if children.len() != 1 {
-                return None;
+                return Ok(None);
             }
             let input = children.remove(0);
             let predicate = normalize_correlated_on_predicate_opt(
                 arena,
                 filter.predicate,
                 outer_correlation_column_ids,
-            );
-            let items = expose_predicate_inner_columns_opt(
+                control,
+            )?;
+            let items = candidate_or_none!(expose_predicate_inner_columns_opt(
                 arena,
                 project.items,
                 predicate,
                 &input,
                 outer_correlation_column_ids,
-            )?;
+                control
+            )?);
             let mut right = OptExpr::new(
                 Operator::LogicalProject(ProjectOp {
                     items,
@@ -89,21 +102,22 @@ pub(super) fn lift_correlated_inner_opt(
         }
         Operator::LogicalFilter(filter) => {
             if children.len() != 1 {
-                return None;
+                return Ok(None);
             }
             let input = children.remove(0);
             let predicate = normalize_correlated_on_predicate_opt(
                 arena,
                 filter.predicate,
                 outer_correlation_column_ids,
-            );
-            if !predicate_inner_refs_available_opt(
+                control,
+            )?;
+            if !candidate_or_none!(predicate_inner_refs_available_opt(
                 arena,
                 predicate,
                 &input,
-                outer_correlation_column_ids,
-            )? {
-                return None;
+                outer_correlation_column_ids
+            )) {
+                return Ok(None);
             }
             Some(LiftedInnerOpt {
                 right: input,
@@ -111,45 +125,48 @@ pub(super) fn lift_correlated_inner_opt(
             })
         }
         _ => None,
-    }
+    })
 }
 
 fn normalize_correlated_on_predicate_opt(
     arena: &mut ScalarArena,
     predicate: ScalarId,
     outer_correlation_column_ids: &[ColumnId],
-) -> ScalarId {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     let outer_ids: HashSet<ColumnId> = outer_correlation_column_ids.iter().copied().collect();
-    normalize_correlated_on_predicate_inner_opt(arena, predicate, &outer_ids)
+    normalize_correlated_on_predicate_inner_opt(arena, predicate, &outer_ids, control)
 }
 
 fn normalize_correlated_on_predicate_inner_opt(
     arena: &mut ScalarArena,
     predicate: ScalarId,
     outer_ids: &HashSet<ColumnId>,
-) -> ScalarId {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ScalarId, crate::compiler::SqlCompileError> {
     let node = arena.node(predicate).clone();
-    let data_type = arena.data_type(predicate).clone();
-    let nullable = arena.nullable(predicate);
-    match node {
+    let value_type = arena.value_type(predicate).clone();
+    Ok(match node {
         ScalarNode::BinaryOp {
             left,
             op,
             right,
             decimal_overflow_policy,
         } if matches!(op, BinOp::And | BinOp::Or) => {
-            let left = normalize_correlated_on_predicate_inner_opt(arena, left, outer_ids);
-            let right = normalize_correlated_on_predicate_inner_opt(arena, right, outer_ids);
-            arena.intern(
+            let left =
+                normalize_correlated_on_predicate_inner_opt(arena, left, outer_ids, control)?;
+            let right =
+                normalize_correlated_on_predicate_inner_opt(arena, right, outer_ids, control)?;
+            arena.intern_observed(
                 ScalarNode::BinaryOp {
                     left,
                     op,
                     right,
                     decimal_overflow_policy,
                 },
-                data_type,
-                nullable,
-            )
+                value_type,
+                control,
+            )?
         }
         ScalarNode::BinaryOp {
             left,
@@ -180,33 +197,36 @@ fn normalize_correlated_on_predicate_inner_opt(
                     let inner_type = arena.data_type(left).clone();
                     let mut outer_expr = right;
                     if arena.data_type(right) != &inner_type {
-                        outer_expr = arena.intern(
+                        outer_expr = arena.intern_observed(
                             ScalarNode::Cast {
                                 child: right,
                                 target: inner_type.clone(),
                                 decimal_overflow_policy:
                                     novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                             },
-                            inner_type,
-                            arena.nullable(right),
-                        );
+                            novarocks_type_contract::FunctionValueType::new(
+                                inner_type,
+                                arena.nullable(right),
+                            ),
+                            control,
+                        )?;
                     }
-                    arena.intern(
+                    arena.intern_observed(
                         ScalarNode::BinaryOp {
                             left: outer_expr,
                             op: reverse_comparison_op(op),
                             right: left,
                             decimal_overflow_policy,
                         },
-                        data_type,
-                        nullable,
-                    )
+                        value_type,
+                        control,
+                    )?
                 }
                 _ => predicate,
             }
         }
         _ => predicate,
-    }
+    })
 }
 
 fn reverse_comparison_op(op: BinOp) -> BinOp {
@@ -225,7 +245,8 @@ fn expose_predicate_inner_columns_opt(
     predicate: ScalarId,
     child: &OptExpr,
     outer_correlation_column_ids: &[ColumnId],
-) -> Option<Vec<ScalarProjectItem>> {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<Option<Vec<ScalarProjectItem>>, crate::compiler::SqlCompileError> {
     let outer_ids: HashSet<ColumnId> = outer_correlation_column_ids.iter().copied().collect();
     let projected_ids: HashSet<ColumnId> = items.iter().map(|item| item.output_column_id).collect();
     let mut missing_project_ids: HashSet<ColumnId> =
@@ -234,22 +255,23 @@ fn expose_predicate_inner_columns_opt(
             .filter(|column_id| !outer_ids.contains(column_id))
             .filter(|column_id| !projected_ids.contains(column_id))
             .collect();
-
     if missing_project_ids.is_empty() {
-        return Some(items);
+        return Ok(Some(items));
     }
 
-    for output in scalar_utils::opt_output_columns(child, arena).ok()? {
+    for output in candidate_or_none!(scalar_utils::opt_output_columns(child, arena).ok()) {
         if missing_project_ids.remove(&output.column_id) {
-            items.push(scalar_utils::project_item_for_column(arena, &output));
+            items.push(scalar_utils::project_item_for_column(
+                arena, &output, control,
+            )?);
         }
     }
 
-    if missing_project_ids.is_empty() {
+    Ok(if missing_project_ids.is_empty() {
         Some(items)
     } else {
         None
-    }
+    })
 }
 
 fn predicate_inner_refs_available_opt(
@@ -392,11 +414,7 @@ mod legacy {
         predicate: TypedExpr,
         outer_ids: &HashSet<ColumnId>,
     ) -> TypedExpr {
-        let TypedExpr {
-            kind,
-            data_type,
-            nullable,
-        } = predicate;
+        let TypedExpr { kind, value_type } = predicate;
         match kind {
             ExprKind::BinaryOp {
                 left,
@@ -410,8 +428,7 @@ mod legacy {
                     right: Box::new(normalize_correlated_on_predicate_inner(*right, outer_ids)),
                     decimal_overflow_policy,
                 },
-                data_type,
-                nullable,
+                value_type: value_type,
             },
             ExprKind::BinaryOp {
                 left,
@@ -444,17 +461,19 @@ mod legacy {
                             right,
                             decimal_overflow_policy,
                         },
-                        data_type,
-                        nullable,
+                        value_type: value_type,
                     },
                     (false, true) => {
-                        let inner_type = left.data_type.clone();
+                        let inner_type = left.value_type.data_type.clone();
                         let inner_expr = *left;
                         let mut outer_expr = *right;
-                        if outer_expr.data_type != inner_type {
+                        if outer_expr.value_type.data_type != inner_type {
                             outer_expr = TypedExpr {
-                                data_type: inner_type.clone(),
-                                nullable: outer_expr.nullable,
+                                value_type: novarocks_type_contract::FunctionValueType::new(
+                                    inner_type.clone(),
+                                    outer_expr.value_type.nullable,
+                                ),
+
                                 kind: ExprKind::Cast {
                                     expr: Box::new(outer_expr),
                                     target: inner_type,
@@ -470,8 +489,7 @@ mod legacy {
                                 right: Box::new(inner_expr),
                                 decimal_overflow_policy,
                             },
-                            data_type,
-                            nullable,
+                            value_type: value_type,
                         }
                     }
                     _ => TypedExpr {
@@ -481,15 +499,13 @@ mod legacy {
                             right,
                             decimal_overflow_policy,
                         },
-                        data_type,
-                        nullable,
+                        value_type: value_type,
                     },
                 }
             }
             kind => TypedExpr {
                 kind,
-                data_type,
-                nullable,
+                value_type: value_type,
             },
         }
     }
@@ -546,8 +562,7 @@ mod legacy {
                             qualifier: None,
                             column: output.name.clone(),
                         },
-                        data_type: output.data_type.clone(),
-                        nullable: output.nullable,
+                        value_type: output.value_type.clone(),
                     },
                     output_name: output.name,
                     output_column_id: output.column_id,
@@ -593,8 +608,7 @@ mod legacy {
     pub(super) fn literal_true() -> TypedExpr {
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Bool(true)),
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -608,8 +622,7 @@ mod legacy {
                 right: Box::new(right),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 }
@@ -651,8 +664,11 @@ mod tests {
                 columns: vec![OutputColumn {
                     column_id: INNER_K,
                     name: "k".to_string(),
-                    data_type: DataType::Int64,
-                    nullable: false,
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    ),
+
                     is_internal: false,
                 }],
                 predicates: vec![],
@@ -672,8 +688,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type: DataType::Int64,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         }
     }
 
@@ -684,8 +699,7 @@ mod tests {
                 qualifier: None,
                 column: name.to_string(),
             },
-            data_type,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(data_type, false),
         }
     }
 
@@ -697,8 +711,7 @@ mod tests {
                 right: Box::new(col_ref(OUTER_K, "k")),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -710,8 +723,7 @@ mod tests {
                 right: Box::new(typed_col_ref(OUTER_K, "k", outer_type)),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -723,8 +735,7 @@ mod tests {
                 right: Box::new(col_ref(OUTER_K, "k")),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            data_type: DataType::Boolean,
-            nullable: false,
+            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         }
     }
 
@@ -749,8 +760,10 @@ mod tests {
                 items: vec![ProjectItem {
                     expr: TypedExpr {
                         kind: ExprKind::Literal(LiteralValue::Int(1)),
-                        data_type: DataType::Int64,
-                        nullable: false,
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Int64,
+                            false,
+                        ),
                     },
                     output_name: "1".to_string(),
                     output_column_id: CONST_ONE,

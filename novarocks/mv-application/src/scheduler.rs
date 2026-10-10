@@ -332,7 +332,7 @@ impl MvRefreshScheduler {
             MvSchedulerSemanticDecision::Invalid { reason } => {
                 self.runtime.record(
                     &projection.mv_id,
-                    MvRefreshDisposition::InvalidDefinition(reason),
+                    MvRefreshDisposition::InvalidDefinition(reason.into()),
                     now_ms,
                 );
                 return;
@@ -617,7 +617,7 @@ mod tests {
             .expect("new configuration observation");
         scheduler.record_observation_failure(
             &stale,
-            MvRefreshDisposition::TerminalFailure("late failure".to_string()),
+            MvRefreshDisposition::TerminalFailure("late failure".to_string().into()),
             1_700_000_002_000,
         );
         let mut changed = current;
@@ -637,19 +637,19 @@ mod tests {
         assert_eq!(
             scheduler.record(
                 7,
-                MvRefreshDisposition::TransientUnavailable("offline".to_string()),
+                MvRefreshDisposition::TransientUnavailable("offline".to_string().into()),
                 100
             ),
             MvRefreshRuntimeDecision::TransientBackoff {
-                error: "offline".to_string(),
+                error: "offline".to_string().into(),
                 retry_at_ms: 110
             }
         );
         for disposition in [
-            MvRefreshDisposition::InvalidDefinition("bad".to_string()),
-            MvRefreshDisposition::TerminalFailure("terminal".to_string()),
-            MvRefreshDisposition::Corruption("corrupt".to_string()),
-            MvRefreshDisposition::InvariantViolation("invariant".to_string()),
+            MvRefreshDisposition::InvalidDefinition("bad".to_string().into()),
+            MvRefreshDisposition::TerminalFailure("terminal".to_string().into()),
+            MvRefreshDisposition::Corruption("corrupt".to_string().into()),
+            MvRefreshDisposition::InvariantViolation("invariant".to_string().into()),
         ] {
             assert!(matches!(
                 scheduler.record(7, disposition, 100),

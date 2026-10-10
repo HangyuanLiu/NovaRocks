@@ -20,10 +20,12 @@ mod cuts;
 mod error;
 mod expr;
 mod graph;
+mod guarantee;
 mod index;
 mod io_cuts;
 mod limits;
 mod node;
+mod package;
 mod properties;
 mod runtime_filter;
 
@@ -39,7 +41,14 @@ pub(crate) use index::*;
 pub use io_cuts::*;
 pub use limits::*;
 pub(crate) use node::*;
+pub(crate) use package::*;
 pub(crate) use properties::*;
+pub use properties::{
+    FragmentPropertyError, derive_fragment_output_properties_in,
+    derive_fragment_output_properties_observed,
+    derive_replica_sensitive_output_properties_observed, validate_fragment_output_properties_in,
+    validate_fragment_output_properties_observed,
+};
 pub(crate) use runtime_filter::*;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -78,7 +87,7 @@ pub fn validate_fragment(fragment: &Fragment, cuts: &FragmentCuts) -> Result<(),
     if !errors.is_empty() {
         return Err(ValidationErrors::from_collector(errors));
     }
-    validate_fragment_cuts_into(fragment, cuts, true, &mut errors);
+    validate_fragment_cuts_into(fragment, cuts, &mut errors);
     validate_fragment_partition_identities(fragment, cuts, &mut errors);
     if errors.is_empty() {
         Ok(())
@@ -95,6 +104,46 @@ pub(crate) fn validate_fragment_definition(fragment: &Fragment) -> Result<(), Va
         Ok(())
     } else {
         Err(ValidationErrors::from_collector(errors))
+    }
+}
+
+/// The sole caller admits this same owned source and its exact pending
+/// runtime-filter count before creating the reference array. Do not repeat
+/// that resource walk after the array has been installed.
+pub(crate) fn validate_fragment_construction_after_admission(
+    fragment: &Fragment,
+    limits: PlanLimits,
+) -> Result<(), ValidationErrors> {
+    let mut errors = ValidationContext::for_construction(limits);
+    validate_fragment_structure_into(fragment, &mut errors);
+    validate_fragment_partition_identities(fragment, &FragmentCuts::default(), &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ValidationErrors::from_collector(errors))
+    }
+}
+
+/// The same complete construction laws with the caller's original scratch
+/// counter and meter. Other expression/type/diagnostic owners remain separate.
+pub(crate) fn validate_fragment_construction_after_admission_in(
+    fragment: &Fragment,
+    limits: PlanLimits,
+    resources: &mut novarocks_type_contract::ControlResourceCounter,
+    admit: &mut dyn FnMut(
+        &novarocks_type_contract::ControlOwnedResourceFacts,
+    ) -> Result<(), novarocks_type_contract::CompileControlError>,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<(), FragmentPropertyError> {
+    let mut errors = ValidationContext::for_construction(limits);
+    validate_fragment_structure_into_in(fragment, &mut errors, resources, admit, work)?;
+    validate_fragment_partition_identities(fragment, &FragmentCuts::default(), &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(FragmentPropertyError::Structure(
+            ValidationErrors::from_collector(errors),
+        ))
     }
 }
 
@@ -137,18 +186,31 @@ pub fn validate_plan_with_limits(
         plan.runtime_filters().len(),
         limits.plan_runtime_filters,
     );
-    bounded_count(
-        &mut errors,
-        "artifact_refs",
-        plan.artifact_refs().len(),
-        limits.plan_artifact_refs,
-    );
     if plan.fragments().is_empty() {
         errors.push(ValidationError::new("fragments", "plan has no fragments"));
     }
 
     for fragment in plan.fragments().values() {
         validate_fragment_into(fragment, &mut errors);
+        // The complete-plan table is the sole intrinsic source. Fragment-only
+        // validation checks reference shape; publication resolves exact values.
+        for (id, expression) in fragment.expressions().iter() {
+            for reference in expression.kind.intrinsic_parameter_references() {
+                if let Err(error) = plan.parameters().require(*reference) {
+                    errors.push(ValidationError::new(
+                        format!(
+                            "fragments[{}].expressions[{}].parameters",
+                            fragment.id().get(),
+                            id.get()
+                        ),
+                        error.to_string(),
+                    ));
+                }
+            }
+            if errors.is_saturated() {
+                break;
+            }
+        }
         if errors.is_saturated() {
             errors.mark_truncated();
             return Err(ValidationErrors::from_collector(errors));
@@ -176,8 +238,6 @@ pub fn validate_plan_with_limits(
     run_validation_stage!(validate_writer_flows(plan, &mut errors));
     run_validation_stage!(validate_result(plan, &mut errors));
     run_validation_stage!(validate_runtime_filters(plan, &mut errors));
-    run_validation_stage!(validate_artifact_refs(plan, &mut errors));
-    run_validation_stage!(validate_artifact_inputs(plan, &mut errors));
     run_validation_stage!(validate_annotations(plan, &mut errors));
     run_validation_stage!(validate_cross_fragment_value_origins(plan, &mut errors));
     run_validation_stage!(validate_provider_read_occurrences(plan, &mut errors));
@@ -225,7 +285,7 @@ pub fn validate_plan_with_limits(
                 ));
                 return Err(ValidationErrors::from_collector(errors));
             };
-            validate_fragment_cuts_into(fragment, &cuts, false, &mut errors);
+            validate_fragment_cuts_into(fragment, &cuts, &mut errors);
             validate_fragment_partition_identities(fragment, &cuts, &mut errors);
             if !errors.is_empty() {
                 return Err(ValidationErrors::from_collector(errors));
@@ -272,12 +332,95 @@ pub(crate) fn validate_provider_read_occurrences(
 }
 
 pub(crate) fn validate_fragment_into(fragment: &Fragment, errors: &mut ValidationContext) {
-    let prefix = format!("fragments[{}]", fragment.id().get());
     let previous_errors = errors.len();
     validate_fragment_resources(fragment, errors);
     if errors.len() != previous_errors {
         return;
     }
+    validate_fragment_structure_into(fragment, errors);
+}
+
+// The original structure body chooses only owned scratch operations. All
+// reference, expression, node and error-order laws remain in that one body.
+trait FragmentStructureScratch {
+    type Error;
+    fn indexes(&mut self, fragment: &Fragment) -> Result<FragmentValidationIndexes, Self::Error>;
+    fn node_graph(
+        &mut self,
+        fragment: &Fragment,
+        errors: &mut ValidationContext,
+    ) -> Result<(), Self::Error>;
+}
+struct PlainFragmentScratch;
+impl FragmentStructureScratch for PlainFragmentScratch {
+    type Error = std::convert::Infallible;
+    fn indexes(&mut self, fragment: &Fragment) -> Result<FragmentValidationIndexes, Self::Error> {
+        Ok(FragmentValidationIndexes::new(fragment))
+    }
+    fn node_graph(
+        &mut self,
+        fragment: &Fragment,
+        errors: &mut ValidationContext,
+    ) -> Result<(), Self::Error> {
+        validate_node_graph(fragment, errors);
+        Ok(())
+    }
+}
+struct CallerFragmentScratch<'a, 'control> {
+    resources: &'a mut novarocks_type_contract::ControlResourceCounter,
+    admit: &'a mut dyn FnMut(
+        &novarocks_type_contract::ControlOwnedResourceFacts,
+    ) -> Result<(), novarocks_type_contract::CompileControlError>,
+    work: &'a mut novarocks_type_contract::CompileCheckpoints<'control>,
+}
+impl FragmentStructureScratch for CallerFragmentScratch<'_, '_> {
+    type Error = novarocks_type_contract::ControlResourceError;
+    fn indexes(&mut self, fragment: &Fragment) -> Result<FragmentValidationIndexes, Self::Error> {
+        FragmentValidationIndexes::new_in(fragment, self.resources, self.admit, self.work)
+    }
+    fn node_graph(
+        &mut self,
+        fragment: &Fragment,
+        errors: &mut ValidationContext,
+    ) -> Result<(), Self::Error> {
+        graph::validate_node_graph_in(fragment, errors, self.resources, self.admit, self.work)
+    }
+}
+
+pub(crate) fn validate_fragment_structure_into(
+    fragment: &Fragment,
+    errors: &mut ValidationContext,
+) {
+    validate_fragment_structure_into_core(fragment, errors, &mut PlainFragmentScratch)
+        .unwrap_or_else(|never| match never {});
+}
+
+pub(crate) fn validate_fragment_structure_into_in(
+    fragment: &Fragment,
+    errors: &mut ValidationContext,
+    resources: &mut novarocks_type_contract::ControlResourceCounter,
+    admit: &mut dyn FnMut(
+        &novarocks_type_contract::ControlOwnedResourceFacts,
+    ) -> Result<(), novarocks_type_contract::CompileControlError>,
+    work: &mut novarocks_type_contract::CompileCheckpoints<'_>,
+) -> Result<(), novarocks_type_contract::ControlResourceError> {
+    validate_fragment_structure_into_core(
+        fragment,
+        errors,
+        &mut CallerFragmentScratch {
+            resources,
+            admit,
+            work,
+        },
+    )
+}
+
+fn validate_fragment_structure_into_core<S: FragmentStructureScratch>(
+    fragment: &Fragment,
+    errors: &mut ValidationContext,
+    scratch: &mut S,
+) -> Result<(), S::Error> {
+    let prefix = format!("fragments[{}]", fragment.id().get());
     bounded_count(
         errors,
         &format!("{prefix}.nodes"),
@@ -322,7 +465,7 @@ pub(crate) fn validate_fragment_into(fragment: &Fragment, errors: &mut Validatio
     }
     let mut aggregate_calls = BTreeMap::new();
     for node in fragment.nodes().values() {
-        let NodeKind::Aggregate { calls, .. } = &node.kind else {
+        let Some((_, calls)) = node.kind.aggregate_contract() else {
             continue;
         };
         for call in calls {
@@ -337,7 +480,7 @@ pub(crate) fn validate_fragment_into(fragment: &Fragment, errors: &mut Validatio
             }
             if errors.is_saturated() {
                 errors.mark_truncated();
-                return;
+                return Ok(());
             }
         }
     }
@@ -345,10 +488,10 @@ pub(crate) fn validate_fragment_into(fragment: &Fragment, errors: &mut Validatio
         validate_value(fragment, value, &aggregate_calls, errors);
         if errors.is_saturated() {
             errors.mark_truncated();
-            return;
+            return Ok(());
         }
     }
-    let indexes = FragmentValidationIndexes::new(fragment);
+    let indexes = scratch.indexes(fragment)?;
     let window_roots = fragment
         .nodes()
         .values()
@@ -396,7 +539,7 @@ pub(crate) fn validate_fragment_into(fragment: &Fragment, errors: &mut Validatio
         );
         if errors.is_saturated() {
             errors.mark_truncated();
-            return;
+            return Ok(());
         }
     }
     validate_expression_acyclic(fragment, errors);
@@ -406,36 +549,18 @@ pub(crate) fn validate_fragment_into(fragment: &Fragment, errors: &mut Validatio
         validate_node(fragment, node, &indexes, errors);
         if errors.is_saturated() {
             errors.mark_truncated();
-            return;
+            return Ok(());
         }
     }
-    validate_node_graph(fragment, errors);
+    scratch.node_graph(fragment, errors)?;
     validate_fragment_sink(fragment, errors);
+    Ok(())
 }
 
 pub(crate) fn validate_annotations(plan: &PhysicalPlan, errors: &mut ValidationContext) {
-    bounded_count(
-        errors,
-        "annotations",
-        plan.annotations().len(),
-        MAX_ANNOTATIONS,
-    );
-    let total_bytes = plan
-        .annotations()
-        .iter()
-        .fold(0_usize, |total, annotation| {
-            total
-                .saturating_add(annotation.key.len())
-                .saturating_add(annotation.value.len())
-        });
-    if total_bytes > MAX_ANNOTATION_BYTES {
-        errors.push(ValidationError::resource_limit(
-            "annotations",
-            format!("contains {total_bytes} bytes, exceeding {MAX_ANNOTATION_BYTES}"),
-        ));
-    }
-    for (index, annotation) in plan.annotations().iter().enumerate() {
-        let valid = match annotation.subject {
+    validate_annotation_table(
+        plan.annotations(),
+        |subject| match subject {
             AnnotationSubject::Plan => true,
             AnnotationSubject::Fragment(fragment) => plan.fragments().contains_key(&fragment),
             AnnotationSubject::Node(fragment, node) => plan
@@ -446,7 +571,30 @@ pub(crate) fn validate_annotations(plan: &PhysicalPlan, errors: &mut ValidationC
                 .fragments()
                 .get(&fragment)
                 .is_some_and(|fragment| fragment.values().contains_key(&value)),
-        };
+        },
+        errors,
+    );
+}
+
+pub(crate) fn validate_annotation_table(
+    annotations: &[crate::PlanAnnotation],
+    valid_subject: impl Fn(AnnotationSubject) -> bool,
+    errors: &mut ValidationContext,
+) {
+    bounded_count(errors, "annotations", annotations.len(), MAX_ANNOTATIONS);
+    let total_bytes = annotations.iter().fold(0_usize, |total, annotation| {
+        total
+            .saturating_add(annotation.key.len())
+            .saturating_add(annotation.value.len())
+    });
+    if total_bytes > MAX_ANNOTATION_BYTES {
+        errors.push(ValidationError::resource_limit(
+            "annotations",
+            format!("contains {total_bytes} bytes, exceeding {MAX_ANNOTATION_BYTES}"),
+        ));
+    }
+    for (index, annotation) in annotations.iter().enumerate() {
+        let valid = valid_subject(annotation.subject);
         // Four different faults read alike once they are one message, and an
         // annotation names a subject the reader has to go and find.
         let fault = if !valid {
@@ -511,3 +659,5 @@ pub(crate) fn _assert_required_contract_is_copy(_: RequiredContracts) {}
 
 #[allow(dead_code)]
 pub(crate) fn _assert_maps_are_deterministic(_: BTreeMap<FragmentId, Fragment>) {}
+
+pub use aggregate::aggregate_bindings_match_observed;

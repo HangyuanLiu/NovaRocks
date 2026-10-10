@@ -79,15 +79,17 @@ pub(crate) fn validate_location(subject: &str, value: &str) -> Result<(), Connec
             )));
         }
         for (key, _) in url.query_pairs() {
-            if matches!(
-                key.to_ascii_lowercase().as_str(),
-                "access_key"
-                    | "access_key_id"
-                    | "secret"
-                    | "secret_key"
-                    | "session_token"
-                    | "token"
-            ) {
+            if [
+                "access_key",
+                "access_key_id",
+                "secret",
+                "secret_key",
+                "session_token",
+                "token",
+            ]
+            .iter()
+            .any(|candidate| key.eq_ignore_ascii_case(candidate))
+            {
                 return Err(invalid(format!(
                     "Iceberg {subject} must not embed credentials"
                 )));
@@ -851,11 +853,61 @@ impl IcebergWriterOutput {
     }
 }
 
+/// COW-only backing minted by the checked schema constructor. No activity lease.
+/// The guard is last so the actual owned schema graph exits before its holder.
+#[derive(Debug)]
+pub(crate) struct IcebergCowSchemaBacking {
+    schema: IcebergSchemaDef,
+    _original: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+}
+impl IcebergCowSchemaBacking {
+    pub(crate) fn from_checked(
+        schema: IcebergSchemaDef,
+        original: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            schema,
+            _original: original,
+        })
+    }
+    pub(crate) fn schema(&self) -> &IcebergSchemaDef {
+        &self.schema
+    }
+    pub(crate) fn original(&self) -> &novarocks_spi::connector::ConnectorPayloadRetentionGuard {
+        &self._original
+    }
+}
+
+/// Private ownership specialization; its serialized shape is exactly SchemaDef.
+#[derive(Clone, Debug)]
+pub(crate) enum IcebergDataSchema {
+    Owned(IcebergSchemaDef),
+    CowShared(Arc<IcebergCowSchemaBacking>),
+}
+impl IcebergDataSchema {
+    pub(crate) fn schema(&self) -> &IcebergSchemaDef {
+        match self {
+            Self::Owned(schema) => schema,
+            Self::CowShared(owner) => owner.schema(),
+        }
+    }
+}
+impl serde::Serialize for IcebergDataSchema {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serde::Serialize::serialize(self.schema(), serializer)
+    }
+}
+impl<'de> serde::Deserialize<'de> for IcebergDataSchema {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        <IcebergSchemaDef as serde::Deserialize>::deserialize(deserializer).map(Self::Owned)
+    }
+}
+
 /// The data-branch recipe: the frozen input schema and the partitioning every
 /// data writer writes through.
 #[derive(Clone, Debug)]
 pub struct IcebergDataBranchRecipe {
-    input_schema: Option<IcebergSchemaDef>,
+    input_schema: Option<IcebergDataSchema>,
     partition_source_column_names: Vec<String>,
     partition_column_names: Vec<String>,
     transform_exprs: Vec<String>,
@@ -870,11 +922,44 @@ pub struct IcebergDataBranchRecipe {
     /// because SQL sends those columns, not because this flag is set, and
     /// clearing it would not stop lineage being written.
     row_lineage: bool,
+    _cow_original: Option<novarocks_spi::connector::ConnectorPayloadRetentionGuard>,
 }
 
 impl IcebergDataBranchRecipe {
     pub fn try_new(
         input_schema: Option<IcebergSchemaDef>,
+        partition_source_column_names: Vec<String>,
+        partition_column_names: Vec<String>,
+        transform_exprs: Vec<String>,
+        row_lineage: bool,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_schema_backing(
+            input_schema.map(IcebergDataSchema::Owned),
+            partition_source_column_names,
+            partition_column_names,
+            transform_exprs,
+            row_lineage,
+        )
+    }
+
+    pub(crate) fn try_new_cow(
+        input_schema: Arc<IcebergCowSchemaBacking>,
+        partition_source_column_names: Vec<String>,
+        partition_column_names: Vec<String>,
+        transform_exprs: Vec<String>,
+        row_lineage: bool,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_new_schema_backing(
+            Some(IcebergDataSchema::CowShared(input_schema)),
+            partition_source_column_names,
+            partition_column_names,
+            transform_exprs,
+            row_lineage,
+        )
+    }
+
+    fn try_new_schema_backing(
+        input_schema: Option<IcebergDataSchema>,
         partition_source_column_names: Vec<String>,
         partition_column_names: Vec<String>,
         transform_exprs: Vec<String>,
@@ -896,17 +981,22 @@ impl IcebergDataBranchRecipe {
                 "Iceberg data writer repeats a partition column name",
             ));
         }
+        let original = match &input_schema {
+            Some(IcebergDataSchema::CowShared(owner)) => Some(owner.original().clone()),
+            _ => None,
+        };
         Ok(Self {
             input_schema,
             partition_source_column_names,
             partition_column_names,
             transform_exprs,
             row_lineage,
+            _cow_original: original,
         })
     }
 
     pub fn input_schema(&self) -> Option<&IcebergSchemaDef> {
-        self.input_schema.as_ref()
+        self.input_schema.as_ref().map(IcebergDataSchema::schema)
     }
     pub fn partition_source_column_names(&self) -> &[String] {
         &self.partition_source_column_names
@@ -2137,9 +2227,11 @@ impl IcebergCommitHandle {
         metadata: Arc<crate::iceberg::spec::TableMetadata>,
     ) -> Result<Self, ConnectorError> {
         let source = metadata.snapshot_for_ref(self.table.target_ref());
+        let mut uuid_buffer = [0u8; 36];
+        let uuid = metadata.uuid().hyphenated().encode_lower(&mut uuid_buffer);
         if self.flavor == IcebergWriteFlavor::StagedCreate
             || self.source_metadata.is_some()
-            || metadata.uuid().to_string() != self.table.table_uuid()
+            || uuid != self.table.table_uuid()
             || source.map(|snapshot| snapshot.snapshot_id()) != self.table.base_snapshot_id()
             || source.map_or(0, |snapshot| snapshot.sequence_number())
                 != self.table.base_sequence_number()
