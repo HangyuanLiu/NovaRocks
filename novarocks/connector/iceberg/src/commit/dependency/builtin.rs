@@ -22,6 +22,7 @@ use super::{Culprit, ValidationInputs, Verdict};
 use crate::iceberg::Result;
 use crate::iceberg::spec::TableMetadata;
 
+// Design: ADR-0171 (docs/adr/ADR-0171-commit-operation-model.md)
 pub async fn validate(
     intent: &OperationIntent,
     metadata: &TableMetadata,

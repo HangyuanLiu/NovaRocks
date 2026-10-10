@@ -279,6 +279,7 @@ impl RetryPolicy {
 
 /// Neither cancellation nor elapsed retry time interrupts an already-issued dispatch.
 /// Once publication is possible, its typed outcome alone decides cleanup and retry.
+// Design: ADR-0171 (docs/adr/ADR-0171-commit-operation-model.md)
 pub(crate) async fn run(
     operation: &IcebergCommitOperation,
     intent: &OperationIntent,

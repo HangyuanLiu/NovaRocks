@@ -63,6 +63,7 @@ pub struct OperationIntentParts {
 }
 
 #[derive(Debug)]
+// Design: ADR-0171 (docs/adr/ADR-0171-commit-operation-model.md)
 pub struct OperationIntent {
     parts: OperationIntentParts,
 }

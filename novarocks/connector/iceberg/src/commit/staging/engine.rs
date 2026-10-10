@@ -220,6 +220,7 @@ impl<'a> StagingEngine<'a> {
         self.requirements = requirements;
         Ok(())
     }
+    // Design: ADR-0171 (docs/adr/ADR-0171-commit-operation-model.md)
     pub fn freeze(self, owned_references: &[ObjectIdentity]) -> Result<FrozenRequest> {
         self.artifacts.check_active()?;
         FrozenRequest::new(FrozenRequestParts {
