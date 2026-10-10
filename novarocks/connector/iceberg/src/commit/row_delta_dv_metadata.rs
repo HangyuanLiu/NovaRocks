@@ -15,19 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Shared metadata helpers for v3 row-lineage deletion-vector commits.
+//! Shared immutable v3 row-lineage facts, validation and canonical entry writing.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 
-use crate::iceberg::io::FileIO;
+use crate::commit::WrittenPuffinDv;
 use crate::iceberg::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, ManifestContentType, ManifestFile,
-    ManifestWriterBuilder, PartitionSpecRef, SchemaRef, TableMetadata,
+    PartitionSpecRef, TableMetadata,
 };
-use crate::iceberg::table::Table;
-
-use crate::commit::WrittenFile;
-use crate::commit::WrittenPuffinDv;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WrittenDvFile {
@@ -61,168 +57,6 @@ pub struct LiveFile {
     pub file_sequence_number: Option<i64>,
 }
 
-pub struct SnapshotIndex {
-    /// Live data files keyed by `file_path()`.
-    pub data_files: HashMap<String, LiveFile>,
-    /// Manifests we did NOT touch; preserved verbatim in the new manifest list.
-    pub untouched_manifests: Vec<ManifestFile>,
-    /// Live delete entries from touched delete manifests that the current
-    /// DELETE did not affect (i.e., reference some other data file). They are
-    /// rewritten into a new `*-row-delta-dv-existing-*.avro` so the DV lineage
-    /// is preserved for unrelated data files.
-    pub touched_delete_existing: Vec<LiveFile>,
-    /// Live DV files removed because a replacement DV was written.
-    pub replaced_delete_files: usize,
-    /// Exact paths of the live Puffin DV files removed from touched delete
-    /// manifests.  A distributed rewrite uses this to prove that its frozen
-    /// input set has neither shrunk nor grown before it submits the one
-    /// replacement snapshot.
-    pub replaced_delete_paths: HashSet<String>,
-    /// Position deletes already represented by removed DV files.
-    pub replaced_delete_records: u64,
-    /// Total file_size_in_bytes of replaced DV files.
-    pub replaced_delete_files_size: u64,
-}
-
-pub async fn build_snapshot_index_metadata_only(
-    table: &Table,
-    file_io: &FileIO,
-    touched_files: &HashSet<String>,
-    target_ref: &str,
-) -> Result<SnapshotIndex, String> {
-    build_snapshot_index(table, file_io, touched_files, target_ref).await
-}
-
-async fn build_snapshot_index(
-    table: &Table,
-    file_io: &FileIO,
-    touched_files: &HashSet<String>,
-    target_ref: &str,
-) -> Result<SnapshotIndex, String> {
-    let mut data_files = HashMap::new();
-    let mut untouched_manifests = Vec::new();
-    let mut touched_delete_existing = Vec::new();
-    let mut replaced_delete_files = 0usize;
-    let mut replaced_delete_paths = HashSet::new();
-    let mut replaced_delete_files_size = 0u64;
-    let mut replaced_delete_records = 0u64;
-    let m = table.metadata();
-    // For branch-targeted deletes, read the manifest list from the branch head
-    // snapshot (not from main's current snapshot). This ensures that files added
-    // to the branch by prior branch DML are visible and carry forward correctly.
-    let snapshot = if target_ref == "main" {
-        m.current_snapshot()
-            .ok_or_else(|| "row-lineage DELETE requires a current snapshot".to_string())?
-    } else {
-        let branch_snapshot_id = m.refs().get(target_ref).map(|r| r.snapshot_id).ok_or_else(
-            || {
-                format!(
-                    "row-lineage DELETE target branch '{target_ref}' not found in table metadata"
-                )
-            },
-        )?;
-        m.snapshot_by_id(branch_snapshot_id)
-            .ok_or_else(|| format!("row-lineage DELETE branch '{target_ref}' snapshot {branch_snapshot_id} not found in metadata"))?
-    };
-    let list = snapshot
-        .load_manifest_list(file_io, table.metadata())
-        .await
-        .map_err(|e| format!("load manifest list failed: {e}"))?;
-
-    for mf in list.entries() {
-        match mf.content {
-            ManifestContentType::Data => {
-                let manifest = mf
-                    .load_manifest(file_io)
-                    .await
-                    .map_err(|e| format!("load data manifest {} failed: {e}", mf.manifest_path))?;
-                for entry in manifest.entries() {
-                    if !entry.is_alive() {
-                        continue;
-                    }
-                    let seq = entry.sequence_number().unwrap_or(mf.sequence_number);
-                    let file_seq = entry.file_sequence_number;
-                    let snapshot_id = entry.snapshot_id().unwrap_or(mf.added_snapshot_id);
-                    let file = entry.data_file().clone();
-                    data_files.insert(
-                        file.file_path().to_string(),
-                        LiveFile {
-                            data_file: file,
-                            partition_spec_id: mf.partition_spec_id,
-                            snapshot_id,
-                            sequence_number: seq,
-                            file_sequence_number: file_seq,
-                        },
-                    );
-                }
-                untouched_manifests.push(mf.clone());
-            }
-            ManifestContentType::Deletes => {
-                let manifest = mf.load_manifest(file_io).await.map_err(|e| {
-                    format!("load delete manifest {} failed: {e}", mf.manifest_path)
-                })?;
-                let mut manifest_touched = false;
-                let mut keep: Vec<LiveFile> = Vec::new();
-                for entry in manifest.entries() {
-                    if !entry.is_alive() {
-                        continue;
-                    }
-                    let seq = entry.sequence_number().unwrap_or(mf.sequence_number);
-                    let file_seq = entry.file_sequence_number;
-                    let snapshot_id = entry.snapshot_id().unwrap_or(mf.added_snapshot_id);
-                    let file = entry.data_file().clone();
-                    validate_delete_file_for_row_lineage(&file)?;
-                    let referenced = file.referenced_data_file().ok_or_else(|| {
-                        format!(
-                            "Puffin DV {} missing referenced_data_file",
-                            file.file_path()
-                        )
-                    })?;
-                    if touched_files.contains(&referenced) {
-                        if !replaced_delete_paths.insert(file.file_path().to_string()) {
-                            return Err(format!(
-                                "duplicate live Puffin DV path {} in Iceberg manifest list",
-                                file.file_path()
-                            ));
-                        }
-                        replaced_delete_records = replaced_delete_records
-                            .checked_add(file.record_count())
-                            .ok_or_else(|| "replaced DV record_count overflow".to_string())?;
-                        replaced_delete_files += 1;
-                        replaced_delete_files_size = replaced_delete_files_size
-                            .checked_add(file.file_size_in_bytes())
-                            .ok_or_else(|| "replaced DV file_size_in_bytes overflow".to_string())?;
-                        manifest_touched = true;
-                    } else {
-                        keep.push(LiveFile {
-                            data_file: file,
-                            partition_spec_id: mf.partition_spec_id,
-                            snapshot_id,
-                            sequence_number: seq,
-                            file_sequence_number: file_seq,
-                        });
-                    }
-                }
-                if manifest_touched {
-                    touched_delete_existing.extend(keep);
-                } else {
-                    untouched_manifests.push(mf.clone());
-                }
-            }
-        }
-    }
-
-    Ok(SnapshotIndex {
-        data_files,
-        untouched_manifests,
-        touched_delete_existing,
-        replaced_delete_files,
-        replaced_delete_paths,
-        replaced_delete_records,
-        replaced_delete_files_size,
-    })
-}
-
 pub fn validate_delete_file_for_row_lineage(file: &DataFile) -> Result<(), String> {
     if file.content_type() == DataContentType::EqualityDeletes {
         return Err(
@@ -251,116 +85,6 @@ pub fn partition_spec_by_id(
                 "row-lineage DELETE references unknown partition spec id {spec_id}"
             ))
         })
-}
-
-pub fn group_live_files_by_partition_spec(files: Vec<LiveFile>) -> BTreeMap<i32, Vec<LiveFile>> {
-    let mut grouped = BTreeMap::new();
-    for file in files {
-        grouped
-            .entry(file.partition_spec_id)
-            .or_insert_with(Vec::new)
-            .push(file);
-    }
-    grouped
-}
-
-pub fn group_written_dvs_by_partition_spec(
-    dvs: &[WrittenDvFile],
-    data_files: &HashMap<String, LiveFile>,
-) -> Result<BTreeMap<i32, Vec<WrittenDvFile>>, String> {
-    let mut grouped = BTreeMap::new();
-    for dv in dvs {
-        let referenced = data_files.get(&dv.referenced_data_file).ok_or_else(|| {
-            format!(
-                "row-lineage DELETE references data file `{}` which is not in the current snapshot",
-                dv.referenced_data_file
-            )
-        })?;
-        grouped
-            .entry(referenced.partition_spec_id)
-            .or_insert_with(Vec::new)
-            .push(dv.clone());
-    }
-    Ok(grouped)
-}
-
-pub async fn write_existing_delete_manifest(
-    file_io: &FileIO,
-    out_path: &str,
-    files: &[LiveFile],
-    partition_spec: PartitionSpecRef,
-    schema: SchemaRef,
-    new_snapshot_id: i64,
-) -> Result<ManifestFile, String> {
-    let output_file = file_io
-        .new_output(out_path)
-        .map_err(|e| format!("FileIO::new_output({out_path}) failed: {e}"))?;
-    let builder = ManifestWriterBuilder::new(
-        output_file,
-        Some(new_snapshot_id),
-        None,
-        schema,
-        (*partition_spec).clone(),
-    );
-    let mut writer = builder.build_v3_deletes();
-    for f in files {
-        writer
-            .add_existing_file(
-                f.data_file.clone(),
-                f.snapshot_id,
-                f.sequence_number,
-                f.file_sequence_number,
-            )
-            .map_err(|e| format!("ManifestWriter::add_existing_file failed: {e}"))?;
-    }
-    let manifest_file = writer
-        .write_manifest_file()
-        .await
-        .map_err(|e| format!("ManifestWriter::write_manifest_file failed: {e}"))?;
-    debug_assert_eq!(manifest_file.content, ManifestContentType::Deletes);
-    Ok(manifest_file)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn write_added_dv_manifest(
-    file_io: &FileIO,
-    out_path: &str,
-    dvs: &[WrittenDvFile],
-    data_files: &HashMap<String, LiveFile>,
-    partition_spec: PartitionSpecRef,
-    schema: SchemaRef,
-    new_seq: i64,
-    new_snapshot_id: i64,
-) -> Result<ManifestFile, String> {
-    let output_file = file_io
-        .new_output(out_path)
-        .map_err(|e| format!("FileIO::new_output({out_path}) failed: {e}"))?;
-    let builder = ManifestWriterBuilder::new(
-        output_file,
-        Some(new_snapshot_id),
-        None,
-        schema,
-        (*partition_spec).clone(),
-    );
-    let mut writer = builder.build_v3_deletes();
-    for written in dvs {
-        let referenced = data_files.get(&written.referenced_data_file).ok_or_else(|| {
-            format!(
-                "row-lineage DELETE references data file `{}` which is not in the current snapshot",
-                written.referenced_data_file
-            )
-        })?;
-        let df = dv_data_file(written, referenced)?;
-        writer
-            .add_file(df, new_seq)
-            .map_err(|e| format!("ManifestWriter::add_file failed: {e}"))?;
-    }
-    let manifest_file = writer
-        .write_manifest_file()
-        .await
-        .map_err(|e| format!("ManifestWriter::write_manifest_file failed: {e}"))?;
-    debug_assert_eq!(manifest_file.content, ManifestContentType::Deletes);
-    Ok(manifest_file)
 }
 
 pub fn dv_data_file(written: &WrittenDvFile, referenced: &LiveFile) -> Result<DataFile, String> {
@@ -401,72 +125,6 @@ pub fn dv_total_records(
                 })
         })
         .transpose()
-}
-
-pub fn dv_summary(
-    dvs: &[WrittenDvFile],
-    written_data_files: &[WrittenFile],
-    total_records: Option<u64>,
-    newly_deleted_records: u64,
-    removed_delete_files: usize,
-    removed_position_deletes: u64,
-) -> Result<HashMap<String, String>, String> {
-    let mut p = HashMap::new();
-    let added_position_deletes = dvs.iter().try_fold(0u64, |sum, file| {
-        sum.checked_add(file.cardinality)
-            .ok_or_else(|| "DV added position delete count overflow".to_string())
-    })?;
-    let added_data_records = written_data_files.iter().try_fold(0u64, |sum, file| {
-        sum.checked_add(file.record_count)
-            .ok_or_else(|| "DV added data record count overflow".to_string())
-    })?;
-    let total_size = dvs
-        .iter()
-        .map(|d| d.file_size_in_bytes)
-        .chain(written_data_files.iter().map(|f| f.file_size_in_bytes))
-        .try_fold(0u64, |sum, size| {
-            sum.checked_add(size)
-                .ok_or_else(|| "DV added file size overflow".to_string())
-        })?;
-    p.insert("added-delete-files".to_string(), dvs.len().to_string());
-    p.insert(
-        "added-position-deletes".to_string(),
-        added_position_deletes.to_string(),
-    );
-    if !written_data_files.is_empty() {
-        p.insert(
-            "added-data-files".to_string(),
-            written_data_files.len().to_string(),
-        );
-        p.insert("added-records".to_string(), added_data_records.to_string());
-    }
-    if newly_deleted_records > 0 {
-        p.insert(
-            "deleted-records".to_string(),
-            newly_deleted_records.to_string(),
-        );
-    }
-    if removed_delete_files > 0 {
-        p.insert(
-            "removed-delete-files".to_string(),
-            removed_delete_files.to_string(),
-        );
-        p.insert(
-            "removed-position-delete-files".to_string(),
-            removed_delete_files.to_string(),
-        );
-    }
-    if removed_position_deletes > 0 {
-        p.insert(
-            "removed-position-deletes".to_string(),
-            removed_position_deletes.to_string(),
-        );
-    }
-    if let Some(total_records) = total_records {
-        p.insert("total-records".to_string(), total_records.to_string());
-    }
-    p.insert("added-files-size".to_string(), total_size.to_string());
-    Ok(p)
 }
 
 pub fn to_iceberg_unexpected(s: String) -> crate::iceberg::Error {
@@ -602,9 +260,11 @@ mod t8b_tests {
     use super::*;
     use crate::commit::model::*;
     use crate::commit::staging::*;
+    use crate::iceberg::io::FileIO;
     use crate::iceberg::spec::*;
     use crate::iceberg::{NamespaceIdent, TableIdent};
     use novarocks_spi::connector::ConnectorWriteOperationId;
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     struct Writer {

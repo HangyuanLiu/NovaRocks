@@ -87,12 +87,8 @@ use crate::commit::write_stack::old_delete::{
 };
 use crate::commit::write_stack::planning::{IcebergBranchSessionPlanInput, plan_branch_session};
 use crate::commit::write_stack::runtime::IcebergWriteAdapter;
-use crate::commit::{
-    CommitOpKind, CommitServiceError, CowUpdateRewriteSet, CowUpdateTouchedFile,
-    IcebergCommitCollector, RunInput, WrittenFile, run_iceberg_commit,
-};
+use crate::commit::{CommitOpKind, CowUpdateRewriteSet, CowUpdateTouchedFile, WrittenFile};
 use crate::iceberg::spec::{DataContentType, DataFileFormat, TableMetadata};
-use crate::iceberg::transaction::ApplyTransactionAction;
 use crate::metadata_context::IcebergMetadataContext;
 use crate::write_descriptor::decode_partition_descriptor;
 
@@ -1249,7 +1245,7 @@ impl IcebergWriteSessionControl {
     /// answer, not a missing feature.
     ///
     /// The read has to reload, and the reload has to reach the catalog.
-    /// `dispatch_commit` loaded the table before the commit, and every cache
+    /// The frozen publication runner loaded the table before the commit, and every cache
     /// between here and the catalog -- the attempt's request scope included --
     /// still holds that pre-commit view, which by construction cannot know the
     /// snapshot just created. Declaring the external effect is what makes the

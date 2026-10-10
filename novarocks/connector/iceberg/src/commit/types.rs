@@ -134,12 +134,6 @@ impl WrittenFile {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CommitOutcome {
-    pub new_snapshot_id: i64,
-    pub written_manifest_paths: Vec<String>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

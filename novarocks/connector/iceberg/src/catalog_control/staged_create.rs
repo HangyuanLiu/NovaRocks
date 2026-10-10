@@ -46,7 +46,7 @@ use novarocks_spi::connector::{
 };
 use novarocks_types::naming::normalize_identifier;
 
-use crate::commit::{CommitOpKind, IcebergCommitCollector, WrittenFile};
+use crate::commit::WrittenFile;
 use crate::iceberg::{TableCreation, TableUpdate};
 
 #[path = "staged_create/publication.rs"]
@@ -681,18 +681,8 @@ impl IcebergStagedCreateAdapter {
         write: &ConnectorStagedWriteProof,
     ) -> Result<Arc<[WrittenFile]>, ConnectorError> {
         let metadata = prepared.staged.table.metadata().clone();
-        let converter = IcebergCommitCollector::new(
-            CommitOpKind::FastAppend,
-            prepared.staged.table.identifier().clone(),
-            None,
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            staged_write_data_prefix(metadata.location(), prepared.operation_id()),
-        )
-        .with_table_metadata(metadata.clone());
         let files = sealed_artifacts(write, &metadata)?.into_iter().map(|report| {
-            let file = converter.convert_writer_report(report).map_err(corrupt)?;
+            let file = crate::commit::report::written_file_from_report(report, metadata.current_schema().as_ref()).map_err(corrupt)?;
             if file.content != crate::iceberg::spec::DataContentType::Data
                 || metadata.partition_spec_by_id(file.partition_spec_id).is_none()
             {

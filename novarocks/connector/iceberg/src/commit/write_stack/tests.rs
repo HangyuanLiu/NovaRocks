@@ -1928,7 +1928,7 @@ fn a_distributed_rewrite_commits_the_exact_file_set_it_froze() {
     // what a writer produced, and a group whose rows were all compacted away
     // produces nothing at all while still having to be retired.
     //
-    // `run_iceberg_commit` refuses `CommitOpKind::SelectedRewrite` outright
+    // The frozen publication runner rejects a selected rewrite without its exact file set
     // when its frozen file set is absent, so before the session carried its
     // frozen groups every rewrite commit failed with "requires its frozen file
     // set". This asserts the session now supplies exactly the union it froze.
@@ -2197,7 +2197,7 @@ fn only_a_rewrite_session_carries_a_frozen_rewrite_file_set() {
 #[test]
 fn a_rewrite_is_not_gated_by_the_external_write_fence() {
     // The rewrite is arbitrated by the ordinary Iceberg base-state compare and
-    // swap `dispatch_commit` already performs against the frozen snapshot, so
+    // swap the frozen publication runner already performs against the frozen snapshot, so
     // it must not also take the distributed external write fence. Every other
     // flavor keeps it.
     for flavor in [

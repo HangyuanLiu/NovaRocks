@@ -15,29 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Eager statistics staging for provider-private atomic publication.
+//! Declarative statistics preparation for a frozen metadata-only request.
 
 use crate::iceberg::spec::StatisticsFile;
-use crate::iceberg::table::Table;
-use crate::iceberg::transaction::{ApplyTransactionAction, Transaction};
-
-/// Eagerly evaluate `SetStatistics` and export its catalog payload without
-/// dispatching. The caller must hand the result to the provider-private
-/// publication frontier; this function never owns OCC retries.
-pub(crate) async fn stage_statistics_file(
-    table: &Table,
-    stats_file: StatisticsFile,
-) -> Result<crate::iceberg::TableCommit, String> {
-    let tx = Transaction::new(table);
-    let tx = tx
-        .update_statistics()
-        .set_statistics(stats_file)
-        .apply(tx)
-        .await
-        .map_err(|error| format!("stage Iceberg SetStatistics: {error}"))?;
-    Ok(tx.into_table_commit())
-}
-
 /// A metadata-only change, independent of the current ref head. The measured
 /// snapshot dependency is checked by the operation before preparation.
 pub(crate) struct StatisticsPreparer {

@@ -295,7 +295,7 @@ impl IcebergWriteFlavor {
     /// external write fence.
     ///
     /// A distributed rewrite must not be: it is arbitrated by the ordinary
-    /// Iceberg base-state compare and swap that `dispatch_commit` already
+    /// Iceberg base-state compare and swap that the frozen publication runner already
     /// performs, and taking the fence would serialize it against ordinary DML
     /// it does not conflict with. Every other flavor keeps the fence, because a
     /// DML write that skipped it would lose that protection.

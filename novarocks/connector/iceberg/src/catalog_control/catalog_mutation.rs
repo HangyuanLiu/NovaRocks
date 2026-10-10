@@ -4070,44 +4070,19 @@ mod tests {
             .runtime()
             .load_table(&table.namespace, &table.table)
             .expect("load managed table fixture");
-        let metadata = loaded.table.metadata();
-        let collector = Arc::new(crate::commit::IcebergCommitCollector::new(
-            crate::commit::CommitOpKind::FastAppend,
-            loaded.table.identifier().clone(),
-            None,
-            metadata.last_sequence_number(),
-            metadata.current_schema().clone(),
-            metadata.default_partition_spec().clone(),
-            format!("{}/data/_staging/fixture", metadata.location()),
-        ));
-        let fs = provider
-            .runtime()
-            .resources()
-            .planning_binding()
-            .resolve_access(metadata.location())
-            .expect("fixture storage access")
-            .operator();
-        let catalog = provider.runtime().novarocks_catalog().vendored_client();
+        let runtime = Arc::clone(provider.runtime());
         provider
             .runtime()
             .resources()
             .catalog_runtime()
             .block_on(async move {
-                crate::commit::run_iceberg_commit(crate::commit::RunInput {
-                    collector,
-                    catalog,
-                    file_io: loaded.table.file_io().clone(),
-                    table: loaded.table,
-                    fs,
-                    cleanup_path_mapper: None,
-                    cow_update_rewrite: None,
-                    selected_rewrite: None,
-                    target_ref: "main".to_string(),
-                    snapshot_properties: BTreeMap::from([(
-                        "fixture".to_string(),
-                        "managed-document".to_string(),
-                    )]),
-                })
+                crate::commit::run::append_snapshot_for_test(
+                    runtime,
+                    loaded.table,
+                    Vec::new(),
+                    "main".to_string(),
+                    BTreeMap::from([("fixture".to_string(), "managed-document".to_string())]),
+                )
                 .await
             })
             .expect("run managed snapshot fixture")
