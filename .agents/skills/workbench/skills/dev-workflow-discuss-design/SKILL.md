@@ -31,6 +31,9 @@ description: "Investigate and discuss a development problem until its current be
 5. 找出必须由用户裁决的重大决策。
 6. 给出 2–3 个真正不同的方案、取舍和推荐理由；不存在有意义的替代方案时，不凑数。
 
+按 contract 第 2.1 节明确正常输入前提与失败边界。合法但罕见的输入和运行期资源/I/O 失败需要处理；违反契约的
+bug、错误数据或人为畸形格式直接拒绝、报错，实际 bug 修复根因，不为它们发明特殊兼容或恢复架构。
+
 ## 对话方式
 
 - 使用当前请求和适用 `AGENTS.md` 规定的沟通语言。

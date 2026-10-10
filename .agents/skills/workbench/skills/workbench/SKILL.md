@@ -34,6 +34,9 @@ description: "Route engineering work through explicit stages, and maintain a dur
 不要把解析出的机器相关路径写回 skill。Memory 只负责定位；bundled contract、适用的 `AGENTS.md` 和当前代码
 共同定义实时规则。
 
+设计与测试以支持契约为边界：区分预期内失败和非预期缺陷，后者直接拒绝、报错，实际 bug 修复根因，避免特殊兼容与额外测试矩阵。
+判断方法与测试范围分别见 `references/workflow-contract.md` 第 2.1、8.4 节。
+
 ## 路由
 
 | 当前状态或用户意图 | 调用 |
