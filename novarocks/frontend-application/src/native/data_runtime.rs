@@ -48,6 +48,16 @@ pub(super) struct CachedNativeChannel {
     generation: Arc<DialGeneration>,
 }
 
+impl CachedNativeChannel {
+    /// Read-only component identity; grants no selection or dial authority.
+    #[cfg(test)]
+    pub(super) fn same_generation_for_test(&self, other: &Self) -> bool {
+        self.slot == other.slot
+            && Arc::ptr_eq(&self.generation, &other.generation)
+            && !self.generation.retired.load(Ordering::Acquire)
+    }
+}
+
 struct DialGeneration {
     retired: AtomicBool,
 }
