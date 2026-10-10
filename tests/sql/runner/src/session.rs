@@ -497,12 +497,8 @@ fn case_table_names(
         "SELECT table_name FROM `{catalog}`.information_schema.tables \
          WHERE table_schema = '{db_name}';"
     );
-    let output = match run_mysql_sql(conn, query_timeout, &sql) {
-        Ok(output) => output,
-        // A database that does not exist has no tables to drop, and the drop
-        // below is idempotent either way.
-        Err(_) => return Ok(Vec::new()),
-    };
+    let output = run_mysql_sql(conn, query_timeout, &sql)
+        .with_context(|| format!("enumerate tables for case database `{catalog}`.`{db_name}`"))?;
     Ok(output
         .lines()
         .skip(1)

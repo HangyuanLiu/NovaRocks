@@ -643,3 +643,55 @@ fn caller_result_numeric_comparison_overflow_is_resource_before_ordinary_finish(
         }
     });
 }
+
+#[test]
+fn caller_result_single_semantic_scalar_source_roundtrips_both_explicit_states() {
+    let fixture = Fixture::new();
+    let c = Control::default();
+    // This fixture also admits the existing complete root schema profile.
+    let root_bytes = crate::physical_fragment_envelope_v2::root_projection_request_bytes().unwrap();
+    let mut scalar_limits = limits();
+    scalar_limits.max_allocation_request_bytes += root_bytes;
+    scalar_limits.max_coexisting_source_and_request_bytes += root_bytes;
+    fixture.with_tokens(&c, |values, read| {
+        for slot in [None, Some(37)] {
+            let semantic = novarocks_result_contract::ScalarSchema::try_new(
+                novarocks_result_contract::ScalarField {
+                    value_type: novarocks_result_contract::ScalarValueType::String,
+                    nullable: true,
+                },
+            )
+            .unwrap();
+            let semantic = match slot {
+                Some(slot) => semantic.bind_native_slots(&[slot]).unwrap(),
+                None => semantic,
+            };
+            let mut input = fixture.single(0);
+            input.scalar_schema = Some(semantic);
+            let encoded = caller_encode(
+                Some(&input),
+                &[0],
+                values,
+                scalar_limits,
+                &mut |_| Ok(()),
+                &c,
+            )
+            .unwrap();
+            assert_eq!(
+                encoded
+                    .0
+                    .as_ref()
+                    .unwrap()
+                    .scalar_schema
+                    .as_ref()
+                    .unwrap()
+                    .source_slot,
+                slot
+            );
+            let decoded =
+                caller_decode(encoded.0.as_ref(), read, scalar_limits, &mut |_| Ok(()), &c)
+                    .unwrap();
+            assert_eq!(decoded.0, Some(input));
+        }
+    });
+}

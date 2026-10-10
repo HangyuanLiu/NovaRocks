@@ -752,11 +752,24 @@ fn emit_decode(
         scalar_schema: match &input.scalar_schema {
             Some(schema) => {
                 w.flush()?;
-                let output = novarocks_proto_codec::scalar_result::decode_scalar_schema(
-                    schema,
-                    output.value_ids.len(),
-                    novarocks_proto_codec::FieldPath::root("result.scalar_schema"),
-                )
+                // ResultPort carries a compiler semantic tree before native
+                // slots exist. Already-bound inputs retain the native decoder;
+                // neither branch retries or invents a slot from a ValueId.
+                let path = novarocks_proto_codec::FieldPath::root("result.scalar_schema");
+                let output = match schema.source_slot {
+                    Some(_) => novarocks_proto_codec::scalar_result::decode_scalar_schema(
+                        schema,
+                        output.value_ids.len(),
+                        path,
+                    ),
+                    None => {
+                        novarocks_proto_codec::scalar_result::decode_semantic_result_scalar_schema(
+                            schema,
+                            output.value_ids.len(),
+                            path,
+                        )
+                    }
+                }
                 .map_err(Error::Root)?;
                 w.flush()?;
                 Some(output)
