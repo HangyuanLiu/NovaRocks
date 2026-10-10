@@ -158,6 +158,9 @@ Unknown 永不重发、abort 或删除；CREATE 被拒绝时按 IF NOT EXISTS �
 
 派发前检查实际完整恢复事实的容量，包括原 token、实际 attempt、精确请求基线和完整 owned ledger。
 保存的载荷与请求引用分类一致；外部解码的 ledger 只是证据，不能成为删除授权。
+私有 write-session V3 载荷使用单帧无损编码，完整事实仍须经过原 64KiB provider payload
+上限检查。解码在解析事实前限制窗口为 1MiB、JSON 字节长度为 8MiB，并拒绝长度不符、尾部或
+拼接帧；这些是私有解码边界，不代表整个工作集预算，也不改变 prepared-write admission。
 Journal 记录冻结请求引用的物理对象并集及 owner proof/finalization。桥接故障按实际阶段分类：
 未派发为 KnownUncommitted，可能派发为 Unknown，已取得 proof 则仍为 KnownCommitted。
 已知提交后的恢复清理只处理实际 owned 残留并排除保留引用；同步恢复桥本身失败时，报告实际未清理
@@ -191,7 +194,7 @@ ledger 分别监督并发和删除责任，不是 FE 资源容量。实际退出
 - 读依赖操作继续要求整个目标 ref 不变，长时间 OPTIMIZE 在持续写入下仍可能失败。当前以更严的可用性
   换取不会盲目重放；细粒度政策需要逐操作证明 delete 适用性、历史连续性与冲突域覆盖。
 - 完整 ledger 和恢复载荷有明确上限，超过载荷容量会在派发前失败。完整证据不能靠丢弃旧 attempt
-  残留来压缩；降低此成本需要另行设计可验证的载荷编码或 owner 事实交接。
+  残留来压缩；无损编码后仍可能因高熵或过大事实而拒绝，owner 事实交接需要另行设计。
 - 每轮重新写 attempt metadata 增加 I/O；跨 attempt 复用尚未实现。先冻结身份与继承字段，使未来
   优化不改变逻辑年龄或清理授权。
 - metadata-only 统计只有准备时存在性检查；快照可在发布前过期。选择尽力发布，避免为估计事实增加

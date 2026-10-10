@@ -3728,6 +3728,7 @@ dependencies = [
  "typetag",
  "url",
  "uuid",
+ "zstd",
 ]
 
 [[package]]

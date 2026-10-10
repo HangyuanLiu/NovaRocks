@@ -36,6 +36,7 @@
 //!   non-commit, so an unresolved session stays unknown.
 
 mod publication;
+mod recovery_codec;
 
 use crate::commit::model::EntryIdentity;
 use std::collections::{BTreeMap, BTreeSet};
@@ -98,7 +99,7 @@ use crate::write_descriptor::decode_partition_descriptor;
 pub const ICEBERG_WRITE_SESSION_MARKER_PROPERTY: &str = "novarocks.write.session.v1";
 
 /// The evidence schema version this control produces and accepts.
-pub const ICEBERG_WRITE_SESSION_EVIDENCE_VERSION: u16 = 2;
+pub const ICEBERG_WRITE_SESSION_EVIDENCE_VERSION: u16 = 3;
 
 /// The operation-kind tag on the evidence envelope.
 pub const ICEBERG_WRITE_SESSION_OPERATION_KIND: &str = "iceberg.connector_write_session.v1";
@@ -213,7 +214,16 @@ fn committed_write_receipt(
     }
 }
 
-use publication::RecoveryPayload as IcebergWriteSessionEvidenceV2;
+use publication::RecoveryPayload as IcebergWriteSessionEvidenceV3;
+
+#[cfg(test)]
+pub(crate) fn decode_write_recovery_facts_for_test(
+    evidence: &ExternalMutationEvidence,
+) -> Result<serde_json::Value, ConnectorError> {
+    let payload: IcebergWriteSessionEvidenceV3 =
+        recovery_codec::decode(evidence.provider_payload().as_ref())?;
+    serde_json::to_value(payload).map_err(|error| corrupt(error.to_string()))
+}
 
 /// The frontend-only Iceberg write authority of one exact catalog generation.
 // Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
@@ -1284,7 +1294,7 @@ impl IcebergWriteSessionControl {
         &self,
         handle: &IcebergCommitHandle,
         evidence: &ExternalMutationEvidence,
-    ) -> Result<IcebergWriteSessionEvidenceV2, ConnectorError> {
+    ) -> Result<IcebergWriteSessionEvidenceV3, ConnectorError> {
         if evidence.schema_version() != ICEBERG_WRITE_SESSION_EVIDENCE_VERSION
             || evidence.descriptor() != &self.descriptor
             || evidence.incarnation() != self.key.incarnation
@@ -1299,10 +1309,8 @@ impl IcebergWriteSessionControl {
                 "Iceberg write session evidence names a different write session",
             ));
         }
-        let payload: IcebergWriteSessionEvidenceV2 =
-            serde_json::from_slice(evidence.provider_payload().as_ref()).map_err(|error| {
-                corrupt(format!("decode Iceberg write session evidence: {error}"))
-            })?;
+        let payload: IcebergWriteSessionEvidenceV3 =
+            recovery_codec::decode(evidence.provider_payload().as_ref())?;
         payload.validate(&self.descriptor, self.key.incarnation, handle)?;
         if handle.recovery_evidence()? != *evidence {
             return Err(corrupt(

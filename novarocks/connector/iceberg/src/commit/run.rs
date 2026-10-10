@@ -1163,8 +1163,9 @@ mod application_document_publication_trace_tests {
             .recovery_evidence()
             .expect("checked dispatch recovery evidence");
         assert!(evidence.provider_payload().len() < MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES);
-        let evidence_payload: serde_json::Value =
-            serde_json::from_slice(evidence.provider_payload()).expect("decode evidence payload");
+        let evidence_payload =
+            crate::commit::write_stack::control::decode_write_recovery_facts_for_test(&evidence)
+                .expect("decode evidence payload");
         assert_eq!(
             evidence_payload["document_manifest_digest"]
                 .as_array()

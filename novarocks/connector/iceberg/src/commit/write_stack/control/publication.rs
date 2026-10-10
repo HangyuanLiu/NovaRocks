@@ -980,8 +980,7 @@ impl RecoveryTemplate {
             artifacts,
         };
         payload.validate_facts(self)?;
-        let bytes = serde_json::to_vec(&payload)
-            .map_err(|e| internal(format!("Encode complete Iceberg recovery ledger: {e}")))?;
+        let bytes = super::recovery_codec::encode(&payload)?;
         ExternalMutationEvidence::try_new(
             ICEBERG_WRITE_SESSION_EVIDENCE_VERSION,
             self.descriptor.clone(),
@@ -1174,6 +1173,9 @@ mod recovery_tests {
             }
         }
         fn intent(&self) -> OperationIntent {
+            self.intent_with_files(Vec::new())
+        }
+        fn intent_with_files(&self, added: Vec<AddedContent>) -> OperationIntent {
             OperationIntent::new(OperationIntentParts {
                 target: TableTarget {
                     ident: crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
@@ -1181,7 +1183,10 @@ mod recovery_tests {
                 },
                 target_ref: "main".into(),
                 start: None,
-                changes: FileChanges::default(),
+                changes: FileChanges {
+                    added,
+                    removed: Vec::new(),
+                },
                 dependencies: vec![Dependency::NoReadDependency],
                 isolation: IsolationLevel::Serializable,
                 shape: RequestShape::SnapshotProducing,
@@ -1192,6 +1197,32 @@ mod recovery_tests {
                 token: self.operation.token(),
             })
             .unwrap()
+        }
+        fn adopt_entropy(&self) -> ObjectIdentity {
+            let mut path = self.directory.path().to_path_buf();
+            // Full independent path entropy remains material after compression.
+            for _ in 0..3 {
+                let segment: String = (0..3)
+                    .map(|_| uuid::Uuid::new_v4().simple().to_string())
+                    .collect();
+                path.push(segment);
+            }
+            std::fs::create_dir_all(&path).unwrap();
+            path.push(format!("{}.parquet", uuid::Uuid::new_v4().simple()));
+            std::fs::write(&path, b"owned file").unwrap();
+            let object = ObjectIdentity::new(format!("file://{}", path.display())).unwrap();
+            self.operation.adopt_session_data(object.clone()).unwrap();
+            object
+        }
+        fn adopt_random_file(&self) -> ObjectIdentity {
+            let path = self.directory.path().join(format!(
+                "novarocks-00000-{}.parquet",
+                uuid::Uuid::new_v4().simple()
+            ));
+            std::fs::write(&path, b"owned file").unwrap();
+            let object = ObjectIdentity::new(format!("file://{}", path.display())).unwrap();
+            self.operation.adopt_session_data(object.clone()).unwrap();
+            object
         }
         fn adopt(&self, ordinal: usize) -> ObjectIdentity {
             let path = self
@@ -1256,7 +1287,7 @@ mod recovery_tests {
     #[tokio::test]
     async fn complete_owned_ledger_over_capacity_refuses_dispatch_and_cleans_actual_objects() {
         let fixture = Fixture::new();
-        let objects: Vec<_> = (0..800).map(|i| fixture.adopt(i)).collect();
+        let objects: Vec<_> = (0..800).map(|_| fixture.adopt_entropy()).collect();
         let publisher = publisher(&fixture);
         let report = attempt::run(
             &fixture.operation,
@@ -1284,6 +1315,149 @@ mod recovery_tests {
                 .iter()
                 .all(|o| !std::path::Path::new(o.path().strip_prefix("file://").unwrap()).exists())
         );
+    }
+
+    #[tokio::test]
+    async fn large_complete_ledger_codec_preserves_all_classes_attempts_and_references() {
+        use crate::commit::staging::StagingEngine;
+        use crate::iceberg::spec::Struct;
+        let fixture = Fixture::new();
+        let sessions: Vec<_> = (0..1221).map(|_| fixture.adopt_random_file()).collect();
+        let old_attempt = fixture.operation.begin_attempt().unwrap();
+        let old_object = old_attempt
+            .allocate(ArtifactClass::Attempt, ArtifactKind::Statistics)
+            .unwrap();
+        let operation_object = old_attempt
+            .allocate(ArtifactClass::Operation, ArtifactKind::Metadata)
+            .unwrap();
+        let mut writer = old_attempt
+            .file_io()
+            .new_output(operation_object.path())
+            .unwrap()
+            .writer()
+            .await
+            .unwrap();
+        writer
+            .write(Bytes::from_static(b"operation-owned metadata"))
+            .await
+            .unwrap();
+        writer.close().await.unwrap();
+        let added = sessions
+            .iter()
+            .map(|object| {
+                AddedContent::new_logical_data(
+                    crate::commit::overwrite::preparer_tests::data(
+                        object.path(),
+                        1,
+                        Struct::empty(),
+                    ),
+                    fixture.metadata.default_partition_spec_id(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let intent = fixture.intent_with_files(added);
+        let current = fixture.operation.begin_attempt().unwrap();
+        let mut engine = StagingEngine::begin(
+            StagingBase::Existing {
+                metadata: fixture.metadata.clone(),
+                metadata_location: format!(
+                    "file://{}/base.metadata.json",
+                    fixture.directory.path().display()
+                ),
+            },
+            &intent,
+            &current,
+        )
+        .unwrap();
+        engine
+            .stage(&crate::commit::fast_append::FastAppendPreparer)
+            .await
+            .unwrap();
+        let mut references = sessions.clone();
+        references.push(operation_object.clone());
+        let request = engine.freeze(&references).unwrap();
+        let evidence = fixture
+            .template
+            .encode(&request, &fixture.operation)
+            .unwrap();
+        let payload: RecoveryPayload =
+            super::super::recovery_codec::decode(evidence.provider_payload()).unwrap();
+        payload.validate_facts(&fixture.template).unwrap();
+        let records = fixture.operation.artifacts().unwrap();
+        assert_eq!(payload.artifacts.len(), records.len());
+        for (object, record) in payload.artifacts.iter().zip(records) {
+            assert_eq!(object.path, record.object.path());
+            assert_eq!(object.attempt, record.attempt.map(RecoveryAttempt::from));
+            let class = match record.class {
+                ArtifactClass::SessionData => OwnedClass::SessionData,
+                ArtifactClass::Operation => OwnedClass::Operation,
+                ArtifactClass::Attempt => OwnedClass::Attempt,
+                ArtifactClass::ExternalRegistered => {
+                    panic!("borrowed object entered actual owned test ledger")
+                }
+            };
+            let state = match record.write_state {
+                crate::commit::model::ArtifactWriteState::Allocated => WriteState::Allocated,
+                crate::commit::model::ArtifactWriteState::Writing => WriteState::Writing,
+                crate::commit::model::ArtifactWriteState::Written => WriteState::Written,
+            };
+            assert_eq!(object.class, class);
+            assert_eq!(object.state, state);
+        }
+        let paths = |indices: &[u32]| -> Vec<ObjectIdentity> {
+            indices
+                .iter()
+                .map(|index| {
+                    ObjectIdentity::new(payload.artifacts[*index as usize].path.clone()).unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(
+            paths(&payload.attempt_owned),
+            request.artifacts().attempt_owned()
+        );
+        assert_eq!(
+            paths(&payload.operation_references),
+            request.artifacts().operation_references()
+        );
+        assert_eq!(
+            paths(&payload.session_references),
+            request.artifacts().session_references()
+        );
+        assert_eq!(payload.session_references.len(), 1221);
+        assert_eq!(payload.operation_references.len(), 1);
+        assert!(!payload.attempt_owned.is_empty());
+        let old = payload
+            .artifacts
+            .iter()
+            .find(|object| object.path == old_object.path())
+            .unwrap();
+        assert_eq!(old.state, WriteState::Allocated);
+        assert_eq!(old.attempt, Some(old_attempt.attempt_token().into()));
+        let raw = serde_json::to_vec(&payload).unwrap();
+        assert!(raw.len() > novarocks_spi::connector::MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES);
+        assert!(
+            evidence.provider_payload().len()
+                <= novarocks_spi::connector::MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES
+        );
+        assert_eq!(
+            super::super::recovery_codec::encode(&payload).unwrap(),
+            evidence.provider_payload().as_ref()
+        );
+        println!(
+            "Recovery codec actual owned objects={} raw_json_bytes={} encoded_bytes={}",
+            payload.artifacts.len(),
+            raw.len(),
+            evidence.provider_payload().len()
+        );
+        assert_eq!(
+            fixture.operation.artifacts().unwrap().len(),
+            payload.artifacts.len()
+        );
+        assert!(sessions.iter().all(|object| {
+            std::path::Path::new(object.path().strip_prefix("file://").unwrap()).exists()
+        }));
     }
 
     #[tokio::test]
@@ -1328,7 +1502,8 @@ mod recovery_tests {
         assert_eq!(publisher.dispatches.load(Ordering::SeqCst), 1);
         assert!(matches!(report.cleanup, IcebergCleanupReport::NotAttempted));
         let evidence = publisher.checked.lock().unwrap().clone().unwrap();
-        let payload: RecoveryPayload = serde_json::from_slice(evidence.provider_payload()).unwrap();
+        let payload: RecoveryPayload =
+            super::super::recovery_codec::decode(evidence.provider_payload()).unwrap();
         payload.validate_facts(&fixture.template).unwrap();
         assert_eq!(payload.operation_id, fixture.operation.token().to_bytes());
         assert_eq!(
@@ -1369,5 +1544,9 @@ mod recovery_tests {
         let mut json = serde_json::to_value(&payload).unwrap();
         json["deleted_objects"] = serde_json::json!([]);
         assert!(serde_json::from_value::<RecoveryPayload>(json).is_err());
+        let mut nested = serde_json::to_value(&payload).unwrap();
+        nested["artifacts"][0]["unknown"] = serde_json::json!(true);
+        let nested = super::super::recovery_codec::encode(&nested).unwrap();
+        assert!(super::super::recovery_codec::decode::<RecoveryPayload>(&nested).is_err());
     }
 }
