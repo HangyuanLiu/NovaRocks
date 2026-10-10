@@ -37,17 +37,20 @@ pub struct DmlError {
     publication_terminal: Option<LakePublicationTerminal>,
     user_error: Option<UserError>,
     engine_error_code: Option<EngineErrorCode>,
+    cow_failure: Option<crate::query_execution::dml::mutation_flow::CowFailure>,
 }
 
 /// DML-local carrier for a SQL analysis error before the frontend client
 /// boundary renders it as a [`UserError`].
 ///
-/// The carrier intentionally keeps non-analysis failures as opaque engine
-/// text. It must not infer a user-facing code from that text.
+/// COW begin failures keep their original typed cause until the original
+/// command worker retires it. Other failures retain their existing text route;
+/// no user-facing code is inferred from that text.
 #[derive(Debug)]
 pub enum DmlExecutionError {
     Engine(String),
     Analyze(AnalyzeError),
+    Cow(crate::query_execution::dml::mutation_flow::CowFailure),
 }
 
 impl DmlExecutionError {
@@ -62,6 +65,7 @@ impl DmlExecutionError {
         match self {
             Self::Engine(error) => DmlError::executor(error),
             Self::Analyze(error) => DmlError::admit(error.to_user_error(source)),
+            Self::Cow(error) => DmlError::cow(error),
         }
     }
 }
@@ -98,13 +102,42 @@ impl std::fmt::Display for DmlExecutionError {
         match self {
             Self::Engine(error) => formatter.write_str(error),
             Self::Analyze(error) => error.fmt(formatter),
+            Self::Cow(error) => error.fmt(formatter),
         }
     }
 }
 
-impl std::error::Error for DmlExecutionError {}
+impl std::error::Error for DmlExecutionError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Cow(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+impl From<crate::query_execution::dml::mutation_flow::CowFailure> for DmlExecutionError {
+    fn from(error: crate::query_execution::dml::mutation_flow::CowFailure) -> Self {
+        Self::Cow(error)
+    }
+}
 
 impl DmlError {
+    fn cow(error: crate::query_execution::dml::mutation_flow::CowFailure) -> Self {
+        Self {
+            kind: DmlErrorKind::Executor,
+            message: "copy-on-write begin failed".to_owned(),
+            publication_terminal: None,
+            user_error: None,
+            engine_error_code: None,
+            cow_failure: Some(error),
+        }
+    }
+    pub(crate) fn take_cow_failure(
+        &mut self,
+    ) -> Option<crate::query_execution::dml::mutation_flow::CowFailure> {
+        self.cow_failure.take()
+    }
+
     pub(crate) fn new(kind: DmlErrorKind, error: impl fmt::Display) -> Self {
         Self {
             kind,
@@ -112,6 +145,7 @@ impl DmlError {
             publication_terminal: None,
             user_error: None,
             engine_error_code: None,
+            cow_failure: None,
         }
     }
 
@@ -149,6 +183,7 @@ impl DmlError {
             publication_terminal: Some(terminal),
             user_error: None,
             engine_error_code: None,
+            cow_failure: None,
         }
     }
 
@@ -165,6 +200,7 @@ impl DmlError {
             publication_terminal: None,
             user_error: Some(error),
             engine_error_code: None,
+            cow_failure: None,
         }
     }
 
@@ -221,4 +257,10 @@ impl fmt::Display for DmlError {
     }
 }
 
-impl std::error::Error for DmlError {}
+impl std::error::Error for DmlError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cow_failure
+            .as_ref()
+            .map(|error| error as &(dyn std::error::Error + 'static))
+    }
+}

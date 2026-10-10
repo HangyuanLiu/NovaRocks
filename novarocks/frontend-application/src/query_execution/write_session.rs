@@ -991,6 +991,27 @@ pub(crate) fn begin_connector_write_session(
         .map_err(|error| format!("begin connector write session: {error}"))
 }
 
+/// COW-only entry: retain the exact provider error until its original
+/// synchronous command worker projects and retires it. Other write callers
+/// keep their existing String boundary.
+pub(crate) fn begin_cow_connector_write_session(
+    lease: ConnectorWriteStackLease,
+    write_lease: &novarocks_spi::connector::ConnectorWriteLease,
+    request: ConnectorWriteBeginRequest,
+) -> Result<
+    std::sync::Arc<ConnectorWriteSession>,
+    crate::query_execution::dml::mutation_flow::CowFailure,
+> {
+    use crate::query_execution::dml::mutation_flow::CowFailure;
+    let catalog_properties = write_lease
+        .catalog_properties()
+        .cloned()
+        .ok_or_else(CowFailure::missing_catalog_identity)?;
+    ConnectorWriteSession::begin(lease, catalog_properties, request)
+        .map(std::sync::Arc::new)
+        .map_err(CowFailure::provider)
+}
+
 /// Open an application-document write with its declaration frozen and its
 /// exact publication pending until execution supplies the remaining facts.
 pub(crate) fn begin_connector_application_document_write_session_pending(

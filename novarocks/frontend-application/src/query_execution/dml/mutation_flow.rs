@@ -1884,6 +1884,8 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
         crate::catalog_application::resolver::invalidate_iceberg_caches(&self.state, &self.target)
     }
 }
+#[path = "cow_failure.rs"]
+mod cow_failure;
 /// Open the write session one copy-on-write mutation writes through.
 ///
 /// Unlike every other write, this session cannot be opened before the statement
@@ -1898,6 +1900,7 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
 /// the file replacement.
 #[path = "cow_necessary_before_begin.rs"]
 mod cow_necessary_before_begin;
+pub(crate) use cow_failure::CowFailure;
 
 fn begin_cow_write_session(
     state: &DmlExecutionKernel,
@@ -1908,7 +1911,7 @@ fn begin_cow_write_session(
     write_planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<Arc<ConnectorWriteSession>, String> {
+) -> Result<Arc<ConnectorWriteSession>, CowFailure> {
     use novarocks_execution::exec::row_position::{
         ICEBERG_LAST_UPDATED_SEQ_COL, ICEBERG_ROW_ID_COL,
     };
@@ -1947,16 +1950,15 @@ fn begin_cow_write_session(
             },
             context: connector_context.clone(),
         };
-        crate::query_execution::write_session::begin_connector_write_session(
-            crate::connector::write_target::derive_write_stack_lease(
-                state.typed_connector_control(),
-                write_planning_lease,
-            )?,
+        crate::query_execution::write_session::begin_cow_connector_write_session(
+            state.typed_connector_control()
+                .acquire_exact_write_stack(write_planning_lease.control_runtime_id())
+                .map_err(CowFailure::lease)?,
             write_lease,
             request,
         )
         },
-    ).map_err(|error| error.to_string())?
+    ).map_err(CowFailure::before_begin)?
 }
 /// The pinned relation one COW rewrite query scans.
 ///
@@ -5642,6 +5644,8 @@ mod tests {
             rows: Vec<spi::ConnectorRowMutationSelectionOrdinal>,
             capacity: novarocks_workload_control::ResultCapacityHandle,
             entered: Arc<Mutex<Vec<[usize; 4]>>>,
+            scripted_begin_failure: Mutex<Option<spi::ConnectorError>>,
+            captured_failure_request: Option<Arc<Mutex<Option<ws::ConnectorWriteBeginRequest>>>>,
         }
         impl ws::ConnectorWriteControl for CowConsumerPort {
             fn binding_key(&self) -> &spi::ConnectorProviderBindingKey {
@@ -5667,6 +5671,12 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(self.capacity.snapshot().held_positions);
+                if let Some(error) = self.scripted_begin_failure.lock().unwrap().take() {
+                    if let Some(captured) = &self.captured_failure_request {
+                        *captured.lock().unwrap() = Some(request);
+                    }
+                    return Err(error);
+                }
                 let ws::ConnectorWriteSessionFlavor::CopyOnWrite {
                     selection,
                     match_contract,
@@ -5732,6 +5742,21 @@ mod tests {
             novarocks_catalog_application::ConnectorWriteStackLease,
             spi::CatalogProperties,
         ) {
+            cow_consumer_generation_with_begin_failure(fixture, capacity, entered, None, None)
+        }
+
+        fn cow_consumer_generation_with_begin_failure(
+            fixture: &CowRewriteQueryFixture,
+            capacity: &novarocks_workload_control::ResultCapacityHandle,
+            entered: Arc<Mutex<Vec<[usize; 4]>>>,
+            failure: Option<spi::ConnectorError>,
+            capture: Option<Arc<Mutex<Option<ws::ConnectorWriteBeginRequest>>>>,
+        ) -> (
+            novarocks_catalog_application::ConnectorControlHost,
+            spi::ConnectorControlPlanningLease,
+            novarocks_catalog_application::ConnectorWriteStackLease,
+            spi::CatalogProperties,
+        ) {
             let generic_seed =
                 novarocks_catalog_application::test_support::test_control_binding_for(
                     spi::ConnectorInstanceId::parse("iceberg").unwrap(),
@@ -5767,6 +5792,8 @@ mod tests {
                 rows: fixture.rows.clone(),
                 capacity: capacity.clone(),
                 entered,
+                scripted_begin_failure: Mutex::new(failure),
+                captured_failure_request: capture,
             });
             // Forward the existing minimal catalog capabilities, with correct write
             // parity. There is exactly one original binding/runtime/generation.
@@ -5846,6 +5873,198 @@ mod tests {
             }
             consumer.check_end(fixture.selection.row_count()).unwrap();
             consumer.finish().unwrap()
+        }
+
+        #[test]
+        fn actual_cow_begin_preserves_original_provider_failure_through_dml_conversion() {
+            use spi::{ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure};
+            use std::error::Error;
+            let cases = [
+                ConnectorError::new(
+                    ConnectorErrorKind::Unavailable,
+                    "original begin unavailable",
+                )
+                .with_retryable_before_progress()
+                .with_cleanup_context("original cleanup retained"),
+                ConnectorError::table_object_binding(
+                    ConnectorTableObjectBindingFailure::Replaced,
+                    "original logical name replaced",
+                )
+                .with_cleanup_context("original binding cleanup"),
+            ];
+            for error in cases {
+                // Pointer/equality oracles are captured before giving the provider its
+                // one original error; only the test's equality oracle makes a clone.
+                let original_pointer = error.message().as_ptr();
+                let expected = error.clone();
+                let legacy_message = crate::dml::error::DmlError::executor(format!(
+                    "begin connector write session: {error}"
+                ))
+                .to_string();
+                let fixture = cow_rewrite_query_fixture(
+                    vec![7],
+                    vec![2],
+                    Arc::new(arrow::array::StringArray::from(vec!["bb"])) as ArrayRef,
+                    DataType::Utf8,
+                );
+                let (control, root, binding, capacity) =
+                    crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+                let context = connector_context_for_test();
+                let original_deadline = context.deadline();
+                let selection = collect_admitted_cow_selection(&fixture, &binding, context.clone());
+                let selection_digest = selection.digest();
+                let validation =
+                    crate::query_execution::row_mutation::RowMutationMatchValidator::try_new(
+                        fixture.preparation.match_contract().clone(),
+                        fixture.preparation.intent().clone(),
+                    )
+                    .and_then(|mut validator| validator.validate_selection(&selection));
+                let entered = Arc::new(Mutex::new(Vec::new()));
+                let captured = Arc::new(Mutex::new(None));
+                let (host, planning, stack, properties) =
+                    cow_consumer_generation_with_begin_failure(
+                        &fixture,
+                        &capacity,
+                        entered.clone(),
+                        Some(error),
+                        Some(captured.clone()),
+                    );
+                let host = Arc::new(host);
+                let write_lease = planning.derive_write_lease().unwrap();
+                let same_runtime = write_lease.control_runtime_id()
+                    == planning.control_runtime_id()
+                    && stack.control_runtime_id() == planning.control_runtime_id();
+                let registry: Arc<dyn spi::ConnectorControlRegistry> = Arc::new(
+                    crate::query_execution::compiler::TestConnectorControlRegistry::default(),
+                );
+                let state = DmlExecutionKernel::new(
+                    crate::query_execution::kernels::DmlPlanningServices::new(
+                        Arc::new(
+                            novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                                .unwrap(),
+                        ),
+                        Arc::new(
+                            crate::catalog_application::query_catalog::new_query_catalog_service(),
+                        ),
+                    ),
+                    None,
+                    registry,
+                    host.clone(),
+                    Arc::new(
+                        crate::connector::unified_statistics::UnifiedStatisticsResolver::default(),
+                    ),
+                    Arc::new(spi::UnavailableMvStorageObservationPort),
+                    crate::query_execution::compiler::test_query_execution_service(),
+                );
+                let execution = QueryExecutionContext::new(
+                    novarocks_types::ClusterRole::Fe,
+                    novarocks_query_application::api::BackendTopologySnapshot::empty(3),
+                    Some(original_deadline),
+                    novarocks_query_application::cancellation::QueryCancellationSource::new()
+                        .view(),
+                    novarocks_sql::compiler::SessionOptimizerSettings::default(),
+                    novarocks_sql::sql_mode::SqlSemanticSettings::default(),
+                )
+                .with_result_capacity(binding.clone())
+                .unwrap();
+                // This calls the exact production request builder, exact stack
+                // acquisition, write-session begin and provider control begin method.
+                let result = begin_cow_write_session(
+                    &state,
+                    &iceberg_target(),
+                    &fixture.preparation,
+                    selection,
+                    &write_lease,
+                    &planning,
+                    &execution,
+                    &context,
+                );
+                let request = captured.lock().unwrap().take();
+                let request_facts = request.as_ref().map(|request| {
+                    let flavor_same = match &request.flavor {
+                        ws::ConnectorWriteSessionFlavor::CopyOnWrite { selection, match_contract } =>
+                            selection.has_owned_sources() && selection.digest() == selection_digest
+                                && match_contract.digest() == fixture.preparation.match_contract().digest(),
+                        _ => false,
+                    };
+                    let input_same = match &request.input {
+                        spi::ConnectorWriteInputRequest::RowLineage { data_fields, row_identity_fields } =>
+                            data_fields.len() == fixture.preparation.match_contract().after_fields().len()
+                                && data_fields.iter().zip(fixture.preparation.match_contract().after_fields())
+                                    .all(|(actual, expected)| actual.field() == expected.field())
+                                && row_identity_fields.len() == 2
+                                && row_identity_fields.iter().zip([
+                                    novarocks_execution::exec::row_position::ICEBERG_ROW_ID_COL,
+                                    novarocks_execution::exec::row_position::ICEBERG_LAST_UPDATED_SEQ_COL,
+                                ]).all(|(actual, name)| actual.field().name() == name
+                                    && actual.field().data_type() == &DataType::Int64
+                                    && actual.field().is_nullable()),
+                        _ => false,
+                    };
+                    request.table.as_ref() == "db1.t"
+                        && &request.target_ref == fixture.preparation.target_ref()
+                        && request.base.as_ref() == Some(fixture.preparation.base_version())
+                        && request.context.deadline() == original_deadline
+                        && request.intent == spi::ConnectorWriteIntent::RowDelta
+                        && request.purpose == spi::ConnectorWriteAdmissionPurpose::OrdinaryDml
+                        && flavor_same && input_same
+                });
+                let mut cause_preserved = false;
+                let mut dml_preserved = false;
+                let mut projection = None;
+                if let Err(failure) = result {
+                    cause_preserved = failure
+                        .source()
+                        .and_then(|source| source.downcast_ref::<ConnectorError>())
+                        .is_some_and(|actual| {
+                            actual.message().as_ptr() == original_pointer && actual == &expected
+                        });
+                    let mut dml =
+                        crate::dml::error::DmlExecutionError::from(failure).into_dml_error(None);
+                    dml_preserved = dml
+                        .source()
+                        .and_then(|source| source.source())
+                        .and_then(|source| source.downcast_ref::<ConnectorError>())
+                        .is_some_and(|actual| {
+                            actual.message().as_ptr() == original_pointer && actual == &expected
+                        });
+                    if let Some(failure) = dml.take_cow_failure() {
+                        projection = Some(failure.retire_on_original_worker(None));
+                    }
+                    drop(dml);
+                }
+                // The provider captured the original request by move, not a selection
+                // clone. Release that genuine input holder before final capacity facts.
+                drop(request);
+                let original_entries = entered.lock().unwrap().clone();
+                drop(captured);
+                drop(entered);
+                drop(execution);
+                drop(state);
+                drop(write_lease);
+                drop(stack);
+                drop(properties);
+                drop(planning);
+                drop(context);
+                let retired =
+                    host.retire_current(&spi::ConnectorInstanceId::parse("iceberg").unwrap());
+                drop(host);
+                drop(fixture);
+                drop(binding);
+                root.owner.complete();
+                root.business.release();
+                let final_positions = capacity.snapshot().held_positions;
+                drop(control);
+                // Assertions follow original request/provider/lease/result/root cleanup.
+                assert!(retired.is_ok());
+                assert!(validation.is_ok());
+                assert!(same_runtime);
+                assert_eq!(original_entries, vec![[0, 0, 1, 0]]);
+                assert_eq!(request_facts, Some(true));
+                assert!(cause_preserved && dml_preserved);
+                assert_eq!(projection.as_deref(), Some(legacy_message.as_str()));
+                assert_eq!(final_positions, [0; 4]);
+            }
         }
 
         #[test]
