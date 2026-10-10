@@ -742,11 +742,14 @@ fn build_node<H: CompiledSchemaMetadataScope>(
         ProgramNodeKind::Analytic { input, .. } => {
             // M1 evaluates every partition on one driver: the instance input
             // is gathered, in the order its sorted source emits it.
-            let factory = CompiledWindowProcessorFactory::try_new(
-                Arc::clone(program),
-                id,
-                Arc::clone(error),
-            )?;
+            let factory = match metadata {
+                CompiledMetadataMode::Direct => CompiledWindowProcessorFactory::try_new(
+                    Arc::clone(program), id, Arc::clone(error),
+                )?,
+                CompiledMetadataMode::Hosted(host) => CompiledWindowProcessorFactory::try_new_with_metadata_host(
+                    Arc::clone(program), id, Arc::clone(error), *host,
+                )?,
+            };
             let build = build_node(program, *input, ctx, error, metadata)?;
             let mut build = gather_to_one(build, ctx, node_id);
             build.pipeline.factories.push(Box::new(factory));
@@ -1107,3 +1110,7 @@ mod window_fixture;
 #[cfg(test)]
 #[path = "compiled_window_tests.rs"]
 mod compiled_window_tests;
+
+#[cfg(test)]
+#[path = "compiled_window_metadata_tests.rs"]
+mod compiled_window_metadata_tests;
