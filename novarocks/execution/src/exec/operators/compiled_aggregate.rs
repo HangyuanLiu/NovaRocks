@@ -919,7 +919,8 @@ mod family_fixture;
 #[cfg(test)]
 mod failure_latch_tests {
     use super::aggregate_fixture::{
-        CallSpec, add_aggregate, bind, compile, extrema_catalog, finish, packages, values,
+        CallSpec, add_aggregate, aggregate_catalog, bind, compile, extrema_catalog, finish,
+        packages, values,
     };
     use super::family_fixture::{FixtureControl, int64};
     use super::*;
@@ -927,6 +928,7 @@ mod failure_latch_tests {
         ExecutionFailureCause, PipelineOperation, RequiredExpressionRowError,
     };
     use arrow::array::Int64Array;
+    use novarocks_functions::PureKernelAbi;
     use novarocks_physical_plan::{
         AggregateCallId, AggregateGrouping, AggregatePhase, FragmentBuilder, FragmentId,
         FragmentSink, LiteralValue, PlanBuilder, PlanVersionId, ResultField, ResultPort,
@@ -938,8 +940,26 @@ mod failure_latch_tests {
         Arc<RuntimeErrorState>,
         Arc<MemTracker>,
     ) {
-        let catalog = extrema_catalog();
-        let count = bind(&catalog, "count", &[]);
+        processor_for_count(false)
+    }
+    fn processor_for_count(
+        distinct: bool,
+    ) -> (
+        CompiledAggregateProcessor,
+        Chunk,
+        Arc<RuntimeErrorState>,
+        Arc<MemTracker>,
+    ) {
+        let catalog = if distinct {
+            aggregate_catalog(&[("multi_distinct_count", PureKernelAbi::AggregateV1)])
+        } else {
+            extrema_catalog()
+        };
+        let count = if distinct {
+            bind(&catalog, "multi_distinct_count", &[int64(false)])
+        } else {
+            bind(&catalog, "count", &[])
+        };
         let fragment = FragmentId::new(1);
         let mut builder = FragmentBuilder::new(fragment);
         let source = builder.reserve_node_id().unwrap();
@@ -957,7 +977,7 @@ mod failure_latch_tests {
                 bound: &count,
                 phase: AggregatePhase::Single,
                 id: AggregateCallId::new(1),
-                arguments: Vec::new(),
+                arguments: if distinct { vec![keys[0]] } else { Vec::new() },
                 distinct: false,
             }],
             AggregateGrouping::Complete,
@@ -1063,6 +1083,49 @@ mod failure_latch_tests {
         let batch = RecordBatch::try_new(input.batch.schema(), vec![column]).unwrap();
         processor.pending.push_back(Chunk::new_like(batch, input));
         weak
+    }
+    #[test]
+    fn compiled_aggregate_failure_latch_count_distinct_cancel_releases_live_state() {
+        let (mut processor, input, error, tracker) = processor_for_count(true);
+        let state = RuntimeState::default();
+        processor.push_chunk(&state, input.clone()).unwrap();
+        processor.push_chunk(&state, input.clone()).unwrap();
+        assert_eq!(processor.groups, 2);
+        assert!(tracker.current() > 0);
+        assert!(processor.instances.is_some());
+        assert!(
+            processor
+                .states
+                .as_ref()
+                .is_some_and(|states| states[0].len() == 2)
+        );
+        error.set_error("stop installed COUNT DISTINCT after accumulation");
+        let original = processor.push_chunk(&state, input.clone()).unwrap_err();
+        assert_eq!(
+            original.cause(),
+            &ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
+        );
+        assert_eq!(tracker.current(), 0, "distinct tables and keys must drop");
+        assert_failed_reentry(&mut processor, &original, &input);
+        assert_eq!(tracker.current(), 0);
+    }
+    #[test]
+    fn compiled_aggregate_failure_latch_count_distinct_drop_releases_live_state() {
+        let (mut processor, input, _, tracker) = processor_for_count(true);
+        processor
+            .push_chunk(&RuntimeState::default(), input)
+            .unwrap();
+        assert!(tracker.current() > 0);
+        assert!(
+            processor
+                .states
+                .as_ref()
+                .is_some_and(|states| states[0].len() == 2)
+        );
+        assert!(processor.key_table.is_some());
+        assert!(processor.instances.is_some());
+        drop(processor);
+        assert_eq!(tracker.current(), 0, "last owner releases distinct backing");
     }
     #[test]
     fn compiled_aggregate_failure_latch_push_cannot_replay_accumulated_prefix() {

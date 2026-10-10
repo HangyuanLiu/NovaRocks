@@ -24,7 +24,22 @@ use allocator_api2::vec::Vec as StateVec;
 use arrow_array::*;
 use arrow_buffer::i256;
 use arrow_schema::{DataType, TimeUnit};
-use hashbrown::{HashSet, hash_map::DefaultHashBuilder};
+use hashbrown::{Equivalent, HashSet, hash_map::DefaultHashBuilder};
+use std::hash::{Hash, Hasher};
+
+// allocator-api2 Vec hashes its complete slice but does not implement
+// Borrow<[u8]>. This query uses that same hash without allocating a stored key.
+struct BorrowedCountKey<'a>(&'a [u8]);
+impl Hash for BorrowedCountKey<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+impl<A: ScalarStateAllocator> Equivalent<StateVec<u8, A>> for BorrowedCountKey<'_> {
+    fn equivalent(&self, key: &StateVec<u8, A>) -> bool {
+        self.0 == key.as_slice()
+    }
+}
 
 #[derive(Debug)]
 pub struct CountDistinctState<A: ScalarStateAllocator> {
@@ -56,26 +71,16 @@ impl<A: ScalarStateAllocator> CountDistinctState<A> {
         value: &[u8],
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<(), ScalarStateError> {
-        // Preserve the original scan and reservation order, including table
-        // capacity left behind if the subsequent key allocation is refused.
-        for existing in &self.values {
-            work.flush()?;
-            if existing.len() == value.len() {
-                let mut equal = true;
-                for (left, right) in existing.iter().zip(value) {
-                    work.step()?;
-                    if left != right {
-                        equal = false;
-                        break;
-                    }
-                }
-                if equal {
-                    return Ok(());
-                }
-            }
-            work.step()?;
-        }
+        // Observe the library lookup at its boundaries; this does not observe
+        // hashing or collision comparisons inside the hash table.
         work.flush()?;
+        let exists = self.values.contains(&BorrowedCountKey(value));
+        work.flush()?;
+        if exists {
+            return Ok(());
+        }
+        // Preserve the original reservation order, including table capacity
+        // left behind if the subsequent key allocation is refused.
         self.values.try_reserve(1).map_err(|_| {
             self.values
                 .allocator()

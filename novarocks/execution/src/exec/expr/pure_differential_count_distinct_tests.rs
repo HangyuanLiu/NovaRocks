@@ -40,6 +40,22 @@ fn check(values: ArrayRef, nullable: bool) {
     assert_eq!(summary.pure_state_type.data_type, DataType::Binary);
 }
 #[test]
+fn pure_differential_count_distinct_high_cardinality_duplicates_nulls_and_grouped_phases() {
+    let rows = 8192;
+    check(
+        Arc::new(StringArray::from_iter((0..rows).map(|row| {
+            (row % 11 != 0).then(|| format!("key-{:05}", row % 4096))
+        }))),
+        true,
+    );
+    check(
+        Arc::new(Int64Array::from_iter(
+            (0..rows).map(|row| (row % 11 != 0).then_some((row % 4096) as i64)),
+        )),
+        true,
+    );
+}
+#[test]
 fn pure_differential_count_distinct_all_raw_flat_profiles_and_zero_groups() {
     for nullable in [false, true] {
         let pattern = (0..516)
