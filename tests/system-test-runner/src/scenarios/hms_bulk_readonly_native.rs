@@ -20,7 +20,8 @@
 //! Observations come from the original generation on the existing FE HTTP listener.
 use super::connector::require_three_backends;
 use crate::actors::mysql_stream::{
-    AsyncMysqlStream, BoundedCommandResponse, BoundedMysqlError, TextResultObservation,
+    AsyncMysqlStream, BoundedCommandError, BoundedCommandResponse, BoundedMysqlError,
+    CommandResponseFailure, TextResultObservation,
 };
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Result, bail, ensure};
@@ -29,7 +30,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fmt, fs,
-    io::Read,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
         Condvar, Mutex,
@@ -712,6 +713,276 @@ fn errors(mut failures: Vec<anyhow::Error>) -> Result<()> {
         rest: failures,
     }))
 }
+// Stages are private diagnostic facts, never new execution rights or clocks.
+#[derive(Clone, Copy)]
+enum InitialStage {
+    PhaseClock,
+    AllocatorBefore,
+    SamplerSpawn,
+    SamplerMetrics,
+    MeasuredOperation,
+    ControlRuntime,
+    ControlConnect,
+    CatalogCreate,
+    CatalogUse,
+    RegistrationComplete,
+    SamplerJoin,
+    AllocatorAfter,
+    CatalogSnapshot,
+}
+impl InitialStage {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PhaseClock => "phase-clock",
+            Self::AllocatorBefore => "allocator-before",
+            Self::SamplerSpawn => "sampler-spawn",
+            Self::SamplerMetrics => "sampler-metrics",
+            Self::MeasuredOperation => "measured-operation",
+            Self::ControlRuntime => "control-runtime",
+            Self::ControlConnect => "control-connect",
+            Self::CatalogCreate => "catalog-create",
+            Self::CatalogUse => "catalog-use",
+            Self::RegistrationComplete => "registration-complete-clock",
+            Self::SamplerJoin => "sampler-join",
+            Self::AllocatorAfter => "allocator-after",
+            Self::CatalogSnapshot => "catalog-snapshot",
+        }
+    }
+}
+struct StageFailure {
+    stage: InitialStage,
+    cause: anyhow::Error,
+}
+impl fmt::Debug for StageFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HmsStageFailure")
+            .field("stage", &self.stage.label())
+            .field("actual_cause_retained", &true)
+            .finish()
+    }
+}
+impl fmt::Display for StageFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HMS original stage failed: {}", self.stage.label())
+    }
+}
+// Preserve opaque sources without invoking their arbitrary chain formatters.
+impl std::error::Error for StageFailure {}
+fn staged_error(stage: InitialStage, cause: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(StageFailure { stage, cause })
+}
+fn at_stage<T>(stage: InitialStage, operation: impl FnOnce() -> Result<T>) -> Result<T> {
+    operation().map_err(|cause| staged_error(stage, cause))
+}
+
+#[derive(Serialize)]
+struct MysqlErrDiagnostic {
+    sequence: u8,
+    payload_bytes: usize,
+    code: u16,
+    sqlstate: String,
+    message: String,
+    message_sha256: String,
+    raw_payload_hex: String,
+    raw_payload_sha256: String,
+}
+#[derive(Serialize)]
+struct MysqlPartialDiagnostic {
+    header: [u8; 4],
+    header_received: usize,
+    expected_payload_bytes: Option<usize>,
+    payload_prefix_hex: String,
+    payload_prefix_sha256: String,
+    original_deadline_expired: bool,
+}
+#[derive(Serialize)]
+struct HttpFailureDiagnostic {
+    is_timeout: bool,
+    is_connect: bool,
+    status: Option<u16>,
+}
+#[derive(Serialize)]
+struct FailureDiagnostic {
+    schema_version: u8,
+    scope: &'static str,
+    stage: Option<&'static str>,
+    class: &'static str,
+    secondary_sources_retained: usize,
+    mysql_err: Option<MysqlErrDiagnostic>,
+    mysql_partial: Option<MysqlPartialDiagnostic>,
+    http_failure: Option<HttpFailureDiagnostic>,
+}
+fn raw_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(&mut result, "{byte:02x}").expect("write bounded String");
+    }
+    result
+}
+fn failure_diagnostic(error: &anyhow::Error) -> Result<FailureDiagnostic> {
+    let mut current = error;
+    let mut stage = None;
+    let mut secondary = 0;
+    // Only inspect our own finite wrappers; never traverse arbitrary sources.
+    for _ in 0..20 {
+        if let Some(failure) = current.downcast_ref::<Failure>() {
+            ensure!(
+                failure.rest.len() <= 19,
+                "HMS diagnostic source slots differ"
+            );
+            secondary += failure.rest.len();
+            current = &failure.first;
+        } else if let Some(failure) = current.downcast_ref::<StageFailure>() {
+            stage = Some(failure.stage.label());
+            current = &failure.cause;
+        } else {
+            let mut result = FailureDiagnostic {
+                schema_version: 1,
+                scope: "private-original-HMS-failure-not-exit-proof",
+                stage,
+                class: "opaque-original-source-retained",
+                secondary_sources_retained: secondary,
+                mysql_err: None,
+                mysql_partial: None,
+                http_failure: None,
+            };
+            if let Some(reply) = current.downcast_ref::<UnexpectedControlReply>() {
+                let raw = &reply.0.original_payload;
+                let error = &reply.0.error;
+                // Mirror the existing actor's 4096-byte response bound, not a new cap.
+                ensure!(
+                    raw.len() >= 9 && raw.len() <= 4096,
+                    "HMS ERR diagnostic raw bound differs"
+                );
+                ensure!(
+                    error.sequence == 1
+                        && error.payload_bytes == raw.len()
+                        && raw[0] == 0xff
+                        && raw[3] == b'#'
+                        && error.code == u16::from_le_bytes([raw[1], raw[2]])
+                        && error.sqlstate.as_bytes() == &raw[4..9]
+                        && error.message.as_bytes() == &raw[9..]
+                        && error.payload_hex == raw_hex(raw),
+                    "HMS ERR diagnostic facts differ from original bytes"
+                );
+                result.class = "complete-bounded-mysql-ERR";
+                result.mysql_err = Some(MysqlErrDiagnostic {
+                    sequence: error.sequence,
+                    payload_bytes: raw.len(),
+                    code: error.code,
+                    sqlstate: error.sqlstate.clone(),
+                    message: error.message.clone(),
+                    message_sha256: sha(error.message.as_bytes()),
+                    raw_payload_hex: raw_hex(raw),
+                    raw_payload_sha256: sha(raw),
+                });
+            } else if let Some(partial) = current.downcast_ref::<CommandResponseFailure>() {
+                ensure!(
+                    partial.header_received <= 4 && partial.payload_prefix.len() <= 4096,
+                    "HMS partial diagnostic facts exceed original bounds"
+                );
+                result.class = "partial-original-mysql-response";
+                result.mysql_partial = Some(MysqlPartialDiagnostic {
+                    header: partial.header,
+                    header_received: partial.header_received,
+                    expected_payload_bytes: partial.expected_payload_bytes,
+                    payload_prefix_hex: raw_hex(&partial.payload_prefix),
+                    payload_prefix_sha256: sha(&partial.payload_prefix),
+                    original_deadline_expired: partial.original_deadline_expired(),
+                });
+            } else if current.is::<Panic>() {
+                result.class = "original-panic-payload-retained";
+            } else if let Some(http) = current.downcast_ref::<reqwest::Error>() {
+                result.http_failure = Some(HttpFailureDiagnostic {
+                    is_timeout: http.is_timeout(),
+                    is_connect: http.is_connect(),
+                    status: http.status().map(|status| status.as_u16()),
+                });
+                result.class = if http.is_timeout() {
+                    "http-timeout"
+                } else if http.is_connect() {
+                    "http-connect"
+                } else {
+                    "http-original-error-retained"
+                };
+            }
+            return Ok(result);
+        }
+    }
+    bail!("HMS private diagnostic wrapper depth exceeded")
+}
+pub(super) fn save_failure_diagnostic(root: &Path, error: &anyhow::Error) -> Result<Value> {
+    let diagnostic = failure_diagnostic(error)?;
+    let raw = serde_json::to_vec(&diagnostic)?;
+    ensure!(
+        raw.len() <= FILE_CAP,
+        "HMS private diagnostic exceeds existing file bound"
+    );
+    let path = root.join("hms-bulk-original-failure.json");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(&raw)?;
+        file.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    bail!("HMS private failure diagnostic requires Unix file permissions");
+    Ok(
+        json!({"file":"hms-bulk-original-failure.json","bytes":raw.len(),
+        "sha256":sha(&raw),"stage":diagnostic.stage,"class":diagnostic.class,
+        "raw_message_export":"private0600-only"}),
+    )
+}
+pub(super) fn finish_evidence_errors(
+    primary: Option<anyhow::Error>,
+    diagnostic_saved: Option<Result<Value>>,
+    saved: Result<()>,
+) -> Result<()> {
+    let mut failures = Vec::with_capacity(3);
+    if let Some(error) = primary {
+        failures.push(error);
+    }
+    if let Some(Err(error)) = diagnostic_saved {
+        failures.push(error);
+    }
+    if let Err(error) = saved {
+        failures.push(error);
+    }
+    errors(failures)
+}
+fn credential_overlay(purpose: &str) -> Result<String> {
+    ensure!(
+        matches!(purpose, "object-store-metadata" | "object-store-data"),
+        "HMS role credential purpose differs"
+    );
+    Ok(format!(
+        r#"[[connector.credentials]]
+purpose = "{purpose}"
+name = "iceberg-test-data"
+generation = "v1"
+kind = "s3"
+access_key_id = "${{ENV:AWS_S3_ACCESS_KEY_ID}}"
+access_key_secret = "${{ENV:AWS_S3_SECRET_ACCESS_KEY}}"
+"#
+    ))
+}
+pub(super) fn install_credential_overlays(launch: &mut ScenarioLaunchConfig) -> Result<()> {
+    ensure!(
+        launch.config_overlay.fe.is_none()
+            && launch.config_overlay.be.is_none()
+            && launch.config_overlay.be_by_index.is_empty(),
+        "HMS credential overlay already present"
+    );
+    launch.config_overlay.fe = Some(credential_overlay("object-store-metadata")?);
+    launch.config_overlay.be = Some(credential_overlay("object-store-data")?);
+    Ok(())
+}
 fn row_oracle() -> (String, u64) {
     let mut digest = Sha256::new();
     let mut total = 0;
@@ -852,15 +1123,16 @@ fn measure(
 ) -> Result<Value> {
     // Same before/scoped sampler/operation/actual join/after organization as
     // listing::measure, with a bounded body and retained original sources.
-    let before = allocator(port, deadline)?;
+    let before = at_stage(InitialStage::AllocatorBefore, || allocator(port, deadline))?;
     let stopped = AtomicBool::new(false);
     std::thread::scope(|scope| {
-        let sampler =
-            std::thread::Builder::new().spawn_scoped(scope, || -> Result<(Allocator, u64)> {
+        let sampler = std::thread::Builder::new()
+            .spawn_scoped(scope, || -> Result<(Allocator, u64)> {
                 let mut peak = before;
                 let mut samples = 0;
                 while !stopped.load(Ordering::Acquire) {
-                    let reading = allocator(port, deadline)?;
+                    let reading =
+                        at_stage(InitialStage::SamplerMetrics, || allocator(port, deadline))?;
                     peak.allocated = peak.allocated.max(reading.allocated);
                     peak.active = peak.active.max(reading.active);
                     peak.resident = peak.resident.max(reading.resident);
@@ -868,7 +1140,8 @@ fn measure(
                     std::thread::sleep(Duration::from_millis(100).min(remaining(deadline)?));
                 }
                 Ok((peak, samples))
-            })?;
+            })
+            .map_err(|cause| staged_error(InitialStage::SamplerSpawn, cause.into()))?;
         let guard = Stop(&stopped);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
         drop(guard);
@@ -879,14 +1152,20 @@ fn measure(
         match outcome {
             Ok(Ok(value)) => result = Some(value),
             Ok(Err(error)) => failure.push(error),
-            Err(payload) => failure.push(anyhow::Error::new(Panic(std::sync::Mutex::new(payload)))),
+            Err(payload) => failure.push(staged_error(
+                InitialStage::MeasuredOperation,
+                anyhow::Error::new(Panic(std::sync::Mutex::new(payload))),
+            )),
         }
         match observed {
             Ok(Ok(value)) => readings = Some(value),
-            Ok(Err(error)) => failure.push(error),
-            Err(payload) => failure.push(anyhow::Error::new(Panic(std::sync::Mutex::new(payload)))),
+            Ok(Err(error)) => failure.push(staged_error(InitialStage::SamplerJoin, error)),
+            Err(payload) => failure.push(staged_error(
+                InitialStage::SamplerJoin,
+                anyhow::Error::new(Panic(std::sync::Mutex::new(payload))),
+            )),
         }
-        let after = match allocator(port, deadline) {
+        let after = match at_stage(InitialStage::AllocatorAfter, || allocator(port, deadline)) {
             Ok(value) => Some(value),
             Err(error) => {
                 failure.push(error);
@@ -905,12 +1184,30 @@ fn measure(
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
-fn catalog_sql(input: &Binding) -> String {
+/// Borrowed, already validated public owner facts; this creates no provider authority.
+pub(super) struct HmsRegistration<'a> {
+    pub(super) catalog: &'a str,
+    pub(super) namespace: &'a str,
+    pub(super) hms_uri: &'a str,
+    pub(super) warehouse: &'a str,
+    pub(super) object_store_endpoint: &'a str,
+}
+fn bulk_registration(input: &Binding) -> HmsRegistration<'_> {
+    HmsRegistration {
+        catalog: CATALOG,
+        namespace: "cl_ns_0000",
+        hms_uri: &input.fixture.hms_uri,
+        warehouse: &input.fixture.warehouse,
+        object_store_endpoint: &input.object_store_endpoint,
+    }
+}
+fn catalog_sql(input: &HmsRegistration<'_>) -> String {
+    let catalog = input.catalog;
     format!(
-        "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES (\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hive\",\"iceberg.catalog.hive.metastore.uris\"={},\"iceberg.catalog.warehouse\"={},\"aws.s3.endpoint\"={},\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"iceberg-test-data\",\"credential.object-store-metadata.generation\"=\"v1\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"static\",\"credential.object-store-data.name\"=\"iceberg-test-data\",\"credential.object-store-data.generation\"=\"v1\")",
-        quote(&input.fixture.hms_uri),
-        quote(&input.fixture.warehouse),
-        quote(&input.object_store_endpoint)
+        "CREATE EXTERNAL CATALOG {catalog} PROPERTIES (\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hive\",\"iceberg.catalog.hive.metastore.uris\"={},\"iceberg.catalog.warehouse\"={},\"aws.s3.endpoint\"={},\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"iceberg-test-data\",\"credential.object-store-metadata.generation\"=\"v1\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"static\",\"credential.object-store-data.name\"=\"iceberg-test-data\",\"credential.object-store-data.generation\"=\"v1\")",
+        quote(input.hms_uri),
+        quote(input.warehouse),
+        quote(input.object_store_endpoint)
     )
 }
 fn unsupported(error: BoundedMysqlError) -> Result<Value> {
@@ -933,37 +1230,88 @@ async fn connect_control(user: &str, port: u16, deadline: Instant) -> Result<Asy
     .await?
 }
 async fn require_ok(connection: &mut AsyncMysqlStream, sql: &str, deadline: Instant) -> Result<()> {
-    match connection.command_response_until(sql, deadline).await? {
+    require_ok_reply(connection.command_response_until(sql, deadline).await?)
+}
+fn require_ok_reply(reply: BoundedCommandResponse) -> Result<()> {
+    match reply {
         BoundedCommandResponse::Ok(_) => Ok(()),
         BoundedCommandResponse::Error(error) => {
-            Err(anyhow::Error::new(UnexpectedControlReply(error.error)))
+            Err(anyhow::Error::new(UnexpectedControlReply(error)))
         }
     }
 }
-#[derive(Debug)]
-struct UnexpectedControlReply(BoundedMysqlError);
+struct UnexpectedControlReply(BoundedCommandError);
+impl fmt::Debug for UnexpectedControlReply {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("UnexpectedBoundedHmsControlReply")
+    }
+}
 impl fmt::Display for UnexpectedControlReply {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("HMS control returned an unexpected bounded error")
     }
 }
 impl std::error::Error for UnexpectedControlReply {}
-fn register(input: &Binding, user: &str, port: u16, deadline: Instant) -> Result<Value> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+// Keep the original typed ERR object. Successful facts come only from the same
+// command_response_until parser, never from an inferred credential diagnosis.
+async fn registration_ok(
+    connection: &mut AsyncMysqlStream,
+    sql: &str,
+    deadline: Instant,
+) -> Result<Value> {
+    registration_ok_reply(connection.command_response_until(sql, deadline).await?)
+}
+fn registration_ok_reply(reply: BoundedCommandResponse) -> Result<Value> {
+    match reply {
+        BoundedCommandResponse::Ok(ok) => Ok(json!({
+            "verdict":"complete-bounded-mysql-OK","sequence":1,
+            "payload_bytes":ok.original_payload.len(),
+            "payload_sha256":sha(&ok.original_payload),
+            "affected_rows":ok.affected_rows,"last_insert_id":ok.last_insert_id,
+            "status_flags":ok.status_flags,"warnings":ok.warnings,
+            "info_bytes":ok.info.len(),"info_sha256":sha(ok.info.as_bytes())
+        })),
+        BoundedCommandResponse::Error(error) => {
+            Err(anyhow::Error::new(UnexpectedControlReply(error)))
+        }
+    }
+}
+pub(super) fn register(
+    input: &HmsRegistration<'_>,
+    user: &str,
+    port: u16,
+    deadline: Instant,
+) -> Result<Value> {
+    let runtime = at_stage(InitialStage::ControlRuntime, || {
+        Ok(tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?)
+    })?;
     runtime.block_on(async {
-        let mut connection = connect_control(user, port, deadline).await?;
-        require_ok(&mut connection, &catalog_sql(input), deadline).await?;
-        require_ok(
+        let stage = InitialStage::ControlConnect;
+        let mut connection = connect_control(user, port, deadline)
+            .await
+            .map_err(|cause| staged_error(stage, cause))?;
+        let stage = InitialStage::CatalogCreate;
+        let created = registration_ok(&mut connection, &catalog_sql(input), deadline)
+            .await
+            .map_err(|cause| staged_error(stage, cause))?;
+        let stage = InitialStage::CatalogUse;
+        let selected = registration_ok(
             &mut connection,
-            &format!("USE {CATALOG}.cl_ns_0000"),
+            &format!("USE {}.{}", input.catalog, input.namespace),
             deadline,
         )
-        .await?;
+        .await
+        .map_err(|cause| staged_error(stage, cause))?;
         drop(connection);
-        remaining(deadline)?;
-        Ok(json!({"catalog":CATALOG,"external_mutation":false}))
+        at_stage(InitialStage::RegistrationComplete, || remaining(deadline))?;
+        Ok(json!({"schema_version":1,"catalog":input.catalog,
+            "namespace":input.namespace,"external_mutation":false,
+            "scope":"same-bounded-register-not-provider-or-role-exit-proof",
+            "control_connect":"actual-handshake-completed",
+            "catalog_create":created,"catalog_use":selected,
+            "registration_complete_clock":"original-deadline-on-time"}))
     })
 }
 fn views(user: &str, port: u16, deadline: Instant) -> Result<Vec<Value>> {
@@ -1029,6 +1377,7 @@ impl Scenario for HmsBulkReadonlyNative {
     fn launch_config(&self, _root: &Path) -> Result<ScenarioLaunchConfig> {
         remaining(self.deadline)?;
         let mut launch = ScenarioLaunchConfig::default();
+        install_credential_overlays(&mut launch)?;
         launch
             .child_environment
             .fe
@@ -1077,13 +1426,13 @@ impl Scenario for HmsBulkReadonlyNative {
         let mut receipts = Vec::with_capacity(6);
         let mut primary = None;
         let execution = (|| -> Result<()> {
-            let phase = self.phase()?;
+            let phase = at_stage(InitialStage::PhaseClock, || self.phase())?;
             // Catalog registration is FE runtime only. It creates no HMS object.
             let registration = measure(port, phase, || {
-                register(&self.input, &user, mysql_port, phase)
+                register(&bulk_registration(&self.input), &user, mysql_port, phase)
             })?;
             receipts.push(json!({"phase":"catalog-admission","allocator":registration}));
-            let mut journal = snapshot(port, phase)?;
+            let mut journal = at_stage(InitialStage::CatalogSnapshot, || snapshot(port, phase))?;
             journal_idle(&journal, frontend)?;
             ensure!(
                 journal.used == 0,
@@ -1222,11 +1571,19 @@ impl Scenario for HmsBulkReadonlyNative {
         if let Err(error) = execution {
             primary = Some(error);
         }
+        // The original primary remains owned until run_one performs role cleanup.
+        // A diagnostic save failure is secondary, never a replacement verdict.
+        let diagnostic_saved = primary
+            .as_ref()
+            .map(|error| save_failure_diagnostic(context.scenario_root(), error));
+        let diagnostic_receipt = diagnostic_saved
+            .as_ref()
+            .and_then(|result| result.as_ref().ok());
         let evidence = json!({"schema_version":1,"scope":"stock-hms-readonly-bulk-native-assertions-only",
             "normal":self.input.normal,"input_ready_sha256":self.input.input_ready_sha256,
             "before_oracle_manifest_sha256":self.input.before_oracle_manifest_sha256,
             "original_process_launch_identities":roles,"actual_frontend_pid":frontend,
-            "phases":receipts,"assertions_passed":primary.is_none(),"role_shutdown":"owned-by-original-runner; not-proven-by-this-receipt",
+            "phases":receipts,"failure_diagnostic":diagnostic_receipt,"assertions_passed":primary.is_none(),"role_shutdown":"owned-by-original-runner; not-proven-by-this-receipt",
             "native_mutations_excluded":true,"physical_last_alias_proven":false,"source_binary_admission":"actual-clean-source-binaries-config-feature-before-original-roles"});
         let saved = serde_json::to_vec_pretty(&evidence)
             .map_err(anyhow::Error::from)
@@ -1239,14 +1596,7 @@ impl Scenario for HmsBulkReadonlyNative {
                 )
                 .map_err(Into::into)
             });
-        let mut failures = Vec::with_capacity(2);
-        if let Some(error) = primary {
-            failures.push(error);
-        }
-        if let Err(error) = saved {
-            failures.push(error);
-        }
-        errors(failures)
+        finish_evidence_errors(primary, diagnostic_saved, saved)
     }
 }
 
@@ -1523,3 +1873,7 @@ mod tests {
         assert!(view_coverage(&value).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "hms_bulk_readonly_native_diagnostic_tests.rs"]
+mod diagnostic_tests;
