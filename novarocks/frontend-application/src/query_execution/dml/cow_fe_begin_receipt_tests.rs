@@ -132,3 +132,204 @@ fn original_control_failure_precedes_missing_source_receipts_at_request_boundary
     assert_eq!(context.deadline(), deadline);
     assert_eq!(exited, [0; 4]);
 }
+
+struct ContextCloneReceiptSink;
+impl spi::ConnectorVendedCredentialLeaseSink for ContextCloneReceiptSink {
+    fn offer_vended_s3_credential_lease(
+        &self,
+        _: &spi::CatalogProperties,
+        _: spi::VendedS3CredentialLeaseContribution,
+    ) -> Result<(), spi::ConnectorError> {
+        panic!("component context clone must not offer a credential contribution")
+    }
+}
+fn nonempty_context_for_clone_receipt(
+    original: spi::ConnectorRequestContext,
+) -> spi::ConnectorRequestContext {
+    let properties = spi::CatalogProperties::new(
+        spi::CatalogHandle::new(
+            spi::ConnectorInstanceId::parse("cow-context-component").unwrap(),
+            spi::CatalogVersion::from_bytes([22; 32]),
+        ),
+        spi::ConnectorProviderId::parse("iceberg").unwrap(),
+        1,
+        vec![
+            spi::CatalogProperty::new("warehouse", "component-warehouse").unwrap(),
+            spi::CatalogProperty::new("format", "component-format").unwrap(),
+        ],
+        vec![
+            spi::CatalogCredentialBinding::try_new(
+                spi::CatalogCredentialPurpose::ObjectStoreMetadata,
+                spi::CredentialConsumerRole::Frontend,
+                spi::CatalogCredentialMode::Static(
+                    spi::StaticCredentialReference::try_new("metadata-principal", "generation-1")
+                        .unwrap(),
+                ),
+            )
+            .unwrap(),
+            spi::CatalogCredentialBinding::try_new(
+                spi::CatalogCredentialPurpose::ObjectStoreData,
+                spi::CredentialConsumerRole::Backend,
+                spi::CatalogCredentialMode::Vended,
+            )
+            .unwrap(),
+        ],
+    )
+    .unwrap();
+    original
+        .with_vended_credential_lease_sink(Arc::new(ContextCloneReceiptSink))
+        .with_vended_credential_lease_collection(properties)
+        .unwrap()
+}
+
+#[test]
+fn real_context_clone_two_vectors_are_counted_before_request_and_strings_shared() {
+    let fixture = cow_rewrite_query_fixture(
+        vec![7],
+        vec![2],
+        Arc::new(arrow::array::StringArray::from(vec!["value"])) as ArrayRef,
+        DataType::Utf8,
+    );
+    let (control, root, binding, capacity) =
+        crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+    let original = connector_context_for_test();
+    let deadline = original.deadline();
+    let selection = collect_admitted_cow_selection(&fixture, &binding, original.clone());
+    let base = cow_fe_begin_receipt::borrowed_fe_begin_receipt(
+        &fixture.preparation,
+        &selection,
+        "db1",
+        "t",
+        &original,
+    )
+    .unwrap()
+    .unwrap();
+    let context = nonempty_context_for_clone_receipt(original);
+    let props = context
+        .vended_credential_lease_collection()
+        .unwrap()
+        .catalog_properties();
+    // Derive the expected new clone layout BEFORE the request Context clone.
+    let expected = props.execution_properties().len() * std::mem::size_of::<spi::CatalogProperty>()
+        + props.credential_bindings().len() * std::mem::size_of::<spi::CatalogCredentialBinding>();
+    let held = capacity.snapshot().held_positions;
+    let receipt = cow_fe_begin_receipt::before_request(
+        &fixture.preparation,
+        &selection,
+        "db1",
+        "t",
+        &binding,
+        &context,
+    )
+    .unwrap();
+    let delta = receipt.fresh_request_peak_upper - base.fresh_request_peak_upper;
+    let total = receipt.through_request_peak_upper().unwrap();
+    let window_check = binding.window_alias().check_backing_total(total).is_ok();
+    // This is the actual production type's Clone, after actual before_request.
+    let copied = context.clone();
+    let copied_props = copied
+        .vended_credential_lease_collection()
+        .unwrap()
+        .catalog_properties();
+    let separate_properties =
+        props.execution_properties().as_ptr() != copied_props.execution_properties().as_ptr();
+    let separate_bindings =
+        props.credential_bindings().as_ptr() != copied_props.credential_bindings().as_ptr();
+    let same_lengths = props.execution_properties().len()
+        == copied_props.execution_properties().len()
+        && props.credential_bindings().len() == copied_props.credential_bindings().len();
+    let shared_properties = props
+        .execution_properties()
+        .iter()
+        .zip(copied_props.execution_properties())
+        .all(|(a, b)| {
+            a.key().as_ptr() == b.key().as_ptr() && a.value().as_ptr() == b.value().as_ptr()
+        });
+    let shared_static = props
+        .credential_bindings()
+        .iter()
+        .zip(copied_props.credential_bindings())
+        .all(
+            |(a, b)| match (a.static_reference(), b.static_reference()) {
+                (Some(a), Some(b)) => {
+                    a.name().as_ptr() == b.name().as_ptr()
+                        && a.generation().as_ptr() == b.generation().as_ptr()
+                }
+                (None, None) => true,
+                _ => false,
+            },
+        );
+    let same_deadline = copied.deadline() == deadline && context.deadline() == deadline;
+    let positions_unchanged = capacity.snapshot().held_positions == held;
+    drop(copied);
+    drop(context);
+    drop(selection);
+    drop(fixture);
+    drop(binding);
+    root.owner.complete();
+    root.business.release();
+    let exited = capacity.snapshot().held_positions;
+    drop(control);
+    assert!(expected > 0);
+    assert_eq!(delta, expected as u64);
+    assert_eq!(receipt.existing_upper, base.existing_upper);
+    assert!(window_check && positions_unchanged && same_deadline);
+    assert!(
+        separate_properties
+            && separate_bindings
+            && same_lengths
+            && shared_properties
+            && shared_static
+    );
+    assert_eq!(exited, [0; 4]);
+}
+
+#[test]
+fn original_stop_refuses_nonempty_context_before_the_request_clone() {
+    let fixture = cow_rewrite_query_fixture(
+        vec![7],
+        vec![2],
+        Arc::new(arrow::array::StringArray::from(vec!["value"])) as ArrayRef,
+        DataType::Utf8,
+    );
+    let (control, root, binding, capacity) =
+        crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+    let selection =
+        collect_admitted_cow_selection(&fixture, &binding, connector_context_for_test());
+    let stop = spi::ConnectorStopOwner::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let context = nonempty_context_for_clone_receipt(
+        spi::ConnectorRequestContext::try_new(deadline, stop.view(), 64 * 1024, 1024 * 1024)
+            .unwrap(),
+    );
+    stop.request_stop();
+    let entered = std::cell::Cell::new(false);
+    let held = capacity.snapshot().held_positions;
+    let result = cow_fe_begin_receipt::before_request(
+        &fixture.preparation,
+        &selection,
+        "db1",
+        "t",
+        &binding,
+        &context,
+    )
+    .map(|_| {
+        entered.set(true);
+        context.clone()
+    });
+    let cancelled = matches!(&result,Err(cow_necessary_before_begin::Error::Control(e)) if e.kind()==spi::ConnectorErrorKind::Cancelled);
+    let same_control = context.is_cancelled() && context.deadline() == deadline;
+    let positions_unchanged = capacity.snapshot().held_positions == held;
+    drop(result);
+    drop(context);
+    drop(selection);
+    drop(fixture);
+    drop(binding);
+    root.owner.complete();
+    root.business.release();
+    let exited = capacity.snapshot().held_positions;
+    drop(control);
+    assert!(cancelled && same_control && positions_unchanged);
+    assert!(!entered.get());
+    assert_eq!(exited, [0; 4]);
+}

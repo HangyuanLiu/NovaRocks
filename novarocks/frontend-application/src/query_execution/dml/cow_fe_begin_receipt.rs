@@ -21,10 +21,10 @@
 
 use novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorMutationMatchContract,
-    ConnectorMutationSourceField, ConnectorMutationTargetField, ConnectorRowConversionFootprint,
-    ConnectorRowMutationPreparation, ConnectorRowMutationSelection, ConnectorWriteFieldRequest,
-    ConnectorWriteFieldToken,
+    CatalogCredentialBinding, CatalogProperty, ConnectorError, ConnectorErrorKind,
+    ConnectorMutationMatchContract, ConnectorMutationSourceField, ConnectorMutationTargetField,
+    ConnectorRowConversionFootprint, ConnectorRowMutationPreparation,
+    ConnectorRowMutationSelection, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
 };
 use std::mem::{align_of, size_of};
 
@@ -130,6 +130,7 @@ pub(super) fn borrowed_fe_begin_receipt(
     selection: &ConnectorRowMutationSelection,
     namespace: &str,
     table: &str,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Option<FeCowBeginReceipt>, ConnectorError> {
     let Some(source) = selection.owned_source_backing_upper()? else {
         // Missing safe source provenance is not a zero-byte source.
@@ -145,6 +146,27 @@ pub(super) fn borrowed_fe_begin_receipt(
     let contract = preparation.match_contract();
     let width = contract.after_fields().len();
     let mut fresh = size_of::<ConnectorWriteBeginRequest>();
+    // Context/collection/Vec headers are already inline in BeginRequest.
+    // The actual collection Clone allocates only these two new Vec backings;
+    // property key/value and static name/generation remain shared Arc<str>.
+    // No collection is a known absent clone, not unknown provenance counted 0.
+    if let Some(collection) = context.vended_credential_lease_collection() {
+        let properties = collection.catalog_properties();
+        fresh = add(
+            fresh,
+            mul(
+                properties.execution_properties().len(),
+                size_of::<CatalogProperty>(),
+            )?,
+        )?;
+        fresh = add(
+            fresh,
+            mul(
+                properties.credential_bindings().len(),
+                size_of::<CatalogCredentialBinding>(),
+            )?,
+        )?;
+    }
     fresh = add(fresh, mul(width, size_of::<ConnectorWriteFieldRequest>())?)?;
     fresh = add(
         fresh,
@@ -196,7 +218,7 @@ pub(super) fn before_request(
     use novarocks_spi::connector::ConnectorOperationControl;
     context.check_active().map_err(Error::Control)?;
     binding.scope().check().map_err(Error::Scope)?;
-    let receipt = borrowed_fe_begin_receipt(preparation, selection, namespace, table)
+    let receipt = borrowed_fe_begin_receipt(preparation, selection, namespace, table, context)
         .map_err(Error::Control)?
         .ok_or_else(|| {
             Error::Control(ConnectorError::new(
