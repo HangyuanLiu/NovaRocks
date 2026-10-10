@@ -5577,6 +5577,387 @@ mod tests {
         assert!(sql.contains("(s.id > 0)"), "{sql}");
     }
 
+    // Insert this whole test-only module inside mutation_flow.rs::tests.
+    // This is an uncompiled candidate, not stock Iceberg or Native evidence.
+    mod admitted_cow_consumer_tests {
+        use super::*;
+        use novarocks_spi::connector as spi;
+        use novarocks_spi::connector::write_stack as ws;
+        use std::sync::{Arc, Mutex};
+
+        struct CowLegacyWrite(spi::ConnectorProviderBindingKey);
+        impl spi::ConnectorWriteControl for CowLegacyWrite {
+            fn binding_key(&self) -> &spi::ConnectorProviderBindingKey {
+                &self.0
+            }
+        }
+
+        struct UnusedCowWire;
+        impl spi::ConnectorWriteHandleWireEncoder for UnusedCowWire {
+            fn owner(&self) -> &str {
+                "iceberg"
+            }
+            fn encode_writer_handle_payload(
+                &self,
+                _: &ws::ConnectorWriterHandle,
+            ) -> Result<spi::ConnectorEncodedPayload, spi::ConnectorCodecError> {
+                unreachable!("this COW consumer component dispatches no native writer")
+            }
+        }
+        impl spi::ConnectorWriteFragmentWireDecoder for UnusedCowWire {
+            fn owner(&self) -> &str {
+                "iceberg"
+            }
+            fn decode_commit_fragment_payload(
+                &self,
+                _: &spi::ConnectorEncodedPayload,
+            ) -> Result<ws::ConnectorCommitFragment, spi::ConnectorCodecError> {
+                unreachable!("this COW consumer component receives no commit fragment")
+            }
+        }
+
+        // This public port accepts a signed COW plan. It does not simulate stock
+        // catalog/SDK admission, external writes, or any transport completion.
+        struct CowConsumerPort {
+            key: spi::ConnectorProviderBindingKey,
+            adapter: ws::WriteRuntimeAdapter<FakeRowMutationProvider>,
+            input: spi::ConnectorWriteInputShape,
+            route: ws::ConnectorWriteRouteFacts,
+            source: ws::ConnectorWriteRewriteSource,
+            rows: Vec<spi::ConnectorRowMutationSelectionOrdinal>,
+            capacity: novarocks_workload_control::ResultCapacityHandle,
+            entered: Arc<Mutex<Vec<[usize; 4]>>>,
+        }
+        impl ws::ConnectorWriteControl for CowConsumerPort {
+            fn binding_key(&self) -> &spi::ConnectorProviderBindingKey {
+                &self.key
+            }
+            fn begin_write(
+                &self,
+                request: ws::ConnectorWriteBeginRequest,
+            ) -> Result<ws::ConnectorWriteSessionPlan, spi::ConnectorError> {
+                if request.context.is_cancelled() {
+                    return Err(spi::ConnectorError::new(
+                        spi::ConnectorErrorKind::Cancelled,
+                        "COW component cancelled before begin",
+                    ));
+                }
+                if std::time::Instant::now() >= request.context.deadline() {
+                    return Err(spi::ConnectorError::new(
+                        spi::ConnectorErrorKind::DeadlineExceeded,
+                        "COW component begin deadline elapsed",
+                    ));
+                }
+                self.entered
+                    .lock()
+                    .unwrap()
+                    .push(self.capacity.snapshot().held_positions);
+                let ws::ConnectorWriteSessionFlavor::CopyOnWrite {
+                    selection,
+                    match_contract,
+                } = &request.flavor
+                else {
+                    return Err(spi::ConnectorError::new(
+                        spi::ConnectorErrorKind::InvalidRequest,
+                        "expected signed COW selection",
+                    ));
+                };
+                let proof = ws::ConnectorWriteCohortRoutingProof::try_new(
+                    self.route.route_id(),
+                    selection.digest(),
+                    self.rows.clone(),
+                    ws::ConnectorWriteCohortRoutingBody::Rewrite,
+                )?;
+                let target = ws::ConnectorWriteTargetPlan::new(
+                    ws::WriteTargetOrdinal::try_new(0)?,
+                    self.adapter.wrap_writer_handle(FakeRowMutationWriter(0)),
+                    self.input.clone(),
+                )
+                .with_route(self.route.clone())
+                .with_routing_proof(proof)
+                .with_rewrite_source(self.source.clone());
+                // This is the actual accepted request -> retained result alias cut.
+                // No binding, window alias, or test guard is retained by this port.
+                ws::ConnectorWriteSessionPlan::try_copy_on_write(
+                    self.adapter.wrap_commit_handle(FakeRowMutationCommit),
+                    vec![target],
+                    selection.clone(),
+                    match_contract.clone(),
+                )
+            }
+            fn finish_write(
+                &self,
+                _: ws::ConnectorWriteFinishRequest<'_>,
+            ) -> Result<spi::ExternalMutationOutcome<spi::ConnectorWriteReceipt>, spi::ConnectorError>
+            {
+                unreachable!("the COW consumer component publishes no external effect")
+            }
+            fn abort_write(
+                &self,
+                _: ws::ConnectorWriteSessionAbortRequest<'_>,
+            ) -> Result<spi::ConnectorWriteAbortOutcome, spi::ConnectorError> {
+                unreachable!("the COW consumer component enters no external write lifecycle")
+            }
+            fn reconcile_write(
+                &self,
+                _: ws::ConnectorWriteSessionReconcileRequest<'_>,
+            ) -> Result<spi::ExternalMutationOutcome<spi::ConnectorWriteReceipt>, spi::ConnectorError>
+            {
+                unreachable!("the COW consumer component has no external unknown outcome")
+            }
+        }
+
+        fn cow_consumer_generation(
+            fixture: &CowRewriteQueryFixture,
+            capacity: &novarocks_workload_control::ResultCapacityHandle,
+            entered: Arc<Mutex<Vec<[usize; 4]>>>,
+        ) -> (
+            novarocks_catalog_application::ConnectorControlHost,
+            spi::ConnectorControlPlanningLease,
+            novarocks_catalog_application::ConnectorWriteStackLease,
+            spi::CatalogProperties,
+        ) {
+            let generic_seed =
+                novarocks_catalog_application::test_support::test_control_binding_for(
+                    spi::ConnectorInstanceId::parse("iceberg").unwrap(),
+                    7,
+                );
+            let key = spi::ConnectorProviderBindingKey {
+                instance_id: generic_seed.descriptor().instance_id.clone(),
+                incarnation: generic_seed.incarnation(),
+            };
+            let catalog = spi::CatalogHandle::new(
+                key.instance_id.clone(),
+                spi::CatalogVersion::from_bytes([9; 32]),
+            );
+            let properties = spi::CatalogProperties::new(
+                catalog.clone(),
+                generic_seed.descriptor().provider_id.clone(),
+                1,
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            let adapter = ws::WriteRuntimeAdapter::new(Arc::new(FakeRowMutationProvider {
+                descriptor: generic_seed.descriptor().clone(),
+                catalog_handle: catalog,
+            }));
+            let legacy = Arc::new(CowLegacyWrite(key.clone()));
+            let port = Arc::new(CowConsumerPort {
+                key,
+                adapter,
+                input: fixture.input.clone(),
+                route: fixture.route_facts.clone(),
+                source: fixture.rewrite_source.clone(),
+                rows: fixture.rows.clone(),
+                capacity: capacity.clone(),
+                entered,
+            });
+            // Forward the existing minimal catalog capabilities, with correct write
+            // parity. There is exactly one original binding/runtime/generation.
+            let generic = Arc::new(
+                spi::ConnectorControlBinding::try_new_with_write(
+                    generic_seed.descriptor().clone(),
+                    generic_seed.incarnation(),
+                    generic_seed.metadata().clone(),
+                    generic_seed.planning().clone(),
+                    generic_seed.execution_distribution().clone(),
+                    None,
+                    Some(legacy.clone()),
+                )
+                .unwrap()
+                .with_catalog_properties(properties.clone())
+                .unwrap(),
+            );
+            let host = novarocks_catalog_application::ConnectorControlHost::new();
+            host.register_role_binding(
+                spi::ConnectorControlRoleBinding::try_new(
+                    spi::NormalizedCatalogProperties::try_new(properties.clone()).unwrap(),
+                    generic,
+                    None,
+                    Some(spi::ConnectorControlWriteBinding::new(
+                        legacy,
+                        port,
+                        Arc::new(UnusedCowWire),
+                        Arc::new(UnusedCowWire),
+                    )),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let planning = spi::ConnectorControlResolver::acquire_current(
+                &host,
+                &spi::ConnectorInstanceId::parse("iceberg").unwrap(),
+            )
+            .unwrap();
+            let write = host
+                .acquire_exact_write_stack(planning.control_runtime_id())
+                .unwrap();
+            (host, planning, write, properties)
+        }
+
+        fn collect_admitted_cow_selection(
+            fixture: &CowRewriteQueryFixture,
+            binding: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+            context: spi::ConnectorRequestContext,
+        ) -> spi::ConnectorRowMutationSelection {
+            use novarocks_native_adapter::root_cow_selection_codec::{
+                CowSelectionEncoder, CowSelectionTotals,
+            };
+            use novarocks_result_render::RenderTurnStatus;
+            let mut consumer =
+                crate::query_execution::row_mutation::CowMatchRootConsumer::try_new_with_capacity(
+                    context,
+                    fixture.selection.schema().clone(),
+                    fixture.preparation.match_contract().clone(),
+                    fixture.preparation.intent().clone(),
+                    binding,
+                )
+                .unwrap();
+            // The existing fixture is the finite upstream relay input/expected
+            // business value, not an arbitrarily adopted FE result backing.
+            let mut totals = CowSelectionTotals::default();
+            let mut packet = [0u8; 64];
+            for batch in fixture.selection.batches() {
+                let mut encoder = CowSelectionEncoder::try_new(batch, totals, 64 * 1024).unwrap();
+                loop {
+                    let turn = encoder.step(&mut packet);
+                    consumer.push_body(&packet[..turn.emitted_bytes]).unwrap();
+                    if turn.status == RenderTurnStatus::InputComplete {
+                        break;
+                    }
+                }
+                totals = encoder.totals();
+            }
+            consumer.check_end(fixture.selection.row_count()).unwrap();
+            consumer.finish().unwrap()
+        }
+
+        #[test]
+        fn real_cow_consumer_retains_internal_window_through_session_ast_and_last_buffer() {
+            let fixture = cow_rewrite_query_fixture(
+                vec![7, 9],
+                vec![2, 4],
+                Arc::new(arrow::array::StringArray::from(vec!["bb", "dd"]))
+                    as arrow::array::ArrayRef,
+                arrow::datatypes::DataType::Utf8,
+            );
+            let (control, root, binding, capacity) =
+                crate::query_execution::internal_result_cpu::admitted_internal_fixture();
+            let context = connector_context_for_test();
+            let selection = collect_admitted_cow_selection(&fixture, &binding, context.clone());
+            let domain_digest = selection.digest();
+            let business_digest = fixture.selection.digest();
+            let owned_source = selection.has_owned_sources();
+            let entered = Arc::new(Mutex::new(Vec::new()));
+            let (host, planning, write_lease, properties) =
+                cow_consumer_generation(&fixture, &capacity, entered.clone());
+            let same_runtime = planning.control_runtime_id() == write_lease.control_runtime_id();
+            let request_fields = |fields: &[spi::ConnectorWriteFieldBinding]| {
+                fields
+                    .iter()
+                    .map(|field| spi::ConnectorWriteFieldRequest::new(field.field().clone()))
+                    .collect::<Vec<_>>()
+            };
+            let spi::ConnectorWriteInputShape::RowLineage {
+                data_fields,
+                row_identity_fields,
+            } = &fixture.input
+            else {
+                panic!("fixture must carry signed lineage input");
+            };
+            let session = Arc::new(
+                ConnectorWriteSession::begin(
+                    write_lease,
+                    properties,
+                    ws::ConnectorWriteBeginRequest {
+                        table: Arc::from("db.t"),
+                        target_ref: fixture.preparation.target_ref().clone(),
+                        intent: spi::ConnectorWriteIntent::RowDelta,
+                        purpose: spi::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                        input: spi::ConnectorWriteInputRequest::RowLineage {
+                            data_fields: request_fields(data_fields),
+                            row_identity_fields: request_fields(row_identity_fields),
+                        },
+                        base: Some(fixture.preparation.base_version().clone()),
+                        flavor: ws::ConnectorWriteSessionFlavor::CopyOnWrite {
+                            selection,
+                            match_contract: fixture.preparation.match_contract().clone(),
+                        },
+                        context,
+                    },
+                )
+                .unwrap(),
+            );
+            let write = build_cow_update_distributed_write(
+                &iceberg_target(),
+                planning,
+                &fixture.preparation,
+                session.clone(),
+            )
+            .unwrap();
+            let exact_session = Arc::ptr_eq(&write.write_session, &session);
+            let target_ordinal = write.targets[0].ordinal.get();
+            let actual_sql = novarocks_parser::printer::print_query(&write.targets[0].query);
+            let expected = build_cow_rewrite_query(
+                &fixture.selection,
+                &fixture.rows,
+                &fixture.input,
+                &fixture.route_facts,
+                &fixture.rewrite_source,
+                fixture.preparation.match_contract(),
+                // Use the actual builder's own relation identity, not a second one.
+                &write.targets[0].frozen_read.as_ref().unwrap().identity,
+            )
+            .unwrap();
+            let expected_sql = novarocks_parser::printer::print_query(&expected);
+            drop(expected);
+            drop(fixture);
+            drop(binding);
+            root.owner.complete();
+            root.business.release();
+            let held_by_original_write = capacity.snapshot().held_positions;
+
+            // These are actual clones of the retained consumer graph. No observer
+            // owns a window alias; ResultCapacityHandle only observes the authority.
+            let routing = session.copy_on_write_routing().unwrap().clone();
+            let array = routing.selection().batches()[0].column(3).clone();
+            let data = array.to_data();
+            let final_buffer = data.buffers()[1].slice(1);
+            drop(write);
+            drop(session);
+            host.retire_current(&spi::ConnectorInstanceId::parse("iceberg").unwrap())
+                .unwrap();
+            drop(host);
+            let held_by_routing = capacity.snapshot().held_positions;
+            drop(routing);
+            let held_by_array = capacity.snapshot().held_positions;
+            drop(array);
+            drop(data);
+            let held_by_actual_buffer = capacity.snapshot().held_positions;
+            drop(final_buffer);
+            let physically_released = capacity.snapshot().held_positions;
+            let original_callback_facts = entered.lock().unwrap().clone();
+            drop(entered);
+            drop(control);
+
+            // All original owners/aliases were actually cleaned before assertions.
+            assert!(owned_source);
+            assert_eq!(domain_digest, business_digest);
+            assert!(same_runtime && exact_session);
+            assert_eq!(target_ordinal, 0);
+            assert_eq!(actual_sql, expected_sql);
+            assert!(actual_sql.contains("LEFT JOIN") && actual_sql.contains("VALUES"));
+            assert!(actual_sql.contains("'bb'") && actual_sql.contains("'dd'"));
+            assert_eq!(original_callback_facts, vec![[0, 0, 1, 0]]);
+            assert_eq!(held_by_original_write, [0, 0, 1, 0]);
+            assert_eq!(held_by_routing, [0, 0, 1, 0]);
+            assert_eq!(held_by_array, [0, 0, 1, 0]);
+            assert_eq!(held_by_actual_buffer, [0, 0, 1, 0]);
+            assert_eq!(physically_released, [0; 4]);
+        }
+    }
+
     // ---- the merge-on-read write-session data plane ----------------------
     //
     // The session under test is scripted rather than provider-backed: what these
