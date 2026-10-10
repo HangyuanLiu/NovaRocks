@@ -61,7 +61,8 @@ use novarocks_sql::compiler::{
     StatisticsFact, StatisticsNeed, builtin_sql_function_catalog,
 };
 use novarocks_workload_control::{
-    ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
+    ResourceConfig, ResultCapacityConfig, ResultWindowClass, WorkClass, WorkRequest,
+    WorkloadConfig, WorkloadControl,
 };
 
 use super::author_frozen_reads;
@@ -283,6 +284,7 @@ impl MaterializedViewFactPort for NoMaterializedViews {
 fn query_scope() -> (
     novarocks_workload_control::RootWork,
     novarocks_workload_control::WorkScope,
+    novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) {
     let control = WorkloadControl::try_new(
         WorkloadConfig::default(),
@@ -293,12 +295,22 @@ fn query_scope() -> (
         },
     )
     .expect("workload control");
+    control
+        .configure_result_capacity(ResultCapacityConfig::V1)
+        .expect("query result capacity");
     control.mark_ready().expect("workload control ready");
-    let root = control
-        .try_begin_root(WorkRequest::new(WorkClass::Query))
+    let (root, window) = control
+        .root_admission()
+        .try_begin_root_with_result(WorkRequest::new(WorkClass::Query), ResultWindowClass::Local)
         .expect("query root");
     let scope = root.owner.scope();
-    (root, scope)
+    let capacity =
+        novarocks_query_application::admitted_query_context::QueryResultCapacityBinding::try_new(
+            &scope,
+            window.retain_alias(),
+        )
+        .expect("original query result binding");
+    (root, scope, capacity)
 }
 
 fn request_for(sql: &str) -> SqlFinalPlanCompileRequest {
@@ -344,6 +356,7 @@ impl PaimonFixture {
         .expect("connector request context");
         let bindings = Arc::new(QueryTableBindingStore::try_new().expect("binding store"));
         let blocking = ConnectorBlockingIoSupervisor::new(self.runtime.handle().clone());
+        let (_root, scope, capacity) = query_scope();
         let source = QueryCompletionFactSource::new(
             Arc::new(FixtureCatalogFacts {
                 host: Arc::clone(&self.host),
@@ -365,9 +378,9 @@ impl PaimonFixture {
                     .expect("connector session"),
                 context,
                 blocking,
+                capacity,
             )),
         );
-        let (_root, scope) = query_scope();
         self.runtime
             .block_on(
                 FinalPlanCompletionDriver::new(Arc::new(source)).complete(request_for(sql), &scope),

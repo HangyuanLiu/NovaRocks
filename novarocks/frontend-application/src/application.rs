@@ -2474,6 +2474,7 @@ mod tests {
                 std::sync::Arc::new(
                     novarocks_sql::compiler::build_builtin_engine_function_catalog().unwrap(),
                 ),
+                crate::application::test_constant_policy(),
             ),
             backend,
             Vec::new(),

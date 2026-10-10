@@ -85,6 +85,8 @@ impl ProviderReadRuntime for LateProvider {
     fn transaction(&self) -> Self::Transaction {}
 }
 impl ProviderReadMetadata for LateProvider {
+    type FrozenSource = novarocks_spi::connector::read_stack::adapter::UnsupportedFrozenReadSource;
+
     fn get_table_handle(
         &self,
         _: &ConnectorSession,
