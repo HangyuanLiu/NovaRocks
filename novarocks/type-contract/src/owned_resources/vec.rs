@@ -108,12 +108,23 @@ pub fn original_fresh_push_requests<T, E: From<ControlResourceError>>(
     count: usize,
     observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<usize, E> {
+    original_fresh_push_allocation_requests_observed::<T, E>(count, observe, &mut None)
+}
+
+pub fn original_fresh_push_allocation_requests_observed<T, E: From<ControlResourceError>>(
+    count: usize,
+    observe: &mut impl FnMut() -> Result<(), E>,
+    allocations: &mut Option<super::metadata_materialization::MetadataAllocationLoan<'_, E>>,
+) -> Result<usize, E> {
     let mut len = 0;
     let mut capacity = if size_of::<T>() == 0 { usize::MAX } else { 0 };
     let mut requests = 0_usize;
     while len < count {
         let facts = push_geometry::<T>(len, capacity).map_err(E::from)?;
         if let Some(layout) = facts.requested_backing {
+            if let Some(allocations) = allocations.as_deref_mut() {
+                allocations(layout, 1)?;
+            }
             requests = requests
                 .checked_add(layout.size())
                 .ok_or_else(|| E::from(resource()))?;

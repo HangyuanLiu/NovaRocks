@@ -23,9 +23,11 @@ use novarocks_type_contract::{ControlResourceError, ValueTypeError, ValueTypeVis
 use novarocks_type_contract::owned_resources::{
     hashmap::fresh_table_layout,
     layout::arc_layout,
-    metadata_materialization::{MetadataMaterializationError, MetadataSidecarRequest},
+    metadata_materialization::{
+        MetadataAllocationLoan, MetadataMaterializationError, MetadataSidecarRequest,
+    },
     type_validation::TypeValidationScratch,
-    vec::original_fresh_push_requests,
+    vec::original_fresh_push_allocation_requests_observed,
 };
 use std::alloc::Layout;
 
@@ -48,15 +50,26 @@ fn times<E: From<MetadataMaterializationError>>(a: usize, b: usize) -> Result<us
     a.checked_mul(b)
         .ok_or_else(|| E::from(MetadataMaterializationError::Arithmetic))
 }
-fn array<T, E: From<MetadataMaterializationError>>(count: usize) -> Result<usize, E> {
-    Layout::array::<T>(count)
-        .map(|layout| layout.size())
-        .map_err(|_| E::from(MetadataMaterializationError::Arithmetic))
+fn array_request<T, E: From<MetadataMaterializationError>>(count: usize) -> Result<Layout, E> {
+    Layout::array::<T>(count).map_err(|_| E::from(MetadataMaterializationError::Arithmetic))
+}
+fn arc_request<T, E: From<MetadataMaterializationError>>() -> Result<Layout, E> {
+    arc_layout(Layout::new::<T>()).map_err(|_| E::from(MetadataMaterializationError::Arithmetic))
 }
 fn arc<T, E: From<MetadataMaterializationError>>() -> Result<usize, E> {
-    arc_layout(Layout::new::<T>())
-        .map(|layout| layout.size())
-        .map_err(|_| E::from(MetadataMaterializationError::Arithmetic))
+    arc_request::<T, E>().map(|layout| layout.size())
+}
+fn allocation<E>(
+    loan: &mut Option<MetadataAllocationLoan<'_, E>>,
+    layout: Layout,
+    occurrences: usize,
+) -> Result<(), E> {
+    if layout.size() != 0 && occurrences != 0 {
+        if let Some(loan) = loan.as_deref_mut() {
+            loan(layout, occurrences)?;
+        }
+    }
+    Ok(())
 }
 
 impl ChunkSchema {
@@ -81,17 +94,46 @@ impl ChunkSchema {
         clone_scratch: &mut TypeValidationScratch<'a>,
         observe: &mut impl FnMut() -> Result<(), E>,
     ) -> Result<Option<ChunkMetadataRequest>, E> {
+        self.original_reconcile_metadata_allocation_requests_observed(
+            traversal,
+            clone_scratch,
+            observe,
+            &mut None,
+        )
+    }
+    pub(crate) fn original_reconcile_metadata_allocation_requests_observed<
+        'a,
+        E: From<MetadataMaterializationError> + From<ValueTypeError> + From<ControlResourceError>,
+    >(
+        &'a self,
+        traversal: &mut TypeValidationScratch<'a>,
+        clone_scratch: &mut TypeValidationScratch<'a>,
+        observe: &mut impl FnMut() -> Result<(), E>,
+        allocations: &mut Option<MetadataAllocationLoan<'_, E>>,
+    ) -> Result<Option<ChunkMetadataRequest>, E> {
         let Some(source) = self.metadata_materializations() else {
             return Ok(None);
         };
         let mut result = ChunkMetadataRequest::default();
         for slot in self.slots() {
+            let mut repeated = |layout: Layout, occurrences: usize| -> Result<(), E> {
+                if let Some(allocations) = allocations.as_deref_mut() {
+                    allocations(layout, times::<E>(occurrences, 3)?)?;
+                }
+                Ok(())
+            };
             let root = slot
                 .field
-                .original_field_clone_request(clone_scratch, observe)
+                .original_field_clone_allocation_requests_observed(
+                    clone_scratch,
+                    observe,
+                    &mut Some(&mut repeated),
+                )
                 .ok_or_else(|| {
                     E::from(MetadataMaterializationError::MissingOriginalFieldOrigin)
                 })??;
+            drop(repeated);
+            allocation(allocations, arc_request::<Field, E>()?, 2)?;
             result.field_clone_requests_bytes = add::<E>(
                 result.field_clone_requests_bytes,
                 times::<E>(root.request_bytes, 3)?,
@@ -103,7 +145,7 @@ impl ChunkSchema {
             result.semantic_clone_requests_bytes = add::<E>(
                 result.semantic_clone_requests_bytes,
                 slot.field_schema
-                    .original_clone_request_observed(observe)?
+                    .original_clone_allocation_requests_observed(observe, allocations)?
                     .request_bytes,
             )?;
             novarocks_type_contract::validate_value_type_structure_with_scratch_observed(
@@ -112,17 +154,27 @@ impl ChunkSchema {
                 |visit| {
                     match visit {
                         ValueTypeVisit::Field(field) => {
+                            let mut repeated =
+                                |layout: Layout, occurrences: usize| -> Result<(), E> {
+                                    if let Some(allocations) = allocations.as_deref_mut() {
+                                        allocations(layout, times::<E>(occurrences, 3)?)?;
+                                    }
+                                    Ok(())
+                                };
                             let request = source
-                                .original_borrowed_field_clone_request_observed(
+                                .original_borrowed_field_clone_allocation_requests_observed(
                                     field,
                                     clone_scratch,
                                     observe,
+                                    &mut Some(&mut repeated),
                                 )?
                                 .ok_or_else(|| {
                                     E::from(
                                         MetadataMaterializationError::MissingOriginalFieldOrigin,
                                     )
                                 })?;
+                            drop(repeated);
+                            allocation(allocations, arc_request::<Field, E>()?, 2)?;
                             result.nested_field_occurrences =
                                 add::<E>(result.nested_field_occurrences, 1)?;
                             result.field_clone_requests_bytes = add::<E>(
@@ -138,17 +190,22 @@ impl ChunkSchema {
                             // Result iteration may have lower hint zero. ONE
                             // original fresh Vec growth author covers it and
                             // any Vec->Box trim before the original Arc slice.
-                            let pushed = original_fresh_push_requests::<Arc<Field>, E>(
-                                fields.len(),
-                                observe,
+                            let pushed = original_fresh_push_allocation_requests_observed::<
+                                Arc<Field>,
+                                E,
+                            >(
+                                fields.len(), observe, allocations
                             )?;
-                            let boxed = array::<Arc<Field>, E>(fields.len())?;
-                            let shared =
+                            let boxed_layout = array_request::<Arc<Field>, E>(fields.len())?;
+                            allocation(allocations, boxed_layout, 1)?;
+                            let boxed = boxed_layout.size();
+                            let shared_layout =
                                 arc_layout(Layout::array::<Arc<Field>>(fields.len()).map_err(
                                     |_| E::from(MetadataMaterializationError::Arithmetic),
                                 )?)
-                                .map_err(|_| E::from(MetadataMaterializationError::Arithmetic))?
-                                .size();
+                                .map_err(|_| E::from(MetadataMaterializationError::Arithmetic))?;
+                            allocation(allocations, shared_layout, 1)?;
+                            let shared = shared_layout.size();
                             result.struct_publication_requests_bytes = add::<E>(
                                 result.struct_publication_requests_bytes,
                                 add::<E>(add::<E>(pushed, boxed)?, shared)?,
@@ -165,25 +222,41 @@ impl ChunkSchema {
         // Sources::finish followed by final ChunkSchema publication are two
         // distinct sidecar tables. This full publication bound includes both;
         // it intentionally does not subtract their shared Schema payload.
-        let sidecar =
-            MetadataSidecarRequest::original_publication(inherited, roots).map_err(E::from)?;
+        let mut repeated = |layout: Layout, occurrences: usize| -> Result<(), E> {
+            if let Some(allocations) = allocations.as_deref_mut() {
+                allocations(layout, times::<E>(occurrences, 2)?)?;
+            }
+            Ok(())
+        };
+        let sidecar = MetadataSidecarRequest::original_publication_allocation_requests_observed(
+            inherited,
+            roots,
+            &mut Some(&mut repeated),
+        )?;
+        drop(repeated);
         result.sidecar_requests_bytes = times::<E>(sidecar.coexistence_request_bytes, 2)?;
         result.sidecar_requests_bytes = add::<E>(
             result.sidecar_requests_bytes,
-            original_fresh_push_requests::<MetadataFieldLoan, E>(
+            original_fresh_push_allocation_requests_observed::<MetadataFieldLoan, E>(
                 result.nested_field_occurrences,
                 observe,
+                allocations,
             )?,
         )?;
         let table = fresh_table_layout::<SlotId, usize>(roots)
             .map_err(|cause| E::from(MetadataMaterializationError::Model(cause)))?;
+        if let Some(layout) = table.layout {
+            allocation(allocations, layout, 1)?;
+        }
         result.descriptor_requests_bytes = table.request_bytes_upper_bound;
-        for bytes in [
-            array::<ChunkSlotSchema, E>(roots)?,
-            array::<SlotId, E>(roots)?,
-            array::<Arc<Field>, E>(roots)?,
-            arc::<ChunkSchema, E>()?,
+        for layout in [
+            array_request::<ChunkSlotSchema, E>(roots)?,
+            array_request::<SlotId, E>(roots)?,
+            array_request::<Arc<Field>, E>(roots)?,
+            arc_request::<ChunkSchema, E>()?,
         ] {
+            allocation(allocations, layout, 1)?;
+            let bytes = layout.size();
             result.descriptor_requests_bytes = add::<E>(result.descriptor_requests_bytes, bytes)?;
         }
         result.cumulative_requests_bytes = result.field_clone_requests_bytes;

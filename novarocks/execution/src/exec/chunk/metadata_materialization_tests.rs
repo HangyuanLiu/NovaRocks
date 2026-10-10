@@ -650,3 +650,6 @@ fn by_schema_origin_reconcile_invoice_every_callback_preserves_seven_causes() {
         }
     }
 }
+
+#[path = "metadata_allocation_tests.rs"]
+mod metadata_allocation_tests;

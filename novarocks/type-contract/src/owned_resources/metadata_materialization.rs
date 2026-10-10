@@ -40,6 +40,31 @@ impl From<crate::ValueTypeError> for MetadataMaterializationError {
     }
 }
 
+/// Borrow ONE actual original allocation request before any host-specific
+/// attribution band or admission. Repetitions name original clone occurrences;
+/// they do not merge several small requests into one tagged allocation.
+/// This callback neither allocates, grants, nor publishes an allocator fact.
+pub type MetadataAllocationLoan<'a, E> =
+    &'a mut dyn FnMut(std::alloc::Layout, usize) -> Result<(), E>;
+fn allocation<E>(
+    loan: &mut Option<MetadataAllocationLoan<'_, E>>,
+    layout: std::alloc::Layout,
+    occurrences: usize,
+) -> Result<(), E> {
+    if layout.size() != 0 && occurrences != 0 {
+        if let Some(loan) = loan.as_deref_mut() {
+            loan(layout, occurrences)?;
+        }
+    }
+    Ok(())
+}
+fn text_layout<E: From<MetadataMaterializationError>>(
+    bytes: usize,
+) -> Result<std::alloc::Layout, E> {
+    std::alloc::Layout::array::<u8>(bytes)
+        .map_err(|_| E::from(MetadataMaterializationError::Arithmetic))
+}
+
 /// ONE original Field clone's requests. Shared child Field/Fields/UnionFields
 /// and timezone Arc payloads make no new requests. The original Dictionary
 /// boxes recurse through the existing borrowed source grammar. The table is
@@ -61,7 +86,20 @@ fn original_field_clone_request<
     scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
     observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<OriginalFieldCloneRequest, E> {
-    let metadata = original_map_clone_request(origin, field.metadata(), observe)?;
+    original_field_clone_request_core(field, origin, scratch, observe, &mut None)
+}
+
+fn original_field_clone_request_core<
+    'a,
+    E: From<MetadataMaterializationError> + From<crate::ValueTypeError>,
+>(
+    field: &'a Field,
+    origin: MetadataCloneOrigin,
+    scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
+    observe: &mut impl FnMut() -> Result<(), E>,
+    loan: &mut Option<MetadataAllocationLoan<'_, E>>,
+) -> Result<OriginalFieldCloneRequest, E> {
+    let metadata = original_map_clone_request_core(origin, field.metadata(), observe, loan)?;
     let mut dictionary_box_requests = 0_usize;
     let mut dictionary_box_bytes = 0_usize;
     crate::visit_original_data_type_clone_with_scratch_observed(
@@ -70,6 +108,7 @@ fn original_field_clone_request<
         |visit| {
             if let crate::ValueTypeVisit::TypeNode(arrow_schema::DataType::Dictionary(_, _)) = visit
             {
+                allocation(loan, std::alloc::Layout::new::<arrow_schema::DataType>(), 2)?;
                 dictionary_box_requests = dictionary_box_requests
                     .checked_add(2)
                     .ok_or_else(|| E::from(MetadataMaterializationError::Arithmetic))?;
@@ -80,6 +119,7 @@ fn original_field_clone_request<
             observe()
         },
     )?;
+    allocation(loan, text_layout::<E>(field.name().len())?, 1)?;
     let request_bytes = field
         .name()
         .len()
@@ -120,7 +160,19 @@ fn original_map_clone_request<E: From<MetadataMaterializationError>>(
     values: &HashMap<String, String>,
     observe: &mut impl FnMut() -> Result<(), E>,
 ) -> Result<MetadataTableCloneRequest, E> {
+    original_map_clone_request_core(metadata, values, observe, &mut None)
+}
+
+fn original_map_clone_request_core<E: From<MetadataMaterializationError>>(
+    metadata: MetadataCloneOrigin,
+    values: &HashMap<String, String>,
+    observe: &mut impl FnMut() -> Result<(), E>,
+    loan: &mut Option<MetadataAllocationLoan<'_, E>>,
+) -> Result<MetadataTableCloneRequest, E> {
     let table_backing = metadata.table_request().map_err(E::from)?.layout;
+    if let Some(layout) = table_backing {
+        allocation(loan, layout, 1)?;
+    }
     let mut text_requests = 0_usize;
     let mut text_bytes = 0_usize;
     for (key, value) in values {
@@ -128,6 +180,7 @@ fn original_map_clone_request<E: From<MetadataMaterializationError>>(
         // strings. An empty string contributes no physical allocation request.
         for text in [key, value] {
             if !text.is_empty() {
+                allocation(loan, text_layout::<E>(text.len())?, 1)?;
                 text_requests = text_requests
                     .checked_add(1)
                     .ok_or_else(|| E::from(MetadataMaterializationError::Arithmetic))?;
@@ -270,6 +323,17 @@ impl MaterializedField {
         observe: &mut impl FnMut() -> Result<(), E>,
     ) -> Result<OriginalFieldCloneRequest, E> {
         original_field_clone_request(&self.field, self.metadata, scratch, observe)
+    }
+    pub fn original_field_clone_allocation_requests_observed<
+        'a,
+        E: From<MetadataMaterializationError> + From<crate::ValueTypeError>,
+    >(
+        &'a self,
+        scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
+        observe: &mut impl FnMut() -> Result<(), E>,
+        loan: &mut Option<MetadataAllocationLoan<'_, E>>,
+    ) -> Result<OriginalFieldCloneRequest, E> {
+        original_field_clone_request_core(&self.field, self.metadata, scratch, observe, loan)
     }
     pub fn clone_original(&self) -> Self {
         Self {
@@ -496,12 +560,31 @@ impl SchemaMetadataMaterializations {
         scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
         observe: &mut impl FnMut() -> Result<(), E>,
     ) -> Result<Option<OriginalFieldCloneRequest>, E> {
+        self.original_borrowed_field_clone_allocation_requests_observed(
+            actual, scratch, observe, &mut None,
+        )
+    }
+    pub fn original_borrowed_field_clone_allocation_requests_observed<
+        'a,
+        E: From<MetadataMaterializationError> + From<crate::ValueTypeError>,
+    >(
+        &self,
+        actual: &'a Field,
+        scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
+        observe: &mut impl FnMut() -> Result<(), E>,
+        allocations: &mut Option<MetadataAllocationLoan<'_, E>>,
+    ) -> Result<Option<OriginalFieldCloneRequest>, E> {
         for loan in self.fields.iter() {
             let same = loan.lends_borrowed_field(actual);
             observe()?;
             if same {
                 return loan
-                    .original_borrowed_field_clone_request(actual, scratch, observe)
+                    .original_borrowed_field_clone_allocation_requests_observed(
+                        actual,
+                        scratch,
+                        observe,
+                        allocations,
+                    )
                     .expect("exact borrowed original Field loan")
                     .map(Some);
             }
@@ -539,6 +622,20 @@ impl MetadataFieldLoan {
     ) -> Option<Result<OriginalFieldCloneRequest, E>> {
         self.lends_borrowed_field(actual)
             .then(|| original_field_clone_request(actual, self.metadata, scratch, observe))
+    }
+    pub fn original_borrowed_field_clone_allocation_requests_observed<
+        'a,
+        E: From<MetadataMaterializationError> + From<crate::ValueTypeError>,
+    >(
+        &self,
+        actual: &'a Field,
+        scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
+        observe: &mut impl FnMut() -> Result<(), E>,
+        loan: &mut Option<MetadataAllocationLoan<'_, E>>,
+    ) -> Option<Result<OriginalFieldCloneRequest, E>> {
+        self.lends_borrowed_field(actual).then(|| {
+            original_field_clone_request_core(actual, self.metadata, scratch, observe, loan)
+        })
     }
     pub fn lends(&self, actual: &FieldRef) -> bool {
         // The retained Weak pins this exact allocation header against reuse.
@@ -719,6 +816,22 @@ impl OriginalFieldMaterialization {
             Self::Materialized(field) => Some(field.original_field_clone_request(scratch, observe)),
         }
     }
+    pub fn original_field_clone_allocation_requests_observed<
+        'a,
+        E: From<MetadataMaterializationError> + From<crate::ValueTypeError>,
+    >(
+        &'a self,
+        scratch: &mut crate::owned_resources::type_validation::TypeValidationScratch<'a>,
+        observe: &mut impl FnMut() -> Result<(), E>,
+        loan: &mut Option<MetadataAllocationLoan<'_, E>>,
+    ) -> Option<Result<OriginalFieldCloneRequest, E>> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Materialized(field) => Some(
+                field.original_field_clone_allocation_requests_observed(scratch, observe, loan),
+            ),
+        }
+    }
     pub fn with_nullable_original(&self, nullable: bool) -> Self {
         match self {
             Self::Plain(field) => Self::Plain(field.clone().with_nullable(nullable)),
@@ -829,6 +942,21 @@ impl MetadataSidecarRequest {
         inherited_loans: usize,
         original_roots: usize,
     ) -> Result<Self, MetadataMaterializationError> {
+        Self::original_publication_allocation_requests_observed(
+            inherited_loans,
+            original_roots,
+            &mut None,
+        )
+    }
+
+    pub fn original_publication_allocation_requests_observed<
+        E: From<MetadataMaterializationError>,
+    >(
+        inherited_loans: usize,
+        original_roots: usize,
+        loan: &mut Option<MetadataAllocationLoan<'_, E>>,
+    ) -> Result<Self, E> {
+        let result = (|| -> Result<(Self, [(std::alloc::Layout, usize); 8]), MetadataMaterializationError> {
         let loans_upper_bound = inherited_loans
             .checked_add(original_roots)
             .ok_or(MetadataMaterializationError::Arithmetic)?;
@@ -875,14 +1003,24 @@ impl MetadataSidecarRequest {
         let coexistence_request_bytes = temporary_requests_bytes
             .checked_add(result_request_bytes)
             .ok_or(MetadataMaterializationError::Arithmetic)?;
-        Ok(Self {
+        Ok((Self {
             inherited_loans,
             original_roots,
             loans_upper_bound,
             temporary_requests_bytes,
             result_request_bytes,
             coexistence_request_bytes,
-        })
+        }, [
+            (loans, 2), (roots, 1), (input_fields, 1), (origins, 1),
+            (sidecar_arc, 1), (fields_arc, 1),
+            (super::layout::arc_layout(std::alloc::Layout::new::<Field>()).map_err(|_| MetadataMaterializationError::Arithmetic)?, original_roots),
+            (super::layout::arc_layout(std::alloc::Layout::new::<Schema>()).map_err(|_| MetadataMaterializationError::Arithmetic)?, 1),
+        ]))
+        })().map_err(E::from)?;
+        for (layout, occurrences) in result.1 {
+            allocation(loan, layout, occurrences)?;
+        }
+        Ok(result.0)
     }
 }
 

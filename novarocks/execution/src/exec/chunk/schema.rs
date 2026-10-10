@@ -80,12 +80,23 @@ impl ChunkFieldSchema {
         &self,
         observe: &mut impl FnMut() -> Result<(), E>,
     ) -> Result<ChunkFieldSchemaCloneRequest, E>{
+        self.original_clone_allocation_requests_observed(observe, &mut None)
+    }
+
+    pub(crate) fn original_clone_allocation_requests_observed<E: From<novarocks_type_contract::owned_resources::metadata_materialization::MetadataMaterializationError>>(
+        &self,
+        observe: &mut impl FnMut() -> Result<(), E>,
+        allocations: &mut Option<novarocks_type_contract::owned_resources::metadata_materialization::MetadataAllocationLoan<'_, E>>,
+    ) -> Result<ChunkFieldSchemaCloneRequest, E>{
         use novarocks_type_contract::owned_resources::metadata_materialization::MetadataMaterializationError;
         let mut request = ChunkFieldSchemaCloneRequest::default();
         self.clone_core(false, &mut |count| {
             let layout = std::alloc::Layout::array::<Self>(count)
                 .map_err(|_| E::from(MetadataMaterializationError::Arithmetic))?;
             if layout.size() != 0 {
+                if let Some(allocations) = allocations.as_deref_mut() {
+                    allocations(layout, 1)?;
+                }
                 request.allocation_requests = request
                     .allocation_requests
                     .checked_add(1)
