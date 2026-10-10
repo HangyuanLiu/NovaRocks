@@ -346,3 +346,6 @@ pub(crate) mod scalar_invocation_data;
 
 // Private original ARRAY diagnostic producer; no owner or ABI is registered.
 mod array_scalar_diagnostic_source;
+
+mod aggregate_top_k;
+mod aggregate_top_k_owner;

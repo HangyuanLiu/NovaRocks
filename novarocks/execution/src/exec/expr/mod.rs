@@ -1668,3 +1668,6 @@ mod legacy_split_part_shared_baseline_tests;
 
 #[cfg(test)]
 mod split_part_actual_sql_source_tests;
+
+#[cfg(test)]
+mod approx_top_k_actual_sql_source_tests;

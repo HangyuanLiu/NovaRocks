@@ -3184,6 +3184,7 @@ pub fn contribute_builtin_functions(
                     "percentile_cont" | "percentile_disc" | "percentile_disc_lc" => {
                         Some(super::aggregate_percentile_owner::effects())
                     }
+                    "approx_top_k" => Some(super::aggregate_top_k_owner::effects()),
                     "max_by" | "min_by" => Some(super::aggregate_by_owner::effects()),
                     "min_n" | "max_n" => Some(super::aggregate_n_owner::effects()),
                     "sum" => Some(super::aggregate_sum_owner::effects()),
@@ -3237,6 +3238,14 @@ pub fn contribute_builtin_functions(
         }
         if matches!(declaration.name, "group_concat" | "string_agg") {
             builder.register(super::aggregate_concat_owner::definition(
+                declaration.name,
+                binding_declaration,
+                resolver,
+            )?)?;
+            continue;
+        }
+        if declaration.name == "approx_top_k" {
+            builder.register(super::aggregate_top_k_owner::definition(
                 declaration.name,
                 binding_declaration,
                 resolver,

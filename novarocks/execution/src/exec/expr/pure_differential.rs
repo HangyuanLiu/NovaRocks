@@ -1970,3 +1970,11 @@ mod left_right_shared_tests;
 #[cfg(test)]
 #[path = "pure_differential_split_part_shared_tests.rs"]
 mod split_part_shared_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_approx_top_k_tests.rs"]
+mod approx_top_k_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_approx_top_k_full_any_error_tests.rs"]
+mod approx_top_k_full_any_error_tests;

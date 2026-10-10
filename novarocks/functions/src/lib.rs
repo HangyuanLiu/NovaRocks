@@ -2749,3 +2749,5 @@ pub use scalar_invocation::*;
 pub mod string_left_right_core;
 
 pub mod string_split_part_core;
+
+pub mod approx_top_k_core;
