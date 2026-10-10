@@ -325,3 +325,11 @@ mod tests {
         let _: &mut dyn RuntimeScalarOperationScope = borrow_scope(&mut scope);
     }
 }
+
+/// Original owner seams for isolated Server GLOBAL integration tests.
+#[cfg(feature = "test-support")]
+pub mod test_support {
+    pub use crate::exec::operators::compiled_expression::runtime_scalar_memory_test_support::{
+        RuntimeScalarFrameForTest, RuntimeScalarWrapperForTest, RuntimeScalarWrapperReceiptForTest,
+    };
+}
