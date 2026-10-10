@@ -171,7 +171,10 @@ pub trait PackageTypeMaterializationScope {
         &mut self,
         facts: &PackageTypeProjectionFacts,
         body: B,
-    ) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, Self::HostError>>
+    ) -> Result<
+        DecodedTypeTable,
+        crate::host_projection_v2::ProjectionFailure<TypeCodecError, Self::HostError>,
+    >
     where
         B: FnOnce() -> Result<DecodedTypeTable, TypeCodecError>;
 }
@@ -186,7 +189,10 @@ impl PackageTypeMaterializationScope for DirectTypeMaterialization {
         &mut self,
         _: &PackageTypeProjectionFacts,
         body: B,
-    ) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, Self::HostError>>
+    ) -> Result<
+        DecodedTypeTable,
+        crate::host_projection_v2::ProjectionFailure<TypeCodecError, Self::HostError>,
+    >
     where
         B: FnOnce() -> Result<DecodedTypeTable, TypeCodecError>,
     {
@@ -204,7 +210,10 @@ pub fn decode_package_type_table_with_host_observed<H: PackageTypeMaterializatio
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
     host: &mut H,
-) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, H::HostError>> {
+) -> Result<
+    DecodedTypeTable,
+    crate::host_projection_v2::ProjectionFailure<TypeCodecError, H::HostError>,
+> {
     decode::decode_package_with_host(package, source_retained_bytes, limits, admit, work, host)
 }
 

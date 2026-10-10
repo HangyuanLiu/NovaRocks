@@ -26,6 +26,7 @@
 
 use super::nodes::{NodeDecodeContext, NodeDispatchLimits, prepare_node_decode_in};
 use super::{PackageWireError, prepare_package_wire_in};
+use crate::host_projection_v2::ProjectionFailure;
 use crate::{
     physical_aggregate_binding_v2::{
         materialize_aggregate_bindings_in, prepare_aggregate_binding_headers_in,
@@ -76,9 +77,8 @@ use crate::{
         decode_frozen_pruning_observed, prepare_semantic_parameters_decode_observed_in,
     },
     physical_type_v2::{
-        PackageTypeProjectionFacts, PackageTypeProjectionLimits, TypeCodecError,
-        DirectTypeMaterialization, PackageTypeMaterializationScope,
-        decode_package_type_table_with_host_observed,
+        DirectTypeMaterialization, PackageTypeMaterializationScope, PackageTypeProjectionFacts,
+        PackageTypeProjectionLimits, TypeCodecError, decode_package_type_table_with_host_observed,
     },
     physical_value_v2::{ValueCodecError, ValueProjectionLimits, decode_values_observed_in},
     physical_writer_recipe_v2::{
@@ -88,7 +88,6 @@ use crate::{
     physical_writer_schema_v2::WriterSchemaProjectionLimits,
     resource_preflight_v2::{DecodeProjectionLimits, FragmentDecodeResourceModel},
 };
-use crate::host_projection_v2::ProjectionFailure;
 use novarocks_arrow_ipc_frame::VerifierOptions;
 use novarocks_constant_contract::ConstantPolicy;
 use novarocks_physical_plan::{
@@ -363,8 +362,14 @@ pub fn decode_fragment_package(
     limits: &PackageDecodeLimits,
     control: &dyn PureCompileControl,
 ) -> Result<p::FragmentPackage, PackageDecodeError> {
-    decode_fragment_package_with_type_host(raw, model, limits, control, &mut DirectTypeMaterialization)
-        .map_err(ProjectionFailure::without_host)
+    decode_fragment_package_with_type_host(
+        raw,
+        model,
+        limits,
+        control,
+        &mut DirectTypeMaterialization,
+    )
+    .map_err(ProjectionFailure::without_host)
 }
 
 /// The one whole-package receiver with a borrowed Type materialization host.
@@ -379,7 +384,10 @@ pub fn decode_fragment_package_with_type_host<H: PackageTypeMaterializationScope
 ) -> Result<p::FragmentPackage, ProjectionFailure<PackageDecodeError, H::HostError>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Decode)?;
     let result = decode_fragment_package_in(raw, model, limits, &mut work, host);
-    if matches!(&result, Err(ProjectionFailure::Host(_) | ProjectionFailure::Codec(PackageDecodeError::Control(_)))) {
+    if matches!(
+        &result,
+        Err(ProjectionFailure::Host(_) | ProjectionFailure::Codec(PackageDecodeError::Control(_)))
+    ) {
         return result;
     }
     work.finish()?;
@@ -454,8 +462,11 @@ fn decode_fragment_package_in<H: PackageTypeMaterializationScope>(
         },
         work,
         host,
-    ).map_err(|error| match error {
-        ProjectionFailure::Codec(error) => ProjectionFailure::Codec(PackageDecodeError::from(error)),
+    )
+    .map_err(|error| match error {
+        ProjectionFailure::Codec(error) => {
+            ProjectionFailure::Codec(PackageDecodeError::from(error))
+        }
         ProjectionFailure::Host(error) => ProjectionFailure::Host(error),
     })?;
     invoice = add(add(invoice, type_requests)?, size_of_val(&types))?;

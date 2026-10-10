@@ -26,6 +26,7 @@ use super::{
 };
 use arrow::datatypes::{DataType, Field, UnionFields, UnionMode};
 use novarocks_proto_models::{physical_type_v2 as wire, plan};
+use novarocks_type_contract::owned_resources::metadata_materialization::MaterializedMetadataMap;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, FunctionValueType, MAX_ARROW_FIELD_METADATA_BYTES,
     MAX_ARROW_FIELD_METADATA_ENTRIES, MAX_ARROW_FIELD_METADATA_KEY_BYTES,
@@ -35,7 +36,6 @@ use novarocks_type_contract::{
 };
 use std::{collections::BTreeMap, sync::Arc};
 use wire::carrier_type_definition::Kind;
-use novarocks_type_contract::owned_resources::metadata_materialization::{MaterializedMetadataMap};
 
 use super::graph::{Index, Node, add, required};
 
@@ -628,8 +628,14 @@ pub(super) fn decode(
     limits: TypeProjectionLimits,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedTypeTable, E> {
-    decode_body(table, limits, work, None, &mut super::DirectTypeMaterialization)
-        .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+    decode_body(
+        table,
+        limits,
+        work,
+        None,
+        &mut super::DirectTypeMaterialization,
+    )
+    .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
 }
 
 fn decode_body<'source, H: super::PackageTypeMaterializationScope>(
@@ -846,8 +852,15 @@ pub(super) fn decode_package(
     admit: &mut impl FnMut(&PackageTypeProjectionFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<DecodedTypeTable, E> {
-    decode_package_with_host(package, source, limits, admit, work, &mut super::DirectTypeMaterialization)
-        .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+    decode_package_with_host(
+        package,
+        source,
+        limits,
+        admit,
+        work,
+        &mut super::DirectTypeMaterialization,
+    )
+    .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
 }
 
 pub(super) fn decode_package_with_host<H: super::PackageTypeMaterializationScope>(

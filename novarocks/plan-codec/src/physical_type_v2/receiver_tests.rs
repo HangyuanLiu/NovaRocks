@@ -623,34 +623,61 @@ impl PackageTypeMaterializationScope for RecordingScope {
         &mut self,
         facts: &PackageTypeProjectionFacts,
         body: B,
-    ) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, HostRefusal>>
-    where B: FnOnce() -> Result<DecodedTypeTable, TypeCodecError> {
+    ) -> Result<
+        DecodedTypeTable,
+        crate::host_projection_v2::ProjectionFailure<TypeCodecError, HostRefusal>,
+    >
+    where
+        B: FnOnce() -> Result<DecodedTypeTable, TypeCodecError>,
+    {
         self.calls += 1;
         self.facts = Some(*facts);
         if self.refuse {
-            return Err(crate::host_projection_v2::ProjectionFailure::Host(HostRefusal(73)));
+            return Err(crate::host_projection_v2::ProjectionFailure::Host(
+                HostRefusal(73),
+            ));
         }
         self.ran += 1;
         body().map_err(crate::host_projection_v2::ProjectionFailure::Codec)
     }
 }
 fn scope(refuse: bool) -> RecordingScope {
-    RecordingScope { calls: 0, ran: 0, refuse, facts: None, entry_events: 0 }
+    RecordingScope {
+        calls: 0,
+        ran: 0,
+        refuse,
+        facts: None,
+        entry_events: 0,
+    }
 }
 fn run_host(
     package: &raw::FragmentPackage,
     caps: PackageTypeProjectionLimits,
     c: &Control,
     host: &mut RecordingScope,
-) -> Result<DecodedTypeTable, crate::host_projection_v2::ProjectionFailure<TypeCodecError, HostRefusal>> {
+) -> Result<
+    DecodedTypeTable,
+    crate::host_projection_v2::ProjectionFailure<TypeCodecError, HostRefusal>,
+> {
     use crate::host_projection_v2::ProjectionFailure;
     let mut work = CompileCheckpoints::try_new(c, CompilePhase::Decode)?;
     let mut entry_events = 0;
     let result = decode_package_type_table_with_host_observed(
-        package, SOURCE, caps, &mut |_| { entry_events = trace(c).len(); Ok(()) }, &mut work, host,
+        package,
+        SOURCE,
+        caps,
+        &mut |_| {
+            entry_events = trace(c).len();
+            Ok(())
+        },
+        &mut work,
+        host,
     );
     host.entry_events = entry_events;
-    if matches!(&result, Err(ProjectionFailure::Host(_) | ProjectionFailure::Codec(TypeCodecError::Control(_)))) {
+    if matches!(
+        &result,
+        Err(ProjectionFailure::Host(_) | ProjectionFailure::Codec(TypeCodecError::Control(_)))
+    ) {
         return result;
     }
     work.finish()?;
@@ -663,7 +690,10 @@ fn receiver_materialization_host_refusal_keeps_nominal_cause_and_zero_body() {
     let p = wide(64);
     let c = Control::default();
     let mut host = scope(true);
-    assert!(matches!(run_host(&p, limits(), &c, &mut host), Err(ProjectionFailure::Host(HostRefusal(73)))));
+    assert!(matches!(
+        run_host(&p, limits(), &c, &mut host),
+        Err(ProjectionFailure::Host(HostRefusal(73)))
+    ));
     assert_eq!((host.calls, host.ran), (1, 0));
     assert!(host.facts.unwrap().allocation_request_bytes_upper_bound > 0);
     // One flush after the final gate, then no body/checkpoint/footer on refusal.
@@ -694,9 +724,14 @@ fn receiver_materialization_host_preserves_every_actual_control_refusal() {
     run_host(&p, limits(), &complete, &mut scope(false)).unwrap();
     for stop in 0..trace(&complete).len() {
         for cause in CAUSES {
-            let c = Control { stop: Some((stop, cause)), events: Mutex::new(Vec::new()) };
+            let c = Control {
+                stop: Some((stop, cause)),
+                events: Mutex::new(Vec::new()),
+            };
             let mut host = scope(false);
-            assert!(matches!(run_host(&p, limits(), &c, &mut host), Err(ProjectionFailure::Codec(TypeCodecError::Control(actual))) if actual == cause));
+            assert!(
+                matches!(run_host(&p, limits(), &c, &mut host), Err(ProjectionFailure::Codec(TypeCodecError::Control(actual))) if actual == cause)
+            );
             assert_eq!(trace(&c).len(), stop + 1);
             assert!(host.calls <= 1 && host.ran == host.calls);
         }
@@ -709,26 +744,40 @@ fn receiver_materialization_host_never_enters_after_original_shape_or_resource_r
     let mut bad = scalar();
     bad.types.as_mut().unwrap().fields[0].carrier_type_id = Some(99);
     let mut host = scope(false);
-    assert!(matches!(run_host(&bad, limits(), &Control::default(), &mut host), Err(ProjectionFailure::Codec(TypeCodecError::InvalidShape(_)))));
+    assert!(matches!(
+        run_host(&bad, limits(), &Control::default(), &mut host),
+        Err(ProjectionFailure::Codec(TypeCodecError::InvalidShape(_)))
+    ));
     assert_eq!(host.calls, 0);
-    let mut caps = limits(); caps.max_allocation_request_bytes = 0;
-    assert!(matches!(run_host(&scalar(), caps, &Control::default(), &mut host), Err(ProjectionFailure::Codec(TypeCodecError::Control(CompileControlError::ResourceExhausted)))));
+    let mut caps = limits();
+    caps.max_allocation_request_bytes = 0;
+    assert!(matches!(
+        run_host(&scalar(), caps, &Control::default(), &mut host),
+        Err(ProjectionFailure::Codec(TypeCodecError::Control(
+            CompileControlError::ResourceExhausted
+        )))
+    ));
     assert_eq!(host.calls, 0);
 }
 
 #[test]
 fn receiver_materialization_host_keeps_original_writer_error_and_ordinary_trace() {
     let mut p = scalar();
-    p.types.as_mut().unwrap().fields[0].metadata.push(plan::ArrowFieldMetadataEntry {
-        key: NR_LOGICAL_TYPE_KEY.into(), value: "unknown-original-logical-type".into(),
-    });
+    p.types.as_mut().unwrap().fields[0]
+        .metadata
+        .push(plan::ArrowFieldMetadataEntry {
+            key: NR_LOGICAL_TYPE_KEY.into(),
+            value: "unknown-original-logical-type".into(),
+        });
     let direct = Control::default();
     let expected = run(&p, limits(), 0, &direct).err().unwrap();
     let hosted = Control::default();
     let mut host = scope(false);
     let actual = run_host(&p, limits(), &hosted, &mut host).err().unwrap();
     match actual {
-        crate::host_projection_v2::ProjectionFailure::Codec(actual) => assert_eq!(actual.to_string(), expected.to_string()),
+        crate::host_projection_v2::ProjectionFailure::Codec(actual) => {
+            assert_eq!(actual.to_string(), expected.to_string())
+        }
         crate::host_projection_v2::ProjectionFailure::Host(_) => panic!("unexpected host refusal"),
     }
     assert_eq!(trace(&hosted), trace(&direct));

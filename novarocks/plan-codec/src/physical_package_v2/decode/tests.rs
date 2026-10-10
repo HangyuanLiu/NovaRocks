@@ -515,9 +515,13 @@ impl PackageTypeMaterializationScope for TypeScope {
         _: &PackageTypeProjectionFacts,
         body: B,
     ) -> Result<crate::physical_type_v2::DecodedTypeTable, ProjectionFailure<TypeCodecError, u32>>
-    where B: FnOnce() -> Result<crate::physical_type_v2::DecodedTypeTable, TypeCodecError> {
+    where
+        B: FnOnce() -> Result<crate::physical_type_v2::DecodedTypeTable, TypeCodecError>,
+    {
         self.calls += 1;
-        if self.refuse { return Err(ProjectionFailure::Host(79)); }
+        if self.refuse {
+            return Err(ProjectionFailure::Host(79));
+        }
         self.ran += 1;
         body().map_err(ProjectionFailure::Codec)
     }
@@ -530,11 +534,29 @@ fn whole_package_type_host_keeps_original_bytes_and_every_checkpoint() {
         let direct = Control::default();
         let expected = decode_fragment_package(&bytes, &model, &decode_limits(), &direct).unwrap();
         let hosted = Control::default();
-        let mut host = TypeScope { calls: 0, ran: 0, refuse: false };
-        let actual = decode_fragment_package_with_type_host(&bytes, &model, &decode_limits(), &hosted, &mut host)
-            .unwrap_or_else(|error| panic!("{name}: {error:?}"));
-        assert_eq!(encode(&actual).unwrap(), encode(&expected).unwrap(), "{name}");
-        assert_eq!(*hosted.trace.lock().unwrap(), *direct.trace.lock().unwrap(), "{name}");
+        let mut host = TypeScope {
+            calls: 0,
+            ran: 0,
+            refuse: false,
+        };
+        let actual = decode_fragment_package_with_type_host(
+            &bytes,
+            &model,
+            &decode_limits(),
+            &hosted,
+            &mut host,
+        )
+        .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+        assert_eq!(
+            encode(&actual).unwrap(),
+            encode(&expected).unwrap(),
+            "{name}"
+        );
+        assert_eq!(
+            *hosted.trace.lock().unwrap(),
+            *direct.trace.lock().unwrap(),
+            "{name}"
+        );
         assert_eq!((host.calls, host.ran), (1, 1), "{name}");
     }
 }
@@ -542,18 +564,54 @@ fn whole_package_type_host_keeps_original_bytes_and_every_checkpoint() {
 fn whole_package_type_host_refusal_is_nominal_without_completion_callback() {
     let bytes = encode(&rich_package()).unwrap();
     let model = model();
-    let mut host = TypeScope { calls: 0, ran: 0, refuse: true };
+    let mut host = TypeScope {
+        calls: 0,
+        ran: 0,
+        refuse: true,
+    };
     let original = Control::default();
-    assert!(matches!(decode_fragment_package_with_type_host(&bytes, &model, &decode_limits(), &original, &mut host), Err(ProjectionFailure::Host(79))));
+    assert!(matches!(
+        decode_fragment_package_with_type_host(
+            &bytes,
+            &model,
+            &decode_limits(),
+            &original,
+            &mut host
+        ),
+        Err(ProjectionFailure::Host(79))
+    ));
     let length = original.trace.lock().unwrap().len();
     // This callback would refuse the ordinary footer. It must never be called
     // after the same host refusal, or replace that original nominal cause.
-    let stop = Control { stop: Some((length, CompileControlError::Cancelled)), trace: Mutex::new(Vec::new()) };
-    let mut host = TypeScope { calls: 0, ran: 0, refuse: true };
-    assert!(matches!(decode_fragment_package_with_type_host(&bytes, &model, &decode_limits(), &stop, &mut host), Err(ProjectionFailure::Host(79))));
+    let stop = Control {
+        stop: Some((length, CompileControlError::Cancelled)),
+        trace: Mutex::new(Vec::new()),
+    };
+    let mut host = TypeScope {
+        calls: 0,
+        ran: 0,
+        refuse: true,
+    };
+    assert!(matches!(
+        decode_fragment_package_with_type_host(&bytes, &model, &decode_limits(), &stop, &mut host),
+        Err(ProjectionFailure::Host(79))
+    ));
     assert_eq!(stop.trace.lock().unwrap().len(), length);
     assert_eq!((host.calls, host.ran), (1, 0));
-    let mut host = TypeScope { calls: 0, ran: 0, refuse: false };
-    assert!(matches!(decode_fragment_package_with_type_host(&[0x80], &model, &decode_limits(), &Control::default(), &mut host), Err(ProjectionFailure::Codec(_))));
+    let mut host = TypeScope {
+        calls: 0,
+        ran: 0,
+        refuse: false,
+    };
+    assert!(matches!(
+        decode_fragment_package_with_type_host(
+            &[0x80],
+            &model,
+            &decode_limits(),
+            &Control::default(),
+            &mut host
+        ),
+        Err(ProjectionFailure::Codec(_))
+    ));
     assert_eq!((host.calls, host.ran), (0, 0));
 }
