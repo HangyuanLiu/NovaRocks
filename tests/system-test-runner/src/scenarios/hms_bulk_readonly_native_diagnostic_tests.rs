@@ -389,3 +389,194 @@ fn registration_success_receipt_projects_actual_complete_ok() {
     assert_eq!(observation["status_flags"], 2);
     assert!(observation.get("info").is_none());
 }
+
+// An exporter-shaped empty journal, built as the actual typed DTO. Validation
+// always uses the production helper rather than duplicated predicates.
+fn initial_empty_journal() -> Journal {
+    Journal {
+        schema_version: 1,
+        process_id: 123,
+        catalog_name: CATALOG.into(),
+        catalog_version: "a".repeat(64),
+        incarnation: "01890f6e-7a00-7123-8123-456789abcdee".into(),
+        domain: "01890f6e-7a00-7123-8123-456789abcded".into(),
+        phase: 1,
+        sequence: 0,
+        invocations_in_flight: 0,
+        admitted_wrappers_live: 0,
+        peak_admitted_wrappers_live: 0,
+        available_positions_sample: Some(8),
+        sdk_objects_live: 0,
+        peak_sdk_objects_live: 0,
+        used: 0,
+        records: Vec::new(),
+    }
+}
+fn initial_settled_journal() -> Journal {
+    let mut journal = initial_empty_journal();
+    journal.sequence = 9;
+    journal.used = 1;
+    journal.peak_admitted_wrappers_live = 1;
+    journal.peak_sdk_objects_live = 1;
+    journal.records.push(Record {
+        ordinal: 1,
+        operation: Operation::Namespaces,
+        target_sha256: None,
+        original_deadline_remaining_nanos: 1,
+        original_deadline_elapsed: false,
+        started: 1,
+        acquired: 2,
+        sdk_created: 3,
+        sdk_first_poll: 4,
+        sdk_ready: 5,
+        sdk_dropped: 6,
+        wrapper_dropped: 7,
+        permit_returned: 8,
+        settled: 9,
+        selection: Selection::ReadyOk,
+        stop_at_selection: false,
+        deadline_at_selection: false,
+    });
+    journal
+}
+fn deposited_journal(receipts: &[Value]) -> Journal {
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(
+        receipts[0],
+        json!({"phase":"catalog-admission","allocator":"original-sample"})
+    );
+    assert_eq!(receipts[1]["phase"], "catalog-admission");
+    // Roundtrip the same saved failure-evidence shape, not an independently
+    // fabricated expected journal or another exporter call.
+    let raw = serde_json::to_vec(receipts).unwrap();
+    let saved: Vec<Value> = serde_json::from_slice(&raw).unwrap();
+    serde_json::from_value(saved[1]["journal"].clone()).unwrap()
+}
+fn initial_receipts() -> Vec<Value> {
+    vec![json!({"phase":"catalog-admission","allocator":"original-sample"})]
+}
+
+#[test]
+fn original_empty_journal_is_deposited_and_passes_shared_admission_gate() {
+    let journal = initial_empty_journal();
+    let mut receipts = initial_receipts();
+    record_and_validate_catalog_admission(&mut receipts, &journal, 123).unwrap();
+    let captured = deposited_journal(&receipts);
+    assert_eq!(captured.process_id, 123);
+    assert_eq!(
+        (captured.phase, captured.sequence, captured.used),
+        (1, 0, 0)
+    );
+    assert_eq!(captured.available_positions_sample, Some(8));
+    assert!(captured.records.is_empty());
+    assert_eq!(
+        serde_json::to_value(&captured).unwrap(),
+        serde_json::to_value(&journal).unwrap()
+    );
+}
+
+#[test]
+fn rejected_pid_sdk_and_positions_remain_in_original_journal_evidence() {
+    for field in 0..3 {
+        let mut journal = initial_empty_journal();
+        match field {
+            0 => journal.process_id = 124,
+            1 => journal.sdk_objects_live = 1,
+            _ => journal.available_positions_sample = Some(7),
+        }
+        let mut receipts = initial_receipts();
+        let error =
+            record_and_validate_catalog_admission(&mut receipts, &journal, 123).unwrap_err();
+        let diagnostic = failure_diagnostic(&error).unwrap();
+        assert_eq!(diagnostic.stage, Some("catalog-journal-validation"));
+        assert_eq!(diagnostic.class, "opaque-original-source-retained");
+        assert!(diagnostic.mysql_err.is_none());
+        let captured = deposited_journal(&receipts);
+        match field {
+            0 => assert_eq!(captured.process_id, 124),
+            1 => assert_eq!(captured.sdk_objects_live, 1),
+            _ => assert_eq!(captured.available_positions_sample, Some(7)),
+        }
+        assert_eq!(
+            serde_json::to_value(&captured).unwrap(),
+            serde_json::to_value(&journal).unwrap()
+        );
+    }
+}
+
+#[test]
+fn settled_listing_passes_idle_but_fails_no_listing_with_original_record_saved() {
+    let journal = initial_settled_journal();
+    journal_idle(&journal, 123).unwrap();
+    let mut receipts = initial_receipts();
+    let error = record_and_validate_catalog_admission(&mut receipts, &journal, 123).unwrap_err();
+    let diagnostic = failure_diagnostic(&error).unwrap();
+    assert_eq!(diagnostic.stage, Some("catalog-admission-no-listing"));
+    let captured = deposited_journal(&receipts);
+    assert_eq!((captured.used, captured.records.len()), (1, 1));
+    let record = &captured.records[0];
+    assert_eq!(record.operation, Operation::Namespaces);
+    assert_eq!(record.selection, Selection::ReadyOk);
+    assert_eq!(
+        (record.started, record.sdk_dropped, record.settled),
+        (1, 6, 9)
+    );
+    assert_eq!(
+        serde_json::to_value(&captured).unwrap(),
+        serde_json::to_value(&journal).unwrap()
+    );
+}
+
+#[test]
+fn rejected_destructor_order_is_saved_before_shared_gate_returns_error() {
+    let mut journal = initial_settled_journal();
+    journal.records[0].sdk_dropped = journal.records[0].permit_returned;
+    let mut receipts = initial_receipts();
+    let error = record_and_validate_catalog_admission(&mut receipts, &journal, 123).unwrap_err();
+    assert_eq!(
+        failure_diagnostic(&error).unwrap().stage,
+        Some("catalog-journal-validation")
+    );
+    let captured = deposited_journal(&receipts);
+    assert_eq!(captured.records[0].sdk_dropped, 8);
+    assert_eq!(captured.records[0].permit_returned, 8);
+}
+
+#[test]
+fn original_journal_validation_primary_survives_secondary_evidence_failures() {
+    let mut journal = initial_empty_journal();
+    journal.sdk_objects_live = 1;
+    let mut receipts = initial_receipts();
+    let primary = record_and_validate_catalog_admission(&mut receipts, &journal, 123).unwrap_err();
+    let original = primary.downcast_ref::<StageFailure>().unwrap() as *const StageFailure;
+    let diagnostic_marker = Arc::new(());
+    let evidence_marker = Arc::new(());
+    let failure = finish_evidence_errors(
+        Some(primary),
+        Some(Err(anyhow::Error::new(Canary(diagnostic_marker.clone())))),
+        Err(anyhow::Error::new(Canary(evidence_marker.clone()))),
+    )
+    .unwrap_err();
+    let retained = failure.downcast_ref::<Failure>().unwrap();
+    assert!(std::ptr::eq(
+        retained.first.downcast_ref::<StageFailure>().unwrap(),
+        original
+    ));
+    assert_eq!(retained.rest.len(), 2);
+    assert!(Arc::ptr_eq(
+        &retained.rest[0].downcast_ref::<Canary>().unwrap().0,
+        &diagnostic_marker
+    ));
+    assert!(Arc::ptr_eq(
+        &retained.rest[1].downcast_ref::<Canary>().unwrap().0,
+        &evidence_marker
+    ));
+    let diagnostic = failure_diagnostic(&failure).unwrap();
+    assert_eq!(diagnostic.stage, Some("catalog-journal-validation"));
+    assert_eq!(diagnostic.secondary_sources_retained, 2);
+    assert_eq!(deposited_journal(&receipts).sdk_objects_live, 1);
+    // The secondary sources have panic formatters. Neither diagnostic nor
+    // presentation may invoke them or substitute them for the primary.
+    let _ = serde_json::to_vec(&diagnostic).unwrap();
+    let _ = format!("{failure:?} {failure}");
+}
