@@ -29,11 +29,8 @@ use arrow_schema::DataType;
 use novarocks_type_contract::ValueLogicalType;
 use std::{alloc::Layout, sync::Arc};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum StringLeftRightOp {
-    Left,
-    Right,
-}
+pub(super) use crate::string_left_right_core::LeftRightOp as StringLeftRightOp;
+use crate::string_left_right_core::{self, LeftRightProjection};
 
 fn output_capacity(rows: usize, bytes: usize) -> Result<(), KernelFailure> {
     i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
@@ -66,36 +63,60 @@ fn observe_char(
     Ok(())
 }
 
+/// Directional view of the exact reversed characters yielded by the sole core.
+struct ReversedSpan<'a>(&'a str);
+struct SelectedProjection<'work, 'control> {
+    work: &'work mut EvaluationCheckpoints<'control>,
+}
+impl<'a> LeftRightProjection<'a> for SelectedProjection<'_, '_> {
+    type Error = KernelFailure;
+    type Output = &'a str;
+    type Reversed = ReversedSpan<'a>;
+    fn empty(&mut self) -> Result<&'a str, KernelFailure> {
+        Ok("")
+    }
+    fn forward(
+        &mut self,
+        source: &'a str,
+        characters: impl Iterator<Item = char>,
+    ) -> Result<&'a str, KernelFailure> {
+        let mut bytes = 0;
+        for character in characters {
+            observe_char(character, self.work)?;
+            bytes += character.len_utf8();
+        }
+        // Preserve the old selected observer's first unselected left character.
+        // This is observation only; the selection program remains in the core.
+        if let Some(character) = source[bytes..].chars().next() {
+            observe_char(character, self.work)?;
+        }
+        Ok(&source[..bytes])
+    }
+    fn reverse(
+        &mut self,
+        source: &'a str,
+        characters: impl Iterator<Item = char>,
+    ) -> Result<ReversedSpan<'a>, KernelFailure> {
+        let mut bytes = 0;
+        for character in characters {
+            observe_char(character, self.work)?;
+            bytes += character.len_utf8();
+        }
+        Ok(ReversedSpan(&source[source.len() - bytes..]))
+    }
+    fn restore(&mut self, reversed: ReversedSpan<'a>) -> Result<&'a str, KernelFailure> {
+        // Reversing the directional character view yields its original forward
+        // source bytes. No allocation or second character traversal is needed.
+        Ok(reversed.0)
+    }
+}
 fn selected_span<'a>(
     op: StringLeftRightOp,
     text: &'a str,
     count: i64,
     work: &mut EvaluationCheckpoints<'_>,
 ) -> Result<&'a str, KernelFailure> {
-    if count <= 0 {
-        return Ok("");
-    }
-    // Preserve the original native usize conversion; no i32 narrowing or abs.
-    let count = count as usize;
-    match op {
-        StringLeftRightOp::Left => {
-            for (ordinal, (byte, character)) in text.char_indices().enumerate() {
-                observe_char(character, work)?;
-                if ordinal == count {
-                    return Ok(&text[..byte]);
-                }
-            }
-            Ok(text)
-        }
-        StringLeftRightOp::Right => {
-            let mut start = text.len();
-            for (byte, character) in text.char_indices().rev().take(count) {
-                start = byte;
-                observe_char(character, work)?;
-            }
-            Ok(&text[start..])
-        }
-    }
+    string_left_right_core::project(text, count, op, SelectedProjection { work })
 }
 
 pub(super) fn evaluate_string_left_right<'a>(

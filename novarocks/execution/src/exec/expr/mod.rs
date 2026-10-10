@@ -1656,3 +1656,9 @@ mod e08s1_time_static_profile_tests;
 
 #[cfg(test)]
 mod legacy_repeat_pad_shared_baseline_tests;
+
+#[cfg(test)]
+mod legacy_left_right_shared_baseline_tests;
+
+#[cfg(test)]
+mod left_right_actual_sql_source_tests;

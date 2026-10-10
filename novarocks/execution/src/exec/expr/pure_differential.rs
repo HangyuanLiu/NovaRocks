@@ -1962,3 +1962,7 @@ mod array_struct_subfield_tests;
 #[cfg(test)]
 #[path = "pure_differential_percentile_union_tests.rs"]
 mod percentile_union_tests;
+
+#[cfg(test)]
+#[path = "pure_differential_left_right_shared_tests.rs"]
+mod left_right_shared_tests;

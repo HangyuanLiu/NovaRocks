@@ -2745,3 +2745,5 @@ pub mod string_repeat_pad_core;
 
 mod scalar_invocation;
 pub use scalar_invocation::*;
+
+pub mod string_left_right_core;

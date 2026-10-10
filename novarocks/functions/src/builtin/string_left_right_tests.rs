@@ -815,3 +815,53 @@ fn string_left_right_constant_null_is_deferred_and_no_unrelated_string_size_cap_
     assert!(!result.is_null(0));
     assert_eq!(result.value(0).as_bytes(), large.as_bytes());
 }
+
+#[test]
+fn string_left_right_shared_all_seven_causes_keep_prefix_and_failed_reentry() {
+    for name in NAMES {
+        let source = strings(vec![Some(&"é中🙂".repeat(80)), None, Some("")]);
+        let lengths = integers(vec![Some(17), Some(i64::MAX), Some(i64::MIN)]);
+        let arguments = [
+            EvaluatedArgument::Column(&source),
+            EvaluatedArgument::Column(&lengths),
+        ];
+        let good = Control::default();
+        instance(name)
+            .evaluate(Selection::all(3), &arguments, &good)
+            .unwrap();
+        let trace = good.trace.lock().unwrap().clone();
+        let diagnostic = crate::KernelDiagnostic::new("original shared observer refusal");
+        for at in 0..trace.len() {
+            for cause in [
+                KernelFailure::Cancelled,
+                KernelFailure::DeadlineExceeded,
+                KernelFailure::ResourceExhausted,
+                KernelFailure::InvalidProgram(diagnostic.clone()),
+                KernelFailure::Internal(diagnostic.clone()),
+                KernelFailure::Operational(diagnostic.clone()),
+                KernelFailure::InstanceFailed,
+            ] {
+                let refused = Control {
+                    trace: Mutex::new(vec![]),
+                    refusal: Some((at, cause.clone())),
+                };
+                let mut kernel = instance(name);
+                assert_eq!(
+                    kernel
+                        .evaluate(Selection::all(3), &arguments, &refused)
+                        .unwrap_err(),
+                    cause
+                );
+                assert_eq!(*refused.trace.lock().unwrap(), trace[..=at]);
+                let after = Control::default();
+                assert_eq!(
+                    kernel
+                        .evaluate(Selection::all(3), &arguments, &after)
+                        .unwrap_err(),
+                    KernelFailure::InstanceFailed
+                );
+                assert!(after.trace.lock().unwrap().is_empty());
+            }
+        }
+    }
+}
