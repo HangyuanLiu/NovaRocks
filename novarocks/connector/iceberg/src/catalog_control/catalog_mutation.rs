@@ -35,7 +35,7 @@ use novarocks_spi::connector::{
     ConnectorRequestContext, ConnectorSchemaChange, ConnectorTableIdentity, ConnectorTableKey,
     ConnectorTableKeyKind, CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
     ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
-    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES, ProviderBindingEpoch,
+    ProviderBindingEpoch,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -53,7 +53,6 @@ use crate::iceberg::spec::{
     SnapshotRetention, StructType, Summary, Transform, Type, UnboundPartitionField,
     UnboundPartitionSpec, UnboundPartitionSpecBuilder,
 };
-use crate::iceberg::transaction::{ApplyTransactionAction, Transaction};
 use crate::iceberg::{
     NamespaceIdent, TableCommit, TableCreation, TableIdent, TableRequirement, TableUpdate,
 };
@@ -69,7 +68,6 @@ const LOGICAL_TYPE_PROPERTY_PREFIX: &str = "novarocks.logical_type.";
 const TABLE_KEY_KIND_PROPERTY: &str = "novarocks.table.key_kind";
 const TABLE_KEY_COLUMNS_PROPERTY: &str = "novarocks.table.key_columns";
 const COLUMN_AGGREGATION_PROPERTY_PREFIX: &str = "novarocks.column_agg.";
-const BOOTSTRAP_OPERATION_MARKER: &str = "novarocks.bootstrap.empty.operation-id";
 const INITIAL_PARTITION_FIELD_ID: i32 = 1000;
 
 impl ConnectorCatalogMutation for IcebergMetadata {
@@ -123,20 +121,6 @@ impl ConnectorCatalogMutation for IcebergMetadata {
                 partitioning,
                 properties,
                 *policy,
-            );
-        }
-        if let ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot {
-            table,
-            expected_current_snapshot,
-            properties,
-        } = &request.operation
-        {
-            return execute_bootstrap(
-                self,
-                &request,
-                table,
-                *expected_current_snapshot,
-                properties,
             );
         }
         if let ConnectorCatalogMutationOperation::AlterRef {
@@ -254,9 +238,6 @@ fn catalog_admission_request(request: &ConnectorCatalogMutationRequest) -> Catal
             CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
             table_target(table),
         ),
-        Mutation::BootstrapEmptyTableSnapshot { table, .. } => {
-            (CatalogOperation::BootstrapSnapshot, table_target(table))
-        }
         Mutation::UpdateApplicationDocuments { intent } => (
             CatalogOperation::UpdateDocuments,
             table_target(intent.observation().target()),
@@ -569,8 +550,7 @@ fn execute_operation(
                 RefActionOutcome::NoOp => ExternalMutationEffect::NoOp,
             })
         }
-        ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot { .. }
-        | ConnectorCatalogMutationOperation::UpdateApplicationDocuments { .. } => {
+        ConnectorCatalogMutationOperation::UpdateApplicationDocuments { .. } => {
             Err(internal("special mutation bypassed its exact commit path"))
         }
     }
@@ -2142,147 +2122,6 @@ fn update_table(
         .map_err(|error| map_iceberg_message(action, error))
 }
 
-fn execute_bootstrap(
-    provider: &IcebergMetadata,
-    request: &ConnectorCatalogMutationRequest,
-    table: &ConnectorTableIdentity,
-    expected_current_snapshot: Option<i64>,
-    properties: &[(Arc<str>, Arc<str>)],
-) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
-    ensure_owner(provider, &table.instance_id)?;
-    if expected_current_snapshot.is_some() {
-        return Ok(known_uncommitted(invalid(
-            "empty-table bootstrap requires an absent current snapshot",
-        )));
-    }
-    let operation_marker = hex_encode(&request.operation_id.to_bytes());
-    let mut snapshot_properties = BTreeMap::new();
-    for (key, value) in properties {
-        if key.is_empty()
-            || key.len() > 1024
-            || value.len() > 4096
-            || key.as_ref() == BOOTSTRAP_OPERATION_MARKER
-            || snapshot_properties
-                .insert(key.to_string(), value.to_string())
-                .is_some()
-        {
-            return Ok(known_uncommitted(invalid(
-                "invalid or duplicate empty-table bootstrap property",
-            )));
-        }
-    }
-    if snapshot_properties.is_empty()
-        || snapshot_properties
-            .iter()
-            .map(|(key, value)| key.len() + value.len())
-            .sum::<usize>()
-            > MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES
-    {
-        return Ok(known_uncommitted(invalid(
-            "empty-table bootstrap properties are empty or exceed the bounded limit",
-        )));
-    }
-    snapshot_properties.insert(
-        BOOTSTRAP_OPERATION_MARKER.to_string(),
-        operation_marker.clone(),
-    );
-    let loaded = match load_optional_table(provider.runtime(), table, &request.context)? {
-        Some(loaded) => loaded,
-        None => return Ok(known_uncommitted(not_found("Iceberg table does not exist"))),
-    };
-    if let Some(snapshot) = loaded.table.metadata().current_snapshot() {
-        if snapshot
-            .summary()
-            .additional_properties
-            .get(BOOTSTRAP_OPERATION_MARKER)
-            .is_some_and(|marker| marker == &operation_marker)
-        {
-            return Ok(ExternalMutationOutcome::KnownCommitted {
-                effect: ExternalMutationEffect::NoOp,
-                receipt: receipt_with_version(
-                    provider,
-                    request.operation_id,
-                    request.operation.kind(),
-                    loaded.table.metadata_location(),
-                )?,
-                finalization: ExternalMutationFinalization::Complete,
-            });
-        }
-        return Ok(known_uncommitted(invalid(
-            "empty-table bootstrap target already has a snapshot",
-        )));
-    }
-    let evidence = evidence(
-        provider,
-        request.operation_id,
-        request.operation.kind(),
-        IcebergMutationEvidenceTarget::BootstrapEmptyTableSnapshot {
-            namespace: table.namespace.to_string(),
-            table: table.table.to_string(),
-            table_uuid: loaded.table.metadata().uuid().to_string(),
-            operation_marker: operation_marker.clone(),
-        },
-    )?;
-    validate_context(&request.context)?;
-    let current = loaded.table.clone();
-    let catalog = provider.runtime().novarocks_catalog().vendored_client();
-    let committed = provider
-        .runtime()
-        .resources()
-        .catalog_runtime()
-        .block_on(async move {
-            if current.metadata().current_snapshot().is_some() {
-                return Err(crate::iceberg::Error::new(
-                    crate::iceberg::ErrorKind::PreconditionFailed,
-                    "empty-table bootstrap target gained a snapshot",
-                ));
-            }
-            // Eagerly stage through the vendored transaction, but keep the
-            // provider-owned single-dispatch frontier below.
-            let transaction = Transaction::new(&current);
-            let transaction = transaction
-                .fast_append()
-                .set_snapshot_properties(snapshot_properties.into_iter().collect())
-                .set_commit_uuid(uuid::Uuid::new_v4())
-                .apply(transaction)
-                .await?;
-            catalog.update_table(transaction.into_table_commit()).await
-        });
-    let committed = match committed {
-        Ok(Ok(table)) => table,
-        Ok(Err(error)) => {
-            let error = map_iceberg(error);
-            if commit_may_be_unknown(error.kind()) {
-                return Ok(ExternalMutationOutcome::CommitUnknown {
-                    failure: failure(&error),
-                    evidence,
-                });
-            }
-            return Ok(known_uncommitted(error));
-        }
-        Err(error) => {
-            return Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: failure(&unavailable(error)),
-                evidence,
-            });
-        }
-    };
-    provider
-        .runtime()
-        .control_state()
-        .invalidate_table_cache(&table.namespace, &table.table);
-    Ok(ExternalMutationOutcome::KnownCommitted {
-        effect: ExternalMutationEffect::Applied,
-        receipt: receipt_with_version(
-            provider,
-            request.operation_id,
-            request.operation.kind(),
-            committed.metadata_location(),
-        )?,
-        finalization: ExternalMutationFinalization::Complete,
-    })
-}
-
 fn execute_application_document_update(
     provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
@@ -2886,9 +2725,6 @@ fn mutation_evidence(
                 expected_snapshot_id,
             }
         }
-        ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot { .. } => {
-            return Err(internal("bootstrap evidence requires its operation marker"));
-        }
         ConnectorCatalogMutationOperation::UpdateApplicationDocuments { .. } => {
             return Err(internal(
                 "application-document update evidence requires its exact commit path",
@@ -2948,18 +2784,6 @@ fn reconcile_evidence(
     evidence: ExternalMutationEvidence,
     context: &ConnectorRequestContext,
 ) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
-    let committed = |provider_version: Option<&str>| {
-        Ok(ExternalMutationOutcome::KnownCommitted {
-            effect: ExternalMutationEffect::Applied,
-            receipt: receipt_with_version(
-                provider,
-                evidence.operation_id(),
-                evidence.operation_kind(),
-                provider_version,
-            )?,
-            finalization: ExternalMutationFinalization::Complete,
-        })
-    };
     let uncommitted = |message: &str| Ok(known_uncommitted(invalid(message)));
     let ambiguous = |message: &str| {
         Ok(ExternalMutationOutcome::CommitUnknown {
@@ -3173,37 +2997,6 @@ fn reconcile_evidence(
                 ambiguous(
                     "Iceberg document update exact postcondition is not attributable to this operation",
                 )
-            }
-        }
-        IcebergMutationEvidenceTarget::BootstrapEmptyTableSnapshot {
-            namespace,
-            table,
-            table_uuid,
-            operation_marker,
-        } => {
-            let identity = ConnectorTableIdentity {
-                instance_id: provider.descriptor().instance_id.clone(),
-                namespace: namespace.into(),
-                table: table.into(),
-            };
-            let Some(current) = load_optional_table(provider.runtime(), &identity, context)? else {
-                return uncommitted("Iceberg bootstrap table does not exist");
-            };
-            if current.table.metadata().uuid().to_string() != table_uuid {
-                return ambiguous("Iceberg bootstrap table incarnation changed");
-            }
-            match current.table.metadata().current_snapshot() {
-                Some(snapshot)
-                    if snapshot
-                        .summary()
-                        .additional_properties
-                        .get(BOOTSTRAP_OPERATION_MARKER)
-                        == Some(&operation_marker) =>
-                {
-                    committed(current.table.metadata_location())
-                }
-                None => uncommitted("Iceberg bootstrap table still has no snapshot"),
-                Some(_) => ambiguous("Iceberg bootstrap target has a different snapshot marker"),
             }
         }
         IcebergMutationEvidenceTarget::MvMetadataOnlyStage { .. } => Err(unsupported(
@@ -3866,14 +3659,6 @@ mod tests {
                 CatalogOperation::CreateTable(CatalogCreateIntent::EmptyTable),
             ),
             (
-                ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot {
-                    table: table.clone(),
-                    expected_current_snapshot: None,
-                    properties: Vec::new(),
-                },
-                CatalogOperation::BootstrapSnapshot,
-            ),
-            (
                 document_request.operation,
                 CatalogOperation::UpdateDocuments,
             ),
@@ -3999,11 +3784,6 @@ mod tests {
                 drop,
             ));
         }
-        assert_eq!(
-            operations.len(),
-            18,
-            "all variants, view policies and ref actions are exercised"
-        );
         for (operation, expected) in operations {
             for initiation in [
                 ConnectorRequestInitiation::Statement,
@@ -4253,28 +4033,56 @@ mod tests {
             CreatePolicy::FailIfExists,
         )
         .expect("create managed table");
-        let bootstrap = provider
-            .execute(ConnectorCatalogMutationRequest {
-                operation_id: ConnectorMutationOperationId::new(),
-                target: ConnectorProviderBindingKey {
-                    instance_id: provider.descriptor().instance_id.clone(),
-                    incarnation: provider.incarnation(),
-                },
-                operation: ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot {
-                    table: table.clone(),
-                    expected_current_snapshot: None,
-                    properties: vec![(Arc::from("fixture"), Arc::from("managed-document"))],
-                },
-                context: context(),
-            })
-            .expect("bootstrap managed table");
-        assert!(matches!(
-            bootstrap,
-            ExternalMutationOutcome::KnownCommitted {
-                effect: ExternalMutationEffect::Applied,
-                ..
-            }
+        let loaded = provider
+            .runtime()
+            .load_table(&table.namespace, &table.table)
+            .expect("load managed table fixture");
+        let metadata = loaded.table.metadata();
+        let collector = Arc::new(crate::commit::IcebergCommitCollector::new(
+            crate::commit::CommitOpKind::FastAppend,
+            loaded.table.identifier().clone(),
+            None,
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            format!("{}/data/_staging/fixture", metadata.location()),
         ));
+        let fs = provider
+            .runtime()
+            .resources()
+            .planning_binding()
+            .resolve_access(metadata.location())
+            .expect("fixture storage access")
+            .operator();
+        let catalog = provider.runtime().novarocks_catalog().vendored_client();
+        provider
+            .runtime()
+            .resources()
+            .catalog_runtime()
+            .block_on(async move {
+                crate::commit::run_iceberg_commit(crate::commit::RunInput {
+                    collector,
+                    catalog,
+                    file_io: loaded.table.file_io().clone(),
+                    table: loaded.table,
+                    fs,
+                    cleanup_path_mapper: None,
+                    cow_update_rewrite: None,
+                    selected_rewrite: None,
+                    target_ref: "main".to_string(),
+                    snapshot_properties: BTreeMap::from([(
+                        "fixture".to_string(),
+                        "managed-document".to_string(),
+                    )]),
+                })
+                .await
+            })
+            .expect("run managed snapshot fixture")
+            .expect("append managed snapshot fixture");
+        provider
+            .runtime()
+            .control_state()
+            .invalidate_table_cache(&table.namespace, &table.table);
         table
     }
 
@@ -5510,7 +5318,8 @@ mod tests {
             "update-application-documents",
             Some(Bytes::from(vec![
                 0;
-                MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES + 1
+                novarocks_spi::connector::MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES
+                    + 1
             ])),
             Some(committed_version.clone()),
             ExternalMutationFinalization::Complete,

@@ -1278,6 +1278,11 @@ impl IcebergWriteSessionControl {
         document_publication: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        if handle.repartition().is_some() {
+            return Err(invalid(
+                "partition evolution requires the eager publication path",
+            ));
+        }
         let facts = handle.table();
         let physical = self
             .runtime
@@ -1285,6 +1290,18 @@ impl IcebergWriteSessionControl {
             .map_err(|error| unavailable(error.to_string()))?;
         let table = physical.into_table();
         let metadata = table.metadata().clone();
+        if let Some(documents) = document_publication {
+            if crate::document_storage::publication::publication_metadata_properties(
+                documents, &metadata,
+            )?
+            .is_some()
+            {
+                return Err(invalid(
+                    "metadata-attached publication documents require the eager publication path",
+                ));
+            }
+        }
+
         if metadata.uuid().to_string() != facts.table_uuid()
             || metadata.current_schema_id() != facts.schema_id()
             || metadata.default_partition_spec_id() != facts.default_partition_spec_id()
@@ -1298,14 +1315,7 @@ impl IcebergWriteSessionControl {
             ));
         }
 
-        // The staged artifacts were written under the generation the *writers*
-        // were built against. Under an atomic partition replacement that is the
-        // prospective one, whose new spec the loaded table does not have yet, so
-        // interpreting the artifacts against the loaded metadata would fail to
-        // resolve their own partition spec.
-        let commit_metadata = handle
-            .repartition()
-            .map_or(&metadata, |prepared| prepared.prospective_metadata());
+        let commit_metadata = &metadata;
 
         let files = validated
             .iter()
@@ -1379,24 +1389,8 @@ impl IcebergWriteSessionControl {
             cleanup_path_mapper: Some(cleanup_path_mapper),
             cow_update_rewrite,
             selected_rewrite: selected_rewrite_files(handle),
-            // A partition replacement is a change to the table itself, and the
-            // one commit that carries it has to be the one that publishes the
-            // rows written under the new spec. `main` is where a managed
-            // publication's default partitioning lives, so the replacement's
-            // commit targets it exactly.
-            target_ref: match handle.repartition() {
-                Some(_) => "main".to_string(),
-                None => facts.target_ref().to_string(),
-            },
+            target_ref: facts.target_ref().to_string(),
             snapshot_properties,
-            atomic_partition_replacement: publication_metadata_updates(
-                handle.repartition(),
-                document_publication,
-                &metadata,
-            )?
-            .map(crate::commit::run::AtomicPartitionReplacement::try_new)
-            .transpose()
-            .map_err(invalid)?,
         };
         // The runtime bridge wraps the commit, so a bridge failure says nothing
         // about whether the catalog request went out. Calling it uncommitted

@@ -550,9 +550,10 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         table: CatalogTableName,
         _metadata_location: Arc<str>,
     ) -> CatalogOutcome<CatalogTableName> {
-        if let Err(reason) =
-            self.admit_operation(&CatalogOperation::BootstrapSnapshot, &table.clone().into())
-        {
+        if let Err(reason) = self.admit_operation(
+            &CatalogOperation::AnchorWrittenMetadata,
+            &table.clone().into(),
+        ) {
             return CatalogOutcome::Unsupported(reason);
         }
         // This catalog owns its own metadata pointer, so a committed write is

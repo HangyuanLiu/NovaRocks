@@ -1002,11 +1002,9 @@ pub struct DmlChangeStreamStatisticsTarget {
 pub enum DmlChangeStreamKind {
     Update {
         target_columns: Vec<novarocks_types::schema::ColumnDef>,
-        new_sequence_number: i64,
     },
     Merge {
         target_columns: Vec<novarocks_types::schema::ColumnDef>,
-        new_sequence_number: i64,
         matched_update: bool,
         matched_delete: bool,
         not_matched_insert: bool,
@@ -1237,24 +1235,17 @@ pub fn begin_final_dml_change_stream(
         .into_optimized_output()
         .map_err(|_| "change-stream intent did not produce an optimized SQL plan".to_string())?;
     let producer = match request.kind {
-        DmlChangeStreamKind::Update {
-            target_columns,
-            new_sequence_number,
-        } => build_update_change_event_expand(
-            compiled.optimized_tree,
-            &target_columns,
-            new_sequence_number,
-        )?,
+        DmlChangeStreamKind::Update { target_columns } => {
+            build_update_change_event_expand(compiled.optimized_tree, &target_columns)?
+        }
         DmlChangeStreamKind::Merge {
             target_columns,
-            new_sequence_number,
             matched_update,
             matched_delete,
             not_matched_insert,
         } => build_merge_change_event_expand(
             compiled.optimized_tree,
             &target_columns,
-            new_sequence_number,
             matched_update,
             matched_delete,
             not_matched_insert,
@@ -1286,24 +1277,17 @@ pub fn compile_final_dml_change_stream(
         .into_optimized_output()
         .map_err(|_| "change-stream intent did not produce an optimized SQL plan".to_string())?;
     let producer = match request.kind {
-        DmlChangeStreamKind::Update {
-            target_columns,
-            new_sequence_number,
-        } => build_update_change_event_expand(
-            compiled.optimized_tree,
-            &target_columns,
-            new_sequence_number,
-        )?,
+        DmlChangeStreamKind::Update { target_columns } => {
+            build_update_change_event_expand(compiled.optimized_tree, &target_columns)?
+        }
         DmlChangeStreamKind::Merge {
             target_columns,
-            new_sequence_number,
             matched_update,
             matched_delete,
             not_matched_insert,
         } => build_merge_change_event_expand(
             compiled.optimized_tree,
             &target_columns,
-            new_sequence_number,
             matched_update,
             matched_delete,
             not_matched_insert,
@@ -1567,7 +1551,6 @@ fn bind_route_layout(
 fn build_update_change_event_expand(
     optimized_tree: crate::optimizer::OptimizedOperatorNode,
     target_columns: &[novarocks_types::schema::ColumnDef],
-    new_sequence_number: i64,
 ) -> Result<crate::optimizer::OptimizedOperatorNode, String> {
     let mut arena = clone_scalar_arena(&optimized_tree, "MOR UPDATE")?;
     let child_outputs = optimized_tree.output_columns.clone();
@@ -1614,17 +1597,7 @@ fn build_update_change_event_expand(
         "UPDATE old row id",
         row_id.column_id,
     )?);
-    let sequence = arena.intern(
-        crate::optimizer::scalar::ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
-            crate::analysis::LiteralValue::Int(new_sequence_number),
-        )),
-        arrow::datatypes::DataType::Int64,
-        false,
-    );
-    assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
-        output_column_id: last_sequence.column_id,
-        expr: Some(sequence),
-    });
+    // Unassigned sequence outputs are NULL and inherit the actual commit sequence.
     build_change_expand(
         distributed,
         arena,
@@ -1642,7 +1615,6 @@ fn build_update_change_event_expand(
 fn build_merge_change_event_expand(
     optimized_tree: crate::optimizer::OptimizedOperatorNode,
     target_columns: &[novarocks_types::schema::ColumnDef],
-    new_sequence_number: i64,
     matched_update: bool,
     matched_delete: bool,
     not_matched_insert: bool,
@@ -1724,17 +1696,7 @@ fn build_merge_change_event_expand(
         "MERGE old row id",
         row_id.column_id,
     )?);
-    let sequence = arena.intern(
-        crate::optimizer::scalar::ScalarNode::Literal(crate::optimizer::scalar::HashableLiteral(
-            crate::analysis::LiteralValue::Int(new_sequence_number),
-        )),
-        arrow::datatypes::DataType::Int64,
-        false,
-    );
-    reuse_assignments.push(crate::optimizer::operator::ChangeEventOutputExpr {
-        output_column_id: last_sequence.column_id,
-        expr: Some(sequence),
-    });
+    // Replace and Insert leave the sequence unassigned for commit-time inheritance.
     let mut events = Vec::new();
     if matched_update {
         events.push(crate::optimizer::operator::ChangeEventSpec {
@@ -2546,6 +2508,129 @@ mod tests {
         StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue,
         StatisticsNumericNature, StatisticsRowCoverage,
     };
+
+    fn mor_match_producer() -> crate::optimizer::OptimizedOperatorNode {
+        use crate::optimizer::operator::{Operator, ValuesOp};
+        use arrow::datatypes::DataType;
+        let output_columns = [
+            ("__nr_file", DataType::Utf8),
+            ("__nr_pos", DataType::Int64),
+            ("__nr_row_id", DataType::Int64),
+            ("__nr_merge_assert_key", DataType::Int64),
+            ("__nr_merge_action", DataType::Int64),
+            ("id", DataType::Int64),
+            ("__nr_new_id", DataType::Int64),
+            ("__nr_ins_id", DataType::Int64),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (name, data_type))| crate::analysis::OutputColumn {
+            column_id: crate::column_id::ColumnId(index as u32 + 1),
+            name: name.into(),
+            data_type,
+            nullable: true,
+            is_internal: true,
+        })
+        .collect::<Vec<_>>();
+        crate::optimizer::OptimizedOperatorNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: output_columns.clone(),
+            }),
+            children: vec![],
+            stats: Default::default(),
+            explain_stats: Default::default(),
+            output_columns,
+            execution_props: crate::optimizer::optimized_tree::PlanExecutionProps {
+                scalar_arena: Some(std::sync::Arc::new(
+                    crate::optimizer::scalar::ScalarArena::new(),
+                )),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn assert_replace_inherits_sequence_and_preserves_row_id(
+        producer: &crate::optimizer::OptimizedOperatorNode,
+    ) {
+        use crate::optimizer::operator::Operator;
+        use novarocks_spi::connector::ConnectorRowMutationEffect;
+        let Operator::PhysicalChangeEventExpand(expand) = &producer.op else {
+            panic!("expected change-event expand");
+        };
+        let sequence = producer
+            .output_columns
+            .iter()
+            .find(|output| output.name == super::ICEBERG_LAST_UPDATED_SEQUENCE_COLUMN)
+            .expect("sequence output");
+        assert!(sequence.nullable);
+        let row_id = producer
+            .output_columns
+            .iter()
+            .find(|output| output.name == super::ICEBERG_ROW_ID_COLUMN)
+            .expect("row ID output");
+        let replaced = expand
+            .events
+            .iter()
+            .find(|event| event.effect == ConnectorRowMutationEffect::Replace)
+            .expect("Replace event");
+        assert!(
+            !replaced
+                .assignments
+                .iter()
+                .any(|assignment| assignment.output_column_id == sequence.column_id),
+            "Replace must inherit its sequence rather than stamp an admission-time value"
+        );
+        let row_id_expr = replaced
+            .assignments
+            .iter()
+            .find(|assignment| assignment.output_column_id == row_id.column_id)
+            .and_then(|assignment| assignment.expr)
+            .expect("Replace must retain row ID");
+        assert!(
+            matches!(producer.execution_props.scalar_arena.as_ref().unwrap().node(row_id_expr),
+            crate::optimizer::scalar::ScalarNode::ColumnRef(id) if *id == crate::column_id::ColumnId(3))
+        );
+    }
+
+    #[test]
+    fn mor_update_replace_inherits_actual_commit_sequence() {
+        let columns = [novarocks_types::schema::ColumnDef {
+            name: "id".into(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        }];
+        let producer =
+            super::build_update_change_event_expand(mor_match_producer(), &columns).unwrap();
+        assert_replace_inherits_sequence_and_preserves_row_id(&producer);
+    }
+
+    #[test]
+    fn mor_merge_replace_inherits_actual_commit_sequence() {
+        let columns = [novarocks_types::schema::ColumnDef {
+            name: "id".into(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: true,
+            write_default: None,
+            logical_type: None,
+        }];
+        let producer = super::build_merge_change_event_expand(
+            mor_match_producer(),
+            &columns,
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+        assert_replace_inherits_sequence_and_preserves_row_id(&producer);
+        let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
+        else {
+            unreachable!()
+        };
+        assert_eq!(expand.events.len(), 3);
+    }
 
     #[test]
     fn m07_ctas_source_keeps_exact_producer_domains_until_target_admission() {

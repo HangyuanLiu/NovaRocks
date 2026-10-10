@@ -379,9 +379,10 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         table: CatalogTableName,
         metadata_location: Arc<str>,
     ) -> CatalogOutcome<CatalogTableName> {
-        if let Err(reason) =
-            self.admit_operation(&CatalogOperation::BootstrapSnapshot, &table.clone().into())
-        {
+        if let Err(reason) = self.admit_operation(
+            &CatalogOperation::AnchorWrittenMetadata,
+            &table.clone().into(),
+        ) {
             return CatalogOutcome::Unsupported(reason);
         }
         // The namespace has to exist before the table can be anchored under it.

@@ -62,14 +62,6 @@ pub struct FastAppendCommit;
 pub(crate) async fn commit_empty_iceberg_mv_snapshot(
     ctx: CommitCtx<'_>,
 ) -> Result<CommitOutcome, String> {
-    if ctx.snapshot_properties.is_empty() {
-        let id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref).unwrap_or(0);
-        return Ok(CommitOutcome {
-            new_snapshot_id: id,
-            written_manifest_paths: vec![],
-        });
-    }
-
     if matches!(
         crate::commit::classify_iceberg_write_mode(ctx.table),
         IcebergWriteMode::RowLineageV3
@@ -91,8 +83,8 @@ impl IcebergCommitAction for FastAppendCommit {
     async fn commit(&self, ctx: CommitCtx<'_>) -> Result<CommitOutcome, String> {
         let written = ctx.collector.take_written_files()?;
 
-        // Ordinary empty input is a no-op. MV staging carries publication
-        // marker properties and therefore needs a data-free snapshot instead.
+        // The write-session owner decides whether an empty write is published.
+        // This entry stages the admitted data-free snapshot and its marker.
         if written.is_empty() {
             return commit_empty_iceberg_mv_snapshot(ctx).await;
         }
@@ -239,20 +231,6 @@ pub(crate) async fn stage_eager_fast_append(
             None
         }
     };
-
-    // An ordinary empty append has no data-plane effect. A managed
-    // publication carries provider properties and therefore still needs the
-    // empty snapshot the custom action builds.
-    if written.is_empty() && ctx.snapshot_properties.is_empty() {
-        let snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref).unwrap_or(0);
-        return Ok((
-            Transaction::new(ctx.table),
-            CommitOutcome {
-                new_snapshot_id: snapshot_id,
-                written_manifest_paths: Vec::new(),
-            },
-        ));
-    }
 
     let manifest_paths_out = Arc::new(Mutex::new(Vec::new()));
     let action: Arc<dyn TransactionAction> = Arc::new(FastAppendV3TxnAction {

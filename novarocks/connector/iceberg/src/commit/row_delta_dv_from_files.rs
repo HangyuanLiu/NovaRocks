@@ -40,10 +40,10 @@ use uuid::Uuid;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::fast_append::commit_empty_iceberg_mv_snapshot;
 use super::helpers::{
-    OccSubmit, debug_assert_single_unmarked_row_bearing_data_manifest, effective_next_row_id,
-    finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
-    required_target_ref_snapshot_id, snapshot_summary, snapshot_total_records,
-    submit_snapshot_occ_action, target_ref_snapshot_id, write_manifest_list,
+    OccSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
+    metadata_dir, now_ms, required_target_ref_snapshot_id, snapshot_summary,
+    snapshot_total_records, submit_snapshot_occ_action, target_ref_snapshot_id,
+    write_manifest_list,
 };
 use super::row_delta_dv_metadata::{
     WrittenDvFile, build_snapshot_index_metadata_only, dv_summary, dv_total_records,
@@ -62,34 +62,8 @@ pub struct RowDeltaDvFromFilesCommit;
 impl IcebergCommitAction for RowDeltaDvFromFilesCommit {
     async fn commit(&self, ctx: CommitCtx<'_>) -> Result<CommitOutcome, String> {
         let written = ctx.collector.take_written_files()?;
-        // M3b: net-new INSERT data files from a folded MERGE not-matched branch
-        // arrive on a dedicated collector channel (the reuse `written` channel
-        // above carries only MOR-UPDATE replacement rows that preserve their
-        // `_row_id`s). The executor knows which writers were the INSERT branch
-        // and routed them here; the entry does NOT content-sniff. Empty for a
-        // plain MOR UPDATE / DELETE, keeping those paths byte-identical.
-        let appended_files = ctx.collector.take_appended_files();
-        let groups = ctx.collector.take_delete_groups();
-        if !groups.is_empty() {
-            return Err(
-                "RowDeltaDvFromFilesCommit does not accept coordinator delete groups; expected BE-written Puffin DV files"
-                    .to_string(),
-            );
-        }
-
-        if written.is_empty() && appended_files.is_empty() {
+        if written.is_empty() {
             return commit_empty_iceberg_mv_snapshot(ctx).await;
-        }
-        // Every appended file must be net-new INSERT data (content == Data); a
-        // DV/position-delete in this channel is a routing bug. Mirrors the
-        // `(Data, _)` partition guard for the reuse channel below.
-        for file in &appended_files {
-            if file.content != DataContentType::Data {
-                return Err(format!(
-                    "RowDeltaDvFromFilesCommit appended file {} has content {:?}; expected Data (net-new INSERT)",
-                    file.path, file.content
-                ));
-            }
         }
         let (written_dvs, written_data) = partition_written_for_dv_from_files(written)?;
         let (written_dvs, superseded_writer_dvs) = coalesce_written_dvs_by_referenced_file(
@@ -105,10 +79,6 @@ impl IcebergCommitAction for RowDeltaDvFromFilesCommit {
         let action = Arc::new(RowDeltaDvFromFilesTxnAction {
             written_dvs,
             written: written_data,
-            // Fresh INSERT rows: see the channel comment above. The action leaves
-            // their manifest UNMARKED so the v3 manifest-list writer allocates
-            // fresh `_row_id`s and advances `next_row_id`.
-            appended_files,
             commit_uuid: ctx.commit_uuid,
             file_io: ctx.file_io.clone(),
             schema: ctx.table.metadata().current_schema().clone(),
@@ -173,13 +143,6 @@ struct RowDeltaDvFromFilesTxnAction {
     /// added-data manifest is marked with `first_row_id` to suppress
     /// allocation.
     written: Vec<WrittenFile>,
-    /// Net-new INSERT data files (e.g. a folded MERGE not-matched INSERT) that
-    /// are genuinely new rows carrying NO preserved `_row_id`. Unlike `written`,
-    /// these MUST draw FRESH `_row_id`s: their manifest is left UNMARKED so the
-    /// v3 manifest-list writer allocates ids starting at the table's effective
-    /// next-row-id and advances `next_row_id` by their `Σ record_count`. Empty
-    /// for MOR UPDATE / plain DELETE, keeping those paths byte-identical.
-    appended_files: Vec<WrittenFile>,
     commit_uuid: Uuid,
     file_io: FileIO,
     schema: SchemaRef,
@@ -207,22 +170,6 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
         let target_ref = &self.target_ref;
         let parent_snapshot_id = target_ref_snapshot_id(m, target_ref);
         let metadata_dir = metadata_dir(table);
-
-        // FRESH base for net-new appended INSERT rows. `row_lineage_first_row_id`
-        // is the REUSE floor (the MOR-UPDATE replacement / DV path never advances
-        // it). When appended INSERT rows are present they draw fresh ids starting
-        // at the table's effective next-row-id; otherwise this equals the reuse
-        // floor so the row-range shape `(floor, 0)` is unchanged.
-        let appended_rows = self.appended_files.iter().try_fold(0u64, |sum, f| {
-            sum.checked_add(f.record_count)
-                .ok_or_else(|| to_iceberg_unexpected("appended row count overflow".to_string()))
-        })?;
-        let has_appended = !self.appended_files.is_empty();
-        let appended_first_row_id = if has_appended {
-            effective_next_row_id(m).map_err(to_iceberg_unexpected)?
-        } else {
-            self.row_lineage_first_row_id
-        };
 
         let touched_files = self
             .written_dvs
@@ -336,38 +283,6 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
             ));
         }
 
-        // Net-new appended INSERT data (folded MERGE not-matched branch). Unlike
-        // the reuse `written` block above, this manifest is left UNMARKED so the
-        // v3 manifest-list writer assigns it `first_row_id = appended_first_row_id`
-        // and advances `next_row_id` by `Σ appended record_count` — mirroring
-        // `overwrite.rs` / `fast_append.rs`. It is pushed LAST so the preceding
-        // marked data manifest and delete manifests leave the writer's counter at
-        // `appended_first_row_id` when this manifest is assigned.
-        if has_appended {
-            let appended_path = format!(
-                "{metadata_dir}/{}-row-delta-appended-data-0.avro",
-                self.commit_uuid
-            );
-            self.abort_handle.record_manifest(appended_path.clone());
-            self.manifest_paths_out
-                .lock()
-                .expect("manifest_paths_out poisoned")
-                .push(appended_path.clone());
-            let appended_manifest = super::overwrite::write_added_data_manifest(
-                &self.file_io,
-                &appended_path,
-                &self.appended_files,
-                m.default_partition_spec().clone(),
-                self.schema.clone(),
-                new_seq,
-                new_snapshot_id,
-                format_version,
-            )
-            .await
-            .map_err(to_iceberg_unexpected)?;
-            new_manifests.push(appended_manifest);
-        }
-
         let manifest_list_path = format!(
             "{metadata_dir}/snap-{}-{}.avro",
             new_snapshot_id, self.commit_uuid
@@ -378,13 +293,6 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
             .lock()
             .expect("manifest_paths_out poisoned")
             .push(manifest_list_path.clone());
-        // The writer starts at `appended_first_row_id`. The marked reuse data
-        // manifest and the delete manifests are `(Some, Some)` / Deletes and
-        // never move the counter; only the unmarked appended manifest (if any)
-        // draws fresh ids and advances it. With no appended files this equals
-        // `row_lineage_first_row_id`, so the MOR-UPDATE / DELETE path is
-        // byte-identical (final next-row-id == floor, row-range `(floor, 0)`).
-        debug_assert_single_unmarked_row_bearing_data_manifest(&new_manifests, has_appended);
         let manifest_list_next_row_id = write_manifest_list(
             &self.file_io,
             &manifest_list_path,
@@ -393,15 +301,11 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
             parent_snapshot_id,
             new_seq,
             format_version,
-            Some(appended_first_row_id),
+            Some(self.row_lineage_first_row_id),
         )
         .await
         .map_err(to_iceberg_unexpected)?;
-        let expected_next_row_id = appended_first_row_id.checked_add(appended_rows).ok_or_else(|| {
-            to_iceberg_unexpected(format!(
-                "Row ID overflow computing row-delta row lineage range: first_row_id={appended_first_row_id}, appended_rows={appended_rows}"
-            ))
-        })?;
+        let expected_next_row_id = self.row_lineage_first_row_id;
         if manifest_list_next_row_id != Some(expected_next_row_id) {
             return Err(to_iceberg_unexpected(format!(
                 "row-lineage row-delta row lineage mismatch: expected next-row-id {expected_next_row_id}, got {manifest_list_next_row_id:?}"
@@ -420,18 +324,7 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
                     index.replaced_delete_records
                 ))
             })?;
-        // Summary `added-*` / `total-records` must count BOTH reuse replacement
-        // rows and net-new appended INSERT rows. When `appended_files` is empty
-        // this borrows `self.written` unchanged, keeping the MOR-UPDATE / DELETE
-        // summary byte-identical.
-        let all_added_data: std::borrow::Cow<'_, [WrittenFile]> = if has_appended {
-            let mut v = self.written.clone();
-            v.extend(self.appended_files.iter().cloned());
-            std::borrow::Cow::Owned(v)
-        } else {
-            std::borrow::Cow::Borrowed(&self.written)
-        };
-        let added_data_records = all_added_data.iter().try_fold(0u64, |sum, file| {
+        let added_data_records = self.written.iter().try_fold(0u64, |sum, file| {
             sum.checked_add(file.record_count).ok_or_else(|| {
                 to_iceberg_unexpected("DV added data record count overflow".to_string())
             })
@@ -445,7 +338,7 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
 
         let mut dv_props = dv_summary(
             &self.written_dvs,
-            &all_added_data,
+            &self.written,
             total_records,
             newly_deleted_records,
             index.replaced_delete_files,
@@ -478,11 +371,7 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
                 additional_properties: summary_props,
             })
             .with_schema_id(self.schema_id)
-            // Reuse rows (DV deletes + MOR-UPDATE replacements) contribute 0;
-            // only fresh appended INSERT rows extend the row-range.
-            // `appended_rows == 0` for MOR UPDATE / DELETE, preserving the prior
-            // `(first_row_id, 0)` shape.
-            .with_row_range(appended_first_row_id, appended_rows)
+            .with_row_range(self.row_lineage_first_row_id, 0)
             .build();
 
         Ok(ActionCommit::new(

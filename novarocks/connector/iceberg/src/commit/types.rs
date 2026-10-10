@@ -26,14 +26,11 @@ pub enum CommitOpKind {
     FastAppend,
     Overwrite,
     RowDelta,
-    RowDeltaDv,
     RowDeltaDvFromFiles,
-    RewriteDataFiles,
     SelectedRewrite,
     CowUpdate,
     Truncate,
     OverwritePartitions,
-    RewriteManifests,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

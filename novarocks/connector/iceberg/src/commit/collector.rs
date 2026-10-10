@@ -35,7 +35,6 @@ use crate::iceberg::spec::{
 use crate::iceberg::table::Table;
 use std::collections::{BTreeMap, HashMap};
 
-use crate::commit::PositionDeleteGroup;
 use crate::commit::abort::AbortLog;
 use crate::commit::report::IcebergWriterReport;
 use crate::commit::{CommitOpKind, WrittenFile};
@@ -43,7 +42,6 @@ use crate::commit::{CommitOpKind, WrittenFile};
 #[derive(Default)]
 struct StagedEffectCounters {
     injected_data_rows: u128,
-    appended_data_rows: u128,
     delete_rows: u128,
 }
 
@@ -66,24 +64,11 @@ pub struct IcebergCommitCollector {
     pub abort_log: Arc<AbortLog>,
     /// Files supplied by the provider execution/control boundary.
     injected: Mutex<Vec<WrittenFile>>,
-    /// Net-new data files (content == Data, NO preserved `_row_id`) that a folded
-    /// MERGE not-matched INSERT branch produced. Kept separate from `injected`
-    /// (the reuse channel) so the `RowDeltaDvFromFilesCommit` entry can route
-    /// them into the action's fresh `appended_files` channel — those rows MUST
-    /// draw fresh `_row_id`s, unlike the reuse replacement rows in `injected`.
-    /// Drained via [`take_appended_files`]. Empty for every non-folded path,
-    /// keeping MOR-UPDATE / DELETE byte-identical.
-    appended: Mutex<Vec<WrittenFile>>,
     /// Cumulative logical effect of every validated file/group injected into
     /// this collector. Commit actions drain the concrete channels above, but
     /// MV refresh still needs the exact staged row counts after an external
     /// commit has completed in connector control.
     staged_effect: Mutex<StagedEffectCounters>,
-    /// Grouped `(referenced_data_file, positions)` records produced by the
-    /// engine-side row-lineage DELETE flow. Only used when
-    /// `op_kind == CommitOpKind::RowDeltaDv`. The `RowDeltaDvCommit` action
-    /// drains this channel via [`take_delete_groups`].
-    delete_groups: Mutex<Vec<PositionDeleteGroup>>,
     /// When set, signals that the engine wrote data files whose `_row_id`
     /// values are already stamped at the reserved field IDs inside the
     /// file (e.g. the OPTIMIZE row-lineage preserve path). The commit
@@ -150,9 +135,7 @@ impl IcebergCommitCollector {
             staging_dir,
             abort_log: Arc::new(AbortLog::new()),
             injected: Mutex::new(Vec::new()),
-            appended: Mutex::new(Vec::new()),
             staged_effect: Mutex::new(StagedEffectCounters::default()),
-            delete_groups: Mutex::new(Vec::new()),
             preserve_row_lineage: AtomicBool::new(false),
             committed: AtomicBool::new(false),
             manifest_cleanup_token: Mutex::new(None),
@@ -188,45 +171,9 @@ impl IcebergCommitCollector {
         self
     }
 
-    /// Mark that the data files injected via [`inject_written_file`] carry
-    /// per-row `_row_id` values stamped at the reserved field IDs. The
-    /// rewrite commit-action consumes this signal to skip `next_row_id`
-    /// allocation and `row_range` emission. Idempotent.
-    pub fn mark_preserve_row_lineage(&self) {
-        self.preserve_row_lineage.store(true, Ordering::Release);
-    }
-
-    /// Returns true when [`mark_preserve_row_lineage`] was called for this
-    /// query.
+    /// Returns whether this collector preserves stored row lineage.
     pub fn preserve_row_lineage(&self) -> bool {
         self.preserve_row_lineage.load(Ordering::Acquire)
-    }
-
-    /// Push a grouped DELETE position vector into the collector. Used by the
-    /// engine-side row-lineage DELETE flow so that `RowDeltaDvCommit` can
-    /// build the merged Puffin DV files at commit time.
-    pub fn inject_delete_group(&self, group: PositionDeleteGroup) {
-        let mut effect = self
-            .staged_effect
-            .lock()
-            .expect("collector staged_effect lock poisoned");
-        effect.delete_rows = effect
-            .delete_rows
-            .saturating_add(group.positions.len() as u128);
-        self.delete_groups
-            .lock()
-            .expect("collector delete_groups lock poisoned")
-            .push(group);
-    }
-
-    /// Drain the grouped DELETE position vectors registered via
-    /// [`inject_delete_group`].
-    pub fn take_delete_groups(&self) -> Vec<PositionDeleteGroup> {
-        let mut guard = self
-            .delete_groups
-            .lock()
-            .expect("collector delete_groups lock poisoned");
-        std::mem::take(&mut *guard)
     }
 
     /// Cumulative `record_count` across every injected [`WrittenFile`] with
@@ -241,25 +188,13 @@ impl IcebergCommitCollector {
         staged_row_count(effect.injected_data_rows)
     }
 
-    /// Sum of data rows across both preserved/reuse files and net-new appended
-    /// files. Used by change-stream based IMV refresh accounting: both channels
-    /// materialize rows into the target snapshot, even though RowDeltaDvFromFiles
-    /// keeps them separate for row-lineage assignment.
+    /// Cumulative data rows retained after the concrete file channel is drained.
     pub fn injected_or_appended_data_record_count(&self) -> i64 {
-        let effect = self
-            .staged_effect
-            .lock()
-            .expect("collector staged_effect lock poisoned");
-        staged_row_count(
-            effect
-                .injected_data_rows
-                .saturating_add(effect.appended_data_rows),
-        )
+        self.injected_data_record_count()
     }
 
-    /// Sum of delete-side rows across coordinator-built delete groups and
-    /// BE-written delete files. Non-destructive; used by IVM-A1 refresh
-    /// accounting and empty-write gating.
+    /// Sum of delete-side rows across BE-written delete files. Non-destructive;
+    /// used by IVM-A1 refresh accounting and empty-write gating.
     pub fn injected_delete_record_count(&self) -> i64 {
         let effect = self
             .staged_effect
@@ -324,59 +259,6 @@ impl IcebergCommitCollector {
             }
             guard.push(wf);
         }
-    }
-
-    /// Pre-load net-new INSERT data files (folded MERGE not-matched branch) into
-    /// the fresh-row-lineage channel. These rows carry NO preserved `_row_id`
-    /// and MUST draw fresh ids at commit time. Kept distinct from
-    /// [`inject_written_files`] (the reuse channel). Each path is recorded in the
-    /// [`AbortLog`] so abort cleanup still works.
-    pub(crate) fn inject_appended_files(&self, files: Vec<WrittenFile>) {
-        use crate::iceberg::spec::DataContentType;
-
-        {
-            let mut effect = self
-                .staged_effect
-                .lock()
-                .expect("collector staged_effect lock poisoned");
-            for file in &files {
-                if matches!(file.content, DataContentType::Data) {
-                    effect.appended_data_rows = effect
-                        .appended_data_rows
-                        .saturating_add(file.record_count as u128);
-                }
-            }
-        }
-        let mut guard = self
-            .appended
-            .lock()
-            .expect("collector appended lock poisoned");
-        for wf in files {
-            self.abort_log.record_data_file(wf.path.clone());
-            guard.push(wf);
-        }
-    }
-
-    /// Drain the net-new INSERT data files registered via
-    /// [`inject_appended_files`]. The `RowDeltaDvFromFilesCommit` entry routes
-    /// these into the action's fresh `appended_files` channel.
-    pub(crate) fn take_appended_files(&self) -> Vec<WrittenFile> {
-        let mut guard = self
-            .appended
-            .lock()
-            .expect("collector appended lock poisoned");
-        std::mem::take(&mut *guard)
-    }
-
-    /// Read-only check that no net-new INSERT data files were registered via
-    /// [`inject_appended_files`]. Used by `CowUpdateCommit` to assert it routes
-    /// appended rows through the rewrite set, NOT this channel. Non-draining, so
-    /// it is safe inside `debug_assert!` (no debug/release state divergence).
-    pub(crate) fn appended_is_empty(&self) -> bool {
-        self.appended
-            .lock()
-            .expect("collector appended lock poisoned")
-            .is_empty()
     }
 
     pub(crate) fn inject_writer_report(&self, report: IcebergWriterReport) -> Result<(), String> {

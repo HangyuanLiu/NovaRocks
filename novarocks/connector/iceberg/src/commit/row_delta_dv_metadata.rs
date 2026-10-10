@@ -27,7 +27,7 @@ use crate::iceberg::spec::{
 use crate::iceberg::table::Table;
 
 use crate::commit::WrittenFile;
-use crate::commit::{DeletionVector, WrittenPuffinDv, read_deletion_vector_puffin};
+use crate::commit::WrittenPuffinDv;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WrittenDvFile {
@@ -84,30 +84,19 @@ pub struct SnapshotIndex {
     pub replaced_delete_files_size: u64,
 }
 
-pub async fn build_snapshot_index_with_dv_merge(
-    table: &Table,
-    file_io: &FileIO,
-    touched_files: &HashSet<String>,
-    vectors: &mut HashMap<String, DeletionVector>,
-    target_ref: &str,
-) -> Result<SnapshotIndex, String> {
-    build_snapshot_index(table, file_io, touched_files, Some(vectors), target_ref).await
-}
-
 pub async fn build_snapshot_index_metadata_only(
     table: &Table,
     file_io: &FileIO,
     touched_files: &HashSet<String>,
     target_ref: &str,
 ) -> Result<SnapshotIndex, String> {
-    build_snapshot_index(table, file_io, touched_files, None, target_ref).await
+    build_snapshot_index(table, file_io, touched_files, target_ref).await
 }
 
 async fn build_snapshot_index(
     table: &Table,
     file_io: &FileIO,
     touched_files: &HashSet<String>,
-    mut vectors_to_merge: Option<&mut HashMap<String, DeletionVector>>,
     target_ref: &str,
 ) -> Result<SnapshotIndex, String> {
     let mut data_files = HashMap::new();
@@ -117,7 +106,6 @@ async fn build_snapshot_index(
     let mut replaced_delete_paths = HashSet::new();
     let mut replaced_delete_files_size = 0u64;
     let mut replaced_delete_records = 0u64;
-    let mut replaced_delete_vectors: HashMap<String, DeletionVector> = HashMap::new();
     let m = table.metadata();
     // For branch-targeted deletes, read the manifest list from the branch head
     // snapshot (not from main's current snapshot). This ensures that files added
@@ -197,37 +185,9 @@ async fn build_snapshot_index(
                                 file.file_path()
                             ));
                         }
-                        if vectors_to_merge.is_some() {
-                            let offset = file.content_offset().ok_or_else(|| {
-                                format!("Puffin DV {} missing content_offset", file.file_path())
-                            })?;
-                            let len = file.content_size_in_bytes().ok_or_else(|| {
-                                format!(
-                                    "Puffin DV {} missing content_size_in_bytes",
-                                    file.file_path()
-                                )
-                            })?;
-                            let old =
-                                read_deletion_vector_puffin(file_io, file.file_path(), offset, len)
-                                    .await
-                                    .map_err(|e| {
-                                        format!(
-                                            "read existing Puffin DV {} failed: {e}",
-                                            file.file_path()
-                                        )
-                                    })?;
-                            replaced_delete_vectors
-                                .entry(referenced.clone())
-                                .or_default()
-                                .merge(&old);
-                            if let Some(vectors) = vectors_to_merge.as_mut() {
-                                vectors.entry(referenced).or_default().merge(&old);
-                            }
-                        } else {
-                            replaced_delete_records = replaced_delete_records
-                                .checked_add(file.record_count())
-                                .ok_or_else(|| "replaced DV record_count overflow".to_string())?;
-                        }
+                        replaced_delete_records = replaced_delete_records
+                            .checked_add(file.record_count())
+                            .ok_or_else(|| "replaced DV record_count overflow".to_string())?;
                         replaced_delete_files += 1;
                         replaced_delete_files_size = replaced_delete_files_size
                             .checked_add(file.file_size_in_bytes())
@@ -250,16 +210,6 @@ async fn build_snapshot_index(
                 }
             }
         }
-    }
-
-    if vectors_to_merge.is_some() {
-        replaced_delete_records =
-            replaced_delete_vectors
-                .values()
-                .try_fold(0u64, |sum, vector| {
-                    sum.checked_add(vector.cardinality())
-                        .ok_or_else(|| "replaced DV cardinality overflow".to_string())
-                })?;
     }
 
     Ok(SnapshotIndex {
