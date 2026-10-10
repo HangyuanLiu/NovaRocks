@@ -152,7 +152,12 @@ pub(crate) fn cow_overlay_conversion_upper(
             .simultaneous_request_terms()
             .map_err(exhausted)?;
     let closure = geometry::prospective_arc_request::<PinnedFileSetOverlay>().map_err(exhausted)?;
+    // The compiler copies the one COW overlay slice into a Vec before the
+    // materializer consumes it. Its strings are counted above; this is the
+    // concrete additional Vec slot, separate from generic binding map Work.
+    let compiler_overlay_slot = std::mem::size_of::<QueryLocalTableOverlay>() as u64;
     copies
         .checked_add(closure)
+        .and_then(|upper| upper.checked_add(compiler_overlay_slot))
         .ok_or_else(|| exhausted(geometry::FootprintError::Overflow))
 }
