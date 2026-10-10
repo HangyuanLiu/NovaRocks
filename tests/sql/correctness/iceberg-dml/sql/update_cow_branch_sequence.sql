@@ -27,7 +27,7 @@ CREATE TABLE ${case_db}.t_cow_ref_sequence (id BIGINT, v STRING)
 TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true",
  "write.update.mode" = "copy-on-write");
 INSERT INTO ${case_db}.t_cow_ref_sequence VALUES (1, 'a'), (2, 'b');
-ALTER TABLE ${case_db}.t_cow_ref_sequence CREATE BRANCH dev;
+ALTER TABLE iceberg_dml_cat_${suite_uuid0}.${case_db}.t_cow_ref_sequence CREATE BRANCH dev;
 INSERT INTO ${case_db}.t_cow_ref_sequence.branch_dev VALUES (3, 'dev');
 
 -- query 2
