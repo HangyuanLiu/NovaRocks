@@ -107,7 +107,7 @@ pub(crate) fn decoded_upper(bytes: &[u8], scope: &CowBeginScope<'_>) -> Result<u
     scope.reserve(mul(bytes.len().max(8) as u64, 3)?)?;
     let largest_slot = [
         size_of::<crate::metadata::IcebergTablePayload>(),
-        size_of::<crate::metadata::IcebergTableInfo>(),
+        size_of::<crate::scan_model::IcebergTableInfo>(),
         size_of::<crate::scan_model::IcebergDataFileInfo>(),
         size_of::<crate::scan_model::IcebergSchemaFieldDef>(),
         size_of::<serde_json::Value>(),

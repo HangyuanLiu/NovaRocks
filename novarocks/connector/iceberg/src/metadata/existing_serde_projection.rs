@@ -308,7 +308,9 @@ impl OwnedProjection {
     pub fn schema(&self) -> &IcebergSchemaDef {
         &self.schema
     }
-    pub(crate) fn into_guarded_parts(self) -> (String, IcebergSchemaDef, ConnectorPayloadRetentionGuard) {
+    pub(crate) fn into_guarded_parts(
+        self,
+    ) -> (String, IcebergSchemaDef, ConnectorPayloadRetentionGuard) {
         (self.metadata_json, self.schema, self._guard)
     }
 }

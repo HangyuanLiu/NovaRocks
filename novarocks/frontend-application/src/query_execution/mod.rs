@@ -44,6 +44,7 @@ pub mod mv_assembly;
 pub mod mv_native_write;
 pub(crate) mod native_execution_adapter;
 pub mod native_fragment;
+pub(crate) mod original_cow_result_scope;
 pub(crate) mod outcome;
 pub(crate) mod package_freeze;
 pub(crate) mod package_reads;
@@ -67,7 +68,6 @@ pub mod statistics;
 pub(crate) mod write_barrier;
 pub(crate) mod write_result;
 pub(crate) mod write_session;
-pub(crate) mod original_cow_result_scope;
 pub(crate) mod write_transaction;
 
 pub mod compiler;
