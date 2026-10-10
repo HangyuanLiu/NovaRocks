@@ -752,6 +752,18 @@ impl<'a> AnalyzerContext<'a> {
             (Some(current_rel), current_scope)
         };
 
+        // Finish FROM recursion before allocating the SELECT analysis frame.
+        // Nested derived tables must not retain every outer projection,
+        // grouping and subquery-rewrite temporary on the planning stack.
+        self.analyze_select_after_from(select, from, scope)
+    }
+
+    fn analyze_select_after_from(
+        &self,
+        select: &ast::Select,
+        from: Option<Relation>,
+        scope: AnalyzerScope,
+    ) -> Result<(ResolvedSelect, Vec<OutputColumn>), AnalyzeError> {
         // --- WHERE clause ---
         let filter = match &select.selection {
             Some(expr) => Some(super::analyzer::subquery_rewrite::coerce_where_to_bool(
