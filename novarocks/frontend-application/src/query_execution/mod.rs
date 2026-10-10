@@ -62,6 +62,7 @@ pub mod statistics;
 pub(crate) mod write_barrier;
 pub(crate) mod write_result;
 pub(crate) mod write_session;
+pub(crate) mod original_cow_result_scope;
 pub(crate) mod write_transaction;
 
 pub mod compiler;

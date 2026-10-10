@@ -40,6 +40,8 @@ use crate::scan_model::IcebergColumnStats;
 const MAX_STATS_DELETE_MEMBERS: usize = 256;
 const MAX_STATS_FIELD_COMPARISONS: usize = 1024;
 use sha2::{Digest, Sha256};
+pub(crate) mod cow_capture;
+use cow_capture::{CaptureBudget, ReadFailure, active as check_cow_active, recipe};
 
 /// Mint exactly once at the provider's pinned handle boundary. Standalone
 /// snapshot callers intentionally create an independent observation.
@@ -236,7 +238,9 @@ pub(crate) async fn build_read_snapshot_in_domain(
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
 ) -> Result<IcebergReadSnapshot, String> {
     let snapshot_id = domain.endpoint().snapshot_id();
-    let files = observe_read_files::<DataFile>(table, domain, control).await?;
+    let files = observe_read_files::<DataFile>(table, domain, control, None)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(IcebergReadSnapshot {
         snapshot_id: Some(snapshot_id),
         files,
@@ -257,7 +261,31 @@ pub(crate) async fn build_cow_read_files_at_with_control(
         .schema(metadata)
         .map_err(|e| format!("resolve snapshot schema: {e}"))?;
     let domain = mint_read_domain(metadata, snapshot_id, &schema)?;
-    observe_read_files::<CowDataFileProjection>(table, domain, control).await
+    observe_read_files::<CowDataFileProjection>(table, domain, control, None)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Checked COW uses the original FE binding and returns its cumulative receipt.
+pub(crate) async fn build_cow_read_files_at_with_original_scope(
+    table: &Table,
+    snapshot_id: i64,
+    budget: &CaptureBudget<'_>,
+) -> Result<Vec<CowReadFile>, ReadFailure> {
+    budget.active()?;
+    let metadata = table.metadata();
+    let snapshot = metadata
+        .snapshot_by_id(snapshot_id)
+        .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
+    let schema = snapshot
+        .schema(metadata)
+        .map_err(|e| format!("resolve snapshot schema: {e}"))?;
+    let serialized = budget.json(metadata)?;
+    budget.json_working(serialized)?;
+    let schema_bytes = budget.json(schema.as_ref())?;
+    budget.json_working(schema_bytes)?;
+    let domain = mint_read_domain(metadata, snapshot_id, &schema)?;
+    observe_read_files::<CowDataFileProjection>(table, domain, None, Some(budget)).await
 }
 
 /// One common observation retains the original entry, delete and lineage checks.
@@ -266,19 +294,44 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
     table: &Table,
     domain: Arc<ReadDomain>,
     control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
-) -> Result<Vec<P::File>, String> {
+    budget: Option<&CaptureBudget<'_>>,
+) -> Result<Vec<P::File>, ReadFailure> {
     check_read_control(control)?;
+    check_cow_active(budget)?;
     let metadata = table.metadata();
+    if let Some(budget) = budget {
+        let bytes = budget.json(metadata)?;
+        budget.json_working(bytes)?;
+        budget.json_working(domain.endpoint().schema_json().len() as u64)?;
+    }
     if domain.endpoint().table_uuid() != metadata.uuid()
         || domain.endpoint().metadata_identity() != metadata_identity(metadata)?
     {
-        return Err("Iceberg read domain differs from the pinned table metadata".to_string());
+        return Err("Iceberg read domain differs from the pinned table metadata"
+            .to_string()
+            .into());
     }
     let snapshot_id = domain.endpoint().snapshot_id();
     let snapshot = metadata
         .snapshot_by_id(snapshot_id)
         .ok_or_else(|| format!("snapshot {snapshot_id} not found"))?;
+    if let Some(budget) = budget {
+        let source_schema = snapshot.schema(metadata).map_err(|e| e.to_string())?;
+        budget.schema_indexes(source_schema.as_ref())?;
+    }
     let schema = domain.endpoint().schema().map_err(|e| e.to_string())?;
+    if let Some(budget) = budget {
+        let map = recipe(cow_capture::geometry::hash_max::<
+            novarocks_spi::connector::ConnectorCowBeginCause,
+            (i32, String),
+        >(schema.as_struct().fields().len()))?;
+        let names = schema.as_struct().fields().iter().try_fold(map, |sum, f| {
+            recipe(cow_capture::geometry::add::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(sum, f.name.len() as u64))
+        })?;
+        budget.charge(names)?;
+    }
     let field_id_to_name: HashMap<i32, String> = schema
         .as_struct()
         .fields()
@@ -294,6 +347,10 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
     let mut observed_data = Vec::new();
     for manifest_file in manifest_list.entries() {
         check_read_control(control)?;
+        check_cow_active(budget)?;
+        if let Some(budget) = budget {
+            budget.hash_insert::<&str>(seen_manifests.len(), seen_manifests.capacity())?;
+        }
         if !seen_manifests.insert(manifest_file.manifest_path.as_str()) {
             continue;
         }
@@ -302,6 +359,7 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
             .await
             .map_err(|e| format!("load manifest: {e}"))?;
         check_read_control(control)?;
+        check_cow_active(budget)?;
         let spec = metadata
             .partition_spec_by_id(manifest_file.partition_spec_id)
             .ok_or_else(|| {
@@ -314,7 +372,17 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
             return Err(format!(
                 "manifest {} partition spec differs from pinned metadata",
                 manifest_file.manifest_path
-            ));
+            )
+            .into());
+        }
+        if let Some(budget) = budget {
+            if let Some(json) = domain
+                .endpoint()
+                .partition_type_jsons()
+                .get(&spec.spec_id())
+            {
+                budget.json_working(json.len() as u64)?;
+            }
         }
         let partition_type = domain
             .endpoint()
@@ -327,6 +395,7 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
             .transpose()?;
         for entry in manifest.entries() {
             check_read_control(control)?;
+            check_cow_active(budget)?;
             // Deleted entries are not live facts; unresolved sequence metadata
             // on them cannot become a read failure or an inheritance fallback.
             if entry.status == ManifestStatus::Deleted {
@@ -339,9 +408,53 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
                 manifest_sequence: manifest_file.sequence_number,
             };
             let df = entry.data_file();
-            let typed_partition = TypedPartition::bind_type(spec, &partition_type, df.partition())
-                .map_err(|e| e.to_string())?;
-            let metrics = manifest_metrics(df, &schema);
+            let typed_partition = if let Some(budget) = budget {
+                TypedPartition::bind_type_checked(
+                    spec,
+                    &partition_type,
+                    df.partition(),
+                    |ty, tuple| {
+                        let plan = recipe(cow_capture::partition::prospective::<
+                            novarocks_spi::connector::ConnectorCowBeginCause,
+                        >(tuple, ty, &mut || {
+                            budget.scope.check_active().map_err(Into::into)
+                        }))?;
+                        budget.charge(plan.canonical_constructor_upper)
+                    },
+                    || budget.active(),
+                )
+                .map_err(|failure| match failure {
+                    crate::delete_semantics::PartitionBindFailure::Semantic(error) => {
+                        ReadFailure::Semantic(error.to_string())
+                    }
+                    crate::delete_semantics::PartitionBindFailure::Original(error) => error,
+                })?
+            } else {
+                TypedPartition::bind_type(spec, &partition_type, df.partition())
+                    .map_err(|e| e.to_string())?
+            };
+            let metrics_upper = if let Some(budget) = budget {
+                let plan = recipe(cow_capture::metrics::prospective::<
+                    novarocks_spi::connector::ConnectorCowBeginCause,
+                >(df, &schema, &mut || {
+                    budget.scope.check_active().map_err(Into::into)
+                }))?;
+                budget.charge(plan.constructor_upper)?;
+                Some(plan.retained_upper)
+            } else {
+                None
+            };
+            let metrics = manifest_metrics_checked(df, &schema, budget)?;
+            if let Some(upper) = metrics_upper {
+                let actual = recipe(cow_capture::metrics::retained::<
+                    novarocks_spi::connector::ConnectorCowBeginCause,
+                >(&metrics))?;
+                if actual.own_upper > upper {
+                    return Err(ReadFailure::Semantic(
+                        "COW metrics exceeded prospective receipt".into(),
+                    ));
+                }
+            }
             match df.content_type() {
                 DataContentType::Data => {
                     let count = i64::try_from(df.record_count())
@@ -355,6 +468,11 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
                             )
                         })?;
                     }
+                    if let Some(budget) = budget {
+                        budget.charge(recipe(cow_capture::geometry::arc_bytes::<
+                            novarocks_spi::connector::ConnectorCowBeginCause,
+                        >(df.file_path().len()))?)?;
+                    }
                     let data = DataFileFact::try_new(
                         df.file_path(),
                         sequence.required_sequence().map_err(|e| e.to_string())?,
@@ -363,9 +481,23 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
                         metrics,
                     )
                     .map_err(|e| e.to_string())?;
+                    if let Some(budget) = budget {
+                        let plan = recipe(cow_capture::partition::prospective::<
+                            novarocks_spi::connector::ConnectorCowBeginCause,
+                        >(
+                            df.partition(),
+                            &partition_type,
+                            &mut || budget.scope.check_active().map_err(Into::into),
+                        ))?;
+                        budget.charge(recipe(cow_capture::partition::before_resolved::<
+                            novarocks_spi::connector::ConnectorCowBeginCause,
+                        >(plan))?)?;
+                        budget.charge(manifest_file.manifest_path.len() as u64)?;
+                        budget.vector(&observed_data)?;
+                    }
                     let values = resolved_partition_values(df.partition(), &partition_type);
                     observed_data.push((
-                        P::capture(df, &field_id_to_name),
+                        P::capture(df, &field_id_to_name, budget)?,
                         data,
                         values,
                         manifest_file.manifest_path.clone(),
@@ -379,6 +511,59 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
                     i64::try_from(df.record_count()).map_err(|_| {
                         format!("delete record count is unrepresentable: {}", df.file_path())
                     })?;
+                    if let Some(budget) = budget {
+                        let mut own = recipe(cow_capture::geometry::arc_bytes::<
+                            novarocks_spi::connector::ConnectorCowBeginCause,
+                        >(df.file_path().len()))?;
+                        if let Some(target) = df.referenced_data_file() {
+                            own = recipe(cow_capture::geometry::add::<
+                                novarocks_spi::connector::ConnectorCowBeginCause,
+                            >(
+                                own,
+                                recipe(cow_capture::geometry::arc_bytes::<
+                                    novarocks_spi::connector::ConnectorCowBeginCause,
+                                >(target.len()))?,
+                            ))?;
+                        }
+                        own = recipe(cow_capture::geometry::add::<
+                            novarocks_spi::connector::ConnectorCowBeginCause,
+                        >(
+                            own,
+                            recipe(cow_capture::geometry::arc_bytes::<
+                                novarocks_spi::connector::ConnectorCowBeginCause,
+                            >(
+                                df.key_metadata().unwrap_or_default().len()
+                            ))?,
+                        ))?;
+                        if let Some(ids) = df.equality_ids() {
+                            let vectors = recipe(cow_capture::geometry::add::<
+                                novarocks_spi::connector::ConnectorCowBeginCause,
+                            >(
+                                recipe(cow_capture::geometry::slots::<
+                                    novarocks_spi::connector::ConnectorCowBeginCause,
+                                    i32,
+                                >(ids.len()))?,
+                                recipe(cow_capture::geometry::slots::<
+                                    novarocks_spi::connector::ConnectorCowBeginCause,
+                                    (i32, PrimitiveType),
+                                >(ids.len()))?,
+                            ))?;
+                            let arc = recipe(cow_capture::geometry::arc_slice::<
+                                novarocks_spi::connector::ConnectorCowBeginCause,
+                                (i32, PrimitiveType),
+                            >(ids.len()))?;
+                            own = recipe(cow_capture::geometry::add::<
+                                novarocks_spi::connector::ConnectorCowBeginCause,
+                            >(
+                                own,
+                                recipe(cow_capture::geometry::add::<
+                                    novarocks_spi::connector::ConnectorCowBeginCause,
+                                >(vectors, arc))?,
+                            ))?;
+                        }
+                        budget.charge(own)?;
+                        budget.vector(&delete_entries)?;
+                    }
                     let (address, kind) = match (df.content_type(), df.file_format()) {
                         (DataContentType::PositionDeletes, DataFileFormat::Puffin) => {
                             let offset = df.content_offset().ok_or_else(|| {
@@ -427,14 +612,16 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
                                 "unsupported Iceberg delete format {:?}: {}",
                                 df.file_format(),
                                 df.file_path()
-                            ));
+                            )
+                            .into());
                         }
                     };
                     if df.key_metadata().is_some_and(|k| !k.is_empty()) {
                         return Err(format!(
                             "Iceberg encrypted delete file {} is unsupported",
                             df.file_path()
-                        ));
+                        )
+                        .into());
                     }
                     delete_entries.push(RawDeleteEntry {
                         sequence,
@@ -454,17 +641,141 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
                 }
             }
         }
+        if let Some(budget) = budget {
+            budget.vector(&delete_manifests)?;
+            budget.charge(recipe(cow_capture::geometry::arc_bytes::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(manifest_file.manifest_path.len()))?)?;
+        }
         delete_manifests.push(ManifestDeleteObservation {
             manifest_path: manifest_file.manifest_path.clone().into(),
             entries: delete_entries,
         });
     }
+    if let Some(budget) = budget {
+        let members = delete_manifests
+            .iter()
+            .try_fold(0usize, |sum, m| sum.checked_add(m.entries.len()))
+            .ok_or_else(|| ReadFailure::Semantic("COW delete member upper overflow".into()))?;
+        budget.delete_structures(delete_manifests.len(), members)?;
+        for manifest in &delete_manifests {
+            for entry in &manifest.entries {
+                budget.active()?;
+                if let DeleteKind::Equality(group) = &entry.file.kind {
+                    let ids = recipe(cow_capture::geometry::slots::<
+                        novarocks_spi::connector::ConnectorCowBeginCause,
+                        i32,
+                    >(group.fields().len()))?;
+                    let fields = recipe(cow_capture::geometry::slots::<
+                        novarocks_spi::connector::ConnectorCowBeginCause,
+                        (i32, PrimitiveType),
+                    >(group.fields().len()))?;
+                    let arc = recipe(cow_capture::geometry::arc_slice::<
+                        novarocks_spi::connector::ConnectorCowBeginCause,
+                        (i32, PrimitiveType),
+                    >(group.fields().len()))?;
+                    let rebound = recipe(cow_capture::geometry::add::<
+                        novarocks_spi::connector::ConnectorCowBeginCause,
+                    >(
+                        recipe(cow_capture::geometry::mul::<
+                            novarocks_spi::connector::ConnectorCowBeginCause,
+                        >(ids, 2))?,
+                        recipe(cow_capture::geometry::add::<
+                            novarocks_spi::connector::ConnectorCowBeginCause,
+                        >(fields, arc))?,
+                    ))?;
+                    budget.charge(rebound)?;
+                }
+                let upper = entry.file.partition.json_owned_upper().ok_or_else(|| {
+                    ReadFailure::Semantic("COW partition JSON upper overflow".into())
+                })?;
+                // Prefix descriptions and bounded statistics may construct
+                // the same tuple; retain a conservative constructor sum.
+                budget.charge(recipe(cow_capture::geometry::mul::<
+                    novarocks_spi::connector::ConnectorCowBeginCause,
+                >(upper, 4))?)?;
+            }
+        }
+        budget.json_working(domain.endpoint().schema_json().len() as u64)?;
+        budget.schema_indexes(&schema)?;
+        for json in domain
+            .endpoint()
+            .partition_spec_jsons()
+            .values()
+            .chain(domain.endpoint().partition_type_jsons().values())
+        {
+            budget.json_working(json.len() as u64)?;
+        }
+    }
     let observation =
-        DeleteObservation::from_manifests(delete_manifests).map_err(|e| e.to_string())?;
-    let index = DeleteCandidateIndex::try_new(domain, observation).map_err(|e| e.to_string())?;
+        DeleteObservation::from_manifests_checked(delete_manifests, || check_cow_active(budget))
+            .map_err(|e| match e {
+                crate::delete_semantics::ConstructionFailure::Semantic(e) => {
+                    ReadFailure::Semantic(e.to_string())
+                }
+                crate::delete_semantics::ConstructionFailure::Original(e) => e,
+            })?;
+    let index =
+        DeleteCandidateIndex::try_new_checked(domain, observation, || check_cow_active(budget))
+            .map_err(|e| match e {
+                crate::delete_semantics::ConstructionFailure::Semantic(e) => {
+                    ReadFailure::Semantic(e.to_string())
+                }
+                crate::delete_semantics::ConstructionFailure::Original(e) => e,
+            })?;
+    if let Some(budget) = budget {
+        budget.charge(recipe(cow_capture::geometry::slots::<
+            novarocks_spi::connector::ConnectorCowBeginCause,
+            P::File,
+        >(observed_data.len()))?)?;
+    }
     let mut files = Vec::with_capacity(observed_data.len());
     for (df, data, partition_values, manifest_path, first_row_id) in observed_data {
         check_read_control(control)?;
+        check_cow_active(budget)?;
+        if let Some(budget) = budget {
+            let metrics = recipe(cow_capture::metrics::retained::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(&data.metrics))?;
+            let buckets = index.size().buckets;
+            let views = recipe(cow_capture::geometry::slots::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+                crate::delete_semantics::BucketView,
+            >(buckets.checked_add(2).ok_or_else(|| {
+                ReadFailure::Semantic("COW bucket upper overflow".into())
+            })?))?;
+            let upper = recipe(cow_capture::geometry::add::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(
+                recipe(cow_capture::geometry::mul::<
+                    novarocks_spi::connector::ConnectorCowBeginCause,
+                >(views, 4))?,
+                metrics.own_upper,
+            ))?;
+            let upper = recipe(cow_capture::geometry::add::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(
+                upper,
+                std::mem::size_of::<DataFileFact>() as u64
+                    + 2 * std::mem::size_of::<usize>() as u64,
+            ))?;
+            budget.charge(upper)?;
+            let plan = recipe(cow_capture::partition::prospective::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(
+                &partition_values,
+                &crate::iceberg::spec::StructType::new(Vec::new()),
+                &mut || budget.scope.check_active().map_err(Into::into),
+            ))?;
+            budget.charge(plan.debug_key_upper)?;
+            // Existing metadata statistics policy bounds the pruning work.
+            budget.charge(recipe(cow_capture::geometry::slots::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+                usize,
+            >(
+                MAX_STATS_DELETE_MEMBERS.saturating_mul(4)
+            ))?)?;
+        }
         let logical = index.for_data(&data).map_err(|e| e.to_string())?;
         // This bound is selected entirely from metadata. A large suffix costs
         // no per-member work and stays a compact, conservative view.
@@ -505,7 +816,11 @@ struct FinalReadFileFacts {
 trait ObservedDataFileProjection: Sized {
     type File;
 
-    fn capture(df: &DataFile, field_id_to_name: &HashMap<i32, String>) -> Self;
+    fn capture(
+        df: &DataFile,
+        field_id_to_name: &HashMap<i32, String>,
+        budget: Option<&CaptureBudget<'_>>,
+    ) -> Result<Self, ReadFailure>;
 
     fn into_file(
         self,
@@ -517,8 +832,12 @@ trait ObservedDataFileProjection: Sized {
 impl ObservedDataFileProjection for DataFile {
     type File = IcebergReadFile;
 
-    fn capture(df: &DataFile, _field_id_to_name: &HashMap<i32, String>) -> Self {
-        df.clone()
+    fn capture(
+        df: &DataFile,
+        _field_id_to_name: &HashMap<i32, String>,
+        _budget: Option<&CaptureBudget<'_>>,
+    ) -> Result<Self, ReadFailure> {
+        Ok(df.clone())
     }
 
     fn into_file(
@@ -582,13 +901,45 @@ pub(crate) struct CowReadFile {
 impl ObservedDataFileProjection for CowDataFileProjection {
     type File = CowReadFile;
 
-    fn capture(df: &DataFile, field_id_to_name: &HashMap<i32, String>) -> Self {
-        Self {
+    fn capture(
+        df: &DataFile,
+        field_id_to_name: &HashMap<i32, String>,
+        budget: Option<&CaptureBudget<'_>>,
+    ) -> Result<Self, ReadFailure> {
+        let stats_upper = if let Some(budget) = budget {
+            let plan = recipe(cow_capture::stats::prospective::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(df, field_id_to_name, &mut || {
+                budget.scope.check_active().map_err(Into::into)
+            }))?;
+            budget.charge(recipe(cow_capture::geometry::add::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(
+                plan.constructor_upper,
+                df.file_path().len() as u64,
+            ))?)?;
+            Some(plan.retained_upper)
+        } else {
+            None
+        };
+        let output = Self {
             path: df.file_path().to_owned(),
             file_size_in_bytes: df.file_size_in_bytes(),
             record_count: df.record_count(),
-            column_stats: column_stats(df, field_id_to_name),
+            column_stats: column_stats_checked(df, field_id_to_name, budget)?,
+        };
+        if let Some(upper) = stats_upper {
+            let actual = recipe(cow_capture::stats::retained::<
+                novarocks_spi::connector::ConnectorCowBeginCause,
+            >(&output.column_stats))?;
+            if actual.own_upper > upper || output.path.capacity() > df.file_path().len() {
+                return Err(ReadFailure::Semantic(
+                    "COW file projection exceeded prospective receipt".into(),
+                ));
+            }
         }
+        check_cow_active(budget)?;
+        Ok(output)
     }
 
     fn into_file(
@@ -640,15 +991,26 @@ fn resolved_partition_values(
     )
 }
 
-fn manifest_metrics(df: &DataFile, schema: &Schema) -> FileMetrics {
+fn manifest_metrics_checked(
+    df: &DataFile,
+    schema: &Schema,
+    budget: Option<&CaptureBudget<'_>>,
+) -> Result<FileMetrics, ReadFailure> {
     let mut ids = std::collections::BTreeSet::new();
-    ids.extend(df.value_counts().keys().copied());
-    ids.extend(df.null_value_counts().keys().copied());
-    ids.extend(df.nan_value_counts().keys().copied());
-    ids.extend(df.lower_bounds().keys().copied());
-    ids.extend(df.upper_bounds().keys().copied());
+    for id in df
+        .value_counts()
+        .keys()
+        .chain(df.null_value_counts().keys())
+        .chain(df.nan_value_counts().keys())
+        .chain(df.lower_bounds().keys())
+        .chain(df.upper_bounds().keys())
+    {
+        check_cow_active(budget)?;
+        ids.insert(*id);
+    }
     let mut fields = BTreeMap::new();
     for id in ids {
+        check_cow_active(budget)?;
         let value_type = match id {
             POSITION_FILE_PATH_FIELD_ID
                 if df.content_type() == DataContentType::PositionDeletes =>
@@ -683,13 +1045,22 @@ fn manifest_metrics(df: &DataFile, schema: &Schema) -> FileMetrics {
             .bind_bounds(),
         );
     }
-    FileMetrics::new(fields)
+    check_cow_active(budget)?;
+    FileMetrics::new_checked(fields, || check_cow_active(budget))
 }
 
 fn column_stats(
     df: &DataFile,
     field_id_to_name: &HashMap<i32, String>,
 ) -> Option<HashMap<String, IcebergColumnStats>> {
+    column_stats_checked(df, field_id_to_name, None)
+        .unwrap_or_else(|_| unreachable!("ordinary stats has no fallible scope"))
+}
+fn column_stats_checked(
+    df: &DataFile,
+    field_id_to_name: &HashMap<i32, String>,
+    budget: Option<&CaptureBudget<'_>>,
+) -> Result<Option<HashMap<String, IcebergColumnStats>>, ReadFailure> {
     let null_counts = df.null_value_counts();
     let value_counts = df.value_counts();
     let col_sizes = df.column_sizes();
@@ -703,14 +1074,20 @@ fn column_stats(
 
     if has_any_stats {
         let mut all_ids = std::collections::HashSet::new();
-        all_ids.extend(null_counts.keys());
-        all_ids.extend(value_counts.keys());
-        all_ids.extend(col_sizes.keys());
-        all_ids.extend(lower.keys());
-        all_ids.extend(upper.keys());
+        for id in null_counts
+            .keys()
+            .chain(value_counts.keys())
+            .chain(col_sizes.keys())
+            .chain(lower.keys())
+            .chain(upper.keys())
+        {
+            check_cow_active(budget)?;
+            all_ids.insert(*id);
+        }
 
         let mut stats_map = HashMap::new();
         for &field_id in &all_ids {
+            check_cow_active(budget)?;
             if let Some(column_name) = field_id_to_name.get(&field_id) {
                 let lower_bound = lower
                     .get(&field_id)
@@ -739,9 +1116,9 @@ fn column_stats(
                 );
             }
         }
-        Some(stats_map)
+        Ok(Some(stats_map))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -2091,7 +2468,7 @@ mod tests {
             .build()
             .unwrap();
         let names = HashMap::from([(1, "id".to_owned())]);
-        let projected = CowDataFileProjection::capture(&original, &names);
+        let projected = CowDataFileProjection::capture(&original, &names, None).unwrap();
         // Enumerating every stored field prevents silently retaining a DataFile
         // or scan metadata Arc in this projection in a later refactor.
         let CowDataFileProjection {
@@ -2117,8 +2494,12 @@ mod tests {
     impl ObservedDataFileProjection for RejectFinalProjection {
         type File = ();
 
-        fn capture(_df: &DataFile, _names: &HashMap<i32, String>) -> Self {
-            Self
+        fn capture(
+            _df: &DataFile,
+            _names: &HashMap<i32, String>,
+            _budget: Option<&CaptureBudget<'_>>,
+        ) -> Result<Self, ReadFailure> {
+            Ok(Self)
         }
 
         fn into_file(
@@ -2135,8 +2516,9 @@ mod tests {
         let valid = table(vec![vec![(data("a"), 5)]], None, false).await;
         let domain =
             mint_read_domain(valid.metadata(), 77, valid.metadata().current_schema()).unwrap();
-        let canary = observe_read_files::<RejectFinalProjection>(&valid, domain, None)
+        let canary = observe_read_files::<RejectFinalProjection>(&valid, domain, None, None)
             .await
+            .map_err(|e| e.to_string())
             .unwrap_err();
         assert_eq!(canary, "final projection canary");
 
@@ -2148,8 +2530,9 @@ mod tests {
         .await;
         let domain =
             mint_read_domain(invalid.metadata(), 77, invalid.metadata().current_schema()).unwrap();
-        let actual = observe_read_files::<RejectFinalProjection>(&invalid, domain, None)
+        let actual = observe_read_files::<RejectFinalProjection>(&invalid, domain, None, None)
             .await
+            .map_err(|e| e.to_string())
             .unwrap_err();
         assert!(actual.contains("older"), "{actual}");
         assert_ne!(actual, canary);
@@ -2176,7 +2559,7 @@ mod tests {
             .build()
             .unwrap();
         let names = HashMap::new();
-        let captured = CowDataFileProjection::capture(&original, &names);
+        let captured = CowDataFileProjection::capture(&original, &names, None).unwrap();
         assert_eq!(captured.file_size_in_bytes, u64::MAX);
         let ordinary = original
             .into_file(final_facts_from_read(read.clone()), &names)

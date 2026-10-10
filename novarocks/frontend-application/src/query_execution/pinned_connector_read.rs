@@ -66,21 +66,34 @@ pub(crate) fn pinned_file_set_query_local_overlay(
     input_schema: &SchemaRef,
     read: QueryPinnedFileSetRead,
 ) -> QueryLocalTableOverlay {
-    let identity = identity.clone();
-    let schema = input_schema.clone();
+    let retained = PinnedFileSetOverlay {
+        identity: identity.clone(),
+        schema: input_schema.clone(),
+        read,
+    };
     QueryLocalTableOverlay::new(
-        identity.namespace().to_string(),
-        identity.table().to_string(),
-        pinned_file_set_binding_key(&identity),
-        move |binding| {
-            pinned_file_set_query_table_binding(
-                identity.clone(),
-                schema.clone(),
-                binding,
-                read.clone(),
-            )
-        },
+        retained.identity.namespace().to_string(),
+        retained.identity.table().to_string(),
+        pinned_file_set_binding_key(&retained.identity),
+        move |binding| retained.materialize(binding),
     )
+}
+
+// One captured owner fixes field destruction order across schema aliases.
+pub(crate) struct PinnedFileSetOverlay {
+    identity: FrozenConnectorScanIdentity,
+    schema: SchemaRef,
+    read: QueryPinnedFileSetRead,
+}
+impl PinnedFileSetOverlay {
+    fn materialize(&self, binding: SqlTableBindingId) -> Result<QueryTableBinding, String> {
+        pinned_file_set_query_table_binding(
+            self.identity.clone(),
+            self.schema.clone(),
+            binding,
+            self.read.clone(),
+        )
+    }
 }
 
 /// Build the minimal physical scan carrier for one pinned cohort read.
@@ -115,4 +128,31 @@ fn pinned_file_set_query_table_binding(
         frozen_snapshot_materializations: BTreeMap::new(),
         admitted_change_scans: BTreeMap::new(),
     })
+}
+
+/// Prospective result-derived conversion copies for the one closed COW read.
+/// The binding store itself and general SQL optimizer/materialization graphs
+/// belong to planning Work; this reports the concrete source/schema/overlay
+/// copies created by this module and the two current analyzer projections.
+pub(crate) fn cow_overlay_conversion_upper(
+    namespace: &str,
+    schema: &arrow::datatypes::Schema,
+    pinned: &novarocks_spi::connector::ConnectorPinnedFileSet,
+) -> Result<u64, novarocks_spi::connector::ConnectorError> {
+    use crate::query_execution::dml::cow_compile_receipt::compiler_handoff as geometry;
+    let exhausted = |_| {
+        novarocks_spi::connector::ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+            "COW schema and overlay conversion footprint overflow",
+        )
+    };
+    let copies =
+        geometry::KnownCompilerCopies::before_closed_identity_growth(namespace, schema, pinned)
+            .map_err(exhausted)?
+            .simultaneous_request_terms()
+            .map_err(exhausted)?;
+    let closure = geometry::prospective_arc_request::<PinnedFileSetOverlay>().map_err(exhausted)?;
+    copies
+        .checked_add(closure)
+        .ok_or_else(|| exhausted(geometry::FootprintError::Overflow))
 }

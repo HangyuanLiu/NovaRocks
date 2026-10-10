@@ -213,12 +213,11 @@ pub struct DistributedQueryRequest {
     deadline: Option<Instant>,
     cancellation: QueryCancellationView,
     completion: QueryOutcomeFactory,
-    /// The NCP-6 write session, present exactly when this query's plan carries
-    /// the dataflow write shape.
-    write_stack_session: Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
     write_root_decode_contract:
         Option<crate::query_execution::write_result::RootWriteDecodeContract>,
     statistics_program: Option<StatisticsCollectionProgram>,
+    // Last: the original COW session outlives every request-owned payload.
+    write_stack_session: Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
 }
 
 enum DistributedQueryPayload {
@@ -409,11 +408,11 @@ pub struct DistributedQueryRequestParts {
     pub deadline: Option<Instant>,
     pub cancellation: QueryCancellationView,
     pub completion: QueryOutcomeFactory,
-    pub(crate) write_stack_session:
-        Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
     pub(crate) write_root_decode_contract:
         Option<crate::query_execution::write_result::RootWriteDecodeContract>,
     pub statistics_program: Option<StatisticsCollectionProgram>,
+    pub(crate) write_stack_session:
+        Option<Arc<crate::query_execution::write_session::ConnectorWriteSession>>,
 }
 
 pub(crate) fn build_request_from_finalized_execution(

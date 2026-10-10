@@ -173,12 +173,26 @@ pub struct FileMetrics {
 
 impl FileMetrics {
     pub fn new(fields: BTreeMap<i32, FieldMetrics>) -> Self {
-        Self {
-            fields: fields
-                .into_iter()
-                .map(|(id, metrics)| (id, metrics.bind_bounds()))
-                .collect(),
+        match Self::new_checked(fields, || Ok::<(), std::convert::Infallible>(())) {
+            Ok(metrics) => metrics,
+            Err(never) => match never {},
         }
+    }
+    pub(crate) fn new_checked<E>(
+        fields: BTreeMap<i32, FieldMetrics>,
+        mut active: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<Self, E> {
+        active()?;
+        let mut entries = Vec::with_capacity(fields.len());
+        for (id, metrics) in fields {
+            active()?;
+            entries.push((id, metrics.bind_bounds()));
+        }
+        let metrics = Self {
+            fields: entries.into_iter().collect(),
+        };
+        active()?;
+        Ok(metrics)
     }
     pub fn fields(&self) -> &BTreeMap<i32, FieldMetrics> {
         &self.fields

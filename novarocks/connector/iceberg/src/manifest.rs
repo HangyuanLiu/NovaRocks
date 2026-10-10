@@ -76,13 +76,24 @@ fn partition_field_values(
     spec_id: i32,
     partition: &crate::iceberg::spec::Struct,
 ) -> Result<Vec<IcebergPartitionFieldValue>, String> {
+    partition_field_values_checked(metadata, schema, spec_id, partition, None)
+        .map_err(|e| e.to_string())
+}
+fn partition_field_values_checked(
+    metadata: &TableMetadata,
+    schema: &crate::iceberg::spec::Schema,
+    spec_id: i32,
+    partition: &crate::iceberg::spec::Struct,
+    budget: Option<&crate::read_snapshot::cow_capture::CaptureBudget<'_>>,
+) -> Result<Vec<IcebergPartitionFieldValue>, crate::read_snapshot::cow_capture::ReadFailure> {
     let Some(spec) = metadata.partition_spec_by_id(spec_id) else {
-        return Err(format!(
-            "iceberg table metadata missing partition spec id {spec_id}"
-        ));
+        return Err(format!("iceberg table metadata missing partition spec id {spec_id}").into());
     };
     let mut values = Vec::with_capacity(spec.fields().len());
     for (idx, field) in spec.fields().iter().enumerate() {
+        if let Some(budget) = budget {
+            budget.active()?;
+        }
         let source_column = schema
             .field_by_id(field.source_id)
             .map(|source| source.name.clone())
@@ -439,6 +450,132 @@ pub(crate) async fn extract_cow_data_files_with_stats_at_with_control(
             })
         })
         .collect()
+}
+
+/// Original-window COW capture keeps all outputs under one neutral owner.
+pub(crate) struct CheckedCowDataFiles {
+    pub files: Vec<DataFileWithStats>,
+    pub simultaneous_upper: u64,
+    pub retention_guard: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+}
+
+pub(crate) async fn extract_cow_data_files_with_stats_at_with_original_scope(
+    table: &Table,
+    snapshot_id: i64,
+    scope: &novarocks_spi::connector::ConnectorOriginalResultScope,
+    base_upper: u64,
+) -> Result<CheckedCowDataFiles, novarocks_spi::connector::ConnectorCowBeginCause> {
+    use crate::read_snapshot::cow_capture::{
+        CaptureBudget, ReadFailure, geometry, partition, recipe,
+    };
+    use novarocks_spi::connector::ConnectorCowBeginCause;
+    let build = async {
+        let budget = CaptureBudget::new(scope, base_upper)?;
+        let metadata = table.metadata();
+        let snapshot_schema = metadata
+            .snapshot_by_id(snapshot_id)
+            .ok_or_else(|| format!("Iceberg snapshot {snapshot_id} is absent from table metadata"))?
+            .schema(metadata)
+            .map_err(|error| format!("resolve Iceberg snapshot {snapshot_id} schema: {error}"))?;
+        let captured = crate::read_snapshot::build_cow_read_files_at_with_original_scope(
+            table,
+            snapshot_id,
+            &budget,
+        )
+        .await?;
+        budget.charge(recipe(geometry::slots::<
+            ConnectorCowBeginCause,
+            DataFileWithStats,
+        >(captured.len()))?)?;
+        let mut files = Vec::with_capacity(captured.len());
+        for file in captured {
+            budget.active()?;
+            let partition_field_values =
+                match (file.partition_spec_id, file.partition_values.as_ref()) {
+                    (Some(spec_id), Some(values)) => {
+                        if let Some(plan) =
+                            recipe(partition::field_values::<ConnectorCowBeginCause>(
+                                metadata,
+                                snapshot_schema.as_ref(),
+                                spec_id,
+                                values,
+                                &mut || scope.check_active().map_err(Into::into),
+                            ))?
+                        {
+                            budget.charge(plan.constructor_upper)?;
+                        }
+                        partition_field_values_checked(
+                            metadata,
+                            snapshot_schema.as_ref(),
+                            spec_id,
+                            values,
+                            Some(&budget),
+                        )?
+                    }
+                    _ => Vec::new(),
+                };
+            let mut delete_files = Vec::new();
+            for fact in file.deletes.members() {
+                budget.active()?;
+                budget.vector(&delete_files)?;
+                let mut upper = fact.address().path().len() as u64;
+                let tuple = fact.partition().json_owned_upper().ok_or_else(|| {
+                    ReadFailure::Semantic("COW delete tuple upper overflow".into())
+                })?;
+                upper = recipe(geometry::add::<ConnectorCowBeginCause>(
+                    upper,
+                    recipe(geometry::mul::<ConnectorCowBeginCause>(tuple, 2))?,
+                ))?;
+                match fact.kind() {
+                    crate::delete_semantics::DeleteKind::Position { exact_target } => {
+                        if let Some(target) = exact_target {
+                            upper = recipe(geometry::add::<ConnectorCowBeginCause>(
+                                upper,
+                                target.len() as u64,
+                            ))?;
+                        }
+                    }
+                    crate::delete_semantics::DeleteKind::DeletionVector { exact_target } => {
+                        upper = recipe(geometry::add::<ConnectorCowBeginCause>(
+                            upper,
+                            exact_target.len() as u64,
+                        ))?;
+                    }
+                    crate::delete_semantics::DeleteKind::Equality(group) => {
+                        upper = recipe(geometry::add::<ConnectorCowBeginCause>(
+                            upper,
+                            recipe(geometry::slots::<ConnectorCowBeginCause, i32>(
+                                group.fields().len(),
+                            ))?,
+                        ))?;
+                    }
+                }
+                budget.charge(upper)?;
+                delete_files.push(canonical_delete_to_catalog_delete(fact)?);
+            }
+            files.push(DataFileWithStats {
+                path: file.path,
+                size: file.size,
+                record_count: file.record_count,
+                column_stats: file.column_stats,
+                partition_spec_id: file.partition_spec_id,
+                partition_key: file.partition_key,
+                partition_values: file.partition_values,
+                manifest_path: file.manifest_path,
+                partition_field_values,
+                first_row_id: file.first_row_id,
+                data_sequence_number: file.data_sequence_number,
+                delete_files,
+            });
+        }
+        budget.active()?;
+        Ok::<_, ReadFailure>(CheckedCowDataFiles {
+            files,
+            simultaneous_upper: budget.upper(),
+            retention_guard: scope.retention_guard(),
+        })
+    };
+    build.await.map_err(ReadFailure::into_cause)
 }
 
 pub async fn extract_data_files_with_stats(

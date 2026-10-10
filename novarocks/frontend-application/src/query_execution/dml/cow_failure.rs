@@ -31,11 +31,17 @@ pub struct CowFailure {
     // Test-only final field observes exit after the original cause fields drop.
     #[cfg(test)]
     exit_probe: Option<ExitProbe>,
+    // Only pre-provider failure uses this holder. Checked provider failures
+    // already carry the same neutral guard inside their move-only envelope.
+    original: Option<novarocks_spi::connector::ConnectorOriginalResultScope>,
 }
 enum Cause {
     BeforeBegin(cow_necessary_before_begin::Error),
     Lease(ConnectorError),
     Provider(ConnectorError),
+    CheckedBegin(novarocks_spi::connector::ConnectorCowBeginFailure),
+    OriginalScope(novarocks_spi::connector::OriginalResultCheckError),
+    Construction(crate::query_execution::dml::cow_closed_ast::BuildError),
     MissingCatalogIdentity,
 }
 impl CowFailure {
@@ -44,6 +50,7 @@ impl CowFailure {
             cause,
             #[cfg(test)]
             exit_probe: None,
+            original: None,
         }
     }
     pub(super) fn before_begin(error: cow_necessary_before_begin::Error) -> Self {
@@ -57,6 +64,32 @@ impl CowFailure {
     }
     pub(crate) fn missing_catalog_identity() -> Self {
         Self::new(Cause::MissingCatalogIdentity)
+    }
+
+    pub(super) fn construction(
+        error: crate::query_execution::dml::cow_closed_ast::BuildError,
+        original: novarocks_spi::connector::ConnectorOriginalResultScope,
+    ) -> Self {
+        let mut failure = Self::new(Cause::Construction(error));
+        failure.original = Some(original);
+        failure
+    }
+
+    pub(crate) fn original_scope(
+        error: novarocks_spi::connector::OriginalResultCheckError,
+    ) -> Self {
+        Self::new(Cause::OriginalScope(error))
+    }
+
+    pub(crate) fn checked_begin(error: novarocks_spi::connector::ConnectorCowBeginFailure) -> Self {
+        Self::new(Cause::CheckedBegin(error))
+    }
+    pub(crate) fn missing_catalog_identity_bound(
+        original: novarocks_spi::connector::ConnectorOriginalResultScope,
+    ) -> Self {
+        let mut failure = Self::missing_catalog_identity();
+        failure.original = Some(original);
+        failure
     }
 
     // This method is invoked only by query::dml_result inside the original
@@ -77,6 +110,43 @@ impl CowFailure {
                 out.push("begin connector write session: ");
                 out.connector(error);
             }
+            Cause::CheckedBegin(failure) => {
+                use novarocks_spi::connector::ConnectorCowBeginCause;
+                match failure.cause() {
+                    ConnectorCowBeginCause::Provider(error) => {
+                        out.push("begin connector write session: ");
+                        out.connector(error);
+                    }
+                    ConnectorCowBeginCause::OriginalResult(error) => {
+                        // Scope emits only these closed first-party causes.
+                        // Preserve their original presentation without invoking
+                        // an erased source formatter or reconstructing cause.
+                        let source = std::error::Error::source(error);
+                        if let Some(source) =
+                            source.and_then(|s| s.downcast_ref::<ConnectorError>())
+                        {
+                            out.connector(source);
+                        } else if let Some(source) = source
+                            .and_then(|s| s.downcast_ref::<novarocks_workload_control::WorkError>())
+                        {
+                            let _ = write!(&mut out, "{source}");
+                        } else {
+                            let _ = write!(&mut out, "{error}");
+                        }
+                    }
+                }
+            }
+            Cause::Construction(error) => {
+                use crate::query_execution::dml::cow_closed_ast::BuildError;
+                match error {
+                    BuildError::Original(error) => out.original(error),
+                    BuildError::Control(error) => out.connector(error),
+                    _ => {
+                        let _ = write!(&mut out, "{error}");
+                    }
+                }
+            }
+            Cause::OriginalScope(error) => out.original(error),
             Cause::MissingCatalogIdentity => {
                 out.push("connector write lease has no immutable catalog runtime identity")
             }
@@ -156,6 +226,9 @@ impl std::error::Error for CowFailure {
         match &self.cause {
             Cause::BeforeBegin(error) => Some(error),
             Cause::Lease(error) | Cause::Provider(error) => Some(error),
+            Cause::CheckedBegin(error) => Some(error),
+            Cause::OriginalScope(error) => Some(error),
+            Cause::Construction(error) => Some(error),
             Cause::MissingCatalogIdentity => None,
         }
     }
@@ -171,6 +244,18 @@ impl DiagnosticPrefix {
             take += 1;
         }
         self.0.push_str(&text[..take]);
+    }
+    fn original(&mut self, error: &novarocks_spi::connector::OriginalResultCheckError) {
+        let source = std::error::Error::source(error);
+        if let Some(error) = source.and_then(|e| e.downcast_ref::<ConnectorError>()) {
+            self.connector(error);
+        } else if let Some(error) =
+            source.and_then(|e| e.downcast_ref::<novarocks_workload_control::WorkError>())
+        {
+            let _ = write!(self, "{error}");
+        } else {
+            let _ = write!(self, "{error}");
+        }
     }
     fn connector(&mut self, error: &ConnectorError) {
         // This concrete, sealed Display is audited in connector-contract/error.rs:

@@ -33,13 +33,13 @@ python3 docs/testing/mem-1-m07/oracles/result_delivery_wire_oracle.py
 
 真实 REST 列表场景直接调用下面两个工具；执行绑定、原始观测及输出均写入 Git 外：
 
-- [prepare_real_rest_cl.py](scripts/prepare_real_rest_cl.py)：核对显式冻结绑定，准备、独立核验和清理私有数据。
+- [prepare_real_rest_cl.py](../../../tests/system-test-runner/tools/prepare_real_rest_cl.py)：核对显式冻结绑定，准备、独立核验和清理私有数据。
 - [observe_real_rest_cl.py](scripts/observe_real_rest_cl.py)：按绑定启动透明观测器，保留实际请求与退出事实。
 
 工具的本地自检可以独立运行，不启动真实 REST/HMS fixture：
 
 ```bash
-python3 docs/testing/mem-1-m07/scripts/prepare_real_rest_cl.py --self-test
+python3 tests/system-test-runner/tools/prepare_real_rest_cl.py --self-test
 python3 docs/testing/mem-1-m07/scripts/observe_real_rest_cl.py --self-test
 ```
 
@@ -50,8 +50,8 @@ python3 docs/testing/mem-1-m07/scripts/observe_real_rest_cl.py --self-test
 
 生产验收使用原生 **1FE+3BE**。工具自检、组件测试和 all-in-one smoke 各自只有其实际覆盖范围。
 第一批实现与已有检查的范围见 [PR #1173](https://github.com/NovaRocks/NovaRocks/pull/1173)；
-完整 M07 验收仍待后续交付，包括真实压力与退出、完整启动与 drain 保护、传输系数、
-macOS 性能/内存测量和最终同 HEAD 全量验证。Linux 验收由用户手动执行。
+剩余 SQL、原生 1FE+3BE 与最终全量验收由用户后续单独执行。传输系数、性能/内存测量及大规模只读 HMS 验证另行开展，
+不作为当前功能实现 PR 的前置条件。Linux 验收由用户手动执行。
 
 运行日志、逐检查点收据、临时探针、一次性基线/预期生成器、执行绑定和测量输出统一放在
 忽略目录 `logs/mem-1-m07/`，不作为仓库长期测试资产维护。PR 正文记录精简的验证结论及其准确版本；

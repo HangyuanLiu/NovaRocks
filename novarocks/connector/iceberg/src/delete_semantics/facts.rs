@@ -699,16 +699,29 @@ impl DeleteObservation {
     pub fn from_manifests(
         manifests: impl IntoIterator<Item = ManifestDeleteObservation>,
     ) -> Result<Self> {
+        match Self::from_manifests_checked(manifests, || Ok::<(), std::convert::Infallible>(())) {
+            Ok(value) => Ok(value),
+            Err(super::ConstructionFailure::Semantic(error)) => Err(error),
+            Err(super::ConstructionFailure::Original(never)) => match never {},
+        }
+    }
+    pub(crate) fn from_manifests_checked<E>(
+        manifests: impl IntoIterator<Item = ManifestDeleteObservation>,
+        mut active: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<Self, super::ConstructionFailure<E>> {
+        active().map_err(super::ConstructionFailure::Original)?;
         let mut paths = HashSet::new();
         let mut dv_targets = HashSet::new();
         let mut facts = Vec::new();
         for manifest in manifests {
+            active().map_err(super::ConstructionFailure::Original)?;
             require_path(&manifest.manifest_path)?;
             // Java's manifest-list path dedup occurs before reading entries.
             if !paths.insert(Arc::clone(&manifest.manifest_path)) {
                 continue;
             }
             for (entry_ordinal, entry) in manifest.entries.into_iter().enumerate() {
+                active().map_err(super::ConstructionFailure::Original)?;
                 let Some(sequence) = entry.sequence.live_sequence()? else {
                     continue;
                 };
@@ -725,7 +738,8 @@ impl DeleteObservation {
                         return Err(Error::new(
                             Kind::MultipleDeletionVectors,
                             format!("multiple live deletion vector entries target {exact_target}"),
-                        ));
+                        )
+                        .into());
                     }
                 }
                 fact.provenance = Some(ManifestEntryProvenance {
@@ -735,6 +749,7 @@ impl DeleteObservation {
                 facts.push(Arc::new(fact));
             }
         }
+        active().map_err(super::ConstructionFailure::Original)?;
         Ok(Self {
             facts,
             observed_manifest_count: paths.len(),

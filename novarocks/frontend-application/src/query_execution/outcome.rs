@@ -75,8 +75,9 @@ pub struct WriteExecutionOutcome {
 /// commit is known to have succeeded, because reporting them earlier would tell
 /// a client about rows that may never become visible.
 pub struct ConnectorWriteSessionCompletion {
-    session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     prepared: crate::query_execution::write_result::DecodedPreparedWriteSet,
+    // Last: the original COW holder outlives the completion payload.
+    session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 }
 
 impl ConnectorWriteSessionCompletion {

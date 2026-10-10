@@ -2885,6 +2885,13 @@ impl std::ops::Deref for IcebergAdmissionStatisticsMetadata {
     }
 }
 
+#[path = "control/cow_begin_own.rs"]
+mod cow_begin_own;
+#[path = "control/cow_begin.rs"]
+pub(crate) mod cow_begin;
+#[path = "control/cow_json.rs"]
+pub(crate) mod cow_json;
+
 impl IcebergWriteSessionControl {
     fn frozen_references_of(
         &self,
@@ -3991,6 +3998,16 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
             copy_on_write,
         )?;
         Ok(plan)
+    }
+
+    fn begin_cow_write_checked(
+        &self,
+        request: ConnectorWriteBeginRequest,
+        original: novarocks_spi::connector::ConnectorOriginalResultScope,
+        existing_caller_upper: u64,
+    ) -> Result<novarocks_spi::connector::ConnectorCowBeginPlan,
+                novarocks_spi::connector::ConnectorCowBeginFailure> {
+        self.begin_cow_original(request, original, existing_caller_upper)
     }
 
     fn finish_write(

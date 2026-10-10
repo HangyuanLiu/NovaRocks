@@ -2275,4 +2275,103 @@ mod tests {
             .is_err()
         );
     }
+    // Insert INSIDE commit::write_stack::codec::tests; reuse original facets/table_facts/output.
+    #[test]
+    fn cow_shared_data_recipe_uses_the_original_writer_handle_wire_and_decodes_owned() {
+        use crate::commit::write_stack::domain::IcebergCowSchemaBacking;
+        use novarocks_spi::connector::ConnectorPayloadRetentionGuard;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Witness(Arc<AtomicUsize>);
+        impl Drop for Witness {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let guard = ConnectorPayloadRetentionGuard::new(Witness(dropped.clone()));
+        // This known finite existing codec fixture does not claim a FE authorization.
+        // SchemaOnlyPlan whole-before-growth is tested separately on V1/V2/V3.
+        let backing = IcebergCowSchemaBacking::from_checked(schema(), guard);
+        let old_recipe = IcebergDataBranchRecipe::try_new(
+            Some(schema()),
+            vec!["d".into()],
+            vec!["d_day".into()],
+            vec!["day(d)".into()],
+            true,
+        )
+        .unwrap();
+        let cow_recipe = IcebergDataBranchRecipe::try_new_cow(
+            backing,
+            vec!["d".into()],
+            vec!["d_day".into()],
+            vec!["day(d)".into()],
+            true,
+        )
+        .unwrap();
+        let old = IcebergWriterHandle::try_new_data(
+            table_facts(),
+            IcebergWriterOutput::try_new(
+                IcebergFileFormat::Parquet,
+                Compression::SNAPPY,
+                Some(4096),
+            )
+            .unwrap(),
+            old_recipe,
+        )
+        .unwrap();
+        let cow = IcebergWriterHandle::try_new_data(
+            table_facts(),
+            IcebergWriterOutput::try_new(
+                IcebergFileFormat::Parquet,
+                Compression::SNAPPY,
+                Some(4096),
+            )
+            .unwrap(),
+            cow_recipe,
+        )
+        .unwrap();
+        let facets = generation();
+        let old_wire = facets.handle_encoder.encode_private(&old).unwrap();
+        let cow_wire = facets.handle_encoder.encode_private(&cow).unwrap();
+        assert_eq!(cow_wire, old_wire);
+        let decoded = decode_private_handle(&facets, &cow_wire, private_limits()).unwrap();
+        assert_eq!(
+            decoded.data().unwrap().input_schema(),
+            old.data().unwrap().input_schema()
+        );
+        assert_eq!(
+            decoded.data().unwrap().partition_source_column_names(),
+            &["d".to_string()]
+        );
+        assert_eq!(
+            decoded.data().unwrap().partition_column_names(),
+            &["d_day".to_string()]
+        );
+        assert_eq!(
+            decoded.data().unwrap().transform_exprs(),
+            &["day(d)".to_string()]
+        );
+        assert!(decoded.data().unwrap().row_lineage());
+        let decoded_clone = decoded.clone();
+        // Real codec decode uses ordinary Owned; no extra variant/tag/guard on wire.
+        assert!(!std::ptr::eq(
+            decoded.data().unwrap().input_schema().unwrap(),
+            decoded_clone.data().unwrap().input_schema().unwrap()
+        ));
+        let cow_last = cow.clone();
+        assert!(std::ptr::eq(
+            cow.data().unwrap().input_schema().unwrap(),
+            cow_last.data().unwrap().input_schema().unwrap()
+        ));
+        drop(cow);
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
+        drop(cow_last);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        drop(decoded_clone);
+        drop(decoded);
+        drop(old);
+    }
 }

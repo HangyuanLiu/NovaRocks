@@ -27,6 +27,12 @@ pub struct ConnectorPayloadRetentionGuard {
 }
 
 impl ConnectorPayloadRetentionGuard {
+    /// Erase an already-owned holder without allocating another holder.
+    /// This conveys retention only, never a new allowance or activity lease.
+    pub fn from_shared<T: Send + Sync + 'static>(holder: Arc<T>) -> Self {
+        Self { _holder: holder }
+    }
+
     pub fn new<T: Send + Sync + 'static>(holder: T) -> Self {
         Self {
             _holder: Arc::new(holder),

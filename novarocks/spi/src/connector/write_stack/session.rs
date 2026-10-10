@@ -1074,6 +1074,18 @@ pub trait ConnectorWriteControl: Send + Sync {
         request: ConnectorWriteBeginRequest,
     ) -> Result<ConnectorWriteSessionPlan, ConnectorError>;
 
+    /// First-party COW admission under the caller's original Internal window.
+    /// Required: no default delegation to ordinary, unchecked begin_write.
+    /// existing_caller_upper is a truthful prospective caller receipt including
+    /// the neutral carrier, request and final FE session header coexistence.
+    /// Provider-owned allocations require their own borrowed phase recipes.
+    fn begin_cow_write_checked(
+        &self,
+        request: ConnectorWriteBeginRequest,
+        original: crate::connector::ConnectorOriginalResultScope,
+        existing_caller_upper: u64,
+    ) -> Result<crate::connector::ConnectorCowBeginPlan, crate::connector::ConnectorCowBeginFailure>;
+
     /// Interpret every commit fragment and perform exactly one external commit.
     fn finish_write(
         &self,

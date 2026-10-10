@@ -69,7 +69,7 @@ fn producer(root: &Path, freeze: &Path, phase: &str, previous: Option<&Path>) ->
     let mut command = Command::new("python3");
     command
         .current_dir(&repository)
-        .arg(repository.join("docs/testing/mem-1-m07/scripts/prepare_real_rest_cl.py"))
+        .arg(repository.join("tests/system-test-runner/tools/prepare_real_rest_cl.py"))
         .args(["--freeze"])
         .arg(freeze)
         .args(["--phase", phase, "--output"])
@@ -130,7 +130,7 @@ impl Observer {
         let repository = repo()?;
         let script = repository.join("docs/testing/mem-1-m07/scripts/observe_real_rest_cl.py");
         let producer_script =
-            repository.join("docs/testing/mem-1-m07/scripts/prepare_real_rest_cl.py");
+            repository.join("tests/system-test-runner/tools/prepare_real_rest_cl.py");
         let freeze = root.join("observer-freeze-bound.json");
         write_json(
             &freeze,
@@ -303,7 +303,7 @@ impl PreparedListing {
                 .join("manifest.json");
             let manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
             let mut freeze: Value = serde_json::from_str(include_str!(
-                "../../../../docs/testing/mem-1-m07/inputs/real-rest-cl-producer-template-v1.json"
+                "../../fixtures/mem-1-m07/real-rest-cl-producer-template-v1.json"
             ))?;
             freeze["frozen_before_execution"] = json!(true);
             freeze["binding"] = json!({

@@ -23,6 +23,7 @@ mod cleanup_maintenance;
 mod codec;
 mod context;
 mod control;
+mod cow_begin;
 mod credential;
 mod credential_lease;
 mod data_mutation;
@@ -38,6 +39,7 @@ mod metadata;
 mod metadata_maintenance;
 mod mutation;
 mod mv_storage_observation;
+mod original_result_scope;
 mod payload_retention;
 mod predicate;
 pub mod provider;
@@ -99,10 +101,10 @@ pub use codec::{
     MAX_CONNECTOR_CODEC_FIELD_NAME_BYTES, MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH,
 };
 pub use context::{
-    ConnectorAttemptContext, ConnectorOperationControl, ConnectorPlanningContext,
-    ConnectorRangeScope, ConnectorRequestContext, ConnectorRequestInitiation,
-    ConnectorRequestScope, ConnectorStorageResolver, ResolvedVendedS3Access, StorageAccessRequest,
-    VendedS3SeedMaterial,
+    ConnectorAttemptContext, ConnectorOperationControl, ConnectorOperationControlView,
+    ConnectorPlanningContext, ConnectorRangeScope, ConnectorRequestContext,
+    ConnectorRequestInitiation, ConnectorRequestScope, ConnectorStorageResolver,
+    ResolvedVendedS3Access, StorageAccessRequest, VendedS3SeedMaterial,
 };
 pub use control::{
     ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
@@ -110,6 +112,7 @@ pub use control::{
     ConnectorControlRegistry, ConnectorControlResolver, ConnectorExecutionDistribution,
     ConnectorScanPlanning,
 };
+pub use cow_begin::{ConnectorCowBeginCause, ConnectorCowBeginFailure, ConnectorCowBeginPlan};
 pub use credential::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose,
     CatalogNonSecretProperty, CatalogStorageAccessDomainInput, CatalogUncredentialedStorageKind,
@@ -231,6 +234,10 @@ pub use mv_storage_observation::{
     MvPublishedRefreshObservation, MvPublishedRefreshTechnique, MvRefreshBaseObservation,
     MvRefreshTargetObservation, MvSchemaValidationObservation, MvStorageObservationPort,
     UnavailableMvStorageObservationPort,
+};
+pub use original_result_scope::{
+    ConnectorOriginalResultScope, ConnectorOriginalResultScopeCheck, OriginalResultCheckClass,
+    OriginalResultCheckError,
 };
 pub use payload_retention::ConnectorPayloadRetentionGuard;
 pub use predicate::{

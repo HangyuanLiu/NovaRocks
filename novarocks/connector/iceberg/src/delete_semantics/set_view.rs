@@ -104,12 +104,17 @@ impl DeleteSet {
         self.cost.candidate_members
     }
     pub fn members(&self) -> impl Iterator<Item = &Arc<DeleteFact>> {
-        let position: Box<dyn Iterator<Item = &Arc<DeleteFact>> + '_> = match &self.position {
-            PositionSource::None => Box::new(std::iter::empty()),
-            PositionSource::OneDv(dv) => Box::new(std::iter::once(dv)),
-            PositionSource::Files(views) => Box::new(views.iter().flat_map(BucketView::members)),
+        let (files, dv) = match &self.position {
+            PositionSource::None => (None, None),
+            PositionSource::OneDv(dv) => (None, Some(dv)),
+            PositionSource::Files(views) => (Some(views.as_slice()), None),
         };
-        position.chain(self.equality.iter().flat_map(BucketView::members))
+        files
+            .into_iter()
+            .flatten()
+            .flat_map(BucketView::members)
+            .chain(dv)
+            .chain(self.equality.iter().flat_map(BucketView::members))
     }
 
     pub fn same_representation(&self, other: &Self) -> bool {

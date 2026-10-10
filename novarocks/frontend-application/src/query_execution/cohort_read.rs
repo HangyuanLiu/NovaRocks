@@ -28,6 +28,8 @@ pub(crate) struct QueryPinnedFileSetRead {
     pub(crate) pinned: ConnectorPinnedFileSet,
     pub(crate) owner: ConnectorInstanceId,
     pub(crate) planning_lease: ConnectorControlPlanningLease,
+    // COW-only neutral holder: declared last so schema/source peers retire first.
+    pub(crate) original: Option<novarocks_spi::connector::ConnectorOriginalResultScope>,
 }
 
 impl std::fmt::Debug for QueryPinnedFileSetRead {

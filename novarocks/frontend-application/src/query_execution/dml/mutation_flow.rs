@@ -35,6 +35,7 @@ use crate::query_execution::planning::write_sink::{
 use crate::query_execution::write_session::ConnectorWriteSession;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_query_application::api::QueryResult;
+#[cfg(test)]
 use novarocks_sql::literal::literal_from_batch;
 use novarocks_sql::planning::dml::{
     DmlChangeStreamCompileRequest, DmlChangeStreamKind, DmlChangeStreamRoute,
@@ -1945,9 +1946,13 @@ fn begin_cow_write_session(
         |selection| {
         let binding = execution.result_capacity().ok_or_else(|| CowFailure::before_begin(
             cow_necessary_before_begin::Error::MissingAdmission))?;
-        let _request_receipt = cow_fe_begin_receipt::before_request(
+        let request_receipt = cow_fe_begin_receipt::before_request(
             preparation, &selection, &target.namespace, &target.table, binding, connector_context,
         ).map_err(CowFailure::before_begin)?;
+        let caller_peak = request_receipt.through_request_peak_upper().map_err(CowFailure::provider)?;
+        let (original_scope, caller_with_scope_upper) = crate::query_execution::original_cow_result_scope::from_original_binding(
+            binding, connector_context, caller_peak,
+        ).map_err(CowFailure::original_scope)?;
         let name_bytes = target.namespace.len().checked_add(1)
             .and_then(|n| n.checked_add(target.table.len())).ok_or_else(|| CowFailure::provider(
                 novarocks_spi::connector::ConnectorError::new(
@@ -1997,6 +2002,8 @@ fn begin_cow_write_session(
                 .map_err(CowFailure::lease)?,
             write_lease,
             request,
+            original_scope,
+            caller_with_scope_upper,
         )
         },
     ).map_err(CowFailure::before_begin)?
@@ -2025,6 +2032,10 @@ struct CowTargetWritePlan {
     input: novarocks_spi::connector::ConnectorWriteInputShape,
     query: novarocks_parser::ast::Query,
     frozen_read: Option<CowFrozenRead>,
+    simultaneous_upper: u64,
+    // Final field: generated graph and frozen read exit before its original
+    // admitted window. This carries no activity lease or fresh admission.
+    original: novarocks_spi::connector::ConnectorOriginalResultScope,
 }
 
 struct CowUpdateDistributedWrite {
@@ -2044,24 +2055,112 @@ fn build_cow_update_distributed_write(
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
     write_session: Arc<ConnectorWriteSession>,
-) -> Result<CowUpdateDistributedWrite, String> {
+) -> Result<CowUpdateDistributedWrite, crate::dml::error::DmlExecutionError> {
+    use super::cow_closed_ast as closed;
+    use super::cow_closed_route as route_builder;
+    use super::cow_compile_receipt::{self as footprint, recipe};
+    let original = write_session
+        .cow_original()
+        .ok_or_else(|| "COW compilation requires the original Internal result scope".to_string())?
+        .clone();
+    let fail = |error| {
+        crate::dml::error::DmlExecutionError::from(CowFailure::construction(
+            error,
+            original.clone(),
+        ))
+    };
+    let check = || {
+        original
+            .check_active()
+            .map_err(closed::BuildError::Original)
+    };
+    check().map_err(&fail)?;
     let routing = write_session.copy_on_write_routing().ok_or_else(|| {
         "copy-on-write write session carries no provider routing proof".to_string()
     })?;
     if routing.match_contract().digest() != preparation.match_contract().digest() {
         return Err(
-            "copy-on-write write session routing proof differs from its statement selection"
-                .to_string(),
+            "copy-on-write write session routing proof differs from its statement selection".into(),
         );
     }
     let selection = routing.selection();
     let contract = routing.match_contract();
-    // Ordering borrows the session's sealed targets; it does not copy each
-    // target's input, routing proof, or frozen source graph.
-    let mut sealed = write_session.targets().iter().collect::<Vec<_>>();
-    sealed.sort_by_key(|target| target.ordinal());
-    let mut targets = Vec::with_capacity(sealed.len());
-    for write_target in sealed {
+    let checked_add = |a: u64, b: u64| {
+        a.checked_add(b)
+            .ok_or(closed::BuildError::ResourceExhausted)
+    };
+    let count = write_session.targets().len();
+    let borrowed_slots = count
+        .checked_mul(std::mem::size_of::<
+            &novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan,
+        >())
+        .ok_or(closed::BuildError::ResourceExhausted)
+        .map_err(&fail)? as u64;
+    let identity_slots = count
+        .checked_mul(std::mem::size_of::<Option<FrozenConnectorScanIdentity>>())
+        .ok_or(closed::BuildError::ResourceExhausted)
+        .map_err(&fail)? as u64;
+    let scalars = (std::mem::size_of::<recipe::Recipe>()
+        + std::mem::size_of::<recipe::CheckedRecipe>()
+        + std::mem::size_of::<recipe::TargetAccumulator>()) as u64;
+    let mut all_metadata = 0;
+    let mut first_pass_scratch = 0;
+    let mut compiler_handoff = 0;
+    for sealed in write_session.targets() {
+        check().map_err(&fail)?;
+        let metadata = footprint::target_metadata_upper::<CowTargetWritePlan>(
+            sealed.input(),
+            &target.namespace,
+            sealed.rewrite_source(),
+        )
+        .map_err(&fail)?;
+        all_metadata = checked_add(all_metadata, metadata).map_err(&fail)?;
+        if let Some(source) = sealed.rewrite_source() {
+            compiler_handoff = compiler_handoff.max(
+                crate::query_execution::pinned_connector_read::cow_overlay_conversion_upper(
+                    &target.namespace,
+                    source.scan_schema(),
+                    source.pinned_source(),
+                )
+                .map_err(closed::BuildError::Control)
+                .map_err(&fail)?,
+            );
+        }
+        first_pass_scratch = first_pass_scratch.max(
+            route_builder::prospective_views_upper(sealed.input(), sealed.rewrite_source())
+                .map_err(&fail)?,
+        );
+    }
+    let scalar_and_identity = checked_add(scalars, identity_slots).map_err(&fail)?;
+    let baseline = checked_add(
+        checked_add(write_session.cow_simultaneous_upper(), borrowed_slots).map_err(&fail)?,
+        scalar_and_identity,
+    )
+    .map_err(&fail)?;
+    let before_views = checked_add(
+        checked_add(baseline, all_metadata).map_err(&fail)?,
+        checked_add(first_pass_scratch, compiler_handoff).map_err(&fail)?,
+    )
+    .map_err(&fail)?;
+    original
+        .check_before_growth(before_views)
+        .map_err(closed::BuildError::Original)
+        .map_err(&fail)?;
+    let mut recipe = recipe::Recipe::start(Some(recipe::ExistingBackingEvidence {
+        session_simultaneous_upper: write_session.cow_simultaneous_upper(),
+        sorted_borrowed_target_vector_upper: borrowed_slots,
+        recipe_and_small_scalars_upper: scalar_and_identity,
+    }))
+    .map_err(route_builder::map_footprint)
+    .map_err(&fail)?;
+    let mut sealed = closed::exact_vec(count).map_err(&fail)?;
+    sealed.extend(write_session.targets().iter());
+    // The sealed ordinals are unique. Unstable sort preserves their ordinal
+    // order and allocates no stable-sort scratch.
+    sealed.sort_unstable_by_key(|target| target.ordinal());
+    let mut identities = closed::exact_vec(count).map_err(&fail)?;
+    for write_target in &sealed {
+        check().map_err(&fail)?;
         let route = write_target.route().ok_or_else(|| {
             format!(
                 "copy-on-write write target {} carries no provider routing facts",
@@ -2075,37 +2174,90 @@ fn build_cow_update_distributed_write(
             )
         })?;
         if proof.route_id() != route.route_id() || proof.selection_digest() != selection.digest() {
-            return Err("COW target routing proof differs from its route or selection".to_string());
+            return Err("COW target routing proof differs from its route or selection".into());
         }
-        let (query, frozen_read) = match (proof.body(), write_target.rewrite_source()) {
+        let identity = match (proof.body(), write_target.rewrite_source()) {
             (
                 novarocks_spi::connector::write_stack::ConnectorWriteCohortRoutingBody::Rewrite,
                 Some(source),
             ) => {
                 if source.base_version_digest() != preparation.base_version().digest() {
                     return Err(
-                        "COW rewrite branch base differs from its signed preparation".to_string(),
+                        "COW rewrite branch base differs from its signed preparation".into(),
                     );
                 }
-                match source.pinned_source().files() {
-                    [_] => {}
-                    _ => {
-                        return Err(
-                            "COW rewrite branch must replace exactly one data file".to_string()
-                        );
-                    }
+                if source.pinned_source().files().len() != 1 {
+                    return Err("COW rewrite branch must replace exactly one data file".into());
                 }
-                let identity = FrozenConnectorScanIdentity::new(
-                    "default_catalog",
-                    target.namespace.clone(),
-                    format!("__nr_cow_{}", uuid::Uuid::new_v4().simple()),
+                Some(footprint::closed_identity(&target.namespace).map_err(&fail)?)
+            }
+            (
+                novarocks_spi::connector::write_stack::ConnectorWriteCohortRoutingBody::Append,
+                None,
+            ) => None,
+            _ => {
+                return Err(
+                    "COW target routing proof body differs from its frozen rewrite source".into(),
                 );
-                let read = crate::query_execution::cohort_read::QueryPinnedFileSetRead {
-                    pinned: source.pinned_source().clone(),
-                    owner: source.source().owner().clone(),
-                    planning_lease: planning_lease.clone(),
-                };
-                let query = build_cow_rewrite_query(
+            }
+        };
+        let metadata = footprint::target_metadata_upper::<CowTargetWritePlan>(
+            write_target.input(),
+            &target.namespace,
+            write_target.rewrite_source(),
+        )
+        .map_err(&fail)?;
+        route_builder::preflight_target(
+            selection,
+            proof.selection_ordinals(),
+            write_target.input(),
+            route,
+            contract,
+            write_target.rewrite_source().zip(identity.as_ref()),
+            metadata,
+            if let Some(source) = write_target.rewrite_source() {
+                crate::query_execution::pinned_connector_read::cow_overlay_conversion_upper(
+                    &target.namespace,
+                    source.scan_schema(),
+                    source.pinned_source(),
+                )
+                .map_err(closed::BuildError::Control)
+                .map_err(&fail)?
+            } else {
+                0
+            }, // Append has no frozen-read overlay.
+            &mut recipe,
+            &check,
+        )
+        .map_err(&fail)?;
+        identities.push(identity);
+    }
+    let receipt = recipe
+        .finish_all(count as u64)
+        .map_err(route_builder::map_footprint)
+        .map_err(&fail)?;
+    let peak = receipt
+        .peak_upper()
+        .map_err(route_builder::map_footprint)
+        .map_err(&fail)?;
+    original
+        .check_before_growth(peak)
+        .map_err(closed::BuildError::Original)
+        .map_err(&fail)?;
+    let maximum_query = receipt.maximum_current_target_clone();
+    let cell_gate = |array: &dyn arrow::array::Array, row| {
+        route_builder::borrowed_checked(array, row, maximum_query, &check).map(|_| ())
+    };
+    let mut targets = closed::exact_vec(count).map_err(&fail)?;
+    for (write_target, identity) in sealed.into_iter().zip(identities) {
+        check().map_err(&fail)?;
+        let route = write_target.route().ok_or("COW sealed route disappeared")?;
+        let proof = write_target
+            .routing_proof()
+            .ok_or("COW sealed proof disappeared")?;
+        let (query, frozen_read) = match (write_target.rewrite_source(), identity) {
+            (Some(source), Some(identity)) => {
+                let query = route_builder::build_cow_rewrite_query_closed(
                     selection,
                     proof.selection_ordinals(),
                     write_target.input(),
@@ -2113,7 +2265,16 @@ fn build_cow_update_distributed_write(
                     source,
                     contract,
                     &identity,
-                )?;
+                    &cell_gate,
+                    &check,
+                )
+                .map_err(&fail)?;
+                let read = crate::query_execution::cohort_read::QueryPinnedFileSetRead {
+                    pinned: source.pinned_source().clone(),
+                    owner: source.source().owner().clone(),
+                    planning_lease: planning_lease.clone(),
+                    original: Some(original.clone()),
+                };
                 (
                     query,
                     Some(CowFrozenRead {
@@ -2123,31 +2284,37 @@ fn build_cow_update_distributed_write(
                     }),
                 )
             }
-            (
-                novarocks_spi::connector::write_stack::ConnectorWriteCohortRoutingBody::Append,
-                None,
-            ) => (
-                build_cow_append_query(
+            (None, None) => (
+                route_builder::build_cow_append_query_closed(
                     selection,
                     proof.selection_ordinals(),
                     write_target.input(),
                     route,
                     contract,
-                )?,
+                    &cell_gate,
+                    &check,
+                )
+                .map_err(&fail)?,
                 None,
             ),
-            _ => {
-                return Err(
-                    "COW target routing proof body differs from its frozen rewrite source"
-                        .to_string(),
-                );
-            }
+            _ => return Err("COW sealed rewrite identity changed after its preflight".into()),
         };
+        let actual = footprint::deep_closed_query::query_owned(&query)
+            .map_err(route_builder::map_footprint)
+            .map_err(&fail)?;
+        if actual > maximum_query {
+            return Err(fail(closed::BuildError::InvalidSource(
+                "COW constructed query exceeded its prospective recipe",
+            )));
+        }
+        check().map_err(&fail)?;
         targets.push(CowTargetWritePlan {
             ordinal: write_target.ordinal(),
             input: write_target.input().clone(),
             query,
             frozen_read,
+            simultaneous_upper: peak,
+            original: original.clone(),
         });
     }
     Ok(CowUpdateDistributedWrite {
@@ -2162,6 +2329,7 @@ fn build_cow_update_distributed_write(
 /// The order is read off the route rather than off this loop, because the
 /// writer reads the root output positionally: a permuted projection would feed
 /// every column into its neighbour's slot.
+#[cfg(test)]
 fn ordered_route_inputs(
     input: &novarocks_spi::connector::ConnectorWriteInputShape,
     route: &novarocks_spi::connector::write_stack::ConnectorWriteRouteFacts,
@@ -2183,6 +2351,7 @@ fn ordered_route_inputs(
         .collect()
 }
 
+#[cfg(test)]
 fn selection_value_sql(
     selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
     row: novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal,
@@ -2215,6 +2384,7 @@ fn selection_value_sql(
 /// The net-new rows of a folded `MERGE` insert, as a literal relation.
 ///
 /// They belong to no rewritten file, so this query reads nothing at all.
+#[cfg(test)]
 fn build_cow_append_query(
     selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
     rows: &[novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal],
@@ -2301,6 +2471,7 @@ fn build_cow_append_query(
 /// dropped by the trailing predicate; every other row is re-emitted so the
 /// replacement file is complete.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn build_cow_rewrite_query(
     selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
     rows: &[novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal],
@@ -2674,6 +2845,20 @@ fn run_one_cow_target(
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
+    plan.original
+        .check_before_growth(plan.simultaneous_upper)
+        .map_err(|error| {
+            CowFailure::construction(
+                super::cow_closed_ast::BuildError::Original(error),
+                plan.original.clone(),
+            )
+        })?;
+    if write_session
+        .cow_original()
+        .is_none_or(|session| !session.is_same_original(&plan.original))
+    {
+        return Err("COW compiled target differs from its admitted write session".into());
+    }
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
     let write_target = write_session
         .targets()
@@ -2756,6 +2941,12 @@ fn run_one_cow_target(
             &[],
         )?,
     };
+    plan.original.check_active().map_err(|error| {
+        CowFailure::construction(
+            super::cow_closed_ast::BuildError::Original(error),
+            plan.original.clone(),
+        )
+    })?;
     Ok(assembly.finish()?)
 }
 
@@ -5693,6 +5884,35 @@ mod tests {
             captured_failure_request: Option<Arc<Mutex<Option<ws::ConnectorWriteBeginRequest>>>>,
         }
         impl ws::ConnectorWriteControl for CowConsumerPort {
+            fn begin_cow_write_checked(
+                &self,
+                request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
+                original: novarocks_spi::connector::ConnectorOriginalResultScope,
+                existing_caller_upper: u64,
+            ) -> Result<
+                novarocks_spi::connector::ConnectorCowBeginPlan,
+                novarocks_spi::connector::ConnectorCowBeginFailure,
+            > {
+                // Test-only scripted provider: the fixture owns its finite graph.
+                if let Err(cause) = original.check_before_growth(existing_caller_upper) {
+                    return Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
+                        cause.into(),
+                        original,
+                    ));
+                }
+                match self.begin_write(request) {
+                    Ok(plan) => Ok(novarocks_spi::connector::ConnectorCowBeginPlan::new(
+                        plan,
+                        original,
+                        existing_caller_upper,
+                    )),
+                    Err(cause) => Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
+                        cause.into(),
+                        original,
+                    )),
+                }
+            }
+
             fn binding_key(&self) -> &spi::ConnectorProviderBindingKey {
                 &self.key
             }
@@ -6437,6 +6657,35 @@ mod tests {
     }
 
     impl novarocks_spi::connector::write_stack::ConnectorWriteControl for FakeRowMutationControl {
+        fn begin_cow_write_checked(
+            &self,
+            request: novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest,
+            original: novarocks_spi::connector::ConnectorOriginalResultScope,
+            existing_caller_upper: u64,
+        ) -> Result<
+            novarocks_spi::connector::ConnectorCowBeginPlan,
+            novarocks_spi::connector::ConnectorCowBeginFailure,
+        > {
+            // Test-only scripted provider: the fixture owns its finite graph.
+            if let Err(cause) = original.check_before_growth(existing_caller_upper) {
+                return Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
+                    cause.into(),
+                    original,
+                ));
+            }
+            match self.begin_write(request) {
+                Ok(plan) => Ok(novarocks_spi::connector::ConnectorCowBeginPlan::new(
+                    plan,
+                    original,
+                    existing_caller_upper,
+                )),
+                Err(cause) => Err(novarocks_spi::connector::ConnectorCowBeginFailure::new(
+                    cause.into(),
+                    original,
+                )),
+            }
+        }
+
         fn binding_key(&self) -> &novarocks_spi::connector::ConnectorProviderBindingKey {
             &self.binding_key
         }

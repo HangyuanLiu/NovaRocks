@@ -1688,6 +1688,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
                 pinned: pinned.clone(),
                 owner: owner.clone(),
                 planning_lease: session.lease().planning_lease(),
+                original: None,
             };
             let source_binding =
                 crate::query_execution::distributed_rewrite::admit_pinned_rewrite_scan_binding(

@@ -139,7 +139,7 @@ class HeldVerifierStrictDtoTests(unittest.TestCase):
         _,projection,reference=self.receipt()
         # Share the actual Rust test fixture; execution templates stay outside Git.
         repository=Path(old.__file__).resolve().parents[2]
-        inputs=repository/"docs/testing/mem-1-m07/inputs"
+        inputs=repository/"tests/system-test-runner/fixtures/mem-1-m07"
         held_input=(inputs/"held-late-ack-freeze-v3.json").read_bytes()
         binding=json.loads((repository/"tests/system-test-runner/src/held_native_admission_test_binding.json").read_bytes())
         commit="a"*40

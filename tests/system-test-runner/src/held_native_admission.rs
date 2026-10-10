@@ -19,7 +19,7 @@
 //! No runtime role, Root authority or scene clock is created by this module.
 use super::*;
 use serde::Deserialize;
-const INPUT_PATH: &str = "docs/testing/mem-1-m07/inputs/held-late-ack-freeze-v3.json";
+const INPUT_PATH: &str = "tests/system-test-runner/fixtures/mem-1-m07/held-late-ack-freeze-v3.json";
 const NEUTRAL_ARGUMENT: &str = "--mem-1-m07-root-observation-build-identity";
 const CASE: &str = "result-delivery/held-response-late-ack";
 const SQL: &str = "SELECT REPEAT('x', 1048576) AS payload FROM generate_series(1, 1)";

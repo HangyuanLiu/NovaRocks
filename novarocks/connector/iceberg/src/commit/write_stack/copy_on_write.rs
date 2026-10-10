@@ -414,8 +414,94 @@ pub(crate) struct IcebergCowFreezeInput<'a> {
 pub(crate) fn freeze_copy_on_write_branches(
     selection: &ConnectorRowMutationSelection,
     match_contract: &ConnectorMutationMatchContract,
-    mut freeze: IcebergCowFreezeInput<'_>,
+    freeze: IcebergCowFreezeInput<'_>,
 ) -> Result<Vec<IcebergCowBranchRecipe>, ConnectorError> {
+    freeze_copy_on_write_branches_kernel(
+        selection,
+        match_contract,
+        freeze,
+        &|| Ok(()),
+        &freeze_branch_source,
+    )
+}
+
+pub(crate) fn freeze_copy_on_write_branches_with_original_scope(
+    selection: &ConnectorRowMutationSelection,
+    match_contract: &ConnectorMutationMatchContract,
+    freeze: IcebergCowFreezeInput<'_>,
+    scope: &crate::commit::write_stack::control::cow_begin::CowBeginScope<'_>,
+) -> Result<Vec<IcebergCowBranchRecipe>, novarocks_spi::connector::ConnectorCowBeginCause> {
+    use crate::commit::write_stack::control::cow_begin::{add, mul};
+    use std::mem::size_of;
+    scope.active()?;
+    let decoded = crate::commit::write_stack::control::cow_json::decoded_upper(
+        match_contract.table().payload(),
+        scope,
+    )?;
+    scope.reserve(decoded)?;
+    let layout = IcebergCowSelectionLayout::resolve(match_contract)?;
+    let mut rows = 0u64;
+    let mut names = 0u64;
+    for batch in selection.batches() {
+        scope.active()?;
+        rows = add(rows, batch.num_rows() as u64)?;
+        let files = batch
+            .column(layout.file)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| invalid("Iceberg copy-on-write `_file` identity is not UTF-8"))?;
+        for i in 0..files.len() {
+            if !files.is_null(i) {
+                names = add(names, files.value(i).len() as u64)?;
+            }
+        }
+    }
+    // Selection grouping, row-id/position uniqueness, source path index and all
+    // recipe/ordinal copies coexist. Each BTree insertion allocates at most
+    // two nodes; this includes both old and new roots. Vec growth retains old
+    // and new buffers, bounded by three times the requested initialized rows.
+    use crate::commit::write_stack::control::cow_begin::tree_upper;
+    let groups = add(
+        tree_upper::<String, Vec<IcebergCowMatchedRow>>(rows)?,
+        add(
+            tree_upper::<String, DataFileWithStats>(freeze.base_files.len() as u64)?,
+            mul(tree_upper::<i64, ()>(rows)?, 2)?,
+        )?,
+    )?;
+    let arrays = mul(
+        rows,
+        (3 * size_of::<IcebergCowMatchedRow>()
+            + 6 * size_of::<i64>()
+            + 8 * size_of::<novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal>()
+            + 4 * size_of::<IcebergCowBranchRecipe>()) as u64,
+    )?;
+    let paths = freeze
+        .base_files
+        .iter()
+        .try_fold(mul(names, 4)?, |n, file| {
+            add(n, mul(file.path.len() as u64, 3)?)
+        })?;
+    scope.reserve(add(add(groups, arrays)?, paths)?)?;
+    freeze_copy_on_write_branches_kernel(
+        selection,
+        match_contract,
+        freeze,
+        &|| scope.active(),
+        &|freeze, file| freeze_branch_source_with_original_scope(freeze, file, scope),
+    )
+}
+
+fn freeze_copy_on_write_branches_kernel<E: From<ConnectorError>>(
+    selection: &ConnectorRowMutationSelection,
+    match_contract: &ConnectorMutationMatchContract,
+    mut freeze: IcebergCowFreezeInput<'_>,
+    before: &impl Fn() -> Result<(), E>,
+    source: &impl Fn(
+        &IcebergCowFreezeInput<'_>,
+        DataFileWithStats,
+    ) -> Result<ConnectorWriteRewriteSource, E>,
+) -> Result<Vec<IcebergCowBranchRecipe>, E> {
+    before()?;
     validate_match_contract(match_contract, selection, &freeze)?;
     let layout = IcebergCowSelectionLayout::resolve(match_contract)?;
     let IcebergCowSelectionGroups {
@@ -432,17 +518,20 @@ pub(crate) fn freeze_copy_on_write_branches(
         if by_path.insert(path.clone(), file).is_some() {
             return Err(corrupt(format!(
                 "Iceberg copy-on-write base contains duplicate data file `{path}`"
-            )));
+            ))
+            .into());
         }
     }
     if by_path.len() != rewrites.len() {
         return Err(invalid(
             "Iceberg copy-on-write selection names a file absent from the frozen base",
-        ));
+        )
+        .into());
     }
 
     let mut recipes = Vec::with_capacity(rewrites.len() + usize::from(!append_ordinals.is_empty()));
     for (old_file, rows) in &rewrites {
+        before()?;
         let data_file = by_path
             .get(old_file)
             .ok_or_else(|| corrupt("Iceberg copy-on-write base lost a matched data file"))?;
@@ -452,7 +541,7 @@ pub(crate) fn freeze_copy_on_write_branches(
         let data_file = by_path
             .remove(old_file)
             .ok_or_else(|| corrupt("Iceberg copy-on-write base lost a matched data file"))?;
-        let rewrite_source = freeze_branch_source(&freeze, data_file)?;
+        let rewrite_source = source(&freeze, data_file)?;
         recipes.push(IcebergCowBranchRecipe {
             input: IcebergCowBranchInput::Rewrite {
                 old_file: old_file.clone(),
@@ -587,6 +676,139 @@ fn freeze_branch_source(
     let source = ConnectorTableHandle::try_new(freeze.catalog.clone(), Bytes::from(encoded))?;
     let (scan_bindings, match_tokens, written_version_token) =
         branch_scan_bindings(freeze.input, scan_schema.as_ref())?;
+    Ok(ConnectorWriteRewriteSource::new(
+        source,
+        pinned_source,
+        freeze.base_version_digest,
+        scan_schema,
+        scan_bindings,
+        match_tokens,
+        written_version_token,
+    ))
+}
+
+fn freeze_branch_source_with_original_scope(
+    freeze: &IcebergCowFreezeInput<'_>,
+    data_file: DataFileWithStats,
+    scope: &crate::commit::write_stack::control::cow_begin::CowBeginScope<'_>,
+) -> Result<ConnectorWriteRewriteSource, novarocks_spi::connector::ConnectorCowBeginCause> {
+    use crate::commit::write_stack::control::cow_begin::{add, mul, projection_error};
+    use crate::metadata::existing_serde_projection as projection;
+    use std::mem::size_of;
+    scope.active()?;
+    let explicit_file = data_file_with_stats_to_iceberg_data_file_info(data_file);
+    crate::delete_file::validate_delete_apply_cost(&explicit_file)?;
+    let (payload, original) =
+        crate::metadata::frozen_copy_on_write_source_payload_with_original_scope(
+            freeze.catalog,
+            freeze.namespace,
+            freeze.table_name,
+            freeze.metadata,
+            freeze.snapshot_id,
+            explicit_file,
+            scope,
+        )?;
+    // Nova owns its Arrow projection passes; the structural recipe is computed
+    // from the borrowed exact Iceberg field/default graph before those passes.
+    scope.reserve(crate::metadata::cow_projected_schema_upper(
+        freeze.metadata,
+        freeze.snapshot_id,
+        scope,
+    )?)?;
+    let scan_schema =
+        crate::metadata::projected_schema_with_metadata(&payload, &[], freeze.metadata)?;
+    let length = projection::count(&payload, scope).map_err(projection_error)?;
+    if length > freeze.max_handle_payload_bytes as u64 {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "Iceberg copy-on-write frozen source exceeds the request handle budget",
+        )
+        .into());
+    }
+    scope.reserve(add(
+        length,
+        (size_of::<Vec<u8>>()
+            + size_of::<novarocks_spi::connector::ConnectorPayloadRetentionGuard>()
+            + 2 * size_of::<usize>()) as u64,
+    )?)?;
+    let encoded = projection::exact_json(&payload, length, scope)
+        .map_err(projection_error)?
+        .into_bytes();
+    // The original holder travels inside the actual payload backing. All
+    // transport/handle clones share this owner until the last Bytes alias exits.
+    struct PayloadOwner {
+        bytes: Vec<u8>,
+        _original: novarocks_spi::connector::ConnectorPayloadRetentionGuard,
+    }
+    impl AsRef<[u8]> for PayloadOwner {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+    let paths = payload.explicit_files.iter().flatten();
+    use crate::commit::write_stack::control::cow_begin::geometry_error;
+    use crate::read_snapshot::cow_capture::geometry;
+    let mut pinned = geometry::arc_bytes::<novarocks_spi::connector::ConnectorCowBeginCause>(
+        payload.namespace.len(),
+    )
+    .map_err(geometry_error)?;
+    pinned = add(
+        pinned,
+        geometry::arc_bytes::<novarocks_spi::connector::ConnectorCowBeginCause>(
+            payload.table.len(),
+        )
+        .map_err(geometry_error)?,
+    )?;
+    let files = paths.clone().count();
+    // try_new starts an empty Vec (minimum capacity four), then sorts it.
+    pinned = add(
+        pinned,
+        mul(
+            (files.max(4) * 3) as u64,
+            size_of::<std::sync::Arc<str>>() as u64,
+        )?,
+    )?;
+    for file in paths.clone() {
+        pinned = add(
+            pinned,
+            geometry::arc_bytes::<novarocks_spi::connector::ConnectorCowBeginCause>(
+                file.path.len(),
+            )
+            .map_err(geometry_error)?,
+        )?;
+    }
+    let bindings = match freeze.input {
+        ConnectorWriteInputShape::RowLineage {
+            data_fields,
+            row_identity_fields,
+        } => data_fields.len() + row_identity_fields.len(),
+        _ => 0,
+    };
+    scope.reserve(add(
+        pinned,
+        mul(
+            bindings as u64,
+            (3 * size_of::<ConnectorRowMutationScanBinding>()
+                + 2 * size_of::<ConnectorWriteFieldToken>()
+                + 2 * size_of::<usize>()) as u64,
+        )?,
+    )?)?;
+    let pinned_source = ConnectorPinnedFileSet::try_new(
+        &payload.namespace,
+        &payload.table,
+        freeze.snapshot_id,
+        paths.map(|f| f.path.as_str()),
+    )?;
+    let source = ConnectorTableHandle::try_new(
+        freeze.catalog.clone(),
+        Bytes::from_owner(PayloadOwner {
+            bytes: encoded,
+            _original: original,
+        }),
+    )?;
+    let (scan_bindings, match_tokens, written_version_token) =
+        branch_scan_bindings(freeze.input, scan_schema.as_ref())?;
+    scope.active()?;
     Ok(ConnectorWriteRewriteSource::new(
         source,
         pinned_source,
