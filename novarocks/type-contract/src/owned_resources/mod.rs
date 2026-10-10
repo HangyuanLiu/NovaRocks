@@ -23,6 +23,7 @@ pub mod btree;
 #[cfg(test)]
 mod bytes_profile;
 pub mod copy;
+pub mod formatting;
 pub mod hashmap;
 pub mod layout;
 pub mod profile;
