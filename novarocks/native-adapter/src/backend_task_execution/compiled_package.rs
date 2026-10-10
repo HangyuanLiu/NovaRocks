@@ -145,6 +145,13 @@ where
                     "package runtime-filter bindings are not resolvable: {error}"
                 ))
             })?;
+        // The compiled RootResult algorithm gathers its terminal pipeline to
+        // one driver; this width is independent of the task pipeline DOP.
+        let root_sink_dop = matches!(
+            package.fragment().sink(),
+            novarocks_physical_plan::FragmentSink::RootResult(_)
+        )
+        .then_some(NonZeroUsize::MIN);
         let validated = validate_fragment_providers(Arc::new(package), &self.providers, control)
             .map_err(|error| match error {
                 ProviderPreparationError::Control(cause) => CompiledPackageError::Control(cause),
@@ -157,9 +164,7 @@ where
             &self.functions,
             LocalCompileOptions {
                 pipeline_dop: options.pipeline_dop,
-                // The plan-tree path places a root sink by the task's DOP,
-                // so the compiled profile freezes no separate width.
-                root_sink_dop: None,
+                root_sink_dop,
                 kernel_abi: KernelAbiVersion::CURRENT,
                 constants: self.constants,
                 exchange_wait: options.exchange_wait,
