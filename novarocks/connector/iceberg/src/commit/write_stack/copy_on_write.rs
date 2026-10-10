@@ -447,7 +447,12 @@ pub(crate) fn freeze_copy_on_write_branches(
             .get(old_file)
             .ok_or_else(|| corrupt("Iceberg copy-on-write base lost a matched data file"))?;
         validate_matched_rows(old_file, rows, data_file)?;
-        let rewrite_source = freeze_branch_source(&freeze, data_file.clone())?;
+        // Validation above retains its original order and borrows the original file.
+        // The local map is the unique owner; no later branch reads this entry.
+        let data_file = by_path
+            .remove(old_file)
+            .ok_or_else(|| corrupt("Iceberg copy-on-write base lost a matched data file"))?;
+        let rewrite_source = freeze_branch_source(&freeze, data_file)?;
         recipes.push(IcebergCowBranchRecipe {
             input: IcebergCowBranchInput::Rewrite {
                 old_file: old_file.clone(),

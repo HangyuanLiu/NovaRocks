@@ -2015,10 +2015,12 @@ fn build_cow_update_distributed_write(
     }
     let selection = routing.selection();
     let contract = routing.match_contract();
-    let mut sealed = write_session.targets().to_vec();
-    sealed.sort_by_key(novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan::ordinal);
+    // Ordering borrows the session's sealed targets; it does not copy each
+    // target's input, routing proof, or frozen source graph.
+    let mut sealed = write_session.targets().iter().collect::<Vec<_>>();
+    sealed.sort_by_key(|target| target.ordinal());
     let mut targets = Vec::with_capacity(sealed.len());
-    for write_target in &sealed {
+    for write_target in sealed {
         let route = write_target.route().ok_or_else(|| {
             format!(
                 "copy-on-write write target {} carries no provider routing facts",
