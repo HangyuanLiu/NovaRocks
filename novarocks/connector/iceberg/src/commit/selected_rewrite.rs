@@ -810,32 +810,12 @@ mod preparer_tests {
                 .await
                 .unwrap()
                 .unwrap();
-        // Temporary P9 migration comparison; remove with the vendor action in T10.
-        let sdk_table = crate::iceberg::table::Table::builder()
-            .identifier(intent.target().ident.clone())
-            .metadata(metadata.clone())
-            .file_io(writer.io.clone())
-            .build()
-            .unwrap();
-        let mut sdk = {
-            use crate::iceberg::transaction::{ApplyTransactionAction, Transaction};
-            let tx = Transaction::new(&sdk_table);
-            tx.update_statistics()
-                .set_statistics(statistics.clone())
-                .apply(tx)
-                .await
-                .unwrap()
-                .into_table_commit()
-        };
-        let sdk_updates = sdk.take_updates();
-        assert!(sdk.take_requirements().is_empty());
         let mut staging = StagingEngine::begin(base(metadata), &intent, &writer).unwrap();
         let preparer = super::super::statistics::StatisticsPreparer {
             statistics: statistics.clone(),
         };
         let change = preparer.prepare(&staging.view(), &intent).await.unwrap();
         assert!(change.requirements.is_empty());
-        assert_eq!(change.updates, sdk_updates);
         assert_eq!(
             serde_json::to_value(&change.updates).unwrap(),
             serde_json::json!([{"action":"set-statistics","snapshot-id":10,"statistics":statistics}])
