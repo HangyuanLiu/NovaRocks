@@ -1135,31 +1135,6 @@ mod application_document_publication_trace_tests {
         .expect("Iceberg commit handle")
     }
 
-    fn recovery_evidence(
-        fixture: &Fixture,
-        plan: &novarocks_spi::connector::write_stack::session::ConnectorWriteSessionPlan,
-        expected_manifest: &[u8],
-    ) -> novarocks_spi::connector::ExternalMutationEvidence {
-        let handle = iceberg_handle(fixture, plan);
-        handle
-            .bind_document_manifest(expected_manifest)
-            .expect("bind prepared document manifest");
-        crate::commit::write_stack::control::encode_session_evidence(
-            fixture.provider.descriptor(),
-            fixture.provider.incarnation(),
-            handle,
-            &RecoveryEvidence {
-                table_ident: "db.t".to_string(),
-                op_kind: handle.commit_op_kind(),
-                base_snapshot_id: handle.table().base_snapshot_id(),
-                base_sequence_number: handle.table().base_sequence_number(),
-                staging_dir: handle.staging_dir(),
-                manifest_cleanup_token: None,
-            },
-        )
-        .expect("encode write recovery evidence")
-    }
-
     fn assert_exact_target_mutation(
         fixture: &Fixture,
         base_snapshot_id: Option<i64>,
@@ -1224,17 +1199,6 @@ mod application_document_publication_trace_tests {
                 ConnectorManagedPublicationShape::Data,
             ))
             .expect("begin full document publication");
-        let evidence = recovery_evidence(&fixture, &plan, &prepared.expected_manifest);
-        assert!(evidence.provider_payload().len() < MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES);
-        let evidence_payload: serde_json::Value =
-            serde_json::from_slice(evidence.provider_payload()).expect("decode evidence payload");
-        assert_eq!(
-            evidence_payload["document_manifest_digest"]
-                .as_array()
-                .expect("document manifest digest")
-                .len(),
-            32
-        );
         let outcome = control
             .finish_write(ConnectorWriteFinishRequest {
                 commit: plan.commit_handle(),
@@ -1251,6 +1215,19 @@ mod application_document_publication_trace_tests {
                 context: context(),
             })
             .expect("finish full document publication");
+        let evidence = iceberg_handle(&fixture, &plan)
+            .recovery_evidence()
+            .expect("checked dispatch recovery evidence");
+        assert!(evidence.provider_payload().len() < MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES);
+        let evidence_payload: serde_json::Value =
+            serde_json::from_slice(evidence.provider_payload()).expect("decode evidence payload");
+        assert_eq!(
+            evidence_payload["document_manifest_digest"]
+                .as_array()
+                .expect("document manifest digest")
+                .len(),
+            32
+        );
         let ExternalMutationOutcome::KnownCommitted {
             receipt,
             finalization,
@@ -1523,7 +1500,6 @@ mod application_document_publication_trace_tests {
                 ConnectorManagedPublicationShape::Data,
             ))
             .expect("begin eager repartition publication");
-        let evidence = recovery_evidence(&fixture, &plan, &prepared.expected_manifest);
         let outcome = control
             .finish_write(ConnectorWriteFinishRequest {
                 commit: plan.commit_handle(),
@@ -1540,6 +1516,9 @@ mod application_document_publication_trace_tests {
                 context: context(),
             })
             .expect("finish eager repartition publication");
+        let evidence = iceberg_handle(&fixture, &plan)
+            .recovery_evidence()
+            .expect("checked dispatch recovery evidence");
         let ExternalMutationOutcome::KnownCommitted { receipt, .. } = outcome else {
             panic!("eager repartition publication must be known committed");
         };
@@ -1654,11 +1633,14 @@ mod application_document_publication_trace_tests {
     impl CatalogCommitDispatch for RecordingUpdateDispatch {
         async fn dispatch_once(
             &self,
-            staged: Option<crate::iceberg::TableCommit>,
+            staged: Option<&crate::commit::model::FrozenRequest>,
         ) -> crate::iceberg::Result<CommitProof> {
             let staged = staged.expect("eager publication must stage a commit");
-            let expected_snapshot = staged.updated_ref_snapshot_id("main");
-            let table = self.catalog.update_table(staged).await?;
+            let expected_snapshot = staged.ref_snapshot_after("main");
+            let table = self
+                .catalog
+                .update_table(staged.into_table_commit())
+                .await?;
             Ok(CommitProof::applied(expected_snapshot)
                 .with_table_uuid(table.metadata().uuid().to_string()))
         }
@@ -1680,30 +1662,82 @@ mod application_document_publication_trace_tests {
     async fn eager_document_publication_is_one_exact_main_commit() {
         let fixture = fixture().await;
         let file = written_file(&fixture.table, "eager");
-        let collector = collector(
-            &fixture.table,
-            CommitOpKind::FastAppend,
-            fixture.table.metadata().default_partition_spec().clone(),
-            vec![file],
-        );
+        use crate::commit::model::{
+            AddedContent, FileChanges, IsolationLevel, OperationIntent, OperationIntentParts,
+            OperationToken, RequestShape, TableTarget,
+        };
+        use crate::commit::operation::{IcebergCommitOperation, OperationLimits};
+        use crate::commit::staging::{StagingBase, StagingEngine};
         let (properties, unresolved) = prepared_snapshot_properties("eager");
-        let (transaction, outcome) =
-            crate::commit::fast_append::stage_eager_fast_append(CommitCtx {
-                collector: &collector,
-                table: &fixture.table,
-                catalog: fixture.catalog.as_ref(),
-                file_io: fixture.table.file_io(),
-                commit_uuid: Uuid::now_v7(),
-                abort_handle: Arc::clone(&collector.abort_log),
-                target_ref: "main",
-                snapshot_properties: &properties,
-            })
+        let operation = IcebergCommitOperation::new(
+            OperationToken::from_mutation(ConnectorMutationOperationId::from_bytes([7; 16])),
+            fixture.table.metadata().location(),
+            fixture
+                .provider
+                .runtime()
+                .resources()
+                .planning_binding()
+                .clone(),
+            context(),
+            fixture
+                .provider
+                .runtime()
+                .resources()
+                .catalog_runtime()
+                .clone(),
+            OperationLimits::default(),
+        )
+        .unwrap();
+        let attempt = operation.begin_attempt().unwrap();
+        let intent = OperationIntent::new(OperationIntentParts {
+            target: TableTarget {
+                ident: fixture.table.identifier().clone(),
+                uuid: Some(fixture.table.metadata().uuid()),
+            },
+            target_ref: "main".into(),
+            start: None,
+            changes: FileChanges {
+                added: vec![
+                    AddedContent::new_logical_data(
+                        crate::commit::data_file::from_written_file(&file).unwrap(),
+                        file.partition_spec_id,
+                    )
+                    .unwrap(),
+                ],
+                removed: vec![],
+            },
+            dependencies: vec![crate::commit::model::Dependency::NoReadDependency],
+            isolation: IsolationLevel::Snapshot,
+            shape: RequestShape::SnapshotProducing,
+            summary: properties,
+            token: operation.token(),
+        })
+        .unwrap();
+        let mut engine = StagingEngine::begin(
+            StagingBase::Existing {
+                metadata: fixture.table.metadata().clone(),
+                metadata_location: fixture.table.metadata_location().unwrap().to_string(),
+            },
+            &intent,
+            &attempt,
+        )
+        .unwrap();
+        engine
+            .stage(&crate::commit::fast_append::FastAppendPreparer)
             .await
-            .expect("stage eager document publication");
-        let mut staged = transaction.into_table_commit();
-        staged.add_requirement(TableRequirement::UuidMatch {
-            uuid: fixture.table.metadata().uuid(),
-        });
+            .unwrap();
+        let snapshot_id = engine
+            .metadata()
+            .snapshot_for_ref("main")
+            .unwrap()
+            .snapshot_id();
+        let manifest_paths: Vec<_> = operation
+            .artifacts()
+            .unwrap()
+            .iter()
+            .map(|r| r.object.path().to_string())
+            .collect();
+        let staged = engine.freeze(&[]).unwrap();
         let mut frontier = crate::catalog::transaction::Transaction::new(
             TransactionIdentity::new("document-publication-test", [7; 16]),
             CatalogTableName::new("db", "t"),
@@ -1724,7 +1758,7 @@ mod application_document_publication_trace_tests {
         assert_one_snapshot_commit(
             &fixture.catalog,
             &["add-snapshot", "set-snapshot-ref"],
-            outcome.new_snapshot_id,
+            snapshot_id,
         );
         let table = fixture
             .catalog
@@ -1733,7 +1767,7 @@ mod application_document_publication_trace_tests {
             .expect("reload eager publication");
         crate::document_storage::publication::validate_expected_manifest(
             table.metadata(),
-            outcome.new_snapshot_id,
+            snapshot_id,
             &unresolved,
         )
         .expect("exact eager document attachment");

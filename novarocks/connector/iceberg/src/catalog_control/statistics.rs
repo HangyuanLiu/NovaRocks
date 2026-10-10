@@ -688,9 +688,41 @@ impl StatisticsCollectionSession for IcebergStatisticsCollectionSession {
                     return Err(error);
                 }
             };
-            staged.add_requirement(crate::iceberg::TableRequirement::UuidMatch {
+            // Temporary caller migration while the statistics lifecycle is moved
+            // to the operation runner. Owner handoff is already a complete request.
+            use crate::commit::model::{
+                AttemptArtifacts, AttemptToken, BaseIdentity, FrozenRequest, FrozenRequestParts,
+                OperationToken, RequestShape,
+            };
+            let mut requirements = staged.take_requirements();
+            requirements.push(crate::iceberg::TableRequirement::UuidMatch {
                 uuid: expected_uuid,
             });
+            let staged = FrozenRequest::new(FrozenRequestParts {
+                shape: RequestShape::MetadataOnly,
+                target: staged.identifier().clone(),
+                target_ref: "main".to_string(),
+                base: BaseIdentity::Existing {
+                    uuid: expected_uuid,
+                    parent: this
+                        .physical_table
+                        .metadata()
+                        .current_snapshot()
+                        .map(|s| s.snapshot_id()),
+                    metadata_location: this
+                        .physical_table
+                        .metadata_location()
+                        .unwrap_or_default()
+                        .to_string(),
+                },
+                requirements,
+                updates: staged.take_updates(),
+                artifacts: AttemptArtifacts::empty(AttemptToken::new(
+                    OperationToken::from_mutation(this.operation_id),
+                    u32::from(attempt),
+                )),
+            })
+            .map_err(|e| corrupt(e.to_string()))?;
             if let Err(error) = frontier.stage(staged) {
                 let error = abort_statistics_frontier(&this.provider, frontier, error);
                 cleanup_uncommitted_statistics_file(
@@ -1518,7 +1550,7 @@ mod tests {
     impl CatalogCommitDispatch for CountingDispatch {
         async fn dispatch_once(
             &self,
-            _staged: Option<crate::iceberg::TableCommit>,
+            _staged: Option<&crate::commit::model::FrozenRequest>,
         ) -> Result<CommitProof, IcebergError> {
             self.dispatches.fetch_add(1, Ordering::SeqCst);
             match self.behavior {
@@ -1768,6 +1800,7 @@ mod tests {
         Table::builder()
             .identifier(TableIdent::from_strs(["db", "t"]).expect("identifier"))
             .metadata(metadata)
+            .metadata_location("memory://warehouse/db/t/metadata/base.metadata.json")
             .file_io(file_io)
             .build()
             .expect("table")

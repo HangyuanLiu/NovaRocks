@@ -135,6 +135,80 @@ impl Publisher for TransitionalPublisher {
     }
 }
 
+/// Eager writes retain the catalog-owner transaction frontier. The request is
+/// complete before admission and is borrowed only by the single dispatch.
+pub(crate) struct OwnerPublisher {
+    pub target: TransitionalPublisher,
+    pub operation: super::model::OperationToken,
+    pub marker: Option<(std::sync::Arc<str>, std::sync::Arc<str>)>,
+}
+
+#[async_trait]
+impl Publisher for OwnerPublisher {
+    async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase> {
+        self.target.load_target(attempt).await
+    }
+
+    fn preflight_recovery(
+        &self,
+        request: &FrozenRequest,
+        operation: &IcebergCommitOperation,
+    ) -> Result<()> {
+        self.target.preflight_recovery(request, operation)
+    }
+
+    async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
+        use super::model::BaseIdentity;
+        use crate::catalog::CatalogTransactionStart;
+        use crate::catalog::transaction::{TransactionIdentity, TransactionRequest};
+        if request.identifier() != &self.target.ident
+            || request.target_ref() != self.target.target_ref
+            || request.artifacts().attempt().operation() != self.operation
+        {
+            return CatalogOutcome::uncommitted(
+                ConnectorMutationFailureKind::InvalidRequest,
+                "Frozen owner request differs from its admitted operation or target",
+            );
+        }
+        let BaseIdentity::Existing { uuid, parent, .. } = request.base() else {
+            return CatalogOutcome::uncommitted(
+                ConnectorMutationFailureKind::InvalidRequest,
+                "Existing owner publication cannot dispatch a create request",
+            );
+        };
+        let admission = TransactionRequest {
+            identity: TransactionIdentity::new(
+                self.operation.authority().label(),
+                self.operation.to_bytes(),
+            ),
+            target: crate::catalog::CatalogTableName::from_identifier(request.identifier()),
+            target_ref: std::sync::Arc::from(request.target_ref()),
+            base_snapshot_id: *parent,
+            expected_table_uuid: Some(std::sync::Arc::from(uuid.to_string())),
+            marker: self.marker.clone(),
+        };
+        let mut frontier = match self.target.catalog.new_transaction(admission).await {
+            CatalogTransactionStart::Ready(frontier) => frontier,
+            CatalogTransactionStart::KnownUncommitted { failure } => {
+                return CatalogOutcome::KnownUncommitted { failure };
+            }
+            CatalogTransactionStart::CommitUnknown { failure, evidence } => {
+                return CatalogOutcome::CommitUnknown { failure, evidence };
+            }
+            CatalogTransactionStart::Unsupported(error) => {
+                return CatalogOutcome::Unsupported(error);
+            }
+        };
+        if let Err(error) = frontier.stage(request) {
+            return CatalogOutcome::uncommitted(
+                ConnectorMutationFailureKind::InvalidRequest,
+                error.message(),
+            );
+        }
+        frontier.commit().await
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RetryPolicy {
     retries: u32,
@@ -426,7 +500,10 @@ async fn prepare(
     Ok((request, retained))
 }
 
-async fn rejected(operation: &IcebergCommitOperation, failure: ConnectorMutationFailure) -> Report {
+pub(crate) async fn rejected(
+    operation: &IcebergCommitOperation,
+    failure: ConnectorMutationFailure,
+) -> Report {
     Report {
         publication: PublicationOutcome::KnownUncommitted(failure),
         cleanup: operation.cleanup(CleanupScope::EntireOperation).await,
@@ -692,6 +769,152 @@ mod tests {
             policy(),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn mor_frozen_before_another_branch_commit_inherits_actual_publication_sequence() {
+        use super::super::model::{ArtifactClass, ArtifactKind, ArtifactWriter, StartSnapshot};
+        use super::super::row_delta_dv_metadata::{LiveFile, WrittenDvFile, dv_data_file};
+        use crate::iceberg::spec::{SnapshotReference, SnapshotRetention};
+        let fixture = Fixture::new();
+        let source = append_state(&fixture, fixture.metadata(FormatVersion::V3), 4).await;
+        let source_id = source.current_snapshot_id().unwrap();
+        let source_sequence = source.snapshot_by_id(source_id).unwrap().sequence_number();
+        let source_data = data(
+            &format!(
+                "file://{}/race-4.parquet",
+                fixture.directory.path().display()
+            ),
+            4,
+            Struct::empty(),
+        );
+        let writer = fixture.operation.begin_attempt().unwrap();
+        let object = writer
+            .allocate(ArtifactClass::Operation, ArtifactKind::DeletionVector)
+            .unwrap();
+        let mut vector = super::super::DeletionVector::new();
+        vector.insert(1).unwrap();
+        let written = super::super::write_single_deletion_vector_puffin(
+            writer.file_io(),
+            object.path(),
+            source_data.file_path(),
+            &vector,
+        )
+        .await
+        .unwrap();
+        let dv = dv_data_file(
+            &WrittenDvFile::from(written),
+            &LiveFile {
+                data_file: source_data,
+                partition_spec_id: 0,
+                snapshot_id: source_id,
+                sequence_number: source_sequence,
+                file_sequence_number: Some(source_sequence),
+            },
+        )
+        .unwrap();
+        let updated_path = format!(
+            "file://{}/updated.parquet",
+            fixture.directory.path().display()
+        );
+        let intent = OperationIntent::new(OperationIntentParts {
+            target: TableTarget {
+                ident: crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
+                uuid: Some(source.uuid()),
+            },
+            target_ref: "main".into(),
+            start: Some(StartSnapshot {
+                snapshot_id: source_id,
+                sequence_number: source_sequence,
+            }),
+            changes: FileChanges {
+                added: vec![
+                    AddedContent::new_logical_data(data(&updated_path, 1, Struct::empty()), 0)
+                        .unwrap(),
+                    AddedContent::new_logical_data(dv, 0).unwrap(),
+                ],
+                removed: vec![],
+            },
+            dependencies: vec![Dependency::RefUnchanged],
+            isolation: IsolationLevel::Serializable,
+            shape: RequestShape::SnapshotProducing,
+            summary: Default::default(),
+            token: fixture.operation.token(),
+        })
+        .unwrap();
+        // This branch commits only after the statement's source facts and
+        // outputs are frozen, but before the publication's authoritative load.
+        let branched = source
+            .into_builder(None)
+            .set_ref(
+                "audit",
+                SnapshotReference::new(source_id, SnapshotRetention::branch(None, None, None)),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let branch_intent = fixture.intent(
+            &branched,
+            "audit",
+            vec![
+                AddedContent::new_logical_data(
+                    data(
+                        &format!(
+                            "file://{}/audit.parquet",
+                            fixture.directory.path().display()
+                        ),
+                        2,
+                        Struct::empty(),
+                    ),
+                    0,
+                )
+                .unwrap(),
+            ],
+        );
+        let after_branch = fixture
+            .stage(branched, &branch_intent, &FastAppendPreparer)
+            .await
+            .0;
+        assert_eq!(after_branch.current_snapshot_id(), Some(source_id));
+        assert!(after_branch.last_sequence_number() > source_sequence);
+        let expected = after_branch.next_sequence_number();
+        let publisher = ControlledPublisher::new(&fixture, after_branch, Dispatch::Commit);
+        let report = run(
+            &fixture.operation,
+            &intent,
+            &PreparedChange::default(),
+            &[&super::super::row_delta_dv_from_files::RowDeltaDvFromFilesPreparer],
+            &publisher,
+            policy(),
+        )
+        .await;
+        assert!(
+            matches!(report.publication, PublicationOutcome::Committed(_)),
+            "{report:?}"
+        );
+        assert_eq!(publisher.requests.lock().unwrap().len(), 1);
+        let committed = publisher.metadata.lock().unwrap().clone();
+        assert_eq!(
+            committed.current_snapshot().unwrap().sequence_number(),
+            expected
+        );
+        let read = fixture.operation.begin_attempt().unwrap();
+        let mut inputs = super::super::dependency::ValidationInputs::new(
+            &committed,
+            committed.current_snapshot_id(),
+            &read,
+        );
+        let live = inputs.live_set().await.unwrap();
+        let new_entries: Vec<_> = live
+            .values()
+            .filter(|e| e.file.file_path() == updated_path || e.file.file_path() == object.path())
+            .collect();
+        assert_eq!(new_entries.len(), 2);
+        for entry in new_entries {
+            assert_eq!(entry.frozen.facts().data_sequence, Some(expected));
+            assert_eq!(entry.frozen.facts().file_sequence, Some(expected));
+        }
     }
 
     #[test]

@@ -141,7 +141,7 @@ pub enum OperationAuthority {
 }
 
 impl OperationAuthority {
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Write => "write",
             Self::Mutation => "mutation",
@@ -220,6 +220,9 @@ impl AttemptToken {
     }
     pub const fn ordinal(self) -> u32 {
         self.ordinal
+    }
+    pub const fn nonce_bytes(self) -> [u8; 16] {
+        *self.nonce.as_bytes()
     }
     pub fn path_component(self) -> String {
         format!("{}-attempt-{}-{}", self.operation, self.ordinal, self.nonce)

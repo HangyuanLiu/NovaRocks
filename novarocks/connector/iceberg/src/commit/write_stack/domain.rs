@@ -1870,6 +1870,9 @@ pub struct IcebergCommitHandle {
     statistics_expectations:
         BTreeMap<WriteTargetOrdinal, Vec<novarocks_spi::connector::StatisticsArtifactIdentity>>,
     document_manifest: std::sync::Mutex<Option<Vec<u8>>>,
+    terminal_finalization: std::sync::Mutex<novarocks_spi::connector::ExternalMutationFinalization>,
+    recovery_evidence:
+        Arc<std::sync::Mutex<Option<novarocks_spi::connector::ExternalMutationEvidence>>>,
     state: std::sync::Mutex<IcebergWriteSessionState>,
 }
 
@@ -1934,7 +1937,7 @@ pub enum IcebergWriteSessionState {
     /// A commit is in flight. A second terminal call must not start another.
     Committing,
     /// The external commit is proven to have happened.
-    KnownCommitted { snapshot_id: i64 },
+    KnownCommitted { snapshot_id: Option<i64> },
     /// The prepared write set was sealed into a receipt and no external commit
     /// was attempted. Only a staged-create session reaches this: the single
     /// external effect belongs to the publication that owns the staged target,
@@ -2121,6 +2124,10 @@ impl IcebergCommitHandle {
             repartition,
             statistics_expectations: BTreeMap::new(),
             document_manifest: std::sync::Mutex::new(None),
+            terminal_finalization: std::sync::Mutex::new(
+                novarocks_spi::connector::ExternalMutationFinalization::Complete,
+            ),
+            recovery_evidence: Arc::new(std::sync::Mutex::new(None)),
             state: std::sync::Mutex::new(IcebergWriteSessionState::Active),
         })
     }
@@ -2439,6 +2446,59 @@ impl IcebergCommitHandle {
         }
     }
 
+    pub(crate) fn retain_finalization(
+        &self,
+        result: novarocks_spi::connector::ExternalMutationFinalization,
+    ) {
+        *self
+            .terminal_finalization
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = result;
+    }
+
+    pub(crate) fn terminal_finalization(
+        &self,
+    ) -> novarocks_spi::connector::ExternalMutationFinalization {
+        self.terminal_finalization
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn recovery_evidence_slot(
+        &self,
+    ) -> Arc<std::sync::Mutex<Option<novarocks_spi::connector::ExternalMutationEvidence>>> {
+        Arc::clone(&self.recovery_evidence)
+    }
+
+    pub(crate) fn retain_recovery_evidence(
+        &self,
+        evidence: novarocks_spi::connector::ExternalMutationEvidence,
+    ) -> Result<(), ConnectorError> {
+        if evidence.operation_id().to_bytes() != self.session_id.to_bytes() {
+            return Err(invalid(
+                "Iceberg recovery evidence names a different session",
+            ));
+        }
+        *self
+            .recovery_evidence
+            .lock()
+            .map_err(|_| invalid("Iceberg recovery evidence state poisoned"))? = Some(evidence);
+        Ok(())
+    }
+
+    pub(crate) fn recovery_evidence(
+        &self,
+    ) -> Result<novarocks_spi::connector::ExternalMutationEvidence, ConnectorError> {
+        self.recovery_evidence
+            .lock()
+            .map_err(|_| invalid("Iceberg recovery evidence state poisoned"))?
+            .clone()
+            .ok_or_else(|| {
+                invalid("Iceberg unknown session has no complete checked recovery evidence")
+            })
+    }
+
     pub fn settle(&self, terminal: IcebergWriteSessionState) -> Result<(), ConnectorError> {
         if matches!(
             terminal,
@@ -2732,7 +2792,9 @@ mod tests {
         handle.begin_commit().expect("first attempt");
         assert!(handle.begin_commit().is_err());
         handle
-            .settle(IcebergWriteSessionState::KnownCommitted { snapshot_id: 7 })
+            .settle(IcebergWriteSessionState::KnownCommitted {
+                snapshot_id: Some(7),
+            })
             .expect("settle");
         assert!(handle.begin_commit().is_err());
         assert!(handle.settle(IcebergWriteSessionState::Active).is_err());

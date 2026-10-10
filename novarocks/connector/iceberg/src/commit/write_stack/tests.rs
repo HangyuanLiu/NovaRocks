@@ -55,8 +55,8 @@ use parquet::arrow::ArrowWriter;
 use crate::access_binding::IcebergReadBinding;
 use crate::commit::CommitOpKind;
 use crate::commit::write_stack::control::{
-    eager_conflict_backoff, release_session_state, session_freezes_old_deletes,
-    session_plan_from_targets, settle_empty_write_without_commit, validate_prepared_set,
+    release_session_state, session_freezes_old_deletes, session_plan_from_targets,
+    settle_empty_write_without_commit, validate_prepared_set,
 };
 use crate::commit::write_stack::copy_on_write::{IcebergCowBranchInput, IcebergCowBranchRecipe};
 use crate::commit::write_stack::domain::{
@@ -96,30 +96,6 @@ fn request_context() -> ConnectorRequestContext {
         1024 * 1024,
     )
     .expect("request context")
-}
-
-#[test]
-fn conflict_backoff_observes_cancellation_before_another_attempt() {
-    let (_executor, runtime) = unreachable_rest_runtime();
-    let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
-    let context = ConnectorRequestContext::try_new(
-        Instant::now() + Duration::from_secs(1),
-        cancellation.view(),
-        64 * 1024,
-        1024 * 1024,
-    )
-    .expect("context");
-    let cancel = Arc::clone(&cancellation);
-    let worker = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(12));
-        cancel.request_stop();
-    });
-    let started = Instant::now();
-    let error =
-        eager_conflict_backoff(runtime.as_ref(), &context, 2).expect_err("cancelled backoff");
-    worker.join().expect("cancel thread");
-    assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
-    assert!(started.elapsed() < Duration::from_millis(80));
 }
 
 fn descriptor(catalog: &str) -> ConnectorInstanceDescriptor {
@@ -834,7 +810,9 @@ fn a_session_dispatches_at_most_one_snapshot_commit() {
     assert!(second.message().contains("already has a commit in flight"));
 
     handle
-        .settle(IcebergWriteSessionState::KnownCommitted { snapshot_id: 42 })
+        .settle(IcebergWriteSessionState::KnownCommitted {
+            snapshot_id: Some(42),
+        })
         .expect("settle committed");
     assert!(
         handle.begin_commit().is_err(),
@@ -845,6 +823,20 @@ fn a_session_dispatches_at_most_one_snapshot_commit() {
 #[test]
 fn a_commit_unknown_session_stays_unknown_through_release() {
     let (handle, _adapter) = dv_session();
+    let checked_evidence = novarocks_spi::connector::ExternalMutationEvidence::try_new(
+        crate::commit::write_stack::control::ICEBERG_WRITE_SESSION_EVIDENCE_VERSION,
+        descriptor("unit"),
+        ProviderBindingEpoch::from_bytes([9; 16]),
+        novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
+            handle.session_id().to_bytes(),
+        ),
+        crate::commit::write_stack::control::ICEBERG_WRITE_SESSION_OPERATION_KIND,
+        bytes::Bytes::from_static(b"complete checked ledger with retained attempt objects"),
+    )
+    .unwrap();
+    handle
+        .retain_recovery_evidence(checked_evidence.clone())
+        .unwrap();
     handle.begin_commit().expect("commit attempt");
     handle
         .settle(IcebergWriteSessionState::CommitUnknown {
@@ -861,6 +853,10 @@ fn a_commit_unknown_session_stays_unknown_through_release() {
     .expect("release");
     match outcome {
         ConnectorWriteAbortOutcome::CommitUnknown { failure, evidence } => {
+            assert_eq!(
+                evidence, checked_evidence,
+                "release must reuse exact preflight bytes"
+            );
             assert!(failure.message().contains("connection reset by peer"));
             assert!(failure.message().contains("staged files remain at"));
             assert_eq!(
@@ -881,7 +877,9 @@ fn a_known_committed_session_cannot_be_aborted_into_uncommitted() {
     let (handle, _adapter) = dv_session();
     handle.begin_commit().expect("commit attempt");
     handle
-        .settle(IcebergWriteSessionState::KnownCommitted { snapshot_id: 7 })
+        .settle(IcebergWriteSessionState::KnownCommitted {
+            snapshot_id: Some(7),
+        })
         .expect("settle committed");
     let outcome = release_session_state(
         &descriptor("unit"),

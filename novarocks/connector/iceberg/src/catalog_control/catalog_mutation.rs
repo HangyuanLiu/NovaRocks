@@ -2235,7 +2235,14 @@ fn execute_application_document_update(
         expected_table_uuid: Some(Arc::from(expected_uuid.to_string())),
         marker: None,
     };
-    let commit = match application_document_update_commit(table, expected_uuid, properties) {
+    let commit = match application_document_update_commit(
+        table,
+        expected_uuid,
+        properties,
+        request.operation_id,
+        base_snapshot_id,
+        loaded.table.metadata_location().unwrap_or_default(),
+    ) {
         Ok(commit) => commit,
         Err(error) => return Ok(known_uncommitted(error)),
     };
@@ -2354,16 +2361,35 @@ fn application_document_update_commit(
     table: &ConnectorTableIdentity,
     expected_uuid: uuid::Uuid,
     properties: HashMap<String, String>,
-) -> Result<TableCommit, ConnectorError> {
-    Ok(TableCommit::builder()
-        .ident(table_ident(table).map_err(invalid)?)
-        .requirements(vec![TableRequirement::UuidMatch {
+    operation_id: ConnectorMutationOperationId,
+    parent: Option<i64>,
+    metadata_location: &str,
+) -> Result<crate::commit::model::FrozenRequest, ConnectorError> {
+    use crate::commit::model::{
+        AttemptArtifacts, AttemptToken, BaseIdentity, FrozenRequest, FrozenRequestParts,
+        OperationToken, RequestShape,
+    };
+    FrozenRequest::new(FrozenRequestParts {
+        shape: RequestShape::MetadataOnly,
+        target: table_ident(table).map_err(invalid)?,
+        target_ref: "main".to_string(),
+        base: BaseIdentity::Existing {
             uuid: expected_uuid,
-        }])
-        .updates(vec![TableUpdate::SetProperties {
+            parent,
+            metadata_location: metadata_location.to_string(),
+        },
+        requirements: vec![TableRequirement::UuidMatch {
+            uuid: expected_uuid,
+        }],
+        updates: vec![TableUpdate::SetProperties {
             updates: properties,
-        }])
-        .build())
+        }],
+        artifacts: AttemptArtifacts::empty(AttemptToken::new(
+            OperationToken::from_mutation(operation_id),
+            0,
+        )),
+    })
+    .map_err(|e| invalid(e.to_string()))
 }
 
 fn execute_guarded_properties(
@@ -4414,21 +4440,28 @@ mod tests {
             ),
         ]);
 
-        let mut commit =
-            application_document_update_commit(&table, table_uuid, properties.clone()).unwrap();
+        let mut commit = application_document_update_commit(
+            &table,
+            table_uuid,
+            properties.clone(),
+            ConnectorMutationOperationId::from_bytes([3; 16]),
+            None,
+            "file:///tmp/metadata/v1.metadata.json",
+        )
+        .unwrap();
         assert_eq!(
             commit.identifier(),
             &crate::iceberg::TableIdent::from_strs(["managed", "mv"]).unwrap()
         );
         assert!(matches!(
-            commit.take_requirements().as_slice(),
+            commit.requirements(),
             [TableRequirement::UuidMatch { uuid }] if *uuid == table_uuid
         ));
         assert!(matches!(
-            commit.take_updates().as_slice(),
+            commit.updates(),
             [TableUpdate::SetProperties { updates }] if updates == &properties
         ));
-        assert!(commit.is_empty());
+        assert!(commit.has_updates());
     }
 
     fn metadata_file_count(table_location: &str) -> usize {
