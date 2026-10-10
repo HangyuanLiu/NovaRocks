@@ -395,6 +395,40 @@ pub(crate) fn build_compiled_pipeline_graph_with_metadata_host<H: CompiledSchema
     )
 }
 
+/// Forward every original builder input without manufacturing source authority.
+#[cfg(feature = "test-support")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The original builder inputs remain independent in the test bridge"
+)]
+pub fn build_compiled_pipeline_graph_with_metadata_host_for_test<H: CompiledSchemaMetadataScope>(
+    program: &Arc<LocalProgram>,
+    exchange_bindings: ExchangeBindings,
+    scan_bindings: ScanBindings,
+    writer_bindings: crate::runtime::fragment::CompiledWriterBindings,
+    runtime_filter_session: Option<crate::runtime_filter::RuntimeFilterSessionRef>,
+    dep_manager: DependencyManager,
+    pipeline_dop: i32,
+    root_sink_dop: Option<i32>,
+    function_set: Arc<SealedExecutionFunctionSet>,
+    error: Arc<RuntimeErrorState>,
+    host: &mut H,
+) -> ExecutionResult<PipelineGraph> {
+    build_compiled_pipeline_graph_with_metadata_host(
+        program,
+        exchange_bindings,
+        scan_bindings,
+        writer_bindings,
+        runtime_filter_session,
+        dep_manager,
+        pipeline_dop,
+        root_sink_dop,
+        function_set,
+        error,
+        host,
+    )
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "The compiled program and its Task capabilities are independent inputs"

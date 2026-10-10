@@ -689,3 +689,105 @@ fn analytic_schema_actual_worker_stop_keeps_nominal_cause_and_runs_no_original_b
         assert!(journal.body.stopped.is_none());
     }
 }
+
+#[test]
+fn analytic_schema_original_body_error_keeps_owned_bytes_through_the_real_host() {
+    let binding = binding(64 << 20);
+    let owner = TestPreparationControl::new(Duration::from_millis(1));
+    let loan = owner.loan();
+    let mut journal = ProjectMetadataJournal::default();
+    let output = compile_window(&binding, &loan, &mut journal).into_preparation();
+    let program = output.program();
+    let node = analytic(program);
+    let layout = program.graph().nodes()[node.index()].output_layout();
+    // Obtain the actual old diagnostic outside this transport-only test body.
+    // This is not proof of an invalid Map passing native FE validation or of
+    // that different Map constructor's resource envelope.
+    let malformed = StaticLayout::try_new(
+        Arc::new(arrow::datatypes::Schema::new(vec![
+            arrow::datatypes::Field::new(
+                "map",
+                arrow::datatypes::DataType::Map(
+                    Arc::new(arrow::datatypes::Field::new(
+                        "entries",
+                        arrow::datatypes::DataType::Int64,
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+        ])),
+        Arc::from([SlotId::new(1)]),
+    )
+    .unwrap();
+    let original = ChunkSchema::from_compiled_layout(&malformed).unwrap_err();
+    let pointer = original.as_ptr();
+    let mut host = CompiledProjectMetadataHost::new(
+        output.native_metadata_loan().unwrap(),
+        &binding,
+        &loan,
+        &Control,
+        &mut journal,
+    );
+    let failure = host
+        .materialize(
+            program,
+            CompiledSchemaSite::AnalyticOutput(node),
+            layout,
+            || Err(original),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        failure.cause(),
+        ExecutionFailureCause::Pipeline(_)
+    ));
+    assert_eq!(failure.detail(), "map entries is not struct: Int64");
+    assert_eq!(failure.detail().as_ptr(), pointer);
+    drop(host);
+    assert!(journal.body.settlement.is_some());
+}
+
+#[test]
+fn analytic_schema_actual_policy_refuses_before_original_body() {
+    let binding = binding(64 << 20);
+    let owner = TestPreparationControl::new(Duration::from_millis(1));
+    let loan = owner.loan();
+    let mut journal = ProjectMetadataJournal::default();
+    let output = compile_window(&binding, &loan, &mut journal).into_preparation();
+    let program = output.program();
+    let node = analytic(program);
+    let layout = program.graph().nodes()[node.index()].output_layout();
+    binding
+        .account()
+        .install_policy(0, novarocks_memory::LimitDimension::Work);
+    let calls = Cell::new(0);
+    let mut host = CompiledProjectMetadataHost::new(
+        output.native_metadata_loan().unwrap(),
+        &binding,
+        &loan,
+        &Control,
+        &mut journal,
+    );
+    let error = host
+        .materialize(
+            program,
+            CompiledSchemaSite::AnalyticOutput(node),
+            layout,
+            || {
+                calls.set(calls.get() + 1);
+                ChunkSchema::from_compiled_layout(layout)
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error.cause(),
+        ExecutionFailureCause::PreparationMetadata(PreparationMetadataFailure::Host(
+            PreparationMemoryRefusal::Capacity(_)
+        ))
+    ));
+    assert_eq!(calls.get(), 0);
+    drop(host);
+    assert!(journal.capacity.is_some());
+    assert!(journal.body.settlement.is_none());
+}

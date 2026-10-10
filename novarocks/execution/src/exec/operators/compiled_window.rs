@@ -117,6 +117,17 @@ pub struct CompiledWindowProcessorFactory {
     original_function_major: bool,
 }
 
+/// The original Hosted constructor, exported only to isolated allocator tests.
+#[cfg(feature = "test-support")]
+pub fn prepare_window_factory_for_test<H: CompiledSchemaMetadataScope>(
+    program: Arc<LocalProgram>,
+    node: ProgramNodeId,
+    error: Arc<RuntimeErrorState>,
+    host: &mut H,
+) -> ExecutionResult<CompiledWindowProcessorFactory> {
+    CompiledWindowProcessorFactory::try_new_with_metadata_host(program, node, error, host)
+}
+
 impl CompiledWindowProcessorFactory {
     pub(crate) fn try_new(
         program: Arc<LocalProgram>,
