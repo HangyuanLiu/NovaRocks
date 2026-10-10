@@ -251,7 +251,7 @@ impl RegisteredIcebergDataMutationBackend {
                         ))
                     })?;
                 let receipt = template.receipt(snapshot).map_err(format_error)?;
-                preflight_journal.record(evidence, receipt)
+                preflight_journal.record(evidence, receipt, request)
             },
         );
         let direct = TransitionalPublisher {
@@ -333,14 +333,12 @@ impl RegisteredIcebergDataMutationBackend {
             Err(error) => {
                 let recovery_operation = operation.clone();
                 let recovery_journal = journal.clone();
-                operation
-                    .runtime()
-                    .block_on(async move {
-                        recovery_journal
-                            .recover_bridge(&recovery_operation, error)
-                            .await
-                    })
-                    .map_err(|error| internal(format!("Iceberg mutation recovery bridge: {error}")))
+                let recovered = operation.runtime().block_on(async move {
+                    recovery_journal
+                        .recover_bridge(&recovery_operation, error)
+                        .await
+                });
+                Ok(project_recovery_bridge(operation, journal, recovered))
             }
         }
     }
@@ -377,6 +375,20 @@ impl RegisteredIcebergDataMutationBackend {
     }
 }
 
+fn project_recovery_bridge(
+    operation: &IcebergCommitOperation,
+    journal: &PublicationJournal<ConnectorDataMutationReceipt>,
+    result: Result<ExternalMutationOutcome<ConnectorDataMutationReceipt>, String>,
+) -> ExternalMutationOutcome<ConnectorDataMutationReceipt> {
+    match result {
+        Ok(outcome) => outcome,
+        Err(error) => journal.bridge_failure(
+            operation,
+            format!("Iceberg mutation recovery bridge: {error}"),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +402,7 @@ mod tests {
     #[derive(Clone, Copy)]
     enum Behavior {
         Conflict,
+        Commit,
         Unknown,
         PanicBeforeLoad,
         PanicAfterIssue,
@@ -450,11 +463,15 @@ mod tests {
                 .receipt(request.ref_snapshot_after(request.target_ref()).unwrap())
                 .map_err(format_error)?;
             *self.checked.lock().unwrap() = Some(evidence.clone());
-            self.journal.record(evidence, receipt)
+            self.journal.record(evidence, receipt, request)
         }
-        async fn dispatch_once(&self, _request: FrozenRequest) -> CatalogOutcome<CommitProof> {
+        async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             match self.behavior {
+                Behavior::Commit => CatalogOutcome::committed(
+                    CommitProof::applied(request.ref_snapshot_after(request.target_ref())),
+                    ExternalMutationEffect::Applied,
+                ),
                 Behavior::Conflict => CatalogOutcome::uncommitted(
                     ConnectorMutationFailureKind::Conflict,
                     "injected OCC refusal",
@@ -605,6 +622,62 @@ mod tests {
                     );
                 }
                 assert_eq!(evidence, checked.lock().unwrap().clone().unwrap());
+                let before = operation.recovery_artifacts();
+                let secondary = project_recovery_bridge(
+                    &operation,
+                    &journal,
+                    Err("injected second bridge failure".into()),
+                );
+                let ExternalMutationOutcome::CommitUnknown {
+                    evidence: secondary,
+                    ..
+                } = secondary
+                else {
+                    panic!("secondary bridge lost its exact issued carrier")
+                };
+                assert_eq!(secondary, evidence);
+                assert_eq!(operation.recovery_artifacts(), before);
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+            Behavior::Commit => {
+                let ExternalMutationOutcome::KnownCommitted {
+                    receipt,
+                    finalization: ExternalMutationFinalization::Complete,
+                    ..
+                } = outcome
+                else {
+                    panic!("controlled mutation lost its commit proof")
+                };
+                let first = backend
+                    .project_bridge(
+                        &operation,
+                        &journal,
+                        Err("injected first post-proof bridge failure".into()),
+                    )
+                    .unwrap();
+                let second = project_recovery_bridge(
+                    &operation,
+                    &journal,
+                    Err("injected second recovery bridge failure".into()),
+                );
+                for outcome in [first, second] {
+                    let ExternalMutationOutcome::KnownCommitted {
+                        receipt: preserved,
+                        finalization: ExternalMutationFinalization::Failed(_),
+                        ..
+                    } = outcome
+                    else {
+                        panic!("post-proof bridge failure downgraded a proven commit")
+                    };
+                    assert_eq!(preserved, receipt);
+                }
+                for record in operation.recovery_artifacts() {
+                    assert!(
+                        std::path::Path::new(record.object.path().trim_start_matches("file://"))
+                            .exists()
+                    );
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
             }
             Behavior::Conflict => {
                 assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -654,5 +727,13 @@ mod tests {
     fn mutation_actual_full_ledger_capacity_refuses_before_dispatch() {
         exercise(Behavior::Capacity(400), false);
         exercise(Behavior::Capacity(50), true);
+    }
+
+    #[test]
+    fn mutation_secondary_recovery_bridge_keeps_exact_unknown_or_committed_outcome() {
+        for truncate in [false, true] {
+            exercise(Behavior::PanicAfterIssue, truncate);
+            exercise(Behavior::Commit, truncate);
+        }
     }
 }

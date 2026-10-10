@@ -191,7 +191,7 @@ impl Projection {
             Bytes::from(statistics.statistics_path.clone()),
         )
         .map_err(preparation_error)?;
-        journal.record(evidence, receipt)
+        journal.record(evidence, receipt, request)
     }
 
     fn preflight_callback(
@@ -241,9 +241,10 @@ fn run_publication(
                 Ok(outcome) => outcome,
                 // Recovery reads the journal before awaiting cleanup. A second
                 // bridge failure must still preserve any observed proof.
-                Err(error) => journal.bridge_failure(format!(
-                    "Statistics publication recovery bridge failed: {error}"
-                )),
+                Err(error) => journal.bridge_failure(
+                    operation,
+                    format!("Statistics publication recovery bridge failed: {error}"),
+                ),
             }
         }
     }

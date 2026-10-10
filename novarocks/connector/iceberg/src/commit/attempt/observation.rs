@@ -20,7 +20,10 @@
 use super::{Publisher, Report};
 use crate::catalog::error::CatalogOutcome;
 use crate::catalog::transaction::CommitProof;
-use crate::commit::model::{CleanupScope, FrozenRequest, OperationToken, PublicationOutcome};
+use crate::commit::model::{
+    CleanupRemainingReason, CleanupScope, FrozenRequest, IcebergCleanupReport, ObjectIdentity,
+    OperationToken, PublicationOutcome, RemainingArtifact,
+};
 use crate::commit::operation::{IcebergCommitAttempt, IcebergCommitOperation};
 use crate::commit::staging::StagingBase;
 use crate::iceberg::{Error, ErrorKind, Result};
@@ -29,12 +32,14 @@ use novarocks_spi::connector::{
     ConnectorMutationFailure, ConnectorMutationFailureKind, ExternalMutationEvidence,
     ExternalMutationFinalization, ExternalMutationOutcome,
 };
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 struct Checked<R> {
     evidence: ExternalMutationEvidence,
     receipt: R,
+    retained: Vec<ObjectIdentity>,
 }
 #[derive(Clone)]
 enum Phase<R> {
@@ -66,8 +71,15 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
     }
     /// Called only by actual FrozenRequest preflight. Capacity and receipt
     /// projection are checked before this transition can authorize dispatch.
-    pub(crate) fn record(&self, evidence: ExternalMutationEvidence, receipt: R) -> Result<()> {
-        if evidence.operation_id().to_bytes() != self.operation.to_bytes() {
+    pub(crate) fn record(
+        &self,
+        evidence: ExternalMutationEvidence,
+        receipt: R,
+        request: &FrozenRequest,
+    ) -> Result<()> {
+        if evidence.operation_id().to_bytes() != self.operation.to_bytes()
+            || request.artifacts().attempt().operation() != self.operation
+        {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 "Checked recovery carrier names another operation",
@@ -83,7 +95,21 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
                 "Publication cannot prepare again after a possible dispatch",
             ));
         }
-        *phase = Phase::Ready(Checked { evidence, receipt });
+        let retained = request
+            .artifacts()
+            .attempt_owned()
+            .iter()
+            .chain(request.artifacts().operation_references())
+            .chain(request.artifacts().session_references())
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        *phase = Phase::Ready(Checked {
+            evidence,
+            receipt,
+            retained,
+        });
         Ok(())
     }
     pub(crate) fn observe(&self, inner: Arc<dyn Publisher>) -> impl Publisher + use<R> {
@@ -150,34 +176,50 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
                 evidence: checked.evidence,
             },
             Phase::Committed(proof, checked, owner_finalization) => {
+                let cleanup = operation.cleanup_after_commit(&checked.retained).await;
+                let cleanup = if matches!(cleanup, IcebergCleanupReport::NotAttempted) {
+                    remaining_after_bridge(operation, &checked.retained, failure.message())
+                } else {
+                    cleanup
+                };
                 ExternalMutationOutcome::KnownCommitted {
                     effect: proof.effect,
                     receipt: checked.receipt,
                     finalization: merge_finalization(
                         owner_finalization,
-                        ExternalMutationFinalization::Failed(failure),
+                        merge_finalization(
+                            ExternalMutationFinalization::Failed(failure),
+                            cleanup.finalization(),
+                        ),
                     ),
                 }
             }
-            Phase::Rejected(original) => ExternalMutationOutcome::KnownUncommitted {
-                failure: original,
-                cleanup: operation
-                    .cleanup(CleanupScope::EntireOperation)
-                    .await
-                    .finalization(),
-            },
-            Phase::Undispatched | Phase::Ready(_) => ExternalMutationOutcome::KnownUncommitted {
-                failure,
-                cleanup: operation
-                    .cleanup(CleanupScope::EntireOperation)
-                    .await
-                    .finalization(),
-            },
+            Phase::Rejected(original) => {
+                let cleanup = operation.cleanup(CleanupScope::EntireOperation).await;
+                ExternalMutationOutcome::KnownUncommitted {
+                    failure: original,
+                    cleanup: unconfirmed_cleanup_finalization(
+                        operation,
+                        cleanup,
+                        failure.message(),
+                    ),
+                }
+            }
+            Phase::Undispatched | Phase::Ready(_) => {
+                let cleanup = operation.cleanup(CleanupScope::EntireOperation).await;
+                let cleanup =
+                    unconfirmed_cleanup_finalization(operation, cleanup, failure.message());
+                ExternalMutationOutcome::KnownUncommitted { failure, cleanup }
+            }
         }
     }
     /// The recovery bridge itself failed. No physical cleanup completion can
     /// be claimed, while an issued or proven publication keeps its exact fact.
-    pub(crate) fn bridge_failure(&self, message: String) -> ExternalMutationOutcome<R> {
+    pub(crate) fn bridge_failure(
+        &self,
+        operation: &IcebergCommitOperation,
+        message: String,
+    ) -> ExternalMutationOutcome<R> {
         let phase = self
             .phase
             .lock()
@@ -191,24 +233,77 @@ impl<R: Clone + Send + Sync> PublicationJournal<R> {
                 evidence: checked.evidence,
             },
             Phase::Committed(proof, checked, owner_finalization) => {
+                let remaining =
+                    remaining_after_bridge(operation, &checked.retained, failure.message());
                 ExternalMutationOutcome::KnownCommitted {
                     effect: proof.effect,
                     receipt: checked.receipt,
                     finalization: merge_finalization(
                         owner_finalization,
-                        ExternalMutationFinalization::Failed(failure),
+                        merge_finalization(
+                            ExternalMutationFinalization::Failed(failure),
+                            remaining.finalization(),
+                        ),
                     ),
                 }
             }
             Phase::Rejected(original) => ExternalMutationOutcome::KnownUncommitted {
                 failure: original,
-                cleanup: ExternalMutationFinalization::Failed(failure),
+                cleanup: merge_finalization(
+                    ExternalMutationFinalization::Failed(failure.clone()),
+                    remaining_after_bridge(operation, &[], failure.message()).finalization(),
+                ),
             },
             Phase::Undispatched | Phase::Ready(_) => ExternalMutationOutcome::KnownUncommitted {
                 failure: failure.clone(),
-                cleanup: ExternalMutationFinalization::Failed(failure),
+                cleanup: merge_finalization(
+                    ExternalMutationFinalization::Failed(failure.clone()),
+                    remaining_after_bridge(operation, &[], failure.message()).finalization(),
+                ),
             },
         }
+    }
+}
+
+/// Read-only recovery facts grant no permission to remove an object. A proven
+/// request's published roots are excluded from unfinished cleanup reporting.
+fn remaining_after_bridge(
+    operation: &IcebergCommitOperation,
+    retained: &[ObjectIdentity],
+    message: &str,
+) -> IcebergCleanupReport {
+    let retained: BTreeSet<_> = retained.iter().collect();
+    let remaining = operation
+        .recovery_artifacts()
+        .into_iter()
+        .filter(|record| !retained.contains(&record.object))
+        .map(|record| RemainingArtifact {
+            object: record.object,
+            reason: CleanupRemainingReason::BridgeInterrupted(message.to_string()),
+        })
+        .collect::<Vec<_>>();
+    if remaining.is_empty() {
+        IcebergCleanupReport::Complete { deleted: 0 }
+    } else {
+        IcebergCleanupReport::Partial {
+            deleted: 0,
+            remaining,
+        }
+    }
+}
+
+fn unconfirmed_cleanup_finalization(
+    operation: &IcebergCommitOperation,
+    cleanup: IcebergCleanupReport,
+    message: &str,
+) -> ExternalMutationFinalization {
+    if matches!(cleanup, IcebergCleanupReport::NotAttempted) {
+        merge_finalization(
+            cleanup.finalization(),
+            remaining_after_bridge(operation, &[], message).finalization(),
+        )
+    } else {
+        cleanup.finalization()
     }
 }
 
@@ -375,7 +470,8 @@ mod tests {
                 Bytes::from(encoded),
             )
             .unwrap();
-            self.journal.record(evidence, "preflight receipt".into())
+            self.journal
+                .record(evidence, "preflight receipt".into(), request)
         }
         async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
             self.dispatches.fetch_add(1, Ordering::SeqCst);
@@ -558,5 +654,250 @@ mod tests {
         assert_eq!(dispatches.load(Ordering::SeqCst), 0);
         assert!(!path.exists());
         assert!(operation.artifacts().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn postproof_recovery_reports_residue_and_keeps_every_frozen_publication_root() {
+        use crate::commit::model::{AddedContent, ArtifactClass, ArtifactKind, ArtifactWriter};
+        use crate::commit::operation::{CleanupBudget, OperationLimits};
+        use crate::commit::overwrite::preparer_tests::data;
+        use crate::commit::staging::StagingEngine;
+        use crate::iceberg::spec::Struct;
+        use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
+        use std::time::{Duration, Instant};
+
+        for behavior in [
+            Behavior::Commit,
+            Behavior::CommitFinalizationFailure,
+            Behavior::Unknown,
+        ] {
+            let fixture = Fixture::new();
+            let metadata = fixture.metadata(FormatVersion::V3);
+            let runtime = tokio::runtime::Handle::current();
+            let binding = crate::access_binding::IcebergReadBinding::new(
+                None,
+                novarocks_fs::FsAccessResolver::new(),
+                Arc::new(novarocks_fs::TokioFileIoRuntime::new(runtime.clone())),
+                Arc::new(novarocks_fs::TokioFileTaskSpawner::new(runtime.clone())),
+            );
+            let stop = ConnectorStopOwner::new();
+            let operation = IcebergCommitOperation::new(
+                fixture.operation.token(),
+                metadata.location(),
+                binding,
+                ConnectorRequestContext::try_new(
+                    Instant::now() + Duration::from_secs(60),
+                    stop.view(),
+                    64 * 1024,
+                    1024 * 1024,
+                )
+                .unwrap(),
+                crate::resources::IcebergCatalogRuntime::new(runtime),
+                OperationLimits {
+                    cleanup: CleanupBudget {
+                        time: Duration::from_secs(30),
+                        objects: 1,
+                    },
+                    ..OperationLimits::default()
+                },
+            )
+            .unwrap();
+            let old = operation.begin_attempt().unwrap();
+            let mut abandoned = Vec::new();
+            for class in [
+                ArtifactClass::Operation,
+                ArtifactClass::Operation,
+                ArtifactClass::Attempt,
+                ArtifactClass::Attempt,
+            ] {
+                let object = old.allocate(class, ArtifactKind::Manifest).unwrap();
+                old.file_io()
+                    .new_output(object.path())
+                    .unwrap()
+                    .write(Bytes::from_static(b"abandoned"))
+                    .await
+                    .unwrap();
+                abandoned.push(object);
+            }
+            let operation_root = ObjectIdentity::new(format!(
+                "{}/publication-provenance.json",
+                metadata.location()
+            ))
+            .unwrap();
+            let session_root =
+                ObjectIdentity::new(format!("{}/session.parquet", metadata.location())).unwrap();
+            std::fs::write(
+                operation_root.path().trim_start_matches("file://"),
+                b"provenance",
+            )
+            .unwrap();
+            std::fs::write(
+                session_root.path().trim_start_matches("file://"),
+                b"session rows",
+            )
+            .unwrap();
+            operation
+                .adopt_operation_reference(operation_root.clone())
+                .unwrap();
+            operation.adopt_session_data(session_root.clone()).unwrap();
+            let intent = fixture.intent(
+                &metadata,
+                "main",
+                vec![
+                    AddedContent::new_logical_data(
+                        data(session_root.path(), 3, Struct::empty()),
+                        0,
+                    )
+                    .unwrap(),
+                ],
+            );
+            let attempt = operation.begin_attempt().unwrap();
+            let mut engine = StagingEngine::begin(
+                StagingBase::Existing {
+                    metadata: metadata.clone(),
+                    metadata_location: "file:///base.metadata.json".into(),
+                },
+                &intent,
+                &attempt,
+            )
+            .unwrap();
+            engine.stage(&FastAppendPreparer).await.unwrap();
+            let request = engine
+                .freeze(&[operation_root.clone(), session_root.clone()])
+                .unwrap();
+            let mut retained = request.artifacts().attempt_owned().to_vec();
+            retained.extend_from_slice(request.artifacts().operation_references());
+            retained.extend_from_slice(request.artifacts().session_references());
+            let journal = PublicationJournal::new(operation.token());
+            let dispatches = Arc::new(AtomicUsize::new(0));
+            let publisher = journal.observe(Arc::new(Fake {
+                operation: operation.clone(),
+                metadata,
+                metadata_location: "file:///base.metadata.json".into(),
+                journal: journal.clone(),
+                dispatches: dispatches.clone(),
+                behavior,
+            }));
+            publisher.preflight_recovery(&request, &operation).unwrap();
+            publisher.dispatch_once(request).await;
+            let before = operation.recovery_artifacts();
+            let first = journal
+                .recover_bridge(&operation, "first post-dispatch bridge failure".into())
+                .await;
+            let second =
+                journal.bridge_failure(&operation, "second recovery bridge failure".into());
+            if matches!(behavior, Behavior::Unknown) {
+                let (
+                    ExternalMutationOutcome::CommitUnknown {
+                        evidence: first, ..
+                    },
+                    ExternalMutationOutcome::CommitUnknown {
+                        evidence: second, ..
+                    },
+                ) = (first, second)
+                else {
+                    panic!("unknown bridge lost its issued carrier")
+                };
+                assert_eq!(first, second);
+                let Phase::Issued(checked) = &*journal.phase.lock().unwrap() else {
+                    panic!("issued phase lost")
+                };
+                assert_eq!(first, checked.evidence);
+                assert_eq!(operation.recovery_artifacts(), before);
+            } else {
+                let ExternalMutationOutcome::KnownCommitted {
+                    finalization: ExternalMutationFinalization::Failed(first),
+                    ..
+                } = first
+                else {
+                    panic!("first post-proof failure lost its committed verdict")
+                };
+                let ExternalMutationOutcome::KnownCommitted {
+                    finalization: ExternalMutationFinalization::Failed(second),
+                    ..
+                } = second
+                else {
+                    panic!("second post-proof failure lost its committed verdict")
+                };
+                let residue = operation
+                    .recovery_artifacts()
+                    .into_iter()
+                    .filter(|record| !retained.contains(&record.object))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    residue.len(),
+                    3,
+                    "bounded cleanup deletes only one abandoned object"
+                );
+                assert!(
+                    residue
+                        .iter()
+                        .any(|record| record.class == ArtifactClass::Operation)
+                );
+                assert!(
+                    residue
+                        .iter()
+                        .any(|record| record.class == ArtifactClass::Attempt)
+                );
+                for record in &residue {
+                    assert!(abandoned.contains(&record.object));
+                    assert!(first.message().contains(record.object.path()));
+                    assert!(second.message().contains(record.object.path()));
+                }
+                assert!(first.message().contains("BudgetExhausted"));
+                assert!(second.message().contains("BridgeInterrupted"));
+                assert!(!second.message().contains("DeleteFailed"));
+                for object in &retained {
+                    assert!(!first.message().contains(object.path()));
+                    assert!(!second.message().contains(object.path()));
+                }
+                if matches!(behavior, Behavior::CommitFinalizationFailure) {
+                    assert!(
+                        first
+                            .message()
+                            .contains("injected owner finalization failure")
+                    );
+                    assert!(
+                        second
+                            .message()
+                            .contains("injected owner finalization failure")
+                    );
+                }
+            }
+            for object in &retained {
+                assert!(std::path::Path::new(object.path().trim_start_matches("file://")).exists());
+            }
+            assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn undispatched_second_bridge_failure_reports_actual_owned_objects_without_io() {
+        let fixture = Fixture::new();
+        let path = fixture.directory.path().join("owned.parquet");
+        std::fs::write(&path, b"owned").unwrap();
+        let object = ObjectIdentity::new(format!("file://{}", path.display())).unwrap();
+        fixture
+            .operation
+            .adopt_operation_reference(object.clone())
+            .unwrap();
+        let journal = PublicationJournal::<String>::new(fixture.operation.token());
+        let before = fixture.operation.recovery_artifacts();
+        let outcome = journal.bridge_failure(
+            &fixture.operation,
+            "second bridge failed before dispatch".into(),
+        );
+        let ExternalMutationOutcome::KnownUncommitted {
+            cleanup: ExternalMutationFinalization::Failed(failure),
+            ..
+        } = outcome
+        else {
+            panic!("unattempted cleanup was claimed complete")
+        };
+        assert!(failure.message().contains(object.path()));
+        assert!(failure.message().contains("BridgeInterrupted"));
+        assert!(!failure.message().contains("DeleteFailed"));
+        assert!(path.exists());
+        assert_eq!(fixture.operation.recovery_artifacts(), before);
     }
 }

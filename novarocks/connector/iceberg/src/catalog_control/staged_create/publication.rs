@@ -208,7 +208,7 @@ impl Publisher for CreatePublisher {
             expected_snapshot_id,
         )
         .map_err(|error| iceberg_error(error.to_string()))?;
-        self.journal.record(evidence, receipt)
+        self.journal.record(evidence, receipt, request)
     }
 
     async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
@@ -356,9 +356,10 @@ pub(super) fn publish(
             }
         }) {
             Ok(outcome) => outcome,
-            Err(error) => {
-                journal.bridge_failure(format!("Staged-create recovery runtime: {error}"))
-            }
+            Err(error) => journal.bridge_failure(
+                &operation,
+                format!("Staged-create recovery runtime: {error}"),
+            ),
         },
     })
 }
@@ -656,7 +657,8 @@ mod tests {
                     with_data
                 );
                 publisher.preflight_recovery(&request, &operation).unwrap();
-                let outcome = journal.bridge_failure("injected before-dispatch bridge stop".into());
+                let outcome = journal
+                    .bridge_failure(&operation, "injected before-dispatch bridge stop".into());
                 assert!(matches!(
                     outcome,
                     ExternalMutationOutcome::KnownUncommitted { .. }
@@ -809,7 +811,7 @@ mod tests {
                 .unwrap();
             assert!(publisher.preflight_recovery(&request, &operation).is_err());
             assert!(matches!(
-                journal.bridge_failure("preflight refused".into()),
+                journal.bridge_failure(&operation, "preflight refused".into()),
                 ExternalMutationOutcome::KnownUncommitted { .. }
             ));
             assert_eq!(operation.artifacts().unwrap().len(), 351);

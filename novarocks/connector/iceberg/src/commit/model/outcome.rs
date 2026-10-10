@@ -24,6 +24,7 @@ use novarocks_spi::connector::ConnectorMutationFailure;
 pub enum CleanupRemainingReason {
     BudgetExhausted,
     DeleteFailed(String),
+    BridgeInterrupted(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
