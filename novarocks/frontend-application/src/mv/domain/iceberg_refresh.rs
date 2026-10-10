@@ -680,6 +680,12 @@ impl MvCreateProviderAdapter for IcebergMvCreateProviderAdapter {
                 MvCreateProviderErrorKind::TargetOperation,
                 message,
             )),
+            StagedPublishOutcome::CommittedFinalizeFailed(message) => {
+                Err(MvCreateProviderError::new(
+                    MvCreateProviderErrorKind::KnownCommittedFinalizeFailed,
+                    message,
+                ))
+            }
             StagedPublishOutcome::Unknown(message) => Err(MvCreateProviderError::new(
                 MvCreateProviderErrorKind::CommitUnknown,
                 message,

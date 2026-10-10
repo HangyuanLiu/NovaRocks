@@ -412,6 +412,7 @@ pub enum StandardCtasPublishOutcome {
     },
     KnownUncommitted {
         failure: CtasFailure,
+        cleanup: ExternalMutationFinalization,
     },
     CommitUnknown {
         failure: CtasFailure,
@@ -2014,10 +2015,11 @@ impl CtasEngine for DmlExecutionKernel {
                 receipt,
                 finalization,
             }),
-            ConnectorStagedCreatePublishOutcome::Conflict { failure }
-            | ConnectorStagedCreatePublishOutcome::KnownUncommitted { failure } => {
+            ConnectorStagedCreatePublishOutcome::Conflict { failure, cleanup }
+            | ConnectorStagedCreatePublishOutcome::KnownUncommitted { failure, cleanup } => {
                 Ok(StandardCtasPublishOutcome::KnownUncommitted {
                     failure: mutation_failure(failure),
+                    cleanup,
                 })
             }
             ConnectorStagedCreatePublishOutcome::CommitUnknown { failure, evidence } => {

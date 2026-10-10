@@ -17,6 +17,8 @@
 
 //! Freeze once from admission; every catalog conflict prepares fresh metadata.
 
+mod lineage;
+
 use super::*;
 use crate::catalog::error::CatalogCommitEvidence;
 use crate::catalog::transaction::CommitProof;
@@ -95,6 +97,13 @@ impl WriteRecipe {
             }
         }
         let selected = selected_rewrite_files(handle);
+        if crate::schema_facts::row_lineage_enabled(&source)
+            && selected.as_ref().is_some_and(|rewrite| {
+                rewrite.kind == crate::commit::selected_rewrite::SelectedRewriteKind::Data
+            })
+        {
+            lineage::freeze_preserved_row_ids(validated, &mut files)?;
+        }
         let removed_dvs = validated
             .iter()
             .filter(|entry| {
@@ -203,7 +212,7 @@ impl WriteRecipe {
             let mut inputs =
                 ValidationInputs::new(&self.source, self.start.map(|s| s.snapshot_id), &source_io);
             let live = inputs.live_set().await?;
-            let identities: BTreeSet<_> = match self.op_kind {
+            let mut identities: BTreeSet<_> = match self.op_kind {
                 CommitOpKind::RowDeltaDvFromFiles => self.removed_dvs.clone(),
                 CommitOpKind::CowUpdate => self
                     .cow
@@ -243,6 +252,31 @@ impl WriteRecipe {
                     .collect(),
                 _ => BTreeSet::new(),
             };
+            if matches!(
+                self.op_kind,
+                CommitOpKind::CowUpdate | CommitOpKind::OverwritePartitions
+            ) {
+                // Deletion vectors follow their exact data file, including when
+                // their stored partition differs. Removing one blob grants no
+                // authority to delete a shared Puffin container.
+                let data_paths: BTreeSet<_> = identities
+                    .iter()
+                    .filter_map(|id| match id {
+                        EntryIdentity::DataFile { path } => Some(path.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                identities.extend(
+                    live.keys()
+                        .filter(|id| {
+                            matches!(id,
+                                EntryIdentity::DeletionVector { referenced_data_file, .. }
+                                    if data_paths.contains(referenced_data_file)
+                            )
+                        })
+                        .cloned(),
+                );
+            }
             for identity in identities {
                 let entry = live.get(&identity).ok_or_else(|| {
                     format_error(corrupt(format!(
@@ -400,7 +434,7 @@ enum DispatchFact {
     Undispatched,
     Ready(ExternalMutationEvidence),
     Issued(ExternalMutationEvidence),
-    Committed(CommitProof),
+    Committed(CommitProof, ExternalMutationFinalization),
     Rejected(ConnectorMutationFailure),
 }
 
@@ -444,9 +478,11 @@ impl Publisher for ObservedPublisher {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match &outcome {
-            CatalogOutcome::KnownCommitted { receipt, .. } => {
-                *state = DispatchFact::Committed(receipt.clone())
-            }
+            CatalogOutcome::KnownCommitted {
+                receipt,
+                finalization,
+                ..
+            } => *state = DispatchFact::Committed(receipt.clone(), finalization.clone()),
             CatalogOutcome::KnownUncommitted { failure } => {
                 *state = DispatchFact::Rejected(failure.clone())
             }
@@ -604,23 +640,34 @@ impl IcebergWriteSessionControl {
                             evidence,
                         });
                     }
-                    DispatchFact::Committed(proof) => attempt::Report {
-                        publication: PublicationOutcome::Committed(proof),
-                        cleanup: IcebergCleanupReport::Partial {
-                            deleted: 0,
-                            remaining: operation
-                                .recovery_artifacts()
-                                .into_iter()
-                                .map(|r| crate::commit::model::RemainingArtifact {
+                    DispatchFact::Committed(proof, finalization) => {
+                        *state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            DispatchFact::Committed(
+                                proof.clone(),
+                                add_finalization_failure(finalization, &error),
+                            );
+                        attempt::Report {
+                            publication: PublicationOutcome::Committed(proof),
+                            cleanup: IcebergCleanupReport::Partial {
+                                deleted: 0,
+                                remaining: operation
+                                    .recovery_artifacts()
+                                    .into_iter()
+                                    .map(|r| {
+                                        crate::commit::model::RemainingArtifact {
                                     object: r.object,
                                     reason:
                                         crate::commit::model::CleanupRemainingReason::DeleteFailed(
                                             error.clone(),
                                         ),
-                                })
-                                .collect(),
-                        },
-                    },
+                                }
+                                    })
+                                    .collect(),
+                            },
+                        }
+                    }
                     DispatchFact::Rejected(failure) => {
                         return Ok(self.reject_operation_failure(&operation, failure));
                     }
@@ -653,6 +700,15 @@ impl IcebergWriteSessionControl {
             }
             PublicationOutcome::Committed(proof) => {
                 let mut finalization = report.cleanup.finalization();
+                if let DispatchFact::Committed(
+                    _,
+                    ExternalMutationFinalization::Failed(owner_failure),
+                ) = &*state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                {
+                    finalization = add_finalization_failure(finalization, owner_failure.message());
+                }
                 let rows = match proof.snapshot_id {
                     Some(id) => match self.publication_row_count(handle, id, context) {
                         Ok(rows) => rows,

@@ -17,6 +17,8 @@
 
 //! One immutable operation, fresh preparation per definite catalog conflict.
 
+pub(crate) mod observation;
+
 use std::collections::{BTreeSet, HashMap};
 use std::time::{Duration, Instant};
 
@@ -456,7 +458,11 @@ async fn prepare(
         })
         .map(|r| r.object.clone())
         .collect();
-    let mut references = BTreeSet::new();
+    let mut references: BTreeSet<_> = attempt
+        .publication_references()
+        .map_err(|e| before_dispatch_failure(&e))?
+        .into_iter()
+        .collect();
     if !cross_attempt.is_empty() {
         // Every snapshot published in this request remains readable by time travel,
         // even when a later stage removes its files from the final head.

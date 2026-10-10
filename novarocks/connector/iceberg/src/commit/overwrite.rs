@@ -80,13 +80,17 @@ impl super::staging::Preparer for OverwritePreparer {
             (true, false) => Operation::Delete,
             _ => Operation::Overwrite,
         };
+        let mut summary = snapshot_file_summary(&intent.changes().added, &removed)?;
+        // Every old entry is removed, so the new row total is fully known even
+        // when the parent's total includes already-deleted rows or is absent.
+        summary.insert("total-records".into(), summary["added-records"].clone());
         prepare_snapshot_change(
             view,
             intent,
             snapshot_id,
             operation,
             manifests,
-            snapshot_file_summary(&intent.changes().added, &removed)?,
+            summary,
             false,
         )
         .await
@@ -269,8 +273,15 @@ pub(crate) async fn prepare_snapshot_change(
     let parent_summary = parent
         .and_then(|id| metadata.snapshot_by_id(id))
         .map(|s| s.summary());
+    // A row-level preparer can calculate visible rows from its exact delete
+    // applicability facts. File counters alone cannot reconstruct that value.
+    let exact_records = properties.get("total-records").cloned();
+    let mut finalized = finalize_snapshot_summary(properties, parent_summary, truncate_full_table);
+    if let Some(total) = exact_records {
+        finalized.insert("total-records".into(), total);
+    }
     let properties = merge_snapshot_summary_properties(
-        finalize_snapshot_summary(properties, parent_summary, truncate_full_table),
+        finalized,
         intent.summary(),
         metadata.uuid(),
         snapshot_id,
@@ -332,6 +343,52 @@ pub(crate) async fn prepare_snapshot_change(
             },
         ],
     })
+}
+
+/// Snapshot sizes count logical delete blobs rather than shared Puffin containers.
+pub(crate) fn set_visible_rows_after_removal(
+    view: &super::staging::StagedView<'_>,
+    removed: &[super::dependency::LiveEntry],
+    summary: &mut HashMap<String, String>,
+) -> crate::iceberg::Result<()> {
+    let Some(total) = view
+        .metadata()
+        .snapshot_for_ref(view.target_ref())
+        .and_then(|s| s.summary().additional_properties.get("total-records"))
+    else {
+        return Ok(());
+    };
+    let invalid =
+        |message| crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, message);
+    let parent: u64 = total
+        .parse()
+        .map_err(|_| invalid("Parent total-records is invalid"))?;
+    let data_paths: std::collections::BTreeSet<_> = removed
+        .iter()
+        .filter_map(|entry| match entry.frozen.identity() {
+            super::model::EntryIdentity::DataFile { path } => Some(path),
+            _ => None,
+        })
+        .collect();
+    let deleted_vectors = removed.iter().filter(|entry| matches!(entry.frozen.identity(),
+        super::model::EntryIdentity::DeletionVector { referenced_data_file, .. } if data_paths.contains(referenced_data_file)
+    )).try_fold(0u64, |sum, entry| sum.checked_add(entry.file.record_count())
+        .ok_or_else(|| invalid("Removed deletion-vector cardinality overflow")))?;
+    let removed_data: u64 = summary["deleted-records"]
+        .parse()
+        .expect("checked summary count");
+    let added: u64 = summary["added-records"]
+        .parse()
+        .expect("checked summary count");
+    let removed_live = removed_data
+        .checked_sub(deleted_vectors)
+        .ok_or_else(|| invalid("Removed deletion-vector cardinality exceeds removed data rows"))?;
+    let total = parent
+        .checked_sub(removed_live)
+        .and_then(|n| n.checked_add(added))
+        .ok_or_else(|| invalid("Visible row total overflow or underflow"))?;
+    summary.insert("total-records".into(), total.to_string());
+    Ok(())
 }
 
 /// Snapshot sizes count logical delete blobs rather than shared Puffin containers.
@@ -2042,6 +2099,105 @@ pub(crate) mod preparer_tests {
         assert_eq!(survivor.sequence_number, Some(1));
         assert_eq!(survivor.file_sequence_number, Some(1));
     }
+    #[tokio::test]
+    async fn dynamic_overwrite_removes_referenced_dv_even_with_a_different_partition() {
+        let fixture = Fixture::new();
+        let base = fixture.metadata(FormatVersion::V3);
+        let spec = crate::iceberg::spec::UnboundPartitionSpecBuilder::new()
+            .add_partition_field(1, "id", crate::iceberg::spec::Transform::Identity)
+            .unwrap()
+            .build();
+        let base = base
+            .into_builder(None)
+            .add_default_partition_spec(spec)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let spec_id = base.default_partition_spec_id();
+        let partition = |id| {
+            [Some(crate::iceberg::spec::Literal::long(id))]
+                .into_iter()
+                .collect::<Struct>()
+        };
+        let intent = fixture.intent(
+            &base,
+            "main",
+            vec![
+                AddedContent::new_logical_data(data("s3://b/p1.parquet", 3, partition(1)), spec_id)
+                    .unwrap(),
+            ],
+        );
+        let (base, _) = fixture
+            .stage(
+                base,
+                &intent,
+                &super::super::fast_append::FastAppendPreparer,
+            )
+            .await;
+        let vector = crate::iceberg::spec::DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("s3://b/shared.puffin".into())
+            .file_format(crate::iceberg::spec::DataFileFormat::Puffin)
+            .partition(partition(2))
+            .partition_spec_id(spec_id)
+            .record_count(1)
+            .file_size_in_bytes(1000)
+            .content_offset(Some(4))
+            .content_size_in_bytes(Some(11))
+            .referenced_data_file(Some("s3://b/p1.parquet".into()))
+            .build()
+            .unwrap();
+        let vector_id = super::super::model::EntryIdentity::try_from(&vector).unwrap();
+        let intent = fixture.intent(
+            &base,
+            "main",
+            vec![AddedContent::new_logical_data(vector, spec_id).unwrap()],
+        );
+        let (base, _) = fixture
+            .stage(base, &intent, &super::super::row_delta::RowDeltaPreparer)
+            .await;
+        let intent = fixture.intent(
+            &base,
+            "main",
+            vec![
+                AddedContent::new_logical_data(
+                    data("s3://b/new-p1.parquet", 2, partition(1)),
+                    spec_id,
+                )
+                .unwrap(),
+            ],
+        );
+        let (after, _) = fixture
+            .stage(
+                base,
+                &intent,
+                &super::super::overwrite_partitions::OverwritePartitionsPreparer,
+            )
+            .await;
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let mut inputs = super::super::dependency::ValidationInputs::new(
+            &after,
+            after.current_snapshot_id(),
+            &attempt,
+        );
+        let live = inputs.live_set().await.unwrap();
+        assert!(!live.contains_key(&vector_id));
+        assert!(
+            !live.contains_key(&super::super::model::EntryIdentity::DataFile {
+                path: "s3://b/p1.parquet".into()
+            })
+        );
+        assert_eq!(
+            after
+                .current_snapshot()
+                .unwrap()
+                .summary()
+                .additional_properties["removed-delete-files"],
+            "1"
+        );
+    }
+
     #[tokio::test]
     async fn overwrite_preparer_can_replace_historical_unassigned_data() {
         let fixture = Fixture::new();

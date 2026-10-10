@@ -78,6 +78,7 @@ struct OperationState {
     permits: Arc<Semaphore>,
     limits: OperationLimits,
     ledger: Mutex<ArtifactLedger>,
+    publication_references: Mutex<BTreeSet<ObjectIdentity>>,
     exit_failures: Mutex<BTreeMap<ObjectIdentity, StreamExitFailure>>,
     retired_objects: Mutex<BTreeSet<ObjectIdentity>>,
     attempt_ordinal: AtomicU32,
@@ -138,6 +139,7 @@ impl IcebergCommitOperation {
                 permits: Arc::new(Semaphore::new(limits.io_requests as usize)),
                 limits,
                 ledger: Mutex::new(ArtifactLedger::new(token)),
+                publication_references: Mutex::new(BTreeSet::new()),
                 exit_failures: Mutex::new(BTreeMap::new()),
                 retired_objects: Mutex::new(BTreeSet::new()),
                 attempt_ordinal: AtomicU32::new(0),
@@ -189,6 +191,38 @@ impl IcebergCommitOperation {
                 attempt: None,
                 write_state: ArtifactWriteState::Written,
             })
+    }
+
+    /// Adopt one provider-authored publication object with an explicit lifetime
+    /// beyond successful dispatch. External registered data cannot use this API.
+    pub(crate) fn adopt_operation_reference(&self, object: ObjectIdentity) -> Result<()> {
+        self.inner
+            .ledger
+            .lock()
+            .map_err(|_| invalid("Iceberg artifact ledger poisoned"))?
+            .register(ArtifactRecord {
+                object: object.clone(),
+                class: ArtifactClass::Operation,
+                attempt: None,
+                write_state: ArtifactWriteState::Written,
+            })?;
+        self.inner
+            .publication_references
+            .lock()
+            .map_err(|_| invalid("Iceberg publication references poisoned"))?
+            .insert(object);
+        Ok(())
+    }
+
+    pub(crate) fn publication_references(&self) -> Result<Vec<ObjectIdentity>> {
+        Ok(self
+            .inner
+            .publication_references
+            .lock()
+            .map_err(|_| invalid("Iceberg publication references poisoned"))?
+            .iter()
+            .cloned()
+            .collect())
     }
 
     pub(crate) fn artifacts(&self) -> Result<Vec<ArtifactRecord>> {
@@ -390,6 +424,10 @@ pub(crate) struct IcebergCommitAttempt {
 impl IcebergCommitAttempt {
     pub(crate) fn operation_artifacts(&self) -> Result<Vec<ArtifactRecord>> {
         self.operation.artifacts()
+    }
+
+    pub(crate) fn publication_references(&self) -> Result<Vec<ObjectIdentity>> {
+        self.operation.publication_references()
     }
 }
 

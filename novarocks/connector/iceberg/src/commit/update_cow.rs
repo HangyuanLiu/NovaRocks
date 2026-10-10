@@ -893,7 +893,7 @@ impl crate::commit::staging::Preparer for CowUpdatePreparer {
         view: &crate::commit::staging::StagedView<'_>,
         intent: &crate::commit::model::OperationIntent,
     ) -> crate::iceberg::Result<crate::commit::staging::PreparedChange> {
-        use super::row_delta_dv_metadata::{logical_file_size, write_added_entry_groups};
+        use super::row_delta_dv_metadata::write_added_entry_groups;
         use crate::commit::model::{Dependency, EntryIdentity, SeqField};
         if view.metadata().format_version() != FormatVersion::V3 {
             return Err(to_iceberg_data_invalid(
@@ -979,14 +979,24 @@ impl crate::commit::staging::Preparer for CowUpdatePreparer {
             .iter()
             .map(|e| e.identity().clone())
             .collect::<HashSet<_>>();
-        let expected = old
+        let mut expected = old
             .iter()
             .cloned()
             .map(|path| EntryIdentity::DataFile { path })
             .collect::<HashSet<_>>();
+        expected.extend(
+            live.keys()
+                .filter(|id| {
+                    matches!(id,
+                        EntryIdentity::DeletionVector { referenced_data_file, .. }
+                            if old.contains(referenced_data_file)
+                    )
+                })
+                .cloned(),
+        );
         if removed.len() != intent.changes().removed.len() || removed != expected {
             return Err(to_iceberg_data_invalid(
-                "Copy-on-write removed entries must equal the frozen touched data files".into(),
+                "Copy-on-write removed entries must equal touched data files and their deletion vectors".into(),
             ));
         }
         for frozen in &intent.changes().removed {
@@ -1040,29 +1050,13 @@ impl crate::commit::staging::Preparer for CowUpdatePreparer {
                 "Copy-on-write frozen additions omit a declared output file".into(),
             ));
         }
-        let mut summary = HashMap::new();
-        let added_records = intent.changes().added.iter().try_fold(0u64, |sum, a| {
-            sum.checked_add(a.file().record_count())
-                .ok_or_else(|| to_iceberg_unexpected("COW added count overflow".into()))
-        })?;
-        let removed_records = intent.changes().removed.iter().try_fold(0u64, |sum, e| {
-            sum.checked_add(e.facts().record_count)
-                .ok_or_else(|| to_iceberg_unexpected("COW removed count overflow".into()))
-        })?;
-        let added_size = intent.changes().added.iter().try_fold(0u64, |sum, a| {
-            sum.checked_add(logical_file_size(a.file())?)
-                .ok_or_else(|| to_iceberg_unexpected("COW added size overflow".into()))
-        })?;
-        let removed_size = removed.iter().try_fold(0u64, |sum, id| {
-            sum.checked_add(logical_file_size(&live[id].file)?)
-                .ok_or_else(|| to_iceberg_unexpected("COW removed size overflow".into()))
-        })?;
-        summary.insert("added-data-files".into(), seen.len().to_string());
-        summary.insert("removed-data-files".into(), removed.len().to_string());
-        summary.insert("added-records".into(), added_records.to_string());
-        summary.insert("deleted-records".into(), removed_records.to_string());
-        summary.insert("added-files-size".into(), added_size.to_string());
-        summary.insert("removed-files-size".into(), removed_size.to_string());
+        let removed_entries = removed
+            .iter()
+            .map(|id| live[id].clone())
+            .collect::<Vec<_>>();
+        let mut summary =
+            super::overwrite::snapshot_file_summary(&intent.changes().added, &removed_entries)?;
+        super::overwrite::set_visible_rows_after_removal(view, &removed_entries, &mut summary)?;
         let snapshot_id = crate::commit::staging::new_snapshot_id(view.metadata());
         let mut manifests = super::overwrite::write_live_entry_groups(
             view,

@@ -1186,6 +1186,84 @@ mod t8b_tests {
         assert_eq!(engine.metadata().next_row_id(), 8);
     }
     #[tokio::test]
+    async fn cow_removes_only_the_exact_dv_of_each_replaced_data_file() {
+        let writer = Writer::new();
+        let metadata = baseline(&writer, false, true).await;
+        let before = live(&writer, &metadata).await;
+        let old_data = EntryIdentity::DataFile {
+            path: "a.parquet".into(),
+        };
+        let old_dv = EntryIdentity::try_from(&dv("shared.puffin", 4, "a.parquet", 1)).unwrap();
+        let other_dv = EntryIdentity::try_from(&dv("shared.puffin", 40, "b.parquet", 1)).unwrap();
+        let rewrite = crate::commit::update_cow::CowUpdateRewriteSet {
+            base_snapshot_id: 11,
+            target_table_uuid: metadata.uuid().to_string(),
+            updated_row_ids: vec![0],
+            touched_data_files: vec![crate::commit::update_cow::CowUpdateTouchedFile {
+                old_file: "a.parquet".into(),
+                new_files: vec!["replacement.parquet".into()],
+                row_ids: vec![0, 2],
+            }],
+            appended_files: vec![],
+        };
+        let incomplete = intent(
+            &metadata,
+            vec![data("replacement.parquet", 2, Some(0))],
+            vec![before[&old_data].frozen.clone()],
+        );
+        let mut engine =
+            StagingEngine::begin(base(metadata.clone()), &incomplete, &writer).unwrap();
+        assert!(
+            engine
+                .stage(&crate::commit::update_cow::CowUpdatePreparer {
+                    rewrite: rewrite.clone()
+                })
+                .await
+                .is_err()
+        );
+        let complete = intent(
+            &metadata,
+            vec![data("replacement.parquet", 2, Some(0))],
+            vec![
+                before[&old_data].frozen.clone(),
+                before[&old_dv].frozen.clone(),
+            ],
+        );
+        let mut engine = StagingEngine::begin(base(metadata), &complete, &writer).unwrap();
+        engine
+            .stage(&crate::commit::update_cow::CowUpdatePreparer { rewrite })
+            .await
+            .unwrap();
+        let after = live(&writer, engine.metadata()).await;
+        assert!(!after.contains_key(&old_data));
+        assert!(!after.contains_key(&old_dv));
+        assert_eq!(after[&other_dv].frozen, before[&other_dv].frozen);
+        assert!(RowLiveIndex::from_live(after).is_ok());
+        let summary = &engine
+            .metadata()
+            .current_snapshot()
+            .unwrap()
+            .summary()
+            .additional_properties;
+        assert_eq!(summary["deleted-data-files"], "1");
+        assert_eq!(summary["deleted-records"], "3");
+        assert_eq!(summary["removed-delete-files"], "1");
+        assert_eq!(summary["removed-position-deletes"], "1");
+        assert_eq!(summary["removed-files-size"], "111");
+        assert_eq!(summary["total-data-files"], "2");
+        assert_eq!(summary["total-delete-files"], "1");
+        assert_eq!(summary["total-records"], "4");
+        assert!(
+            writer
+                .ledger
+                .lock()
+                .unwrap()
+                .records()
+                .all(|record| record.object.path() != "shared.puffin")
+        );
+    }
+
+    #[tokio::test]
     async fn t8b_coalesces_new_blobs_without_deleting_their_owned_objects() {
         let writer = Writer::new();
         let metadata = baseline(&writer, false, false).await;

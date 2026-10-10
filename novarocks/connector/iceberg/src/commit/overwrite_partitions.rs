@@ -111,9 +111,10 @@ impl super::staging::Preparer for OverwritePartitionsPreparer {
             .iter()
             .map(|a| a.file().partition().clone())
             .collect();
+        let live = inputs.live_set().await?;
         let mut removed = Vec::new();
         let mut entries = Vec::new();
-        for entry in inputs.live_set().await?.values() {
+        for entry in live.values() {
             let deleted = match partition_match_in_touched(
                 entry.file.partition(),
                 entry.frozen.facts().partition_spec_id,
@@ -134,6 +135,24 @@ impl super::staging::Preparer for OverwritePartitionsPreparer {
             }
             entries.push((entry.clone(), deleted));
         }
+        let removed_data: HashSet<_> = removed
+            .iter()
+            .filter_map(|entry| match entry.frozen.identity() {
+                super::model::EntryIdentity::DataFile { path } => Some(path.clone()),
+                _ => None,
+            })
+            .collect();
+        for (entry, deleted) in &mut entries {
+            if !*deleted
+                && matches!(entry.frozen.identity(),
+                    super::model::EntryIdentity::DeletionVector { referenced_data_file, .. }
+                        if removed_data.contains(referenced_data_file)
+                )
+            {
+                *deleted = true;
+                removed.push(entry.clone());
+            }
+        }
         let snapshot_id = super::staging::new_snapshot_id(metadata);
         let mut manifests =
             super::overwrite::write_live_entry_groups(view, snapshot_id, entries).await?;
@@ -141,6 +160,7 @@ impl super::staging::Preparer for OverwritePartitionsPreparer {
             .extend(super::overwrite::write_added_intent_data(view, intent, snapshot_id).await?);
         let mut summary =
             super::overwrite::snapshot_file_summary(&intent.changes().added, &removed)?;
+        super::overwrite::set_visible_rows_after_removal(view, &removed, &mut summary)?;
         summary.insert("replace-partitions".into(), "true".into());
         super::overwrite::prepare_snapshot_change(
             view,
