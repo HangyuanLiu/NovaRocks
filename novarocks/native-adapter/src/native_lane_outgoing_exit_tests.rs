@@ -524,3 +524,483 @@ async fn an_entered_original_response_future_survives_close_until_actual_waiter_
     assert_eq!(entered.requests, [1, 0, 0, 0]);
     assert_eq!(exited.requests, [0; 4]);
 }
+
+use std::sync::Mutex;
+
+// Component-only public lazy-connector mechanism. This is not the FE eager
+// factory, a Native query, a byte coefficient, or an internal Buffer getter.
+#[derive(Clone, Copy, Debug)]
+struct PublicQueueFacts {
+    ready_calls: usize,
+    retained_calls: usize,
+    ninth_pending: bool,
+    original_connector_first_pending: bool,
+    original_connector_attempts: usize,
+    connector_released: bool,
+    before_original_deadline: bool,
+    native_available: usize,
+    outgoing: FrontendOutgoingSnapshot,
+    completed_responses: usize,
+    after_ninth_drop_available: usize,
+}
+fn public_queue_fill_source(facts: &PublicQueueFacts) -> Result<(), StdError> {
+    if facts.ready_calls != 8
+        || facts.retained_calls != 8
+        || !facts.ninth_pending
+        || !facts.original_connector_first_pending
+        || facts.original_connector_attempts != 1
+        || facts.connector_released
+        || !facts.before_original_deadline
+        || facts.native_available != 119
+        || facts.outgoing.closed
+        || facts.outgoing.requests != [8, 0, 0, 0]
+        || facts.outgoing.data_connections != 1
+        || facts.outgoing.data_handshakes != 1
+        || facts.outgoing.control_connections != 0
+        || facts.outgoing.control_handshakes != 0
+    {
+        return Err("public queue fill source bracket incomplete".into());
+    }
+    Ok(())
+}
+
+struct QueueConnectorSignals {
+    release: Mutex<Option<oneshot::Receiver<()>>>,
+    entered: Mutex<Option<oneshot::Sender<()>>>,
+    attempts: std::sync::atomic::AtomicUsize,
+    first_pending: AtomicBool,
+    released: AtomicBool,
+}
+
+struct QueuePollPanic(Mutex<Box<dyn std::any::Any + Send>>);
+impl std::fmt::Debug for QueuePollPanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The actual payload remains owned; no arbitrary formatter is invoked.
+        let _ = &self.0;
+        f.write_str("OriginalQueueComponentPollPanic")
+    }
+}
+impl std::fmt::Display for QueuePollPanic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("original queue component future panicked")
+    }
+}
+impl std::error::Error for QueuePollPanic {}
+async fn queue_catch_poll<F: Future>(future: F) -> Result<F::Output, StdError> {
+    let mut original = Box::pin(future);
+    std::future::poll_fn(|cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| original.as_mut().poll(cx)))
+        {
+            Ok(Poll::Pending) => Poll::Pending,
+            Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
+            Err(payload) => Poll::Ready(Err(
+                Box::new(QueuePollPanic(Mutex::new(payload))) as StdError
+            )),
+        }
+    })
+    .await
+}
+
+// Exactly one original peer task. It owns accept + H2 polling, never spawns a
+// child stream/driver task, and detects any ninth application request.
+async fn queue_original_peer(
+    listener: tokio::net::TcpListener,
+    mut stop: oneshot::Receiver<()>,
+) -> Result<usize, StdError> {
+    let accepted = tokio::select! {
+        accepted = listener.accept() => Some(accepted?),
+        _ = &mut stop => None,
+    };
+    drop(listener);
+    let Some((io, _)) = accepted else {
+        return Ok(0);
+    };
+    let mut h2 = h2::server::Builder::new().handshake::<_, Bytes>(io).await?;
+    let mut received = 0;
+    let mut seen = [false; 8];
+    loop {
+        tokio::select! {
+            _ = &mut stop => {
+                h2.graceful_shutdown();
+                std::future::poll_fn(|cx| h2.poll_closed(cx)).await?;
+                return Ok(received);
+            }
+            accepted = h2.accept() => {
+                let Some(accepted) = accepted else { return Ok(received) };
+                let (request, mut response) = accepted?;
+                let index: usize = request.headers().get("x-component-queue-index")
+                    .ok_or("queue request lacks component index")?.to_str()?.parse()?;
+                if index >= 8 || seen[index] || !request.body().is_end_stream() {
+                    return Err("duplicate/extra/body-bearing queue component request".into());
+                }
+                seen[index] = true;
+                received += 1;
+                let headers = hyper::http::Response::builder().status(200)
+                    .header("content-type", "application/grpc").body(())?;
+                let mut body = response.send_response(headers, false)?;
+                body.send_data(Bytes::from_static(&[0, 0, 0, 0, 0]), false)?;
+                let mut trailers = hyper::http::HeaderMap::new();
+                trailers.insert("grpc-status", hyper::http::HeaderValue::from_static("0"));
+                body.send_trailers(trailers)?;
+            }
+        }
+    }
+}
+async fn queue_body_public_eof(
+    mut response: hyper::http::Response<BoxBody>,
+) -> Result<(), StdError> {
+    if response.status() != 200
+        || response.headers().get("content-type")
+            != Some(&hyper::http::HeaderValue::from_static("application/grpc"))
+    {
+        return Err("queue component response headers differ".into());
+    }
+    let mut bytes = [0u8; 5];
+    let mut used = 0;
+    let mut trailers = 0;
+    let mut ended = false;
+    // One fixed five-byte DATA message, one trailer, public EOF. No arbitrary body retention.
+    for _ in 0..4 {
+        let frame = std::future::poll_fn(|cx| Pin::new(response.body_mut()).poll_frame(cx)).await;
+        let Some(frame) = frame else {
+            ended = true;
+            break;
+        };
+        let frame = frame?;
+        if let Some(data) = frame.data_ref() {
+            let next = used + data.len();
+            if next > bytes.len() {
+                return Err("queue component response DATA exceeds literal".into());
+            }
+            bytes[used..next].copy_from_slice(data);
+            used = next;
+        } else if let Some(fields) = frame.trailers_ref() {
+            if fields.len() != 1
+                || fields.get("grpc-status") != Some(&hyper::http::HeaderValue::from_static("0"))
+            {
+                return Err("queue component response trailers differ".into());
+            }
+            trailers += 1;
+        } else {
+            return Err("unknown queue component response frame".into());
+        }
+    }
+    if !ended || used != 5 || bytes != [0; 5] || trailers != 1 {
+        return Err("queue component response lacks complete literal DATA/trailers/EOF".into());
+    }
+    Ok(())
+}
+struct QueueRun {
+    result: Result<PublicQueueFacts, StdError>,
+    cleanup: [Option<StdError>; 4],
+    peer_requests: Option<usize>,
+    original_peer_joined: bool,
+    public_io_and_calls_drained: bool,
+}
+fn queue_error_class(error: &StdError) -> &'static str {
+    if error.is::<tokio::time::error::Elapsed>() {
+        "original-deadline"
+    } else if error.is::<h2::Error>() {
+        "original-h2"
+    } else if error.is::<std::io::Error>() {
+        "original-io"
+    } else if error.is::<tokio::task::JoinError>() {
+        "original-peer-join"
+    } else {
+        "retained-original-other"
+    }
+}
+async fn public_queue_recipe(ready_only: bool) -> Result<QueueRun, StdError> {
+    let geometry =
+        novarocks_execution_contract::native_result_support::NativeResultSupportGeometry::V1;
+    if geometry.transport_streams_per_connection != 128
+        || geometry.transport_tonic_pending_per_connection != 8
+        || geometry.transport_connect_deadline_ms != 2000
+    {
+        return Err("queue recipe frozen public geometry differs".into());
+    }
+    // One absolute clock, established before bind/Channel/firstpoll. Endpoint's
+    // original 2s timeout remains; T is conservatively earlier, never reset.
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_millis(geometry.transport_connect_deadline_ms);
+    let admission = NativeTransportAdmission::frontend(None)?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let (stop, stop_rx) = oneshot::channel();
+    let mut peer = tokio::task::JoinSet::new();
+    let (release, release_rx) = oneshot::channel();
+    let (entered_tx, mut entered) = oneshot::channel();
+    let signals = Arc::new(QueueConnectorSignals {
+        release: Mutex::new(Some(release_rx)),
+        entered: Mutex::new(Some(entered_tx)),
+        attempts: std::sync::atomic::AtomicUsize::new(0),
+        first_pending: AtomicBool::new(false),
+        released: AtomicBool::new(false),
+    });
+    let native = novarocks_native_trust::NativeEndpointConnector::plaintext(
+        novarocks_types::NativeEndpoint::from_socket_addr(address),
+    );
+    let captured_admission = admission.clone();
+    let captured_signals = signals.clone();
+    let connector = tower::service_fn(move |_uri: hyper::http::Uri| {
+        let native = native.clone();
+        let admission = captured_admission.clone();
+        let signals = captured_signals.clone();
+        async move {
+            // This is the actual connector firstpoll and original public dial
+            // guard. The test pause owns that guard until actual IO is returned.
+            if signals.attempts.fetch_add(1, Ordering::AcqRel) != 0 {
+                return Err::<
+                    hyper_util::rt::TokioIo<novarocks_native_trust::BoxedNativeIo>,
+                    StdError,
+                >("queue recipe attempted a second connector".into());
+            }
+            let dial = admission.try_dial_lane(FrontendNativeLane::ResultData)?;
+            let mut released = signals
+                .release
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+                .ok_or("queue connector lost original release receiver")?;
+            std::future::poll_fn(|cx| match Pin::new(&mut released).poll(cx) {
+                Poll::Pending => {
+                    signals.first_pending.store(true, Ordering::Release);
+                    if let Some(entered) = signals
+                        .entered
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take()
+                    {
+                        if entered.send(()).is_err() {
+                            return Poll::Ready(Err(
+                                "queue connector original observer exited".into()
+                            ));
+                        }
+                    }
+                    Poll::Pending
+                }
+                Poll::Ready(Ok(())) => Poll::Ready(Ok::<(), StdError>(())),
+                Poll::Ready(Err(error)) => Poll::Ready(Err(Box::new(error) as StdError)),
+            })
+            .await?;
+            let io = native.connect().await?;
+            let io: novarocks_native_trust::BoxedNativeIo = Box::new(
+                novarocks_native_trust::OwnedNativeIo::with_guard(io, dial.established()?),
+            );
+            Ok(hyper_util::rt::TokioIo::new(io))
+        }
+    });
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{address}"))?;
+    let channel = configure_native_endpoint(endpoint).connect_with_connector_lazy(connector);
+    let mut original = Some(NativeLaneChannel::new(
+        channel,
+        NativeLane::ResultData,
+        Some(&admission),
+    ));
+    type OriginalCall = <NativeLaneChannel as Service<hyper::http::Request<BoxBody>>>::Future;
+    let mut calls: [Option<OriginalCall>; 8] = std::array::from_fn(|_| None);
+    let mut ready_clones: [Option<NativeLaneChannel>; 8] = std::array::from_fn(|_| None);
+    let mut ninth = None;
+    let mut release = Some(release);
+    // All fallible setup completed before the original test-owned task exists.
+    // After spawn, every operation failure reaches the same explicit join path.
+    peer.spawn(queue_original_peer(listener, stop_rx));
+    let operation = async {
+        let lane = original.as_mut().ok_or("original queue lane missing")?;
+        if lane.stream_limit() != 128 || lane.available_streams() != 128 {
+            return Err("original queue lane initial public stream geometry differs".into());
+        }
+        let mut ready_calls = 0;
+        for index in 0..8 {
+            if ready_only {
+                let mut clone = lane.clone();
+                clone.ready().await?;
+                ready_clones[index] = Some(clone);
+            } else {
+                lane.ready().await?;
+                let mut offered = request();
+                offered.headers_mut().insert(
+                    "x-component-queue-index",
+                    hyper::http::HeaderValue::from_str(&index.to_string())?,
+                );
+                calls[index] = Some(lane.call(offered));
+                ready_calls += 1;
+                if index == 0 {
+                    (&mut entered).await?;
+                }
+            }
+        }
+        ninth = Some(lane.clone());
+        let ninth_lane = ninth.as_mut().ok_or("ninth queue lane missing")?;
+        let ninth_pending = std::future::poll_fn(|cx| {
+            Poll::Ready(matches!(ninth_lane.poll_ready(cx), Poll::Pending))
+        })
+        .await;
+        let mut facts = PublicQueueFacts {
+            ready_calls,
+            retained_calls: calls.iter().filter(|item| item.is_some()).count(),
+            ninth_pending,
+            original_connector_first_pending: signals.first_pending.load(Ordering::Acquire),
+            original_connector_attempts: signals.attempts.load(Ordering::Acquire),
+            connector_released: signals.released.load(Ordering::Acquire),
+            before_original_deadline: tokio::time::Instant::now() < deadline,
+            native_available: lane.available_streams(),
+            outgoing: admission.frontend_outgoing_snapshot()?,
+            completed_responses: 0,
+            after_ninth_drop_available: 0,
+        };
+        if !ready_only {
+            public_queue_fill_source(&facts)?;
+            signals.released.store(true, Ordering::Release);
+            release
+                .take()
+                .ok_or("original connector release sender missing")?
+                .send(())
+                .map_err(|_| "original connector exited before release")?;
+            for call in &mut calls {
+                let response = call
+                    .take()
+                    .ok_or("original retained queue call missing")?
+                    .await?;
+                queue_body_public_eof(response).await?;
+                facts.completed_responses += 1;
+            }
+            ninth
+                .as_mut()
+                .ok_or("original ninth waiter missing")?
+                .ready()
+                .await?;
+            drop(ninth.take());
+            facts.after_ninth_drop_available = lane.available_streams();
+            if facts.completed_responses != 8
+                || facts.after_ninth_drop_available != 128
+                || admission.frontend_outgoing_snapshot()?.requests != [0; 4]
+            {
+                return Err("original queue response/body/ninth qualification exits differ".into());
+            }
+        }
+        Ok::<_, StdError>(facts)
+    };
+    // The future borrows the parent's original futures/IO. Timeout or panic
+    // drops that borrow, not the parent's actual peer owner or stored handles.
+    let result = match tokio::time::timeout_at(deadline, queue_catch_poll(operation)).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(error),
+        Err(error) => Err(Box::new(error) as StdError),
+    };
+    for call in &mut calls {
+        drop(call.take());
+    }
+    for clone in &mut ready_clones {
+        drop(clone.take());
+    }
+    drop(ninth.take());
+    drop(release.take());
+    let mut cleanup: [Option<StdError>; 4] = std::array::from_fn(|_| None);
+    if let Err(error) = admission.close_frontend_outgoing() {
+        cleanup[0] = Some(Box::new(error));
+    }
+    let _ = stop.send(());
+    let mut peer_requests = None;
+    // The same original JoinSet is borrowed by the timeout. No handle is
+    // consumed by a watchdog; after timeout, abort_all then actual join_next.
+    match tokio::time::timeout_at(deadline, peer.join_next()).await {
+        Ok(Some(Ok(Ok(count)))) => peer_requests = Some(count),
+        Ok(Some(Ok(Err(error)))) => cleanup[1] = Some(error),
+        Ok(Some(Err(error))) => cleanup[1] = Some(Box::new(error)),
+        Ok(None) => cleanup[1] = Some("original peer JoinSet unexpectedly empty".into()),
+        Err(error) => {
+            cleanup[1] = Some(Box::new(error));
+            peer.abort_all();
+        }
+    }
+    while let Some(joined) = peer.join_next().await {
+        match joined {
+            Ok(Ok(count)) => peer_requests = Some(count),
+            Ok(Err(error)) => cleanup[2] = Some(error),
+            Err(error) if error.is_cancelled() => {}
+            Err(error) => cleanup[2] = Some(Box::new(error)),
+        }
+    }
+    let original_peer_joined = peer.is_empty();
+    // Keep the original Channel alive until its peer's normal close has been
+    // polled and joined. Dropping the client first races the peer's GOAWAY write.
+    drop(original.take());
+    let public_io_and_calls_drained = match admission.wait_frontend_outgoing_until(deadline).await {
+        Ok(()) => true,
+        Err(error) => {
+            cleanup[3] = Some(Box::new(error));
+            false
+        }
+    };
+    // No late settlement is accepted. The original deadline is never renewed,
+    // even though mandatory abort/join cleanup may finish after it.
+    if tokio::time::Instant::now() >= deadline && cleanup[3].is_none() {
+        cleanup[3] = Some("queue component settled after original deadline".into());
+    }
+    Ok(QueueRun {
+        result,
+        cleanup,
+        peer_requests,
+        original_peer_joined,
+        public_io_and_calls_drained,
+    })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn eight_actual_calls_fill_public_buffer_at_original_connector_pending_with_native_headroom()
+{
+    let run = public_queue_recipe(false).await;
+    // Every assertion follows the actual original peer join and public exit.
+    let run = match run {
+        Ok(run) => run,
+        Err(_) => panic!("queue component setup/owner construction failed"),
+    };
+    assert!(
+        run.cleanup.iter().all(Option::is_none),
+        "queue component original cleanup failed; operation_ok={} cleanup={:?} peer_requests={:?} joined={} drained={}",
+        run.result.is_ok(),
+        run.cleanup
+            .each_ref()
+            .map(|error| error.as_ref().map(queue_error_class)),
+        run.peer_requests,
+        run.original_peer_joined,
+        run.public_io_and_calls_drained,
+    );
+    assert!(run.original_peer_joined && run.public_io_and_calls_drained);
+    let facts = match run.result {
+        Ok(facts) => facts,
+        Err(_) => panic!("queue component original operation failed"),
+    };
+    assert!(public_queue_fill_source(&facts).is_ok());
+    assert_eq!(facts.completed_responses, 8);
+    assert_eq!(facts.after_ninth_drop_available, 128);
+    assert_eq!(run.peer_requests, Some(8));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn eight_actual_ready_only_reservations_do_not_prove_public_queue_messages() {
+    let run = public_queue_recipe(true).await;
+    let run = match run {
+        Ok(run) => run,
+        Err(_) => panic!("ready-only component setup/owner construction failed"),
+    };
+    assert!(
+        run.cleanup.iter().all(Option::is_none),
+        "ready-only original cleanup failed"
+    );
+    assert!(run.original_peer_joined && run.public_io_and_calls_drained);
+    let facts = match run.result {
+        Ok(facts) => facts,
+        Err(_) => panic!("ready-only original operation failed"),
+    };
+    assert!(facts.ninth_pending);
+    assert_eq!(facts.native_available, 119);
+    assert_eq!(facts.ready_calls, 0);
+    assert_eq!(facts.retained_calls, 0);
+    assert_eq!(facts.outgoing.requests, [0; 4]);
+    assert_eq!(facts.original_connector_attempts, 0);
+    assert!(!facts.original_connector_first_pending);
+    assert!(public_queue_fill_source(&facts).is_err());
+    assert_eq!(run.peer_requests, Some(0));
+}
