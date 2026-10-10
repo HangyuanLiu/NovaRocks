@@ -45,6 +45,31 @@ pub enum IcebergCleanupReport {
     NotAttempted,
 }
 
+impl IcebergCleanupReport {
+    pub(crate) fn finalization(&self) -> novarocks_spi::connector::ExternalMutationFinalization {
+        use novarocks_spi::connector::{
+            ConnectorMutationFailureKind, ExternalMutationFinalization,
+        };
+        match self {
+            Self::Complete { .. } => ExternalMutationFinalization::Complete,
+            Self::Partial { deleted, remaining } => {
+                ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    format!(
+                        "Iceberg owned artifact cleanup incomplete: deleted={deleted}, remaining={remaining:?}"
+                    ),
+                ))
+            }
+            Self::NotAttempted => {
+                ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                    ConnectorMutationFailureKind::Unavailable,
+                    "Iceberg owned artifact cleanup completion was not attempted",
+                ))
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum PublicationOutcome<Proof, Evidence> {
     Committed(Proof),

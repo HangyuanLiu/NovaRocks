@@ -214,9 +214,11 @@ impl DistributedRewriteSession for FrontendDistributedRewriteSession<'_> {
                     },
                 })
             }
-            ExternalMutationOutcome::KnownUncommitted { failure } => {
+            ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
                 Ok(RewriteCommit::KnownUncommitted {
-                    failure: failure.to_string(),
+                    failure: crate::connector::mutation::known_uncommitted_message(
+                        failure, &cleanup,
+                    ),
                 })
             }
             ExternalMutationOutcome::CommitUnknown { failure, .. } => {
@@ -248,7 +250,7 @@ impl DistributedRewriteSession for FrontendDistributedRewriteSession<'_> {
     fn abort(&mut self, _reason: String) -> Result<(), String> {
         self.engine
             .abort_distributed_rewrite(&self.session)
-            .map(|_| ())
+            .and_then(crate::query_execution::write_session::require_uncommitted_release)
     }
 }
 

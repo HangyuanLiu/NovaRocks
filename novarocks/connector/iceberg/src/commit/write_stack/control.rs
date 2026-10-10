@@ -551,17 +551,24 @@ fn cleanup_eager_logs(
     fs: crate::opendal::Operator,
     mapper: crate::commit::CleanupPathMapper,
     logs: Vec<Arc<crate::commit::abort::AbortLog>>,
-) {
-    let _ = runtime.resources().catalog_runtime().block_on(async move {
+) -> ExternalMutationFinalization {
+    let result = runtime.resources().catalog_runtime().block_on(async move {
+        let mut errors = Vec::new();
         for log in logs {
-            for error in log
-                .cleanup_with_path_mapper(&fs, |path| mapper(path))
-                .await
-            {
+            for error in log.cleanup_with_path_mapper(&fs, |path| mapper(path)).await {
                 tracing::warn!(path = %error.path, source = ?error.source, "eager Iceberg cleanup failed");
+                errors.push(error.path);
             }
         }
+        crate::commit::service::CleanupAttempt::completed(errors).finalization()
     });
+    match result {
+        Ok(cleanup) => cleanup,
+        Err(error) => ExternalMutationFinalization::Failed(failure(
+            ConnectorMutationFailureKind::Unavailable,
+            format!("Iceberg cleanup runtime bridge failed: {error}"),
+        )),
+    }
 }
 
 pub(crate) fn eager_conflict_backoff(
@@ -1168,7 +1175,7 @@ impl IcebergWriteSessionControl {
                     .unwrap_or_default();
                 handle.settle(IcebergWriteSessionState::KnownCommitted { snapshot_id })?;
             }
-            Ok(ExternalMutationOutcome::KnownUncommitted { failure }) => {
+            Ok(ExternalMutationOutcome::KnownUncommitted { failure, .. }) => {
                 handle.settle(IcebergWriteSessionState::KnownUncommitted {
                     message: failure.message().to_string(),
                 })?;
@@ -1446,13 +1453,8 @@ impl IcebergWriteSessionControl {
             Err(CommitServiceError::InvalidInput { message }) => Err(invalid(message)),
             Err(CommitServiceError::KnownUncommitted { message, cleanup }) => {
                 Ok(ExternalMutationOutcome::KnownUncommitted {
-                    failure: failure(
-                        ConnectorMutationFailureKind::Conflict,
-                        format!(
-                            "{message}; staged cleanup attempted={}, errors={}",
-                            cleanup.attempted, cleanup.error_count
-                        ),
-                    ),
+                    failure: failure(ConnectorMutationFailureKind::Conflict, message),
+                    cleanup: cleanup.finalization(),
                 })
             }
             Err(CommitServiceError::Unknown { message, evidence }) => {
@@ -1567,6 +1569,7 @@ impl IcebergWriteSessionControl {
                     ConnectorMutationFailureKind::Conflict,
                     "atomic partition replacement cannot rebase its frozen metadata updates",
                 ),
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             });
         }
         let commit_metadata = handle.repartition().map_or(initial.metadata(), |prepared| {
@@ -1666,6 +1669,7 @@ impl IcebergWriteSessionControl {
                             ConnectorMutationFailureKind::Conflict,
                             "Iceberg write conflict retry resolved a different table generation or schema",
                         ),
+                        cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                     });
                 }
             }
@@ -1964,6 +1968,7 @@ impl IcebergWriteSessionControl {
                             ConnectorMutationFailureKind::InvalidRequest,
                             format!("Iceberg eager staging failed before dispatch: {error}"),
                         ),
+                        cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                     });
                 }
                 Err(bridge) => {
@@ -2066,13 +2071,13 @@ impl IcebergWriteSessionControl {
                     }
                 }
                 CatalogOutcome::KnownUncommitted { failure } => {
-                    cleanup_eager_logs(
+                    let cleanup = cleanup_eager_logs(
                         self.runtime.as_ref(),
                         cleanup_fs.clone(),
                         Arc::clone(&cleanup_mapper),
                         vec![Arc::clone(&collector.abort_log), Arc::clone(&session_abort)],
                     );
-                    return Ok(ExternalMutationOutcome::KnownUncommitted { failure });
+                    return Ok(ExternalMutationOutcome::KnownUncommitted { failure, cleanup });
                 }
                 CatalogOutcome::CommitUnknown { failure, .. } => {
                     return Ok(ExternalMutationOutcome::CommitUnknown {
@@ -2288,6 +2293,7 @@ pub(crate) fn settle_empty_write_without_commit(
         })?;
         return Ok(ExternalMutationOutcome::KnownUncommitted {
             failure: failure(ConnectorMutationFailureKind::Conflict, message),
+            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
         });
     };
     let receipt = crate::write_codec::connector_write_receipt_with_partitioning(
@@ -2466,6 +2472,7 @@ impl IcebergWriteSessionControl {
             IcebergWriteSessionState::KnownUncommitted { message } => {
                 return Ok(ExternalMutationOutcome::KnownUncommitted {
                     failure: failure(ConnectorMutationFailureKind::Conflict, message),
+                    cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
                 });
             }
             IcebergWriteSessionState::Active => {
@@ -3271,6 +3278,11 @@ impl IcebergWriteSessionControl {
                 branches,
             },
         )?;
+        let handle = if handle.flavor() == IcebergWriteFlavor::StagedCreate {
+            handle
+        } else {
+            handle.with_source_metadata(Arc::new(metadata))?
+        };
         Ok((handle, targets, statistics_metadata))
     }
 

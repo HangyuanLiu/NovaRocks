@@ -1769,7 +1769,8 @@ impl MorUpdateChangeStreamExecutor {
         completion
             .session()
             .abort(self.connector_context.clone())
-            .map(|_| ())
+            .map_err(|error| error.to_string())
+            .and_then(crate::query_execution::write_session::require_uncommitted_release)
             .map_err(|error| format!("release empty MOR UPDATE write session: {error}"))
     }
 
@@ -1825,7 +1826,8 @@ impl MorMergeChangeStreamExecutor {
         completion
             .session()
             .abort(self.connector_context.clone())
-            .map(|_| ())
+            .map_err(|error| error.to_string())
+            .and_then(crate::query_execution::write_session::require_uncommitted_release)
             .map_err(|error| format!("release empty MOR MERGE write session: {error}"))
     }
 
@@ -2505,7 +2507,8 @@ impl DistributedCowUpdateExecutor {
     fn release_empty_write_session(&self) -> Result<(), String> {
         self.write_session
             .abort(self.connector_context.clone())
-            .map(|_| ())
+            .map_err(|error| error.to_string())
+            .and_then(crate::query_execution::write_session::require_uncommitted_release)
             .map_err(|error| format!("release empty COW write session: {error}"))
     }
 }
@@ -5945,6 +5948,7 @@ mod tests {
                 novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
                 "scripted",
             ),
+            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
         }
     }
 

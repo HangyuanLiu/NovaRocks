@@ -681,6 +681,7 @@ fn execute_create_table(
                     ConnectorMutationFailureKind::AlreadyExists,
                     "Iceberg table already exists",
                 ),
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
             }),
         };
     }
@@ -852,6 +853,7 @@ fn execute_create_table(
                 ConnectorMutationFailureKind::AlreadyExists,
                 "Iceberg table already exists",
             ),
+            cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
         }),
     }
 }
@@ -2330,7 +2332,10 @@ fn execute_application_document_update(
             })
         }
         CatalogOutcome::KnownUncommitted { failure } => {
-            Ok(ExternalMutationOutcome::KnownUncommitted { failure })
+            Ok(ExternalMutationOutcome::KnownUncommitted {
+                failure,
+                cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
+            })
         }
         CatalogOutcome::CommitUnknown { failure, .. } => {
             Ok(ExternalMutationOutcome::CommitUnknown {
@@ -3295,6 +3300,7 @@ fn known_uncommitted(
 ) -> ExternalMutationOutcome<ConnectorCatalogMutationReceipt> {
     ExternalMutationOutcome::KnownUncommitted {
         failure: failure(&error),
+        cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
     }
 }
 
@@ -3306,6 +3312,7 @@ fn known_conflict(
             ConnectorMutationFailureKind::Conflict,
             message.into(),
         ),
+        cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
     }
 }
 
@@ -3807,7 +3814,7 @@ mod tests {
                 assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
                 assert!(error.to_string().contains("read-only compatibility entry"));
                 match provider.execute(request).expect("typed refusal") {
-                    ExternalMutationOutcome::KnownUncommitted { failure } => {
+                    ExternalMutationOutcome::KnownUncommitted { failure, .. } => {
                         assert_eq!(failure.kind(), ConnectorMutationFailureKind::Unsupported);
                         assert!(
                             failure
@@ -3839,7 +3846,7 @@ mod tests {
         );
         invalid.target.incarnation = ProviderBindingEpoch::from_bytes([7; 16]);
         assert!(
-            matches!(provider.execute(invalid).unwrap(), ExternalMutationOutcome::KnownUncommitted { failure } if failure.kind() == ConnectorMutationFailureKind::InvalidRequest),
+            matches!(provider.execute(invalid).unwrap(), ExternalMutationOutcome::KnownUncommitted { failure, .. } if failure.kind() == ConnectorMutationFailureKind::InvalidRequest),
             "generation validation must precede owner admission"
         );
     }
@@ -3877,7 +3884,7 @@ mod tests {
         };
         assert!(matches!(
             provider.execute(background).unwrap(),
-            ExternalMutationOutcome::KnownUncommitted { failure }
+            ExternalMutationOutcome::KnownUncommitted { failure, .. }
                 if failure.kind() == ConnectorMutationFailureKind::Unsupported
         ));
         assert_eq!(std::fs::read_dir(warehouse.path()).unwrap().count(), before);
@@ -4344,7 +4351,7 @@ mod tests {
             policy,
         )? {
             ExternalMutationOutcome::KnownCommitted { effect, .. } => Ok(effect),
-            ExternalMutationOutcome::KnownUncommitted { failure } => {
+            ExternalMutationOutcome::KnownUncommitted { failure, .. } => {
                 Err(map_mutation_failure(&failure))
             }
             ExternalMutationOutcome::CommitUnknown { failure, .. } => Err(ConnectorError::new(
@@ -4727,7 +4734,7 @@ mod tests {
             .expect("strict existing create");
         assert!(matches!(
             strict,
-            ExternalMutationOutcome::KnownUncommitted { failure }
+            ExternalMutationOutcome::KnownUncommitted { failure, .. }
                 if failure.kind() == ConnectorMutationFailureKind::AlreadyExists
         ));
 
@@ -4868,7 +4875,7 @@ mod tests {
             .expect("execute empty guarded property mutation");
         assert!(matches!(
             empty,
-            ExternalMutationOutcome::KnownUncommitted { failure }
+            ExternalMutationOutcome::KnownUncommitted { failure, .. }
                 if failure.kind() == ConnectorMutationFailureKind::InvalidRequest
         ));
 
@@ -4907,7 +4914,7 @@ mod tests {
             .expect("execute mismatched property mutation");
         assert!(matches!(
             mismatch,
-            ExternalMutationOutcome::KnownUncommitted { failure }
+            ExternalMutationOutcome::KnownUncommitted { failure, .. }
                 if failure.kind() == ConnectorMutationFailureKind::Conflict
         ));
     }
@@ -5007,7 +5014,7 @@ mod tests {
         let outcome = known_conflict("default partition spec changed during commit");
         assert!(matches!(
             outcome,
-            ExternalMutationOutcome::KnownUncommitted { failure }
+            ExternalMutationOutcome::KnownUncommitted { failure, .. }
                 if failure.kind() == ConnectorMutationFailureKind::Conflict
         ));
     }
@@ -5669,7 +5676,7 @@ mod tests {
             }
         ));
         assert!(
-            matches!(provider.execute(request(ConnectorDataType::Int)).unwrap(),ExternalMutationOutcome::KnownUncommitted {failure} if failure.kind()==ConnectorMutationFailureKind::Unsupported)
+            matches!(provider.execute(request(ConnectorDataType::Int)).unwrap(),ExternalMutationOutcome::KnownUncommitted {failure, .. } if failure.kind()==ConnectorMutationFailureKind::Unsupported)
         );
         assert_eq!(
             metadata_file_count(before.table.metadata().location()),

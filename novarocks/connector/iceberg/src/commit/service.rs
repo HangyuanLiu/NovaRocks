@@ -54,6 +54,23 @@ impl CleanupAttempt {
         }
     }
 
+    pub(crate) fn finalization(&self) -> novarocks_spi::connector::ExternalMutationFinalization {
+        use novarocks_spi::connector::{
+            ConnectorMutationFailure, ConnectorMutationFailureKind, ExternalMutationFinalization,
+        };
+        if self.attempted && self.error_count == 0 {
+            ExternalMutationFinalization::Complete
+        } else {
+            ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+                ConnectorMutationFailureKind::Unavailable,
+                format!(
+                    "Iceberg cleanup incomplete: attempted={}, remaining={} ({:?})",
+                    self.attempted, self.error_count, self.error_paths
+                ),
+            ))
+        }
+    }
+
     pub fn from_cleanup_errors(errors: &[CleanupError]) -> Self {
         Self::completed(errors.iter().map(|error| error.path.clone()).collect())
     }

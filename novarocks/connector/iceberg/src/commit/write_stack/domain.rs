@@ -1844,6 +1844,9 @@ pub struct IcebergCommitHandle {
     /// flavor performs, and the seal reads its schema and partition spec to
     /// interpret the artifacts the backends staged.
     staged_metadata: Option<Arc<crate::iceberg::spec::TableMetadata>>,
+    /// Source facts remain pinned across retries, independently of latest M.
+    /// This is a provider-private runtime value, never a serialized handle.
+    source_metadata: Option<Arc<crate::iceberg::spec::TableMetadata>>,
     /// The frozen input file set of every sealed rewrite branch, in ordinal
     /// order. Present exactly on a distributed rewrite, which is the one flavor
     /// whose commit replaces files it named before any writer ran.
@@ -2112,6 +2115,7 @@ impl IcebergCommitHandle {
             targets,
             delete_owner,
             staged_metadata,
+            source_metadata: None,
             rewrite_inputs,
             copy_on_write,
             repartition,
@@ -2119,6 +2123,30 @@ impl IcebergCommitHandle {
             document_manifest: std::sync::Mutex::new(None),
             state: std::sync::Mutex::new(IcebergWriteSessionState::Active),
         })
+    }
+
+    pub(crate) fn with_source_metadata(
+        mut self,
+        metadata: Arc<crate::iceberg::spec::TableMetadata>,
+    ) -> Result<Self, ConnectorError> {
+        let source = metadata.snapshot_for_ref(self.table.target_ref());
+        if self.flavor == IcebergWriteFlavor::StagedCreate
+            || self.source_metadata.is_some()
+            || metadata.uuid().to_string() != self.table.table_uuid()
+            || source.map(|snapshot| snapshot.snapshot_id()) != self.table.base_snapshot_id()
+            || source.map_or(0, |snapshot| snapshot.sequence_number())
+                != self.table.base_sequence_number()
+        {
+            return Err(invalid(
+                "Pinned Iceberg source metadata contradicts the admitted session",
+            ));
+        }
+        self.source_metadata = Some(metadata);
+        Ok(self)
+    }
+
+    pub(crate) fn source_metadata(&self) -> Option<&crate::iceberg::spec::TableMetadata> {
+        self.source_metadata.as_deref()
     }
 
     pub(crate) fn with_statistics_expectations(

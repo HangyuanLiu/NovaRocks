@@ -291,10 +291,17 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
                     },
                 }
             }
-            ExternalMutationOutcome::KnownUncommitted { .. } => StatisticsPublicationOutcome {
-                fact: StatisticsPublicationFact::KnownUncommitted,
-                finalization_failure: None,
-            },
+            ExternalMutationOutcome::KnownUncommitted { cleanup, .. } => {
+                StatisticsPublicationOutcome {
+                    fact: StatisticsPublicationFact::KnownUncommitted,
+                    finalization_failure: match cleanup {
+                        ExternalMutationFinalization::Complete => None,
+                        ExternalMutationFinalization::Failed(error) => Some(StatisticsFailure {
+                            message: Arc::from(error.to_string()),
+                        }),
+                    },
+                }
+            }
             ExternalMutationOutcome::CommitUnknown { .. } => StatisticsPublicationOutcome {
                 fact: StatisticsPublicationFact::CommitUnknown,
                 finalization_failure: None,
@@ -601,6 +608,32 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn uncommitted_statistics_cleanup_is_retained_as_a_separate_failure() {
+        let outcome = super::FrontendThreePhaseStatisticsAttemptExecutor::publication_outcome(
+            ExternalMutationOutcome::KnownUncommitted {
+                failure: novarocks_spi::connector::ConnectorMutationFailure::new(
+                    novarocks_spi::connector::ConnectorMutationFailureKind::Conflict,
+                    "snapshot changed",
+                ),
+                cleanup: ExternalMutationFinalization::Failed(
+                    novarocks_spi::connector::ConnectorMutationFailure::new(
+                        novarocks_spi::connector::ConnectorMutationFailureKind::Unavailable,
+                        "Puffin delete completion absent",
+                    ),
+                ),
+            },
+        );
+        assert_eq!(outcome.fact, StatisticsPublicationFact::KnownUncommitted);
+        assert!(
+            outcome
+                .finalization_failure
+                .unwrap()
+                .message
+                .contains("Puffin delete completion absent")
+        );
+    }
 
     fn test_root_capacity() -> (
         novarocks_workload_control::RootWork,

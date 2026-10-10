@@ -1379,8 +1379,11 @@ fn seal_ctas_write(
     // have succeeded.
     let Some(row_count) = affected_rows else {
         let message = match outcome {
-            ExternalMutationOutcome::KnownUncommitted { failure } => {
-                format!("CTAS write was not sealed: {}", failure.message())
+            ExternalMutationOutcome::KnownUncommitted { failure, cleanup } => {
+                format!(
+                    "CTAS write was not sealed: {}",
+                    crate::connector::mutation::known_uncommitted_message(failure, &cleanup)
+                )
             }
             ExternalMutationOutcome::CommitUnknown { failure, .. } => format!(
                 "CTAS write sealing outcome is unresolved: {}",

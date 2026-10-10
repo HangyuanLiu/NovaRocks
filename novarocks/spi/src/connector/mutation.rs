@@ -218,6 +218,8 @@ pub enum ExternalMutationOutcome<T> {
     },
     KnownUncommitted {
         failure: ConnectorMutationFailure,
+        /// Cleanup completion is independent of the proven publication verdict.
+        cleanup: ExternalMutationFinalization,
     },
     CommitUnknown {
         failure: ConnectorMutationFailure,

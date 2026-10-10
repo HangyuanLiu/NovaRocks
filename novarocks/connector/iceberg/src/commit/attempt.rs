@@ -43,17 +43,28 @@ pub(crate) type Report = PublicationReport<CommitProof, CatalogCommitEvidence>;
 pub(crate) trait Publisher: Send + Sync {
     /// Read the authoritative target; no cached source snapshot is a retry base.
     async fn load_target(&self, attempt: &IcebergCommitAttempt) -> Result<StagingBase>;
+    /// Encode and bound the complete recovery ledger before publication becomes
+    /// possible. Failure here is definitely undispatched.
+    fn preflight_recovery(
+        &self,
+        request: &FrozenRequest,
+        operation: &IcebergCommitOperation,
+    ) -> Result<()>;
     /// Consume one complete request and issue at most one external mutation.
     async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof>;
 }
 
 /// The retained OCC entrance has one direct catalog dispatch per attempt.
 /// It shares staging and retry with owner publication without changing topology.
+pub(crate) type RecoveryPreflight =
+    std::sync::Arc<dyn Fn(&FrozenRequest, &IcebergCommitOperation) -> Result<()> + Send + Sync>;
+
 pub(crate) struct TransitionalPublisher {
     pub catalog: std::sync::Arc<dyn crate::catalog::NovaRocksCatalog>,
     pub ident: crate::iceberg::TableIdent,
     pub target_ref: String,
     pub evidence: CatalogCommitEvidence,
+    pub recovery_preflight: RecoveryPreflight,
 }
 
 #[async_trait]
@@ -73,6 +84,14 @@ impl Publisher for TransitionalPublisher {
             metadata: base.metadata,
             metadata_location: base.metadata_location,
         })
+    }
+
+    fn preflight_recovery(
+        &self,
+        request: &FrozenRequest,
+        operation: &IcebergCommitOperation,
+    ) -> Result<()> {
+        (self.recovery_preflight)(request, operation)
     }
 
     async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
@@ -224,6 +243,12 @@ pub(crate) async fn run(
             Ok(prepared) => prepared,
             Err(failure) => return rejected(operation, failure).await,
         };
+        if let Err(error) = check_window(operation, started, policy) {
+            return rejected(operation, before_dispatch_failure(&error)).await;
+        }
+        if let Err(error) = publisher.preflight_recovery(&request, operation) {
+            return rejected(operation, before_dispatch_failure(&error)).await;
+        }
         if let Err(error) = check_window(operation, started, policy) {
             return rejected(operation, before_dispatch_failure(&error)).await;
         }
@@ -468,6 +493,7 @@ mod tests {
         dispatch: Dispatch,
         cancel_after_load: bool,
         load_delay: Duration,
+        recovery_refused: bool,
         loads: AtomicUsize,
         requests: Mutex<Vec<serde_json::Value>>,
     }
@@ -479,6 +505,7 @@ mod tests {
                 dispatch,
                 cancel_after_load: false,
                 load_delay: Duration::ZERO,
+                recovery_refused: false,
                 loads: AtomicUsize::new(0),
                 requests: Mutex::new(Vec::new()),
             }
@@ -502,6 +529,26 @@ mod tests {
                 ),
             })
         }
+        fn preflight_recovery(
+            &self,
+            request: &FrozenRequest,
+            operation: &IcebergCommitOperation,
+        ) -> Result<()> {
+            assert_eq!(request.artifacts().attempt().operation(), operation.token());
+            if self.recovery_refused {
+                assert_eq!(operation.artifacts()?.len(), 3);
+                return Err(
+                    Error::new(ErrorKind::Unexpected, "Recovery envelope was refused").with_source(
+                        ConnectorError::new(
+                            ConnectorErrorKind::ResourceExhausted,
+                            "complete recovery evidence exceeds its capacity",
+                        ),
+                    ),
+                );
+            }
+            Ok(())
+        }
+
         async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
             let call = {
                 let mut requests = self.requests.lock().unwrap();
@@ -963,6 +1010,44 @@ mod tests {
         );
         assert!(publisher.requests.lock().unwrap().is_empty());
         assert!(fixture.operation.artifacts().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recovery_preflight_refusal_is_undispatched_and_cleans_all_owned_artifacts() {
+        let fixture = Fixture::new();
+        let metadata = fixture.metadata(FormatVersion::V3);
+        let intent = append_intent(&fixture, &metadata, vec![Dependency::NoReadDependency]);
+        let file = intent.changes().added[0].file().file_path();
+        std::fs::write(file.strip_prefix("file://").unwrap(), b"session data").unwrap();
+        fixture
+            .operation
+            .adopt_session_data(ObjectIdentity::new(file).unwrap())
+            .unwrap();
+        let mut publisher = ControlledPublisher::new(&fixture, metadata, Dispatch::Commit);
+        publisher.recovery_refused = true;
+        let report = run(
+            &fixture.operation,
+            &intent,
+            &PreparedChange::default(),
+            &[&FastAppendPreparer],
+            &publisher,
+            policy(),
+        )
+        .await;
+        let PublicationOutcome::KnownUncommitted(failure) = report.publication else {
+            panic!("preflight refusal is not an unknown commit")
+        };
+        assert_eq!(
+            failure.kind(),
+            ConnectorMutationFailureKind::ResourceExhausted
+        );
+        assert_eq!(
+            report.cleanup,
+            IcebergCleanupReport::Complete { deleted: 3 }
+        );
+        assert!(publisher.requests.lock().unwrap().is_empty());
+        assert!(fixture.operation.artifacts().unwrap().is_empty());
+        assert!(!std::path::Path::new(file.strip_prefix("file://").unwrap()).exists());
     }
 
     struct RemoveAfterAppend;

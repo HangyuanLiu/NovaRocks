@@ -923,10 +923,16 @@ impl ConnectorDataMutation for IcebergDataMutationAdapter {
                         commit.new_snapshot_id,
                         ExternalMutationFinalization::Complete,
                     )?,
-                    Err(CommitServiceError::KnownUncommitted { message, .. })
-                    | Err(CommitServiceError::InvalidInput { message }) => {
+                    Err(CommitServiceError::KnownUncommitted { message, cleanup }) => {
                         ExternalMutationOutcome::KnownUncommitted {
                             failure: failure(ConnectorMutationFailureKind::Conflict, message),
+                            cleanup: cleanup.finalization(),
+                        }
+                    }
+                    Err(CommitServiceError::InvalidInput { message }) => {
+                        ExternalMutationOutcome::KnownUncommitted {
+                            failure: failure(ConnectorMutationFailureKind::InvalidRequest, message),
+                            cleanup: ExternalMutationFinalization::Complete,
                         }
                     }
                     Err(CommitServiceError::Unknown { message, .. }) => {

@@ -5555,10 +5555,15 @@ impl novarocks_mv_application::ports::MvDropProviderPort for IcebergDropEffects<
                 }
                 Ok(())
             }
-            ResolvedCatalogMutation::KnownUncommitted { failure } => Err(MvProviderFailure::new(
-                MvProviderFailureKind::KnownUncommitted,
-                format!("MV DROP did not commit: {failure}"),
-            )),
+            ResolvedCatalogMutation::KnownUncommitted { failure, cleanup } => {
+                Err(MvProviderFailure::new(
+                    MvProviderFailureKind::KnownUncommitted,
+                    format!(
+                        "MV DROP did not commit: {}",
+                        crate::connector::mutation::known_uncommitted_message(failure, &cleanup)
+                    ),
+                ))
+            }
             ResolvedCatalogMutation::CommitUnknown { failure, .. } => Err(MvProviderFailure::new(
                 MvProviderFailureKind::CommitUnknown,
                 format!("MV DROP outcome is unknown: {failure}"),

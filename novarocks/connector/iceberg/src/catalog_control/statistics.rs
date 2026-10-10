@@ -749,7 +749,7 @@ impl StatisticsCollectionSession for IcebergStatisticsCollectionSession {
                     );
                 }
                 CatalogOutcome::KnownUncommitted { failure } => {
-                    cleanup_uncommitted_statistics_file(
+                    let cleanup = cleanup_uncommitted_statistics_file(
                         &this.provider,
                         this.physical_table.file_io().clone(),
                         path,
@@ -757,13 +757,13 @@ impl StatisticsCollectionSession for IcebergStatisticsCollectionSession {
                     let Some(next_attempt) =
                         next_statistics_attempt(&failure, attempt, MAX_ATTEMPTS)
                     else {
-                        return Ok(ExternalMutationOutcome::KnownUncommitted { failure });
+                        return Ok(ExternalMutationOutcome::KnownUncommitted { failure, cleanup });
                     };
                     statistics_conflict_backoff(&this.provider, &this.context, next_attempt)?;
                     continue;
                 }
                 CatalogOutcome::Unsupported(unsupported) => {
-                    cleanup_uncommitted_statistics_file(
+                    let cleanup = cleanup_uncommitted_statistics_file(
                         &this.provider,
                         this.physical_table.file_io().clone(),
                         path,
@@ -773,6 +773,7 @@ impl StatisticsCollectionSession for IcebergStatisticsCollectionSession {
                             ConnectorMutationFailureKind::Unsupported,
                             unsupported.message(),
                         ),
+                        cleanup,
                     });
                 }
                 CatalogOutcome::CommitUnknown { failure, .. } => {
@@ -855,22 +856,25 @@ fn cleanup_uncommitted_statistics_file(
     provider: &IcebergMetadata,
     file_io: crate::iceberg::io::FileIO,
     path: String,
-) {
+) -> ExternalMutationFinalization {
     let cleanup_path = path.clone();
     let cleanup = provider
         .runtime()
         .resources()
         .catalog_runtime()
         .block_on(async move { file_io.delete(&cleanup_path).await });
-    match cleanup {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            tracing::warn!(path = %path, source = ?error, "statistics Puffin cleanup failed");
-        }
+    let message = match cleanup {
+        Ok(Ok(())) => return ExternalMutationFinalization::Complete,
+        Ok(Err(error)) => format!("Statistics Puffin cleanup failed for {path}: {error}"),
         Err(error) => {
-            tracing::warn!(path = %path, source = ?error, "statistics Puffin cleanup runtime bridge failed");
+            format!("Statistics Puffin cleanup runtime bridge failed for {path}: {error}")
         }
-    }
+    };
+    tracing::warn!(path = %path, "{message}");
+    ExternalMutationFinalization::Failed(ConnectorMutationFailure::new(
+        ConnectorMutationFailureKind::Unavailable,
+        message,
+    ))
 }
 
 fn collection_requirements(
@@ -1384,6 +1388,7 @@ fn statistics_receipt(
 fn known_uncommitted(error: ConnectorError) -> ExternalMutationOutcome<StatisticsReceipt> {
     ExternalMutationOutcome::KnownUncommitted {
         failure: ConnectorMutationFailure::new(failure_kind(error.kind()), error.to_string()),
+        cleanup: novarocks_spi::connector::ExternalMutationFinalization::Complete,
     }
 }
 
@@ -1946,7 +1951,7 @@ mod tests {
             .expect("definite catalog rejection");
         assert!(matches!(
             outcome,
-            ExternalMutationOutcome::KnownUncommitted { ref failure }
+            ExternalMutationOutcome::KnownUncommitted { ref failure, .. }
                 if failure.kind() == ConnectorMutationFailureKind::InvalidRequest
         ));
         assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 1);
