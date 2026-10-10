@@ -1890,6 +1890,8 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
 }
 #[path = "cow_failure.rs"]
 mod cow_failure;
+#[path = "cow_fe_begin_receipt.rs"]
+mod cow_fe_begin_receipt;
 /// Open the write session one copy-on-write mutation writes through.
 ///
 /// Unlike every other write, this session cannot be opened before the statement
@@ -1924,6 +1926,22 @@ fn begin_cow_write_session(
     cow_necessary_before_begin::before_request_owned(
         preparation, selection, execution.result_capacity(), connector_context,
         |selection| {
+        let binding = execution.result_capacity().ok_or_else(|| CowFailure::before_begin(
+            cow_necessary_before_begin::Error::MissingAdmission))?;
+        let _request_receipt = cow_fe_begin_receipt::before_request(
+            preparation, &selection, &target.namespace, &target.table, binding, connector_context,
+        ).map_err(CowFailure::before_begin)?;
+        let name_bytes = target.namespace.len().checked_add(1)
+            .and_then(|n| n.checked_add(target.table.len())).ok_or_else(|| CowFailure::provider(
+                novarocks_spi::connector::ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted,
+                    "COW table identifier size overflowed")))?;
+        let mut name = String::with_capacity(name_bytes);
+        name.push_str(&target.namespace);
+        name.push('.');
+        name.push_str(&target.table);
+        let table_name: Arc<str> = Arc::from(name.as_str());
+        drop(name);
         let field = |name: &str, data_type: DataType, nullable: bool| {
             ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(name, data_type, nullable))
         };
@@ -1934,7 +1952,7 @@ fn begin_cow_write_session(
             data_fields.push(field(source.name(), source.data_type().clone(), source.is_nullable()));
         }
         let request = novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
-            table: Arc::from(format!("{}.{}", target.namespace, target.table).as_str()),
+            table: table_name,
             target_ref: preparation.target_ref().clone(),
             intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
             purpose: novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
@@ -5884,6 +5902,8 @@ mod tests {
             consumer.check_end(fixture.selection.row_count()).unwrap();
             consumer.finish().unwrap()
         }
+
+        include!("cow_fe_begin_receipt_tests.rs");
 
         #[test]
         fn actual_cow_begin_preserves_original_provider_failure_through_dml_conversion() {
