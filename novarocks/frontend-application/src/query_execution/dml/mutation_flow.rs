@@ -1300,6 +1300,10 @@ pub(crate) fn stage_prepared_update_mutation(
                 &connector_context,
                 &cow_preparations.preparation,
             )?;
+            // The completed match owns its selection. Release the generated
+            // SQL and AST before constructing the next COW transformation.
+            drop(query);
+            drop(source_sql);
             if selection.row_count() == 0 {
                 return Ok(MutationStagedWrite::NoOp);
             }
@@ -1923,10 +1927,12 @@ fn begin_cow_write_session(
         let field = |name: &str, data_type: DataType, nullable: bool| {
             ConnectorWriteFieldRequest::new(arrow::datatypes::Field::new(name, data_type, nullable))
         };
-        let data_fields = cow_target_columns(preparation)
-            .iter()
-            .map(|column| field(&column.name, column.data_type.clone(), column.nullable))
-            .collect::<Vec<_>>();
+        let after_fields = preparation.match_contract().after_fields();
+        let mut data_fields = Vec::with_capacity(after_fields.len());
+        for signed in after_fields {
+            let source = signed.field();
+            data_fields.push(field(source.name(), source.data_type().clone(), source.is_nullable()));
+        }
         let request = novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
             table: Arc::from(format!("{}.{}", target.namespace, target.table).as_str()),
             target_ref: preparation.target_ref().clone(),
@@ -3664,6 +3670,8 @@ pub(crate) fn stage_prepared_merge_mutation(
         &connector_context,
         &cow_preparations.preparation,
     )?;
+    // The generated match AST is no longer needed by the owned selection.
+    drop(query);
     if selection.row_count() == 0 {
         return Ok(MutationStagedWrite::NoOp);
     }
