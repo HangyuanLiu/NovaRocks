@@ -316,6 +316,38 @@ async fn closed_poll_ready_destroys_the_original_hidden_acquire_qualification() 
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn original_hidden_readiness_qualification_exits_on_channel_drop_without_repoll() {
+    // Unit-only: the real PollSemaphore and original gate, with no Native IO.
+    let admission = small_frontend();
+    let lazy = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+    let mut lane = NativeLaneChannel::new(lazy, NativeLane::ResultData, Some(&admission));
+    let count = lane.stream_limit();
+    // Retain the SAME semaphore only to inspect its actual returned positions.
+    let original_streams = Arc::clone(&lane.gate.semaphore);
+    let held = Arc::clone(&original_streams)
+        .acquire_many_owned(u32::try_from(count).unwrap())
+        .await
+        .unwrap();
+    let was_pending = lane
+        .poll_ready(&mut Context::from_waker(std::task::Waker::noop()))
+        .is_pending();
+    drop(held); // Assigns one qualification inside this original acquire future.
+    let assigned = original_streams.available_permits();
+    admission.close_frontend_outgoing().unwrap();
+    // Do not poll_ready or call again: cancellation must drop this very holder.
+    let after_close = original_streams.available_permits();
+    let public_exits = admission.frontend_outgoing_snapshot().unwrap();
+    drop(lane);
+    let after_original_drop = original_streams.available_permits();
+
+    assert!(was_pending);
+    assert_eq!(assigned, count - 1);
+    assert_eq!(after_close, count - 1);
+    assert!(public_exits.is_drained()); // Scoped IO/handshake/dispatched requests only.
+    assert_eq!(after_original_drop, count);
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn escaped_ready_channel_cannot_dispatch_after_the_original_role_close() {
     let admission = small_frontend();
     let mut peer = OriginalH2Peer::start().await.unwrap();
