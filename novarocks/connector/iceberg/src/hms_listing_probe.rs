@@ -111,6 +111,27 @@ impl HmsListingProbe {
         Ok(())
     }
 
+    /// Read the original materialized target; no SDK call or second selection.
+    pub fn captured_admission_owner(
+        &self,
+        candidate: &novarocks_connector_contract::ConnectorInstanceId,
+    ) -> Result<Option<(CatalogHandle, ProviderBindingEpoch)>, &'static str> {
+        if candidate.as_str() != self.catalog_name {
+            return Ok(None);
+        }
+        let target = self
+            .target
+            .lock()
+            .map_err(|_| "HMS observation target lock failed")?;
+        let target = target
+            .as_ref()
+            .ok_or("HMS admission owner was not captured before publication")?;
+        if target.handle.catalog_name() != candidate || target.listing.upgrade().is_none() {
+            return Err("HMS captured admission generation differs or has exited");
+        }
+        Ok(Some((target.handle.clone(), target.incarnation)))
+    }
+
     /// Strict, finite request/response boundary for the existing management owner.
     pub fn handle_json(&self, body: &[u8]) -> Result<Vec<u8>, &'static str> {
         if body.len() > REQUEST_LIMIT {

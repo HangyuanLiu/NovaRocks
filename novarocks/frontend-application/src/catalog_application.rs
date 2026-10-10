@@ -35,6 +35,9 @@ use novarocks_state_store_api::StateStore;
 #[cfg(test)]
 use uuid::Uuid;
 
+#[cfg(feature = "mem-1-m07-hms-listing-observe")]
+pub mod admission_completion;
+
 pub mod command;
 pub mod create_table_ddl;
 pub mod iceberg_ref_command;
@@ -102,6 +105,15 @@ impl QueryCatalogBinding {
 /// the catalog or fail the controller's convergence.
 pub trait CatalogAdmissionObserver: Send + Sync {
     fn catalog_admitted(&self, instance_id: &ConnectorInstanceId);
+
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    fn catalog_admitted_observed(
+        &self,
+        observation: &CatalogRuntimeObservation,
+        _sweep: Option<admission_completion::Sweep>,
+    ) {
+        self.catalog_admitted(&observation.instance_id);
+    }
 }
 
 /// Frontend-owned exact runtime publication set.
@@ -115,14 +127,31 @@ pub struct CatalogRuntimeProjection {
     published: Mutex<BTreeMap<ConnectorInstanceId, CatalogRuntimeObservation>>,
     query_catalog: Mutex<Option<QueryCatalogBinding>>,
     admission_observers: Mutex<Vec<std::sync::Weak<dyn CatalogAdmissionObserver>>>,
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    admission_completion: Arc<admission_completion::AdmissionCompletion>,
 }
 
 impl CatalogRuntimeProjection {
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub fn bind_hms_admission_selector(
+        &self,
+        selector: admission_completion::OwnerSelector,
+    ) -> Result<(), &'static str> {
+        self.admission_completion.bind_selector(selector)
+    }
+
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub fn hms_admission_completion(&self) -> Arc<admission_completion::AdmissionCompletion> {
+        Arc::clone(&self.admission_completion)
+    }
+
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             published: Mutex::new(BTreeMap::new()),
             query_catalog: Mutex::new(None),
             admission_observers: Mutex::new(Vec::new()),
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            admission_completion: admission_completion::AdmissionCompletion::new(),
         })
     }
 
@@ -166,7 +195,22 @@ impl CatalogRuntimeProjection {
             }
             Err(_) => return,
         };
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+        let observed = self
+            .published
+            .lock()
+            .ok()
+            .and_then(|published| published.get(instance_id).cloned());
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+        let sweep = observed
+            .as_ref()
+            .and_then(|observation| self.admission_completion.queue(observation));
         for observer in observers.iter().filter_map(std::sync::Weak::upgrade) {
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            if let Some(observation) = observed.as_ref() {
+                observer.catalog_admitted_observed(observation, sweep.clone());
+                continue;
+            }
             observer.catalog_admitted(instance_id);
         }
     }
@@ -320,6 +364,8 @@ impl CatalogRuntimePublisherSink for CatalogRuntimeProjection {
             .is_some_and(|current| current.generation == generation)
         {
             published.remove(instance_id);
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            self.admission_completion.retired(instance_id, generation);
             // Revoking the SQL name before the caller retires its local
             // generation is what stops new admission for a dropped catalog.
             if let Some(binding) = self

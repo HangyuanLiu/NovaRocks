@@ -448,26 +448,11 @@ fn journal_idle(value: &Journal, frontend: u32) -> Result<()> {
     }
     Ok(())
 }
-// Deposit the original bounded history before validating it. The same helper
-// serves the actual run and regression tests; no reset or later snapshot can
-// erase the rejected facts from the original failure evidence.
-fn record_and_validate_catalog_admission(
-    receipts: &mut Vec<Value>,
-    journal: &Journal,
-    frontend: u32,
-) -> Result<()> {
-    receipts.push(json!({"phase":"catalog-admission","journal":journal}));
-    at_stage(InitialStage::CatalogJournalValidation, || {
-        journal_idle(journal, frontend)
-    })?;
-    at_stage(InitialStage::CatalogAdmissionNoListing, || {
-        ensure!(
-            journal.used == 0,
-            "HMS original catalog admission unexpectedly listed objects"
-        );
-        Ok(())
-    })
-}
+#[path = "hms_admission_completion.rs"]
+mod admission_completion;
+#[cfg(test)]
+use admission_completion::record_and_validate_catalog_admission;
+use admission_completion::wait_original_admission;
 
 fn uuid(value: &str) -> bool {
     value.len() == 36
@@ -751,7 +736,7 @@ enum InitialStage {
     AllocatorAfter,
     CatalogSnapshot,
     CatalogJournalValidation,
-    CatalogAdmissionNoListing,
+    CatalogAdmissionCompletion,
 }
 impl InitialStage {
     fn label(self) -> &'static str {
@@ -770,7 +755,7 @@ impl InitialStage {
             Self::AllocatorAfter => "allocator-after",
             Self::CatalogSnapshot => "catalog-snapshot",
             Self::CatalogJournalValidation => "catalog-journal-validation",
-            Self::CatalogAdmissionNoListing => "catalog-admission-no-listing",
+            Self::CatalogAdmissionCompletion => "catalog-admission-completion",
         }
     }
 }
@@ -1457,8 +1442,8 @@ impl Scenario for HmsBulkReadonlyNative {
                 register(&bulk_registration(&self.input), &user, mysql_port, phase)
             })?;
             receipts.push(json!({"phase":"catalog-admission","allocator":registration}));
-            let mut journal = at_stage(InitialStage::CatalogSnapshot, || snapshot(port, phase))?;
-            record_and_validate_catalog_admission(&mut receipts, &journal, frontend)?;
+            let (mut journal, admission) =
+                wait_original_admission(&mut receipts, port, frontend, phase)?;
             let generation = (
                 journal.process_id,
                 journal.catalog_name.clone(),
@@ -1466,14 +1451,23 @@ impl Scenario for HmsBulkReadonlyNative {
                 journal.incarnation.clone(),
                 journal.domain.clone(),
             );
-            fs::write(
-                context
-                    .scenario_root()
-                    .join("hms-bulk-catalog-admission.json"),
-                serde_json::to_vec_pretty(&receipts)?,
+            admission_completion::persist_before_reset(
+                &receipts,
+                &journal,
+                &admission,
+                frontend,
+                phase,
+                || {
+                    fs::write(
+                        context
+                            .scenario_root()
+                            .join("hms-bulk-catalog-admission.json"),
+                        serde_json::to_vec_pretty(&receipts)?,
+                    )
+                    .map_err(Into::into)
+                },
+                || reset(port, &journal, phase),
             )?;
-            remaining(phase)?;
-            reset(port, &journal, phase)?;
             for count in CLIENTS {
                 let phase = self.phase()?;
                 let before = snapshot(port, phase)?;

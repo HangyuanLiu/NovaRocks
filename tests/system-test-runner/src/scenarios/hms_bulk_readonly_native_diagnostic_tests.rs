@@ -412,7 +412,7 @@ fn initial_empty_journal() -> Journal {
         records: Vec::new(),
     }
 }
-fn initial_settled_journal() -> Journal {
+pub(super) fn initial_settled_journal() -> Journal {
     let mut journal = initial_empty_journal();
     journal.sequence = 9;
     journal.used = 1;
@@ -457,10 +457,18 @@ fn initial_receipts() -> Vec<Value> {
 }
 
 #[test]
-fn original_empty_journal_is_deposited_and_passes_shared_admission_gate() {
+fn original_empty_journal_is_deposited_but_cannot_prove_worker_discovery_completion() {
     let journal = initial_empty_journal();
     let mut receipts = initial_receipts();
-    record_and_validate_catalog_admission(&mut receipts, &journal, 123).unwrap();
+    assert!(
+        record_and_validate_catalog_admission(
+            &mut receipts,
+            &journal,
+            &super::admission_completion::completed_for_test(&journal),
+            123
+        )
+        .is_err()
+    );
     let captured = deposited_journal(&receipts);
     assert_eq!(captured.process_id, 123);
     assert_eq!(
@@ -485,8 +493,13 @@ fn rejected_pid_sdk_and_positions_remain_in_original_journal_evidence() {
             _ => journal.available_positions_sample = Some(7),
         }
         let mut receipts = initial_receipts();
-        let error =
-            record_and_validate_catalog_admission(&mut receipts, &journal, 123).unwrap_err();
+        let error = record_and_validate_catalog_admission(
+            &mut receipts,
+            &journal,
+            &super::admission_completion::completed_for_test(&journal),
+            123,
+        )
+        .unwrap_err();
         let diagnostic = failure_diagnostic(&error).unwrap();
         assert_eq!(diagnostic.stage, Some("catalog-journal-validation"));
         assert_eq!(diagnostic.class, "opaque-original-source-retained");
@@ -505,13 +518,17 @@ fn rejected_pid_sdk_and_positions_remain_in_original_journal_evidence() {
 }
 
 #[test]
-fn settled_listing_passes_idle_but_fails_no_listing_with_original_record_saved() {
+fn settled_original_namespace_and_worker_quarantine_pass_with_history_saved() {
     let journal = initial_settled_journal();
     journal_idle(&journal, 123).unwrap();
     let mut receipts = initial_receipts();
-    let error = record_and_validate_catalog_admission(&mut receipts, &journal, 123).unwrap_err();
-    let diagnostic = failure_diagnostic(&error).unwrap();
-    assert_eq!(diagnostic.stage, Some("catalog-admission-no-listing"));
+    record_and_validate_catalog_admission(
+        &mut receipts,
+        &journal,
+        &super::admission_completion::completed_for_test(&journal),
+        123,
+    )
+    .unwrap();
     let captured = deposited_journal(&receipts);
     assert_eq!((captured.used, captured.records.len()), (1, 1));
     let record = &captured.records[0];
@@ -532,7 +549,13 @@ fn rejected_destructor_order_is_saved_before_shared_gate_returns_error() {
     let mut journal = initial_settled_journal();
     journal.records[0].sdk_dropped = journal.records[0].permit_returned;
     let mut receipts = initial_receipts();
-    let error = record_and_validate_catalog_admission(&mut receipts, &journal, 123).unwrap_err();
+    let error = record_and_validate_catalog_admission(
+        &mut receipts,
+        &journal,
+        &super::admission_completion::completed_for_test(&journal),
+        123,
+    )
+    .unwrap_err();
     assert_eq!(
         failure_diagnostic(&error).unwrap().stage,
         Some("catalog-journal-validation")
@@ -547,7 +570,13 @@ fn original_journal_validation_primary_survives_secondary_evidence_failures() {
     let mut journal = initial_empty_journal();
     journal.sdk_objects_live = 1;
     let mut receipts = initial_receipts();
-    let primary = record_and_validate_catalog_admission(&mut receipts, &journal, 123).unwrap_err();
+    let primary = record_and_validate_catalog_admission(
+        &mut receipts,
+        &journal,
+        &super::admission_completion::completed_for_test(&journal),
+        123,
+    )
+    .unwrap_err();
     let original = primary.downcast_ref::<StageFailure>().unwrap() as *const StageFailure;
     let diagnostic_marker = Arc::new(());
     let evidence_marker = Arc::new(());

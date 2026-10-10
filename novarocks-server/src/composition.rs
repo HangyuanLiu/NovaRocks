@@ -770,8 +770,22 @@ pub fn compose_frontend_role_config(
             process_memory: Some(frontend_process_memory_observation()),
             #[cfg(feature = "mem-1-m07-hms-listing-observe")]
             hms_listing_observation: provider_manifest.hms_listing_probe().map(|probe| {
-                std::sync::Arc::new(move |body: &[u8]| probe.handle_json(body))
-                    as novarocks_frontend_application::HmsListingObservationHandler
+                let selected = std::sync::Arc::clone(&probe);
+                novarocks_frontend_application::HmsListingObservationSetup::new(
+                    std::sync::Arc::new(move |body: &[u8]| probe.handle_json(body)),
+                    std::sync::Arc::new(move |observation| {
+                        selected
+                            .captured_admission_owner(&observation.instance_id)
+                            .map(|owner| {
+                                owner.map(|(handle, incarnation)| {
+                                    novarocks_frontend_application::HmsAdmissionInstalledOwner {
+                                        handle,
+                                        incarnation,
+                                    }
+                                })
+                            })
+                    }),
+                )
             }),
         },
         serving: FrontendServingConfig {
