@@ -237,17 +237,21 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
         SqlPhysicalEmissionMode::OriginalNativeV1,
         SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
     ] {
-        for scenario in 0..3 {
-            let complex_key = scenario != 0;
-            let fields = [
+        for scenario in 0..5 {
+            let complex_key = matches!(scenario, 1..=3);
+            let mut fields = vec![
                 Field::new("k", DataType::Utf8, true),
                 Field::new("v", DataType::Utf8, true),
                 Field::new("n", DataType::Int64, true),
             ];
+            if scenario >= 3 {
+                fields.push(Field::new("id", DataType::Int32, true));
+            }
             let sql = match scenario {
                 0 => "SELECT json_object(k, v) AS j FROM t",
                 1 => "SELECT json_object([n], v) AS j FROM t",
                 2 => "SELECT json_object(NULL, json_object([n], v)) AS j FROM t",
+                3 | 4 => "SELECT json_object([[id, n]][IF(id = 2, NULL, 1)], v) AS j FROM t",
                 _ => unreachable!(),
             };
             let source = sql_source_with_declared_fields(sql, &fields, mode);
@@ -273,6 +277,81 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                 }
             }
             assert_eq!(authored, if scenario == 2 { 2 } else { 1 });
+
+            if scenario >= 3 {
+                if let Ok(directory) = std::env::var("C16_SQL_SOURCE_OUT") {
+                    std::fs::write(
+                        std::path::Path::new(&directory)
+                            .join(format!("nested-index-{mode:?}-{scenario}.txt")),
+                        format!("{:#?}\n", source.plan()),
+                    )
+                    .unwrap();
+                }
+                let mut accesses = 0;
+                for fragment in source.plan().fragments().values() {
+                    for (_, expression) in fragment.expressions().iter() {
+                        let ExprKind::FunctionCall { function, args } = &expression.kind else {
+                            continue;
+                        };
+                        if function.function_id.as_str() != "builtin.scalar/__array_element_at/v1" {
+                            continue;
+                        }
+                        accesses += 1;
+                        assert_eq!(args.len(), 2);
+                        assert_eq!(
+                            expression.ty.data_type,
+                            DataType::List(Arc::new(Field::new("item", DataType::Int64, true)))
+                        );
+                        assert!(expression.ty.nullable);
+                        let index = fragment.expressions().get(args[1]).unwrap();
+                        assert_eq!(index.ty.data_type, DataType::Int32);
+                        assert!(index.ty.nullable);
+                        let ExprKind::Cast {
+                            expr: if_id,
+                            target,
+                            ..
+                        } = &index.kind
+                        else {
+                            panic!("SQL subscript's actual index cast");
+                        };
+                        assert_eq!(target, &DataType::Int32);
+                        let conditional = fragment.expressions().get(*if_id).unwrap();
+                        assert_eq!(conditional.ty.data_type, DataType::Int64);
+                        assert!(conditional.ty.nullable);
+                        let ExprKind::FunctionCall { function, args } = &conditional.kind else {
+                            panic!("primitive SQL IF");
+                        };
+                        assert_eq!(function.function_id.as_str(), "builtin.scalar/if/v1");
+                        assert_eq!(args.len(), 3);
+                        for (arg, value) in args[1..].iter().zip([None, Some(1)]) {
+                            let branch = fragment.expressions().get(*arg).unwrap();
+                            assert_eq!(branch.ty.data_type, DataType::Int64);
+                            let actual = match &branch.kind {
+                                ExprKind::Literal(
+                                    novarocks_physical_plan::LiteralValue::Int64(v),
+                                ) => Some(*v),
+                                ExprKind::Constant(reference) => {
+                                    let pool =
+                                        &source.plan().constants().entries()[&reference.pool];
+                                    assert_eq!(pool.value_type(), &branch.ty);
+                                    let values = pool
+                                        .array()
+                                        .as_any()
+                                        .downcast_ref::<arrow::array::Int64Array>()
+                                        .unwrap();
+                                    let row = usize::try_from(reference.ordinal).unwrap();
+                                    assert_eq!(branch.ty.nullable, value.is_none());
+                                    (!values.is_null(row)).then(|| values.value(row))
+                                }
+                                other => panic!("actual SQL integer source {other:?}"),
+                            };
+                            assert_eq!(actual, value);
+                        }
+                    }
+                }
+                assert_eq!(accesses, 1, "real nested List subscript is present");
+            }
+
             let programs = compiler_results(&source, &installed_builtin_owner_catalogue());
             let mut producer = None;
             for program in programs.into_values() {
@@ -324,7 +403,7 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                     else {
                         panic!("real JSON producer");
                     };
-                    let key_slot = if complex_key {
+                    let key_slot = if complex_key || scenario == 4 {
                         None
                     } else {
                         let StaticExprKind::SlotId(slot) = arena.node(args[0]).unwrap().kind()
@@ -376,10 +455,14 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                 .iter()
                 .zip(slots)
                 .map(|(field, slot)| match field.data_type() {
-                    DataType::Int64 => {
-                        Arc::new(arrow::array::Int64Array::from(vec![Some(1), None, Some(3)]))
-                            as ArrayRef
+                    DataType::Int32 => {
+                        Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3])) as ArrayRef
                     }
+                    DataType::Int64 => Arc::new(arrow::array::Int64Array::from(if scenario >= 3 {
+                        vec![Some(42), Some(-7), None]
+                    } else {
+                        vec![Some(1), None, Some(3)]
+                    })) as ArrayRef,
                     DataType::Utf8 => Arc::new(StringArray::from(if key_slot == Some(*slot) {
                         vec![Some("a"), None, Some("b")]
                     } else {
@@ -403,8 +486,8 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                 Some(host),
             )
             .unwrap();
-            let rows = [0, 2];
-            let selection = Selection::try_sparse(3, &rows).unwrap();
+            let rows: &[usize] = if scenario == 4 { &[1] } else { &[0, 2] };
+            let selection = Selection::try_sparse(3, rows).unwrap();
             let output = frame.evaluate_evaluation(
                 &batch,
                 selection,
@@ -443,9 +526,17 @@ fn c16_p1_json_object_real_sql_package_local_compiler_and_frame_keep_whole_call_
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .unwrap();
-                assert_eq!(text.value(0), "{\"a\": {\"a\": 1, \"z\": 2}}");
-                assert_eq!(text.value(1), "{\"b\": \"ordinary text\"}");
-                let alias = output.values().slice(1, 1);
+                if scenario == 4 {
+                    assert_eq!(text.len(), 1);
+                    assert!(
+                        text.is_null(0),
+                        "a NULL nested index yields a successful NULL key"
+                    );
+                } else {
+                    assert_eq!(text.value(0), "{\"a\": {\"a\": 1, \"z\": 2}}");
+                    assert_eq!(text.value(1), "{\"b\": \"ordinary text\"}");
+                }
+                let alias = output.values().slice(if scenario == 4 { 0 } else { 1 }, 1);
                 drop(output);
                 drop(frame);
                 assert!(

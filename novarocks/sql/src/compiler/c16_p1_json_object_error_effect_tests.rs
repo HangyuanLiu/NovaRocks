@@ -23,6 +23,14 @@ use novarocks_functions::PureKernelAbi;
 use novarocks_type_contract::FunctionIntrinsicRowError;
 
 fn compile(sql: &str, mode: SqlPhysicalEmissionMode) -> SqlOptimizedOutput {
+    compile_with_id_type(sql, mode, DataType::Int64)
+}
+
+fn compile_with_id_type(
+    sql: &str,
+    mode: SqlPhysicalEmissionMode,
+    id_type: DataType,
+) -> SqlOptimizedOutput {
     let source = crate::planner::table::test_sql_scan_source(
         crate::planner::table::SqlScanKind::ConnectorRead,
     );
@@ -50,7 +58,11 @@ fn compile(sql: &str, mode: SqlPhysicalEmissionMode) -> SqlOptimizedOutput {
                     .into_iter()
                     .map(|name| novarocks_types::schema::ColumnDef {
                         name: name.into(),
-                        data_type: DataType::Int64,
+                        data_type: if name == "id" {
+                            id_type.clone()
+                        } else {
+                            DataType::Int64
+                        },
                         nullable: true,
                         write_default: None,
                         logical_type: None,
@@ -179,6 +191,100 @@ fn c16_p1_json_object_real_sql_pruning_and_filter_rules_preserve_whole_data_in_b
                     count_preserved_filter(&output.optimized_tree, mode) > 0,
                     "PushFilterThroughProject must retain the outer filter above Data"
                 );
+            }
+        }
+    }
+}
+
+#[test]
+fn c16_p1_json_object_native_nested_index_keeps_accurate_types_and_whole_data_in_both_modes() {
+    fn check(node: &OptimizedOperatorNode, mode: SqlPhysicalEmissionMode) -> usize {
+        let mut count = 0;
+        if let Operator::PhysicalProject(project) = &node.op {
+            let arena = node.execution_props.scalar_arena.as_ref().unwrap();
+            for item in &project.items {
+                let ScalarNode::FunctionCall { binding, args, .. } = arena.node(item.expr) else {
+                    continue;
+                };
+                if binding.function_id.as_str() != "builtin.scalar/json_object/v1" {
+                    continue;
+                }
+                assert!(whole_data_project(node, mode));
+                let ScalarNode::FunctionCall {
+                    binding,
+                    args: access,
+                    ..
+                } = arena.node(args[0])
+                else {
+                    panic!("nested key's actual bound access");
+                };
+                assert_eq!(
+                    binding.function_id.as_str(),
+                    "builtin.scalar/__array_element_at/v1"
+                );
+                assert_eq!(access.len(), 2);
+                let inner = DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Int64,
+                    true,
+                )));
+                assert_eq!(arena.data_type(args[0]), &inner);
+                assert!(arena.nullable(args[0]));
+                assert_eq!(
+                    arena.data_type(access[0]),
+                    &DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                        "item", inner, true
+                    )))
+                );
+                let ScalarNode::Cast { child, target, .. } = arena.node(access[1]) else {
+                    panic!("native SQL index cast");
+                };
+                assert_eq!(target, &DataType::Int32);
+                assert!(arena.nullable(access[1]));
+                assert_eq!(arena.data_type(*child), &DataType::Int64);
+                assert!(arena.nullable(*child));
+                let ScalarNode::FunctionCall {
+                    binding,
+                    args: branches,
+                    ..
+                } = arena.node(*child)
+                else {
+                    panic!("primitive IF source");
+                };
+                assert_eq!(binding.function_id.as_str(), "builtin.scalar/if/v1");
+                assert_eq!(branches.len(), 3);
+                assert_eq!(arena.data_type(branches[0]), &DataType::Boolean);
+                for (branch, nullable) in branches[1..].iter().zip([true, false]) {
+                    assert_eq!(arena.data_type(*branch), &DataType::Int64);
+                    assert_eq!(arena.nullable(*branch), nullable);
+                }
+                count += 1;
+            }
+        }
+        count
+            + node
+                .children
+                .iter()
+                .map(|child| check(child, mode))
+                .sum::<usize>()
+    }
+    for mode in [
+        SqlPhysicalEmissionMode::OriginalNativeV1,
+        SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
+    ] {
+        for filtered in [false, true] {
+            let suffix = if filtered {
+                "WHERE id = 2 ORDER BY id"
+            } else {
+                "ORDER BY id"
+            };
+            let sql = format!(
+                "SELECT id FROM (SELECT id, json_object([[id, n]][IF(id = 2, NULL, 1)], n) AS unused_error FROM t) s {suffix}"
+            );
+            let output = compile_with_id_type(&sql, mode, DataType::Int32);
+            assert_eq!(check(&output.optimized_tree, mode), 1);
+            if filtered {
+                assert!(count_preserved_filter(&output.optimized_tree, mode) > 0);
             }
         }
     }
