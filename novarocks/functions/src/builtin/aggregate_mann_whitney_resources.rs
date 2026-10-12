@@ -17,11 +17,17 @@
 //! Checked facts for the original Mann-Whitney emission containers.
 //! These stack facts neither run the statistic nor authorize an allocation.
 
-use super::aggregate_mann_whitney_core::MannStateExtents;
+use super::aggregate_mann_whitney_core::{MannResourceEvent, MannStateExtents};
 use crate::arrow_result_custody::{
     FlatByteKind, FlatDirectByteFacts, RequestUpper, direct_flat_byte_facts,
 };
+use crate::scalar_copy_geometry::{
+    ScalarCopyDiagnosticGeometry, arrow_default_debug_bytes_upper, scalar_copy_diagnostic_geometry,
+};
 use crate::scalar_resources::ScalarResourceError;
+use crate::{KernelEvaluationControl, KernelFailure};
+use arrow_array::ArrayRef;
+use arrow_schema::DataType;
 use novarocks_type_contract::{
     ControlResourceError, owned_resources::formatting::original_format_string_request_bound,
 };
@@ -268,6 +274,160 @@ pub(crate) fn default_byte_payload(
         ComponentFacts::ZERO
     };
     data.overlap(offsets)?.overlap(bitmap)
+}
+
+fn source_failure(error: ScalarResourceError) -> KernelFailure {
+    match error {
+        ScalarResourceError::Arithmetic => KernelFailure::ResourceExhausted,
+        ScalarResourceError::SourceModel(detail) => crate::kernel_control::invalid(detail),
+        ScalarResourceError::Invariant(detail) => crate::kernel_control::internal(detail),
+    }
+}
+
+fn static_diagnostic_facts(message: &'static str, replacement: bool) -> Result<ComponentFacts> {
+    let original = ComponentFacts::exact(bytes::<u8>(message.len())?);
+    replace_diagnostic(original, replacement)
+}
+fn replace_diagnostic(original: ComponentFacts, replacement: bool) -> Result<ComponentFacts> {
+    if !replacement {
+        return Ok(original);
+    }
+    // The original treatment replacement is one exact str::to_string birth.
+    let replacement = ComponentFacts::exact(bytes::<u8>(56)?);
+    Ok(ComponentFacts {
+        requests: requests(original.requests, replacement.requests)?,
+        peak: add(original.peak, replacement.peak)?,
+        retained: replacement.retained,
+    })
+}
+
+/// Generic default ToString starts empty and may write several Debug pieces.
+/// This is not the nonzero estimated-capacity format! destination author.
+fn fresh_display_string(output: usize) -> Result<ComponentFacts> {
+    if output == 0 {
+        return Ok(ComponentFacts::ZERO);
+    }
+    let capacity = mul(2, output)?.max(8);
+    bytes::<u8>(capacity)?;
+    let count = add(usize::BITS as usize, 2)?;
+    Ok(ComponentFacts {
+        requests: RequestUpper {
+            bytes: mul(count, capacity)?,
+            requests: count,
+        },
+        peak: mul(2, capacity)?,
+        retained: capacity,
+    })
+}
+/// ScalarStateError Display writes its whole message once into a fresh String.
+fn one_write_display_string(output: usize) -> Result<ComponentFacts> {
+    if output == 0 {
+        return Ok(ComponentFacts::ZERO);
+    }
+    Ok(ComponentFacts::exact(bytes::<u8>(output.max(8))?))
+}
+fn first_alternative_facts(source_bytes: usize) -> Result<ComponentFacts> {
+    let output = mul(12, source_bytes)?;
+    let lowercase = if source_bytes == 0 {
+        ComponentFacts::ZERO
+    } else {
+        vector::<u8>(source_bytes, output, 8)?
+    };
+    let invalid = format_string(76, add(38, output)?)?;
+    Ok(ComponentFacts {
+        requests: requests(lowercase.requests, invalid.requests)?,
+        peak: lowercase.peak.max(add(lowercase.retained, invalid.peak)?),
+        retained: invalid.retained,
+    })
+}
+fn merge_scratch_facts(left: MannStateExtents, right: MannStateExtents) -> Result<ComponentFacts> {
+    let left = sample_sorts(left)?;
+    let right = sample_sorts(right)?;
+    Ok(ComponentFacts {
+        requests: requests(left.requests, right.requests)?,
+        peak: left.peak.max(right.peak),
+        retained: 0,
+    })
+}
+fn int_setup_diagnostic_facts(
+    data_type: &DataType,
+    replacement: bool,
+    control: &dyn KernelEvaluationControl,
+) -> std::result::Result<ComponentFacts, KernelFailure> {
+    let debug = arrow_default_debug_bytes_upper(data_type, control)?;
+    let output = add(28, debug).map_err(source_failure)?;
+    replace_diagnostic(
+        format_string(56, output).map_err(source_failure)?,
+        replacement,
+    )
+    .map_err(source_failure)
+}
+fn scalar_read_event_facts(
+    array: &ArrayRef,
+    row: usize,
+    control: &dyn KernelEvaluationControl,
+) -> std::result::Result<ComponentFacts, KernelFailure> {
+    let geometry = scalar_copy_diagnostic_geometry(array, row, control)?;
+    let (copy, diagnostic) = match geometry {
+        ScalarCopyDiagnosticGeometry::Known { copy } => (copy, None),
+        ScalarCopyDiagnosticGeometry::FailureOnly {
+            copy,
+            diagnostic_bytes_upper,
+        } => (copy, Some(diagnostic_bytes_upper)),
+    };
+    let copy_requests = RequestUpper {
+        bytes: copy.requested_bytes_upper,
+        requests: copy.requests_upper,
+    };
+    let result = (|| {
+        if let Some(output) = diagnostic {
+            let first = fresh_display_string(output)?;
+            let second = one_write_display_string(output)?;
+            Ok(ComponentFacts {
+                requests: requests(requests(copy_requests, first.requests)?, second.requests)?,
+                peak: add(copy.peak_bytes_upper, add(first.peak, second.retained)?)?,
+                retained: second.retained,
+            })
+        } else {
+            let numeric = ComponentFacts::exact(bytes::<u8>(41)?);
+            Ok(ComponentFacts {
+                requests: requests(copy_requests, numeric.requests)?,
+                peak: add(copy.peak_bytes_upper, numeric.peak)?,
+                retained: numeric.retained,
+            })
+        }
+    })();
+    result.map_err(source_failure)
+}
+impl MannSourceParams {
+    /// Only source-qualified parameters can project reached-event facts.
+    /// The caller flushes pending core work before neutral geometry and borrows
+    /// the SAME controller; Noop legacy calls never reach this dispatcher.
+    pub(crate) fn event_facts(
+        &self,
+        event: MannResourceEvent<'_>,
+        control: &dyn KernelEvaluationControl,
+    ) -> std::result::Result<ComponentFacts, KernelFailure> {
+        match event {
+            MannResourceEvent::StaticDiagnostic {
+                message,
+                treatment_replacement,
+            } => static_diagnostic_facts(message, treatment_replacement).map_err(source_failure),
+            MannResourceEvent::IntSetupDiagnostic {
+                data_type,
+                treatment_replacement,
+            } => int_setup_diagnostic_facts(data_type, treatment_replacement, control),
+            MannResourceEvent::FirstAlternative { source } => {
+                first_alternative_facts(source.len()).map_err(source_failure)
+            }
+            MannResourceEvent::ScalarRead { array, row } => {
+                scalar_read_event_facts(array, row, control)
+            }
+            MannResourceEvent::MergeScratch { left, right } => {
+                merge_scratch_facts(left, right).map_err(source_failure)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

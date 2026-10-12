@@ -276,3 +276,292 @@ fn mann_whitney_resources_guard_rejects_a_second_number_author() {
     }
     assert!(require_number_sources(&lock.replace("1.0.150", "1.0.151")).is_err());
 }
+
+#[derive(Default)]
+struct GeometryControl {
+    calls: std::sync::Mutex<usize>,
+    refusal: Option<KernelFailure>,
+}
+impl KernelEvaluationControl for GeometryControl {
+    fn checkpoint(&self, _: u32) -> std::result::Result<(), KernelFailure> {
+        let mut calls = self.calls.lock().unwrap();
+        assert!(
+            self.refusal.is_none() || *calls == 0,
+            "geometry callback after refusal"
+        );
+        *calls += 1;
+        match &self.refusal {
+            Some(cause) => Err(cause.clone()),
+            None => Ok(()),
+        }
+    }
+    fn wait(&self, _: std::time::Duration) -> std::result::Result<(), KernelFailure> {
+        unreachable!()
+    }
+}
+
+#[test]
+fn mann_whitney_event_facts_keep_static_and_generic_string_authors_distinct() {
+    let params = MannSourceParams::try_new().unwrap();
+    let control = GeometryControl::default();
+    let original = params
+        .event_facts(
+            MannResourceEvent::StaticDiagnostic {
+                message: "abc",
+                treatment_replacement: false,
+            },
+            &control,
+        )
+        .unwrap();
+    let actual = "abc".to_string();
+    assert_eq!(original, ComponentFacts::exact(actual.capacity()));
+    assert_eq!(original.requests.bytes, 3);
+    struct DisplayOne;
+    impl std::fmt::Display for DisplayOne {
+        fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            out.write_str("abc")
+        }
+    }
+    let displayed = DisplayOne.to_string();
+    assert_eq!(
+        one_write_display_string(3).unwrap(),
+        ComponentFacts::exact(displayed.capacity())
+    );
+    assert_eq!(displayed.capacity(), 8);
+    for n in [0, 1, 3, 31, 1000] {
+        let facts = fresh_display_string(n).unwrap();
+        let text = "x".repeat(n);
+        let mut actual = String::new();
+        for piece in text.as_bytes().chunks(3) {
+            actual.push_str(std::str::from_utf8(piece).unwrap());
+        }
+        assert!(actual.capacity() <= facts.retained);
+    }
+    let replaced = params
+        .event_facts(
+            MannResourceEvent::StaticDiagnostic {
+                message: "failed to downcast to Int8Array",
+                treatment_replacement: true,
+            },
+            &control,
+        )
+        .unwrap();
+    assert_eq!(
+        replaced.requests,
+        RequestUpper {
+            bytes: 87,
+            requests: 2
+        }
+    );
+    assert_eq!(replaced.peak, 87);
+    assert_eq!(replaced.retained, 56);
+    assert_eq!(*control.calls.lock().unwrap(), 0);
+    assert_eq!(
+        fresh_display_string(usize::MAX),
+        Err(ScalarResourceError::Arithmetic)
+    );
+}
+
+#[test]
+fn mann_whitney_event_facts_alternative_carries_lowercase_without_parsing() {
+    let params = MannSourceParams::try_new().unwrap();
+    let control = GeometryControl::default();
+    for source in [
+        "",
+        "LESS",
+        "invalid",
+        "İΣ",
+        "ﬃ",
+        "invalid with a large suffix",
+    ] {
+        let facts = params
+            .event_facts(MannResourceEvent::FirstAlternative { source }, &control)
+            .unwrap();
+        let lower = source.to_lowercase();
+        let original = format!("Logical Error: invalid alternative `{}`.", lower);
+        assert!(facts.peak >= lower.capacity() + original.capacity());
+        assert!(facts.retained >= original.capacity());
+        assert!(facts.requests.bytes >= lower.capacity() + original.capacity());
+    }
+    assert_eq!(
+        first_alternative_facts(0).unwrap(),
+        format_string(76, 38).unwrap()
+    );
+    assert_eq!(
+        first_alternative_facts(usize::MAX),
+        Err(ScalarResourceError::Arithmetic)
+    );
+    assert_eq!(*control.calls.lock().unwrap(), 0);
+}
+
+#[test]
+fn mann_whitney_event_facts_use_full_debug_and_two_original_reader_strings() {
+    use arrow_array::{ArrayRef, UInt64Array};
+    use arrow_schema::{DataType, Field};
+    use std::sync::Arc;
+    let params = MannSourceParams::try_new().unwrap();
+    let control = GeometryControl::default();
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert("quoted-key".to_owned(), "large value ".repeat(100));
+    let data_type = DataType::Struct(
+        vec![Arc::new(
+            Field::new("quoted-field", DataType::UInt64, true).with_metadata(metadata),
+        )]
+        .into(),
+    );
+    let formatted = format!("unsupported int input type: {:?}", data_type);
+    let plain = params
+        .event_facts(
+            MannResourceEvent::IntSetupDiagnostic {
+                data_type: &data_type,
+                treatment_replacement: false,
+            },
+            &control,
+        )
+        .unwrap();
+    let replaced = params
+        .event_facts(
+            MannResourceEvent::IntSetupDiagnostic {
+                data_type: &data_type,
+                treatment_replacement: true,
+            },
+            &control,
+        )
+        .unwrap();
+    assert!(plain.retained >= formatted.capacity());
+    assert_eq!(replaced.requests.bytes - plain.requests.bytes, 56);
+    assert_eq!(replaced.peak - plain.peak, 56);
+    assert_eq!(replaced.retained, 56);
+    let array: ArrayRef = Arc::new(UInt64Array::from(vec![None]));
+    let geometry = scalar_copy_diagnostic_geometry(&array, 0, &control).unwrap();
+    let ScalarCopyDiagnosticGeometry::FailureOnly {
+        copy,
+        diagnostic_bytes_upper,
+    } = geometry
+    else {
+        panic!("unsupported NULL must remain failure-only")
+    };
+    let first = fresh_display_string(diagnostic_bytes_upper).unwrap();
+    let second = one_write_display_string(diagnostic_bytes_upper).unwrap();
+    let facts = params
+        .event_facts(
+            MannResourceEvent::ScalarRead {
+                array: &array,
+                row: 0,
+            },
+            &control,
+        )
+        .unwrap();
+    assert_eq!(
+        facts.requests.bytes,
+        copy.requested_bytes_upper + first.requests.bytes + second.requests.bytes
+    );
+    assert_eq!(facts.retained, second.retained);
+    let original = crate::aggregate_scalar::scalar_from_array(
+        &array,
+        0,
+        &mut crate::aggregate_scalar::ScalarWork::new(None),
+    )
+    .unwrap_err();
+    let projected = original.to_string();
+    assert!(facts.retained >= projected.capacity());
+    assert!(facts.peak >= projected.capacity());
+}
+
+#[test]
+fn mann_whitney_event_facts_known_copy_uses_same_facet_and_sequential_merge_peak() {
+    use arrow_array::ArrayRef;
+    use std::sync::Arc;
+    let params = MannSourceParams::try_new().unwrap();
+    let control = GeometryControl::default();
+    let array: ArrayRef = Arc::new(arrow_array::StringArray::from(vec!["copied bytes"]));
+    let ScalarCopyDiagnosticGeometry::Known { copy } =
+        scalar_copy_diagnostic_geometry(&array, 0, &control).unwrap()
+    else {
+        panic!("expected known copy")
+    };
+    let facts = params
+        .event_facts(
+            MannResourceEvent::ScalarRead {
+                array: &array,
+                row: 0,
+            },
+            &control,
+        )
+        .unwrap();
+    assert_eq!(
+        facts.requests,
+        RequestUpper {
+            bytes: copy.requested_bytes_upper + 41,
+            requests: copy.requests_upper + 1
+        }
+    );
+    assert_eq!(facts.peak, copy.peak_bytes_upper + 41);
+    assert_eq!(facts.retained, 41);
+    let facts = params
+        .event_facts(
+            MannResourceEvent::MergeScratch {
+                left: state(600, 700, false, true),
+                right: state(800, 900, false, true),
+            },
+            &control,
+        )
+        .unwrap();
+    assert_eq!(
+        facts.requests,
+        RequestUpper {
+            bytes: (600 + 700 + 800 + 900) * 8,
+            requests: 4
+        }
+    );
+    assert_eq!(facts.peak, 900 * 8);
+    assert_eq!(facts.retained, 0);
+    let sorted = params
+        .event_facts(
+            MannResourceEvent::MergeScratch {
+                left: state(600, 700, true, true),
+                right: state(800, 900, true, true),
+            },
+            &control,
+        )
+        .unwrap();
+    assert_eq!(sorted, ComponentFacts::ZERO);
+}
+
+#[test]
+fn mann_whitney_event_facts_geometry_keeps_all_typed_control_causes() {
+    use arrow_array::ArrayRef;
+    use std::sync::Arc;
+    let params = MannSourceParams::try_new().unwrap();
+    let array: ArrayRef = Arc::new(arrow_array::StringArray::from(vec!["bytes"]));
+    let causes = [
+        KernelFailure::Cancelled,
+        KernelFailure::DeadlineExceeded,
+        KernelFailure::ResourceExhausted,
+        KernelFailure::InvalidProgram(crate::KernelDiagnostic::new("typed geometry refusal")),
+        KernelFailure::Internal(crate::KernelDiagnostic::new("typed geometry refusal")),
+        KernelFailure::Operational(crate::KernelDiagnostic::new("typed geometry refusal")),
+        KernelFailure::InstanceFailed,
+    ];
+    for cause in causes {
+        for is_int in [false, true] {
+            let control = GeometryControl {
+                refusal: Some(cause.clone()),
+                ..GeometryControl::default()
+            };
+            let event = if is_int {
+                MannResourceEvent::IntSetupDiagnostic {
+                    data_type: &DataType::Utf8,
+                    treatment_replacement: true,
+                }
+            } else {
+                MannResourceEvent::ScalarRead {
+                    array: &array,
+                    row: 0,
+                }
+            };
+            assert_eq!(params.event_facts(event, &control), Err(cause.clone()));
+            assert_eq!(*control.calls.lock().unwrap(), 1);
+        }
+    }
+}
