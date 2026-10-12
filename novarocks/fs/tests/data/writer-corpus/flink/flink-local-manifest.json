@@ -1,0 +1,50 @@
+{
+  "columns": [
+    "id",
+    "category",
+    "label",
+    "amount",
+    "event_time",
+    "nested"
+  ],
+  "created_by": "parquet-mr version 1.15.2 (build 859eac165b08f927fa14590c33bc5f476405fb68)",
+  "distribution_archive": {
+    "official_url": "https://archive.apache.org/dist/flink/flink-1.20.5/flink-1.20.5-bin-scala_2.12.tgz",
+    "sha512": "c846ecbcc4a1705724832acdbad27538c31f17aa494e8b69ff5f92d724574be83d1dff0b363aa0570e5a448f529224705d967d0d14df3267143eec5064a52a1f",
+    "transport_url": "https://mirrors.huaweicloud.com/apache/flink/flink-1.20.5/flink-1.20.5-bin-scala_2.12.tgz"
+  },
+  "file": "flink-local-1.20.5.parquet",
+  "file_bytes": 36302,
+  "generator": "provision_flink_local.sh",
+  "hadoop_runtime": {
+    "file": "flink-shaded-hadoop-2-uber-2.8.3-10.0.jar",
+    "sha256": "492b2a559f2a1dad3808b51d9a26a575dbb1202004c9f85f5059c520e0632127",
+    "url": "https://repo.maven.apache.org/maven2/org/apache/flink/flink-shaded-hadoop-2-uber/2.8.3-10.0/flink-shaded-hadoop-2-uber-2.8.3-10.0.jar"
+  },
+  "java": {
+    "major_version": 17,
+    "runtime_version": "openjdk version \"17.0.13\" 2024-10-15"
+  },
+  "oracle_sha256": "208a9924fe5c40097c1133309832eee9031819bfdaaca4658a9de72a55fd8f69",
+  "parameters": {
+    "compression": "SNAPPY",
+    "filesystem_sink": "local",
+    "parallelism": 1,
+    "runtime_mode": "batch",
+    "utc_timezone": true
+  },
+  "parquet_bundle": {
+    "file": "flink-sql-parquet-1.20.5.jar",
+    "sha256": "6b98bbb43f6e4a721343621ec29850e0b0f19e55d9434624ffccf4cb1236f9f5",
+    "url": "https://repo.maven.apache.org/maven2/org/apache/flink/flink-sql-parquet/1.20.5/flink-sql-parquet-1.20.5.jar"
+  },
+  "provision_method": "official-archive-local",
+  "row_groups": 1,
+  "rows": 4096,
+  "schema_version": 1,
+  "sha256": "55faf3ea8a35561c8a4750c244e25bf1d9ad4a2b301508a5e67f6956a9146851",
+  "sql_file": "flink-local.sql",
+  "sql_sha256": "7487840d7d2d0decf8e50a65ca7ac846911b4460b0a8cb0c81fc8336d6e45036",
+  "writer": "Flink",
+  "writer_version": "1.20.5"
+}

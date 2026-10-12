@@ -19,7 +19,7 @@
 //! Requires the separately reviewed actor v2 and runner launch opt-in integration.
 
 use super::result_delivery::root_census;
-use super::result_delivery_baseline::await_idle;
+use super::result_delivery_support::await_idle;
 use super::result_delivery_root_protocol::parse_created_task_candidates;
 use crate::actors::mysql_stream::{
     AsyncMysqlStream, BoundedNegativeTextObservation, TextColumnObservation, TextResultObservation,

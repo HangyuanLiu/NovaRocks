@@ -37,6 +37,9 @@ mod query_lifecycle;
 mod query_output;
 mod result_delivery;
 mod result_delivery_baseline;
+mod result_delivery_concurrency;
+mod result_delivery_progress;
+mod result_delivery_support;
 mod result_delivery_closing;
 mod result_delivery_root_protocol;
 mod result_delivery_root_reply;
@@ -65,6 +68,8 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.push(Box::new(listing::ObjectStoreListingBoundary));
     scenarios.extend(uea1_performance::scenarios());
     scenarios.extend(result_delivery_baseline::scenarios());
+    scenarios.extend(result_delivery_progress::scenarios());
+    scenarios.extend(result_delivery_concurrency::scenarios());
     scenarios.extend(result_delivery::scenarios());
     scenarios.extend(result_delivery_root_reply::scenarios());
     scenarios.extend(result_delivery_closing::scenarios());

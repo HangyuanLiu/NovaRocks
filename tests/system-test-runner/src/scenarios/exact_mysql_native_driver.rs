@@ -21,7 +21,7 @@
 use super::exact_mysql_native_oracle::{ActualBinding, RowInput, compare_cancel};
 use super::independent_root_target::{IndependentRootObserver, IndependentRootTarget};
 use super::result_delivery::root_census;
-use super::result_delivery_baseline::metric;
+use super::result_delivery_support::metric;
 use crate::actors::exact_mysql_control_v2::{Command, GatePhase, ReplyFacts, UnixControlClient};
 use crate::actors::mysql_stream::exact_result_reader::{ExactReadSnapshot, ExactResultReader};
 use crate::exact_mysql_target_binding;

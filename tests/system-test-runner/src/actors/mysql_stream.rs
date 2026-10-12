@@ -57,6 +57,17 @@ pub struct AsyncMysqlStream {
     connection_id: u32,
 }
 
+/// Test-client commands only; Drain removes the payload gate before joining.
+pub(crate) enum PayloadReadPermit {
+    Chunk,
+    Drain,
+}
+
+pub(crate) struct ControlledPayloadReads {
+    pub permits: tokio::sync::mpsc::Receiver<PayloadReadPermit>,
+    pub progress: tokio::sync::mpsc::UnboundedSender<u64>,
+}
+
 pub struct MysqlPacket {
     sequence: u8,
     payload: Vec<u8>,
@@ -498,6 +509,7 @@ impl AsyncMysqlStream {
             std::time::Instant::now() + self.timeout,
             false,
             1,
+            None,
         )
         .await
         .observation
@@ -513,8 +525,16 @@ impl AsyncMysqlStream {
         )>,
         original_deadline: std::time::Instant,
     ) -> OwnedTextResultObservation {
-        self.observe_text_query_kernel_until(sql, read_delay, pause, original_deadline, true, 1)
-            .await
+        self.observe_text_query_kernel_until(
+            sql,
+            read_delay,
+            pause,
+            original_deadline,
+            true,
+            1,
+            None,
+        )
+        .await
     }
     /// Observe the frozen three-column listing on the original socket and clock.
     /// This does not relax the existing one-column owned observer.
@@ -523,9 +543,41 @@ impl AsyncMysqlStream {
         sql: &str,
         original_deadline: std::time::Instant,
     ) -> OwnedTextResultObservation {
-        self.observe_text_query_kernel_until(sql, Duration::ZERO, None, original_deadline, true, 3)
-            .await
+        self.observe_text_query_kernel_until(
+            sql,
+            Duration::ZERO,
+            None,
+            original_deadline,
+            true,
+            3,
+            None,
+        )
+        .await
     }
+    /// Each Chunk permits one bounded scratch read; progress reports actual row bytes.
+    /// Both metadata and payload gates share the caller's original absolute deadline.
+    pub(crate) async fn observe_text_query_with_controlled_reads(
+        &mut self,
+        sql: &str,
+        pause: Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+        control: ControlledPayloadReads,
+        original_deadline: std::time::Instant,
+    ) -> OwnedTextResultObservation {
+        self.observe_text_query_kernel_until(
+            sql,
+            Duration::ZERO,
+            pause,
+            original_deadline,
+            true,
+            1,
+            Some(control),
+        )
+        .await
+    }
+
     async fn observe_text_query_kernel_until(
         &mut self,
         sql: &str,
@@ -537,6 +589,7 @@ impl AsyncMysqlStream {
         original_deadline: std::time::Instant,
         strict_owned: bool,
         expected_owned_columns: u64,
+        mut payload_control: Option<ControlledPayloadReads>,
     ) -> OwnedTextResultObservation {
         let started = std::time::Instant::now();
         let mut observation = TextResultObservation::default();
@@ -625,6 +678,17 @@ impl AsyncMysqlStream {
                 let mut first_chunk = true;
                 while remaining != 0 {
                     let count = remaining.min(scratch.len());
+                    if let Some(control) = payload_control.as_mut() {
+                        match control
+                            .permits
+                            .recv()
+                            .await
+                            .context("payload read controller closed")?
+                        {
+                            PayloadReadPermit::Chunk => {}
+                            PayloadReadPermit::Drain => payload_control = None,
+                        }
+                    }
                     read_observed(
                         &mut self.stream,
                         &mut scratch[..count],
@@ -645,7 +709,10 @@ impl AsyncMysqlStream {
                                 );
                                 server_result_error_code =
                                     Some(u16::from_le_bytes([scratch[1], scratch[2]]));
-                                bail!("original server result ERR retained");
+                                bail!(
+                                    "original server result ERR retained: {}",
+                                    observation_error(&scratch[..count])
+                                );
                             }
                             bail!(
                                 "server result error {}",
@@ -671,6 +738,12 @@ impl AsyncMysqlStream {
                     digest.update(&scratch[..count]);
                     row_bytes += count as u64;
                     observation.row_payload_bytes += count as u64;
+                    if let Some(control) = payload_control.as_ref() {
+                        control
+                            .progress
+                            .send(observation.row_payload_bytes)
+                            .context("payload progress controller closed")?;
+                    }
                     remaining -= count;
                     if !read_delay.is_zero() {
                         tokio::time::sleep(read_delay).await;
@@ -1310,6 +1383,95 @@ mod tests {
                     Some("absolute query deadline exceeded")
                 );
                 assert_eq!((observation.rows, observation.packets), (0, 3));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn controlled_payload_reads_hold_real_bytes_then_drain_or_expire() {
+        for drain in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let peer = tokio::spawn(async move {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                let budget = Duration::from_secs(2);
+                read_wire_packet_async(&mut peer, budget).await.unwrap();
+                let mut row = vec![0xfd, 0, 0, 2]; // One 131072-byte cell.
+                row.extend(std::iter::repeat_n(b'x', 131072));
+                for (sequence, payload) in [
+                    (1, vec![1]),
+                    (2, column_definition()),
+                    (3, vec![0xfe, 0, 0, 0, 0]),
+                    (4, row),
+                    (5, vec![0xfe, 0, 0, 0, 0]),
+                ] {
+                    write_packet_async(&mut peer, sequence, &payload, budget)
+                        .await
+                        .unwrap();
+                }
+            });
+            let (permits, receiver) = tokio::sync::mpsc::channel(2);
+            let (progress, mut observed_bytes) = tokio::sync::mpsc::unbounded_channel();
+            let job = tokio::spawn(async move {
+                AsyncMysqlStream {
+                    stream: client,
+                    timeout: Duration::from_secs(2),
+                    receive_buffer_bytes: None,
+                    connection_id: 0,
+                }
+                .observe_text_query_with_controlled_reads(
+                    "SELECT large_value",
+                    None,
+                    super::ControlledPayloadReads {
+                        permits: receiver,
+                        progress,
+                    },
+                    std::time::Instant::now() + Duration::from_millis(200),
+                )
+                .await
+            });
+            permits.send(super::PayloadReadPermit::Chunk).await.unwrap();
+            let bytes = tokio::time::timeout(Duration::from_secs(2), observed_bytes.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(bytes, 65536); // Excludes the already-consumed metadata/header.
+            assert!(!job.is_finished());
+            assert!(matches!(
+                observed_bytes.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ));
+            if drain {
+                permits.send(super::PayloadReadPermit::Drain).await.unwrap();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(2), job)
+                .await
+                .unwrap()
+                .unwrap();
+            peer.await.unwrap();
+            if drain {
+                assert!(result.actual_failure.is_none());
+                assert_eq!(
+                    (
+                        result.observation.rows,
+                        result.observation.row_payload_bytes
+                    ),
+                    (1, 131076)
+                );
+            } else {
+                assert_eq!(
+                    result.observation.error.as_deref(),
+                    Some("absolute query deadline exceeded")
+                );
+                assert_eq!(
+                    (
+                        result.observation.rows,
+                        result.observation.row_payload_bytes
+                    ),
+                    (0, 65536)
+                );
             }
         }
     }

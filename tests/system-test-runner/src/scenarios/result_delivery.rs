@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::result_delivery_baseline::await_idle;
+use super::result_delivery_support::await_idle;
 use crate::actors::mysql_stream::{AsyncMysqlStream, TextColumnObservation, TextResultObservation};
 use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Context, Result, ensure};
@@ -418,7 +418,7 @@ const ROOT_RESOURCES: [&str; 14] = [
 ];
 
 pub(super) fn root_census(rows: &[serde_json::Value]) -> Result<Option<BTreeMap<String, u64>>> {
-    use super::result_delivery_baseline::metric;
+    use super::result_delivery_support::metric;
     let available = metric(
         rows,
         "novarocks_backend_root_ownership_snapshot_available",
