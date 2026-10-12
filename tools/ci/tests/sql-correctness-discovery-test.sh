@@ -23,16 +23,17 @@ source "$REPO_ROOT/tools/ci/lib/sql_suites.sh"
 discovered="$(ci_discover_sql_suites "$REPO_ROOT")"
 
 grep -qx 'filter' <<<"$discovered"
-if grep -Eq '^(ssb|tpc-h|tpc-ds)$' <<<"$discovered"; then
-  echo "correctness discovery returned a benchmark workload" >&2
-  exit 1
-fi
+defaults="$(ci_discover_sql_suites "$REPO_ROOT" default)"
+for suite in ssb tpc-h tpc-ds; do
+  grep -qx "$suite" <<<"$discovered"
+  if grep -qx "$suite" <<<"$defaults"; then
+    echo "explicit prepared dataset suite entered default selection: $suite" >&2
+    exit 1
+  fi
+done
 
 ci_suite_exists "$REPO_ROOT" filter
-if ci_suite_exists "$REPO_ROOT" ssb; then
-  echo "benchmark workload was accepted as a correctness suite" >&2
-  exit 1
-fi
+ci_suite_exists "$REPO_ROOT" ssb
 sql_root="$REPO_ROOT/tests/sql"
 if [ -e "$sql_root/suites" ]; then
   echo "retired SQL suite root still exists" >&2

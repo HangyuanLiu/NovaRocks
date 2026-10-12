@@ -72,11 +72,15 @@ ci_native_cross_process_suites() {
 
 ci_discover_sql_suites() {
   local repo_root="$1"
+  local -a selection_args=()
+  if [ "${2:-all}" = default ]; then
+    selection_args=(--suite all)
+  fi
 
   cargo run --quiet \
     --manifest-path "$repo_root/tests/sql/runner/Cargo.toml" \
     --profile "${NOVA_CI_CARGO_PROFILE:-dev-opt}" \
-    --bin novarocks-sql-test -- --list-suites
+    --bin novarocks-sql-test -- --list-suites "${selection_args[@]}"
 }
 
 ci_suite_exists() {

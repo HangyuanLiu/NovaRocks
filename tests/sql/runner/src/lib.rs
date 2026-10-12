@@ -20,6 +20,7 @@ pub mod benchmark;
 pub(crate) mod benchmark_bootstrap;
 mod cluster;
 mod config;
+mod dataset_fixture;
 mod extension_manifest;
 mod failure_artifacts;
 mod fault_injection;
@@ -387,7 +388,7 @@ fn expected_engine_error_code_diff_result(
     about = "Run SQL correctness tests for suite directories under tests/sql/correctness/"
 )]
 pub(crate) struct Cli {
-    /// Suite name(s), comma-separated.  Use "all" to run every discovered suite.
+    /// Suite name(s), comma-separated. Use "all" for the default non-explicit suites.
     #[arg(long, required_unless_present_any = ["list_extensions", "list_suites"])]
     suite: Option<String>,
 
@@ -2155,6 +2156,21 @@ fn write_benchmark_profile(
         .with_context(|| format!("write benchmark profile {}", path.display()))
 }
 
+fn mismatch_artifact_root(ctx: &SuiteRunContext, log: &mut String) -> Option<PathBuf> {
+    match ctx
+        .actual_artifact_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| ctx.failure_artifacts.case_artifact_root())
+    {
+        Ok(root) => Some(root),
+        Err(error) => {
+            let _ = writeln!(log, "    failed to allocate mismatch artifacts: {error:#}");
+            None
+        }
+    }
+}
+
 fn preserve_case_failure_snapshot(
     ctx: &SuiteRunContext,
     case_id: &str,
@@ -2383,16 +2399,21 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
     };
 
     // Helper closure: drop all case databases (best-effort).
-    let drop_all_case_dbs = |ctx: &SuiteRunContext, dbs: &[String]| {
+    let drop_all_case_dbs = |ctx: &SuiteRunContext, dbs: &[String], log: &mut String| {
         for db in dbs {
-            let _ = drop_case_database(&target_case_db_admin_conn, ctx.query_timeout, db, "target");
-            if ctx.reference_required {
-                let _ = drop_case_database(
-                    &reference_case_db_admin_conn,
-                    ctx.query_timeout,
-                    db,
-                    "reference",
-                );
+            for (connection, role) in [
+                (&target_case_db_admin_conn, "target"),
+                (&reference_case_db_admin_conn, "reference"),
+            ] {
+                if role == "reference" && !ctx.reference_required {
+                    continue;
+                }
+                if let Err(error) = drop_case_database(connection, ctx.query_timeout, db, role) {
+                    let _ = writeln!(
+                        log,
+                        "    case cleanup failure {role} database={db}: {error:#}"
+                    );
+                }
             }
         }
     };
@@ -2404,7 +2425,8 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             db_name,
             "target",
         ) {
-            drop_all_case_dbs(ctx, &case_dbs);
+            preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
+            drop_all_case_dbs(ctx, &case_dbs, &mut log);
             let _ = writeln!(
                 log,
                 "    ❌ failed to prepare target case database {}: {:#}",
@@ -2429,7 +2451,8 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 "reference",
             )
         {
-            drop_all_case_dbs(ctx, &case_dbs);
+            preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
+            drop_all_case_dbs(ctx, &case_dbs, &mut log);
             let _ = writeln!(
                 log,
                 "    ❌ failed to prepare reference case database {}: {:#}",
@@ -2465,7 +2488,8 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
     let mut target_session = match MysqlSession::new(&case_target_conn) {
         Ok(s) => s,
         Err(exc) => {
-            drop_all_case_dbs(ctx, &case_dbs);
+            preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
+            drop_all_case_dbs(ctx, &case_dbs, &mut log);
             let _ = writeln!(
                 log,
                 "    ❌ failed to create target mysql session: {:#}",
@@ -2488,7 +2512,8 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         match MysqlSession::new(&case_reference_conn) {
             Ok(s) => Some(s),
             Err(exc) => {
-                drop_all_case_dbs(ctx, &case_dbs);
+                preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
+                drop_all_case_dbs(ctx, &case_dbs, &mut log);
                 let _ = writeln!(
                     log,
                     "    ❌ failed to create reference mysql session: {:#}",
@@ -2518,7 +2543,8 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             if ok { Ok(()) } else { Err(message) }
         },
     ) {
-        drop_all_case_dbs(ctx, &case_dbs);
+        preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
+        drop_all_case_dbs(ctx, &case_dbs, &mut log);
         let _ = writeln!(log, "    ❌ {error}");
         if ctx.fail_fast {
             abort.store(true, Ordering::Relaxed);
@@ -3212,28 +3238,30 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         let preview = execution.text_output.chars().take(500).collect::<String>();
                         let _ = writeln!(log, "    last result preview: {preview:?}");
                     }
-                    if let (Some(root), Some(expected), Some(execution)) = (
-                        ctx.actual_artifact_dir.as_ref(),
+                    if let (Some(expected), Some(execution)) = (
                         expected_results
                             .as_ref()
                             .and_then(|results| results.get(&step.query_number)),
                         last_execution.as_ref(),
                     ) && last_failure.starts_with("VERIFY FAILED: ")
                     {
+                        let root = mismatch_artifact_root(ctx, &mut log);
                         let artifact_id = format!("{}-query{}", case.case_id, step.query_number);
                         let reason = last_failure
                             .trim_start_matches("VERIFY FAILED: ")
                             .to_string();
-                        if let Err(exc) = write_mismatch_artifacts(MismatchArtifacts {
-                            root_dir: root,
-                            suite_name: &ctx.suite_name,
-                            artifact_id: &artifact_id,
-                            expected_header: &expected.header,
-                            expected_rows: &expected.rows,
-                            actual_header: &execution.header,
-                            actual_rows: &execution.rows,
-                            reason: &reason,
-                        }) {
+                        if let Some(root) = root.as_ref()
+                            && let Err(exc) = write_mismatch_artifacts(MismatchArtifacts {
+                                root_dir: root,
+                                suite_name: &ctx.suite_name,
+                                artifact_id: &artifact_id,
+                                expected_header: &expected.header,
+                                expected_rows: &expected.rows,
+                                actual_header: &execution.header,
+                                actual_rows: &execution.rows,
+                                reason: &reason,
+                            })
+                        {
                             let _ =
                                 writeln!(log, "    ⚠️ failed to write mismatch artifacts: {}", exc);
                         }
@@ -3651,7 +3679,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             } else {
                                 case_failed = true;
                                 let _ = writeln!(log, "    ❌ DIFF FAILED: {}", reason);
-                                if let Some(root) = &ctx.actual_artifact_dir {
+                                if let Some(root) = mismatch_artifact_root(ctx, &mut log).as_ref() {
                                     let artifact_id =
                                         format!("{}-query{}", case.case_id, step.query_number);
                                     if let Err(exc) = write_mismatch_artifacts(MismatchArtifacts {
@@ -3854,6 +3882,23 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         CaseStatus::Pass
     };
 
+    if case_failed {
+        match ctx.failure_artifacts.persist_case_diagnostic(
+            &ctx.suite_name,
+            &case.case_id,
+            &case.source_file,
+            case_path.as_deref(),
+            &log,
+        ) {
+            Ok(path) => {
+                let _ = writeln!(log, "    case diagnostics retained at {}", path.display());
+            }
+            Err(error) => {
+                let _ = writeln!(log, "    failed to retain case diagnostics: {error:#}");
+            }
+        }
+    }
+
     if case_failed && ctx.fail_fast {
         abort.store(true, Ordering::Relaxed);
     }
@@ -3891,6 +3936,15 @@ fn load_failure_outcomes(suite_name: &str, failures: &[CaseLoadFailure]) -> Vec<
 }
 
 fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) -> SuiteOutcome {
+    run_suite_with_hooks(ps, abort, stdout_lock, execute_suite_hook)
+}
+
+fn run_suite_with_hooks(
+    ps: &PreparedSuite,
+    abort: &AtomicBool,
+    stdout_lock: &Mutex<()>,
+    mut execute_hook: impl FnMut(&ConnectionConfig, u64, &SuiteHook, &str) -> Result<()>,
+) -> SuiteOutcome {
     let wall_start = Instant::now();
     let ctx = &ps.ctx;
     let total = ps.cases.len() + ps.load_failures.len();
@@ -3909,17 +3963,25 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
                 hook.path.display()
             );
         }
-        if let Err(exc) =
-            execute_suite_hook(&ctx.target_admin_conn, ctx.query_timeout, hook, "target")
-        {
+        if let Err(exc) = execute_hook(&ctx.target_admin_conn, ctx.query_timeout, hook, "target") {
+            ctx.failure_artifacts.record_provenance(
+                format!("suite-init/{}", ctx.suite_name),
+                serde_json::json!({"role": "target", "error": format!("{exc:#}")}),
+            );
             preserve_suite_failure_snapshot(ctx, "init-target", stdout_lock);
-            if let Some(cleanup) = ps.cleanup_hook.as_ref() {
-                let _ = execute_suite_hook(
+            let mut cleanup_errors = Vec::new();
+            if let Some(cleanup) = ps.cleanup_hook.as_ref()
+                && let Err(error) = execute_hook(
                     &ctx.target_admin_conn,
                     ctx.query_timeout,
                     cleanup,
                     "target cleanup after init failure",
-                );
+                )
+            {
+                cleanup_errors.push(format!(
+                    "[{}] target cleanup after init failure: {error:#}",
+                    ctx.suite_name
+                ));
             }
             let _guard = stdout_lock.lock().unwrap();
             println!("[{}] ❌ suite init failed: {exc:#}", ctx.suite_name);
@@ -3943,7 +4005,7 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
                 suite_name: ctx.suite_name.clone(),
                 total,
                 outcomes,
-                cleanup_errors: vec![],
+                cleanup_errors,
                 wall_time: wall_start.elapsed(),
             };
         }
@@ -3956,26 +4018,32 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
                     hook.path.display()
                 );
             }
-            if let Err(exc) = execute_suite_hook(
+            if let Err(exc) = execute_hook(
                 &ctx.reference_admin_conn,
                 ctx.query_timeout,
                 hook,
                 "reference",
             ) {
+                ctx.failure_artifacts.record_provenance(
+                    format!("suite-init/{}", ctx.suite_name),
+                    serde_json::json!({"role": "reference", "error": format!("{exc:#}")}),
+                );
                 preserve_suite_failure_snapshot(ctx, "init-reference", stdout_lock);
+                let mut cleanup_errors = Vec::new();
                 if let Some(cleanup) = ps.cleanup_hook.as_ref() {
-                    let _ = execute_suite_hook(
-                        &ctx.reference_admin_conn,
-                        ctx.query_timeout,
-                        cleanup,
-                        "reference cleanup after init failure",
-                    );
-                    let _ = execute_suite_hook(
-                        &ctx.target_admin_conn,
-                        ctx.query_timeout,
-                        cleanup,
-                        "target cleanup after init failure",
-                    );
+                    for (connection, role) in [
+                        (&ctx.reference_admin_conn, "reference"),
+                        (&ctx.target_admin_conn, "target"),
+                    ] {
+                        if let Err(error) =
+                            execute_hook(connection, ctx.query_timeout, cleanup, role)
+                        {
+                            cleanup_errors.push(format!(
+                                "[{}] {role} cleanup after init failure: {error:#}",
+                                ctx.suite_name
+                            ));
+                        }
+                    }
                 }
                 let _guard = stdout_lock.lock().unwrap();
                 println!(
@@ -4002,7 +4070,7 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
                     suite_name: ctx.suite_name.clone(),
                     total,
                     outcomes,
-                    cleanup_errors: vec![],
+                    cleanup_errors,
                     wall_time: wall_start.elapsed(),
                 };
             }
@@ -4081,9 +4149,7 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
                 hook.path.display()
             );
         }
-        if let Err(exc) =
-            execute_suite_hook(&ctx.target_admin_conn, ctx.query_timeout, hook, "target")
-        {
+        if let Err(exc) = execute_hook(&ctx.target_admin_conn, ctx.query_timeout, hook, "target") {
             preserve_suite_failure_snapshot(ctx, "cleanup-target", stdout_lock);
             cleanup_errors.push(format!("[{}] {exc:#}", ctx.suite_name));
         }
@@ -4096,7 +4162,7 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
                     hook.path.display()
                 );
             }
-            if let Err(exc) = execute_suite_hook(
+            if let Err(exc) = execute_hook(
                 &ctx.reference_admin_conn,
                 ctx.query_timeout,
                 hook,
@@ -4729,10 +4795,25 @@ fn finish_run_with_server_cleanup(
     };
     report_preserved_failure_artifacts(&preserve_result);
     let cleanup_result = shutdown_server_handle(&server_handle);
+    if let Err(error) = &cleanup_result {
+        failure_artifacts.record_provenance(
+            "server-cleanup".to_string(),
+            serde_json::json!(format!("{error:#}")),
+        );
+    }
     if !primary_failed && cleanup_result.is_err() {
         preserve_result = shutdown_failure_candidate
             .and_then(|candidate| failure_artifacts.persist_staged_run_failure(candidate));
         report_preserved_failure_artifacts(&preserve_result);
+    }
+    if let Ok(Some(path)) = &preserve_result {
+        let outcome = serde_json::json!({
+            "primary": match &primary_result {Ok(code) => format!("exit_code={code}"), Err(error) => format!("{error:#}")},
+            "server_cleanup": match &cleanup_result {Ok(()) => "complete; no residual server processes".to_string(), Err(error) => format!("{error:#}")}
+        });
+        if let Err(error) = failure_artifacts.persist_terminal_outcome(path, &outcome) {
+            preserve_result = Err(error);
+        }
     }
     let run_result = match (primary_result, cleanup_result) {
         (Ok(exit_code), Ok(())) => Ok(exit_code),
@@ -4787,6 +4868,22 @@ fn select_cluster_launch_profile(
     Ok(profile)
 }
 
+fn validate_dataset_launch_profile(
+    selected: &[String],
+    suites: &BTreeMap<String, SuiteConfig>,
+    profile: novarocks_cluster_harness::LaunchProfile,
+) -> Result<()> {
+    if profile != novarocks_cluster_harness::LaunchProfile::Performance {
+        for suite in selected {
+            anyhow::ensure!(
+                suites[suite].manifest.prepared_dataset.is_none(),
+                "suite {suite} requires the clean --cluster-launch-profile performance; selected profile is {profile:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32> {
     let base_dir = resolve_repo_root()?;
     let suite_configs = build_suite_configs(&base_dir, lane)?;
@@ -4799,7 +4896,12 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
     }
 
     if cli.list_suites {
-        for suite_name in suite_configs.keys() {
+        let listed = if let Some(requested) = cli.suite.as_deref() {
+            select_suite_names(requested, &suite_configs)?
+        } else {
+            suite_configs.keys().cloned().collect()
+        };
+        for suite_name in listed {
             println!("{suite_name}");
         }
         return Ok(0);
@@ -4915,6 +5017,18 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
         FixtureEndpoints::from_runner_config(&runner_config)?
     };
     let subprocess_environment = fixture_endpoints.project(&mut runner_config);
+    let mut dataset_bindings = BTreeMap::new();
+    for suite_name in &suite_names {
+        if let Some(requirement) = &suite_configs[suite_name].manifest.prepared_dataset {
+            let binding =
+                dataset_fixture::bind_prepared_dataset(requirement, &runner_config, &base_dir)?;
+            failure_artifacts.record_provenance(
+                format!("dataset/{suite_name}"),
+                serde_json::to_value(&binding)?,
+            );
+            dataset_bindings.insert(suite_name.clone(), binding);
+        }
+    }
     // SAFETY: no runner-owned server, trace, proxy or case worker exists yet.
     // Publish the physical fixture projection once before starting those threads.
     unsafe {
@@ -4992,6 +5106,14 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
         lane,
         query_lifecycle_faults_enabled,
         cleanup_faults_enabled,
+    )?;
+
+    validate_dataset_launch_profile(&suite_names, &suite_configs, launch_profile)?;
+    failure_artifacts.record_build_provenance(
+        &base_dir,
+        launch_profile,
+        selected_cluster_mode,
+        selected_cluster_size,
     )?;
 
     let launch_cluster_mode = if cli.dry_run {
@@ -5143,11 +5265,24 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
                 suite.sql_glob.clone()
             };
 
-            let placeholder_vars = placeholder_variables_with_run_id(
+            let mut placeholder_vars = placeholder_variables_with_run_id(
                 &runner_config,
                 &suite.name,
                 cli.benchmark_run_id.as_deref(),
             );
+            if let Some(binding) = dataset_bindings.get(suite_name) {
+                placeholder_vars.insert(
+                    "dataset_iceberg_catalog_warehouse".to_string(),
+                    binding.exact_warehouse.clone(),
+                );
+                println!(
+                    "dataset_binding suite={} ready={} publication={} warehouse={}",
+                    suite_name,
+                    binding.ready_uri,
+                    binding.publication_identity,
+                    binding.exact_warehouse
+                );
+            }
             let suite_init_hook =
                 load_suite_hook(suite.init_sql.as_deref(), &meta_re, &placeholder_vars)
                     .with_context(|| {
@@ -5594,6 +5729,12 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
                     elapsed: co.elapsed,
                 });
             }
+            if !so.cleanup_errors.is_empty() {
+                failure_artifacts.record_provenance(
+                    format!("suite-cleanup/{}", so.suite_name),
+                    serde_json::json!(so.cleanup_errors),
+                );
+            }
             all_cleanup_errors.extend(so.cleanup_errors.iter().cloned());
         }
 
@@ -5884,18 +6025,20 @@ mod tests {
         discover_novarocks_binary_with_override, render_cross_process_config,
         startup_timeout_from_env, validate_cluster_args,
     };
-    use crate::config::substitute_placeholders;
+    use crate::config::{TestLane, substitute_placeholders};
     use crate::parser::{extract_suite_hook, load_sql_case_from_file};
     use crate::results::{load_expected_results, parse_output, write_result_file};
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
     use crate::sql_error_codes::SqlErrorPhase;
     use crate::types::{
-        QueryExecution, QueryLifecycleStructuredAssertion, QueryMeta, ResultSet,
+        ConnectionConfig, QueryExecution, QueryLifecycleStructuredAssertion, QueryMeta, ResultSet,
         RuntimeFilterDetailExpectation, SqlCase, SqlErrorLocation, SqlErrorTier, SqlStep,
+        SuiteHook,
     };
     use crate::{
-        AlterJobPollState, Cli, annotate_failure_with_engine_error_code,
-        bounded_fault_query_timeout, classify_alter_job_poll, evaluate_expected_error_branch,
+        AlterJobPollState, CaseStatus, Cli, Mode, RecordFrom,
+        annotate_failure_with_engine_error_code, bounded_fault_query_timeout,
+        classify_alter_job_poll, evaluate_expected_error_branch,
         evaluate_expected_error_branch_with_sql_error_descriptors, execute_target_session_sql_with,
         expected_engine_error_code_diff_result, expected_engine_error_code_result,
         finish_expected_error_step, sql_text_has_query_lifecycle_fault_directive,
@@ -6953,6 +7096,149 @@ mod tests {
                 max_history_tail_bytes,
             )))
         }
+    }
+
+    #[test]
+    fn failed_suite_init_runs_owned_cleanup_once_and_preserves_both_errors() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let conn = ConnectionConfig {
+            mysql: "unused".into(),
+            host: "localhost".into(),
+            port: "1".into(),
+            user: "root".into(),
+            password: None,
+            catalog: None,
+            db: None,
+        };
+        let artifacts = Arc::new(crate::failure_artifacts::FailureArtifactRecorder::new(
+            crate::failure_artifacts::FailureArtifactContext {
+                root: temp.path().join("failures"),
+                lane: "correctness".into(),
+                suites: vec!["test".into()],
+            },
+        ));
+        let ctx = super::SuiteRunContext {
+            suite_name: "test".into(),
+            mode: Mode::Verify,
+            record_from: RecordFrom::Target,
+            target_conn_base: conn.clone(),
+            reference_conn_base: conn.clone(),
+            target_admin_conn: conn.clone(),
+            reference_admin_conn: conn,
+            result_dir: None,
+            actual_artifact_dir: None,
+            verify_enabled: true,
+            query_timeout: 1,
+            reference_required: false,
+            auto_case_db: false,
+            order_sensitive_default: false,
+            float_epsilon: None,
+            preview_lines: 0,
+            update_expected: false,
+            target_session_sql: vec![],
+            rewrite_explain_contains_as_not_contains: vec![],
+            marker_re: Regex::new("query").unwrap(),
+            fail_fast: false,
+            server_handle: Arc::new(Mutex::new(Box::new(ArtifactCapableServer))),
+            failure_artifacts: artifacts,
+            publication_catalog_control: None,
+            publication_service_control: None,
+            benchmark_profile_dir: None,
+            benchmark_skip_init: false,
+            benchmark_skip_cleanup: false,
+            benchmark_cleanup_only: false,
+        };
+        let hook = |name: &str| SuiteHook {
+            path: temp.path().join(name),
+            sql: name.into(),
+            catalog: None,
+            db: None,
+        };
+        let prepared = super::PreparedSuite {
+            ctx,
+            cases: vec![SqlCase {
+                source_file: temp.path().join("case.sql"),
+                case_id: "case".into(),
+                steps: vec![],
+                case_dbs: vec![],
+                sequential: false,
+            }],
+            load_failures: vec![],
+            init_hook: Some(hook("init")),
+            cleanup_hook: Some(hook("cleanup")),
+        };
+        let mut calls = Vec::new();
+        let outcome = super::run_suite_with_hooks(
+            &prepared,
+            &std::sync::atomic::AtomicBool::new(false),
+            &Mutex::new(()),
+            |_, _, hook, _| {
+                calls.push(hook.sql.clone());
+                anyhow::bail!("injected {} failure", hook.sql)
+            },
+        );
+        assert_eq!(calls, ["init", "cleanup"]);
+        assert_eq!(outcome.outcomes[0].status, CaseStatus::Fail);
+        assert!(outcome.cleanup_errors[0].contains("injected cleanup failure"));
+        let snapshots = fs::read_dir(temp.path().join("failures"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots.len(), 1);
+        let provenance = fs::read_to_string(snapshots[0].join("provenance.json")).unwrap();
+        assert!(provenance.contains("injected init failure"));
+    }
+
+    #[test]
+    fn native_listing_returns_before_invalid_runtime_configuration() {
+        for args in [
+            vec![
+                "novarocks-sql-test",
+                "--list-suites",
+                "--config",
+                "/no/runtime/config",
+            ],
+            vec![
+                "novarocks-sql-test",
+                "--list-suites",
+                "--suite",
+                "all",
+                "--config",
+                "/no/runtime/config",
+            ],
+        ] {
+            assert_eq!(
+                super::run_cli(Cli::parse_from(args), TestLane::Correctness, "correctness")
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn dataset_launch_profile_is_explicit_and_incompatible_selection_fails() {
+        let suites = crate::config::build_suite_configs(
+            &crate::config::resolve_repo_root().unwrap(),
+            TestLane::Correctness,
+        )
+        .unwrap();
+        let selected = vec!["ssb".to_string()];
+        assert!(
+            super::validate_dataset_launch_profile(
+                &selected,
+                &suites,
+                novarocks_cluster_harness::LaunchProfile::FaultScenario
+            )
+            .is_err()
+        );
+        assert!(
+            super::validate_dataset_launch_profile(
+                &selected,
+                &suites,
+                novarocks_cluster_harness::LaunchProfile::Performance
+            )
+            .is_ok()
+        );
     }
 
     #[test]

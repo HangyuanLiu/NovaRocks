@@ -62,6 +62,7 @@ export PATH="$TMP/binding/bin:$PATH"
 # Runner-facing --check is typed JSON and uses only direct storage objects.
 env_file="$TMP/env.sh"
 cat > "$env_file" <<EOF
+NOVA_ENV_READY=true
 NOVA_ENV_COMPOSE_ENV=$TMP/compose.env
 NOVA_ENV_COMPOSE_PROJECT=fake-project
 NOVA_ENV_COMPOSE_FILE=$TMP/compose.yml
@@ -95,6 +96,7 @@ PY
 output="$(NOVA_ENV_REST_ENV_FILE="$env_file" BENCHMARK_FIXTURE_STORAGE_DIR="$BENCHMARK_FIXTURE_STORAGE_DIR" BENCHMARK_FIXTURE_UP_COMMAND="$TMP/binding/bind" "$BOOTSTRAP" --suite ssb --scale 1 --resolved-dataset "$resolved" --check)"
 python3 "$ROOT/tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py" --suite ssb --scale 1 --shared-root s3://fixture/shared/benchmarks --validate-ensure-result <(printf '%s\n' "$output")
 [[ "$output" != *test-secret* ]] || fail 'credential leaked to stdout'
+[[ ! -f "$TMP/binding/calls.jsonl" ]] || fail 'read-only check bound or inspected a producer'
 
 # A malformed READY still exposes its exact ETag to explicit rebuild.  The
 # bootstrap must retain it (rather than treating ReadyInvalid as Absent), and

@@ -1,0 +1,11 @@
+schema_version = 1
+scenario = "standard-sf1"
+workload = "tpc-ds"
+scale = "1GB"
+distribution = "standard"
+file_layout = "standard"
+cache_mode = "warm"
+query_order = "lexical"
+warmup_runs = 1
+measured_runs = 5
+concurrency = 1

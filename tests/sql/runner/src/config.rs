@@ -491,10 +491,7 @@ pub fn resolve_target_port(cli_port: Option<&str>, runner_config: &RunnerConfig)
 pub fn resolve_repo_root() -> Result<PathBuf> {
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     loop {
-        if dir.join("tests/sql/correctness").is_dir()
-            && dir.join("tests/sql/benchmarks").is_dir()
-            && dir.join("Cargo.toml").is_file()
-        {
+        if dir.join("tests/sql/correctness").is_dir() && dir.join("Cargo.toml").is_file() {
             return Ok(dir);
         }
         if !dir.pop() {

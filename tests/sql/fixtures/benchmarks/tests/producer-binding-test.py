@@ -130,10 +130,32 @@ class ProducerBindingTest(unittest.TestCase):
             "NOVA_ENV_REST_ENV_FILE": str(self.fixture / "r1-env.sh"), "BENCHMARK_FIXTURE_UP_COMMAND": str(self.fixture / "bind"),
             "BENCHMARK_FIXTURE_STORAGE_DIR": str(self.storage), "PATH": str(self.fixture / "bin") + os.pathsep + os.environ["PATH"]}
 
-    def run_bootstrap(self, mode="--check"):
+    def run_bootstrap(self, mode="--ensure"):
         return subprocess.run(["bash", str(self.root / "tests/sql/fixtures/benchmarks/bootstrap_benchmark_data.sh"),
             "--suite", "ssb", "--scale", "1", "--resolved-dataset", str(self.resolved_path), mode],
             env=self.environment, capture_output=True, text=True, timeout=20)
+
+    def test_ready_check_uses_published_input_without_bind_or_spark(self):
+        self.environment["NOVA_ENV_REST_ENV_FILE"] = str(self.publication / "env.sh")
+        result = self.run_bootstrap("--check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["dataset_key"], self.resolved["dataset_key"])
+        self.assertFalse((self.fixture / "calls.jsonl").exists())
+        ready = self.storage / self.resolved["ready_uri"].removeprefix("s3://")
+        ready.unlink()
+        result = self.run_bootstrap("--check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(json.loads(result.stdout)["error"], "ready_invalid")
+        self.assertFalse((self.fixture / "calls.jsonl").exists())
+
+    def test_unbound_check_fails_without_creating_runtime(self):
+        self.environment["NOVA_ENV_REST_ENV_FILE"] = str(self.fixture / "unbound-env.sh")
+        # Remove ambient endpoints so an unbound publication cannot borrow them.
+        for key in ("NOVA_ENV_COMPOSE_ENV", "NOVA_ENV_COMPOSE_PROJECT", "NOVA_ENV_COMPOSE_FILE"):
+            self.environment.pop(key, None)
+        result = self.run_bootstrap("--check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.fixture / "calls.jsonl").exists())
 
     def test_r1_cached_entry_is_ignored_after_current_r2_bind(self):
         result = self.run_bootstrap()

@@ -22,17 +22,66 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-/// Suite metadata deliberately controls discovery only. Cluster mode and
-/// cardinality are runner CLI concerns, so a suite cannot select a runtime.
+/// Native static suite facts. Dataset inputs are resolved only when running;
+/// cluster mode and cardinality remain runner CLI concerns.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct SuiteManifest {
     pub explicit_only: bool,
+    pub prepared_dataset: Option<PreparedDatasetRequirement>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedDatasetRequirement {
+    pub dataset: DatasetName,
+    pub scale: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub enum DatasetName {
+    #[serde(rename = "ssb")]
+    Ssb,
+    #[serde(rename = "tpc-h")]
+    TpcH,
+    #[serde(rename = "tpc-ds")]
+    TpcDs,
+}
+
+impl DatasetName {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ssb => "ssb",
+            Self::TpcH => "tpc-h",
+            Self::TpcDs => "tpc-ds",
+        }
+    }
+
+    fn golden_scale(self) -> &'static str {
+        match self {
+            Self::Ssb | Self::TpcH => "1",
+            Self::TpcDs => "1GB",
+        }
+    }
 }
 
 impl SuiteManifest {
     pub fn parse(content: &str) -> Result<Self> {
-        toml::from_str(content).context("failed to parse suite manifest")
+        let manifest: Self = toml::from_str(content).context("failed to parse suite manifest")?;
+        if let Some(requirement) = &manifest.prepared_dataset {
+            anyhow::ensure!(
+                manifest.explicit_only,
+                "prepared dataset suites require explicit_only = true"
+            );
+            anyhow::ensure!(
+                requirement.scale == requirement.dataset.golden_scale(),
+                "dataset {} scale {} does not match checked-in golden scale {}",
+                requirement.dataset.as_str(),
+                requirement.scale,
+                requirement.dataset.golden_scale()
+            );
+        }
+        Ok(manifest)
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -94,7 +143,10 @@ mod tests {
             .into_iter()
             .map(|(name, explicit_only)| {
                 let name = name.to_string();
-                let manifest = SuiteManifest { explicit_only };
+                let manifest = SuiteManifest {
+                    explicit_only,
+                    ..SuiteManifest::default()
+                };
                 (
                     name.clone(),
                     SuiteConfig {
@@ -116,13 +168,23 @@ mod tests {
     }
 
     #[test]
-    fn manifest_accepts_only_explicit_only() {
+    fn manifest_accepts_static_declarations_and_rejects_runtime_fields() {
         assert!(
             SuiteManifest::parse("explicit_only = true\n")
                 .unwrap()
                 .explicit_only
         );
         assert!(SuiteManifest::parse("cluster_size = 3\n").is_err());
+    }
+
+    #[test]
+    fn dataset_manifest_fixes_the_golden_scale() {
+        let prefix = "explicit_only = true\n[prepared_dataset]\ndataset = \"ssb\"\n";
+        assert!(SuiteManifest::parse(&format!("{prefix}scale = \"1\"\n")).is_ok());
+        assert!(SuiteManifest::parse(&format!("{prefix}scale = \"10\"\n")).is_err());
+        assert!(
+            SuiteManifest::parse("[prepared_dataset]\ndataset = \"ssb\"\nscale = \"1\"\n").is_err()
+        );
     }
 
     #[test]

@@ -18,9 +18,10 @@
 use crate::cluster::{ServerFailureLogSources, ServerHandle};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fmt::Write as FmtWrite;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -73,6 +74,8 @@ impl SnapshotSlot {
 pub(crate) struct FailureArtifactRecorder {
     context: FailureArtifactContext,
     state: Mutex<CaptureState>,
+    provenance: Mutex<BTreeMap<String, serde_json::Value>>,
+    case_artifact_root: Mutex<Option<PathBuf>>,
 }
 
 pub(crate) struct StagedRunFailure {
@@ -81,10 +84,146 @@ pub(crate) struct StagedRunFailure {
 
 impl FailureArtifactRecorder {
     pub(crate) fn new(context: FailureArtifactContext) -> Self {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let sequence = ARTIFACT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let attempt = format!("sql-{timestamp}-{}-{sequence}", std::process::id());
+        let provenance = BTreeMap::from([(
+            "attempt".to_string(),
+            serde_json::json!({
+                "identity": attempt, "lane": context.lane, "suites": context.suites,
+            }),
+        )]);
         Self {
             context,
             state: Mutex::new(CaptureState::default()),
+            provenance: Mutex::new(provenance),
+            case_artifact_root: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn persist_terminal_outcome(
+        &self,
+        snapshot: &Path,
+        outcome: &serde_json::Value,
+    ) -> Result<()> {
+        let path = snapshot.join("outcome.json");
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&path)
+            .context("create terminal cleanup outcome")?;
+        file.write_all(serde_json::to_string_pretty(outcome)?.as_bytes())?;
+        file.sync_all().context("sync terminal cleanup outcome")
+    }
+
+    pub(crate) fn record_provenance(&self, key: String, value: serde_json::Value) {
+        self.provenance
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(key, value);
+    }
+
+    pub(crate) fn record_build_provenance(
+        &self,
+        base_dir: &Path,
+        profile: novarocks_cluster_harness::LaunchProfile,
+        mode: crate::cluster::ClusterMode,
+        backend_count: usize,
+    ) -> Result<()> {
+        let binary_fact = |path: PathBuf| -> Result<serde_json::Value> {
+            let path = path.canonicalize()?;
+            let mut file = fs::File::open(&path)?;
+            let mut hash = Sha256::new();
+            let mut buffer = [0_u8; 65536];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hash.update(&buffer[..read]);
+            }
+            Ok(
+                serde_json::json!({"path": path, "sha256": format!("{:x}", hash.finalize()),
+                "compiled_capabilities": "unknown", "effective_cargo_profile": "unknown"}),
+            )
+        };
+        let git = |args: &[&str]| -> Option<String> {
+            std::process::Command::new("git")
+                .current_dir(base_dir)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        };
+        let server = crate::cluster::discover_novarocks_binary(base_dir)
+            .and_then(&binary_fact)
+            .unwrap_or_else(|error| serde_json::json!({"source_error": format!("{error:#}")}));
+        let runner = std::env::current_exe()
+            .map_err(anyhow::Error::from)
+            .and_then(binary_fact)?;
+        self.record_provenance("build-and-launch".to_string(), serde_json::json!({
+            "source_head": git(&["rev-parse", "HEAD"]), "source_worktree_status": git(&["status", "--porcelain"]),
+            "runner": runner, "server": server,
+            "requested_launch_profile": format!("{profile:?}"), "cluster_mode": format!("{mode:?}"),
+            "requested_backend_count": backend_count,
+            "capability_note": "Binary hashes identify content; build capability and Cargo profile self-report are unavailable."
+        }));
+        Ok(())
+    }
+
+    fn provenance_json(&self) -> Result<String> {
+        serde_json::to_string_pretty(&*self.provenance.lock().unwrap_or_else(|p| p.into_inner()))
+            .context("serialize SQL failure provenance")
+    }
+
+    pub(crate) fn case_artifact_root(&self) -> Result<PathBuf> {
+        let mut root = self
+            .case_artifact_root
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(path) = &*root {
+            return Ok(path.clone());
+        }
+        let pending = PendingArtifactDir::create(&self.context.root, "case-diagnostics")?;
+        pending.write_file("provenance.json", &self.provenance_json()?)?;
+        let path = pending.commit();
+        *root = Some(path.clone());
+        Ok(path)
+    }
+
+    pub(crate) fn persist_case_diagnostic(
+        &self,
+        suite: &str,
+        case_id: &str,
+        source: &Path,
+        expected: Option<&Path>,
+        log: &str,
+    ) -> Result<PathBuf> {
+        let root = self.case_artifact_root()?;
+        let pending = PendingArtifactDir::create(
+            &root,
+            &case_artifact_name_prefix(&self.context.lane, suite, case_id, None),
+        )?;
+        pending.write_file("case.json", &serde_json::to_string_pretty(&serde_json::json!({
+            "suite": suite, "case": case_id, "source": source, "expected_source": expected,
+            "actual_note": "Actual rows are retained only when query execution produced a row set."
+        }))?)?;
+        pending.write_file("failure.txt", log)?;
+        pending.write_file(
+            "case.sql",
+            &fs::read_to_string(source)
+                .with_context(|| format!("read failed case {}", source.display()))?,
+        )?;
+        if let Some(expected) = expected.filter(|p| p.is_file()) {
+            pending.write_file("expected.tsv", &fs::read_to_string(expected)?)?;
+        }
+        Ok(pending.commit())
     }
 
     pub(crate) fn persist_case_failure(
@@ -138,7 +277,7 @@ impl FailureArtifactRecorder {
         &self,
         staged: Option<StagedRunFailure>,
     ) -> Result<Option<PathBuf>> {
-        let Some(staged) = staged else {
+        let Some(mut staged) = staged else {
             return Ok(None);
         };
         if !self.claim(SnapshotSlot::Terminal) {
@@ -148,6 +287,7 @@ impl FailureArtifactRecorder {
             "{}-terminal",
             artifact_name_prefix(&self.context.lane, &self.context.suites)
         );
+        staged.captured.provenance = Some(self.provenance_json()?);
         let result =
             persist_captured_failure_logs(&self.context.root, &prefix, staged.captured).map(Some);
         if result.is_err() {
@@ -177,7 +317,8 @@ impl FailureArtifactRecorder {
             })
             .and_then(|captured| {
                 captured
-                    .map(|captured| {
+                    .map(|mut captured| {
+                        captured.provenance = Some(self.provenance_json()?);
                         persist_captured_failure_logs(&self.context.root, &prefix, captured)
                     })
                     .transpose()
@@ -227,6 +368,7 @@ struct CapturedFailureLogs {
     slot: SnapshotSlot,
     backend_count: usize,
     logs: Vec<CapturedProcessLog>,
+    provenance: Option<String>,
 }
 
 struct PendingArtifactDir {
@@ -415,6 +557,7 @@ fn capture_failure_log_sources(
     Ok(CapturedFailureLogs {
         slot,
         backend_count: captured.backend_count,
+        provenance: None,
         logs: captured
             .logs
             .into_iter()
@@ -475,6 +618,9 @@ fn persist_captured_failure_logs(
         pending.write_file(&log.name, &log.contents)?;
     }
     pending.write_file("manifest.txt", &manifest)?;
+    if let Some(provenance) = captured.provenance {
+        pending.write_file("provenance.json", &provenance)?;
+    }
 
     Ok(pending.commit())
 }
@@ -827,6 +973,48 @@ mod tests {
                 .is_none()
         );
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn failed_attempt_diagnostics_do_not_overwrite_prior_attempt_or_invent_actual() {
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("case.sql");
+        let expected = temp.path().join("case.result");
+        fs::write(&source, "SELECT missing;\n").unwrap();
+        fs::write(&expected, "answer\n42\n").unwrap();
+        let mut roots = Vec::new();
+        for _ in 0..2 {
+            let recorder = FailureArtifactRecorder::new(context(&temp.path().join("artifacts")));
+            recorder.record_provenance(
+                "dataset/ssb".into(),
+                serde_json::json!({"publication_identity":"ready-identity"}),
+            );
+            let path = recorder
+                .persist_case_diagnostic(
+                    "ssb",
+                    "q1.1",
+                    &source,
+                    Some(&expected),
+                    "statement failed",
+                )
+                .unwrap();
+            assert_eq!(
+                fs::read_to_string(path.join("case.sql")).unwrap(),
+                "SELECT missing;\n"
+            );
+            assert_eq!(
+                fs::read_to_string(path.join("expected.tsv")).unwrap(),
+                "answer\n42\n"
+            );
+            assert!(!path.join("actual.tsv").exists());
+            roots.push(path.parent().unwrap().to_path_buf());
+        }
+        assert_ne!(roots[0], roots[1]);
+        assert!(
+            fs::read_to_string(roots[0].join("provenance.json"))
+                .unwrap()
+                .contains("ready-identity")
+        );
     }
 
     #[test]
