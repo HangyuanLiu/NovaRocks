@@ -296,6 +296,8 @@ impl Connected<axum::serve::IncomingStream<'_>> for ObservedConnection {
 }
 
 struct ReadHoldState {
+    proxy: Weak<ProxyState>,
+    request_identity: Mutex<Option<(u64, u64)>>,
     matcher: HoldMatcher,
     mode: DelayedS3HoldMode,
     entered: Mutex<bool>,
@@ -319,6 +321,18 @@ enum HoldMatcher {
 /// test explicitly releases it, so a cancellation test cannot pass by sleep.
 pub struct DelayedS3ReadHold {
     state: Arc<ReadHoldState>,
+}
+
+/// Terminal facts for the exact request that entered one hold. A closed
+/// connection is recorded only after its final Arc, including the route's
+/// ConnectInfo, exits. It cannot be supplied by another client connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct DelayedS3ReadExitObservation {
+    pub request_id: u64,
+    pub connection_id: u64,
+    pub upstream_body_complete: bool,
+    pub exact_connection_closed: bool,
+    pub upstream_error: bool,
 }
 
 impl DelayedS3ReadHold {
@@ -354,6 +368,75 @@ impl DelayedS3ReadHold {
             "timed out waiting for held S3 read to finish forwarding"
         );
         Ok(())
+    }
+
+    /// Observe the exact held request without treating cancellation as a
+    /// promise to consume the downstream object's entire body.
+    pub fn read_exit_observation(&self) -> Result<DelayedS3ReadExitObservation> {
+        let (request_id, connection_id) = self
+            .state
+            .request_identity
+            .lock()
+            .expect("S3 hold identity lock")
+            .context("held S3 read has not entered a real request")?;
+        let proxy = self
+            .state
+            .proxy
+            .upgrade()
+            .context("held S3 proxy owner exited before observation")?;
+        ensure!(
+            proxy.event_overflow.load(Ordering::Acquire) == 0,
+            "held S3 read observation is incomplete after raw event overflow"
+        );
+        let events = proxy.events.lock().expect("S3 event log lock");
+        let upstream_body_complete = events.iter().any(|event| {
+            event.request_id == request_id && event.kind == DelayedS3EventKind::BodyComplete
+        });
+        let upstream_error = events.iter().any(|event| {
+            event.request_id == request_id && event.kind == DelayedS3EventKind::UpstreamError
+        });
+        drop(events);
+        let exact_connection_closed = proxy
+            .connection_events
+            .lock()
+            .expect("S3 connection event lock")
+            .iter()
+            .any(|event| {
+                event.connection_id == connection_id
+                    && event.kind == DelayedS3ConnectionEventKind::Closed
+            });
+        Ok(DelayedS3ReadExitObservation {
+            request_id,
+            connection_id,
+            upstream_body_complete,
+            exact_connection_closed,
+            upstream_error,
+        })
+    }
+
+    /// Cancellation may either finish the real store read or drop the exact
+    /// route before forwarding. Both require terminal evidence; release, SQL
+    /// terminal publication and unrelated connection closure are insufficient.
+    pub fn wait_until_cancelled_read_exited(
+        &self,
+        timeout: Duration,
+    ) -> Result<DelayedS3ReadExitObservation> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let observation = self.read_exit_observation()?;
+            ensure!(
+                !observation.upstream_error,
+                "held S3 read exited with upstream error: {observation:?}"
+            );
+            if observation.upstream_body_complete || observation.exact_connection_closed {
+                return Ok(observation);
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "held S3 read has no terminal I/O evidence: {observation:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// The first body bytes have been queued to the BE-facing response stream.
@@ -759,6 +842,8 @@ impl DelayedS3Proxy {
         ensure!(next.is_none(), "S3 read hold is already armed");
         let (release, _) = watch::channel(false);
         let state = Arc::new(ReadHoldState {
+            proxy: Arc::downgrade(&self.state),
+            request_identity: Mutex::new(None),
             matcher,
             mode,
             entered: Mutex::new(false),
@@ -917,6 +1002,8 @@ async fn forward_read(
     state.record(event.clone());
 
     if let Some(hold) = &hold {
+        *hold.request_identity.lock().expect("S3 hold identity lock") =
+            Some((request_id, connection.lifetime.id));
         let mut released = hold.release.subscribe();
         *hold.entered.lock().expect("S3 hold entry lock") = true;
         hold.entered_changed.notify_all();
@@ -1200,6 +1287,72 @@ mod tests {
         })
         .expect("start delayed proxy");
         (upstream, proxy)
+    }
+
+    #[test]
+    fn cancelled_hold_requires_its_own_request_or_connection_exit() {
+        use std::io::Write;
+        use std::net::{Shutdown, TcpStream};
+
+        let (_upstream, proxy) = fixture_with_object(b"held bytes");
+        let hold = proxy
+            .hold_next_read_with_suffix(".parquet")
+            .expect("arm real hold");
+        let address = proxy
+            .endpoint()
+            .strip_prefix("http://")
+            .expect("loopback HTTP endpoint");
+        let mut held_client = TcpStream::connect(address).expect("connect held client");
+        write!(held_client, "GET /bucket/data/file.parquet HTTP/1.1\r\nHost: {address}\r\nAuthorization: {SIGNED}\r\n\r\n")
+            .expect("send held request");
+        hold.wait_until_entered(Duration::from_secs(5))
+            .expect("held request entered");
+        let held = hold
+            .read_exit_observation()
+            .expect("bound request identity");
+        assert!(!held.upstream_body_complete && !held.exact_connection_closed);
+
+        let unrelated = TcpStream::connect(address).expect("connect another client");
+        unrelated
+            .shutdown(Shutdown::Both)
+            .expect("close unrelated client");
+        drop(unrelated);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !proxy.connection_log().iter().any(|event| {
+            event.kind == DelayedS3ConnectionEventKind::Closed
+                && event.connection_id != held.connection_id
+        }) {
+            assert!(
+                Instant::now() < deadline,
+                "unrelated connection did not close"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let unrelated_exit = hold
+            .read_exit_observation()
+            .expect("read exact terminal facts");
+        assert!(!unrelated_exit.upstream_body_complete && !unrelated_exit.exact_connection_closed);
+        assert!(
+            hold.wait_until_cancelled_read_exited(Duration::from_millis(20))
+                .is_err()
+        );
+
+        held_client
+            .shutdown(Shutdown::Both)
+            .expect("cancel exact held connection");
+        drop(held_client);
+        let exact_exit = hold
+            .wait_until_cancelled_read_exited(Duration::from_secs(5))
+            .expect("exact cancelled route physically exited");
+        assert_eq!(exact_exit.request_id, held.request_id);
+        assert_eq!(exact_exit.connection_id, held.connection_id);
+        assert!(exact_exit.exact_connection_closed && !exact_exit.upstream_body_complete);
+        hold.release();
+        // A cancelled route is not proof that the upstream body was read.
+        assert!(
+            hold.wait_until_forwarded(Duration::from_millis(20))
+                .is_err()
+        );
     }
 
     #[test]

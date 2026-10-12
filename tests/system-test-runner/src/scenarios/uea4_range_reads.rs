@@ -19,6 +19,7 @@
 //! only; the functional stage checks multi-file rows and held-read cleanup.
 
 use super::connector::{await_resource_convergence, require_three_backends, resource_baseline};
+use super::provider_mysql_actors::{MysqlActor, record_cancelled_proxy_read, run_checks};
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
@@ -42,6 +43,7 @@ use std::time::{Duration, Instant};
 
 const WORKLOAD_ENV: &str = "NOVAROCKS_UEA4A2_WORKLOAD_MANIFEST";
 const FIXTURE_ENV: &str = "NOVAROCKS_UEA4A2_FIXTURE_MANIFEST";
+const SHORT_FIXTURE_ENV: &str = "NOVAROCKS_ICEBERG_SHORT_FIXTURE_MANIFEST";
 const GROUP_ENV: &str = "NOVAROCKS_UEA4A2_GROUP";
 const PILOT_ENV: &str = "NOVAROCKS_UEA4A2_BASELINE_PILOT";
 const CALIBRATION_SECONDS_ENV: &str = "NOVAROCKS_UEA4A2_CALIBRATION_SECONDS";
@@ -168,7 +170,7 @@ impl Workload {
 }
 
 #[derive(Deserialize)]
-struct PilotFixture {
+struct PublishedIcebergFixture {
     schema_version: u32,
     fixture_kind: String,
     table_location: String,
@@ -187,7 +189,7 @@ struct PilotFixture {
 }
 
 #[derive(Deserialize)]
-struct PilotOracle {
+struct FixtureOracle {
     row_count: u64,
     min_id: u64,
     max_id: u64,
@@ -196,7 +198,7 @@ struct PilotOracle {
 }
 
 #[derive(Deserialize)]
-struct PilotObject {
+struct FixtureObject {
     key: String,
     etag: String,
     sha256: Option<String>,
@@ -204,14 +206,27 @@ struct PilotObject {
 }
 
 struct CheckedFixture {
-    facts: PilotFixture,
-    objects: Vec<PilotObject>,
+    facts: PublishedIcebergFixture,
+    objects: Vec<FixtureObject>,
     manifest_sha256: String,
 }
 
 impl CheckedFixture {
     fn load(query: &PilotQuery, calibration: bool) -> Result<Self> {
-        let path = env_path(FIXTURE_ENV)?;
+        let fixture = Self::load_source(&env_path(FIXTURE_ENV)?, calibration)?;
+        if calibration {
+            let (lower, upper) = calibration_id_range(&query.sql)?;
+            let upper = upper.min(fixture.facts.row_count - 1);
+            let expected = if lower > upper { 0 } else { upper - lower + 1 };
+            ensure!(
+                query.expected_row_count == expected,
+                "I00 calibration expected count does not match the published Iceberg oracle"
+            );
+        }
+        Ok(fixture)
+    }
+
+    fn load_source(path: &Path, allow_a4: bool) -> Result<Self> {
         let bytes =
             fs::read(&path).with_context(|| format!("read UEA-4A-2 fixture {}", path.display()))?;
         let digest = sha256(&bytes);
@@ -223,39 +238,39 @@ impl CheckedFixture {
             ready.trim() == format!("sha256:{digest}"),
             "fixture READY does not bind the exact manifest"
         );
-        let facts: PilotFixture =
-            serde_json::from_slice(&bytes).context("decode G0 pilot fixture")?;
+        let facts: PublishedIcebergFixture =
+            serde_json::from_slice(&bytes).context("decode published Iceberg fixture")?;
         ensure!(
             facts.schema_version == 1,
-            "G0 pilot requires a versioned published Iceberg fixture"
+            "published Iceberg fixture must be versioned"
         );
-        let a4_calibration = calibration && facts.fixture_kind == "uea4a4-iceberg-performance-v1";
+        let a4_fixture = allow_a4 && facts.fixture_kind == "uea4a4-iceberg-performance-v1";
         let short_fixture = facts.fixture_kind == "uea4a2-iceberg-short-v1";
         ensure!(
-            a4_calibration || short_fixture,
-            "G0 pilot requires the published short Iceberg fixture; A4 is calibration only"
+            a4_fixture || short_fixture,
+            "expected a published short or explicitly selected A4 Iceberg fixture"
         );
         ensure!(
-            if a4_calibration {
+            if a4_fixture {
                 facts.data_file_count >= 16 && facts.row_count == 768
             } else {
                 facts.data_file_count >= 1 && facts.row_count == 4096
             },
-            "G0 pilot fixture has the wrong source data shape"
+            "published Iceberg fixture has the wrong source data shape"
         );
         ensure!(
             facts.rest_uri.starts_with("http://127.0.0.1:")
                 || facts.rest_uri.starts_with("http://localhost:"),
-            "G0 pilot REST endpoint must be loopback"
+            "fixture REST endpoint must be loopback"
         );
         ensure!(
             facts.s3_endpoint.starts_with("http://127.0.0.1:")
                 || facts.s3_endpoint.starts_with("http://localhost:"),
-            "G0 pilot S3 endpoint must be loopback"
+            "fixture S3 endpoint must be loopback"
         );
         ensure!(
             facts.table_location.starts_with("s3://") && !facts.table_location.contains('?'),
-            "G0 pilot table location must be an exact S3 path"
+            "fixture table location must be an exact S3 path"
         );
         for id in [
             &facts.database,
@@ -291,7 +306,7 @@ impl CheckedFixture {
             sha256(&objects_bytes) == facts.objects_sha256,
             "fixture object inventory changed after artifact verification"
         );
-        let objects: Vec<PilotObject> =
+        let objects: Vec<FixtureObject> =
             serde_json::from_slice(&objects_bytes).context("decode G0 pilot object inventory")?;
         let mut distinct_keys = BTreeSet::new();
         let data_files = objects
@@ -329,9 +344,9 @@ impl CheckedFixture {
             facts.artifacts.get("oracle.json") == Some(&sha256(&oracle_bytes)),
             "fixture oracle hash mismatch"
         );
-        let oracle: PilotOracle =
+        let oracle: FixtureOracle =
             serde_json::from_slice(&oracle_bytes).context("decode G0 pilot oracle")?;
-        let expected_rows = if a4_calibration { 768 } else { 4096 };
+        let expected_rows = if a4_fixture { 768 } else { 4096 };
         let expected_id_sum = (expected_rows - 1) * expected_rows / 2;
         ensure!(
             oracle.row_count == expected_rows
@@ -339,23 +354,13 @@ impl CheckedFixture {
                 && oracle.min_id == 0
                 && oracle.max_id == expected_rows - 1
                 && oracle.id_sum == expected_id_sum
-                && if a4_calibration {
+                && if a4_fixture {
                     oracle.value_sum > 0
                 } else {
                     oracle.value_sum == 3 * expected_id_sum
                 },
-            "G0 pilot row oracle is inconsistent"
+            "published Iceberg row oracle is inconsistent"
         );
-        if calibration {
-            let (lower, upper) = calibration_id_range(&query.sql)?;
-            let lower = lower.max(oracle.min_id);
-            let upper = upper.min(oracle.max_id);
-            let expected = if lower > upper { 0 } else { upper - lower + 1 };
-            ensure!(
-                query.expected_row_count == expected,
-                "I00 calibration expected count does not match the published Iceberg oracle"
-            );
-        }
         Ok(Self {
             facts,
             objects,
@@ -801,7 +806,7 @@ fn drain_proxy_logs(
     Ok(())
 }
 
-fn credential_overlay(purpose: &str, fixture: &PilotFixture) -> String {
+fn credential_overlay(purpose: &str, fixture: &PublishedIcebergFixture) -> String {
     format!(
         "[[connector.credentials]]\npurpose = \"{purpose}\"\nname = \"{}\"\ngeneration = \"{}\"\nkind = \"s3\"\naccess_key_id = \"${{ENV:{ACCESS_KEY_ENV}}}\"\naccess_key_secret = \"${{ENV:{SECRET_KEY_ENV}}}\"\n",
         fixture.credential_name, fixture.credential_generation
@@ -1280,6 +1285,10 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::<RangePerformance>::default(),
         Box::<RangeFunctional>::default(),
+        Box::new(RangeFunctional {
+            short: true,
+            fixture: Mutex::new(None),
+        }),
     ]
 }
 
@@ -1288,23 +1297,25 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
 #[derive(Default)]
 struct RangeFunctional {
     fixture: Mutex<Option<LiveFixture>>,
+    short: bool,
 }
 
 impl RangeFunctional {
-    fn checked_fixture() -> Result<CheckedFixture> {
-        let query = PilotQuery {
-            name: "uea4a2-functional".to_owned(),
-            sql: "SELECT COUNT(*) FROM ${table} WHERE id BETWEEN 0 AND 767".to_owned(),
-            expected_row_count: 768,
-            clients: 1,
-            min_query_interval_ms: 1,
-            warmup_ms: 1000,
+    fn checked_fixture(&self) -> Result<CheckedFixture> {
+        let variable = if self.short {
+            SHORT_FIXTURE_ENV
+        } else {
+            FIXTURE_ENV
         };
-        let fixture = CheckedFixture::load(&query, true)?;
+        let fixture = CheckedFixture::load_source(&env_path(variable)?, !self.short)?;
+        let expected_kind = if self.short {
+            "uea4a2-iceberg-short-v1"
+        } else {
+            "uea4a4-iceberg-performance-v1"
+        };
         ensure!(
-            fixture.facts.fixture_kind == "uea4a4-iceberg-performance-v1"
-                && fixture.facts.data_file_count >= 16,
-            "functional multi-split stage requires the published A4 multi-file Iceberg fixture"
+            fixture.facts.fixture_kind == expected_kind,
+            "functional range input does not match the explicitly selected fixture"
         );
         Ok(fixture)
     }
@@ -1312,7 +1323,11 @@ impl RangeFunctional {
 
 impl Scenario for RangeFunctional {
     fn name(&self) -> &'static str {
-        "uea4/iceberg-range-functional"
+        if self.short {
+            "connector/iceberg-short-range-concurrent"
+        } else {
+            "uea4/iceberg-range-functional"
+        }
     }
 
     fn is_explicit_stage(&self) -> bool {
@@ -1320,7 +1335,7 @@ impl Scenario for RangeFunctional {
     }
 
     fn validate_runner_inputs(&self, _profile: LaunchProfile, _uea1: Option<&Path>) -> Result<()> {
-        Self::checked_fixture()?;
+        self.checked_fixture()?;
         for name in ["AWS_S3_ACCESS_KEY_ID", "AWS_S3_SECRET_ACCESS_KEY"] {
             ensure!(!env::var(name)?.is_empty(), "{name} must be nonempty");
         }
@@ -1328,7 +1343,7 @@ impl Scenario for RangeFunctional {
     }
 
     fn launch_config(&self, _scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        let fixture = Self::checked_fixture()?;
+        let fixture = self.checked_fixture()?;
         let proxy = DelayedS3Proxy::start(DelayedS3Config {
             downstream: fixture.facts.s3_endpoint.clone(),
             delay: Duration::ZERO,
@@ -1396,6 +1411,12 @@ impl Scenario for RangeFunctional {
         connection
             .query_drop(fixture.checked.catalog_sql(fixture.proxy.endpoint()))
             .context("create functional Iceberg catalog")?;
+        if self.short {
+            drop(connection);
+            run_range_clients(context, &table, true)?;
+            context.action("four short-range clients independently verified (id, 3 * id) for id=1..10 and exited");
+            return Ok(());
+        }
         let scan = format!("SELECT id FROM {table} WHERE id BETWEEN 0 AND 767 ORDER BY id");
         let initial_baseline = resource_baseline(context)?;
         let before = fixture.proxy.snapshot();
@@ -1415,71 +1436,106 @@ impl Scenario for RangeFunctional {
         );
         drop(connection);
         await_resource_convergence(context, &initial_baseline, "multi-file and LIMIT reads")?;
+        run_range_clients(context, &table, false)?;
+        context.action(
+            "four multi-file clients each verified the independent ordered ID oracle and exited",
+        );
 
         let baseline = resource_baseline(context)?;
         let hold = fixture.proxy.hold_next_read_with_suffix(".parquet")?;
-        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-        let (done_tx, done_rx) = mpsc::sync_channel(1);
-        let user = context.mysql_user().to_owned();
-        let port = context.mysql_port();
-        let timeout = context.remaining("connect held functional Iceberg read")?;
         let held_scan = scan.clone();
-        let actor = thread::spawn(move || -> Result<()> {
-            let mut connection = mysql_actor::connect_for_cancellation(&user, port, timeout)?;
-            ready_tx.send(connection.connection_id())?;
-            done_tx.send(connection.query::<u64, _>(held_scan))?;
-            Ok(())
-        });
+        let mut actor = MysqlActor::spawn(context, "a4-held-read", move |connection| {
+            Ok(connection.query::<u64, _>(held_scan))
+        })?;
+        let mut kill_actor = None;
+        let mut entered = false;
         let operation = (|| -> Result<()> {
-            let connection_id = ready_rx
-                .recv_timeout(context.remaining("receive held read connection ID")?)
-                .context("held Iceberg read did not publish connection ID")?;
+            let connection_id =
+                actor.connection_id(context.remaining("receive held read connection ID")?)?;
             hold.wait_until_entered(
                 context
                     .remaining("observe held Parquet read")?
                     .min(Duration::from_secs(30)),
             )?;
-            let (kill_tx, kill_rx) = mpsc::sync_channel(1);
-            let user = context.mysql_user().to_owned();
-            let port = context.mysql_port();
-            let timeout = context.remaining("connect held read control")?;
-            let kill_actor = thread::spawn(move || -> Result<()> {
-                let mut control = mysql_actor::connect(&user, port, timeout)?;
-                kill_tx.send(control.query_drop(format!("KILL QUERY {connection_id}")))?;
-                Ok(())
-            });
-            let kill_result = kill_rx
-                .recv_timeout(
+            entered = true;
+            kill_actor = Some(MysqlActor::spawn(
+                context,
+                "a4-held-kill",
+                move |control| {
+                    control
+                        .query_drop(format!("KILL QUERY {connection_id}"))
+                        .context("cancel held multi-file Iceberg read")
+                },
+            )?);
+            kill_actor
+                .as_mut()
+                .expect("control actor installed")
+                .receive(
                     context
-                        .remaining("await held read KILL QUERY control")?
+                        .remaining("await held read KILL QUERY")?
                         .min(Duration::from_secs(10)),
-                )
-                .context("KILL QUERY did not respond while the Parquet read was held")?;
-            kill_result.context("cancel held multi-file Iceberg read")?;
+                )?;
             hold.release();
-            hold.wait_until_forwarded(
+            hold.wait_until_cancelled_read_exited(
                 context
                     .remaining("drain held Parquet read")?
                     .min(Duration::from_secs(30)),
             )?;
-            let result = done_rx
-                .recv_timeout(context.remaining("await cancelled Iceberg read")?)
-                .context("cancelled Iceberg read did not exit")?;
+            let result = actor.receive(context.remaining("await cancelled Iceberg read")?)?;
             ensure!(
                 matches!(result, Err(mysql::Error::MySqlError(ref error)) if error.code == 1317),
                 "held Iceberg read did not report query cancellation: {result:?}"
             );
-            kill_actor
-                .join()
-                .map_err(|_| anyhow::anyhow!("held Iceberg KILL QUERY actor panicked"))??;
             Ok(())
         })();
+        let mut cleanup = Vec::new();
+        if operation.is_err() {
+            if let Err(error) = actor.cancel(context) {
+                cleanup.push(format!("cancel read: {error:#}"));
+            }
+            if let Some(actor) = &mut kill_actor
+                && let Err(error) = actor.cancel(context)
+            {
+                cleanup.push(format!("cancel control: {error:#}"));
+            }
+        }
         hold.release();
-        actor
-            .join()
-            .map_err(|_| anyhow::anyhow!("held Iceberg read actor panicked"))??;
+        if entered
+            && let Err(error) = hold.wait_until_cancelled_read_exited(Duration::from_secs(30))
+        {
+            cleanup.push(format!("held read terminal I/O: {error:#}"));
+        }
+        if let Err(error) = actor.finish(context) {
+            cleanup.push(format!("read actual join: {error:#}"));
+        }
+        if let Some(actor) = &mut kill_actor
+            && let Err(error) = actor.finish(context)
+        {
+            cleanup.push(format!("control actual join: {error:#}"));
+        }
+        if let Err(error) =
+            await_resource_convergence(context, &baseline, "held multi-file Iceberg cancellation")
+        {
+            cleanup.push(format!("resource exit: {error:#}"));
+        }
+        if let Err(error) =
+            record_cancelled_proxy_read(context, "a4-held-read", &fixture.proxy, &hold)
+        {
+            cleanup.push(format!("proxy terminal evidence: {error:#}"));
+        }
+        let evidence = fs::write(
+            context.scenario_root().join("a4-held-read-exit.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "operation_error":operation.as_ref().err().map(|error| format!("{error:#}")),
+                "cleanup_errors":cleanup,"actual_actor_joins_completed":true,
+            }))?,
+        );
         operation?;
-        await_resource_convergence(context, &baseline, "held multi-file Iceberg cancellation")?;
+        ensure!(
+            cleanup.is_empty(),
+            "held multi-file cleanup failed: {cleanup:?}"
+        );
+        evidence?;
         context.action("cancelled a real held Parquet read and observed native resource drain");
 
         let mut followup = mysql_actor::connect(
@@ -1509,5 +1565,56 @@ fn verify_functional_rows(connection: &mut mysql::Conn, sql: &str) -> Result<()>
         rows.len() == 768 && rows.iter().copied().eq(0..768),
         "multi-file Iceberg rows differ from the published ordered ID oracle"
     );
+    Ok(())
+}
+
+/// Each finite actor checks an independent input oracle; client agreement alone
+/// does not establish correctness. Joining all actors precedes error reporting.
+fn run_range_clients(context: &mut ScenarioContext, table: &str, short: bool) -> Result<()> {
+    let baseline = resource_baseline(context)?;
+    let sql = if short {
+        format!("SELECT id, value FROM {table} WHERE id BETWEEN 1 AND 10 ORDER BY id")
+    } else {
+        format!("SELECT id FROM {table} WHERE id BETWEEN 0 AND 767 ORDER BY id")
+    };
+    let checks = (0..4)
+        .map(|index| {
+            let sql = sql.clone();
+            Box::new(move |connection: &mut mysql::Conn| -> Result<()> {
+                if short {
+                    let actual: Vec<(u64, u64)> = connection.query(&sql)?;
+                    let expected = (1..=10).map(|id| (id, 3 * id)).collect::<Vec<_>>();
+                    ensure!(
+                        actual == expected,
+                        "short-range client {index} rows differ: {actual:?}"
+                    );
+                } else {
+                    verify_functional_rows(connection, &sql)
+                        .with_context(|| format!("multi-file range client {index}"))?;
+                }
+                Ok(())
+            }) as Box<dyn FnOnce(&mut mysql::Conn) -> Result<()> + Send>
+        })
+        .collect();
+    let execution = run_checks(
+        context,
+        if short {
+            "short-range"
+        } else {
+            "multi-file-range"
+        },
+        checks,
+    );
+    let exit = await_resource_convergence(context, &baseline, "concurrent range clients");
+    let evidence = fs::write(
+        context.scenario_root().join("range-concurrent-exit.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "short_fixture":short,"actors":4,"execution_error":execution.as_ref().err().map(ToString::to_string),
+            "resource_exit_error":exit.as_ref().err().map(ToString::to_string),
+        }))?,
+    );
+    execution?;
+    exit?;
+    evidence?;
     Ok(())
 }

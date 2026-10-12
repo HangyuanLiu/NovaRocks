@@ -21,6 +21,7 @@
 //! coarse check only rejects large regressions; it is not a formal benchmark.
 
 use super::connector::{await_resource_convergence, require_three_backends, resource_baseline};
+use super::provider_mysql_actors::{MysqlActor, record_cancelled_proxy_read};
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
@@ -37,7 +38,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -274,6 +275,116 @@ struct LiveFixtures {
     paimon_slow: DelayedS3Proxy,
 }
 
+/// Shared functional setup owns published inputs, credentials and proxies.
+/// It does not load or validate measurement windows, repetitions or warmup.
+struct FunctionalPlanningSetup {
+    fixtures: Mutex<Option<LiveFixtures>>,
+    concurrency_limit: usize,
+}
+
+impl FunctionalPlanningSetup {
+    fn new(concurrency_limit: usize) -> Self {
+        Self {
+            fixtures: Mutex::new(None),
+            concurrency_limit,
+        }
+    }
+
+    fn validate_runner_inputs(
+        &self,
+        profile: LaunchProfile,
+        _workload: Option<&Path>,
+    ) -> Result<()> {
+        ensure!(
+            profile == LaunchProfile::Performance,
+            "provider functionality requires the clean --launch-profile performance environment"
+        );
+        CheckedFixture::load(ICEBERG_FIXTURE_ENV, "iceberg", 16)?;
+        CheckedFixture::load(PAIMON_FIXTURE_ENV, "paimon", 16)?;
+        Ok(())
+    }
+
+    fn launch_config(&self, _scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        launch_planning_config(&self.fixtures, self.concurrency_limit, 16, Duration::ZERO)
+    }
+
+    fn teardown(&self) -> Result<()> {
+        self.fixtures
+            .lock()
+            .map_err(|_| anyhow::anyhow!("provider fixture lock poisoned"))?
+            .take();
+        Ok(())
+    }
+}
+
+fn launch_planning_config(
+    fixtures: &Mutex<Option<LiveFixtures>>,
+    concurrency_limit: usize,
+    minimum_data_files: u64,
+    delay: Duration,
+) -> Result<ScenarioLaunchConfig> {
+    let iceberg = CheckedFixture::load(ICEBERG_FIXTURE_ENV, "iceberg", minimum_data_files)?;
+    let paimon = CheckedFixture::load(PAIMON_FIXTURE_ENV, "paimon", minimum_data_files)?;
+    let iceberg_slow = DelayedS3Proxy::start(DelayedS3Config {
+        downstream: iceberg.facts.s3_endpoint.clone(),
+        delay,
+    })?;
+    let paimon_slow = DelayedS3Proxy::start(DelayedS3Config {
+        downstream: paimon.facts.s3_endpoint.clone(),
+        delay,
+    })?;
+    let access_key = env::var("AWS_S3_ACCESS_KEY_ID")
+        .context("provider fixture requires AWS_S3_ACCESS_KEY_ID")?;
+    let secret_key = env::var("AWS_S3_SECRET_ACCESS_KEY")
+        .context("provider fixture requires AWS_S3_SECRET_ACCESS_KEY")?;
+    ensure!(
+        !access_key.is_empty() && !secret_key.is_empty(),
+        "UEA-4A-4 fixture credentials must be nonempty"
+    );
+    let mut child_environment = CrossProcessChildEnvironment::default();
+    for values in [&mut child_environment.fe, &mut child_environment.be] {
+        values.insert(ACCESS_KEY_ENV.to_owned(), access_key.clone());
+        values.insert(SECRET_KEY_ENV.to_owned(), secret_key.clone());
+    }
+    let mut fe = format!(
+        "[runtime.frontend_workload]\nconcurrency_limit = {}\nwaiting_limit = 512\ncapacity_wait_timeout_ms = 30000\n",
+        concurrency_limit
+    );
+    let mut be = String::new();
+    let mut credentials = std::collections::BTreeSet::new();
+    for fixture in [&iceberg, &paimon] {
+        credentials.insert((
+            fixture.facts.credential_name.as_str(),
+            fixture.facts.credential_generation.as_str(),
+        ));
+    }
+    for (name, generation) in credentials {
+        fe.push_str(&credential_overlay(
+            "object-store-metadata",
+            name,
+            generation,
+        ));
+        be.push_str(&credential_overlay("object-store-data", name, generation));
+    }
+    *fixtures
+        .lock()
+        .map_err(|_| anyhow::anyhow!("UEA-4A-4 fixture lock poisoned"))? = Some(LiveFixtures {
+        iceberg,
+        paimon,
+        iceberg_slow,
+        paimon_slow,
+    });
+    Ok(ScenarioLaunchConfig {
+        child_environment,
+        config_overlay: CrossProcessConfigOverlay {
+            fe: Some(fe),
+            be: Some(be),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+}
+
 struct CatalogPlanningPerformance {
     fixtures: Mutex<Option<LiveFixtures>>,
     smoke_only: bool,
@@ -318,70 +429,12 @@ impl Scenario for CatalogPlanningPerformance {
 
     fn launch_config(&self, _scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
         let (workload, _) = Workload::load()?;
-        let iceberg =
-            CheckedFixture::load(ICEBERG_FIXTURE_ENV, "iceberg", workload.minimum_data_files)?;
-        let paimon =
-            CheckedFixture::load(PAIMON_FIXTURE_ENV, "paimon", workload.minimum_data_files)?;
-        let delay = Duration::from_millis(workload.slow_s3_delay_ms);
-        let iceberg_slow = DelayedS3Proxy::start(DelayedS3Config {
-            downstream: iceberg.facts.s3_endpoint.clone(),
-            delay,
-        })?;
-        let paimon_slow = DelayedS3Proxy::start(DelayedS3Config {
-            downstream: paimon.facts.s3_endpoint.clone(),
-            delay,
-        })?;
-        let access_key = env::var("AWS_S3_ACCESS_KEY_ID")
-            .context("UEA-4A-4 performance requires AWS_S3_ACCESS_KEY_ID")?;
-        let secret_key = env::var("AWS_S3_SECRET_ACCESS_KEY")
-            .context("UEA-4A-4 performance requires AWS_S3_SECRET_ACCESS_KEY")?;
-        ensure!(
-            !access_key.is_empty() && !secret_key.is_empty(),
-            "UEA-4A-4 fixture credentials must be nonempty"
-        );
-        let mut child_environment = CrossProcessChildEnvironment::default();
-        for values in [&mut child_environment.fe, &mut child_environment.be] {
-            values.insert(ACCESS_KEY_ENV.to_owned(), access_key.clone());
-            values.insert(SECRET_KEY_ENV.to_owned(), secret_key.clone());
-        }
-        let mut fe = format!(
-            "[runtime.frontend_workload]\nconcurrency_limit = {}\nwaiting_limit = 512\ncapacity_wait_timeout_ms = 30000\n",
-            workload.warehouse_concurrency_limit
-        );
-        let mut be = String::new();
-        let mut credentials = std::collections::BTreeSet::new();
-        for fixture in [&iceberg, &paimon] {
-            credentials.insert((
-                fixture.facts.credential_name.as_str(),
-                fixture.facts.credential_generation.as_str(),
-            ));
-        }
-        for (name, generation) in credentials {
-            fe.push_str(&credential_overlay(
-                "object-store-metadata",
-                name,
-                generation,
-            ));
-            be.push_str(&credential_overlay("object-store-data", name, generation));
-        }
-        *self
-            .fixtures
-            .lock()
-            .map_err(|_| anyhow::anyhow!("UEA-4A-4 fixture lock poisoned"))? = Some(LiveFixtures {
-            iceberg,
-            paimon,
-            iceberg_slow,
-            paimon_slow,
-        });
-        Ok(ScenarioLaunchConfig {
-            child_environment,
-            config_overlay: CrossProcessConfigOverlay {
-                fe: Some(fe),
-                be: Some(be),
-                ..Default::default()
-            },
-            ..Default::default()
-        })
+        launch_planning_config(
+            &self.fixtures,
+            workload.warehouse_concurrency_limit,
+            workload.minimum_data_files,
+            Duration::from_millis(workload.slow_s3_delay_ms),
+        )
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -796,27 +849,27 @@ fn sha256_file(path: &Path) -> Result<String> {
 /// The SDK manifest and native file reader are exercised separately because
 /// they have different cancellation wiring and may run on different roles.
 struct IcebergHeldReadCancellation {
-    setup: CatalogPlanningPerformance,
+    setup: FunctionalPlanningSetup,
 }
 
 /// Exercises the FE planning and admitted BE read paths with both real
 /// providers. The published small fixture cannot cross the former Paimon
 /// item/byte limits; that separate boundary is reported as uncovered.
 struct CatalogPlanningNoFeQuota {
-    setup: CatalogPlanningPerformance,
+    setup: FunctionalPlanningSetup,
 }
 
 /// Verifies that an FE metadata read remains owned after query cancellation:
 /// the next provider query can use the released warehouse slot while the old
 /// object request remains held, and the old query eventually exits cancelled.
 struct CatalogPlanningResponsibility {
-    setup: CatalogPlanningPerformance,
+    setup: FunctionalPlanningSetup,
 }
 
 impl CatalogPlanningResponsibility {
     fn new() -> Self {
         Self {
-            setup: CatalogPlanningPerformance::new(true),
+            setup: FunctionalPlanningSetup::new(1),
         }
     }
 }
@@ -839,23 +892,7 @@ impl Scenario for CatalogPlanningResponsibility {
     }
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        let mut config = self.setup.launch_config(scenario_root)?;
-        let (workload, _) = Workload::load()?;
-        let frontend = config
-            .config_overlay
-            .fe
-            .as_mut()
-            .context("responsibility scenario has no FE workload config")?;
-        let original = format!(
-            "concurrency_limit = {}",
-            workload.warehouse_concurrency_limit
-        );
-        ensure!(
-            frontend.contains(&original),
-            "FE workload limit was not rendered"
-        );
-        *frontend = frontend.replacen(&original, "concurrency_limit = 1", 1);
-        Ok(config)
+        self.setup.launch_config(scenario_root)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -1010,7 +1047,7 @@ impl Scenario for CatalogPlanningResponsibility {
 impl CatalogPlanningNoFeQuota {
     fn new() -> Self {
         Self {
-            setup: CatalogPlanningPerformance::new(true),
+            setup: FunctionalPlanningSetup::new(3),
         }
     }
 }
@@ -1123,7 +1160,7 @@ impl Scenario for CatalogPlanningNoFeQuota {
 impl IcebergHeldReadCancellation {
     fn new() -> Self {
         Self {
-            setup: CatalogPlanningPerformance::new(true),
+            setup: FunctionalPlanningSetup::new(1),
         }
     }
 }
@@ -1146,23 +1183,7 @@ impl Scenario for IcebergHeldReadCancellation {
     }
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        let mut config = self.setup.launch_config(scenario_root)?;
-        let (workload, _) = Workload::load()?;
-        let frontend = config
-            .config_overlay
-            .fe
-            .as_mut()
-            .context("held-read scenario has no FE workload config")?;
-        let original = format!(
-            "concurrency_limit = {}",
-            workload.warehouse_concurrency_limit
-        );
-        ensure!(
-            frontend.contains(&original),
-            "FE workload limit was not rendered"
-        );
-        *frontend = frontend.replacen(&original, "concurrency_limit = 1", 1);
-        Ok(config)
+        self.setup.launch_config(scenario_root)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -1310,44 +1331,32 @@ fn run_iceberg_held_deadline(
 ) -> Result<()> {
     let baseline = resource_baseline(context)?;
     let hold = proxy.hold_next_read_with_suffix(".avro")?;
-    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-    let (done_tx, done_rx) = mpsc::sync_channel(1);
-    let user = context.mysql_user().to_owned();
-    let port = context.mysql_port();
-    let timeout = context.remaining("connect held Iceberg deadline query")?;
     let query = sql.to_owned();
-    let query_thread = thread::spawn(move || -> Result<()> {
-        let mut connection = mysql_actor::connect_for_cancellation(&user, port, timeout)?;
+    let mut query_actor = MysqlActor::spawn(context, "iceberg-deadline-q1", move |connection| {
         connection
             .query_drop("SET query_timeout = 1")
             .context("set one-second statement deadline")?;
-        ready_tx.send(())?;
-        done_tx.send(connection.query::<u64, _>(query))?;
-        Ok(())
-    });
+        Ok(connection.query::<u64, _>(query))
+    })?;
+    let mut followup_actor = None;
+    let mut entered = false;
     let operation = (|| -> Result<()> {
-        ready_rx
-            .recv_timeout(context.remaining("await Iceberg deadline query start")?)
-            .context("Iceberg deadline query did not start")?;
+        query_actor.connection_id(context.remaining("await deadline query connection")?)?;
         hold.wait_until_entered(
             context
                 .remaining("observe held Iceberg deadline manifest read")?
                 .min(Duration::from_secs(30)),
         )?;
+        entered = true;
         let before = proxy.snapshot();
-        let result = done_rx
-            .recv_timeout(
-                context
-                    .remaining("await Iceberg statement deadline while S3 is held")?
-                    .min(Duration::from_secs(10)),
-            )
-            .context("held Iceberg query did not reach its statement deadline")?;
+        let result = query_actor.receive(
+            context
+                .remaining("await statement deadline while S3 is held")?
+                .min(Duration::from_secs(10)),
+        )?;
         ensure!(
             matches!(result, Err(mysql::Error::MySqlError(ref error)) if error.message.to_ascii_lowercase().contains("timed out")),
             "held Iceberg query did not return a deadline terminal: {result:?}"
-        );
-        context.action(
-            "Q1 returned a statement-timeout terminal while its SDK manifest read remained held",
         );
         let state = frontend_workload_state(context)?;
         ensure!(
@@ -1355,74 +1364,43 @@ fn run_iceberg_held_deadline(
                 .pointer("/workload/governance/admitted_queries")
                 .and_then(serde_json::Value::as_u64)
                 == Some(0),
-            "Q1 deadline terminal retained the sole warehouse permit: {}",
-            state
+            "Q1 deadline terminal retained the sole warehouse permit: {state}"
         );
-        context.action(format!(
-            "after Q1 deadline, FE workload active={} admitted=0 waiting={} preparation={}",
-            state
-                .pointer("/workload/active/statement")
-                .unwrap_or(&serde_json::Value::Null),
-            state
-                .pointer("/workload/governance/waiting_records")
-                .unwrap_or(&serde_json::Value::Null),
-            state
-                .pointer("/workload/governance/preparation")
-                .unwrap_or(&serde_json::Value::Null),
-        ));
-
-        let (followup_tx, followup_rx) = mpsc::sync_channel(1);
-        let followup_user = context.mysql_user().to_owned();
-        let followup_port = context.mysql_port();
-        let followup_query = followup_sql.to_owned();
-        let followup_connect_timeout = context
-            .remaining("connect Q2 after Iceberg deadline terminal")?
-            .min(Duration::from_secs(10));
-        let followup_thread = thread::spawn(move || {
-            let result = (|| -> Result<Option<u64>> {
-                let mut connection = mysql_actor::connect_for_cancellation(
-                    &followup_user,
-                    followup_port,
-                    followup_connect_timeout,
-                )?;
+        context.action("Q1 returned a statement-timeout terminal and released admission while its SDK manifest read remained held");
+        let query = followup_sql.to_owned();
+        followup_actor = Some(MysqlActor::spawn(
+            context,
+            "iceberg-deadline-q2",
+            move |connection| {
                 connection
-                    .query_first(followup_query)
+                    .query_first::<u64, _>(query)
                     .context("read Q2 after Iceberg deadline")
-            })();
-            let _ = followup_tx.send(result);
-        });
-        let observed = match followup_rx.recv_timeout(
-            context
-                .remaining("await Q2 while expired Iceberg read remains held")?
-                .min(Duration::from_secs(10)),
-        ) {
-            Ok(result) => result?,
-            Err(error) => {
-                let snapshot = frontend_governance_snapshot(context)
-                    .unwrap_or_else(|state_error| format!("unavailable: {state_error:#}"));
-                hold.release();
-                let after_release = followup_rx
-                    .recv_timeout(Duration::from_secs(10))
-                    .map(|result| format!("{result:?}"))
-                    .unwrap_or_else(|release_error| format!("unavailable: {release_error}"));
-                anyhow::bail!(
-                    "Q2 did not complete before the expired Q1 read was released: {error}; FE workload: {snapshot}; Q2 after release: {after_release}"
-                );
-            }
-        };
-        followup_thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("Iceberg deadline follow-up actor panicked"))?;
+            },
+        )?);
+        let actor = followup_actor.as_mut().expect("follow-up actor installed");
+        actor.connection_id(context.remaining("await deadline follow-up connection")?)?;
+        let observed = actor
+            .receive(
+                context
+                    .remaining("await Q2 while expired Iceberg read remains held")?
+                    .min(Duration::from_secs(10)),
+            )
+            .with_context(|| {
+                format!(
+                    "Q2 failed before Q1 read release; FE workload: {}",
+                    frontend_governance_snapshot(context)
+                        .unwrap_or_else(|error| format!("unavailable: {error:#}"))
+                )
+            })?;
         ensure!(
             observed == Some(followup_count),
-            "Q2 returned {observed:?} while the expired Q1 read was held"
+            "Q2 returned {observed:?} while expired Q1 was held"
         );
         context.action("independent Q2 completed before the expired Q1 object read was released");
-
         hold.release();
-        hold.wait_until_forwarded(
+        hold.wait_until_cancelled_read_exited(
             context
-                .remaining("await released Iceberg deadline read forwarding")?
+                .remaining("observe expired Iceberg request exit")?
                 .min(Duration::from_secs(30)),
         )?;
         let after = proxy.snapshot();
@@ -1431,19 +1409,44 @@ fn run_iceberg_held_deadline(
                 && after.upstream_errors == before.upstream_errors,
             "released Iceberg deadline manifest read did not complete cleanly"
         );
-        context
-            .action("released Q1 SDK manifest object read finished forwarding from the real store");
         Ok(())
     })();
-    hold.release();
-    if operation.is_ok() {
-        query_thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("Iceberg deadline query actor panicked"))??;
-        await_frontend_local_exit(context, "Iceberg held deadline")?;
-        await_resource_convergence(context, &baseline, "Iceberg held deadline")?;
+    let mut cleanup = Vec::new();
+    if operation.is_err() {
+        collect_actor_cleanup(&mut cleanup, "cancel Q1", query_actor.cancel(context));
+        if let Some(actor) = &mut followup_actor {
+            collect_actor_cleanup(&mut cleanup, "cancel Q2", actor.cancel(context));
+        }
     }
-    operation
+    hold.release();
+    if entered {
+        collect_actor_cleanup(
+            &mut cleanup,
+            "cancelled held request exit",
+            hold.wait_until_cancelled_read_exited(Duration::from_secs(30))
+                .map(|_| ()),
+        );
+    }
+    collect_actor_cleanup(&mut cleanup, "join Q1", query_actor.finish(context));
+    if let Some(actor) = &mut followup_actor {
+        collect_actor_cleanup(&mut cleanup, "join Q2", actor.finish(context));
+    }
+    collect_actor_cleanup(
+        &mut cleanup,
+        "FE exit",
+        await_frontend_local_exit(context, "Iceberg held deadline"),
+    );
+    collect_actor_cleanup(
+        &mut cleanup,
+        "BE exit",
+        await_resource_convergence(context, &baseline, "Iceberg held deadline"),
+    );
+    collect_actor_cleanup(
+        &mut cleanup,
+        "proxy terminal evidence",
+        record_cancelled_proxy_read(context, "iceberg-held-deadline", proxy, &hold),
+    );
+    finish_held_evidence(context, "iceberg-held-deadline", operation, cleanup)
 }
 
 fn run_held_provider_read(
@@ -1463,93 +1466,74 @@ fn run_held_provider_read(
         Some(suffix) => proxy.hold_next_read_with_suffix(suffix)?,
         None => proxy.hold_next_read()?,
     };
-    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-    let (done_tx, done_rx) = mpsc::sync_channel(1);
-    let user = context.mysql_user().to_owned();
-    let port = context.mysql_port();
-    let timeout = context.remaining("connect held provider query")?;
     let query = sql.to_owned();
-    let query_thread = thread::spawn(move || -> Result<()> {
-        let mut connection = mysql_actor::connect_for_cancellation(&user, port, timeout)?;
-        ready_tx.send(connection.connection_id())?;
-        done_tx.send(connection.query::<u64, _>(query))?;
-        Ok(())
-    });
+    let label = format!("{provider}-{owner}");
+    let mut query_actor = MysqlActor::spawn(context, &format!("{label}-q1"), move |connection| {
+        Ok(connection.query::<u64, _>(query))
+    })?;
+    let mut kill_actor = None;
+    let mut followup_actor = None;
+    let mut entered = false;
     let operation = (|| -> Result<()> {
-        let connection_id = ready_rx
-            .recv_timeout(context.remaining("receive held provider connection ID")?)
-            .with_context(|| format!("held {provider} query did not publish its connection ID"))?;
+        let connection_id =
+            query_actor.connection_id(context.remaining("receive held provider connection ID")?)?;
         hold.wait_until_entered(
             context
                 .remaining("observe real held provider object read")?
                 .min(Duration::from_secs(30)),
         )?;
+        entered = true;
         let held_snapshot = proxy.snapshot();
-        let (kill_tx, kill_rx) = mpsc::sync_channel(1);
-        let user = context.mysql_user().to_owned();
-        let port = context.mysql_port();
-        let kill_timeout = context.remaining("connect held provider KILL QUERY session")?;
-        let kill_thread = thread::spawn(move || -> Result<()> {
-            let mut control = mysql_actor::connect(&user, port, kill_timeout)?;
-            kill_tx.send(control.query_drop(format!("KILL QUERY {connection_id}")))?;
-            Ok(())
-        });
-        let kill_result = kill_rx
-            .recv_timeout(
+        kill_actor = Some(MysqlActor::spawn(
+            context,
+            &format!("{label}-kill"),
+            move |control| {
+                control
+                    .query_drop(format!("KILL QUERY {connection_id}"))
+                    .context("cancel held provider query")
+            },
+        )?);
+        kill_actor
+            .as_mut()
+            .expect("control actor installed")
+            .receive(
                 context
-                    .remaining("await held provider KILL QUERY control")?
-                    .min(Duration::from_secs(10)),
-            )
-            .with_context(|| {
-                format!("{owner} KILL QUERY did not respond while S3 read was held")
-            })?;
-        kill_result.with_context(|| format!("cancel held {provider} {owner} query"))?;
-        let early_result = match done_rx.try_recv() {
-            Ok(result) => Some(result),
-            Err(mpsc::TryRecvError::Empty) => None,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                anyhow::bail!("{provider} {owner} query actor exited without a result")
-            }
-        };
-        if expect_independent_followup {
-            // This is the FE metadata/source-open case: cancellation releases
-            // the only warehouse slot while the old local I/O still runs.
-            // A held BE data reader belongs to task cleanup and has a
-            // different terminal boundary.
-            let mut followup = mysql_actor::connect(
-                context.mysql_user(),
-                context.mysql_port(),
-                context
-                    .remaining("connect follow-up query while provider read is held")?
+                    .remaining("await held provider KILL QUERY")?
                     .min(Duration::from_secs(10)),
             )?;
-            let observed: Option<u64> = followup.query_first(followup_sql).with_context(|| {
-                format!("independent query did not complete while {owner} read was held")
-            })?;
+        let early_result = query_actor.try_result()?;
+        if expect_independent_followup {
+            let query = followup_sql.to_owned();
+            followup_actor = Some(MysqlActor::spawn(
+                context,
+                &format!("{label}-q2"),
+                move |connection| {
+                    connection
+                        .query_first::<u64, _>(query)
+                        .context("independent query while provider read held")
+                },
+            )?);
+            let actor = followup_actor.as_mut().expect("follow-up actor installed");
+            actor.connection_id(context.remaining("await held provider follow-up connection")?)?;
+            let observed = actor.receive(
+                context
+                    .remaining("await independent provider query")?
+                    .min(Duration::from_secs(10)),
+            )?;
             ensure!(
                 observed == Some(followup_count),
                 "independent query returned {observed:?} while {owner} read was held"
             );
         }
         hold.release();
-        hold.wait_until_forwarded(
+        hold.wait_until_cancelled_read_exited(
             context
-                .remaining("await held provider object read forwarding")?
+                .remaining("observe cancelled provider request exit")?
                 .min(Duration::from_secs(30)),
         )?;
-        context.action(format!(
-            "{provider} {owner} held object read finished forwarding after release"
-        ));
-        kill_thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("{provider} {owner} KILL QUERY actor panicked"))??;
         let result = match early_result {
             Some(result) => result,
-            None => done_rx
-                .recv_timeout(context.remaining("await held provider query exit")?)
-                .with_context(|| {
-                    format!("{provider} {owner} query did not exit after S3 release")
-                })?,
+            None => query_actor.receive(context.remaining("await held provider query exit")?)?,
         };
         ensure!(
             matches!(result, Err(mysql::Error::MySqlError(ref error)) if error.code == 1317),
@@ -1563,23 +1547,370 @@ fn run_held_provider_read(
         );
         Ok(())
     })();
-    hold.release();
-    if operation.is_ok() {
-        query_thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("{provider} {owner} query actor panicked"))??;
-        await_frontend_local_exit(context, &format!("{provider} {owner} held read"))?;
-        await_resource_convergence(context, &baseline, &format!("{provider} {owner} held read"))?;
+    let mut cleanup = Vec::new();
+    if operation.is_err() {
+        collect_actor_cleanup(&mut cleanup, "cancel Q1", query_actor.cancel(context));
+        if let Some(actor) = &mut kill_actor {
+            collect_actor_cleanup(&mut cleanup, "cancel control", actor.cancel(context));
+        }
+        if let Some(actor) = &mut followup_actor {
+            collect_actor_cleanup(&mut cleanup, "cancel Q2", actor.cancel(context));
+        }
     }
-    operation
+    hold.release();
+    if entered {
+        collect_actor_cleanup(
+            &mut cleanup,
+            "cancelled held request exit",
+            hold.wait_until_cancelled_read_exited(Duration::from_secs(30))
+                .map(|_| ()),
+        );
+    }
+    collect_actor_cleanup(&mut cleanup, "join Q1", query_actor.finish(context));
+    if let Some(actor) = &mut kill_actor {
+        collect_actor_cleanup(&mut cleanup, "join control", actor.finish(context));
+    }
+    if let Some(actor) = &mut followup_actor {
+        collect_actor_cleanup(&mut cleanup, "join Q2", actor.finish(context));
+    }
+    collect_actor_cleanup(
+        &mut cleanup,
+        "FE exit",
+        await_frontend_local_exit(context, &label),
+    );
+    collect_actor_cleanup(
+        &mut cleanup,
+        "BE exit",
+        await_resource_convergence(context, &baseline, &label),
+    );
+    collect_actor_cleanup(
+        &mut cleanup,
+        "proxy terminal evidence",
+        record_cancelled_proxy_read(context, &label, proxy, &hold),
+    );
+    finish_held_evidence(context, &label, operation, cleanup)
+}
+
+fn collect_actor_cleanup(errors: &mut Vec<String>, phase: &str, result: Result<()>) {
+    if let Err(error) = result {
+        errors.push(format!("{phase}: {error:#}"));
+    }
+}
+
+fn finish_held_evidence(
+    context: &ScenarioContext,
+    label: &str,
+    operation: Result<()>,
+    cleanup: Vec<String>,
+) -> Result<()> {
+    let evidence = fs::write(
+        context.scenario_root().join(format!("{label}-exit.json")),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "operation_error":operation.as_ref().err().map(|error| format!("{error:#}")),
+            "cleanup_errors":cleanup,"actual_actor_joins_completed":true,
+        }))?,
+    );
+    operation?;
+    ensure!(
+        cleanup.is_empty(),
+        "held provider cleanup failed: {cleanup:?}"
+    );
+    evidence?;
+    Ok(())
 }
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
-        Box::new(CatalogPlanningPerformance::new(true)),
+        Box::new(CatalogPlanningSmoke {
+            setup: FunctionalPlanningSetup::new(3),
+        }),
         Box::new(CatalogPlanningPerformance::new(false)),
         Box::new(IcebergHeldReadCancellation::new()),
         Box::new(CatalogPlanningNoFeQuota::new()),
         Box::new(CatalogPlanningResponsibility::new()),
+        Box::new(ProviderReadQueuedProgress {
+            setup: FunctionalPlanningSetup::new(1),
+        }),
     ]
+}
+
+struct CatalogPlanningSmoke {
+    setup: FunctionalPlanningSetup,
+}
+
+impl Scenario for CatalogPlanningSmoke {
+    fn name(&self) -> &'static str {
+        "uea4/catalog-planning-smoke"
+    }
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+    fn validate_runner_inputs(
+        &self,
+        profile: LaunchProfile,
+        workload: Option<&Path>,
+    ) -> Result<()> {
+        self.setup.validate_runner_inputs(profile, workload)
+    }
+    fn launch_config(&self, root: &Path) -> Result<ScenarioLaunchConfig> {
+        self.setup.launch_config(root)
+    }
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let slot = self
+            .setup
+            .fixtures
+            .lock()
+            .map_err(|_| anyhow::anyhow!("provider fixture lock poisoned"))?;
+        let fixtures = slot
+            .as_ref()
+            .context("provider fixtures were not prepared")?;
+        let baseline = resource_baseline(context)?;
+        let mut connection = mysql_actor::connect(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.remaining("connect provider smoke")?,
+        )?;
+        for (fixture, proxy) in [
+            (&fixtures.iceberg, &fixtures.iceberg_slow),
+            (&fixtures.paimon, &fixtures.paimon_slow),
+        ] {
+            for (slow, endpoint) in [
+                (false, fixture.facts.s3_endpoint.as_str()),
+                (true, proxy.endpoint()),
+            ] {
+                connection.query_drop(fixture.catalog_sql(slow, endpoint))?;
+                verify_provider_rows(&mut connection, &fixture.table_name(slow), fixture)?;
+            }
+        }
+        drop(connection);
+        await_frontend_local_exit(context, "provider smoke")?;
+        await_resource_convergence(context, &baseline, "provider smoke")?;
+        context.action("verified independent complete Iceberg and Paimon fixture rows through normal and proxy catalogs");
+        Ok(())
+    }
+    fn teardown(&self) -> Result<()> {
+        self.setup.teardown()
+    }
+}
+
+/// The producer inserts 32 consecutive IDs per commit and stores the commit
+/// ordinal as value. This formula is independent of either native query result.
+fn verify_provider_rows(
+    connection: &mut mysql::Conn,
+    table: &str,
+    fixture: &CheckedFixture,
+) -> Result<()> {
+    ensure!(
+        fixture.facts.row_count % 32 == 0,
+        "provider fixture does not match its 32-row input batches"
+    );
+    let actual: Vec<(u64, u64)> =
+        connection.query(format!("SELECT id, value FROM {table} ORDER BY id"))?;
+    let expected = (0..fixture.facts.row_count)
+        .map(|id| (id, id / 32))
+        .collect::<Vec<_>>();
+    ensure!(
+        actual == expected,
+        "{} provider rows differ from their independent fixture formula: {actual:?}",
+        fixture.provider
+    );
+    Ok(())
+}
+
+struct ProviderReadQueuedProgress {
+    setup: FunctionalPlanningSetup,
+}
+
+impl Scenario for ProviderReadQueuedProgress {
+    fn name(&self) -> &'static str {
+        "catalog/provider-read-queued-progress"
+    }
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+    fn validate_runner_inputs(
+        &self,
+        profile: LaunchProfile,
+        workload: Option<&Path>,
+    ) -> Result<()> {
+        self.setup.validate_runner_inputs(profile, workload)
+    }
+    fn launch_config(&self, root: &Path) -> Result<ScenarioLaunchConfig> {
+        self.setup.launch_config(root)
+    }
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let slot = self
+            .setup
+            .fixtures
+            .lock()
+            .map_err(|_| anyhow::anyhow!("provider fixture lock poisoned"))?;
+        let fixtures = slot
+            .as_ref()
+            .context("provider fixtures were not prepared")?;
+        for (fixture, proxy) in [
+            (&fixtures.iceberg, &fixtures.iceberg_slow),
+            (&fixtures.paimon, &fixtures.paimon_slow),
+        ] {
+            run_queued_provider(context, fixture, proxy)?;
+        }
+        Ok(())
+    }
+    fn teardown(&self) -> Result<()> {
+        self.setup.teardown()
+    }
+}
+
+fn run_queued_provider(
+    context: &mut ScenarioContext,
+    fixture: &CheckedFixture,
+    proxy: &DelayedS3Proxy,
+) -> Result<()> {
+    let baseline = resource_baseline(context)?;
+    let mut connection = mysql_actor::connect(
+        context.mysql_user(),
+        context.mysql_port(),
+        context.remaining("connect queued provider setup")?,
+    )?;
+    connection.query_drop(fixture.catalog_sql(true, proxy.endpoint()))?;
+    connection.query_drop(fixture.catalog_sql(false, &fixture.facts.s3_endpoint))?;
+    drop(connection);
+    let hold = proxy.hold_next_read_with_suffix(".parquet")?;
+    let mut actors = Vec::new();
+    let mut completed = [false; 2];
+    let mut entered = false;
+    let operation = (|| -> Result<()> {
+        for index in 0..2 {
+            let facts = fixture.clone();
+            let table = facts.table_name(index == 0);
+            actors.push(MysqlActor::spawn(
+                context,
+                &format!("{}-queued-{index}", fixture.provider),
+                move |connection| verify_provider_rows(connection, &table, &facts),
+            )?);
+            actors[index].connection_id(context.remaining("await queued provider connection")?)?;
+            if index == 0 {
+                hold.wait_until_entered(
+                    context
+                        .remaining("observe Q1 provider read hold")?
+                        .min(Duration::from_secs(30)),
+                )?;
+                entered = true;
+            }
+        }
+        let deadline = Instant::now()
+            + context
+                .remaining("observe provider admission queue")?
+                .min(Duration::from_secs(30));
+        loop {
+            let state = frontend_workload_state(context)?;
+            let admitted = state
+                .pointer("/workload/governance/admitted_queries")
+                .and_then(serde_json::Value::as_u64);
+            let waiting = state
+                .pointer("/workload/governance/waiting_records")
+                .and_then(serde_json::Value::as_u64);
+            if admitted == Some(1) && waiting.is_some_and(|n| n >= 1) {
+                fs::write(
+                    context
+                        .scenario_root()
+                        .join(format!("{}-queued-state.json", fixture.provider)),
+                    serde_json::to_vec_pretty(&state)?,
+                )?;
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "{} Q1 hold did not establish admitted=1 and queued Q2: {state}",
+                fixture.provider
+            );
+            for (index, actor) in actors.iter_mut().enumerate() {
+                match actor.try_result() {
+                    Ok(Some(())) => {
+                        completed[index] = true;
+                        anyhow::bail!(
+                            "provider actor {index} completed before Q1 hold and Q2 queue"
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        completed[index] = true;
+                        return Err(error);
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        context.action(format!(
+            "{} Q1 provider read held with admitted=1 and Q2 waiting",
+            fixture.provider
+        ));
+        hold.release();
+        hold.wait_until_forwarded(
+            context
+                .remaining("forward held provider read")?
+                .min(Duration::from_secs(30)),
+        )?;
+        while completed.iter().any(|done| !done) {
+            for (index, actor) in actors.iter_mut().enumerate() {
+                if !completed[index] {
+                    match actor.try_result() {
+                        Ok(Some(())) => completed[index] = true,
+                        Ok(None) => {}
+                        Err(error) => {
+                            completed[index] = true;
+                            return Err(error);
+                        }
+                    }
+                }
+            }
+            context.remaining("await queued provider results")?;
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(())
+    })();
+    let mut cleanup = Vec::new();
+    if operation.is_err() {
+        for actor in &mut actors {
+            collect_actor_cleanup(&mut cleanup, "cancel actor", actor.cancel(context));
+        }
+    }
+    hold.release();
+    if entered {
+        collect_actor_cleanup(
+            &mut cleanup,
+            "forward held request",
+            hold.wait_until_forwarded(Duration::from_secs(30)),
+        );
+    }
+    for (index, actor) in actors.iter_mut().enumerate() {
+        collect_actor_cleanup(&mut cleanup, "actual join", actor.finish(context));
+        if !completed[index]
+            && let Err(error) = actor.try_result()
+        {
+            cleanup.push(format!("actor {index} result after cleanup: {error:#}"));
+        }
+    }
+    collect_actor_cleanup(
+        &mut cleanup,
+        "FE exit",
+        await_frontend_local_exit(context, "queued provider reads"),
+    );
+    collect_actor_cleanup(
+        &mut cleanup,
+        "BE exit",
+        await_resource_convergence(context, &baseline, "queued provider reads"),
+    );
+    finish_held_evidence(
+        context,
+        &format!("{}-queued", fixture.provider),
+        operation,
+        cleanup,
+    )?;
+    context.action(format!(
+        "{} queued actors each verified their independent full rows and owners exited",
+        fixture.provider
+    ));
+    Ok(())
 }

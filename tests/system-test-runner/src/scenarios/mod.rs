@@ -14,6 +14,7 @@ mod frontend_lifecycle;
 pub(crate) mod hms_bulk_readonly_native;
 pub(crate) mod hms_classification_preflight;
 mod iceberg_delete_applicability;
+mod iceberg_delete_warm;
 mod iceberg_delete_oracle;
 mod iceberg_delete_performance;
 #[cfg(unix)]
@@ -32,6 +33,7 @@ mod native_ingress;
 mod native_trust;
 mod paimon;
 mod preparation_capacity;
+mod provider_mysql_actors;
 mod query_concurrency;
 mod query_lifecycle;
 mod query_output;
@@ -81,6 +83,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(runtime_filter::scenarios());
     scenarios.extend(runtime_filter::native_trust_directional_scenarios());
     scenarios.extend(connector::scenarios());
+    scenarios.extend(iceberg_delete_warm::scenarios());
     scenarios.push(Box::new(
         iceberg_delete_applicability::IcebergDeleteApplicability::default(),
     ));
