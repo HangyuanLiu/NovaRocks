@@ -97,6 +97,7 @@ pub mod pattern_memo;
 pub mod percentile_hash_core;
 pub mod percentile_input;
 mod pure_catalogue;
+mod scalar_copy_geometry;
 mod scalar_kernel;
 mod scalar_resources;
 pub mod selected_copy;
