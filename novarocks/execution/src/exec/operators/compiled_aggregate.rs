@@ -102,9 +102,7 @@ impl TrackedStateAllocator {
 }
 
 /// Actual expression and aggregate backing share the same tracker adapter.
-pub(crate) fn expression_allocation_host(
-    tracker: Arc<MemTracker>,
-) -> Arc<dyn AggregateStateAllocator> {
+pub(crate) fn expression_allocation_host(tracker: Arc<MemTracker>) -> Arc<TrackedStateAllocator> {
     Arc::new(TrackedStateAllocator { tracker })
 }
 

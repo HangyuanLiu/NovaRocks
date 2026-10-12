@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Private request components of the original whole-invocation wrapper.
-//! These do not install a positive profile or grant allocation authority.
+//! Closed request facts for the original whole-invocation wrapper.
+//! Only the audited prepared owner supplies a positive source; facts grant
+//! no allocation authority.
 //! Body, validation and concrete host callbacks retain their own authors.
 
 use crate::json_object_resources::AllocationGeometry;
@@ -47,10 +48,100 @@ pub(crate) struct InvocationInputResources {
     pub(crate) metadata: AllocationGeometry,
 }
 
-#[derive(Debug)]
-pub(crate) enum InvocationPreparationFailure {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum InvocationPreparationFailure {
     Source(ScalarResourceError),
     Kernel(KernelFailure),
+}
+
+/// Complete Functions-owned cumulative requests for ONE original evaluate.
+/// A qualified concrete host composes its callback requests separately, only
+/// when this original path can reach that host. These facts carry no grant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WholeInvocationRequestFacts {
+    geometry: AllocationGeometry,
+    requires_host_callback: bool,
+}
+impl WholeInvocationRequestFacts {
+    pub const fn bytes(self) -> usize {
+        self.geometry.requested_bytes
+    }
+    pub const fn requests(self) -> usize {
+        self.geometry.requests
+    }
+    pub const fn peak_bytes(self) -> usize {
+        self.geometry.peak_bytes
+    }
+    pub const fn requires_host_callback(self) -> bool {
+        self.requires_host_callback
+    }
+}
+
+/// Source selected by the SAME audited prepared whole-invocation owner.
+/// This pure profile does not qualify arbitrary controllers or Arrow carriers.
+#[derive(Clone, Debug)]
+pub struct WholeInvocationResourceProfile {
+    source: WholeInvocationSource,
+    prepared: std::sync::Weak<dyn crate::PreparedInvocationScalarKernel>,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WholeInvocationSource {
+    JsonObject,
+}
+impl WholeInvocationResourceProfile {
+    pub(crate) fn json_object(
+        prepared: std::sync::Weak<dyn crate::PreparedInvocationScalarKernel>,
+    ) -> Self {
+        Self {
+            source: WholeInvocationSource::JsonObject,
+            prepared,
+        }
+    }
+    /// The original bounded diagnostic potentially created during preparation.
+    /// The qualified Runtime controller's refusals themselves are bare enums.
+    pub fn preparation_prefix(&self) -> WholeInvocationRequestFacts {
+        WholeInvocationRequestFacts {
+            geometry: preparation_prefix_geometry(),
+            requires_host_callback: false,
+        }
+    }
+    /// Borrow the original instance contract, arguments and explicit demand.
+    /// Preparation neither calls nor latches the instance. Ordinary argument
+    /// errors remain with its ONE original evaluate and original validator.
+    pub fn requests_for(
+        &self,
+        instance: &crate::InvocationScalarEvaluationInstance,
+        selection: Selection<'_>,
+        arguments: &[EvaluatedArgument<'_>],
+        activation: ScalarInvocationActivation,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<WholeInvocationRequestFacts, InvocationPreparationFailure> {
+        if !self
+            .prepared
+            .upgrade()
+            .is_some_and(|owner| instance.matches_resource_owner(&owner))
+        {
+            return Err(InvocationPreparationFailure::Source(
+                ScalarResourceError::Invariant(
+                    "whole-invocation profile differs from its exact prepared instance",
+                ),
+            ));
+        }
+        let resources = match self.source {
+            WholeInvocationSource::JsonObject => json_object_invocation_resources(
+                instance.is_failed(),
+                activation,
+                instance.contract().value_argument_types(),
+                arguments,
+                selection,
+                control,
+            )?,
+        };
+        Ok(WholeInvocationRequestFacts {
+            geometry: resources.geometry,
+            requires_host_callback: resources.path == InvocationRequestPath::Activated,
+        })
+    }
 }
 impl From<KernelFailure> for InvocationPreparationFailure {
     fn from(cause: KernelFailure) -> Self {
@@ -602,6 +693,193 @@ mod tests {
     }
 
     #[test]
+    fn invocation_scalar_resources_public_ticket_cannot_author_a_different_prepared_owner() {
+        #[derive(Debug)]
+        struct ForeignPrepared {
+            original: Arc<dyn crate::PreparedInvocationScalarKernel>,
+            profile: WholeInvocationResourceProfile,
+        }
+        impl crate::PreparedInvocationScalarKernel for ForeignPrepared {
+            fn contract(&self) -> &Arc<crate::ScalarCallContract> {
+                self.original.contract()
+            }
+            fn instance_retained_upper_bound(&self) -> usize {
+                self.original.instance_retained_upper_bound()
+            }
+            fn instance_inline_allocation_bytes(&self) -> usize {
+                self.original.instance_inline_allocation_bytes()
+            }
+            fn invocation_resource_profile(&self) -> Option<WholeInvocationResourceProfile> {
+                Some(self.profile.clone())
+            }
+            fn create_instance_with_allocator(
+                &self,
+                host: Arc<dyn crate::AggregateStateAllocator>,
+            ) -> Result<Box<dyn crate::InvocationScalarKernelInstance>, KernelFailure> {
+                self.original.create_instance_with_allocator(host)
+            }
+        }
+        let original = prepare_original_json(&[DataType::Utf8]);
+        let profile = original.invocation_resource_profile().unwrap();
+        let foreign: Arc<dyn crate::PreparedInvocationScalarKernel> = Arc::new(ForeignPrepared {
+            original,
+            profile: profile.clone(),
+        });
+        let host = Arc::new(RequestHost {
+            typed: AtomicUsize::new(0),
+            opaque: AtomicUsize::new(0),
+        });
+        let instance = crate::InvocationScalarEvaluationInstance::instantiate_with_allocator(
+            foreign,
+            Some(host.clone()),
+        )
+        .unwrap();
+        let poison: ArrayRef = Arc::new(UnreadArray(StringArray::from(vec!["unread"])));
+        let control = ProbeControl::default();
+        let (result, requests) = measured(|| {
+            instance
+                .invocation_resource_profile()
+                .unwrap()
+                .requests_for(
+                    &instance,
+                    Selection::all(usize::MAX),
+                    &[EvaluatedArgument::Column(&poison)],
+                    ScalarInvocationActivation::Activated,
+                    &control,
+                )
+        });
+        assert_eq!(
+            result,
+            Err(InvocationPreparationFailure::Source(
+                ScalarResourceError::Invariant(
+                    "whole-invocation profile differs from its exact prepared instance",
+                )
+            ))
+        );
+        assert_eq!(requests, (0, 0, 0, 0));
+        assert_eq!(control.calls.load(Ordering::Relaxed), 0);
+        assert!(!instance.is_failed());
+        drop(instance);
+        assert_eq!(host.typed.load(Ordering::Relaxed), 0);
+        assert_eq!(host.opaque.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn invocation_scalar_resources_public_profile_preserves_early_failure_and_latch() {
+        let prepared = prepare_original_json(&[DataType::Utf8]);
+        let profile = prepared.invocation_resource_profile().unwrap();
+        let prefix = profile.preparation_prefix();
+        assert_eq!(
+            (prefix.bytes(), prefix.requests(), prefix.peak_bytes()),
+            (512, 1, 512)
+        );
+        assert!(!prefix.requires_host_callback());
+        let host = Arc::new(RequestHost {
+            typed: AtomicUsize::new(0),
+            opaque: AtomicUsize::new(0),
+        });
+        let mut instance = crate::InvocationScalarEvaluationInstance::instantiate_with_allocator(
+            prepared,
+            Some(host.clone()),
+        )
+        .unwrap();
+        let poison: ArrayRef = Arc::new(UnreadArray(StringArray::from(vec!["unread"])));
+        let arguments = [EvaluatedArgument::Column(&poison)];
+        let control = ProbeControl::default();
+        let selection = Selection::all(usize::MAX);
+        let (facts, requests) = measured(|| {
+            profile.requests_for(
+                &instance,
+                selection,
+                &arguments,
+                ScalarInvocationActivation::ValidateOnly,
+                &control,
+            )
+        });
+        let facts = facts.unwrap();
+        assert_eq!(requests, (0, 0, 0, 0));
+        assert_eq!((facts.bytes(), facts.requests()), (512, 1));
+        assert!(!facts.requires_host_callback());
+        assert!(!instance.is_failed());
+        assert_eq!(control.calls.load(Ordering::Relaxed), 0);
+        assert!(matches!(instance.evaluate(selection, &arguments,
+            ScalarInvocationActivation::ValidateOnly, &control),
+            Err(crate::ScalarInvocationFailure::Kernel(KernelFailure::InvalidProgram(ref cause)))
+            if cause.message() == "nonempty scalar demand cannot be validation-only"));
+        assert!(instance.is_failed());
+        let facts = profile
+            .requests_for(
+                &instance,
+                selection,
+                &arguments,
+                ScalarInvocationActivation::Activated,
+                &control,
+            )
+            .unwrap();
+        assert_eq!(
+            (facts.bytes(), facts.requests(), facts.peak_bytes()),
+            (0, 0, 0)
+        );
+        assert!(!facts.requires_host_callback());
+        assert_eq!(control.calls.load(Ordering::Relaxed), 0);
+        drop(instance);
+        assert_eq!(host.typed.load(Ordering::Relaxed), 0);
+        assert_eq!(host.opaque.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn invocation_scalar_resources_public_profile_refusal_does_not_call_or_fail_instance() {
+        let prepared = prepare_original_json(&[DataType::Utf8]);
+        let host = Arc::new(RequestHost {
+            typed: AtomicUsize::new(0),
+            opaque: AtomicUsize::new(0),
+        });
+        let mut instance = crate::InvocationScalarEvaluationInstance::instantiate_with_allocator(
+            prepared,
+            Some(host.clone()),
+        )
+        .unwrap();
+        let profile = instance.invocation_resource_profile().unwrap();
+        let key: ArrayRef = Arc::new(StringArray::from(vec!["key"]));
+        let arguments = [EvaluatedArgument::Column(&key)];
+        let control = ProbeControl {
+            refusal: Some((0, KernelFailure::DeadlineExceeded)),
+            ..Default::default()
+        };
+        assert_eq!(
+            profile.requests_for(
+                &instance,
+                Selection::all(1),
+                &arguments,
+                ScalarInvocationActivation::Activated,
+                &control
+            ),
+            Err(InvocationPreparationFailure::Kernel(
+                KernelFailure::DeadlineExceeded
+            ))
+        );
+        assert!(!instance.is_failed());
+        let output = instance
+            .evaluate(
+                Selection::all(1),
+                &arguments,
+                ScalarInvocationActivation::Activated,
+                &ProbeControl::default(),
+            )
+            .unwrap();
+        let text = output
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(text.value(0), "{\"key\": null}");
+        drop(output);
+        drop(instance);
+        assert_eq!(host.typed.load(Ordering::Relaxed), 0);
+        assert_eq!(host.opaque.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn invocation_scalar_resources_complete_functions_geometry_covers_original_whole_evaluate() {
         let rows = [2, 8];
         let key: ArrayRef = Arc::new(StringArray::from(vec!["key"]));
@@ -665,17 +943,18 @@ mod tests {
                 .unwrap();
             let control = ProbeControl::default();
             let (bound, preparation) = measured(|| {
-                json_object_invocation_resources(
-                    false,
-                    activation,
-                    instance.contract().value_argument_types(),
-                    &arguments,
-                    selection,
-                    &control,
-                )
+                instance
+                    .invocation_resource_profile()
+                    .expect("installed positive source")
+                    .requests_for(&instance, selection, &arguments, activation, &control)
             });
             assert_eq!(preparation, (0, 0, 0, 0));
-            let bound = bound.unwrap().geometry;
+            let facts = bound.unwrap();
+            assert_eq!(
+                facts.requires_host_callback(),
+                activation == ScalarInvocationActivation::Activated
+            );
+            let bound = facts.geometry;
             let (result, actual) =
                 measured(|| instance.evaluate(selection, &arguments, activation, &control));
             assert!(actual.0 > 0 && actual.1 > 0);

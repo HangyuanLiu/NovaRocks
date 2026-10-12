@@ -122,6 +122,9 @@ pub use evaluation::*;
 pub use evaluation_failure::*;
 pub use higher_order_call::*;
 pub use higher_order_kernel::*;
+pub use invocation_scalar_resources::{
+    InvocationPreparationFailure, WholeInvocationRequestFacts, WholeInvocationResourceProfile,
+};
 pub use kernel_control::*;
 pub use kernel_input::validate_type_observed as validate_function_value_type_observed;
 pub use kernel_input::{
