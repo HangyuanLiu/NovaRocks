@@ -2,14 +2,50 @@
 n_rows	n_unique_row_ids
 5	5
 
+-- query 4
+id	v
+1	10
+2	99
+3	30
+5	50
+6	60
+
 -- query 5
+multiple_data_files	has_active_delete_files
+1	1
+
+-- query 6
+main_matches_pre_opt
+1
+
+-- query 8
 n_rows	n_unique_row_ids
 5	5
 
--- query 6
+-- query 9
+id	v
+1	10
+2	99
+3	30
+5	50
+6	60
+
+-- query 10
 rows_changed_by_optimize
 0
 
--- query 7
+-- query 11
+baseline_rows_missing_after_optimize
+0
+
+-- query 12
 n_replace_snapshots
 1
+
+-- query 13
+current_replace_child_of_pre_opt
+1
+
+-- query 14
+active_delete_files_after_optimize
+0
