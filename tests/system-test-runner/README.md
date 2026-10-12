@@ -6,6 +6,14 @@ failure reporting. `novarocks-cluster-harness` remains the only owner of
 1FE+NBE configuration, spawn, readiness, topology, faults, restart, logs and
 cleanup.
 
+Follow [test governance](../../docs/guides/development/test-governance.md) for
+asset admission, approval snapshots, new exclusive attempt roots, retention and
+report interpretation. Pass a fresh root through the existing `--artifact-root`;
+the runner's `create_dir_all` does not enforce exclusive ownership. Existing
+ignored report directories and the commands below remain supported. Preserve
+unresolved failure materials and record the actual output location; a local
+path is not a shared evidence handoff.
+
 List all registered scenarios (including explicit stages):
 
 ```bash

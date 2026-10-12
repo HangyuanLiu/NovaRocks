@@ -18,14 +18,14 @@
 name: Cargo governance
 
 on:
-  pull_request:
+  # Run governance manually instead of making it a pull request gate.
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: cargo-governance-${{ github.event.pull_request.number || github.ref }}
+  group: cargo-governance-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

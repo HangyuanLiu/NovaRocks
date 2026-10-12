@@ -24,6 +24,12 @@ SQL tests have two physical roots:
 - `tests/sql/correctness/` contains the small-data correctness corpus used by development and full CI.
 - `tests/sql/benchmarks/` contains fixed-data performance workloads. They are not selected by correctness CI.
 
+For asset admission, approval snapshots, attempt retention and evidence limits,
+see [test governance](../../docs/guides/development/test-governance.md). Existing
+runner output locations remain valid local materials; record their actual paths
+and retain unresolved failures. A generated report does not establish a shared
+handoff or a performance verdict.
+
 ## Object Store Prerequisite
 
 Iceberg 等对象存储套件使用显式 runner 配置中的端点与凭证；fixture 服务的 host 端口由 runtime owner 分配，不能假设 `9000/8181` 或默认凭证。先验证本机 BOM 并绑定，再解析一次 publication：

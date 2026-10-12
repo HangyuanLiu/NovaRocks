@@ -37,6 +37,9 @@ description: "Route engineering work through explicit stages, and maintain a dur
 设计与测试以支持契约为边界：区分预期内失败和非预期缺陷，后者直接拒绝、报错，实际 bug 修复根因，避免特殊兼容与额外测试矩阵。
 判断方法与测试范围分别见 `references/workflow-contract.md` 第 2.1、8.4 节。
 
+新增或实质扩展测试与验收材料时消费同一 contract 第 8.5–8.7 节：准入、采集与判断分工、最小证据和尝试保留。
+各阶段按适用 `AGENTS.md` 读取项目快照与材料约定；不另设逐例表单、runner 判据解析或人工门。
+
 ## 路由
 
 | 当前状态或用户意图 | 调用 |

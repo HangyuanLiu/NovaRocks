@@ -688,6 +688,11 @@ SQL.
 
 ## 8. Development and Testing Standards
 
+Use [test governance](docs/guides/development/test-governance.md) for new or
+materially expanded test assets, approval snapshots, attempt materials and the
+boundaries of existing evidence. The common workflow contract owns the rules;
+the guide supplies NovaRocks locations and operational responsibilities.
+
 ### 8.1 Language Standard
 
 - User communication and design docs: Chinese
@@ -837,19 +842,20 @@ little changed. `--suite all` selects 33 suites / 776 cases; one runner
 invocation owns one server lifecycle, so running suites one at a time pays a
 server start per suite and a full pass costs tens of minutes.
 
-**A saturated machine produces false failures.** These are load-sensitive, not
-regressions:
+**Investigate timing failures with evidence.** Credential-expiration checks
+such as `provider_pool_evicts_vended_provider_at_credential_expiration`
+(`novarocks/fs/src/access.rs`) and the `managed_process` family
+(`tests/test-support/src/managed_process.rs`) can warrant investigating load,
+readiness and signal timing. Their names or time constants do not establish a
+cause. Preserve the original failure and actual load/process observations;
+record isolated reruns separately. A pass when run alone means the failure was
+not reproduced in that attempt. Concurrent load, even when observed, does not
+by itself exclude a product race or justify calling the failure noise.
 
-- `novarocks-fs`: `provider_pool_evicts_vended_provider_at_credential_expiration`
-  (`novarocks/fs/src/access.rs`) turns on a credential-expiration time constant.
-- `novarocks-test-support`: the `managed_process` family
-  (`tests/test-support/src/managed_process.rs`) turns on process readiness and
-  signal timing.
-
-The criterion is the combination — a time constant in the test, concurrent load
-while it ran, and a clean pass when run alone — not the crate name. Neither is
-in `tools/ci/baselines/known-failures.toml`, which covers accepted SQL failures
-only.
+Neither family is in `tools/ci/baselines/known-failures.toml`, which covers
+accepted SQL failures only. Keep an existing approved disposition separate from
+this run's raw failures; targeted passes must not overwrite a full run's raw
+result. See [failure and evidence boundaries](docs/guides/development/test-governance.md#失败与结论边界).
 
 For SQL suites, read the first failure rather than the failure count: one
 failing statement can leave the shared server in a state where later cases fail
@@ -971,6 +977,11 @@ through `provenance` and `related` only.
 ---
 
 ## 12. Project Development Workflow and Knowledge Base
+
+Before execution, follow [test governance](docs/guides/development/test-governance.md)
+for the project approval Git snapshot, a new attempt location and retention.
+Before cleanup or finish, verify the recorded evidence handoff and recoverability.
+These conventions do not authorize push, PR, upload or automatic deletion.
 
 For NovaRocks feature, architecture, roadmap, and refactor work, resolve the
 project documentation root from memory. Use the newest directly applicable,
