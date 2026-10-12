@@ -18,7 +18,41 @@
 //! Original platform-private aggregate helper backing on the actual host.
 use crate::opaque_memory::{OpaqueReservation, OpaqueRetainedCharge};
 use crate::{AggregateStateAllocator, KernelFailure};
-use std::sync::Arc;
+use std::{alloc::Layout, sync::Arc};
+
+/// The typed adapter supplies its actual frame Layout. The returned lease
+/// lives outside the Box, so its release follows the Box's own deallocation.
+pub(crate) fn reserve_frame_backing(
+    host: Option<&Arc<dyn AggregateStateAllocator>>,
+    layout: Layout,
+) -> Result<OpaqueReservation, KernelFailure> {
+    let host = host.ok_or_else(|| {
+        crate::kernel_control::invalid(
+            "aggregate helper memory requires its actual allocation host",
+        )
+    })?;
+    OpaqueRetainedCharge::try_new(Arc::clone(host))?.reserve_operation(layout.size())
+}
+
+/// Each observer's original fixed branches can keep at most three newly
+/// cloned/replacement diagnostics live at once. Input and escaping causes
+/// retain their original GLOBAL responsibility; this lease is temporary.
+pub(crate) fn reserve_observation_backing(
+    host: Option<&Arc<dyn AggregateStateAllocator>>,
+) -> Result<OpaqueReservation, KernelFailure> {
+    // Preserve the named rejection for an unsupported platform.
+    let mutex_bytes = private_mutex_backing_bytes()?;
+    let bytes = crate::MAX_ROW_ERROR_MESSAGE_BYTES
+        .checked_mul(3)
+        .and_then(|bytes| bytes.checked_add(mutex_bytes))
+        .ok_or(KernelFailure::ResourceExhausted)?;
+    let host = host.ok_or_else(|| {
+        crate::kernel_control::invalid(
+            "aggregate helper memory requires its actual allocation host",
+        )
+    })?;
+    OpaqueRetainedCharge::try_new(Arc::clone(host))?.reserve_operation(bytes)
+}
 
 /// Pinned std 1.98.1 uses inline futex storage on Linux. On 64-bit macOS,
 /// pthread Mutex owns one Box<pal::Mutex>: vendored libc 0.2.185 defines its

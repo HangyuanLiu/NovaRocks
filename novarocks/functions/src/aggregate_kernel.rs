@@ -198,6 +198,11 @@ pub trait PreparedAggregateKernel: Send + Sync + fmt::Debug + 'static {
     fn requires_emission_context(&self) -> bool {
         false
     }
+    /// Immutable declaration for framework helper backing on the same host.
+    /// Existing owners make no new resource-coverage claim by default.
+    fn requires_helper_memory(&self) -> bool {
+        false
+    }
     fn prepare_update_evaluation<'batch>(
         &'batch self,
         input: SelectedAggregateUpdateInput<'batch, 'batch>,
@@ -884,7 +889,20 @@ where
     K::State: 'state,
     I: ExactSizeIterator<Item = &'state K::State> + Clone,
 {
+    // Declare the lease first: the observer and its private Mutex backing
+    // must be destroyed before the temporary reservation is released.
+    let _helper_lease = if kernel.requires_helper_memory() {
+        Some(crate::aggregate_helper_memory::reserve_observation_backing(
+            context.and_then(AggregateEmissionContext::allocator),
+        )?)
+    } else {
+        None
+    };
     let observed = crate::kernel_control::KernelControlObservation::new(control);
+    if _helper_lease.is_some() {
+        // Exclusively initialize the fresh journal without invoking control.
+        observed.finish(Ok(()))?;
+    }
     let result =
         emit_aggregate_evaluation_observed(kernel, states, row_capacity, context, &observed);
     match result {
