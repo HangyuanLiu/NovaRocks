@@ -16,6 +16,7 @@
 // under the License.
 //! The original Mann–Whitney state, sample transitions, codec and formatter.
 //! Callers supply storage; this module owns no execution context or tracker.
+use crate::KernelFailure;
 use crate::aggregate_scalar::{
     AggScalarValue, ScalarStateAllocator, ScalarStateError, ScalarWork, scalar_from_array,
 };
@@ -62,6 +63,64 @@ pub(crate) struct MannStateExtents {
     pub(crate) sample_capacities: [usize; 2],
     pub(crate) sorted: bool,
     pub(crate) initialized: bool,
+}
+
+/// Reached allocation frontiers of the ONE original algorithm. Events borrow
+/// facts only; an observer must retain its loans outside an escaping error.
+pub(crate) enum MannResourceEvent<'a> {
+    StaticDiagnostic {
+        message: &'static str,
+        treatment_replacement: bool,
+    },
+    IntSetupDiagnostic {
+        data_type: &'a DataType,
+        treatment_replacement: bool,
+    },
+    FirstAlternative {
+        source: &'a str,
+    },
+    ScalarRead {
+        array: &'a ArrayRef,
+        row: usize,
+    },
+    MergeScratch {
+        left: MannStateExtents,
+        right: MannStateExtents,
+    },
+}
+pub(crate) trait MannResources {
+    fn before(
+        &mut self,
+        event: MannResourceEvent<'_>,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), KernelFailure>;
+}
+struct NoopMannResources;
+impl MannResources for NoopMannResources {
+    fn before(
+        &mut self,
+        _: MannResourceEvent<'_>,
+        _: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), KernelFailure> {
+        Ok(())
+    }
+}
+fn static_error<O: MannResources>(
+    message: &'static str,
+    treatment_replacement: bool,
+    work: &mut ScalarWork<'_, '_>,
+    resources: &mut O,
+) -> ScalarStateError {
+    match resources.before(
+        MannResourceEvent::StaticDiagnostic {
+            message,
+            treatment_replacement,
+        },
+        work,
+    ) {
+        Ok(()) => message.to_string().into(),
+        Err(cause) => cause.into(),
+    }
 }
 
 impl<A: ScalarStateAllocator> MannWhitneyState<A> {
@@ -128,8 +187,17 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
 
     pub fn merge_with_work(
         &mut self,
+        other: Self,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), ScalarStateError> {
+        self.merge_with_resources(other, work, &mut NoopMannResources)
+    }
+
+    pub(crate) fn merge_with_resources<O: MannResources>(
+        &mut self,
         mut other: Self,
         work: &mut ScalarWork<'_, '_>,
+        resources: &mut O,
     ) -> Result<(), ScalarStateError> {
         if self.is_uninitialized() {
             *self = other;
@@ -141,17 +209,34 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
         if self.alternative != other.alternative
             || self.continuity_correction != other.continuity_correction
         {
-            return Err("mann_whitney_u_test state parameters mismatch"
-                .to_string()
-                .into());
+            return Err(static_error(
+                "mann_whitney_u_test state parameters mismatch",
+                false,
+                work,
+                resources,
+            ));
         }
+        resources.before(
+            MannResourceEvent::MergeScratch {
+                left: self.extents(),
+                right: other.extents(),
+            },
+            work,
+        )?;
         self.sort_if_needed(work)?;
         other.sort_if_needed(work)?;
         for idx in 0..2 {
             let capacity = self.stats[idx]
                 .len()
                 .checked_add(other.stats[idx].len())
-                .ok_or_else(|| "mann_whitney_u_test sample count overflow".to_string())?;
+                .ok_or_else(|| {
+                    static_error(
+                        "mann_whitney_u_test sample count overflow",
+                        false,
+                        work,
+                        resources,
+                    )
+                })?;
             let mut merged = ScalarVec::new_in(self.allocator.clone());
             merged.try_reserve_exact(capacity).map_err(|_| {
                 self.allocator
@@ -220,14 +305,26 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
     }
 
     pub fn deserialize_in_with_work(
-        mut data: &[u8],
+        data: &[u8],
         allocator: A,
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<Self, ScalarStateError> {
+        Self::deserialize_in_with_resources(data, allocator, work, &mut NoopMannResources)
+    }
+
+    pub(crate) fn deserialize_in_with_resources<O: MannResources>(
+        mut data: &[u8],
+        allocator: A,
+        work: &mut ScalarWork<'_, '_>,
+        resources: &mut O,
+    ) -> Result<Self, ScalarStateError> {
         if data.len() < 1 + 8 + 4 + 4 {
-            return Err("mann_whitney_u_test deserialize: buffer too short"
-                .to_string()
-                .into());
+            return Err(static_error(
+                "mann_whitney_u_test deserialize: buffer too short",
+                false,
+                work,
+                resources,
+            ));
         }
         let alternative = match data[0] {
             1 => TestingAlternative::TwoSided,
@@ -254,9 +351,12 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
         })?;
         for _ in 0..len0 {
             if data.len() < 8 {
-                return Err("mann_whitney_u_test deserialize: buffer too short"
-                    .to_string()
-                    .into());
+                return Err(static_error(
+                    "mann_whitney_u_test deserialize: buffer too short",
+                    false,
+                    work,
+                    resources,
+                ));
             }
             work.step()?;
             let mut bytes = [0u8; 8];
@@ -270,9 +370,12 @@ impl<A: ScalarStateAllocator> MannWhitneyState<A> {
         })?;
         for _ in 0..len1 {
             if data.len() < 8 {
-                return Err("mann_whitney_u_test deserialize: buffer too short"
-                    .to_string()
-                    .into());
+                return Err(static_error(
+                    "mann_whitney_u_test deserialize: buffer too short",
+                    false,
+                    work,
+                    resources,
+                ));
             }
             work.step()?;
             let mut bytes = [0u8; 8];
@@ -428,29 +531,71 @@ enum IntArrayView<'a> {
 }
 
 impl<'a> IntArrayView<'a> {
-    fn new(array: &'a ArrayRef) -> Result<Self, String> {
+    fn new_with_resources<O: MannResources>(
+        array: &'a ArrayRef,
+        treatment_replacement: bool,
+        work: &mut ScalarWork<'_, '_>,
+        resources: &mut O,
+    ) -> Result<Self, ScalarStateError> {
         match array.data_type() {
             DataType::Int64 => array
                 .as_any()
                 .downcast_ref::<Int64Array>()
                 .map(Self::Int64)
-                .ok_or_else(|| "failed to downcast to Int64Array".to_string()),
+                .ok_or_else(|| {
+                    static_error(
+                        "failed to downcast to Int64Array",
+                        treatment_replacement,
+                        work,
+                        resources,
+                    )
+                }),
             DataType::Int32 => array
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .map(Self::Int32)
-                .ok_or_else(|| "failed to downcast to Int32Array".to_string()),
+                .ok_or_else(|| {
+                    static_error(
+                        "failed to downcast to Int32Array",
+                        treatment_replacement,
+                        work,
+                        resources,
+                    )
+                }),
             DataType::Int16 => array
                 .as_any()
                 .downcast_ref::<Int16Array>()
                 .map(Self::Int16)
-                .ok_or_else(|| "failed to downcast to Int16Array".to_string()),
+                .ok_or_else(|| {
+                    static_error(
+                        "failed to downcast to Int16Array",
+                        treatment_replacement,
+                        work,
+                        resources,
+                    )
+                }),
             DataType::Int8 => array
                 .as_any()
                 .downcast_ref::<Int8Array>()
                 .map(Self::Int8)
-                .ok_or_else(|| "failed to downcast to Int8Array".to_string()),
-            other => Err(format!("unsupported int input type: {:?}", other)),
+                .ok_or_else(|| {
+                    static_error(
+                        "failed to downcast to Int8Array",
+                        treatment_replacement,
+                        work,
+                        resources,
+                    )
+                }),
+            other => {
+                resources.before(
+                    MannResourceEvent::IntSetupDiagnostic {
+                        data_type: other,
+                        treatment_replacement,
+                    },
+                    work,
+                )?;
+                Err(format!("unsupported int input type: {:?}", other).into())
+            }
         }
     }
 
@@ -470,17 +615,34 @@ enum TreatmentArrayView<'a> {
 }
 
 impl<'a> TreatmentArrayView<'a> {
-    fn new(array: &'a ArrayRef) -> Result<Self, String> {
+    fn new_with_resources<O: MannResources>(
+        array: &'a ArrayRef,
+        work: &mut ScalarWork<'_, '_>,
+        resources: &mut O,
+    ) -> Result<Self, ScalarStateError> {
         if matches!(array.data_type(), DataType::Boolean) {
             let arr = array
                 .as_any()
                 .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| "failed to downcast to BooleanArray".to_string())?;
+                .ok_or_else(|| {
+                    static_error("failed to downcast to BooleanArray", false, work, resources)
+                })?;
             return Ok(Self::Boolean(arr));
         }
-        Ok(Self::Int(IntArrayView::new(array).map_err(|_| {
-            "mann_whitney_u_test expects boolean or integer treatment".to_string()
-        })?))
+        Ok(Self::Int(
+            IntArrayView::new_with_resources(array, true, work, resources).map_err(|error| {
+                match error {
+                    // Only the original integer data error receives the original
+                    // replacement. An observer's typed refusal remains primary.
+                    ScalarStateError::Legacy(_) => {
+                        "mann_whitney_u_test expects boolean or integer treatment"
+                            .to_string()
+                            .into()
+                    }
+                    other => other,
+                }
+            })?,
+        ))
     }
 
     fn value_at(&self, row: usize) -> Option<bool> {
@@ -531,14 +693,27 @@ impl<'a> MannWhitneyInput<'a> {
         arity: usize,
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<Self, ScalarStateError> {
+        Self::try_new_channels_with_resources(channels, arity, work, &mut NoopMannResources)
+    }
+
+    pub(crate) fn try_new_channels_with_resources<O: MannResources>(
+        channels: [Option<&'a ArrayRef>; 4],
+        arity: usize,
+        work: &mut ScalarWork<'_, '_>,
+        resources: &mut O,
+    ) -> Result<Self, ScalarStateError> {
         work.flush()?;
         if !(2..=4).contains(&arity) || channels[..arity.min(4)].iter().any(Option::is_none) {
-            return Err("mann_whitney_u_test expects 2 to 4 arguments"
-                .to_string()
-                .into());
+            return Err(static_error(
+                "mann_whitney_u_test expects 2 to 4 arguments",
+                false,
+                work,
+                resources,
+            ));
         }
         let values = channels[0].unwrap();
-        let treatment = TreatmentArrayView::new(channels[1].unwrap())?;
+        let treatment =
+            TreatmentArrayView::new_with_resources(channels[1].unwrap(), work, resources)?;
 
         let alternative = if arity >= 3 {
             Some(
@@ -546,14 +721,26 @@ impl<'a> MannWhitneyInput<'a> {
                     .unwrap()
                     .as_any()
                     .downcast_ref::<StringArray>()
-                    .ok_or_else(|| "mann_whitney_u_test expects string alternative".to_string())?,
+                    .ok_or_else(|| {
+                        static_error(
+                            "mann_whitney_u_test expects string alternative",
+                            false,
+                            work,
+                            resources,
+                        )
+                    })?,
             )
         } else {
             None
         };
 
         let continuity = if arity == 4 {
-            Some(IntArrayView::new(channels[3].unwrap())?)
+            Some(IntArrayView::new_with_resources(
+                channels[3].unwrap(),
+                false,
+                work,
+                resources,
+            )?)
         } else {
             None
         };
@@ -572,6 +759,16 @@ impl<'a> MannWhitneyInput<'a> {
         addresses: [usize; 4],
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<(), ScalarStateError> {
+        self.update_row_with_resources(state, addresses, work, &mut NoopMannResources)
+    }
+
+    pub(crate) fn update_row_with_resources<A: ScalarStateAllocator, O: MannResources>(
+        &self,
+        state: &mut MannWhitneyState<A>,
+        addresses: [usize; 4],
+        work: &mut ScalarWork<'_, '_>,
+        resources: &mut O,
+    ) -> Result<(), ScalarStateError> {
         work.step()?;
         if state.is_uninitialized() {
             let mut alternative = TestingAlternative::TwoSided;
@@ -580,6 +777,12 @@ impl<'a> MannWhitneyInput<'a> {
                 && !alt_arr.is_null(addresses[2])
             {
                 work.flush()?;
+                resources.before(
+                    MannResourceEvent::FirstAlternative {
+                        source: alt_arr.value(addresses[2]),
+                    },
+                    work,
+                )?;
                 let alt = alt_arr.value(addresses[2]).to_lowercase();
                 work.flush()?;
                 let parsed = TestingAlternative::from_str(&alt);
@@ -592,9 +795,12 @@ impl<'a> MannWhitneyInput<'a> {
                 && let Some(v) = cont_arr.value_at(addresses[3])
             {
                 if v < 0 {
-                    return Err("Logical Error: continuity_correction must be non-negative."
-                        .to_string()
-                        .into());
+                    return Err(static_error(
+                        "Logical Error: continuity_correction must be non-negative.",
+                        false,
+                        work,
+                        resources,
+                    ));
                 }
                 continuity = v;
             }
@@ -604,6 +810,13 @@ impl<'a> MannWhitneyInput<'a> {
         let Some(treatment) = self.treatment.value_at(addresses[1]) else {
             return Ok(());
         };
+        resources.before(
+            MannResourceEvent::ScalarRead {
+                array: self.values,
+                row: addresses[0],
+            },
+            work,
+        )?;
         let Some(value) =
             scalar_from_array(self.values, addresses[0], work).map_err(|error| match error {
                 ScalarStateError::Kernel(_) => error,
@@ -917,3 +1130,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "aggregate_mann_whitney_core/resource_tests.rs"]
+mod resource_tests;
