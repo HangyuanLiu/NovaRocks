@@ -55,17 +55,17 @@ SELECT 40000 + 2000 + 96;
 SELECT date_format('2020-01-01', '%Y-%m');
 
 -- ---------------------------------------------------------------------------
--- 3. A string literal against a DATE column folds to the epoch-day literal,
---    with no CAST left in the scan predicate.
+-- 3. A string literal against a DATE column folds to a DATE constant,
+--    rendered as a calendar date with no CAST left in the scan predicate.
 -- ---------------------------------------------------------------------------
--- @explain_contains=predicates: dt = 18262
+-- @explain_contains=predicates: dt = 2020-01-01
 -- @explain_not_contains=CAST(
 SELECT id FROM ${case_db}.t_fold_dates WHERE dt = '2020-01-01';
 
 -- ---------------------------------------------------------------------------
 -- 4. The typed DATE literal must produce exactly the same scan predicate.
 -- ---------------------------------------------------------------------------
--- @explain_contains=predicates: dt = 18262
+-- @explain_contains=predicates: dt = 2020-01-01
 -- @explain_not_contains=CAST(
 SELECT id FROM ${case_db}.t_fold_dates WHERE dt = DATE '2020-01-01';
 
