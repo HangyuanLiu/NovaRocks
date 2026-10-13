@@ -47,7 +47,7 @@ use novarocks_type_contract::{
     FunctionValueType, PureCompileControl, SemanticParameters,
 };
 
-use crate::exec::chunk::Chunk;
+use crate::exec::chunk::{Chunk, ChunkSchema, OutputColumnMetadata};
 use crate::exec::operators::{ResultSinkFactory, ResultSinkHandle};
 use crate::exec::pipeline::binding::ExchangeBindings;
 use crate::exec::pipeline::executor::prepare_compiled_program_pipeline_execution;
@@ -59,6 +59,41 @@ impl PureCompileControl for FixtureControl {
     fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
         Ok(())
     }
+}
+
+impl novarocks_functions::KernelEvaluationControl for FixtureControl {
+    fn checkpoint(&self, _: u32) -> Result<(), novarocks_functions::KernelFailure> {
+        Ok(())
+    }
+    fn wait(&self, _: Duration) -> Result<(), novarocks_functions::KernelFailure> {
+        panic!("column metadata fixture never waits")
+    }
+}
+
+/// A declared constant input with an admitted original columns Vec. Only
+/// container metadata is paid here; this does not grant payload authority.
+pub(super) fn paid_input(
+    program: &LocalProgram,
+    tracker: &Arc<crate::runtime::mem_tracker::MemTracker>,
+) -> Chunk {
+    let node = &program.graph().nodes()[0];
+    let novarocks_local_program::ProgramNodeKind::Values { values } = node.kind() else {
+        panic!("fixture input is not Values");
+    };
+    let source = values.batch().expect("fixture Values are constant");
+    let schema = ChunkSchema::from_compiled_layout(node.output_layout()).unwrap();
+    let metadata = OutputColumnMetadata::try_new(
+        source.num_columns(),
+        crate::exec::operators::compiled_aggregate::expression_allocation_host(tracker.clone()),
+        &FixtureControl,
+    )
+    .unwrap();
+    let mut columns = Vec::new();
+    columns.try_reserve_exact(source.num_columns()).unwrap();
+    columns.extend(source.columns().iter().cloned());
+    let batch =
+        arrow::record_batch::RecordBatch::try_new(schema.arrow_schema_ref(), columns).unwrap();
+    Chunk::try_new_with_output_column_metadata(batch, schema, metadata).unwrap()
 }
 
 pub(super) fn int64(nullable: bool) -> FunctionValueType {
