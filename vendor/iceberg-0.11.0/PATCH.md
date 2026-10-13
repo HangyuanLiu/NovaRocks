@@ -71,3 +71,13 @@ No patches applied in the initial source commit.
 - Production dependency: Hadoop catalog namespace/table discovery; unsupported storage backends return FeatureUnsupported.
 - Exit: IRU-6a removes this patch after the catalog storage boundary owns directory discovery without the SDK extension.
 - Coverage: existing connector Hadoop catalog discovery tests; V2 standalone core check. Old core has no dedicated directory-listing tests.
+
+## U2 — add-schema last-column-id
+
+- Purpose: preserve the optional REST `TableUpdate::AddSchema.last_column_id` field, including omitted-field serde behavior.
+- Files: `src/catalog/mod.rs`, `src/spec/table_metadata_builder.rs`, `src/transaction/update_schema.rs`.
+- Upstream status: no tracked upstream issue; rc.2 omits the high-watermark field.
+- Production dependency: FrozenRequest and authoritative staged-create initialization preserve catalog metadata high-watermarks.
+- Exit: IRU-13b removes this patch when the connector owns the REST update vocabulary.
+- Coverage: migrated `catalog::tests::test_add_schema` serde expectations for Some(3)/None; existing table metadata builder and update-schema tests adapted to the additive field.
+- Port adaptation: the new 0.11 SDK update-schema action emits `last_column_id: None`; its schema-match tests ignore the new field. No SDK mutation semantics changed.

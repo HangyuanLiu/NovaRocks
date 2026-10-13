@@ -458,7 +458,10 @@ impl TransactionAction for UpdateSchemaAction {
             .build()?;
 
         let updates = vec![
-            TableUpdate::AddSchema { schema },
+            TableUpdate::AddSchema {
+                schema,
+                last_column_id: None,
+            },
             TableUpdate::SetCurrentSchema { schema_id: -1 },
         ];
 
@@ -626,7 +629,7 @@ mod tests {
 
         // Extract the new schema from the AddSchema update.
         let new_schema = match &updates[0] {
-            TableUpdate::AddSchema { schema } => schema,
+            TableUpdate::AddSchema { schema, .. } => schema,
             other => panic!("expected AddSchema, got {other:?}"),
         };
 
@@ -670,7 +673,7 @@ mod tests {
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
-            TableUpdate::AddSchema { schema } => schema,
+            TableUpdate::AddSchema { schema, .. } => schema,
             other => panic!("expected AddSchema, got {other:?}"),
         };
 
@@ -697,7 +700,7 @@ mod tests {
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
-            TableUpdate::AddSchema { schema } => schema,
+            TableUpdate::AddSchema { schema, .. } => schema,
             other => panic!("expected AddSchema, got {other:?}"),
         };
 
@@ -746,7 +749,7 @@ mod tests {
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
-            TableUpdate::AddSchema { schema } => schema,
+            TableUpdate::AddSchema { schema, .. } => schema,
             other => panic!("expected AddSchema, got {other:?}"),
         };
 
@@ -796,7 +799,7 @@ mod tests {
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
-            TableUpdate::AddSchema { schema } => schema,
+            TableUpdate::AddSchema { schema, .. } => schema,
             other => panic!("expected AddSchema, got {other:?}"),
         };
 
@@ -827,7 +830,7 @@ mod tests {
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
-            TableUpdate::AddSchema { schema } => schema,
+            TableUpdate::AddSchema { schema, .. } => schema,
             other => panic!("expected AddSchema, got {other:?}"),
         };
 
@@ -880,7 +883,7 @@ mod tests {
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
-            TableUpdate::AddSchema { schema } => schema,
+            TableUpdate::AddSchema { schema, .. } => schema,
             other => panic!("expected AddSchema, got {other:?}"),
         };
 
@@ -915,7 +918,7 @@ mod tests {
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
-            TableUpdate::AddSchema { schema } => schema,
+            TableUpdate::AddSchema { schema, .. } => schema,
             other => panic!("expected AddSchema, got {other:?}"),
         };
 
@@ -945,7 +948,7 @@ mod tests {
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
-            TableUpdate::AddSchema { schema } => schema,
+            TableUpdate::AddSchema { schema, .. } => schema,
             other => panic!("expected AddSchema, got {other:?}"),
         };
 
@@ -980,7 +983,7 @@ mod tests {
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
-            TableUpdate::AddSchema { schema } => schema,
+            TableUpdate::AddSchema { schema, .. } => schema,
             other => panic!("expected AddSchema, got {other:?}"),
         };
 
@@ -1094,7 +1097,7 @@ mod tests {
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
-            TableUpdate::AddSchema { schema } => schema,
+            TableUpdate::AddSchema { schema, .. } => schema,
             other => panic!("expected AddSchema, got {other:?}"),
         };
 
@@ -1140,7 +1143,7 @@ mod tests {
         let updates = action_commit.take_updates();
 
         let new_schema = match &updates[0] {
-            TableUpdate::AddSchema { schema } => schema,
+            TableUpdate::AddSchema { schema, .. } => schema,
             other => panic!("expected AddSchema, got {other:?}"),
         };
 
