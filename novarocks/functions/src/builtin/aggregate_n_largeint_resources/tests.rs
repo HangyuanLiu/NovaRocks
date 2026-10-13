@@ -36,17 +36,22 @@ use std::{
 };
 
 #[derive(Default)]
-struct Ledger {
-    blocks: Vec<(usize, Layout)>,
-    loans: Vec<usize>,
-    attempts: usize,
-    grants: usize,
-    releases: usize,
+pub(in crate::builtin) struct Ledger {
+    pub(in crate::builtin) blocks: Vec<(usize, Layout)>,
+    pub(in crate::builtin) loans: Vec<usize>,
+    pub(in crate::builtin) attempts: usize,
+    pub(in crate::builtin) typed_attempts: usize,
+    pub(in crate::builtin) grants: usize,
+    pub(in crate::builtin) releases: usize,
+    pub(in crate::builtin) granted_bytes: usize,
+    pub(in crate::builtin) released_bytes: usize,
 }
 #[derive(Default)]
-struct Host {
-    ledger: Mutex<Ledger>,
-    refusal: Option<(usize, KernelFailure)>,
+pub(in crate::builtin) struct Host {
+    pub(in crate::builtin) ledger: Mutex<Ledger>,
+    pub(in crate::builtin) refusal: Option<(usize, KernelFailure)>,
+    pub(in crate::builtin) armed_opaque: Mutex<Option<(usize, KernelFailure)>>,
+    pub(in crate::builtin) armed_typed: Mutex<Option<(usize, KernelFailure)>>,
 }
 impl AggregateStateAllocator for Host {
     fn opaque_allocation_host(&self) -> Option<&dyn OpaqueAllocationHost> {
@@ -54,6 +59,17 @@ impl AggregateStateAllocator for Host {
     }
     fn allocate(&self, layout: Layout) -> Result<NonNull<u8>, KernelFailure> {
         assert_ne!(layout.size(), 0);
+        {
+            let mut ledger = self.ledger.lock().unwrap();
+            let at = ledger.typed_attempts;
+            ledger.typed_attempts += 1;
+            if let Some((stop, cause)) = self.armed_typed.lock().unwrap().as_ref() {
+                assert!(at <= *stop, "typed allocation after primary refusal");
+                if at == *stop {
+                    return Err(cause.clone());
+                }
+            }
+        }
         let pointer = NonNull::new(unsafe { std::alloc::alloc(layout) })
             .ok_or(KernelFailure::ResourceExhausted)?;
         self.ledger
@@ -81,7 +97,11 @@ impl OpaqueAllocationHost for Host {
         let mut ledger = self.ledger.lock().unwrap();
         let at = ledger.attempts;
         ledger.attempts += 1;
-        if let Some((stop, cause)) = &self.refusal {
+        let refusal = self
+            .refusal
+            .clone()
+            .or_else(|| self.armed_opaque.lock().unwrap().clone());
+        if let Some((stop, cause)) = &refusal {
             assert!(at <= *stop, "admission after primary refusal");
             if at == *stop {
                 return Err(cause.clone());
@@ -89,6 +109,7 @@ impl OpaqueAllocationHost for Host {
         }
         ledger.loans.push(bytes);
         ledger.grants += 1;
+        ledger.granted_bytes += bytes;
         Ok(())
     }
     fn release_opaque(&self, bytes: usize) {
@@ -96,19 +117,35 @@ impl OpaqueAllocationHost for Host {
             return;
         }
         let mut ledger = self.ledger.lock().unwrap();
-        let index = ledger
-            .loans
-            .iter()
-            .position(|entry| *entry == bytes)
-            .expect("exact opaque reservation released once");
-        ledger.loans.swap_remove(index);
-        ledger.releases += 1;
+        // The opaque port grants fungible bytes. Custody may split a prior
+        // operation loan into retained output and an unused remainder.
+        let available: usize = ledger.loans.iter().sum();
+        assert!(
+            bytes <= available,
+            "opaque release exceeds actual live funding"
+        );
+        ledger.released_bytes += bytes;
+        let mut remaining = bytes;
+        while remaining != 0 {
+            let index = ledger
+                .loans
+                .iter()
+                .position(|entry| *entry == remaining)
+                .unwrap_or(ledger.loans.len() - 1);
+            let released = remaining.min(ledger.loans[index]);
+            ledger.loans[index] -= released;
+            remaining -= released;
+            if ledger.loans[index] == 0 {
+                ledger.loans.swap_remove(index);
+                ledger.releases += 1;
+            }
+        }
     }
 }
-struct Control {
+pub(in crate::builtin) struct Control {
     host: Arc<Host>,
-    refusal: Option<(usize, KernelFailure)>,
-    checks: Mutex<Vec<(u32, usize)>>,
+    pub(in crate::builtin) refusal: Option<(usize, KernelFailure)>,
+    pub(in crate::builtin) checks: Mutex<Vec<(u32, usize)>>,
 }
 impl KernelEvaluationControl for Control {
     fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
@@ -128,7 +165,10 @@ impl KernelEvaluationControl for Control {
         panic!("N codec never waits")
     }
 }
-fn control(host: &Arc<Host>, refusal: Option<(usize, KernelFailure)>) -> Control {
+pub(in crate::builtin) fn control(
+    host: &Arc<Host>,
+    refusal: Option<(usize, KernelFailure)>,
+) -> Control {
     Control {
         host: Arc::clone(host),
         refusal,
@@ -141,7 +181,7 @@ fn allocator(host: &Arc<Host>) -> HostAggregateAllocator {
 fn charge(host: &Arc<Host>) -> OpaqueRetainedCharge {
     OpaqueRetainedCharge::try_new(Arc::clone(host) as Arc<dyn AggregateStateAllocator>).unwrap()
 }
-fn causes() -> [KernelFailure; 7] {
+pub(in crate::builtin) fn causes() -> [KernelFailure; 7] {
     [
         KernelFailure::Cancelled,
         KernelFailure::DeadlineExceeded,
@@ -158,11 +198,12 @@ fn kernel_cause(error: ScalarStateError) -> KernelFailure {
         other => panic!("expected typed cause, got {other:?}"),
     }
 }
-fn clean(host: &Host) {
+pub(in crate::builtin) fn clean(host: &Host) {
     let ledger = host.ledger.lock().unwrap();
     assert!(ledger.blocks.is_empty());
     assert!(ledger.loans.is_empty());
     assert_eq!(ledger.grants, ledger.releases);
+    assert_eq!(ledger.granted_bytes, ledger.released_bytes);
 }
 fn state(
     allocator: &HostAggregateAllocator,
@@ -180,7 +221,7 @@ struct Writer {
     bytes: Vec<u8>,
     appends: usize,
     host: Option<Arc<Host>>,
-    refusal: Option<(usize, KernelFailure)>,
+    pub(in crate::builtin) refusal: Option<(usize, KernelFailure)>,
     protected: usize,
 }
 impl ByEncodeBuffer for Writer {

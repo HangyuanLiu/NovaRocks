@@ -129,5 +129,223 @@ impl NCodecResources for BoundNCodecResources<'_> {
     }
 }
 
+pub(super) const LEGACY_TEXT_UPPER: usize = 192;
+/// Two actual checkpoint/cause diagnostics plus one original error String.
+pub(super) fn operation_prefix_bytes() -> Result<usize, KernelFailure> {
+    crate::MAX_ROW_ERROR_MESSAGE_BYTES
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(768))
+        .ok_or(KernelFailure::ResourceExhausted)
+}
+pub(super) fn add(a: usize, b: usize) -> Result<usize, KernelFailure> {
+    a.checked_add(b).ok_or(KernelFailure::ResourceExhausted)
+}
+fn mul(a: usize, b: usize) -> Result<usize, KernelFailure> {
+    a.checked_mul(b).ok_or(KernelFailure::ResourceExhausted)
+}
+fn bytes<T>(count: usize) -> Result<usize, KernelFailure> {
+    std::alloc::Layout::array::<T>(count)
+        .map(|layout| layout.size())
+        .map_err(|_| KernelFailure::ResourceExhausted)
+}
+fn arc_bytes<T>() -> Result<usize, KernelFailure> {
+    novarocks_type_contract::owned_resources::layout::arc_layout(std::alloc::Layout::new::<T>())
+        .map(|layout| layout.size())
+        .map_err(|_| KernelFailure::ResourceExhausted)
+}
+
+/// Separate named estimates for the original stable sort and Arrow work unit.
+/// They are neither measured rates nor private allocation upper bounds.
+pub(super) struct NLibraryBudgetPolicyV1;
+impl NLibraryBudgetPolicyV1 {
+    fn sort(elements: usize) -> Result<usize, KernelFailure> {
+        add(
+            4096,
+            mul(
+                2,
+                bytes::<crate::aggregate_scalar::TrackedAggScalarValue<HostAggregateAllocator>>(
+                    elements,
+                )?,
+            )?,
+        )
+    }
+    fn arrow(
+        rows: usize,
+        values: usize,
+        payload: usize,
+        nodes: usize,
+        buffers: usize,
+    ) -> Result<usize, KernelFailure> {
+        add(
+            add(
+                add(add(16384, mul(64, add(rows, values)?)?)?, mul(2, payload)?)?,
+                mul(2048, nodes)?,
+            )?,
+            mul(1024, buffers)?,
+        )
+    }
+}
+pub(super) struct BoundNSortResources<'a> {
+    pub(super) charge: &'a OpaqueRetainedCharge,
+    pub(super) allocator: &'a HostAggregateAllocator,
+}
+impl super::aggregate_n_core::NSortResources for BoundNSortResources<'_> {
+    type Lease = OpaqueReservation;
+    fn before_sort(
+        &mut self,
+        len: usize,
+        _work: &mut ScalarWork<'_, '_>,
+    ) -> Result<Self::Lease, KernelFailure> {
+        BoundNCodecResources {
+            charge: self.charge,
+            allocator: self.allocator,
+        }
+        .reserve(NLibraryBudgetPolicyV1::sort(len)?)
+    }
+    fn before_comparison(
+        &mut self,
+        _work: &mut ScalarWork<'_, '_>,
+    ) -> Result<Option<Self::Lease>, KernelFailure> {
+        // Both original discarded diagnostic literals are at most39 bytes.
+        BoundNCodecResources {
+            charge: self.charge,
+            allocator: self.allocator,
+        }
+        .reserve(39)
+        .map(Some)
+    }
+}
+
+#[derive(Default)]
+pub(super) struct NEmissionGeometry {
+    pub(super) rows: usize,
+    pub(super) values: usize,
+    utf8: usize,
+    encoded: usize,
+}
+impl NEmissionGeometry {
+    pub(super) fn add_state(
+        &mut self,
+        core: &super::aggregate_n_core::NState<HostAggregateAllocator>,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), ScalarStateError> {
+        use crate::aggregate_scalar::TrackedAggScalarValue as V;
+        self.rows = add(self.rows, 1)?;
+        self.values = add(self.values, core.values.len())?;
+        self.encoded = add(self.encoded, 8)?;
+        for value in &core.values {
+            work.step()?;
+            let encoded = match value {
+                V::Bool(_) => 2,
+                V::Int64(_) | V::Float64(_) | V::Timestamp(_) => 9,
+                V::Date32(_) => 5,
+                V::Decimal128(_) => 17,
+                V::Decimal256(_) => 83,
+                V::Utf8(bytes) => {
+                    self.utf8 = add(self.utf8, bytes.len())?;
+                    add(5, bytes.len())?
+                }
+                // Private state provenance is Fixed16 update or the original
+                // eight-leaf decoder; no public legal codec shape is rejected.
+                _ => {
+                    return Err(internal(
+                        "min_n/max_n emission has an invalid private scalar producer",
+                    )
+                    .into());
+                }
+            };
+            self.encoded = add(self.encoded, encoded)?;
+        }
+        Ok(())
+    }
+    pub(super) fn facts(&self, final_result: bool) -> Result<NEmissionFacts, KernelFailure> {
+        use crate::aggregate_scalar::AggScalarValue;
+        use crate::arrow_result_custody::custody_node_metadata_upper_bound as node;
+        use arrow_array::{BinaryArray, FixedSizeBinaryArray, ListArray};
+        let (own_peak, payload, metadata, bodies, nodes, buffers) = if final_result {
+            let offsets = bytes::<i32>(add(self.rows, 1)?)?;
+            let values = bytes::<u8>(mul(16, self.values)?)?;
+            let flat = if self.values == 0 {
+                0
+            } else {
+                mul(
+                    2,
+                    bytes::<Option<AggScalarValue>>(mul(2, self.values)?.max(4))?,
+                )?
+            };
+            let mut own = add(
+                bytes::<Option<AggScalarValue>>(self.rows)?,
+                bytes::<Option<AggScalarValue>>(self.values)?,
+            )?;
+            for term in [
+                self.utf8,
+                flat,
+                bytes::<Option<i128>>(self.values)?,
+                offsets,
+                values,
+                arc_bytes::<ListArray>()?,
+                arc_bytes::<FixedSizeBinaryArray>()?,
+            ] {
+                own = add(own, term)?;
+            }
+            (
+                own,
+                add(offsets, values)?,
+                add(node(1, false, 1)?, node(1, false, 0)?)?,
+                add(size_of::<ListArray>(), size_of::<FixedSizeBinaryArray>())?,
+                2,
+                2,
+            )
+        } else {
+            let (data_peak, data_capacity) = default_vector::<u8>(1024, self.encoded, 8)?;
+            let (offset_peak, offset_capacity) =
+                default_vector::<i32>(1025, add(self.rows, 1)?, 4)?;
+            // Original finish resets a fresh i32 Vec with its minimum4 elements.
+            let own = add(
+                add(add(data_peak, offset_peak)?, bytes::<i32>(4)?)?,
+                arc_bytes::<BinaryArray>()?,
+            )?;
+            (
+                own,
+                add(data_capacity, offset_capacity)?,
+                node(2, false, 0)?,
+                size_of::<BinaryArray>(),
+                1,
+                2,
+            )
+        };
+        let library_invoice =
+            NLibraryBudgetPolicyV1::arrow(self.rows, self.values, payload, nodes, buffers)?;
+        let settlement = add(add(payload, bodies)?, metadata)?;
+        // The SAME reservation passed to custody has enough UNUSED backing for
+        // its complete stock/metadata transfer, independently of transient peak.
+        Ok(NEmissionFacts {
+            operation: add(own_peak, library_invoice)?.max(settlement),
+            own_peak,
+            library_invoice,
+            settlement,
+        })
+    }
+}
+fn default_vector<T>(
+    initial: usize,
+    demand: usize,
+    minimum: usize,
+) -> Result<(usize, usize), KernelFailure> {
+    if demand <= initial {
+        let bytes = bytes::<T>(initial)?;
+        return Ok((bytes, bytes));
+    }
+    let capacity = add(mul(2, demand)?.max(initial), minimum)?;
+    let retained = bytes::<T>(capacity)?;
+    Ok((mul(2, retained)?, retained))
+}
+pub(super) struct NEmissionFacts {
+    pub(super) operation: usize,
+    pub(super) own_peak: usize,
+    pub(super) library_invoice: usize,
+    pub(super) settlement: usize,
+}
+
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
