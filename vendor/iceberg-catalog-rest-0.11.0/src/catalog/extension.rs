@@ -246,13 +246,88 @@ impl RestSessionCatalog {
     }
 }
 
+impl RestCatalog {
+    /// Load a response with storage delegation before selecting a FileIO.
+    pub async fn load_table_deferred_with_access_delegation(
+        &self,
+        table_ident: &TableIdent,
+    ) -> Result<DeferredRestTableWithAccessDelegation> {
+        self.inner
+            .load_table_deferred_with_access_delegation(&self.session_context, table_ident)
+            .await
+    }
+}
+
+impl RestSessionCatalog {
+    /// Load a frozen response and its response-local storage delegation.
+    pub async fn load_table_deferred_with_access_delegation(
+        &self,
+        _context: &SessionContext,
+        table_ident: &TableIdent,
+    ) -> Result<DeferredRestTableWithAccessDelegation> {
+        let client = self.client().await?;
+        let request = HttpRequest::build(
+            client
+                .http_client
+                .request(Method::GET, client.config.table_endpoint(table_ident))
+                .header("x-iceberg-access-delegation", "vended-credentials"),
+        )?;
+        let response = client.query_catalog(request).await?;
+        let response = match response.status() {
+            StatusCode::OK | StatusCode::NOT_MODIFIED => {
+                deserialize_catalog_response::<LoadTableResult>(response)?
+            }
+            StatusCode::NOT_FOUND => {
+                return Err(Error::new(
+                    ErrorKind::TableNotFound,
+                    "Tried to load a table that does not exist",
+                ));
+            }
+            _ => {
+                return Err(deserialize_unexpected_catalog_error(
+                    response,
+                    client.http_client.disable_header_redaction(),
+                ));
+            }
+        };
+        Ok(self.defer_table_response(table_ident.clone(), response))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Credential-handoff correctness coverage: exact-key reads preserve the
     //! response while Debug never reveals values. This isolated in-memory test
     //! follows the closed handoff contract and runs with the REST crate suite;
     //! the NovaRocks connector maintainer owns it until IRU-13a replaces R6.
+    //! Scripted HTTP cases each own a mockito listener and join its lifetime
+    //! on drop; they preserve the prior credential response and opt-in oracle.
     use super::*;
+    use iceberg::io::LocalFsStorageFactory;
+    use mockito::{Matcher, Mock, Server, ServerGuard};
+
+    async fn create_config_mock(server: &mut ServerGuard) -> Mock {
+        server
+            .mock("GET", "/v1/config")
+            .with_status(200)
+            .with_body(r#"{"overrides":{"warehouse":"s3://iceberg-catalog"},"defaults":{}}"#)
+            .create_async()
+            .await
+    }
+
+    fn catalog(
+        config: RestCatalogConfig,
+        storage_factory: Option<Arc<dyn StorageFactory>>,
+    ) -> RestCatalog {
+        RestCatalog::new(
+            SessionContext::empty(),
+            config,
+            None,
+            storage_factory,
+            Runtime::try_current().unwrap(),
+            None,
+        )
+    }
 
     #[test]
     fn storage_delegation_exposes_exact_keys_without_debug_secrets() {
@@ -321,5 +396,70 @@ mod tests {
                 );
             }
         }
+    }
+    #[tokio::test]
+    async fn access_delegation_is_opt_in_and_preserves_redacted_facts() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let response = std::fs::read_to_string(format!(
+            "{}/testdata/load_table_response.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+        .replacen(
+            "\n}",
+            ",\n  \"storage-credentials\": [{\n    \"prefix\": \"s3://warehouse/database/\",\n    \"config\": {\"s3.access-key-id\": \"access-canary\", \"s3.secret-access-key\": \"secret-canary\"}\n  }]\n}",
+            1,
+        );
+        let ordinary = server
+            .mock("GET", "/v1/namespaces/ns1/tables/ordinary")
+            .match_header("x-iceberg-access-delegation", Matcher::Missing)
+            .with_status(200)
+            .with_body(response.clone())
+            .create_async()
+            .await;
+        let delegated = server
+            .mock("GET", "/v1/namespaces/ns1/tables/delegated")
+            .match_header("x-iceberg-access-delegation", "vended-credentials")
+            .with_status(200)
+            .with_body(response)
+            .create_async()
+            .await;
+        let catalog = catalog(
+            RestCatalogConfig::builder().uri(server.url()).build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let ordinary_table = catalog
+            .load_table(&TableIdent::from_strs(["ns1", "ordinary"]).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(ordinary_table.identifier().name, "ordinary");
+        let delegated_response = catalog
+            .load_table_deferred_with_access_delegation(
+                &TableIdent::from_strs(["ns1", "delegated"]).unwrap(),
+            )
+            .await
+            .unwrap();
+        let (materialization, delegation) = delegated_response.into_parts();
+        assert!(delegation.is_present());
+        assert_eq!(delegation.len(), 1);
+        let credential = delegation.credentials().next().unwrap();
+        assert_eq!(credential.prefix(), "s3://warehouse/database/");
+        assert_eq!(
+            credential.config_value("s3.access-key-id"),
+            Some("access-canary")
+        );
+        assert!(format!("{credential:?}").contains("s3.access-key-id"));
+        assert!(!format!("{credential:?}").contains("secret-canary"));
+        assert!(!format!("{materialization:?}").contains("secret-canary"));
+        let request_scoped_table = materialization
+            .materialize_with_file_io(FileIO::new_with_memory())
+            .expect("materialize deferred response with caller-owned FileIO");
+        assert_eq!(request_scoped_table.identifier().name, "delegated");
+
+        config_mock.assert_async().await;
+        ordinary.assert_async().await;
+        delegated.assert_async().await;
     }
 }

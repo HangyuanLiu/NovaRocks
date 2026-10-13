@@ -58,3 +58,17 @@ accounting hooks. Only the approved protocol/API patch inventory may diverge.
 - Coverage: `catalog::extension::tests::deferred_materialization_retains_loading_runtime_and_kms_without_ambient_runtime`;
   deferred load/stage component tests migrate with R5 and R3.
 - Validation: standalone REST crate tests after the shared Cargo window is free.
+
+### R5: deferred delegated table load
+
+- Files: `src/catalog/extension.rs`.
+- Purpose: retain only `load_table_deferred_with_access_delegation`; issue one
+  delegated GET, accept 200/304, retain TableNotFound on 404, defer FileIO.
+  RestCatalog forwards its bound SessionContext to the session owner.
+- Upstream status: no equivalent deferred delegated table load at the baseline.
+- Production dependency: NovaRocks REST owner, loaded-table materialization and
+  execution credential acquisition. Unused eager delegated load/create APIs and
+  public header constants are intentionally not restored.
+- Exit: IRU-13a replaces the vendored deferred handoff.
+- Coverage: migrated `access_delegation_is_opt_in_and_preserves_redacted_facts`.
+- Validation: standalone REST crate tests after the shared Cargo window is free.
