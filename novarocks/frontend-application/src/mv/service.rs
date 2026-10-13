@@ -643,7 +643,9 @@ fn execute_scheduled_refresh(
     .with_result_capacity(result_capacity.clone());
     let context = match context {
         Ok(context) => context,
-        Err(error) => return ScheduledRefreshDisposition::InvariantViolation(error.to_string().into()),
+        Err(error) => {
+            return ScheduledRefreshDisposition::InvariantViolation(error.to_string().into());
+        }
     };
     let connector_context =
         match crate::connector::connector_request_context_for_execution_on_runtime(
