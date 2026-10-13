@@ -34,4 +34,24 @@ accounting hooks. Only the approved protocol/API patch inventory may diverge.
 
 ## Patch inventory
 
-No patches applied in the initial source commit.
+### H3: typed missing-table result
+
+- Purpose: preserve `load_table`'s exact `O2(NoSuchObjectException)` mapping to
+  `TableNotFound`; other declared Thrift exceptions and transport failures retain
+  `Unexpected`. The upstream runtime/KMS table construction is unchanged.
+- Files: `src/catalog.rs` (`HmsCatalog::load_table`).
+- Upstream status: no PR/issue tracked. rc.2 still classifies this load error as
+  `Unexpected`; `get_namespace`'s corresponding namespace mapping is already
+  upstream and has no local patch.
+- Production dependency/owner: NovaRocks Iceberg connector's HMS catalog control
+  and load paths distinguish explicit absence from unavailable catalog service by
+  `ErrorKind`; the Iceberg connector maintainers own this compatibility contract.
+- Exit: remove in an HMS upstream-convergence follow-up owned by those maintainers
+  once the adopted upstream load API preserves the typed absence/transport
+  distinction and the consumer coverage passes without this patch. No accepted
+  IRU subtask currently claims that deletion.
+- Coverage: existing NovaRocks `catalog::error` unit tests cover the consumer's
+  `TableNotFound` versus `Unexpected` classification; `iceberg-hms` SQL covers
+  normal table loading. Standalone crate checking validates the match against
+  the generated Thrift exception vocabulary. There is no isolated RPC-absence
+  test in this port; no new test hooks or mock classification helper are added.
