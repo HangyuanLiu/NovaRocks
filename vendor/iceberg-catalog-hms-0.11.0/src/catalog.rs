@@ -38,6 +38,7 @@ use volo_thrift::MaybeException;
 
 use super::utils::*;
 use crate::error::{from_io_error, from_thrift_error, from_thrift_exception};
+use crate::table_projection::{HMS_TABLE_OBJECT_BATCH_SIZE, project_iceberg_table_batch};
 
 /// HMS catalog address
 pub const HMS_CATALOG_PROP_URI: &str = "uri";
@@ -476,7 +477,7 @@ impl Catalog for HmsCatalog {
     /// - `Err(...)` if an error occurs during namespace validation or while
     /// querying the database.
     async fn list_tables(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
-        let name = validate_namespace(namespace)?;
+        let name: faststr::FastStr = validate_namespace(namespace)?.into();
         if !self.namespace_exists(namespace).await? {
             return Err(Error::new(
                 ErrorKind::NamespaceNotFound,
@@ -484,19 +485,32 @@ impl Catalog for HmsCatalog {
             ));
         }
 
-        let tables = self
+        let names = self
             .client
             .0
-            .get_all_tables(name.into())
+            .get_all_tables(name.clone())
             .await
             .map(from_thrift_exception)
             .map_err(from_thrift_error)??;
 
-        let tables = tables
-            .iter()
-            .map(|table| TableIdent::new(namespace.clone(), table.to_string()))
-            .collect();
-
+        let mut tables = Vec::new();
+        for batch in names.chunks(HMS_TABLE_OBJECT_BATCH_SIZE) {
+            // These are HMS entities, not Iceberg metadata files. Keep the same
+            // client and outer listing admission/deadline for every batch.
+            let objects = self
+                .client
+                .0
+                .get_table_objects_by_name(name.clone(), batch.to_vec())
+                .await
+                .map(from_thrift_exception)
+                .map_err(from_thrift_error)??;
+            let iceberg = project_iceberg_table_batch(name.as_str(), batch, &objects)?;
+            for (index, table) in batch.iter().enumerate() {
+                if iceberg[index] {
+                    tables.push(TableIdent::new(namespace.clone(), table.to_string()));
+                }
+            }
+        }
         Ok(tables)
     }
 

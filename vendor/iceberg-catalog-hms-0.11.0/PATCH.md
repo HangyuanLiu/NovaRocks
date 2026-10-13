@@ -55,3 +55,29 @@ accounting hooks. Only the approved protocol/API patch inventory may diverge.
   normal table loading. Standalone crate checking validates the match against
   the generated Thrift exception vocabulary. There is no isolated RPC-absence
   test in this port; no new test hooks or mock classification helper are added.
+
+### H4: classify HMS table listings from entity parameters
+
+- Purpose: preserve serial `get_table_objects_by_name` batches of at most 100
+  names on the existing client. Emit only entities whose `parameters["table_type"]`
+  is `iceberg` ignoring ASCII case, validate the entire returned batch before
+  projection, and omit entities that disappeared after the initial name list.
+  This is an RPC item-count bound; it does not claim allocation or response-byte
+  accounting. rc.2's namespace-existence precheck remains in place.
+- Files: `src/catalog.rs` (`HmsCatalog::list_tables`), `src/lib.rs`,
+  `src/table_projection.rs` (copied unchanged from the 0.9 vendor).
+- Upstream status: no upstream PR/issue tracked; NovaRocks M07 PR #1173 introduced
+  this classification. rc.2's `get_all_tables` still returns unclassified names.
+- Production dependency/owner: NovaRocks Iceberg connector's catalog listing
+  contract; Iceberg connector/MEM-1 maintainers own classification and listing
+  admission. No metadata-file loads, retries, client owners, view capability,
+  paging capability, or allocation hooks are added.
+- Exit: the MEM-1 follow-up that replaces the HMS listing boundary owns deletion,
+  after its replacement classifies actual HMS entities with the same omission,
+  validation, and error semantics and passes the existing coverage. Alternatively,
+  remove through that owner when adopted upstream provides the same behavior.
+- Coverage: the nine existing `table_projection_tests` are carried unchanged;
+  NovaRocks connector tests compile this source through the existing `#[path]`
+  seam (the new path is wired in T6). They cover classification, historical case,
+  missing entities, ordering, identity, duplicates, and the 100-name item bound.
+  Existing `hms_listing_observer_tests` cover listing admission/exit ownership.

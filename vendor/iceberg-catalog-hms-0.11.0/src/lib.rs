@@ -53,4 +53,5 @@ pub use catalog::*;
 
 mod error;
 mod schema;
+mod table_projection;
 mod utils;
