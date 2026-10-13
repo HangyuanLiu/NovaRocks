@@ -57,12 +57,12 @@ use novarocks_spi::connector::{
     CatalogHandle, ConnectorDistributedRewriteShape, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorManagedPublicationIntent, ConnectorMutationFailure,
     ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorProviderBindingKey,
-    ConnectorRequestContext, ConnectorWriteAbortOutcome, ConnectorWriteBaseVersion,
-    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
-    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteReceipt,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome, ProviderBindingEpoch, StatisticsArtifactIdentity,
-    StatisticsRequiredAggregation, StatisticsScanColumn,
+    ConnectorRequestContext, ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose,
+    ConnectorWriteBaseVersion, ConnectorWriteFieldBinding, ConnectorWriteFieldRequest,
+    ConnectorWriteFieldToken, ConnectorWriteInputRequest, ConnectorWriteInputShape,
+    ConnectorWriteReceipt, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome, ProviderBindingEpoch,
+    StatisticsArtifactIdentity, StatisticsRequiredAggregation, StatisticsScanColumn,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2138,6 +2138,24 @@ impl IcebergWriteSessionControl {
         if staged.is_none() {
             crate::commit::validation::ensure_iceberg_write_supported_from_metadata(&metadata)
                 .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unsupported, error))?;
+            // INSERT uses this ordinary data session instead of the legacy
+            // prepare_write call. Reuse its intent/ref policy after the existing
+            // generic support gate; other session flavors and input families
+            // retain their independent admission contracts.
+            if matches!(request.flavor, ConnectorWriteSessionFlavor::Ordinary)
+                && request.purpose == ConnectorWriteAdmissionPurpose::OrdinaryDml
+                && matches!(request.input, ConnectorWriteInputRequest::Data { .. })
+            {
+                let target_fqn = format!("{}.{}", self.key.instance_id.as_str(), request.table);
+                if let Some(denied) = crate::commit::write_preparation::insert_intent_support_denial(
+                    &metadata,
+                    request.intent,
+                    request.target_ref.as_str(),
+                    &target_fqn,
+                ) {
+                    return Err(denied);
+                }
+            }
         }
         let target_ref = request.target_ref.as_str();
         let base_snapshot_id = match &staged {

@@ -1697,6 +1697,234 @@ mod tests {
         assert_eq!(server.list_requests().len(), 2);
     }
 
+    fn insert_admission_metadata(
+        version: crate::iceberg::spec::FormatVersion,
+        partitioned: bool,
+    ) -> crate::iceberg::spec::TableMetadata {
+        use crate::iceberg::spec::{
+            NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder, TableMetadataBuilder,
+            Transform, Type,
+        };
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("schema");
+        let spec = if partitioned {
+            PartitionSpec::builder(schema.clone())
+                .with_spec_id(0)
+                .add_partition_field("id", "id", Transform::Identity)
+                .expect("partition field")
+                .build()
+                .expect("partition spec")
+        } else {
+            PartitionSpec::unpartition_spec()
+        };
+        let builder = TableMetadataBuilder::new(
+            schema,
+            spec.into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///tmp/novarocks-insert-admission/table".to_string(),
+            version,
+            HashMap::new(),
+        )
+        .expect("metadata builder");
+        builder.build().expect("metadata").metadata
+    }
+
+    /// Exercise the actual session owner against the existing isolated REST
+    /// backend, not a preparation-only guard or a mocked admission verdict.
+    fn begin_insert_admission(
+        metadata: crate::iceberg::spec::TableMetadata,
+        intent: novarocks_spi::connector::ConnectorWriteIntent,
+        target_ref: &str,
+        purpose: novarocks_spi::connector::ConnectorWriteAdmissionPurpose,
+    ) -> Result<
+        novarocks_spi::connector::write_stack::session::ConnectorWriteSessionPlan,
+        ConnectorError,
+    > {
+        use novarocks_spi::connector::write_stack::session::{
+            ConnectorWriteBeginRequest, ConnectorWriteControl, ConnectorWriteSessionFlavor,
+        };
+        use novarocks_spi::connector::{
+            CatalogHandle, CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId,
+            ConnectorProviderId, ConnectorRequestContext, ConnectorStopOwner,
+            ConnectorWriteFieldRequest, ConnectorWriteInputRequest, ConnectorWriteTargetRef,
+            ProviderBindingEpoch,
+        };
+        let response = serde_json::json!({
+            "metadata-location": "file:///tmp/novarocks-insert-admission/metadata.json",
+            "metadata": metadata,
+        })
+        .to_string();
+        let server = PagedTablesServer::start_http_response(move |request| {
+            assert!(
+                request.starts_with("GET /v1/namespaces/db/tables/t "),
+                "admission must only load metadata: {request}"
+            );
+            (200, response.clone())
+        });
+        let executor = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(
+                executor.handle().clone(),
+            )),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(
+                executor.handle().clone(),
+            )),
+        );
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[
+                ("iceberg.catalog.type".into(), "rest".into()),
+                ("uri".into(), format!("http://{}", server.address)),
+            ],
+        )
+        .expect("configuration");
+        let runtime = Arc::new(
+            crate::metadata_context::IcebergMetadataContext::try_new(
+                crate::catalog_control::IcebergCatalogControlState::new(configuration),
+                crate::resources::IcebergMetadataResources::new(binding, executor.handle().clone()),
+            )
+            .expect("metadata owner"),
+        );
+        let instance_id = ConnectorInstanceId::parse("ice").expect("instance");
+        let control = crate::commit::write_stack::control::IcebergWriteSessionControl::new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
+                instance_id: instance_id.clone(),
+            },
+            ProviderBindingEpoch::new(),
+            CatalogHandle::new(instance_id, CatalogVersion::from_bytes([1; 32])),
+            runtime,
+        );
+        let result = control.begin_write(ConnectorWriteBeginRequest {
+            table: Arc::from("db.t"),
+            target_ref: ConnectorWriteTargetRef::parse(target_ref).expect("target ref"),
+            intent,
+            purpose,
+            input: ConnectorWriteInputRequest::Data {
+                fields: vec![ConnectorWriteFieldRequest::new(
+                    arrow::datatypes::Field::new("id", arrow::datatypes::DataType::Int64, false),
+                )],
+            },
+            base: None,
+            flavor: ConnectorWriteSessionFlavor::Ordinary,
+            context: ConnectorRequestContext::try_new(
+                std::time::Instant::now() + Duration::from_secs(30),
+                ConnectorStopOwner::new().view(),
+                64 * 1024,
+                1024 * 1024,
+            )
+            .expect("request context"),
+        });
+        assert_eq!(server.list_requests(), ["/v1/namespaces/db/tables/t"]);
+        result
+    }
+
+    #[test]
+    fn ordinary_insert_session_denies_partition_overwrite_on_unpartitioned_and_pre_v3_tables() {
+        use crate::iceberg::spec::FormatVersion;
+        use novarocks_spi::connector::{ConnectorWriteAdmissionPurpose, ConnectorWriteIntent};
+        for (version, partitioned, expected) in [
+            (
+                FormatVersion::V3,
+                false,
+                "INSERT OVERWRITE PARTITIONS requires a partitioned table; table ice.db.t is unpartitioned (use OVERWRITE without PARTITIONS)",
+            ),
+            (
+                FormatVersion::V2,
+                true,
+                "INSERT OVERWRITE PARTITIONS requires an Iceberg v3 row-lineage table; table ice.db.t is v2",
+            ),
+        ] {
+            let error = begin_insert_admission(
+                insert_admission_metadata(version, partitioned),
+                ConnectorWriteIntent::PartitionOverwrite,
+                "main",
+                ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            )
+            .expect_err("partition overwrite must be denied before a writer is admitted");
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            assert_eq!(error.message(), expected);
+        }
+    }
+
+    #[test]
+    fn ordinary_insert_session_keeps_supported_v2_append_and_v3_partition_overwrite_admissible() {
+        use crate::iceberg::spec::FormatVersion;
+        use novarocks_spi::connector::{ConnectorWriteAdmissionPurpose, ConnectorWriteIntent};
+        for (version, partitioned, intent) in [
+            (FormatVersion::V2, false, ConnectorWriteIntent::Append),
+            (
+                FormatVersion::V3,
+                true,
+                ConnectorWriteIntent::PartitionOverwrite,
+            ),
+        ] {
+            let plan = begin_insert_admission(
+                insert_admission_metadata(version, partitioned),
+                intent,
+                "main",
+                ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            )
+            .expect("a supported ordinary INSERT must remain admissible");
+            assert_eq!(plan.expected_targets().len(), 1);
+        }
+    }
+
+    #[test]
+    fn ordinary_session_materialized_view_purpose_does_not_acquire_insert_only_denials() {
+        use crate::iceberg::spec::FormatVersion;
+        use novarocks_spi::connector::{ConnectorWriteAdmissionPurpose, ConnectorWriteIntent};
+        // Same table, intent and input as the unpartitioned INSERT denial above.
+        // The existing purpose path remains independent of the new INSERT gate.
+        let plan = begin_insert_admission(
+            insert_admission_metadata(FormatVersion::V3, false),
+            ConnectorWriteIntent::PartitionOverwrite,
+            "main",
+            ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+        )
+        .expect("the existing MV-purpose admission must retain its own policy");
+        assert_eq!(plan.expected_targets().len(), 1);
+    }
+    #[test]
+    fn ordinary_insert_session_keeps_generic_support_error_kind_and_precedence() {
+        use crate::iceberg::spec::FormatVersion;
+        use novarocks_spi::connector::{ConnectorWriteAdmissionPurpose, ConnectorWriteIntent};
+        // This protocol-valid metadata names a sort source absent from its schema.
+        // It also fails the unpartitioned INSERT-only gate. The existing generic
+        // support error must retain its kind and precedence.
+        let mut json = serde_json::to_value(insert_admission_metadata(FormatVersion::V3, false))
+            .expect("metadata JSON");
+        json["default-sort-order-id"] = serde_json::json!(1);
+        json["sort-orders"] = serde_json::json!([{
+            "order-id": 1,
+            "fields": [{
+                "transform": "identity", "source-id": 999,
+                "direction": "asc", "null-order": "nulls-first",
+            }],
+        }]);
+        let metadata = serde_json::from_value(json).expect("metadata with unresolved sort source");
+        let error = begin_insert_admission(
+            metadata,
+            ConnectorWriteIntent::PartitionOverwrite,
+            "main",
+            ConnectorWriteAdmissionPurpose::OrdinaryDml,
+        )
+        .expect_err("generic support must fail before the INSERT-only gate");
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(
+            error.message(),
+            "iceberg table sort field references missing source id 999"
+        );
+    }
+
     fn existence_response() -> String {
         use crate::iceberg::spec::{
             FormatVersion, NestedField, PrimitiveType, Schema, SortOrder, TableMetadataBuilder,
