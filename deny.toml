@@ -155,11 +155,8 @@ skip = [
     { crate = "tower@0.4.13", reason = "transitive through tonic 0.12" },
     { crate = "twox-hash@1.6.3", reason = "transitive through the dev-only synchronous mysql client" },
 
-    # The benchmark intentionally validates toml 0.9 while product config stays on 0.8.
-    { crate = "toml@0.9.8", reason = "owned by novarocks-datasketches-bench input parsing" },
-    { crate = "serde_spanned@1.1.1", reason = "transitive through toml 0.9" },
-    { crate = "toml_datetime@0.7.3", reason = "transitive through toml 0.9 and toml_edit 0.23" },
-    { crate = "toml_edit@0.23.9", reason = "transitive through proc-macro-crate and toml 0.9" },
+    { crate = "toml_datetime@0.7.3", reason = "transitive through toml_edit 0.23" },
+    { crate = "toml_edit@0.23.9", reason = "transitive through proc-macro-crate" },
 
     # Windows support crates are split by upstream minimum-version ranges.
     { crate = "windows-sys@0.52.0", reason = "transitive through ring and socket2 0.5" },

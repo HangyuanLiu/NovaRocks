@@ -1044,6 +1044,7 @@ mod tests {
             let evaluator = FakeEvaluator::new(mode);
             let arena = Rc::new(RefCell::new(ScalarArena::new()));
             let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+            ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
             ctx.set_scalar_arena(Rc::clone(&arena));
             ctx.set_constant_evaluator(evaluator);
             Self {
@@ -1057,6 +1058,7 @@ mod tests {
         fn without_evaluator() -> Self {
             let arena = Rc::new(RefCell::new(ScalarArena::new()));
             let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+            ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
             ctx.set_scalar_arena(Rc::clone(&arena));
             Self {
                 arena,
@@ -1266,6 +1268,7 @@ mod tests {
             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             control,
         );
+        ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_scalar_arena(Rc::clone(&fixture.arena));
         if let Some(evaluator) = evaluator {
             ctx.set_constant_evaluator(evaluator);

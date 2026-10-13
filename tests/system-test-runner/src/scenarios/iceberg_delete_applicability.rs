@@ -116,15 +116,27 @@ pub(super) fn credential_overlay_with_cache(enabled: bool) -> CrossProcessConfig
     }
 }
 pub(super) fn create_catalog_sql(fixture: &Fixture) -> String {
+    create_catalog_sql_from_parts(
+        &fixture.manifest.rest_uri,
+        &fixture.manifest.warehouse,
+        fixture.proxy.endpoint(),
+    )
+}
+
+pub(super) fn create_catalog_sql_from_parts(
+    rest_uri: &str,
+    warehouse: &str,
+    s3_endpoint: &str,
+) -> String {
     format!(
         r#"CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(
 "type"="iceberg", "iceberg.catalog.type"="rest", "uri"="{}", "warehouse"="{}",
 "aws.s3.endpoint"="{}", "aws.s3.region"="us-east-1", "aws.s3.enable_path_style_access"="true",
 "credential.object-store-metadata.consumer-role"="frontend", "credential.object-store-metadata.mode"="static", "credential.object-store-metadata.name"="uea4g-fixture", "credential.object-store-metadata.generation"="v1",
 "credential.object-store-data.consumer-role"="backend", "credential.object-store-data.mode"="static", "credential.object-store-data.name"="uea4g-fixture", "credential.object-store-data.generation"="v1")"#,
-        escaped(&fixture.manifest.rest_uri),
-        escaped(&fixture.manifest.warehouse),
-        escaped(fixture.proxy.endpoint())
+        escaped(rest_uri),
+        escaped(warehouse),
+        escaped(s3_endpoint)
     )
 }
 

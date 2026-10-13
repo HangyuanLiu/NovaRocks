@@ -73,11 +73,3 @@ novarocks-connector-iceberg-functions.workspace = true
 novarocks-plan-codec.workspace = true
 novarocks-sql = { workspace = true, features = ["test-support"] }
 novarocks-parser.workspace = true
-
-[[bench]]
-name = "table_write_statistics"
-harness = false
-
-[[bench]]
-name = "regexp_pattern_compile"
-harness = false

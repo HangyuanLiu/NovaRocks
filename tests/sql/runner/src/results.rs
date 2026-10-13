@@ -715,9 +715,14 @@ pub fn write_mismatch_artifacts(request: MismatchArtifacts<'_>) -> Result<()> {
         actual_rows,
         reason,
     } = request;
-    let out_dir = root_dir.join(suite_name).join(artifact_id);
-    fs::create_dir_all(&out_dir)
-        .with_context(|| format!("create dir failed: {}", out_dir.display()))?;
+    let suite_dir = root_dir.join(suite_name);
+    fs::create_dir_all(&suite_dir)
+        .with_context(|| format!("create dir failed: {}", suite_dir.display()))?;
+    let out_dir = tempfile::Builder::new()
+        .prefix(&format!("{artifact_id}-"))
+        .tempdir_in(&suite_dir)
+        .context("allocate unique mismatch directory")?
+        .keep();
 
     let expected = BTreeMap::from([(
         1usize,
@@ -1050,5 +1055,32 @@ mod expected_error_code_result_classification_tests {
             verify_text_assertions(&misnamed, &analyze_jobs(&[["1", "SUCCEEDED", "own", ""]]));
         assert!(!ok);
         assert!(reason.contains("has no column \"tbl\""), "{reason}");
+    }
+}
+
+#[cfg(test)]
+mod mismatch_artifact_tests {
+    #[test]
+    fn mismatch_artifacts_retain_distinct_attempts() {
+        let temp = tempfile::tempdir().unwrap();
+        for actual in ["wrong-one", "wrong-two"] {
+            super::write_mismatch_artifacts(super::MismatchArtifacts {
+                root_dir: temp.path(),
+                suite_name: "suite",
+                artifact_id: "case-query1",
+                expected_header: &["answer".into()],
+                expected_rows: &[vec!["42".into()]],
+                actual_header: &["answer".into()],
+                actual_rows: &[vec![actual.into()]],
+                reason: "different rows",
+            })
+            .unwrap();
+        }
+        let mut outputs = std::fs::read_dir(temp.path().join("suite"))
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path().join("actual.tsv")).unwrap())
+            .collect::<Vec<_>>();
+        outputs.sort();
+        assert_eq!(outputs, vec!["answer\nwrong-one\n", "answer\nwrong-two\n"]);
     }
 }

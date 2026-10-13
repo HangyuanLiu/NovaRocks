@@ -5,6 +5,7 @@ domain: [test-fixtures]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by: [ADR-0173]
 date: 2026-09-29
 provenance:
   - "discussion: 2026-09-29 versioned fixture runtime ownership and atomic publication"

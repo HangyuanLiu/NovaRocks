@@ -19,7 +19,7 @@ under the License.
 
 # 测试准入、尝试材料与证据边界
 
-开发规则由 [workflow-contract](../../../.agents/skills/workbench/skills/workbench/references/workflow-contract.md) §8.5–§8.7 定义；本指南落实 NovaRocks 的位置、操作责任和现有报告解释，不建立第二套运行协议或结果 schema。新资产及实质扩展从规则合入起消费合同；存量按领域迁移，文件存在或一次通过不表示已经合规。本文不改变 Cargo、runner、fixture、默认输出位置或产品验收门。
+开发规则由 [workflow-contract](../../../.agents/skills/workbench/skills/workbench/references/workflow-contract.md) §8.5–§8.7 定义；本指南落实 NovaRocks 的位置、操作责任和现有报告解释，不建立第二套运行协议或结果 schema。新资产及实质扩展从规则合入起消费合同；存量按领域迁移，文件存在或一次通过不表示已经合规。当前阶段仅维护功能和数据正确性；SQL 原生入口仅发现 correctness suite，旧常设测量载体已退出。
 
 ## 准入与领域迁移
 
@@ -31,7 +31,7 @@ SQL 文件保留必要的语义输入和断言，多步生命周期编排归 sys
 
 ## 获批判据的 Git 快照
 
-原生执行 owner 负责 workload、动作、合法输入、采样有效性、正确性断言、资源保护停止条件与实际退出；分析 owner 负责方法适用性、比较、效应量和不确定度。runner 不读取任务验收门限，不以历史报告判断当前运行资格。常设协议与方法引用已有不可变版本；持续基准不需要每轮新建 plan。任务特有对照、门限和适用范围写入获批 plan，在候选确认性测量前固定。需要探索的先声明探索及后续判据确认，不能测后挑门限。
+原生执行 owner 负责 workload、动作、合法输入、采样有效性、正确性断言、资源保护停止条件与实际退出；分析 owner 负责方法适用性、比较、效应量和不确定度。runner 不读取任务验收门限，不以历史报告判断当前运行资格。一次性实验的方法与输入引用已有不可变版本；本阶段不维护常设基准或持续测量协议。任务特有对照、门限和适用范围写入获批 plan，在候选确认性测量前固定。需要探索的先声明探索及后续判据确认，不能测后挑门限。
 
 NovaRocks 的工作文档根按 [AGENTS §12](../../../AGENTS.md#12-project-development-workflow-and-knowledge-base) 解析；vault Git 仓库可能位于该项目文档根的上级。操作时先确认真实仓库根和仓库相对路径，不把机器路径固化为项目接口。
 
@@ -83,13 +83,13 @@ PY_CREATE
 
 在材料中记录实际路径，将临时脚本、输入/环境说明、实际命令与输出一起保存。可以明确选择其它实验根并承担同样保留责任；这不是新增环境变量、CLI 或目录管理机制。不默认写 `/tmp`，不在 `tests/benchmarks/<任务>` 或 `docs/testing/<任务>` 新建永久验收机器。
 
-现有 runner 的原生 artifact-root、checkout 内 ignored logs/reports 仍允许。可通过新根满足独占的使用原生参数，如 system 的 `--artifact-root`；不能独占的明确记录存量缺口并交对应迁移。system `run_one` 对固定场景子目录用 `create_dir_all`，SQL benchmark 也对毫秒时间子目录用 `create_dir_all`；二者都没有原子拒绝已存在目录的保证。调用者选新根是目前操作责任，本文不声称 runner 已强制执行。关联所有输出的真实位置，不提交运行产物进源码 Git。
+现有 runner 的原生 artifact-root、checkout 内 ignored logs/reports 仍允许。可通过新根满足独占的使用原生参数，如 system 的 `--artifact-root`；不能独占的明确记录存量缺口并交对应迁移。system `run_one` 对固定场景子目录用 `create_dir_all`，没有原子拒绝已存在目录的保证。调用者选新根是目前操作责任，本文不声称 runner 已强制执行。关联所有输出的真实位置，不提交运行产物进源码 Git。
 
 ## 保留、共享交接与清理
 
 材料默认不自动过期，未解决失败继续保留。只有任务结论已审阅、正式引用和重分析所需脚本/输入说明已共享交接且核实可恢复后，才按记录的处置清理本地副本。未被正式引用的纯探索可在明确结束并记录取舍后清理。正式材料由存储 owner 记录访问、保留依据与处置；不能用删除 worktree 或定时清理代替。
 
-本地路径只称本地证据。正式共享引用需有真实共享访问、保留 owner 以及所引用 Git 对象/输入/脚本的恢复条件；尚无共享交接时如实声明。本指南不自动上传、创建云服务或删除材料，凭据继续按既有规则脱敏。历史失败可显式用于分析与定位，不能成为新采集的隐藏输入；声明为长期 fixture 时按 fixture 自身合同维护。TST-G6b 的隔离重跑验证与 TST-G7b 的持续历史/共享服务仍需实际交付，干净工作树或本地 commit 不替代这些证据。
+本地路径只称本地证据。正式共享引用需有真实共享访问、保留 owner 以及所引用 Git 对象/输入/脚本的恢复条件；尚无共享交接时如实声明。本指南不自动上传、创建云服务或删除材料，凭据继续按既有规则脱敏。历史失败可显式用于分析与定位，不能成为新采集的隐藏输入；声明为长期 fixture 时按 fixture 自身合同维护。周期调度和共享证据存储尚未交付；TST-G7a/G7b 已取消，没有新的持续测量/共享历史服务承诺。干净工作树或本地 commit 不替代这些证据。
 
 ## 代表性原生报告映射
 
@@ -99,15 +99,28 @@ PY_CREATE
 |---|---|---|
 | system [scenario.rs `write_evidence`](../../../tests/system-test-runner/src/scenario.rs) → 场景根 `scenario-evidence.json` | `scenario`、`command`、开始/结束时间、`source_revision/source_dirty/source_tree_sha256`、runner identity/路径、Cargo.lock hash、平台、`actions/phase_observations`、runtime/binary/config 路径及 config hash、`cluster_size`、`launch_profile`、进程 launch identities、有效配置及 hash、`outcome/exit_code`、失败 diagnostics；当前 schema 5 | `launch_profile` 是 harness 的 `fault-scenario/performance` 配置，不是 Cargo profile。binary 路径与 runner identity 不证明各 FE/BE 实际能力。字段不保证每个阶段均被观察或此次已运行。G2 补实际构建自报；各领域补缺少的性质/退出观察。 |
 | system [runner.rs `run_one`](../../../tests/system-test-runner/src/runner.rs) → stdout/stderr、场景 evidence 与 runtime/log 根 | 选择由 registry/`--only` 决定；失败保留材料、动作、诊断和 rerun 命令。正常路径先检查 cluster shutdown 与 fixture teardown，追加 cleanup action，再写 Passed；失败路径先写 Failed，随后处理 cleanup 错误 | evidence 的 `exit_code` 按 outcome 合成 0/1，不是每个子进程退出码。Failed 写出时尚未完成 cleanup；cleanup 出错或启动失败可能缺最终 evidence，须保留 runner 原始错误与实际退出事实。打印的旧 rerun 根不能直接复用，复跑换新根。现有 G6b/领域链路承接隔离与终态缺口。 |
-| CI [logging.sh `ci_render_summary`](../../../tools/ci/lib/logging.sh) → `CI_SUMMARY` | 外层传入的 Status、开始/结束/耗时、Repo/Branch/Commit/Run dir、runtime/SQL config 与 MySQL port；stage、system scenario、SQL suite/case rows 的原生 status/耗时/log/artifact；可选 blocked、SQL failure classification、failure tail | summary 是外层记录的汇总，未写入的行不能补为通过；Commit 不等于二进制来源或能力，config 路径不证明有效配置。状态不代替实际进程退出/清理日志、不可变判据引用或共享保留。G2 补构建事实；实际 CI/领域 owner 与 G6b 保留运行边界，G7b 承接持续共享历史。 |
-| 系统实验 [performance/provenance.rs](../../../tests/system-test-runner/src/performance/provenance.rs) → 场景根 `run-manifest.json` 及引用材料 | `kind/formal/run_id/scenario/command`、时间与 `status/exit_code`；源码 revision/tree hash/dirty、runner 路径、live BE build identity 和进程身份；配置/workload/fixture/tool/Cargo.lock/构建图/descriptor/effective-config/资源与 realization/inventory 的 hash；工具链、平台及 `build_profile`。完成路径验证输入未改变后记录 completed/0；未完成 Drop 尝试写 incomplete | 当前 writer schema 6，而 [UEA1 artifact_protocol.py](../../../tests/benchmarks/uea1/artifact_protocol.py) 的 `RUN_MANIFEST_SCHEMA_VERSION` 为 5，不能称 reader/writer 已对齐。`build_profile` 由 binary 路径分量推测，FE build identity 取一致的 BE identity；不等于逐二进制自报。Drop 的 best-effort 写入不保证崩溃时终态持久化或资源退出。G7a 设计共享采样/分析与记录接线，G2 补自报，UEA1 领域/G7c 承接漂移及旧实验迁移，不把旧 schema 或准入白名单冻结为共享合同。 |
+| CI [logging.sh `ci_render_summary`](../../../tools/ci/lib/logging.sh) → `CI_SUMMARY` | 外层传入的 Status、开始/结束/耗时、Repo/Branch/Commit/Run dir、runtime/SQL config 与 MySQL port；stage、system scenario、SQL suite/case rows 的原生 status/耗时/log/artifact；可选 blocked、SQL failure classification、failure tail | summary 是外层记录的汇总，未写入的行不能补为通过；Commit 不等于二进制来源或能力，config 路径不证明有效配置。状态不代替实际进程退出/清理日志、不可变判据引用或共享保留。G2 补构建事实；实际 CI/领域 owner 与 G6b 保留运行边界；共享历史服务尚未交付。 |
 
-构建身份的当前来源见 [version/build.rs](../../../novarocks/version/build.rs)：`NOVAROCKS_NATIVE_BUILD_IDENTITY` 显式字符串或完整 Git commit，以及短 hash/full commit/time；未自报实际传递依赖合并的能力、profile 和有效编译设置。G2 交付前记录当前可确认的构建材料与缺口，不能从源码 HEAD、target 路径、文件名或 identity 推定“未编入测试能力”。G7a 原样关联各 FE/BE 和 runner 实际使用的自报材料，G2 交付时验证接线；本文没有实现该机制。
+构建身份的当前来源见 [version/build.rs](../../../novarocks/version/build.rs)：`NOVAROCKS_NATIVE_BUILD_IDENTITY` 显式字符串或完整 Git commit，以及短 hash/full commit/time；未自报实际传递依赖合并的能力、profile 和有效编译设置。G2 交付前记录当前可确认的构建材料与缺口，不能从源码 HEAD、target 路径、文件名或 identity 推定“未编入测试能力”。G2 能力/profile 自报与正式发布门控未交付前仍为未知；本文没有实现该机制。
 
-SQL benchmark 是补充输出位置，见 [benchmark.rs](../../../tests/sql/runner/src/benchmark.rs)：默认 `reports/sql-benchmarks/` 下 `run-<millis>/<workload>/` 写 `run.json`、`SUMMARY.md`、测量 CSV 和 profile 材料。`WorkloadReport` 表达 workload/scenario/READY fixture、verification、warmup/measured runs、concurrency、cross-process topology、binary 路径以及 controller 提供的 environment/comparison key；这些字段不证明来源/能力或跨机器可比性，`verification: passed` 也不是性能达标。它不构成共享分析协议，供给、失败材料与测量迁移由 G7c 承接；现有命令和默认位置不在 G1 改动范围。
+## 当前功能资产、成本与频率
+
+| 性质 / owner | 入口与成本 | 相关改动与频率 |
+|---|---|---|
+| result support、FS corpus、MV owner | 对应 Rust crate；本地、无集群 | 模块/helper/输入改动必跑，沿已有 Rust CI |
+| 慢端、并发结果与原查询期限 | system 精确 selector；1FE+3BE、显式 | writer/buffer/ACK/取消/helper 改动必跑；领域维护者每周手工轮次 |
+| range/delete/planning/DOP | system 显式功能组；真实 fixture 和 1FE+3BE，成本较高 | provider/cache/delete/range/admission/fixture 改动必跑；每周相关领域轮次，缺输入如实记录 |
+| MV/OPTIMIZE | SQL correctness 的具体 case | publication/maintenance 改动必跑，沿既有 suite |
+| SSB/TPC-H/TPC-DS | 原生 SQL 三套 `explicit_only`；高成本 | runner/输入绑定改动必跑三套；领域 SQL 按相关性选择，每周手工完整数据集轮次 |
+
+这些周期是维护责任，尚无自动调度；没有真实运行就不记录周期通过。完整发现与默认执行分别由 `--list/--list-default`（system）和 `--list-suites`/suite manifest（SQL）定义。`performance` launch profile 只选择干净的原生 harness 配置，支持 release binary 并拒绝 fault 注入，不是性能实验。相关指南见 [system](../../../tests/system-test-runner/README.md) 与 [SQL](../../../tests/sql/README.md)。
+
+SSB/TPC 输入 owner 显式供给 READY，消费者仅 check，不在失败后自动 ensure。SQL 正常成功、语句错误、结果 mismatch 和清理失败分别保留原生返回值、case/expected/actual/diff、FE/BE 日志和实际退出；耗时只作普通运行说明，不转成测量 CSV 或比较门。FE preparation 运行级路由和计时钩子退出，独立鉴权的 statement observation 保留功能消费者；这不表示 G2 发布能力门控完成。
 
 ## 失败与结论边界
 
 原始失败、复跑结果、归因和已批准处置分别记录。单跑通过只证明该次未复现；时间常量加并发负载也不能单独排除产品竞争。调查应保留实际负载/进程观察、失败阶段和相同条件下的比较证据；未知原因就保留未知，不以测试名或一次成功归因噪声。全量原始失败不能被定向通过覆盖，历史已批准失败处置也不能改写本次原始结果。
 
 缺终态保持未完成；清理失败、必跑覆盖未执行、另行豁免及构建事实缺失均保留原状并缩小结论。采集成功只证明取得数据，没有适用比较方法时明确未评估。all-in-one smoke、定向功能检查、本地机制运行与真实 1FE+3BE/Linux 性能验收分别表达，不用全局 PASS 掩盖它们的边界。
+
+G7c 本次批准的剩余 SQL 与单测失败例外只影响本次退役推进条件：保留各次 raw FAIL、具体失败集合、来源和批准处置，不改 golden、断言或原始退出码，不称全套 SQL/UT 已通过。该例外不豁免新的语句观测、生命周期、输入校验与清理性质，也不构成后续任务的全局 baseline 豁免。最终 P09/workspace 结论由真实独立结果填写。

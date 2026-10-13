@@ -149,10 +149,7 @@ fn run_dispatch(cli: Cli) -> Result<()> {
         bail!("no system scenarios are registered");
     }
     for scenario in &selected {
-        scenario.validate_runner_inputs(
-            config.launch_profile,
-            config.uea1_workload_manifest.as_deref(),
-        )?;
+        scenario.validate_runner_inputs(config.launch_profile)?;
     }
     for scenario in selected {
         run_one(scenario, &config)?;
@@ -244,11 +241,6 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         );
     }
     let bounded_original = exact_mysql_clock.is_some() || root_observation_clock.is_some();
-    let uea1_preparation_diagnostic_secret = launch_config
-        .child_environment
-        .fe
-        .get("NOVAROCKS_PREPARATION_DIAGNOSTIC_SECRET")
-        .cloned();
     let preparation = (|| -> Result<_> {
         if bounded_original {
             crate::scenario::ExactMysqlPrelaunchClock::validate_launch(
@@ -414,8 +406,6 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         config.base_config_path.clone(),
         config.cluster_size,
         config.launch_profile,
-        config.uea1_workload_manifest.clone(),
-        uea1_preparation_diagnostic_secret,
         exact_mysql_clock,
     );
     context.action("cluster launched and topology barrier passed");
@@ -441,18 +431,13 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
             novarocks_cluster_harness::LaunchProfile::FaultScenario => "fault-scenario",
             novarocks_cluster_harness::LaunchProfile::Performance => "performance",
         };
-        let manifest = config
-            .uea1_workload_manifest
-            .as_ref()
-            .map(|path| format!(" --uea1-workload-manifest {}", path.display()))
-            .unwrap_or_default();
         let exact_binding = config
             .exact_mysql_execution_binding
             .as_ref()
             .map(|path| format!(" --exact-mysql-execution-binding {}", path.display()))
             .unwrap_or_default();
         eprintln!(
-            "rerun: novarocks-system-tests --only {} --binary {} --config {} --artifact-root {} --cluster-size {} --timeout-secs {} --launch-profile {}{}{}",
+            "rerun: novarocks-system-tests --only {} --binary {} --config {} --artifact-root {} --cluster-size {} --timeout-secs {} --launch-profile {}{}",
             context.name(),
             config.binary.display(),
             config.base_config_path.display(),
@@ -460,7 +445,6 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
             config.cluster_size,
             config.timeout.as_secs(),
             launch_profile,
-            manifest,
             exact_binding,
         );
         let cluster_cleanup = if exact_mysql_clock.is_some() {
@@ -602,7 +586,6 @@ mod tests {
         let selected = select(&scenarios, &[]).expect("select default system baseline");
         assert!(selected.iter().all(|scenario| {
             scenario.name() != "frontend-lifecycle/blue-green-session-cutover"
-                && scenario.name() != "query-concurrency/uea4a1-b0-performance"
         }));
         assert!(
             select(
@@ -620,66 +603,8 @@ mod tests {
         let scenarios = crate::scenarios::all();
         for scenario in select(&scenarios, &[]).expect("select default system baseline") {
             scenario
-                .validate_runner_inputs(
-                    novarocks_cluster_harness::LaunchProfile::FaultScenario,
-                    None,
-                )
+                .validate_runner_inputs(novarocks_cluster_harness::LaunchProfile::FaultScenario)
                 .unwrap_or_else(|error| panic!("default scenario {}: {error:#}", scenario.name()));
-        }
-    }
-
-    #[test]
-    fn performance_preflight_rejects_missing_profile_and_manifest() {
-        let scenarios = crate::scenarios::all();
-        let selected = select(
-            &scenarios,
-            &["performance/uea1-short-concurrent".to_string()],
-        )
-        .expect("select performance scenario");
-        let scenario = selected[0];
-        assert!(
-            scenario
-                .validate_runner_inputs(
-                    novarocks_cluster_harness::LaunchProfile::FaultScenario,
-                    None
-                )
-                .is_err()
-        );
-        assert!(
-            scenario
-                .validate_runner_inputs(novarocks_cluster_harness::LaunchProfile::Performance, None)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn startup_baseline_requires_the_performance_profile_before_launch() {
-        let scenarios = crate::scenarios::all();
-        assert!(
-            select(&scenarios, &[])
-                .expect("select default scenarios")
-                .iter()
-                .all(|scenario| scenario.name() != "task-execution/uea5d-startup-baseline"),
-            "the 1,000-query formal baseline must remain an explicit stage"
-        );
-        for name in [
-            "task-execution/startup-baseline",
-            "task-execution/uea5d-startup-baseline",
-        ] {
-            let selected =
-                select(&scenarios, &[name.to_string()]).expect("select startup baseline scenario");
-            let scenario = selected[0];
-            assert!(
-                scenario
-                    .validate_runner_inputs(
-                        novarocks_cluster_harness::LaunchProfile::FaultScenario,
-                        None
-                    )
-                    .is_err()
-            );
-            scenario
-                .validate_runner_inputs(novarocks_cluster_harness::LaunchProfile::Performance, None)
-                .expect("performance profile is accepted before startup");
         }
     }
 }
@@ -899,7 +824,6 @@ mod exact_mysql_prelaunch_teardown_tests {
             cluster_size: 3,
             timeout: Duration::from_secs(20),
             launch_profile: LaunchProfile::FaultScenario,
-            uea1_workload_manifest: None,
             exact_mysql_execution_binding: None,
             held_native_execution_binding: None,
             held_live_collector_fences: false,
@@ -1056,7 +980,6 @@ mod neutral_root_prelaunch_tests {
             cluster_size: 3,
             timeout: Duration::from_secs(20),
             launch_profile: LaunchProfile::FaultScenario,
-            uea1_workload_manifest: None,
             exact_mysql_execution_binding: None,
             held_native_execution_binding: None,
             held_live_collector_fences: false,

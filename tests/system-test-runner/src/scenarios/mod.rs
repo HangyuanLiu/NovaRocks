@@ -15,7 +15,7 @@ pub(crate) mod hms_bulk_readonly_native;
 pub(crate) mod hms_classification_preflight;
 mod iceberg_delete_applicability;
 mod iceberg_delete_oracle;
-mod iceberg_delete_performance;
+mod iceberg_delete_warm;
 #[cfg(unix)]
 mod independent_root_target;
 mod listing;
@@ -32,24 +32,24 @@ mod native_ingress;
 mod native_trust;
 mod paimon;
 mod preparation_capacity;
+mod provider_mysql_actors;
 mod query_concurrency;
 mod query_lifecycle;
 mod query_output;
 mod result_delivery;
-mod result_delivery_baseline;
 mod result_delivery_closing;
+mod result_delivery_concurrency;
+mod result_delivery_deadline;
+mod result_delivery_progress;
 mod result_delivery_root_protocol;
 mod result_delivery_root_reply;
+mod result_delivery_support;
 mod runtime_filter;
 mod state_family;
 mod table_maintenance;
 mod task_evidence;
-mod task_execution;
-mod uea1_performance;
 mod uea4_catalog_planning;
 mod uea4_range_reads;
-mod uea4_rss_baselines;
-mod uea4_scan_performance;
 mod uea4_scan_readiness;
 
 pub fn all() -> Vec<Box<dyn Scenario>> {
@@ -63,24 +63,21 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.push(Box::new(listing_real_rest::RealRestListing::default()));
     scenarios.push(Box::new(listing::CatalogListingCancellation));
     scenarios.push(Box::new(listing::ObjectStoreListingBoundary));
-    scenarios.extend(uea1_performance::scenarios());
-    scenarios.extend(result_delivery_baseline::scenarios());
+    scenarios.extend(result_delivery_progress::scenarios());
+    scenarios.extend(result_delivery_concurrency::scenarios());
+    scenarios.extend(result_delivery_deadline::scenarios());
     scenarios.extend(result_delivery::scenarios());
     scenarios.extend(result_delivery_root_reply::scenarios());
     scenarios.extend(result_delivery_closing::scenarios());
     scenarios.extend(uea4_catalog_planning::scenarios());
     scenarios.extend(uea4_range_reads::scenarios());
-    scenarios.extend(uea4_rss_baselines::scenarios());
-    scenarios.extend(uea4_scan_performance::scenarios());
     scenarios.extend(uea4_scan_readiness::scenarios());
     scenarios.extend(runtime_filter::scenarios());
     scenarios.extend(runtime_filter::native_trust_directional_scenarios());
     scenarios.extend(connector::scenarios());
+    scenarios.extend(iceberg_delete_warm::scenarios());
     scenarios.push(Box::new(
         iceberg_delete_applicability::IcebergDeleteApplicability::default(),
-    ));
-    scenarios.push(Box::new(
-        iceberg_delete_performance::IcebergDeletePerformance::default(),
     ));
     scenarios.extend(distributed_writer::scenarios());
     scenarios.extend(frontend_lifecycle::scenarios());
@@ -101,6 +98,5 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(preparation_capacity::scenarios());
     scenarios.extend(state_family::scenarios());
     scenarios.extend(table_maintenance::scenarios());
-    scenarios.extend(task_execution::scenarios());
     scenarios
 }

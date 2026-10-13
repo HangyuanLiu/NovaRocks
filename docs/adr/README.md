@@ -197,6 +197,7 @@ code-anchors:
 - ADR-0011 — 请求执行为何使用 immutable context、一次 topology capture 并拒绝 ambient fallback（active）
 - ADR-0012 — Query session admission 与 router 为何由 frontend 拥有、core 只保留 wire/compiler kernel（active）
 - ADR-0102 — MySQL KILL 为何经 exact generation token 与 protocol-owned connection lifecycle 实现（active）
+- [ADR-0172](ADR-0172-mysql-query-deadlines-and-active-delivery-work-budgets.md) — MySQL 查询期限、累计30秒活跃交付工作与绝对5秒Closing为何由不同owner约束（active）
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0092 — 查询 execution identity 为何以 process-local namespace 与连续 sequence 保持既有 wire 形状（active）
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active；Create 的身份幂等与本条水位幂等的区分见 ADR-0161）
@@ -495,7 +496,8 @@ statement family。边界层只能传递或编码 owner 的事实，测试只能
 而不是下载或普通测试失败。
 
 - ADR-0155 — fixture 输入为何以锁定 provision/BOM 供给、并在离线 verify 阶段消费（active）
-- ADR-0165 — fixture 运行实例为何按输入版本化、由唯一 owner 发布工作区绑定，并以显式引用保护删除（active；补充 ADR-0155 的运行所有权，不替代输入供给）
+- ADR-0165 — fixture 运行实例为何按输入版本化、由唯一 owner 发布工作区绑定，并以显式引用保护删除（active；条9的已有READY消费范围由ADR-0173部分替代，显式供给及其余所有权规则仍有效）
+- [ADR-0173](ADR-0173-prepared-dataset-consumption-is-check-only.md) — 已有数据消费者为何仅check准确READY绑定，而实际producer核验与数据写入保留给显式供给（active；部分替代ADR-0165条9）
 
 #### 历史
 

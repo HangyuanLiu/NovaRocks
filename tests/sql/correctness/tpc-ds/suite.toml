@@ -1,0 +1,5 @@
+explicit_only = true
+
+[prepared_dataset]
+dataset = "tpc-ds"
+scale = "1GB"

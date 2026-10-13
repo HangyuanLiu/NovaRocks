@@ -9,11 +9,12 @@ retain unused APIs merely to keep historical round trips compiling.
 
 ## Baselines and P00 receipt
 
-- Current upstream execution baseline:
+- Historical M02a P00 execution baseline:
   `b1d13989c50231ee7a5031163255b2607c5176c0`.
 - Historical Reservation performance comparator:
-  `af9d0591676c75ede5fb53c2d64949e2d80667c5`. Build this exact revision in an
-  external measurement checkout; do not copy its mechanism into the new core.
+  `af9d0591676c75ede5fb53c2d64949e2d80667c5`. Interpret prior comparisons against
+  this exact revision; the active comparator and measurement entrypoint have retired.
+  Do not copy its mechanism into the new core.
 - P00 ran `cargo test -p novarocks-memory` on the current baseline on
   2026-09-30: exit code 0; 147 tests passed across 13 targets; zero failures.
   Local receipt: `/tmp/mem-m02a-baseline.log`. This was the existing core and
@@ -107,36 +108,15 @@ automatically deletion targets.
 
 Remove the old shared Reservation, its protocol/model/benchmark and unused
 wait/reclaim/pressure framework. Update exports, Cargo.lock, the dependency
-guard and mutation fixtures, memory boundary/performance guides, and final ADR
+guard and mutation fixtures, functional memory boundary guidance, and final ADR
 status coherently. Keep the zero normal dependency rule, neutral dev closure,
 and StateStore API boundary as actual Cargo graph checks.
 
-## Frozen cost inputs and outstanding evidence
+## 当前维护边界与历史证据
 
-Manifest: `../benches/stock_cost_manifest.json`.
+当前阶段仅维护功能与数据正确性。stock/attribution成本manifest、bench binary、比较和采样脚本已退出，不再给出持续成本验收命令。旧P00、M02a/M02b记录只解释原版本和输入，不能作为当前HEAD通过；历史未验证Linux成本不补为PASS。Loom/Miri、unsafe地址/别名/生命周期、并发和独立预期全部保留。
 
-SHA256 of its exact UTF-8 bytes at P00:
-`cd3f06768bd6b757860b8c17c724a31469eb880ab2674cd608d7b13693a0d676`.
-
-The protocol defaults are frozen before candidate measurement: quantum
-256 KiB, low/high watermarks q/3q, maximum depth 16, 65,536 active owners,
-64 MiB metadata budget and maintenance budget 64 records per turn. The
-manifest records deterministic per-cell workset and high/low target recipes,
-all plan section 4.4 matrices, minimum rounds/samples and pass thresholds.
-Assembly storage in those recipes is prepaid root/index/Shared backing plus
-the actual account-tree Arc-box fees, checked against pressure.storage_metadata
-after tree creation. Historical residual payload/record metadata is separately
-included in target recipes. These amounts are derived from configuration and type sizes;
-it is not performance calibration. The benchmark must save each resolved numeric cell input together with the
-manifest hash. Residual counts and active-owner counts are separate axes.
-
-The Linux host, N, CPU affinity, compiler/cgroup details and once-only
-supply-work calibration are unresolved. Freeze those before collecting any
-candidate gate data. Neither a local macOS smoke nor this manifest is Linux
-cost acceptance. Do not select quantum, calibration, cells or thresholds after
-examining candidate performance. Historical Reservation is an external static
-equivalent-responsibility comparator; it has no invented residual or dynamic
-capacity counterpart.
+相关核心/helper修改沿现有Rust测试链路；本地模型按其既有显式要求执行，不因测量资产退役减免。
 
 The current M08a regression targets include Server `memory_observation`,
 `memory_limit`, `cgroup_memory`, authority composition/configuration tests,
@@ -155,11 +135,6 @@ I/O kind/identity, cancel origin, maximum inflight work, actual exit condition,
 D_io and its assumptions before integration/G4. A mocked deadline proves the
 core preserves responsibility; it does not establish a production I/O bound.
 M02b/M03/M08b/M10/M11 retain their own downstream acceptance duties.
-
-The user explicitly waived agent-run Linux validation and will collect formal
-Linux evidence manually. P06 still delivers the frozen inputs and runnable
-benchmark entrypoint. Agent-run Linux acceptance is not a local goal completion
-condition; formal performance gates remain unverified until that handoff.
 
 Active scopes and external bounds retain their required control owners. A
 production FactToken uses process-lifetime record storage and may survive the
@@ -200,4 +175,4 @@ MIRI_TOOLCHAIN=nightly-YYYY-MM-DD tools/ci/memory-model-checks.sh --miri
 
 脚本以 `--locked --offline` 执行 Cargo，Miri 预检已安装 nightly、miri、rust-src；缺项非零退出并报告，`--all` 在缺项时不先跑 Loom。Miri sysroot 在 rust-src 的 `library/` 内准备，使用其随附的 vendored std 依赖，不联网。Miri 使用 System 后端、Tree Borrows 与 strict provenance/symbolic alignment，并关闭 isolation（readout 读取 SystemTime；isolation 只限制宿主访问，不放宽 UB 检查）。选择 Tree Borrows 的原因见 ADR-0167：Stacked Borrows 把 std Box/Arc 交给 `dealloc` 的指针权限收窄到 `size_of::<T>()`，任何经该指针读取请求长度之后带内元数据的 allocator 都会被拒绝。Miri 覆盖 lib lane/TLS/readout、全部 `attribution_*`、旧 allocator observation，以及驱动资金域 FactToken 发布与释放的 `owner_lifetime`、`lane_lifecycle`；验证非对齐 token、realloc/受控失败、System segment、TLS，以及 owned store 在最后访问之后释放 backing。生产 store 的 segment 永不释放，回收后的逻辑晚访问不产生地址错误，Miri 看不到；这部分最终访问证明（I4）由 Loom 模型和静态复核承担。token 不含指针，不提供 provenance 豁免。独立 `attribution_reconcile` 避免 libtest 后台分配污染对账；压力测试不代替 Loom/Miri。
 
-收敛边界：Miri 结论以 Tree Borrows 为别名模型，不等于 Rust 最终别名模型下的证明；正式 Linux 成本由用户手动执行，G1 待验证。P00 同一 33 套件选择集记录 822 cases /806 PASS /16 FAIL /0 SKIP，最终 SQL 必须与该失败集合比较，不能声称 all 全通过。当前指标/模型/定向测试不能证明所有生产 query/R1 已接线或硬内存治理交付。
+收敛边界：Miri 结论以 Tree Borrows 为别名模型，不等于 Rust 最终别名模型下的证明；当前不维护Linux成本采集入口；历史成本缺口保持未验证，不以本次功能通过关闭。P00 同一 33 套件选择集记录 822 cases /806 PASS /16 FAIL /0 SKIP，最终 SQL 必须与该失败集合比较，不能声称 all 全通过。当前指标/模型/定向测试不能证明所有生产 query/R1 已接线或硬内存治理交付。

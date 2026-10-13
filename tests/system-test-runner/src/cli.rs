@@ -15,7 +15,6 @@ pub struct Cli {
     pub cluster_size: usize,
     pub timeout_secs: u64,
     pub launch_profile: LaunchProfile,
-    pub uea1_workload_manifest: Option<PathBuf>,
     /// Exact private binding for the optional small HMS correctness preflight.
     pub hms_classification_binding: Option<PathBuf>,
     /// Already-prepared readonly stock HMS bulk input; no fixture preparation.
@@ -45,7 +44,6 @@ impl Cli {
             cluster_size: 3,
             timeout_secs: 300,
             launch_profile: LaunchProfile::FaultScenario,
-            uea1_workload_manifest: None,
             hms_classification_binding: None,
             hms_bulk_readonly_binding: None,
             exact_mysql_execution_binding: None,
@@ -123,10 +121,6 @@ impl Cli {
                     cli.hms_classification_binding =
                         Some(PathBuf::from(value("--hms-classification-binding")?));
                 }
-                "--uea1-workload-manifest" => {
-                    cli.uea1_workload_manifest =
-                        Some(PathBuf::from(value("--uea1-workload-manifest")?));
-                }
                 "--help" | "-h" => bail!(Self::usage()),
                 _ => bail!("unknown option {argument}\n{}", Self::usage()),
             }
@@ -137,7 +131,6 @@ impl Cli {
                 || !cli.only.is_empty()
                 || cli.compatible_binary.is_some()
                 || cli.other_island_binary.is_some()
-                || cli.uea1_workload_manifest.is_some()
                 || cli.exact_mysql_execution_binding.is_some()
                 || cli.hms_classification_binding.is_some()
                 || cli.held_native_execution_binding.is_some()
@@ -155,7 +148,6 @@ impl Cli {
                 || cli.list_default
                 || cli.compatible_binary.is_some()
                 || cli.other_island_binary.is_some()
-                || cli.uea1_workload_manifest.is_some()
                 || cli.exact_mysql_execution_binding.is_some()
                 || cli.hms_classification_binding.is_some()
                 || cli.launch_profile != LaunchProfile::FaultScenario
@@ -172,7 +164,6 @@ impl Cli {
                 || !cli.only.is_empty()
                 || cli.compatible_binary.is_some()
                 || cli.other_island_binary.is_some()
-                || cli.uea1_workload_manifest.is_some()
                 || cli.exact_mysql_execution_binding.is_some())
         {
             bail!("--hms-classification-binding is an exclusive preflight run mode");
@@ -182,7 +173,6 @@ impl Cli {
                 || cli.list_default
                 || cli.compatible_binary.is_some()
                 || cli.other_island_binary.is_some()
-                || cli.uea1_workload_manifest.is_some()
                 || cli.launch_profile != LaunchProfile::FaultScenario
                 || cli.cluster_size != 3)
         {
@@ -209,7 +199,7 @@ impl Cli {
             "[--other-island-binary <path>] --config <path> ",
             "--artifact-root <path>] [--cluster-size <N>] [--timeout-secs <N>] ",
             "[--launch-profile <fault-scenario|performance>] ",
-            "[--uea1-workload-manifest <path>] [--hms-classification-binding <path>] [--hms-bulk-readonly-binding <path>] [--exact-mysql-execution-binding <path>] [--held-native-execution-binding <path>] [--held-live-collector-fences-v1]"
+            "[--hms-classification-binding <path>] [--hms-bulk-readonly-binding <path>] [--exact-mysql-execution-binding <path>] [--held-native-execution-binding <path>] [--held-live-collector-fences-v1]"
         )
     }
 }
@@ -232,7 +222,6 @@ mod tests {
             vec!["--launch-profile", "performance"],
             vec!["--list"],
             vec!["--held-live-collector-fences-v1"],
-            vec!["--uea1-workload-manifest", "manifest"],
         ] {
             let mut args = base.clone();
             args.extend(extra.clone());
@@ -293,7 +282,6 @@ mod tests {
             vec!["--cluster-size", "1"],
             vec!["--list"],
             vec!["--launch-profile", "performance"],
-            vec!["--uea1-workload-manifest", "perf"],
             vec![
                 "--only",
                 "result-delivery/held-response-late-ack",
@@ -331,7 +319,6 @@ mod tests {
             vec!["--cluster-size".into(), "1".into()],
             vec!["--launch-profile".into(), "performance".into()],
             vec!["--hms-classification-binding".into(), "hms.json".into()],
-            vec!["--uea1-workload-manifest".into(), "perf.json".into()],
         ] {
             let mut args = vec![flag.clone(), "frozen.json".to_string()];
             args.extend(extra);
@@ -388,19 +375,23 @@ mod tests {
     }
 
     #[test]
-    fn parses_performance_profile_and_manifest() {
+    fn parses_clean_launch_profile() {
         let cli = Cli::parse(vec![
             "--launch-profile".to_string(),
             "performance".to_string(),
+        ])
+        .expect("parse clean launch profile");
+        assert_eq!(cli.launch_profile, LaunchProfile::Performance);
+    }
+
+    #[test]
+    fn retired_workload_manifest_is_an_unknown_option() {
+        let error = Cli::parse(vec![
             "--uea1-workload-manifest".to_string(),
             "/tmp/workloads.json".to_string(),
         ])
-        .expect("parse performance inputs");
-        assert_eq!(cli.launch_profile, LaunchProfile::Performance);
-        assert_eq!(
-            cli.uea1_workload_manifest,
-            Some(PathBuf::from("/tmp/workloads.json"))
-        );
+        .expect_err("retired manifest option must be refused");
+        assert!(error.to_string().contains("unknown option"));
     }
 }
 
@@ -424,12 +415,7 @@ mod hms_preflight_cli_tests {
             ])
             .is_err()
         );
-        for option in [
-            "--only",
-            "--compatible-binary",
-            "--other-island-binary",
-            "--uea1-workload-manifest",
-        ] {
+        for option in ["--only", "--compatible-binary", "--other-island-binary"] {
             assert!(
                 parse(&[
                     "--hms-classification-binding",

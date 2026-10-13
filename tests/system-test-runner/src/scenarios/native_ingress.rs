@@ -45,7 +45,6 @@ use crate::{
     scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig},
 };
 use novarocks_cluster_harness::LaunchProfile;
-use novarocks_cluster_harness::process_resources::ProcessResourceSampler;
 
 use super::native_compatibility::{
     RawUnaryConnection, RawUnaryResponse, authorization_header, raw_acquire_admission_ticket,
@@ -66,7 +65,6 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(QueryMessageBounds),
         Box::new(CurrentGateObservation),
         Box::new(BlockingSaturationControl),
-        Box::new(ResidentEnvelopeCalibration),
         Box::new(AsyncSchedulingPressure),
         Box::new(PartialBodyDeadline),
         Box::new(RegistryContentionControl),
@@ -77,7 +75,6 @@ struct OuterPreflightRejection;
 struct QueryMessageBounds;
 struct CurrentGateObservation;
 struct BlockingSaturationControl;
-struct ResidentEnvelopeCalibration;
 struct AsyncSchedulingPressure;
 struct PartialBodyDeadline;
 struct RegistryContentionControl;
@@ -343,11 +340,7 @@ impl Scenario for CurrentGateObservation {
         true
     }
 
-    fn validate_runner_inputs(
-        &self,
-        launch_profile: LaunchProfile,
-        _manifest: Option<&std::path::Path>,
-    ) -> Result<()> {
+    fn validate_runner_inputs(&self, launch_profile: LaunchProfile) -> Result<()> {
         ensure!(
             launch_profile == LaunchProfile::FaultScenario,
             "dynamic gate observation requires --launch-profile fault-scenario"
@@ -452,11 +445,7 @@ impl Scenario for BlockingSaturationControl {
         true
     }
 
-    fn validate_runner_inputs(
-        &self,
-        launch_profile: LaunchProfile,
-        _uea1_workload_manifest: Option<&std::path::Path>,
-    ) -> Result<()> {
+    fn validate_runner_inputs(&self, launch_profile: LaunchProfile) -> Result<()> {
         ensure!(
             launch_profile == LaunchProfile::FaultScenario,
             "blocking saturation requires --launch-profile fault-scenario"
@@ -619,71 +608,6 @@ impl Scenario for BlockingSaturationControl {
         wait_ingress_slot(context, "ordinary", "running", 0.0)?;
         wait_ingress_slot(context, "ordinary", "waiting", 0.0)?;
         context.action("ordinary running/waiting returned to zero after release and queue drain");
-        Ok(())
-    }
-}
-
-impl Scenario for ResidentEnvelopeCalibration {
-    fn name(&self) -> &'static str {
-        "native-ingress/resident-envelope-calibration"
-    }
-
-    fn is_explicit_stage(&self) -> bool {
-        true
-    }
-
-    fn validate_runner_inputs(
-        &self,
-        launch_profile: LaunchProfile,
-        manifest: Option<&std::path::Path>,
-    ) -> Result<()> {
-        BlockingSaturationControl.validate_runner_inputs(launch_profile, manifest)
-    }
-
-    fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        BlockingSaturationControl.launch_config(scenario_root)
-    }
-
-    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        let (connector, control_connector, authorization, backend, compatibility_id) =
-            probe(context)?;
-        let operation = ticket_operation(
-            &control_connector,
-            &authorization,
-            backend,
-            compatibility_id,
-        )?;
-        let mut sampler = ProcessResourceSampler::from_identities(
-            context.process_resource_identities()?,
-            context.name(),
-        )?;
-        sampler.sample_cluster()?;
-        let before = sample_rss(&sampler, "be-0")?;
-        let mut held =
-            HeldOrdinary::start_with_near_limit(&connector, &authorization, operation, backend, 8)?;
-        held.await_entered(context.deadline())?;
-        wait_ingress_slot(context, "ordinary", "running", 8.0)?;
-        sampler.sample_cluster()?;
-        let during = sample_rss(&sampler, "be-0")?;
-        held.release_and_join()?;
-        wait_ingress_slot(context, "ordinary", "running", 0.0)?;
-        sampler.sample_cluster()?;
-        let after = sample_rss(&sampler, "be-0")?;
-        let path = context.scenario_root().join("process-resources.json");
-        sampler.write_json(&path)?;
-        if let (Some(before), Some(during)) = (before, during) {
-            ensure!(
-                during.saturating_sub(before) < 1024 * 1024 * 1024,
-                "one near-limit and seven small held Native requests caused an obvious >1 GiB BE RSS jump"
-            );
-        }
-        context.action(format!(
-            "BE[0] RSS MiB before/during-one-48MiB-ordinary-plus-seven-small-held/after={}/{}/{}; outer padding is not a frozen-plan carrier; process samples at {}",
-            rss_mib(before),
-            rss_mib(during),
-            rss_mib(after),
-            path.display()
-        ));
         Ok(())
     }
 }
@@ -878,12 +802,8 @@ impl Scenario for RegistryContentionControl {
         true
     }
 
-    fn validate_runner_inputs(
-        &self,
-        launch_profile: LaunchProfile,
-        manifest: Option<&std::path::Path>,
-    ) -> Result<()> {
-        BlockingSaturationControl.validate_runner_inputs(launch_profile, manifest)
+    fn validate_runner_inputs(&self, launch_profile: LaunchProfile) -> Result<()> {
+        BlockingSaturationControl.validate_runner_inputs(launch_profile)
     }
 
     fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
@@ -1196,23 +1116,6 @@ fn total_shuffle_bytes(context: &mut ScenarioContext) -> Result<f64> {
         total += metric(&rows, "novarocks_exchange_shuffle_bytes_total", &[])?;
     }
     Ok(total)
-}
-
-fn sample_rss(sampler: &ProcessResourceSampler, role: &str) -> Result<Option<u64>> {
-    sampler
-        .samples()
-        .iter()
-        .rev()
-        .find(|sample| sample.role == role)
-        .map(|sample| sample.rss_bytes)
-        .with_context(|| format!("missing {role} process sample"))
-}
-
-fn rss_mib(bytes: Option<u64>) -> String {
-    bytes.map_or_else(
-        || "unavailable".to_owned(),
-        |bytes| format!("{:.1}", bytes as f64 / 1048576.0),
-    )
 }
 
 fn read_backend_metrics(context: &mut ScenarioContext, index: usize) -> Result<Vec<Value>> {

@@ -245,7 +245,7 @@ fn invalid_data_error(message: impl Into<String>) -> io::Error {
 }
 
 #[cfg(test)]
-mod streaming_result_tests {
+pub(crate) mod streaming_result_tests {
     use std::sync::Arc;
 
     use arrow::datatypes::DataType;
@@ -269,10 +269,11 @@ mod streaming_result_tests {
         SessionIdentity,
     };
 
-    struct Fixture {
-        producer: ResultStreamTestProducer,
-        result: Option<StreamingStatementResult>,
+    pub(crate) struct Fixture {
+        pub(crate) producer: ResultStreamTestProducer,
+        pub(crate) result: Option<StreamingStatementResult>,
         capacity: novarocks_workload_control::ResultCapacityHandle,
+        pub(crate) protocol_capacity: novarocks_workload_control::ResultCapacityHandle,
         _governance: WorkloadControl,
         control: QueryControlService,
         session: QuerySessionLease,
@@ -284,6 +285,14 @@ mod streaming_result_tests {
     }
 
     fn fixture_with_timeout(fields: Vec<ResultField>, timeout_ms: Option<u64>) -> Fixture {
+        fixture_with_admission_deadline(fields, None, timeout_ms)
+    }
+
+    pub(crate) fn fixture_with_admission_deadline(
+        fields: Vec<ResultField>,
+        deadline: Option<tokio::time::Instant>,
+        timeout_ms: Option<u64>,
+    ) -> Fixture {
         let execution_id = QueryExecutionId::new(
             QueryId::new(71, 1),
             AttemptId::new(1).expect("test attempt"),
@@ -318,12 +327,17 @@ mod streaming_result_tests {
             },
         )
         .expect("test statement workload");
+        // The protocol statement has its own host. The producer host's profile
+        // cannot authorize Closing on this statement's exact scope.
+        let protocol_capacity = governance
+            .configure_result_capacity(novarocks_workload_control::ResultCapacityConfig::V1)
+            .expect("install the protocol host's complete result and Closing profile");
         governance.mark_ready().expect("statement workload ready");
         let mut statement = control
             .begin_governed_query_statement(
                 session.token(),
                 &governance.root_admission(),
-                None,
+                deadline,
                 timeout_ms,
                 None,
             )
@@ -337,6 +351,7 @@ mod streaming_result_tests {
         Fixture {
             result: Some(result),
             capacity: producer.result_capacity(),
+            protocol_capacity,
             producer,
             _governance: governance,
             control,
@@ -345,11 +360,11 @@ mod streaming_result_tests {
         }
     }
 
-    fn string_fields() -> Vec<ResultField> {
+    pub(crate) fn string_fields() -> Vec<ResultField> {
         vec![ResultField::new("value", DataType::Utf8, false, None)]
     }
 
-    fn text_body(value: &str) -> Vec<u8> {
+    pub(crate) fn text_body(value: &str) -> Vec<u8> {
         assert!(value.len() < 251);
         let mut body = Vec::new();
         body.extend_from_slice(&((value.len() + 1) as u32).to_le_bytes());

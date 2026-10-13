@@ -157,11 +157,8 @@ where
         })?;
         let cancellation = request_context.execution().cancellation().clone();
         let scope = command_context.scope().clone();
-        let statement_token = command_context.statement_token();
         executor
             .execute(move || {
-                let _diagnostic_scope =
-                    crate::preparation_diagnostics::enter_statement(statement_token);
                 if cancellation.is_cancelled() {
                     return Err(command_error(
                         CommandErrorKind::Cancelled,
@@ -212,11 +209,8 @@ where
         })?;
         let cancellation = request_context.execution().cancellation().clone();
         let scope = command_context.scope().clone();
-        let statement_token = command_context.statement_token();
         executor
             .execute(move || {
-                let _diagnostic_scope =
-                    crate::preparation_diagnostics::enter_statement(statement_token);
                 if cancellation.is_cancelled() {
                     return Err(command_error(
                         CommandErrorKind::Cancelled,
@@ -759,7 +753,6 @@ fn dml_result<T>(result: Result<T, crate::dml::DmlError>) -> Result<T, RoutedExe
 async fn execute_synchronous_stage<T, F>(
     executor: QueryBlockingExecutor,
     cancellation: QueryCancellationView,
-    diagnostic_statement: StatementToken,
     execution_owner: WorkOwner,
     result_window: Option<ResultWindowAlias>,
     call: F,
@@ -777,8 +770,6 @@ where
 {
     executor
         .execute(move || {
-            let _diagnostic_scope =
-                crate::preparation_diagnostics::enter_statement(diagnostic_statement);
             let result = if cancellation.is_cancelled() {
                 Err(RoutedExecutionError::Engine(
                     "typed statement was cancelled before synchronous command execution began"
@@ -817,7 +808,6 @@ where
 async fn execute_prepared_dml_statement<P, Prepare, Execute>(
     executor: QueryBlockingExecutor,
     cancellation: QueryCancellationView,
-    diagnostic_statement: StatementToken,
     execution_owner: WorkOwner,
     result_window: Option<ResultWindowAlias>,
     prepare: Prepare,
@@ -831,7 +821,6 @@ where
     let (prepared, execution_owner, result_window) = execute_synchronous_stage(
         executor.clone(),
         cancellation.clone(),
-        diagnostic_statement,
         execution_owner,
         result_window,
         prepare,
@@ -841,7 +830,6 @@ where
         Ok(prepared) => execute_synchronous_stage(
             executor,
             cancellation,
-            diagnostic_statement,
             execution_owner,
             result_window,
             move || execute(prepared),
@@ -858,7 +846,6 @@ where
 async fn execute_prepared_explain_statement<P, Execute>(
     executor: QueryBlockingExecutor,
     cancellation: QueryCancellationView,
-    diagnostic_statement: StatementToken,
     execution_owner: WorkOwner,
     result_window: Option<ResultWindowAlias>,
     prepared: Result<P, RoutedExecutionError>,
@@ -871,8 +858,6 @@ where
     match prepared {
         Ok(prepared) => executor
             .execute(move || {
-                let _diagnostic_scope =
-                    crate::preparation_diagnostics::enter_statement(diagnostic_statement);
                 let result = if cancellation.is_cancelled() {
                     Err(RoutedExecutionError::Engine(
                         "typed statement was cancelled before prepared query execution began"
@@ -1412,8 +1397,6 @@ impl FrontendQuerySession {
             cancellation,
             preparation_window,
             move || {
-                let _diagnostic_scope =
-                    crate::preparation_diagnostics::enter_statement(statement_token);
                 let _observation_scope = observed_sql.as_deref().and_then(|sql| {
                     crate::preparation_diagnostics::enter_statement_for_sql(statement_token, sql)
                 });
@@ -1991,11 +1974,11 @@ impl FrontendQuerySession {
                     return Ok(self.governed_typed_error(internal_error(error), statement));
                 }
             };
-        let diagnostic_statement = statement.token();
+        let statement_token = statement.token();
         let command_context = CommandContext::new(
             statement.scope().clone(),
             connector_context,
-            diagnostic_statement,
+            statement_token,
             Arc::clone(&self.principal),
         );
         let command_context = match statement.result_window_alias() {
@@ -2022,8 +2005,6 @@ impl FrontendQuerySession {
                 let execution_cancellation = worker_cancellation.clone();
                 let (prepared, execution_owner, producer_window) = query_cpu_executor
                     .run(move || {
-                        let _diagnostic_scope =
-                            crate::preparation_diagnostics::enter_statement(diagnostic_statement);
                         let result = if worker_cancellation.is_cancelled() {
                             Err(RoutedExecutionError::Engine(
                                 "typed statement was cancelled before query compilation began"
@@ -2059,7 +2040,6 @@ impl FrontendQuerySession {
                 execute_prepared_explain_statement(
                     synchronous_command_executor,
                     execution_cancellation,
-                    diagnostic_statement,
                     execution_owner,
                     producer_window,
                     prepared,
@@ -2080,7 +2060,6 @@ impl FrontendQuerySession {
                 Box::pin(execute_prepared_dml_statement(
                     synchronous_command_executor,
                     worker_cancellation,
-                    diagnostic_statement,
                     execution_owner,
                     producer_window,
                     move || {
@@ -2111,7 +2090,6 @@ impl FrontendQuerySession {
                 Box::pin(execute_prepared_dml_statement(
                     synchronous_command_executor,
                     worker_cancellation,
-                    diagnostic_statement,
                     execution_owner,
                     producer_window,
                     move || {
@@ -2142,7 +2120,6 @@ impl FrontendQuerySession {
                 Box::pin(execute_prepared_dml_statement(
                     synchronous_command_executor,
                     worker_cancellation,
-                    diagnostic_statement,
                     execution_owner,
                     producer_window,
                     move || {
@@ -2176,7 +2153,6 @@ impl FrontendQuerySession {
                 Box::pin(execute_prepared_dml_statement(
                     synchronous_command_executor,
                     worker_cancellation,
-                    diagnostic_statement,
                     execution_owner,
                     producer_window,
                     move || {
@@ -2208,7 +2184,6 @@ impl FrontendQuerySession {
                 Box::pin(execute_prepared_dml_statement(
                     synchronous_command_executor,
                     worker_cancellation,
-                    diagnostic_statement,
                     execution_owner,
                     producer_window,
                     move || {
@@ -2266,7 +2241,6 @@ impl FrontendQuerySession {
                 Box::pin(execute_prepared_dml_statement(
                     synchronous_command_executor,
                     worker_cancellation,
-                    diagnostic_statement,
                     execution_owner,
                     producer_window,
                     move || {
@@ -2298,7 +2272,6 @@ impl FrontendQuerySession {
                         execute_prepared_dml_statement(
                             synchronous_command_executor,
                             worker_cancellation,
-                            diagnostic_statement,
                             execution_owner,
                             producer_window,
                             move || {
@@ -3886,18 +3859,11 @@ mod tests {
             );
         });
         let caller = tokio::spawn(async move {
-            execute_synchronous_stage(
-                executor,
-                cancellation,
-                StatementToken::new(SessionToken::new(91, 1), 1),
-                root.owner,
-                Some(alias),
-                move || {
-                    dml_result::<()>(Err(
-                        crate::dml::error::DmlExecutionError::Cow(failure).into_dml_error(None)
-                    ))
-                },
-            )
+            execute_synchronous_stage(executor, cancellation, root.owner, Some(alias), move || {
+                dml_result::<()>(Err(
+                    crate::dml::error::DmlExecutionError::Cow(failure).into_dml_error(None)
+                ))
+            })
             .await
         });
         let exit_thread = tokio::time::timeout(Duration::from_secs(2), observed).await;
@@ -4056,7 +4022,6 @@ mod tests {
                 execute_prepared_explain_statement(
                     executor,
                     cancellation,
-                    StatementToken::new(SessionToken::new(91, 1), 1),
                     owner,
                     Some(alias),
                     Ok(()),
@@ -4064,16 +4029,9 @@ mod tests {
                 )
                 .await
             } else {
-                execute_synchronous_stage(
-                    executor,
-                    cancellation,
-                    StatementToken::new(SessionToken::new(91, 1), 1),
-                    owner,
-                    Some(alias),
-                    produce,
-                )
-                .await
-                .map(|(result, owner, _window)| (result, owner))
+                execute_synchronous_stage(executor, cancellation, owner, Some(alias), produce)
+                    .await
+                    .map(|(result, owner, _window)| (result, owner))
             }
         });
         tokio::time::timeout(Duration::from_secs(2), running)
@@ -4222,7 +4180,6 @@ mod tests {
             execute_prepared_explain_statement(
                 executor,
                 cancellation,
-                StatementToken::new(SessionToken::new(91, 1), 1),
                 root.owner,
                 None,
                 Ok(()),
@@ -4285,7 +4242,6 @@ mod tests {
         let (result, execution_owner) = execute_prepared_explain_statement(
             blocking.executor(),
             cancellation,
-            StatementToken::new(SessionToken::new(91, 1), 1),
             root.owner,
             None,
             Ok(()),

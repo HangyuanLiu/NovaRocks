@@ -367,10 +367,13 @@ grep -q "UNEXPECTED_PASS" "$run_dir/summary.md"
 targeted_suites="$(ci_tier_suites targeted "$REPO_ROOT/tools/ci/suites/stable-correctness-suites.txt")"
 grep -qx "optimizer-dist" <<<"$targeted_suites"
 
-if ci_suite_exists "$REPO_ROOT" ssb; then
-  echo "benchmark workload must not be accepted as an explicit correctness suite" >&2
-  exit 1
-fi
+ci_suite_exists "$REPO_ROOT" ssb
+for suite in ssb tpc-h tpc-ds; do
+  if ci_tier_suites full "$STABLE_SUITES_FILE" | grep -qx "$suite"; then
+    echo "explicit dataset entered default stable tier: $suite" >&2
+    exit 1
+  fi
+done
 if ! ci_suite_exists "$REPO_ROOT" filter; then
   echo "correctness suite must remain selectable" >&2
   exit 1
@@ -589,5 +592,42 @@ if ! awk '
   echo "SQL_QUERY_TIMEOUT_SECONDS must override the iceberg-dml suite timeout" >&2
   exit 1
 fi
+
+# The caller's clean profile and functional timeout reach both real launcher
+# paths; no dataset name changes the profile or default timeout implicitly.
+for round in primary additional; do
+  capture="$tmpdir/profile-$round.args"
+  (
+    REPO_ROOT="$tmpdir/current-worktree"
+    CI_RUN_DIR="$tmpdir/profile-$round"
+    NOVAROCKS_SQL_TEST_CONFIG="$tmpdir/sql-test.toml"
+    NOVA_ENV_REST_ENV_FILE="$publication_a/env.sh"
+    SQL_CLUSTER_MODE="cross-process"
+    SQL_CLUSTER_SIZE="3"
+    SQL_CLUSTER_LAUNCH_PROFILE="performance"
+    SQL_QUERY_TIMEOUT_SECONDS="120"
+    NOVA_CI_NATIVE_CROSS_PROCESS_FULL="1"
+    RUN_MODE="explicit"
+    mkdir -p "$CI_RUN_DIR/sql"
+    resolve_suites() { SUITES=(ssb); }
+    ci_native_cross_process_suites() { printf '%s\n' ssb; }
+    ci_suite_exists() { return 0; }
+    ci_run_logged() { printf '%s\n' "$@" >"$capture"; return 0; }
+    ci_record_sql_suite() { :; }
+    ci_render_summary() { :; }
+    if [ "$round" = primary ]; then run_sql_suites; else run_native_cross_process_sql_suites; fi
+  )
+  for pair in '--cluster-launch-profile performance' '--query-timeout 120'; do
+    read -r option value <<<"$pair"
+    if ! awk -v option="$option" -v value="$value" '
+      previous == option && $0 == value { found = 1 }
+      { previous = $0 }
+      END { exit(found ? 0 : 1) }
+    ' "$capture"; then
+      echo "$round SQL launcher lost $pair" >&2
+      exit 1
+    fi
+  done
+done
 
 echo "local-full-ci-classification-test: PASS"

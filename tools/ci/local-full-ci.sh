@@ -49,6 +49,7 @@ PAIMON_FIXTURE_DIR=""
 PAIMON_FIXTURE_RUN_ID=""
 NOVA_CI_CARGO_PROFILE="${NOVA_CI_CARGO_PROFILE:-dev-opt}"
 SQL_CLUSTER_MODE="${SQL_CLUSTER_MODE:-cross-process}"
+SQL_CLUSTER_LAUNCH_PROFILE=""
 if [ -n "${SQL_CLUSTER_SIZE:-}" ]; then
   SQL_CLUSTER_SIZE_EXPLICIT="true"
 else
@@ -97,6 +98,8 @@ Options:
                         registered scenario and records a skip as SKIP.
   --cluster-mode <mode> SQL runner cluster mode. Default: cross-process.
   --cluster-size <n>    Number of BE processes. Default: 3, or 1 for all-in-one.
+  --cluster-launch-profile <fault-scenario|performance>
+                        Pass an explicit native launch profile to every SQL round.
   --keep-runtime        Keep this worktree's docker/iceberg-rest runtime entry.
   -h, --help            Show this help text.
 EOF
@@ -208,6 +211,18 @@ parse_args() {
               ;;
           esac
         fi
+        shift 2
+        ;;
+      --cluster-launch-profile)
+        CARGO_ONLY_CONFLICT="true"
+        if [ "$#" -lt 2 ]; then
+          echo "error: --cluster-launch-profile requires a profile" >&2
+          exit 2
+        fi
+        case "$2" in
+          fault-scenario|performance) SQL_CLUSTER_LAUNCH_PROFILE="$2" ;;
+          *) echo "error: unsupported --cluster-launch-profile: $2" >&2; exit 2 ;;
+        esac
         shift 2
         ;;
       --cluster-size)
@@ -1052,6 +1067,7 @@ run_sql_suites() {
   local duration
   local -a suite_extra_args
   local -a suite_query_timeout_args
+  local -a suite_launch_profile_args
   local query_timeout
   local novarocks_bin
   local suite_cluster_mode
@@ -1070,6 +1086,10 @@ run_sql_suites() {
     start="$(ci_epoch)"
     suite_extra_args=()
     suite_query_timeout_args=()
+    suite_launch_profile_args=()
+    if [ -n "$SQL_CLUSTER_LAUNCH_PROFILE" ]; then
+      suite_launch_profile_args=(--cluster-launch-profile "$SQL_CLUSTER_LAUNCH_PROFILE")
+    fi
     query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-60}"
     suite_cluster_mode="$(ci_suite_cluster_mode "$suite")"
     suite_cluster_size="$(ci_suite_cluster_size "$suite")"
@@ -1108,6 +1128,7 @@ run_sql_suites() {
         "${suite_query_timeout_args[@]}" \
         --cluster-mode "$suite_cluster_mode" \
         --cluster-size "$suite_cluster_size" \
+        "${suite_launch_profile_args[@]}" \
         "${suite_extra_args[@]}" \
         -j 1
     code=$?
@@ -1180,6 +1201,7 @@ run_native_cross_process_sql_suites() {
   local suite_cluster_size
   local -a native_cross_process_suites
   local -a suite_query_timeout_args
+  local -a suite_launch_profile_args
   local suites_output
 
   if ! ci_native_cross_process_enabled; then
@@ -1217,14 +1239,15 @@ run_native_cross_process_sql_suites() {
     log_path="$CI_RUN_DIR/sql-native-cross-process/${suite}.log"
     start="$(ci_epoch)"
     suite_query_timeout_args=()
+    suite_launch_profile_args=()
+    if [ -n "$SQL_CLUSTER_LAUNCH_PROFILE" ]; then
+      suite_launch_profile_args=(--cluster-launch-profile "$SQL_CLUSTER_LAUNCH_PROFILE")
+    fi
     query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-60}"
     suite_cluster_mode="$(ci_native_cross_process_suite_cluster_mode "$suite")"
     suite_cluster_size="$(ci_native_cross_process_suite_cluster_size "$suite")"
     case "$suite" in
-      tpc-ds|tpc-h)
-        query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-300}"
-        ;;
-      complex-type|ssb)
+      complex-type)
         query_timeout="${SQL_QUERY_TIMEOUT_SECONDS:-120}"
         ;;
       optimizer-dist)
@@ -1246,6 +1269,7 @@ run_native_cross_process_sql_suites() {
         "${suite_query_timeout_args[@]}" \
         --cluster-mode "$suite_cluster_mode" \
         --cluster-size "$suite_cluster_size" \
+        "${suite_launch_profile_args[@]}" \
         -j 1
     code=$?
     duration=$(($(ci_epoch) - start))

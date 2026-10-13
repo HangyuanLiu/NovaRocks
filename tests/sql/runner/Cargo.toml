@@ -28,10 +28,6 @@ name = "novarocks-sql-test"
 path = "src/bin/novarocks-sql-test.rs"
 
 [[bin]]
-name = "novarocks-sql-benchmark"
-path = "src/bin/novarocks-sql-benchmark.rs"
-
-[[bin]]
 name = "publication-catalog-fixture"
 path = "src/bin/publication-catalog-fixture.rs"
 

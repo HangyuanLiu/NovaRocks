@@ -31,13 +31,12 @@ use opensrv_mysql::{
     CapabilityFlags, ErrorKind, OwnedStreamingMysqlWriter, QueryResultWriter, StatusFlags,
 };
 use tokio::io::AsyncWrite;
-use tokio::time::Instant;
 
 use crate::governed_result_writer::{
     MysqlStatementWriteOutcome, is_terminal_cancellation, wait_terminal_result_failure,
 };
 
-pub(crate) const ACTIVE_WRITE_DEADLINE: Duration = Duration::from_secs(30);
+use crate::active_delivery_budget::ActiveDeliveryWorkBudget;
 pub(crate) const CLOSING_DEADLINE: Duration = Duration::from_secs(5);
 // Frozen complete object allowance: metadata, coalescer/index, diagnostic,
 // current segment and a compacted tail coexist during the transfer.
@@ -84,30 +83,42 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
         )
     })?;
     let capabilities = results.client_capabilities();
-    let metadata =
+    let mut budget = ActiveDeliveryWorkBudget::new();
+    let metadata = budget.run_sync(|| {
         crate::relay_metadata::preflight_result_schema(schema.schema(), capabilities, limits)
             .and_then(|()| crate::mysql_columns_for_result_fields(schema.schema().fields()))
             .and_then(|columns| {
                 crate::relay_metadata::frozen_result_metadata(&columns, capabilities, limits)
-            });
+            })
+    });
     let metadata = match metadata {
         Ok(metadata) => metadata,
         Err(error) => {
             schema.fail(invalid(error.to_string()));
-            let _ = result.fail();
+            if error.kind() == io::ErrorKind::TimedOut {
+                let _ = result.client_disconnected();
+            } else {
+                let _ = result.fail();
+            }
             return Err(error);
         }
     };
-    let deadline = Instant::now() + ACTIVE_WRITE_DEADLINE;
-    let mut lease = tokio::time::timeout_at(deadline, results.into_streaming_result())
-        .await
-        .map_err(|_| timeout_error())??;
-    lease.writer().start_metadata(metadata)?;
+    let mut lease = match budget.run(results.into_streaming_result()).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            schema.fail(invalid(error.to_string()));
+            let _ = result.client_disconnected();
+            return Err(error);
+        }
+    };
     let cancellation = result.cancellation();
     let started = tokio::select! {
         biased;
         error = wait_terminal_result_failure(&mut failure, &cancellation) => Err(WriteInterruption::Query(error)),
-        outcome = tokio::time::timeout_at(deadline, lease.writer().finish_metadata()) => outcome.map_err(|_| timeout_error()).and_then(|outcome| outcome).map_err(WriteInterruption::Io),
+        outcome = budget.run(async {
+            lease.writer().start_metadata(metadata)?;
+            lease.writer().finish_metadata().await
+        }) => outcome.map_err(WriteInterruption::Io),
     };
     if let Err(error) = started {
         #[cfg(feature = "mem-1-m07-exact-mysql-write")]
@@ -164,7 +175,6 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
             biased;
             error = wait_terminal_result_failure(&mut failure, &cancellation) => Err(error),
             next = result.next_delivery() => next.and_then(|next| next.ok_or_else(|| invalid("relayed stream ended without a success delivery"))),
-            _ = tokio::time::sleep_until(deadline) => Err(QueryExecutionError::new(QueryExecutionErrorKind::DeadlineExceeded, "MySQL response write deadline expired")),
         };
         let delivery = match next {
             Ok(delivery) => delivery,
@@ -190,32 +200,42 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
         match delivery {
             ResultDelivery::Segment(delivery) => {
                 resident_window = delivery.resident_window();
-                let body = delivery.client_rows().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "relayed MySQL delivery has no ClientRows spans",
-                    )
-                })?;
-                // The actor validates each complete body before delivery. The
-                // writer checks its own cursor as well, across segment receipts.
-                let expected_remaining = body.before().remaining() as usize;
-                let actual_remaining = lease.receipt().logical_remaining();
-                if actual_remaining != expected_remaining
-                    || delivery.kind() != RootOutputKind::ClientRows
-                    || body.body().len() > profile.segment_bytes()
-                {
-                    let error =
-                        invalid("MySQL framing frontier differs from the validated root body");
-                    delivery.fail(error.clone());
-                    drop(lease);
-                    let _ = result.fail();
-                    return Err(io_error(error));
-                }
+                let body = match budget.run_sync(|| {
+                    let body = delivery.client_rows().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "relayed MySQL delivery has no ClientRows spans",
+                        )
+                    })?;
+                    // The actor validates each complete body before delivery.
+                    // Check the writer's cursor across segment receipts as well.
+                    if lease.receipt().logical_remaining() != body.before().remaining() as usize
+                        || delivery.kind() != RootOutputKind::ClientRows
+                        || body.body().len() > profile.segment_bytes()
+                    {
+                        return Err(io_error(invalid(
+                            "MySQL framing frontier differs from the validated root body",
+                        )));
+                    }
+                    Ok(body)
+                }) {
+                    Ok(body) => body,
+                    Err(error) => {
+                        delivery.fail(invalid(error.to_string()));
+                        drop(lease);
+                        if error.kind() == io::ErrorKind::TimedOut {
+                            let _ = result.client_disconnected();
+                        } else {
+                            let _ = result.fail();
+                        }
+                        return Err(error);
+                    }
+                };
                 let cancellation = result.cancellation();
                 let written = tokio::select! {
                     biased;
                     error = wait_terminal_result_failure(&mut failure, &cancellation) => Err(WriteInterruption::Query(error)),
-                    outcome = tokio::time::timeout_at(deadline, write_body(lease.writer(), &body)) => outcome.map_err(|_| timeout_error()).and_then(|outcome| outcome).map_err(WriteInterruption::Io),
+                    outcome = budget.run(write_body(lease.writer(), &body)) => outcome.map_err(WriteInterruption::Io),
                 };
                 if let Err(error) = written {
                     return match error {
@@ -317,18 +337,19 @@ pub(crate) async fn write_relay_result_one<'writer, W: AsyncWrite + Unpin>(
                     let _ = result.fail();
                     return Err(io_error(error));
                 }
-                let terminal = success_payload(capabilities, more_results);
-                match tokio::time::timeout_at(deadline, lease.finish(&terminal)).await {
-                    Ok(Ok(writer)) => {
+                match budget
+                    .run(async {
+                        let terminal = success_payload(capabilities, more_results);
+                        lease.finish(&terminal).await
+                    })
+                    .await
+                {
+                    Ok(writer) => {
                         delivery.complete();
                         let _ = result.complete();
                         return Ok(MysqlStatementWriteOutcome::Continue(writer));
                     }
-                    outcome => {
-                        let error = match outcome {
-                            Ok(Err(error)) => error,
-                            _ => timeout_error(),
-                        };
+                    Err(error) => {
                         delivery.fail(invalid(error.to_string()));
                         let _ = result.client_disconnected();
                         return Err(error);

@@ -35,7 +35,7 @@ use crate::optimizer::rewrite::context::RewriteContext;
 use crate::optimizer::rewrite::phase::RewritePhase;
 use crate::optimizer::rewrite::result::RewriteResult;
 use crate::optimizer::rewrite::rule::LogicalRewriteRule;
-use crate::optimizer::rewrite::rules::utils::join_equi_keys_opt;
+use crate::optimizer::rewrite::rules::utils::{collect_output_ids_opt, join_equi_keys_opt};
 use crate::optimizer::scalar::{ScalarArena, ScalarId, ScalarNode};
 
 pub(crate) struct DeriveJoinNotNullPredicate;
@@ -238,9 +238,9 @@ fn wrap_not_null(
     ))
 }
 
-/// Walk `plan`'s predicate spine (passthrough single-input nodes down to the
-/// root scan) collecting column identities already guaranteed non-null by an
-/// `IS NOT NULL` conjunct. Used for idempotency / redundant-filter avoidance.
+/// Collect explicit non-null predicate facts that still hold at this output.
+/// A pushed predicate remains a fact through an inner join, but an outer
+/// join's null extension and a projection's column mapping are real boundaries.
 fn spine_not_null(expr: &OptExpr, arena: &ScalarArena) -> HashSet<ColumnId> {
     let mut ids = HashSet::new();
     spine_not_null_inner(expr, arena, &mut ids);
@@ -258,11 +258,43 @@ fn spine_not_null_inner(expr: &OptExpr, arena: &ScalarArena, ids: &mut HashSet<C
                 record_not_null_conjuncts(arena, *pred_id, ids);
             }
         }
-        // Project may rename columns; id-based matching remains valid through
-        // passthrough projections and intentionally ignores name-only matches.
-        Operator::LogicalProject(_) | Operator::LogicalSort(_) | Operator::LogicalLimit(_) => {
+        Operator::LogicalProject(project) => {
+            let child_ids = spine_not_null(expr.unary_input(), arena);
+            for item in &project.items {
+                if let ScalarNode::ColumnRef(source) = arena.node(item.expr)
+                    && child_ids.contains(source)
+                    && item.output_column_id != ColumnId::UNSET
+                {
+                    ids.insert(item.output_column_id);
+                }
+            }
+        }
+        Operator::LogicalSort(_) | Operator::LogicalLimit(_) => {
             spine_not_null_inner(expr.unary_input(), arena, ids)
         }
+        Operator::LogicalJoin(join) if expr.children.len() == 2 => {
+            let (preserve_left, preserve_right) = match join.join_type {
+                JoinKind::Inner | JoinKind::Cross => (true, true),
+                JoinKind::LeftOuter
+                | JoinKind::LeftSemi
+                | JoinKind::LeftAnti
+                | JoinKind::NullAwareLeftAnti => (true, false),
+                JoinKind::RightOuter | JoinKind::RightSemi | JoinKind::RightAnti => (false, true),
+                JoinKind::FullOuter => (false, false),
+            };
+            let output_ids = collect_output_ids_opt(expr);
+            for (child, preserved) in expr.children.iter().zip([preserve_left, preserve_right]) {
+                if preserved {
+                    ids.extend(
+                        spine_not_null(child, arena)
+                            .into_iter()
+                            .filter(|column| output_ids.contains(column)),
+                    );
+                }
+            }
+        }
+        // CTE references and set operations need their own exact output maps;
+        // facts from an arbitrary referenced body or one branch do not suffice.
         _ => {}
     }
 }
@@ -302,7 +334,7 @@ mod tests {
 
     use super::*;
     use crate::analysis::{BinOp, ExprKind, OutputColumn, TypedExpr};
-    use crate::optimizer::operator::{LogicalJoinOp, ScanOp};
+    use crate::optimizer::operator::{LogicalJoinOp, ProjectOp, ScalarProjectItem, ScanOp};
     use crate::optimizer::rewrite::context::RewriteContext;
     use crate::optimizer::scalar::ScalarArena;
     use crate::planner::table::TableDef;
@@ -469,6 +501,127 @@ mod tests {
                 col_typed("r", "b", 2, right_nullable),
             )),
         )
+    }
+
+    fn filtered_scan_opt(arena: &mut ScalarArena, alias: &str, id: u32) -> OptExpr {
+        let operand = crate::planner::optimizer_bridge::scalar::intern_typed(
+            arena,
+            &col_typed(alias, "k", id, true),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
+        wrap_not_null(
+            scan_opt(alias, alias, &[("k", id, true)]),
+            vec![operand],
+            arena,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn pushed_not_null_below_inner_join_is_visible_to_outer_derivation() {
+        let mut arena = ScalarArena::new();
+        // Predicate pushdown has moved both facts below the nested join. An
+        // outer join still sees those filtered values, even though its child
+        // no longer has a Filter immediately at the root.
+        let left = filtered_scan_opt(&mut arena, "l", 1);
+        let right = filtered_scan_opt(&mut arena, "r", 2);
+        let nested = join_opt(
+            &mut arena,
+            JoinKind::Inner,
+            left,
+            right,
+            Some(eq_expr(
+                col_typed("l", "k", 1, true),
+                col_typed("r", "k", 2, true),
+            )),
+        );
+        let outer = join_opt(
+            &mut arena,
+            JoinKind::Inner,
+            nested,
+            scan_opt("s", "s", &[("k", 3, false)]),
+            Some(eq_expr(
+                col_typed("l", "k", 1, true),
+                col_typed("s", "k", 3, false),
+            )),
+        );
+        let mut ctx = make_ctx(arena);
+        assert!(matches!(
+            DeriveJoinNotNullPredicate.apply(outer, &mut ctx).unwrap(),
+            RewriteResult::Unchanged
+        ));
+    }
+
+    #[test]
+    fn projected_predicate_facts_follow_exact_alias_ids_only() {
+        let mut arena = ScalarArena::new();
+        let source = filtered_scan_opt(&mut arena, "l", 1);
+        let item = crate::planner::optimizer_bridge::scalar::intern_typed(
+            &mut arena,
+            &col_typed("l", "k", 1, true),
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
+        let computed = is_not_null(
+            &mut arena,
+            item,
+            crate::optimizer::rewrite::context::unbounded_rewrite_test_control(),
+        )
+        .unwrap();
+        let projected = OptExpr::new(
+            Operator::LogicalProject(ProjectOp {
+                items: vec![
+                    ScalarProjectItem {
+                        expr: item,
+                        output_name: "renamed".into(),
+                        output_column_id: ColumnId::new_for_test(11),
+                        expr_display: None,
+                    },
+                    ScalarProjectItem {
+                        expr: computed,
+                        output_name: "computed".into(),
+                        output_column_id: ColumnId::new_for_test(12),
+                        expr_display: None,
+                    },
+                ],
+                output_qualifier: None,
+            }),
+            vec![source],
+        );
+        assert_eq!(
+            spine_not_null(&projected, &arena),
+            HashSet::from([ColumnId::new_for_test(11)])
+        );
+    }
+
+    #[test]
+    fn outer_join_null_extension_does_not_inherit_filtered_side_facts() {
+        for (kind, expected) in [
+            (JoinKind::LeftOuter, vec![1]),
+            (JoinKind::RightOuter, vec![2]),
+            (JoinKind::FullOuter, vec![]),
+        ] {
+            let mut arena = ScalarArena::new();
+            let left = filtered_scan_opt(&mut arena, "l", 1);
+            let right = filtered_scan_opt(&mut arena, "r", 2);
+            let joined = join_opt(
+                &mut arena,
+                kind,
+                left,
+                right,
+                Some(eq_expr(
+                    col_typed("l", "k", 1, true),
+                    col_typed("r", "k", 2, true),
+                )),
+            );
+            assert_eq!(
+                spine_not_null(&joined, &arena),
+                expected.into_iter().map(ColumnId::new_for_test).collect(),
+                "{kind:?} must discard facts for null-extended output values"
+            );
+        }
     }
 
     #[test]

@@ -27,8 +27,9 @@ cargo run -p novarocks-system-test-runner -- --list-default
 ```
 
 The default list uses the same registry classification as a run without
-`--only`. Explicit stages, including performance baselines and external
-fixtures, remain discoverable through `--list` and selectable by exact `--only`.
+`--only`. Explicit functional stages with external fixtures or higher cost remain
+discoverable through `--list` and selectable by exact `--only`. 当前阶段不维护
+测量基线；`performance` launch profile只选择clean harness配置，不表示性能实验。
 
 Run one scenario against the native 1FE+3BE default:
 
@@ -71,6 +72,15 @@ command. Successful scenarios explicitly stop their own process group and
 remove the generated runtime directory.
 
 ## In CI
+
+两个按需期限场景为 `result-delivery/producer-wait-query-deadline-separation`
+与 `result-delivery/original-query-deadline-cancels-producer-wait`。分别用正常
+MySQL session 的 `query_timeout=120` 和 `2` 执行 `SLEEP(35)`，验证独立预期
+Boolean true / 原 ERR 1317，再在同一 socket 执行 `SELECT 1`。每例独占
+native 1FE+3BE，使用 `--launch-profile performance --timeout-secs 300` 和独立
+artifact root；不构建数据 fixture，不参与默认基线。公开 root census、BE
+query owner 计数与双零 FE/BE barrier 分别证明实际排空；ERR、客户端关闭和
+进程 shutdown 保留为不同事实。35 秒是旧期限错误的复现输入，不是性能门。
 
 `result-delivery/many-small-rows-cross-segment` 验证 200000 小行跨 Native
 1 MiB 段时的准确顺序与字节；`result-delivery/large-row-cross-u24` 验证一个
@@ -115,11 +125,6 @@ during, and after a runner-held ordinary Worker closure, so an available gate
 can be distinguished from an unknown, unimplemented source. The explicit
 `blocking-saturation-control` case fills the ordinary blocking pool and checks
 that a small Cancel still completes while a ninth ordinary request waits.
-`resident-envelope-calibration` records coarse BE process RSS before, during,
-and after one legal 48 MiB outer request plus seven small-body closures in
-`process-resources.json`. Its padding is a legal protobuf unknown field, not a
-retained FrozenFragment carrier; it does not establish a hard RSS bound or a
-mixed ordinary/control peak.
 `async-scheduling-pressure` runs four distributed SQL queries, waits for real
 Exchange shuffle bytes while one remains active, and checks a small control
 receipt; it is a liveness check under ordinary async work, not proof that all
@@ -177,3 +182,21 @@ pass and transport supervisor composition tests, not by these scenarios.
 ### 内存归属观测
 
 默认场景 `memory-attribution/observation-families` 启动原生 1FE+3BE，验证分布式查询及连接退出取消前后的每个 BE `/metrics`。证据写入场景目录的 `memory-attribution.json`，关联独立 PID 与 HTTP endpoint；两个进程尺寸段、固定归属分类、记录状态、故障与批量采样族均须存在。S1 未接生产 lane，query/residual/service 记录和事实为零，16 条 immortal unattributed 记录单独存在；unattributed 字节大于零，生命周期与孤儿故障为零。签名的对账及账本盲区为独立采样，不要求在并发 scrape 期间瞬时归零。
+
+## 迁入的显式功能保护与维护频率
+
+下列场景独占原生1FE+3BE，以有限输入和独立行袋/协议预期检验性质；timeout只停止挂死，不是性能门。选择时用准确selector，每次独占artifact root；`--launch-profile performance`是clean配置，原有需要fault的场景继续使用自己的fault-scenario要求。
+
+| 性质 | 原生selector | 输入/实际退出 |
+|---|---|---|
+| 慢读与完全不读客户端 | `result-delivery/slow-client-progress`、`result-delivery/unread-client-progress` | 正常MySQL、冻结行/字节预期，进展/取消与owner收敛分开 |
+| 独立并发结果 | `result-delivery/concurrent-results-drain` | 有限actors，失败取消其他live peers、实际join，保留primary及cleanup错误 |
+| range/短查询 | `uea4/iceberg-range-functional`、`connector/iceberg-short-range-concurrent` | 多文件A4及独立4096行单文件manifest；准确行序/算术、LIMIT后退出、并发结果 |
+| 同provider排队进展 | `catalog/provider-read-queued-progress` | held真实Parquet读、同provider waiting，释放后两个查询正确并退出 |
+| planning责任与取消 | `uea4/catalog-planning-responsibility`、`uea4/catalog-planning-no-fe-quota`、`uea4/iceberg-held-read-cancellation`、`uea4/catalog-planning-smoke` | Iceberg/Paimon真实READY；FE/BE责任、held请求精确终态及公开收敛 |
+| warm异质delete | `connector/iceberg-delete-warm-concurrent` | typed独立Java corpus receipt，固定旧/latest snapshot及私有mutation，有限并发和真实退出 |
+| cold delete | `connector/iceberg-delete-applicability` | 完整冻结native manifest包含corpus/anomaly/scale；真实多文件与split/page-source退出 |
+
+range/planning输入准备与校验见保留的 [range fixture](../benchmarks/uea4a2/README.md) 和 [planning fixture](../benchmarks/uea4a4/README.md)。原目录名不赋予测量责任。正常held转发仍要求真正forward完成；取消路径按同request精确connection的上游终态观察，不能把其他连接关闭或ERR当退出。
+
+结果owner相关writer/buffer/ACK/取消/helper改动必跑对应场景；range/delete/planning/DOP由Connector/scan领域按provider/cache/range/admission/fixture改动必跑。高成本显式组每周由维护者手工相关领域轮次，记录缺输入与raw FAIL，不扩默认registry选择。周期调度与共享存储尚未交付；G7a/G7b已取消，不作为未来服务承诺。FE statement observation/auth保留，运行级计时collector退出；G2发布能力/profile自报及门控仍未知。

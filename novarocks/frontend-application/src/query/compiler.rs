@@ -718,23 +718,12 @@ impl FrontendQueryCompiler {
             Self::scan_read_budget(query_options.as_ref()),
             novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
         );
-        // Plain reads now complete through the final-plan driver. Observe that
-        // actual preparation edge under the reserved logical query identity;
-        // the older analyze/optimize hooks belong to the sealed path and no
-        // longer run for this statement shape.
         let encoding_control = request.control().clone();
-        let completed = crate::preparation_diagnostics::observe_result(
-            "compile",
-            "final_plan_complete",
-            "not-applicable",
-            None,
-            || {
-                self.connector_blocking_io.runtime().block_on(
-                    FinalPlanCompletionDriver::new(Arc::new(facts)).complete(request, scope),
-                )
-            },
-        )
-        .map_err(|failure| FrontendQueryCompilerError::from_completion(failure.error()))?;
+        let completed = self
+            .connector_blocking_io
+            .runtime()
+            .block_on(FinalPlanCompletionDriver::new(Arc::new(facts)).complete(request, scope))
+            .map_err(|failure| FrontendQueryCompilerError::from_completion(failure.error()))?;
         // Resolve application purpose before the plan is shared with Native
         // projection. Presentation uses one FE offset, never the BE clock.
         let root_output = match purpose {

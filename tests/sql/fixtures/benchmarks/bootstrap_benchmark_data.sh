@@ -814,6 +814,23 @@ main() {
     exit 0
   fi
 
+  if [[ "$check_only" == 1 ]]; then
+    # Consume exactly the caller's published environment and immutable READY.
+    # A consumer never binds a runtime or starts Spark to inspect existing data.
+    source_env
+    if [[ "${NOVA_ENV_READY:-false}" != true ]]; then
+      emit_error ready_invalid "fixture publication is unbound"
+      exit 1
+    fi
+    ready_etag=""
+    if check_readiness; then
+      emit_result true false "$ready_etag"
+      exit 0
+    fi
+    emit_error ready_invalid "READY is absent or invalid"
+    exit 1
+  fi
+
   if ! ensure_docker_services; then
     emit_error writer_failed "ProducerIdentityMismatch: unable to bind and verify the current Spark producer"
     exit 1

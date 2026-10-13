@@ -1,0 +1,30 @@
+{
+  "columns": [
+    "id",
+    "label",
+    "nested",
+    "event_time",
+    "amount"
+  ],
+  "created_by": "parquet-cpp-arrow version 23.0.1",
+  "file": "pyarrow-23.0.1.parquet",
+  "file_bytes": 73651,
+  "generator": "writer_corpus.py provision-pyarrow",
+  "oracle_sha256": "65b9b2881e65830bcfd8c8d529330b93e14f5e8cbb205768239aadab1091dc93",
+  "parameters": {
+    "compression": "snappy",
+    "data_page_size": 1024,
+    "dictionary_columns": [
+      "label"
+    ],
+    "parquet_version": "2.6",
+    "row_group_size": 1024,
+    "write_page_index": true
+  },
+  "row_groups": 4,
+  "rows": 4096,
+  "schema_version": 1,
+  "sha256": "201538becb093d98fec2be4b3dca7126f2e7907f97d9fed63a571e84fd855f40",
+  "writer": "PyArrow",
+  "writer_version": "23.0.1"
+}

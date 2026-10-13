@@ -19,15 +19,15 @@ under the License.
 
 # SQL Conformance Corpus
 
-`tests/sql/correctness/` is NovaRocks' executable small-data SQL conformance corpus. Its
+`tests/sql/correctness/` is NovaRocks' executable SQL conformance corpus, including small-data cases and explicit prepared-dataset correctness suites. Its
 three manifests are derived from runnable cases rather than maintained as a
 separate compatibility spreadsheet.
 
 ## Suite map
 
 Pick suites by the engine area a change touches; do not run the whole corpus to
-verify one fix.  `--suite all` currently selects 33 suites / 776 cases, and seven
-more suites are `explicit_only` and must be named.  Ask
+verify one fix. `--suite all` excludes suites whose manifest declares `explicit_only`;
+these must be named. Ask
 `cargo run --manifest-path tests/sql/runner/Cargo.toml -- --list-suites` for the
 authoritative current list.
 
@@ -74,6 +74,9 @@ authoritative current list.
 | `sort` | Sort, TopN, ranking, NULL and non-finite float ordering | `novarocks/execution/src/exec/operators/sort/**` | — |
 | `sql-reject` | Statements NovaRocks must reject, SQL error codes and phases | `novarocks/sql/src/admission.rs`, `novarocks/user-error/**` | — |
 | `statistics` | ANALYZE, NDV, min/max, Puffin statistics round-trip | `novarocks/statistics-application/**`, `novarocks/connector/iceberg/**` | REST Catalog |
+| [`ssb`](ssb/README.md) | 完整数据查询与结果正确性 | SQL planner/operators及输入绑定 | explicit-only；READY scale 1；1FE+3BE、-j1、clean performance launch |
+| [`tpc-h`](tpc-h/README.md) | 完整数据查询与结果正确性 | 同上 | explicit-only；READY scale 1；同上 |
+| [`tpc-ds`](tpc-ds/README.md) | 完整数据查询与结果正确性 | 同上 | explicit-only；READY scale 1GB；同上 |
 | `subquery` | Scalar subquery semantics and unnesting | `novarocks/sql/src/optimizer/**` | — |
 | `table-function` | UNNEST and table-function join shapes | `novarocks/execution/src/exec/operators/table_function_processor.rs` | — |
 
@@ -109,7 +112,7 @@ ordinary one, and the runner says so rather than silently redirecting it.
 七项必需端点由同一 publication 投影：`iceberg_rest_uri`、`iceberg_rest_warehouse`、`iceberg_rest_mv_uri`、`iceberg_rest_mv_warehouse`、`oss_ak`、`oss_sk`、`oss_endpoint`。MV 两项同时导出为 `NOVAROCKS_ICEBERG_REST_MV_URI` 和 `NOVAROCKS_ICEBERG_REST_MV_WAREHOUSE`，供受控子进程使用。`rest-mv` 保存 view version 的 `storage-table`，stock `rest` 保留为不支持该字段的对照；具体套件按自身契约选择端点。
 `mv-publication-v11` 在创建前从本机 provisioned base 构建 checked-in hook image，以 publication-hook profile 启动私有 REST，并发布 loopback control URI；不会在 stock 就绪后替换容器。hook 只修改 `rest`，同栈的 `rest-mv` 保持普通服务定义。runner 记录 profile、实际镜像身份与 control URI，结束后删除其私有项目。hook 镜像的供给快照统一仍属于后续工作。
 
-共享套件使用 publication 中的实际端点和 `[env].fixture_env_file`；stable runtime 目录只用于运行数据。共享 catalog 删除前先退出 HMS 等外部 endpoint；force 不豁免该检查。新对象存储需要重建 benchmark READY 数据，旧 REST/Hive 不自动迁移或删除。
+共享套件使用 publication 中的实际端点和 `[env].fixture_env_file`；stable runtime 目录只用于运行数据。共享 catalog 删除前先退出 HMS 等外部 endpoint；force 不豁免该检查。新对象存储需要显式准备共享数据集 READY，旧 REST/Hive 不自动迁移或删除。
 
 引入 `rest-mv` 后，每台机器按新 lock provision 一次，各 worktree rebase 并重新 `up.sh`；旧 lock 在 verify 处 BLOCKED，旧绑定的 offline prepare 不补造 MV 端点。缺少 `iceberg_rest_mv_*` 时按 runner 提示重新 `up.sh`。CI 准备阶段运行 `python3 docker/iceberg-rest/rest-mv/probe.py contract --manifest "$NOVA_ENV_MANIFEST"`；失败为 VERIFY FAILED，且不会重启共享服务。完整切换、隔离生命周期检查与配方维护见 [fixture README](../../../docker/iceberg-rest/README.md) 和 [rest-mv README](../../../docker/iceberg-rest/rest-mv/README.md)。
 
@@ -184,8 +187,10 @@ selects them, `@result_rows_count=<n>` requires exactly that many, and
 row. The count is mandatory, so a selector that matches nothing, or also
 matches another case's row, fails instead of passing.
 
-UEA-4G 的额外原生验收入口是 system scenario `connector/iceberg-delete-applicability`，属于显式阶段。`NOVAROCKS_UEA4G_NATIVE_MANIFEST` 指向已冻结输入清单，清单以 SHA-256 绑定独立 Java corpus 和规模收据；S3 凭证从现有 fixture 环境注入，清单不保存密钥。场景重放准确 snapshot 的行袋，并以真实多文件输入检查三个 BE 的 split/page-source/退出事实，保存对象范围与资源收敛收据。性能对照及 provider 内闭包、union、完成屏障和物理范围测试分别验收，不能由 SQL 行数或空闲 BE 数代替。
+UEA-4G 的额外原生验收入口是 system scenario `connector/iceberg-delete-applicability`，属于显式阶段。`NOVAROCKS_UEA4G_NATIVE_MANIFEST` 指向已冻结输入清单，清单以 SHA-256 绑定独立 Java corpus 和规模收据；S3 凭证从现有 fixture 环境注入，清单不保存密钥。场景重放准确 snapshot 的行袋，并以真实多文件输入检查三个 BE 的 split/page-source/退出事实，保存对象范围与资源收敛收据。provider 内闭包、union、完成屏障和物理范围测试分别验收，不能由 SQL 行数或空闲 BE 数代替。
 
 `iceberg-ivm/iceberg_ivm_delete_applicability` 使用官方 Iceberg writer 构造五个端点阶段，检查 same-commit DV/equality、同一不可变 Puffin 的不同 blob、删除 artifact 等价替代与整个数据文件移除；每阶段比较增量 MV、独立 FULL MV 和关闭 MV rewrite 的基表行袋。该 suite 使用隔离 REST fixture，需单独运行。
 
-release 对照入口为 `connector/iceberg-delete-performance` 和 `tests/system-test-runner/scripts/uea4g-performance.py`。驱动在执行前冻结二进制、源码、配置、输入与八次运行顺序；同一 cold/warm 配置在 baseline/candidate 间交替，第二遍反转顺序。全部 raw samples 保留，baseline 错行的非 control case 不计算性能比例，candidate 错行直接失败；control 噪声超过冻结门限时要求按同一参数重做实验。性能场景只能使用 `--launch-profile performance`；行袋、闭包与性能收据各自证明对应契约。
+当前阶段不维护 delete 性能对照，旧performance场景和脚本已退出。有限 warm/concurrent 行袋与旧/latest snapshot读取由 `connector/iceberg-delete-warm-concurrent` 承担；cold多文件/split/page-source性质仍由显式 `connector/iceberg-delete-applicability` 承担，不能以warm结果替代。两者都要求真实输入和退出；供给与消费分离，见 [system指南](../../system-test-runner/README.md)。
+
+三套数据集正确性共用正常runner入口和原native生命周期；准备/READY/check-only/失败差异/清理命令见 [SQL入口](../README.md)。每周完整轮次当前由领域维护者手工执行，自动调度尚未交付；未运行不记PASS。

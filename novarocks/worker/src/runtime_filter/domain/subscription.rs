@@ -423,7 +423,8 @@ impl BackendSubscriptionGroup {
                         slot.publish(Arc::clone(snapshot), terminal)?
                     }
                     SnapshotAcquireOutcome::Unavailable(reason) => {
-                        slot.terminal(terminal.unwrap_or(LiveTerminal::Unavailable(*reason)))
+                        // Channel completion does not prove this consumer received an artifact.
+                        slot.terminal(LiveTerminal::Unavailable(*reason))
                     }
                     SnapshotAcquireOutcome::Cancelled => slot.terminal(LiveTerminal::Cancelled),
                     SnapshotAcquireOutcome::Unsupported(_) | SnapshotAcquireOutcome::TimedOut => {
@@ -561,6 +562,32 @@ mod tests {
                     UnavailableReason::MaterializationFailed
                 )),
                 ..
+            }
+        ));
+    }
+
+    #[test]
+    fn live_materialization_unavailable_overrides_logical_channel_completion() {
+        let (group, route, _) = group(ConsumerActivation::NonBlockingLive {
+            late_apply: RuntimeFilterLateApplyGranularity::Batch,
+        });
+        group
+            .publish(
+                route,
+                SnapshotAcquireOutcome::Unavailable(UnavailableReason::ResourceLimit),
+                Some(LiveTerminal::Completed),
+            )
+            .unwrap();
+        let RuntimeFilterSubscriptionHandle::Live(slot) =
+            group.handle(UniqueId::new(12, 13)).unwrap()
+        else {
+            panic!("expected live slot")
+        };
+        assert!(matches!(
+            slot.poll_after(None),
+            LivePollOutcome::Idle {
+                latest_version: None,
+                terminal: Some(LiveTerminal::Unavailable(UnavailableReason::ResourceLimit)),
             }
         ));
     }

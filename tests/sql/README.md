@@ -17,120 +17,53 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-# SQL Tests
+# SQL correctness entrypoint
 
-SQL tests have two physical roots:
+原生 runner 仅发现 `tests/sql/correctness/`。当前阶段只维护功能与数据正确性，SQL benchmark binary、专用 workload、比较/采样协议及隐藏参数已退出；普通 elapsed 输出是运行说明。资产准入、失败保留和批准例外见 [测试治理](../../docs/guides/development/test-governance.md)，suite 覆盖见 [correctness map](correctness/README.md)。
 
-- `tests/sql/correctness/` contains the small-data correctness corpus used by development and full CI.
-- `tests/sql/benchmarks/` contains fixed-data performance workloads. They are not selected by correctness CI.
+## 原生运行与输入
 
-For asset admission, approval snapshots, attempt retention and evidence limits,
-see [test governance](../../docs/guides/development/test-governance.md). Existing
-runner output locations remain valid local materials; record their actual paths
-and retain unresolved failures. A generated report does not establish a shared
-handoff or a performance verdict.
+生产验收使用 cross-process 1FE+3BE。runner 通过 `NOVAROCKS_BIN` 指定实际二进制，拥有 spawn、READY、执行和实际 shutdown；`all-in-one` 模式只连接配置中的已有服务，属于本地 smoke，不替代生产拓扑。
 
-## Object Store Prerequisite
-
-Iceberg 等对象存储套件使用显式 runner 配置中的端点与凭证；fixture 服务的 host 端口由 runtime owner 分配，不能假设 `9000/8181` 或默认凭证。先验证本机 BOM 并绑定，再解析一次 publication：
+非隔离套件先绑定验证过 BOM 的 fixture，再解析一次 immutable publication；不猜固定端点和凭据：
 
 ```bash
 docker/iceberg-rest/up.sh
 fixture_publication="$(python3 -c 'from pathlib import Path; print(Path("docker/iceberg-rest/runtime/current/published").resolve(strict=True))')"
 source "$fixture_publication/env.sh"
+export NOVAROCKS_BIN="$PWD/target/dev-opt/novarocks"
+cargo run --locked --profile dev-opt --manifest-path tests/sql/runner/Cargo.toml --bin novarocks-sql-test -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite filter --mode verify \
+  --cluster-mode cross-process --cluster-size 3 -j 1
 ```
 
-生成的 `sql-test.toml` 同时包含实际端点和 `[env].fixture_env_file` 的不可变 publication 路径。缺少运行配置时 runner 明确报错，不回退固定端点。BOM 前置条件失败（75）是 BLOCKED；端口/身份/owner 失败是 VERIFY FAILED。verify/测试不自动 provision。
+`--list-suites` 列出所有注册套件，包括 explicit-only；`--suite all` 按 suite manifest 排除 explicit-only。`--list-extensions` 不启动集群。默认配置不提供完整 fixture 端点，不能用旧环境补造缺项。隔离 REST 套件由 runner 启停私有 fixture，准备和测试分离，见 [fixture 操作](../../docker/iceberg-rest/README.md)。
 
-`up.sh --prepare-only` 无 Docker，只恢复已保存状态；unbound 不提供占位端点，保存的 ready 也不是健康证明。`NOVA_ENV_RUNTIME_DIR` 存放稳定运行数据，消费者使用 `NOVA_ENV_REST_ENV_FILE`，不能拼接 runtime/env.sh。解绑/purge、版本实例及 HMS 退出顺序见 [fixture 操作说明](../../docker/iceberg-rest/README.md)。
+## SSB/TPC 数据正确性
 
-## Who Owns the Server
+`ssb`、`tpc-h`、`tpc-ds` 与其他 suite 共用正常 case discovery、suite init/cleanup、结果比对和 server cleanup；分别消费 scale `1`、`1`、`1GB` 的共享 READY 数据。仅以完整 suite manifest 的 `prepared_dataset` 绑定输入，不读取旧测量 scenario/window 定义。
 
-The runner's default `--cluster-mode all-in-one` does **not** start a server: it
-connects to the host and port its config names, so a server must already be
-running there. `--cluster-mode cross-process` is the opposite — the runner
-launches and owns the FE/BE cluster itself, locating the binary through
-`NOVAROCKS_BIN` or a build under `target/`.
-
-## Default Standalone Flow
-
-Start a server first. It takes one FE config and one BE config — copy
-`novarocks-fe.toml.example` and `novarocks-be.toml.example` from the repo root,
-or use the generated pair below. There is no `--port` flag:
+输入 owner 先显式准备。下例变量需要替换成仓库外独占尝试目录和真实 suite/scale，不在 verify 的错误恢复路径自动供给：
 
 ```bash
-NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone \
-  --role all-in-one --fe-config ./novarocks-fe.toml --be-config ./novarocks-be.toml
+python3 tests/sql/fixtures/benchmarks/resolve_benchmark_fixture.py \
+  --suite "$suite" --scale "$scale" --shared-root "$NOVA_ENV_SHARED_BENCHMARK_ROOT" > "$attempt/resolved-dataset.json"
+tests/sql/fixtures/benchmarks/bootstrap_benchmark_data.sh \
+  --suite "$suite" --scale "$scale" --resolved-dataset "$attempt/resolved-dataset.json" --ensure
 ```
 
-Inside a worktree, do not assume a port — source the generated environment and
-use its configs, so this worktree cannot collide with another:
+同次 publication、真实 Spark image/BOM、schema与对象布局由既有输入 owner 核对。消费者只运行 `--check`，核对 READY 的 dataset key、manifest URI、publication identity/ETag及实际 warehouse；缺失、失效或不匹配即非零退出，不启动集群或重写数据。新对象存储需重新显式供给，共享 READY 不属于 worktree purge。
 
 ```bash
-source docker/iceberg-rest/runtime/current/env.sh
-NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone \
-  --role all-in-one --fe-config "$NOVAROCKS_FE_CONFIG" --be-config "$NOVAROCKS_BE_CONFIG"
+cargo run --locked --profile dev-opt --manifest-path tests/sql/runner/Cargo.toml --bin novarocks-sql-test -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite ssb,tpc-h,tpc-ds --mode verify \
+  --cluster-mode cross-process --cluster-size 3 -j 1 --cluster-launch-profile performance
 ```
 
-When backgrounding the server, gate the first query on the `NOVAROCKS_READY`
-marker it prints after binding — probing the port alone cannot tell a fresh
-server from a leftover process that already owned it.
+`performance` 是 clean harness 启动配置，支持 release binary、拒绝 fault 注入；本命令不测吞吐或延迟分位数。三套高成本 suite 是 explicit-only，不扩默认 CI。runner/输入绑定变更必跑三套；领域 SQL 变更按相关性选择；维护者每周手工完整轮次，自动调度尚未交付。邻近说明见 [SSB](correctness/ssb/README.md)、[TPC-H](correctness/tpc-h/README.md)、[TPC-DS](correctness/tpc-ds/README.md)。
 
-非隔离套件运行时使用已绑定 publication 的生成配置；即使 `filter` 不访问 Iceberg，runner 仍在启动时核验这组明确的 fixture 配置：
+## 失败、材料与退出
 
-```bash
-cargo run --manifest-path tests/sql/runner/Cargo.toml --bin novarocks-sql-test -- \
-  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
-  --suite filter --mode verify
-```
+语句失败与 mismatch 非零退出，原始 FAIL 保留。未传 `--write-actual-dir` 也由失败材料根保存 case/expected/actual/diff；默认根为 `logs/sql-test-failures`，可用 `--failure-artifact-dir` 或现有环境变量选择真实独占材料位置。FE/BE 日志、suite hook错误、primary error和cleanup error分别记录，cleanup失败不能被结果 PASS 覆盖。每次重跑换新材料根，不自动复跑或删除旧失败。
 
-所有非隔离套件都需要明确的端点、凭证和 `fixture_env_file`。默认 `tests/sql/runner/conf/default.toml` 不提供这些值，不能当作可直接运行的 fixture 配置。使用上述生成的 `--config`，或提供具有同一完整契约的显式配置；runner 不以默认端口或环境中的旧端点补齐缺失值。隔离套件由 runner 启动自己的 fixture，再统一投影其配置。
-
-`tests/sql/correctness/README.md` carries the suite map — which engine area each
-suite covers and what fixture or topology it needs. Choose suites from it rather
-than running the whole corpus.
-
-## Benchmark Flow
-
-Benchmarks are deliberately separate from correctness suites. Use the local
-wrapper, which builds the release server binary and defaults to SSB:
-
-```bash
-tools/benchmark/run-sql-benchmark.sh
-```
-
-Pass benchmark-runner options after the script name to choose a workload or an
-output location. Benchmarks always use the cross-process FE/BE harness; choose
-the number of BEs for this run with `--backend-count` (the default is one):
-
-```bash
-tools/benchmark/run-sql-benchmark.sh --suite tpc-ds --backend-count 2
-tools/benchmark/run-sql-benchmark.sh --suite all --backend-count 4 --output-dir /tmp/novarocks-benchmarks
-```
-
-benchmark runner 在 suite hook 前解析固定共享数据。bootstrap 先 bind 并读取同次 publication，再核对实际 Spark image ID/BOM producer 后检查或构建 READY；第一次新对象存储需要重建数据，worktree purge 保留共享 READY。
-It verifies results, performs one warmup pass, records five serial measured
-passes, and captures a profile pass. Generated reports go to
-`reports/sql-benchmarks/` and do not belong in correctness CI.
-
-An external controller may attach an opaque environment JSON object and a
-comparison key. The runner does not inspect host CPU, memory, or OS details;
-it records these controller-provided values unchanged in both `run.json` and
-`SUMMARY.md` for the controller's cross-machine comparison policy:
-
-```bash
-tools/benchmark/run-sql-benchmark.sh --backend-count 3 \
-  --controller-environment '{"machine_pool":"nightly-a","storage":"local-minio"}' \
-  --comparison-key nightly-a-release
-```
-
-## Explicit Iceberg Config
-
-For Docker-backed Iceberg suites, prefer the generated fixture config:
-
-```bash
-source docker/iceberg-rest/runtime/current/env.sh
-cargo run --manifest-path tests/sql/runner/Cargo.toml --bin novarocks-sql-test -- \
-  --config "$NOVAROCKS_SQL_TEST_CONFIG" \
-  --suite materialized-view --mode verify
-```
+suite init失败仍执行所属cleanup一次；case失败不跳过正常cleanup；runner拥有实际cluster shutdown和残留进程核对。执行成功、SQL ERR、取消、owner排空、进程退出是不同事实。定向通过不覆盖全量 raw FAIL，批准的本次例外与运行结果分别表达。

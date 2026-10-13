@@ -16,7 +16,7 @@
 // under the License.
 
 use super::result_delivery::root_census;
-use super::result_delivery_baseline::await_idle;
+use super::result_delivery_support::await_idle;
 use crate::actors::mysql_stream::{AsyncMysqlStream, TextColumnObservation};
 use crate::scenario::{Scenario, ScenarioContext};
 use anyhow::{Context, Result, ensure};

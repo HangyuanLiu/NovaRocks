@@ -19,9 +19,10 @@
 -- @order_sensitive=true
 -- @tags=write_path,mv,iceberg,ivm,storage_engine_iceberg
 -- Test Objective:
--- 1. Validate standalone CREATE / REFRESH / SELECT / DROP MATERIALIZED VIEW over an Iceberg base table.
+-- 1. Validate CREATE / REFRESH / SELECT / DROP MATERIALIZED VIEW through the native SQL entrypoint.
 -- 2. Confirm MV contents stay stale until the next manual REFRESH.
 -- 3. MV is Iceberg-target (PROPERTIES('storage_engine'='iceberg')).
+-- 4. FULL publications report the independently known logical result rows.
 
 -- query 1
 -- @skip_result_check=true
@@ -66,32 +67,52 @@ SELECT k1, v2 FROM orders_mv ORDER BY k1;
 
 -- query 3
 -- @skip_result_check=true
-REFRESH MATERIALIZED VIEW orders_mv;
+REFRESH MATERIALIZED VIEW orders_mv FULL;
 
 -- query 4
 SELECT k1, v2 FROM orders_mv ORDER BY k1;
 
 -- query 5
+-- A full publication contains the three declared seed rows. Processed input
+-- and physical write counts are not the oracle for LastRefreshRows.
+-- @result_rows_where=Name=orders_mv
+-- @result_rows_count=1
+-- @result_rows_expect=LastRefreshRows=3
+-- @result_rows_expect=StorageEngine=iceberg
+SHOW MATERIALIZED VIEWS;
+
+-- query 6
 -- @skip_result_check=true
 INSERT INTO mv_ice_${uuid0}.ns_${uuid0}.orders VALUES (4, 70);
 
--- query 6
+-- query 7
 SELECT k1, v2 FROM orders_mv ORDER BY k1;
 
--- query 7
+-- query 8
 -- @skip_result_check=true
 REFRESH MATERIALIZED VIEW orders_mv;
 
--- query 8
+-- query 9
 -- @imv_equivalence_check=orders_mv
 SELECT k1, v2 FROM orders_mv ORDER BY k1;
 
--- query 9
--- @result_contains=orders_mv
--- @result_contains=iceberg
+-- query 10
+-- Incremental publication rows need not equal the complete table's row count.
+-- A second full publication supplies the independently known four-row oracle.
+-- @skip_result_check=true
+REFRESH MATERIALIZED VIEW orders_mv FULL;
+
+-- query 11
+SELECT k1, v2 FROM orders_mv ORDER BY k1;
+
+-- query 12
+-- @result_rows_where=Name=orders_mv
+-- @result_rows_count=1
+-- @result_rows_expect=LastRefreshRows=4
+-- @result_rows_expect=StorageEngine=iceberg
 SHOW MATERIALIZED VIEWS;
 
--- query 10
+-- query 13
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_mv;

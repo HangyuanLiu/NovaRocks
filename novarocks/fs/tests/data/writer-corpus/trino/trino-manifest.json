@@ -1,0 +1,22 @@
+{
+  "columns": [
+    "id",
+    "category",
+    "amount",
+    "nested"
+  ],
+  "created_by": "parquet-mr-trino version 483 (build n/a)",
+  "file": "trino-483.parquet",
+  "file_bytes": 15970,
+  "generator": "provision_trino.sh",
+  "image_digest": "sha256:db58cc93e593a2706553745f276bb119c9810e69918be56ecde088ba7ccb0534",
+  "oracle_sha256": "d9692d1e4c69c62c9a6aa1ff11012679068491123d0e97f15d359ffb71c5f2d7",
+  "row_groups": 1,
+  "rows": 4096,
+  "schema_version": 1,
+  "sha256": "012f19f5e78f28bc006bcdae895df74fd9a69dda7428cbee05986dd6e0dc0ea8",
+  "source_object": "s3://warehouse/novarocks-5b2f15f1/rest/uea4a2_writer_84977/sample-1d698ccd288f49adaa8afc7ed447df35/data/20260923_110435_00002_u3pnc-ba89bd58-736c-4206-a148-17a5e0e1424c.parquet",
+  "sql": "CREATE TABLE iceberg.uea4a2_writer_84977.sample WITH (format = 'PARQUET') AS SELECT CAST(id AS BIGINT) AS id, CAST(id % 17 AS INTEGER) AS category, CAST(id * 0.01 AS DECIMAL(12,2)) AS amount, CAST(ARRAY[CAST(id % 5 AS INTEGER), CAST(id % 7 AS INTEGER)] AS ARRAY(INTEGER)) AS nested FROM UNNEST(sequence(0, 4095)) AS t(id)",
+  "writer": "Trino",
+  "writer_version": "483"
+}

@@ -50,7 +50,7 @@ TLS 是无需析构的 const `Cell`，线程只有一个 Q=1 MiB 槽。切槽、
 
 进程 small/tagged 计数、三类 tagged/R1 small、unattributed、signed 盲区和对账、metadata 估计、批量估计分列。RSS/cgroup/jemalloc 与请求/责任事实不能相加。S1 尚未把生产 query/R1 调用面接线，零 query lane 指标不能证明查询已被硬治理；driver 安全点与 query 强制属于后续工作。
 
-完整合同见 [ADR-0167](../../adr/ADR-0167-size-banded-allocation-attribution.md)，验证入口见 [memory tests](../../../novarocks/memory/tests/README.md)，成本入口见 [attribution harness](../../../tools/memory-attribution-bench/README.md)。本地 smoke、模型完成和文档检查均不代替 Miri 地址验证或用户的 Linux 成本结论。
+完整合同见 [ADR-0167](../../adr/ADR-0167-size-banded-allocation-attribution.md)，验证入口见 [memory tests](../../../novarocks/memory/tests/README.md)。当前阶段仅维护功能与数据正确性，归属/资金测量载体已退出；历史 Linux 成本结论仍只能按其原输入和版本解释，不能补为当前通过。Loom/Miri 与 unsafe 地址、别名和生命周期要求保留；本地 smoke、模型完成及文档检查不代替 Miri 地址验证。
 
 ## CI 依赖门
 

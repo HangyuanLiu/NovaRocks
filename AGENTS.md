@@ -327,8 +327,8 @@ Execution, and do not recreate a Backend facade around it.
   these contracts. `tools/ci/memory-model-checks.sh` runs local Loom/Miri only;
   Miri uses Tree Borrows because Stacked Borrows rejects any in-band allocator
   tail read through the narrowed pointers std Box/Arc pass to `dealloc`. The
-  attribution benchmark has a separate frozen manifest and user-run Linux
-  acceptance gate; smoke runs never prove cost acceptance.
+  当前阶段仅维护功能与数据正确性，内存测量载体已退出；保留 Loom/Miri
+  和 unsafe 地址/生命周期要求。smoke 不证明性能或所有生产调用面已接线。
 
 ### 4.8 Connectors / Catalog Backends / Filesystem
 
@@ -678,7 +678,7 @@ and `http://minio:9000` for object storage. NovaRocks should use the host
 endpoints from `env.sh`. Do not mix container endpoints into NovaRocks catalog
 SQL.
 
-`docker/iceberg-rest/down.sh --runtime-only` 显式解绑，发布 unbound 并回收旧输出，保留全部历史 `data_locations`。加 `--purge` 才清理全部已记录对象存储位置的私有前缀；只有全部成功才释放数据引用，失败保留原发布供重试。标准 benchmark READY 数据不属于 worktree 清理范围；首次新对象存储需要重新构建 benchmark 数据。
+`docker/iceberg-rest/down.sh --runtime-only` 显式解绑，发布 unbound 并回收旧输出，保留全部历史 `data_locations`。加 `--purge` 才清理全部已记录对象存储位置的私有前缀；只有全部成功才释放数据引用，失败保留原发布供重试。共享 SSB/TPC 正确性 READY 数据不属于 worktree 清理范围；首次新对象存储需由输入 owner 显式准备并校验。
 
 共享服务的停止与删除使用 `docker/iceberg-rest/fixture-runtime.sh stop/delete <exact-runtime-id>`，全局 `--root/--daemon` 放在子命令前并取自 manifest 的 owner locator。catalog 普通删除在有绑定时拒绝；force 只条件解绑仍指向目标的 worktree，保留数据引用。对象存储默认停止和任何删除都受 catalog/数据引用保护；force-stop 可以中断消费者但保留记录、卷和端口。HMS 或其他外部 endpoint 未退出时普通/force catalog 删除均在破坏操作前拒绝；先按 HMS 自身入口退出。共享模式拒绝 `down.sh --docker/--volumes`。旧 `nr-iceberg-rest`、`nr-iceberg-hive` 项目和卷不自动接管或删除，退出由用户另行安排。
 
@@ -719,11 +719,11 @@ machine — treat as relative, not absolute):
 - **Release build (`cargo build --release`)**: opt-level 3 + thin LTO + `codegen-units = 1`,
   `incremental` off. Fastest execution, but incremental rebuilds are punishing
   (~6 min for a one-line lib change), so it is unusable for iteration.
-  **Use when**: measuring query latency/throughput or running benchmarks.
+  **Use when**: checking a release artifact or deployment build. 当前阶段不维护性能测量资产。
 
 **Rule of thumb**: `dev` for pure correctness iteration; `dev-opt` for the dev/test
 loop when query speed matters (fast rebuilds + release-class runtime); `--release`
-only for performance measurement and benchmarks.
+for release artifact checks; this is a Cargo build profile, not a performance test verdict.
 
 ### 8.3 Code Quality
 
@@ -734,8 +734,7 @@ only for performance measurement and benchmarks.
 
 ### 8.4 SQL Regression Tests
 
-The unified runner is under `tests/sql/runner`, with correctness suites under `tests/sql/correctness`
-and benchmark workloads under `tests/sql/benchmarks`.
+The SQL runner is under `tests/sql/runner`; its only suite root is `tests/sql/correctness`.
 It requires a running NovaRocks
 MySQL-compatible standalone server. Do not assume a fixed port in Codex
 workspaces; source `docker/iceberg-rest/runtime/current/env.sh` when that
@@ -793,10 +792,13 @@ Suites are discovered from `tests/sql/correctness/`; ask the runner for the
 current list with `--list-suites`. `tests/sql/correctness/README.md` carries the
 suite map — which engine area each suite covers, its typical change entry, and
 whether it needs the REST Catalog fixture or a cross-process topology — and is
-the reference for choosing suites. `ssb`, `tpc-h` and `tpc-ds` are benchmark
-workloads under `tests/sql/benchmarks/` and belong to the benchmark runner, not
-to correctness CI. Cluster mode and backend count come from runner CLI; no suite
-owns an alternate server runtime.
+the reference for choosing suites. `ssb`, `tpc-h` and `tpc-ds` are explicit-only
+dataset correctness suites in this same root. They require prepared READY inputs,
+`--cluster-mode cross-process --cluster-size 3 -j 1` and explicit
+`--cluster-launch-profile performance`. That launch profile selects the clean
+harness configuration; it does not measure performance. The consumer only checks
+inputs, runs suite init/cases/cleanup and owns actual FE/BE shutdown.
+Cluster mode and backend count come from runner CLI; no suite owns an alternate runtime.
 
 **Run specific cases:**
 
@@ -1051,3 +1053,11 @@ stop; pause only for the major decision conditions defined by
 are allowed after a coherent plan section completes or before risky changes.
 The execute stage must never push or open a PR; those actions require explicit
 authorization in `dev-workflow-finish`.
+
+### 当前测试资产与维护频率
+
+当前阶段只维护功能与数据正确性；不新增或维护吞吐、延迟分位数、RSS 比较门及持续测量协议。历史报告和 frozen receipt 仅是来源证据，不能成为新采集准入。一次性研究保存在仓库外独占尝试目录；晋升资产前先确定性质、最低充分 owner、独立 oracle、输入和真实退出。先承接性质再删除旧载体。
+
+相关 Rust owner/helper/input 改动沿既有单测链路；结果慢端/并发与 range/delete/planning/DOP 显式功能组由领域维护者每周手工运行，相关 owner/fixture 改动必跑。三套 SSB/TPC correctness 成本较高，runner/输入绑定改动必跑三套，每周手工完整轮次，不扩默认 CI。MV/OPTIMIZE 沿既有 suite。周期调度与共享证据服务尚未交付，G7a/G7b 已取消，不作未来交付承诺。详见 [测试治理](docs/guides/development/test-governance.md)。
+
+FE preparation 只保留带独立 secret 鉴权的 `/statement/{arm,peek,drain}` 功能观测；运行级 `/arm`、`/drain` 与专用计时钩子退出。G2 发布能力/profile 自报与门控未交付前保持未知，不能从 binary 路径或源码 HEAD 推定发布物不含测试能力。

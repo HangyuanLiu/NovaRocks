@@ -17,9 +17,9 @@
 
 -- @tags=optimizer,topn,aggregate,session_rule_disable
 -- Test Objective:
--- Lock in PushDownTopNToPreAgg plan-shape coverage. The full EXPLAIN golden
--- distinguishes the pushed pre-aggregate LOCAL TOP-N from the generic
--- SplitTopN LOCAL TOP-N above the global aggregate.
+-- Rows TopN budgets consume complete Global groups. The native physical
+-- contract checks their exact sequence and input; these EXPLAIN assertions
+-- cover the planner's ordered-bound publication without unstable node IDs.
 
 DROP TABLE IF EXISTS ${case_db}.t_pushdown_topn_preagg;
 CREATE TABLE ${case_db}.t_pushdown_topn_preagg (city INT, sales INT);
@@ -30,8 +30,12 @@ ANALYZE TABLE ${case_db}.t_pushdown_topn_preagg;
 
 SET disable_optimizer_rules = '';
 
--- Rule enabled: ORDER BY group key can insert a partial TopN between
--- global and local aggregate.
+-- Normal SplitTopN ranks complete Global groups and publishes a live bound.
+-- @skip_result_check=true
+-- @result_contains=LOCAL TOP-N
+-- @result_contains=HASH AGGREGATE (GLOBAL, group by: [city])
+-- @result_contains=domain = OrderedBound(key=Int32 ASC NULLS FIRST, inclusive=true)
+-- @result_contains=activation = NonBlockingLive(Batch)
 EXPLAIN VERBOSE
 SELECT city, SUM(sales)
 FROM (
@@ -43,9 +47,14 @@ GROUP BY city
 ORDER BY city
 LIMIT 10;
 
-SET disable_optimizer_rules = 'PushDownTopNToPreAgg';
+SET disable_optimizer_rules = 'SplitTopN';
 
--- Rule disabled: no pre-aggregate partial TopN.
+-- A single Rows budget still completes the answer, without a split producer.
+-- @skip_result_check=true
+-- @result_contains=TOP-N
+-- @result_contains=HASH AGGREGATE (
+-- @result_not_contains=LOCAL TOP-N
+-- @result_not_contains=domain = OrderedBound
 EXPLAIN VERBOSE
 SELECT city, SUM(sales)
 FROM (
@@ -59,8 +68,10 @@ LIMIT 10;
 
 SET disable_optimizer_rules = '';
 
--- Negative: ORDER BY aggregate output is not eligible for pre-aggregate
--- partial TopN pushdown.
+-- Ranking an aggregate result cannot publish a bound on its input group key.
+-- @skip_result_check=true
+-- @result_contains=sum(sales) DESC NULLS LAST
+-- @result_not_contains=domain = OrderedBound
 EXPLAIN VERBOSE
 SELECT city, SUM(sales) AS s
 FROM (
@@ -72,9 +83,10 @@ GROUP BY city
 ORDER BY s DESC
 LIMIT 10;
 
--- Negative: ORDER BY a proper subset of group keys is not safe. Local
--- per-shard TopN may prune different tied groups and leave the global
--- aggregate with partial inputs.
+-- A proper subset of grouping keys cannot prove a distinct-key bound.
+-- @skip_result_check=true
+-- @result_contains=group by: [city, sales]
+-- @result_not_contains=domain = OrderedBound
 EXPLAIN VERBOSE
 SELECT city, sales, SUM(sales) AS s
 FROM (

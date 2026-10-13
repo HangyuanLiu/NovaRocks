@@ -4,18 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
-import subprocess
-import tempfile
+import sys
+from urllib.parse import quote, urlencode
+from urllib.request import urlopen
 
 import pyarrow.parquet as pq
-from pyiceberg.catalog.rest import RestCatalog
 
-IDENTITY = ("uea4a2_short_20260923", "short_v1")
 KIND = "uea4a2-iceberg-short-v1"
 
 
@@ -31,40 +32,72 @@ def write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
-def command(*args: str) -> str:
-    return subprocess.run(args, check=True, capture_output=True, text=True).stdout.strip()
+def fixture_support():
+    path = Path(__file__).resolve().parents[4] / "docker/paimon-read/fixture.py"
+    spec = importlib.util.spec_from_file_location("short_fixture_support", path)
+    if spec is None or spec.loader is None:
+        raise ValueError("the existing fixture support is unavailable")
+    support = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = support
+    spec.loader.exec_module(support)
+    return support
 
 
-def provision(output: Path, spark_image_id: str) -> None:
+def rest_json(url: str):
+    with urlopen(url, timeout=30) as response:
+        return json.load(response)
+
+
+def provision(output: Path, spark_image_id: str, database: str, table_name: str, spark_output: Path) -> None:
     if output.exists():
         raise ValueError(f"refusing to replace existing fixture: {output}")
+    identity = (database, table_name)
+    if not all(re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part) for part in identity):
+        raise ValueError("short fixture database and table must be explicit SQL identifiers")
     endpoint = os.environ["AWS_S3_ENDPOINT"]
-    access = os.environ["AWS_S3_ACCESS_KEY_ID"]
-    secret = os.environ["AWS_S3_SECRET_ACCESS_KEY"]
     rest = os.environ["NOVAROCKS_ICEBERG_REST_URI"]
     warehouse = os.environ["NOVAROCKS_ICEBERG_REST_WAREHOUSE"]
-    catalog = RestCatalog("task", uri=rest, warehouse=warehouse, **{
-        "s3.endpoint": endpoint, "s3.access-key-id": access,
-        "s3.secret-access-key": secret, "s3.region": "us-east-1",
-    })
-    table = catalog.load_table(IDENTITY)
-    suffix = "/" + "/".join(IDENTITY)
-    if not table.location().endswith(suffix):
+    support = fixture_support()
+    env_file = Path(os.environ["NOVA_ENV_REST_ENV_FILE"]).resolve(strict=True)
+    runtime = support.load_runtime(env_file)
+    if runtime.minio_endpoint_host != endpoint:
+        raise ValueError("short publisher endpoint differs from its fixed environment publication")
+    config = rest_json(rest.rstrip("/") + "/v1/config?" + urlencode({"warehouse": warehouse}))
+    properties = dict(config.get("defaults", {}))
+    properties.update(config.get("overrides", {}))
+    prefix = properties.get("prefix", "")
+    prefix_path = "/" + quote(prefix, safe="") if prefix else ""
+    loaded = rest_json(rest.rstrip("/") + "/v1" + prefix_path +
+                       "/namespaces/" + quote(database, safe="") +
+                       "/tables/" + quote(table_name, safe=""))
+    metadata = loaded["metadata"]
+    location = metadata["location"]
+    suffix = "/" + "/".join(identity)
+    if not location.endswith(suffix):
         raise ValueError("short Iceberg table location does not match its namespace and name")
-    actual_warehouse = table.location().removesuffix(suffix)
-    current = table.inspect.files().to_pylist()
-    if len(current) != 1 or current[0]["record_count"] != 4096:
-        raise ValueError("short Iceberg table must have exactly one current 4096-row data file")
-    object_uri = current[0]["file_path"]
-    if not object_uri.startswith(table.location() + "/data/") or not object_uri.endswith(".parquet"):
+    actual_warehouse = location.removesuffix(suffix)
+    current_snapshot = metadata["current-snapshot-id"]
+    if not any(snapshot["snapshot-id"] == current_snapshot for snapshot in metadata["snapshots"]):
+        raise ValueError("REST metadata does not contain the current short snapshot")
+    text = spark_output.read_text()
+    records = [json.loads(line.removeprefix("NR_SHORT_FILE|"))
+               for line in text.splitlines() if line.startswith("NR_SHORT_FILE|")]
+    if len(records) != 1 or records[0]["record_count"] != 4096:
+        raise ValueError("official Spark files receipt must contain one current 4096-row data file")
+    object_uri = records[0]["file_path"]
+    if not object_uri.startswith(location + "/data/") or not object_uri.endswith(".parquet"):
         raise ValueError("current data file is outside the exact Iceberg table")
+    object_stat = json.loads(support.compose_mc(runtime,
+        'set -eu\n/usr/bin/mc alias set minio http://minio:9000 "${MINIO_ROOT_USER:-admin}" "${MINIO_ROOT_PASSWORD:-admin123}" >/dev/null\n/usr/bin/mc stat --json "$1"',
+        "minio/" + object_uri.removeprefix("s3://")))
+    data = support.compose_mc_bytes(runtime,
+        'set -eu\n/usr/bin/mc alias set minio http://minio:9000 "${MINIO_ROOT_USER:-admin}" "${MINIO_ROOT_PASSWORD:-admin123}" >/dev/null\n/usr/bin/mc cat "$1"',
+        "minio/" + object_uri.removeprefix("s3://"))
+    if len(data) != object_stat["size"] or len(data) != records[0]["file_size_in_bytes"]:
+        raise ValueError("short data bytes differ from their official files receipt and object stat")
     output.mkdir(parents=True)
-    with tempfile.TemporaryDirectory(prefix="uea4a2-mc-") as config:
-        mc = ["mc", "--config-dir", config]
-        command(*mc, "alias", "set", "task", endpoint, access, secret)
-        remote = "task/" + object_uri.removeprefix("s3://")
-        object_stat = json.loads(command(*mc, "stat", "--json", remote))
-        command(*mc, "cp", remote, str(output / "data.parquet"))
+    (output / "data.parquet").write_bytes(data)
+    shutil.copyfile(spark_output, output / "writer.log")
     rows = pq.read_table(output / "data.parquet").to_pylist()
     if len(rows) != 4096 or sorted(rows, key=lambda row: row["id"]) != [
         {"id": number, "value": number * 3} for number in range(4096)
@@ -76,25 +109,25 @@ def provision(output: Path, spark_image_id: str) -> None:
     }
     write_json(output / "oracle.json", oracle)
     write_json(output / "objects.json", [{
-        "key": object_uri.removeprefix(table.location() + "/"),
+        "key": object_uri.removeprefix(location + "/"),
         "size": int(object_stat["size"]),
         "etag": object_stat["etag"],
         "sha256": digest(output / "data.parquet"),
     }])
-    source = Path(__file__).parent
+    source = Path(__file__).resolve().parents[4] / "novarocks/fs/tests/data/writer-corpus/spark"
     for name in ("provision_short_iceberg.sql", "compact_short_iceberg.sql"):
         shutil.copyfile(source / name, output / name)
     artifacts = {name: digest(output / name) for name in (
         "data.parquet", "oracle.json", "objects.json",
-        "provision_short_iceberg.sql", "compact_short_iceberg.sql",
+        "provision_short_iceberg.sql", "compact_short_iceberg.sql", "writer.log",
     )}
     manifest = {
         "schema_version": 1, "fixture_kind": KIND,
-        "database": IDENTITY[0], "table": IDENTITY[1],
-        "table_location": table.location(), "warehouse_uri": actual_warehouse,
+        "database": database, "table": table_name,
+        "table_location": location, "warehouse_uri": actual_warehouse,
         "rest_uri": rest, "s3_endpoint": endpoint, "region": "us-east-1",
         "credential_name": "iceberg-test-data", "credential_generation": "v1",
-        "snapshot_id": table.metadata.current_snapshot_id,
+        "snapshot_id": current_snapshot,
         "data_file_count": 1, "row_count": 4096,
         "objects_sha256": artifacts["objects.json"],
         "writer": {"engine": "Spark", "version": "3.5.5", "image_id": spark_image_id},
@@ -135,11 +168,16 @@ def main() -> None:
     parser.add_argument("mode", choices=("provision", "verify"))
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--spark-image-id", help="required for provision")
+    parser.add_argument("--database", help="explicit prepared namespace, required for provision")
+    parser.add_argument("--table", help="explicit prepared table, required for provision")
+    parser.add_argument("--spark-output", type=Path, help="official Spark files output, required for provision")
     args = parser.parse_args()
     if args.mode == "provision":
         if not args.spark_image_id or not args.spark_image_id.startswith("sha256:"):
             parser.error("provision requires --spark-image-id sha256:...")
-        provision(args.output, args.spark_image_id)
+        if not args.database or not args.table or not args.spark_output:
+            parser.error("provision requires explicit --database, --table and --spark-output")
+        provision(args.output, args.spark_image_id, args.database, args.table, args.spark_output)
     else:
         verify(args.output)
 

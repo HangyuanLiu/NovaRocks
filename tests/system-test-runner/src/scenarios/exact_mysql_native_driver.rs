@@ -21,7 +21,7 @@
 use super::exact_mysql_native_oracle::{ActualBinding, RowInput, compare_cancel};
 use super::independent_root_target::{IndependentRootObserver, IndependentRootTarget};
 use super::result_delivery::root_census;
-use super::result_delivery_baseline::metric;
+use super::result_delivery_support::metric;
 use crate::actors::exact_mysql_control_v2::{Command, GatePhase, ReplyFacts, UnixControlClient};
 use crate::actors::mysql_stream::exact_result_reader::{ExactReadSnapshot, ExactResultReader};
 use crate::exact_mysql_target_binding;
@@ -382,14 +382,10 @@ impl Scenario for ExactNativeCase {
     fn is_explicit_stage(&self) -> bool {
         true
     }
-    fn validate_runner_inputs(
-        &self,
-        profile: LaunchProfile,
-        manifest: Option<&Path>,
-    ) -> Result<()> {
+    fn validate_runner_inputs(&self, profile: LaunchProfile) -> Result<()> {
         ensure!(
-            profile == LaunchProfile::FaultScenario && manifest.is_none(),
-            "exact native fixture requires fault-scenario without a performance workload"
+            profile == LaunchProfile::FaultScenario,
+            "exact native fixture requires the fault-scenario launch profile"
         );
         self.run.validate_shape()
     }

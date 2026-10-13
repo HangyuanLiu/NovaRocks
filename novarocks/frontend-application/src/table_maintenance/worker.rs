@@ -665,10 +665,6 @@ impl OptimizeJobExecution for FrontendOptimizeJobExecution {
             .for_admitted_execution(capacity)
             .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
         stat2f_record_provider_dispatch(job.job_id).map_err(OptimizeTerminalError::failed)?;
-        let _diagnostic_scope = crate::preparation_diagnostics::enter_product_work(
-            format!("maintenance-job:{}", job.job_id),
-            format!("maintenance-job:{}", job.job_id),
-        );
         self.product.execute_rewrite_terminal(
             &FrontendMaintenanceEffectPort::new(engine.as_ref()),
             &job.target,
@@ -688,10 +684,6 @@ impl OptimizeJobExecution for FrontendOptimizeJobExecution {
             .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
         stat2f_record_provider_dispatch(job.job_id)
             .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
-        let _diagnostic_scope = crate::preparation_diagnostics::enter_product_work(
-            format!("maintenance-job:{}", job.job_id),
-            format!("maintenance-job:{}", job.job_id),
-        );
         self.product.execute_automatic_rewrite_terminal(
             &FrontendMaintenanceEffectPort::new(engine.as_ref()),
             &job.target,

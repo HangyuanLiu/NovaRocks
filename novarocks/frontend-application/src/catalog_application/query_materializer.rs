@@ -453,18 +453,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
         database: &str,
         table: &str,
     ) -> CatalogResolutionResult<ResolvedAnalyzerTable> {
-        crate::preparation_diagnostics::observe_result_lazy(
-            "metadata_observation",
-            || {
-                format!(
-                    "resolve_table:{}.{database}.{table}",
-                    self.effective_catalog(catalog).unwrap_or("default_catalog")
-                )
-            },
-            "static",
-            None,
-            || self.resolve_table_for_analysis_once(catalog, database, table),
-        )
+        self.resolve_table_for_analysis_once(catalog, database, table)
     }
 
     /// Resolve an Iceberg metadata relation with the same typed absence
@@ -476,18 +465,7 @@ impl<'a> CatalogServiceMaterializer<'a> {
         table: &str,
         metadata_table_type: novarocks_sql::planning::catalog::MetadataTableKind,
     ) -> CatalogResolutionResult<ResolvedAnalyzerTable> {
-        crate::preparation_diagnostics::observe_result_lazy(
-            "metadata_observation",
-            || {
-                format!(
-                    "resolve_metadata_table:{}.{database}.{table}:{metadata_table_type:?}",
-                    self.effective_catalog(catalog).unwrap_or("default_catalog")
-                )
-            },
-            "static",
-            None,
-            || self.metadata_table_def(catalog, database, table, metadata_table_type),
-        )
+        self.metadata_table_def(catalog, database, table, metadata_table_type)
     }
 }
 

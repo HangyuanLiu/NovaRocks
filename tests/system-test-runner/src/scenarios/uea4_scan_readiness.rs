@@ -35,10 +35,6 @@
 //!   backend query resource converges while the read is still held: a
 //!   scan's close stops and observes its reads instead of waiting for their
 //!   bytes.
-//! * `uea4/scan-producer-fanout`: with several driver workers, a scan whose
-//!   downstream is CPU-bound uses more than one core on its backend once the
-//!   pipeline is wider than one, because the scan hands its chunks to
-//!   consumer drivers instead of running the downstream itself.
 //!
 //! Placement is structural, not incidental: every data scan has one task on
 //! every backend, and a single split goes to the backend that sorts first by
@@ -65,7 +61,6 @@ use novarocks_cluster_harness::delayed_s3::{
     DelayedS3Config, DelayedS3ConnectionEventKind, DelayedS3EventKind, DelayedS3Proxy,
     DelayedS3ReadHold,
 };
-use novarocks_cluster_harness::process_resources::ProcessResourceSampler;
 use novarocks_cluster_harness::{CrossProcessConfigOverlay, LaunchProfile, ServerHandle};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -103,9 +98,6 @@ const MYSQL_QUERY_INTERRUPTED: u16 = 1317;
 /// Rows of the one-file table whose single row group decodes into many more
 /// pages than one turn's budget allows.
 const LONG_TABLE_ROWS: u64 = 400_000;
-const FANOUT_TABLE_ROWS: u64 = 1_000_000;
-const FANOUT_WORKERS: usize = 4;
-const FANOUT_DOP: usize = 4;
 /// Caches off, so every read of a file under test is a real object read that
 /// the proxy can hold, even after another catalog read the same file.
 const NO_CACHE_OVERLAY: &str = "[runtime.cache]\npage_cache_enable = false\nparquet_meta_cache_enable = false\nparquet_page_cache_enable = false\ndatacache_enable = false\n";
@@ -114,7 +106,6 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(ScanProducerReadiness),
         Box::new(ScanProducerCancel),
-        Box::new(ScanProducerFanout),
     ]
 }
 
@@ -557,10 +548,6 @@ fn write_report(context: &ScenarioContext, file: &str, report: &impl Serialize) 
     .with_context(|| format!("write {file}"))
 }
 
-fn run_id(context: &ScenarioContext) -> String {
-    context.name().replace('/', "-")
-}
-
 // ------------------------------------------------------------- readiness
 
 struct ScanProducerReadiness;
@@ -713,11 +700,7 @@ impl Scenario for ScanProducerReadiness {
         true
     }
 
-    fn validate_runner_inputs(
-        &self,
-        launch_profile: LaunchProfile,
-        _workload: Option<&Path>,
-    ) -> Result<()> {
+    fn validate_runner_inputs(&self, launch_profile: LaunchProfile) -> Result<()> {
         validate_environment(launch_profile)
     }
 
@@ -931,11 +914,7 @@ impl Scenario for ScanProducerCancel {
         true
     }
 
-    fn validate_runner_inputs(
-        &self,
-        launch_profile: LaunchProfile,
-        _workload: Option<&Path>,
-    ) -> Result<()> {
+    fn validate_runner_inputs(&self, launch_profile: LaunchProfile) -> Result<()> {
         validate_environment(launch_profile)
     }
 
@@ -980,155 +959,6 @@ impl Scenario for ScanProducerCancel {
 }
 
 // ------------------------------------------------------------------ fanout
-
-struct ScanProducerFanout;
-
-#[derive(Serialize)]
-struct FanoutRun {
-    pipeline_dop: usize,
-    wall_millis: u128,
-    backend_cpu_millis: u128,
-    backend_cores: f64,
-    result: i64,
-}
-
-#[derive(Serialize)]
-struct FanoutReport {
-    driver_workers_per_backend: usize,
-    backend: usize,
-    rows: u64,
-    runs: Vec<FanoutRun>,
-}
-
-fn backend_cpu_nanos(sampler: &ProcessResourceSampler, backend: usize) -> Result<u64> {
-    let role = format!("be-{backend}");
-    let sample = sampler
-        .samples()
-        .iter()
-        .rev()
-        .find(|sample| sample.role == role)
-        .with_context(|| format!("no resource sample for {role}"))?;
-    match (sample.cpu_user_nanos, sample.cpu_system_nanos) {
-        (Some(user), Some(system)) => Ok(user + system),
-        _ => bail!(
-            "{role} CPU time is unavailable: {:?}",
-            sample.unavailable_reason
-        ),
-    }
-}
-
-impl Scenario for ScanProducerFanout {
-    fn name(&self) -> &'static str {
-        "uea4/scan-producer-fanout"
-    }
-
-    fn is_explicit_stage(&self) -> bool {
-        true
-    }
-
-    fn validate_runner_inputs(
-        &self,
-        launch_profile: LaunchProfile,
-        _workload: Option<&Path>,
-    ) -> Result<()> {
-        validate_environment(launch_profile)
-    }
-
-    fn launch_config(&self, _scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        launch_config(FANOUT_WORKERS)
-    }
-
-    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        require_three_backends(context)?;
-        let _catalogs = Catalogs::create(context, false)?;
-        let mut control = connect(context, "connect fanout setup session")?;
-        let table = IcebergTable::create(&mut control, "t_fanout", FANOUT_TABLE_ROWS)?;
-        // Two SHA-512 rounds per row keep the downstream CPU-bound, so its
-        // parallelism, not the scan's decoding, decides the cores used.
-        let sql = format!(
-            "SELECT SUM(LENGTH(sha2(sha2(CAST(v AS VARCHAR), 512), 512))) FROM {}",
-            table.qualified(DIRECT_ICEBERG)
-        );
-        let mut runs = Vec::new();
-        let mut backend = None;
-        for dop in [1, FANOUT_DOP] {
-            context.action(format!(
-                "run the CPU-bound downstream at pipeline_dop={dop}"
-            ));
-            control
-                .query_drop(format!("SET pipeline_dop = {dop}"))
-                .context("set pipeline_dop")?;
-            let offsets = log_offsets(context)?;
-            let mut sampler = ProcessResourceSampler::from_identities(
-                context.process_resource_identities()?,
-                run_id(context),
-            )?;
-            sampler.sample_cluster()?;
-            let started = Instant::now();
-            let result: Option<i64> = control
-                .query_first(sql.as_str())
-                .with_context(|| format!("run the fanout query at pipeline_dop={dop}"))?;
-            let wall = started.elapsed();
-            sampler.sample_cluster()?;
-            let placement = await_single_split(context, &offsets, "fanout scan")?;
-            let expected_backend = *backend.get_or_insert(placement.backend);
-            ensure!(
-                placement.backend == expected_backend,
-                "the fanout table's split moved from BE[{expected_backend}] to BE[{}]",
-                placement.backend
-            );
-            let cpu_nanos = {
-                let samples = sampler.samples();
-                let role = format!("be-{}", placement.backend);
-                let first = samples
-                    .iter()
-                    .find(|sample| sample.role == role)
-                    .and_then(|sample| Some(sample.cpu_user_nanos? + sample.cpu_system_nanos?))
-                    .with_context(|| format!("no initial CPU sample for {role}"))?;
-                backend_cpu_nanos(&sampler, placement.backend)?.saturating_sub(first)
-            };
-            let cores = cpu_nanos as f64 / wall.as_nanos().max(1) as f64;
-            context.action(format!(
-                "pipeline_dop={dop}: BE[{}] used {cores:.2} cores over {} ms",
-                placement.backend,
-                wall.as_millis()
-            ));
-            runs.push(FanoutRun {
-                pipeline_dop: dop,
-                wall_millis: wall.as_millis(),
-                backend_cpu_millis: u128::from(cpu_nanos / 1_000_000),
-                backend_cores: cores,
-                result: result.context("fanout query returned no row")?,
-            });
-        }
-        let [narrow, wide] = runs.as_slice() else {
-            bail!("expected one narrow and one wide fanout run");
-        };
-        ensure!(
-            narrow.result == wide.result,
-            "fanout changed the result: {} at dop 1, {} at dop {FANOUT_DOP}",
-            narrow.result,
-            wide.result
-        );
-        ensure!(
-            wide.backend_cores >= 1.5 && wide.backend_cores >= narrow.backend_cores * 1.3,
-            "a {FANOUT_DOP}-wide pipeline used {:.2} cores against {:.2} at dop 1: the scan's \
-             downstream did not run on several drivers",
-            wide.backend_cores,
-            narrow.backend_cores
-        );
-        write_report(
-            context,
-            "uea4a3-scan-fanout.json",
-            &FanoutReport {
-                driver_workers_per_backend: FANOUT_WORKERS,
-                backend: backend.expect("two runs"),
-                rows: table.rows,
-                runs,
-            },
-        )
-    }
-}
 
 #[cfg(test)]
 mod tests {

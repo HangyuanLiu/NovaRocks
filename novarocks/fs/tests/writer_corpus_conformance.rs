@@ -58,7 +58,7 @@ impl Writer {
 
     fn relative_file(self) -> &'static str {
         match self {
-            Self::Spark => "../short_iceberg/data.parquet",
+            Self::Spark => "spark/data.parquet",
             Self::PyArrow => "pyarrow/pyarrow-23.0.1.parquet",
             Self::Trino => "trino/trino-483.parquet",
             Self::Flink => "flink/flink-local-1.20.5.parquet",
@@ -96,7 +96,7 @@ impl Writer {
 }
 
 fn corpus_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/benchmarks/uea4a2/fixtures/corpus")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/data/writer-corpus")
 }
 
 fn assert_sha256(path: &Path, expected: &str) {

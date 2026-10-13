@@ -537,7 +537,7 @@ mod tests {
             std::time::Duration::from_secs(5)
         );
         assert_eq!(
-            report.mysql.active_write_deadline,
+            report.mysql.active_delivery_work_budget,
             std::time::Duration::from_secs(30)
         );
         assert_eq!(report.complete_native_root_peak_per_frontend_backend, None);

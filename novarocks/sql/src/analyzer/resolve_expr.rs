@@ -6251,7 +6251,13 @@ fn implicit_cast_to_boolean(expr: TypedExpr) -> TypedExpr {
     if expr.value_type.data_type == DataType::Boolean {
         return expr;
     }
-    let nullable = expr.value_type.nullable;
+    let nullable = expr.value_type.nullable
+        || novarocks_functions::carrier_cast_can_produce_null_with_policy(
+            &expr.value_type.data_type,
+            &DataType::Boolean,
+            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            false,
+        );
     TypedExpr {
         kind: ExprKind::Cast {
             expr: Box::new(expr),
@@ -7418,6 +7424,29 @@ mod tests {
                 panic!("array literal produces one scalar container value");
             };
             assert_eq!(selected.data_type, expression.value_type.data_type, "{sql}");
+        }
+    }
+
+    #[test]
+    fn implicit_boolean_or_preserves_successful_null_cast_obligations() {
+        for sql in [
+            "select 'DHL' || ',' || 'BARIAN'",
+            "select coalesce(NULL, '') || ', ' || coalesce(NULL, '')",
+        ] {
+            let expression = analyze_projection_expr(sql).expect("analyze string boolean coercion");
+            assert_eq!(expression.value_type.data_type, DataType::Boolean, "{sql}");
+            assert!(
+                expression.value_type.nullable,
+                "string boolean conversion can produce SQL NULL: {sql}"
+            );
+        }
+        for sql in ["select 1 || 0", "select true || false"] {
+            let expression = analyze_projection_expr(sql).expect("analyze total boolean coercion");
+            assert_eq!(expression.value_type.data_type, DataType::Boolean, "{sql}");
+            assert!(
+                !expression.value_type.nullable,
+                "total non-null inputs stay non-null: {sql}"
+            );
         }
     }
 
