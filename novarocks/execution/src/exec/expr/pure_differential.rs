@@ -1721,6 +1721,9 @@ mod nullif_tests;
 #[path = "pure_differential/by_tests.rs"]
 mod by_tests;
 
+#[path = "pure_differential/n_largeint_tests.rs"]
+mod n_largeint_tests;
+
 #[path = "pure_differential/n_largeint_declaration_tests.rs"]
 mod n_largeint_declaration_tests;
 #[cfg(test)]
