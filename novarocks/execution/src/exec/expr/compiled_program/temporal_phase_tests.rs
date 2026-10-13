@@ -212,9 +212,12 @@ fn long_zone_data_error_is_full_until_owner_row_projection() {
     let array =
         Arc::new(TimestampMicrosecondArray::from(vec![i64::MAX]).with_timezone(zone.clone()))
             as ArrayRef;
-    let expected = format!(
-        "Parser error: Invalid timezone \"{zone}\": only offset based timezones supported without chrono-tz feature"
-    );
+    // The feature-selected Arrow parser authors the complete source error.
+    let expected = zone
+        .parse::<arrow::array::timezone::Tz>()
+        .unwrap_err()
+        .to_string();
+    assert!(expected.contains(&zone));
     let mut values = TemporalValues::new(3, &mut work).unwrap();
     let rows = [5];
     assert_eq!(

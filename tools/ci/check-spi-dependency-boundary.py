@@ -44,7 +44,11 @@ PACKAGE_NAME = "novarocks-spi"
 
 # Internal crates the Connector contract closure may legitimately contain.
 # This is an allow-list, not a required set.
-NEUTRAL_INTERNAL_PACKAGES = frozenset({"novarocks-connector-contract", "novarocks-secret"})
+# Type/result contracts own immutable semantic vocabulary; they grant no runtime.
+NEUTRAL_INTERNAL_PACKAGES = frozenset({
+    "novarocks-connector-contract", "novarocks-secret",
+    "novarocks-type-contract", "novarocks-result-contract",
+})
 
 
 class Capability:

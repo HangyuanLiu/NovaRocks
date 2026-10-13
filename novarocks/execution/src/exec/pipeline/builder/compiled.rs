@@ -724,9 +724,7 @@ fn build_node(
                                         expr_id,
                                         nullable,
                                     } => Ok(crate::exec::node::unpivot::UnpivotConstant::Scalar {
-                                        expr_id: crate::exec::expr::ExprId(
-                                            expr_id.index(),
-                                        ),
+                                        expr_id: crate::exec::expr::ExprId(expr_id.index()),
                                         nullable: *nullable,
                                     }),
                                     novarocks_local_program::UnpivotConstant::Int32List(values) => {

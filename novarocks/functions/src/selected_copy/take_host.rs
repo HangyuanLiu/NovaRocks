@@ -17,12 +17,14 @@
 
 //! ONE selected-copy extent author feeds this opaque take admission. Geometry
 //! is not authority: only the supplied host grants its operation reservation.
-use super::{CopyError, CopyMode, ScratchCoverage, add, mul, buffer_extent, zip};
 use super::copy_buffer_peak::CopyBufferPeak;
+use super::{CopyError, CopyMode, ScratchCoverage, add, buffer_extent, mul, zip};
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::opaque_memory::OpaqueRetainedCharge;
-use crate::{AggregateStateAllocator, KernelControlObservation, KernelEvaluationControl, KernelFailure};
+use crate::{
+    AggregateStateAllocator, KernelControlObservation, KernelEvaluationControl, KernelFailure,
+};
 use arrow_array::{Array, ArrayRef, UInt32Array, UInt64Array};
 use arrow_buffer::ArrowNativeType;
 use arrow_data::{ArrayData, transform::MutableArrayData};

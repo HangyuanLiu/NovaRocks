@@ -188,7 +188,6 @@ impl PureFunctionMetadataOwner for FromUnixtimeOwner {
             .map(|_| ())
             .map_err(|_| FunctionBindingError::UnavailableImplementation(selected.overload.clone()))
     }
-
 }
 
 impl FunctionEffectOwner for FromUnixtimeOwner {
@@ -340,7 +339,9 @@ impl ScalarKernelInstance for FromUnixtimeInstance {
     }
 }
 
-fn valid_environment(input: CallEffectInput<'_>) -> Result<super::calendar_unixtime::TimeZoneSpec, FunctionBindingError> {
+fn valid_environment(
+    input: CallEffectInput<'_>,
+) -> Result<super::calendar_unixtime::TimeZoneSpec, FunctionBindingError> {
     valid_environment_references(input.environment, input.parameters)
 }
 fn valid_environment_references(

@@ -39,7 +39,7 @@ mod tests {
             .iter()
             .map(|(name, _)| (*name).to_owned())
             .collect::<BTreeSet<_>>();
-        assert_eq!(builtin_dispositions().len(), 417);
+        assert_eq!(builtin_dispositions().len(), 418);
         assert_eq!(admitted.len(), builtin_dispositions().len());
         assert_eq!(declared, admitted);
         assert!(

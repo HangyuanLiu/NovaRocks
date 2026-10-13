@@ -2052,6 +2052,9 @@ mod tests {
                 final_binary_input(Some("hll"), None, None, false),
             )
             .unwrap_err();
-        assert!(error.to_string().contains("logical domain differs"), "{error}");
+        assert!(
+            error.to_string().contains("logical domain differs"),
+            "{error}"
+        );
     }
 }

@@ -19,8 +19,8 @@
 //! The facts are Layouts, not grants. Recursive scratch and Arrow output need
 //! their separate exact invoice and admission; this entry does not run take.
 use super::{
-    Block, CopyError, ScratchCoverage, add, buffer_extent, mul, preflight_take_with_root_scope,
-    preflight_take_with_child_tables,
+    Block, CopyError, ScratchCoverage, add, buffer_extent, mul, preflight_take_with_child_tables,
+    preflight_take_with_root_scope,
 };
 use crate::opaque_memory::OpaqueRetainedCharge;
 use crate::{

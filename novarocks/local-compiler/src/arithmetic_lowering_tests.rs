@@ -742,23 +742,64 @@ fn nullable_false_division_cannot_hide_a_successful_null_behind_nonnullable_resu
 }
 
 #[test]
-fn unsupported_arithmetic_domains_do_not_gain_a_signed_recipe_from_their_carrier() {
+fn floating_arithmetic_preserves_exact_prepared_types_and_policies() {
     let functions = functions();
     for carrier in [DataType::Float32, DataType::Float64] {
         let ty = FunctionValueType::new(carrier, true);
         let fixture = fixture(
             ty.clone(),
-            ty,
+            ty.clone(),
             ArithmeticOperator::Add,
             true,
             DecimalOverflowPolicy::ReportError,
             true,
             false,
         );
-        assert_arithmetic_failure(
-            compile(package(&fixture), &functions, &Control).unwrap_err(),
-            ArithmeticPrepareError::Unsupported,
+        let program = compile(package(&fixture), &functions, &Control).unwrap();
+        let recipe = program.arithmetic_recipe(occurrence(&program)).unwrap();
+        assert_eq!(recipe.operator(), ArithmeticOperator::Add);
+        assert_eq!(recipe.left_type(), &ty);
+        assert_eq!(recipe.right_type(), &ty);
+        assert_eq!(
+            recipe.result_type(),
+            &FunctionValueType::new(DataType::Float64, true)
         );
+        assert_eq!(
+            recipe.decimal_overflow_policy(),
+            DecimalOverflowPolicy::ReportError
+        );
+        assert!(recipe.allow_throw_exception());
+    }
+}
+
+#[test]
+fn unsupported_largeint_float_domains_do_not_gain_a_recipe_from_their_carrier() {
+    let functions = functions();
+    for carrier in [DataType::Float32, DataType::Float64] {
+        let float = FunctionValueType::new(carrier, true);
+        let largeint = FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            true,
+            novarocks_type_contract::ValueLogicalType::LargeInt,
+        )
+        .unwrap();
+        // The frozen source can author this pair, but the original Float owner
+        // explicitly does not claim the LARGEINT/Float invocation-wide data port.
+        for (left, right) in [(float.clone(), largeint.clone()), (largeint, float)] {
+            let fixture = fixture(
+                left,
+                right,
+                ArithmeticOperator::Add,
+                true,
+                DecimalOverflowPolicy::ReportError,
+                true,
+                false,
+            );
+            assert_arithmetic_failure(
+                compile(package(&fixture), &functions, &Control).unwrap_err(),
+                ArithmeticPrepareError::Unsupported,
+            );
+        }
     }
 }
 

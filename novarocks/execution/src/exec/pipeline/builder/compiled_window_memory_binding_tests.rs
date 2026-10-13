@@ -17,14 +17,14 @@
 
 use super::*;
 
-use crate::runtime::query_memory::QueryMemoryBinding;
 use crate::runtime::execution_runtime::test_execution_runtime;
 use crate::runtime::fragment::runtime_state::{RuntimeStateInputs, build_runtime_state};
+use crate::runtime::query_memory::QueryMemoryBinding;
 use novarocks_execution_contract::TaskIdentity;
 use novarocks_memory::{AccountKind, ExternalRef};
 use novarocks_types::{
     QueryId,
-    identity::{QueryExecutionId, AttemptId, StageId, TaskId, BackendProcessId},
+    identity::{AttemptId, BackendProcessId, QueryExecutionId, StageId, TaskId},
 };
 
 #[test]

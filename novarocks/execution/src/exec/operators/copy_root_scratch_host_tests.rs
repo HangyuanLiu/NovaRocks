@@ -18,13 +18,13 @@
 //! Root scratch probes borrow the ACTUAL production opaque/tracker adapter.
 //! These assertions cover root plan vectors only, not all recursive scratch,
 //! Arrow output, RSS, or formal query memory settlement.
-use super::{expression_allocation_host, MemTracker};
+use super::{MemTracker, expression_allocation_host};
 use arrow::array::{Array, ArrayRef, Int32Array, StringArray};
-use novarocks_functions::{
-    KernelDiagnostic, KernelEvaluationControl, KernelFailure, MAX_UNOBSERVED_KERNEL_WORK,
-};
 use novarocks_functions::selected_copy::{
     CopyError, TakeRootScratchFacts, preflight_take, preflight_take_root_scratch_in,
+};
+use novarocks_functions::{
+    KernelDiagnostic, KernelEvaluationControl, KernelFailure, MAX_UNOBSERVED_KERNEL_WORK,
 };
 use std::{
     sync::{Arc, Mutex},

@@ -85,7 +85,7 @@ fn by_copy_original_concat_diagnostic_geometry_preserves_all_original_type_forma
 }
 #[test]
 fn by_copy_original_concat_dictionary_resource_domain_does_not_apply_native_key_gate() {
-    use arrow_array::{StringArray, ArrayRef};
+    use arrow_array::{ArrayRef, StringArray};
     let left: ArrayRef = Arc::new(StringArray::from(vec!["first"; 70]));
     let right: ArrayRef = Arc::new(StringArray::from(vec!["second"; 70]));
     let mut invoice = super::super::take_host::CopyInvoiceTotals::default();

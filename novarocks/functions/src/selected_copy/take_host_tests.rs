@@ -18,7 +18,7 @@
 //! Symbolic geometry probes. Real host grant/rollback/custody is exercised in
 //! Execution, not inferred from these arithmetic-only tests.
 use super::*;
-use arrow_array::{Int64Array, StringArray, ListArray};
+use arrow_array::{Int64Array, ListArray, StringArray};
 use arrow_buffer::{OffsetBuffer, ScalarBuffer};
 use arrow_schema::Field;
 
@@ -108,8 +108,8 @@ fn by_copy_joint_invoice_result_identity_cannot_be_reused_for_another_copy() {
 
 #[test]
 fn by_copy_joint_invoice_original_empty_nested_offsets_are_actual_backing() {
-    use arrow_array::{DictionaryArray, Int8Array, ListViewArray, RunArray, StructArray};
     use arrow_array::types::{Int8Type, Int16Type};
+    use arrow_array::{DictionaryArray, Int8Array, ListViewArray, RunArray, StructArray};
     let strings: ArrayRef = Arc::new(StringArray::from(vec!["original nonempty"]));
     let item = Arc::new(Field::new("original_item", DataType::Utf8, true));
     let list: ArrayRef = Arc::new(

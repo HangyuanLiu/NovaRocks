@@ -399,7 +399,10 @@ const fn compiled_sink_refusal(sink: &FragmentSink) -> Option<&'static str> {
         FragmentSink::Router { .. } => {
             Some("the compiled package carrier does not express change-stream router sinks yet")
         }
-        FragmentSink::Result | FragmentSink::RootResult(_) | FragmentSink::Stream { .. } | FragmentSink::Noop => None,
+        FragmentSink::Result
+        | FragmentSink::RootResult(_)
+        | FragmentSink::Stream { .. }
+        | FragmentSink::Noop => None,
     }
 }
 
@@ -2141,7 +2144,10 @@ mod tests {
         )).unwrap();
         let plan = completed.candidate().plan();
         let result = plan.result_port().unwrap();
-        let outputs = completed_fragment_output_columns(completed.candidate().original_public_result_port(), result.fragment);
+        let outputs = completed_fragment_output_columns(
+            completed.candidate().original_public_result_port(),
+            result.fragment,
+        );
         assert_eq!(
             outputs
                 .iter()

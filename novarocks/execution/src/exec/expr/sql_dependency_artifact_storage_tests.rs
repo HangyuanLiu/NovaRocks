@@ -119,11 +119,27 @@ fn sql_dependency_artifact_storage_foreign_authority_retains_exact_nominal_error
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
     assert!(matches!(
-        AdmittedCaptureBytes::try_new(&b.resources().expect("test workload resource authority"), &work.owner.scope(), 128),
+        AdmittedCaptureBytes::try_new(
+            &b.resources().expect("test workload resource authority"),
+            &work.owner.scope(),
+            128
+        ),
         Err(CaptureStorageError::Work(WorkError::ForeignAuthority))
     ));
-    assert_eq!(a.resources().expect("test workload resource authority").snapshot().held_bytes(), 0);
-    assert_eq!(b.resources().expect("test workload resource authority").snapshot().held_bytes(), 0);
+    assert_eq!(
+        a.resources()
+            .expect("test workload resource authority")
+            .snapshot()
+            .held_bytes(),
+        0
+    );
+    assert_eq!(
+        b.resources()
+            .expect("test workload resource authority")
+            .snapshot()
+            .held_bytes(),
+        0
+    );
 }
 #[test]
 fn sql_dependency_artifact_storage_backing_release_is_not_terminal_owner_publication() {

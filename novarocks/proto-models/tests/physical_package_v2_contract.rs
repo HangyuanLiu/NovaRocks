@@ -163,7 +163,7 @@ fn singular_numeric_references_preserve_zero_maximum_and_absence() {
 }
 
 #[test]
-fn execution_enums_have_explicit_unspecified_values_and_preserve_unknown_wire_values() {
+fn execution_enums_preserve_unspecified_or_explicit_plain_zero_and_unknown_wire_values() {
     let pool = pool();
     let mut enums = BTreeSet::new();
     for message in pool
@@ -178,13 +178,32 @@ fn execution_enums_have_explicit_unspecified_values_and_preserve_unknown_wire_va
                 continue;
             }
             enums.insert(enumeration.full_name().to_owned());
-            assert!(
-                enumeration
-                    .get_value(0)
-                    .unwrap()
-                    .name()
-                    .ends_with("UNSPECIFIED")
-            );
+            let zero = enumeration.get_value(0).unwrap();
+            if enumeration.full_name() == "novarocks.physical_package_v2.ResultValueDomain" {
+                // This optional field distinguishes absent domain from explicit PLAIN.
+                assert_eq!(zero.name(), "RESULT_VALUE_DOMAIN_PLAIN");
+                assert_eq!(
+                    field.full_name(),
+                    "novarocks.physical_package_v2.ResultField.domain"
+                );
+                assert!(field.supports_presence());
+                let absent = DynamicMessage::new(message.clone());
+                let mut plain = DynamicMessage::new(message.clone());
+                plain.set_field(&field, Value::EnumNumber(0));
+                assert!(!absent.has_field(&field));
+                assert!(plain.has_field(&field));
+                let encoded = plain.encode_to_vec();
+                assert_ne!(encoded, absent.encode_to_vec());
+                let decoded = DynamicMessage::decode(message.clone(), encoded.as_slice()).unwrap();
+                assert!(decoded.has_field(&field));
+                assert_eq!(decoded.get_field(&field).as_ref(), &Value::EnumNumber(0));
+            } else {
+                assert!(
+                    zero.name().ends_with("UNSPECIFIED"),
+                    "{}",
+                    enumeration.full_name()
+                );
+            }
             if field.is_list() {
                 continue;
             }

@@ -21,7 +21,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use novarocks_connector_contract::{ConnectorWriteRecipeDraft, FrozenConnectorRead, WriteTargetOrdinal};
+use novarocks_connector_contract::{
+    ConnectorWriteRecipeDraft, FrozenConnectorRead, WriteTargetOrdinal,
+};
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
     SemanticParameterError, SemanticParameterProjectionError, SemanticParameterRef,

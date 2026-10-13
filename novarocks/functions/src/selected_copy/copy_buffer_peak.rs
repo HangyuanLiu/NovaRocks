@@ -18,7 +18,7 @@
 //! Pinned Arrow buffer geometry facts, not allocation authority.
 //! The whole copy invoice must combine these with the ONE selected-copy
 //! traversal and actual metadata before a caller enters the opaque operation.
-use super::{CopyError, add, mul, buffer_extent, zip};
+use super::{CopyError, add, buffer_extent, mul, zip};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct CopyBufferPeak {

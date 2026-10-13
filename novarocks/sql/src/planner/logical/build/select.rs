@@ -58,12 +58,7 @@ pub(super) fn plan_select_scoped_with_source(
     let analyzed_projection_facts: Vec<_> = select
         .projection
         .iter()
-        .map(|item| {
-            (
-                item.output_column_id,
-                item.expr.value_type.clone(),
-            )
-        })
+        .map(|item| (item.output_column_id, item.expr.value_type.clone()))
         .collect();
 
     // Take ownership of all apply specs up-front. The wrap points below consume
@@ -300,7 +295,9 @@ fn transfer_projection_provenance(
             return Err("same-value projection rewrite changed its declared carrier".into());
         }
         if value_type.logical_type != item.expr.value_type.logical_type {
-            return Err("same-value projection rewrite changed its declared logical identity".into());
+            return Err(
+                "same-value projection rewrite changed its declared logical identity".into(),
+            );
         }
         // A symbol can be nullable at an outer-join boundary while its
         // producing expression is non-null (for example a match indicator).

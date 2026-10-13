@@ -18,8 +18,8 @@
 //! Actual Chunk accounting is the input owner. New copied output backing is
 //! separately admitted through the SAME production control allocator.
 use super::*;
-use novarocks_functions::selected_copy::{CopyIndices, CopyOperationError, take_copy_in};
 use arrow::array::UInt32Array;
+use novarocks_functions::selected_copy::{CopyIndices, CopyOperationError, take_copy_in};
 
 #[test]
 fn by_copy_joint_actual_chunk_input_and_new_output_keep_distinct_lifetimes() {

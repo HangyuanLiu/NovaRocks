@@ -7085,24 +7085,28 @@ pub(crate) mod tests {
     #[test]
     fn direct_statistics_unpivot_wire_uses_exact_result_names_types_and_port_order() {
         use arrow::array::{
-            Array, ArrayRef, Int32Array, ListArray, MapArray, StringArray, StructArray,
+            Array, ArrayRef, BinaryArray, Int32Array, ListArray, MapArray, StringArray, StructArray,
         };
         use arrow::buffer::OffsetBuffer;
         use arrow::datatypes::Field;
         use novarocks_constant_contract::ConstantPool;
         use novarocks_physical_plan::{
-            ConstantPoolId, ConstantPools, ConstantReference, LiteralValue, UnpivotSpec,
-            UnpivotValueMapping,
+            ConstantPoolId, ConstantPools, ConstantReference, UnpivotSpec, UnpivotValueMapping,
         };
         use novarocks_type_contract::CompilePhase;
         let mut builder = FragmentBuilder::new(FragmentId::new(24));
         let source = builder.reserve_node_id().unwrap();
         let body_ty = ValueType::new(DataType::Binary, false);
+        let body_id = ConstantPoolId::new(2);
+        let label_id = ConstantPoolId::new(3);
         let body_expr = builder
             .add_expression(
                 source,
                 body_ty.clone(),
-                ExprKind::Literal(LiteralValue::Binary(Box::from([0xffu8]))),
+                ExprKind::Constant(ConstantReference {
+                    pool: body_id,
+                    ordinal: 0,
+                }),
             )
             .unwrap();
         let body_input = builder
@@ -7136,7 +7140,7 @@ pub(crate) mod tests {
                 false,
             ),
             ValueType::new(DataType::Utf8, false),
-            body_ty,
+            body_ty.clone(),
             ValueType::new(
                 DataType::Map(
                     Arc::new(Field::new(
@@ -7194,7 +7198,14 @@ pub(crate) mod tests {
         let list_id = ConstantPoolId::new(0);
         let map_id = ConstantPoolId::new(1);
         let mut pools = ConstantPools::empty();
-        for (id, ty, values) in [(list_id, &types[0], list), (map_id, &types[3], map)] {
+        let body: ArrayRef = Arc::new(BinaryArray::from(vec![Some(&[0xffu8][..])]));
+        let label_values: ArrayRef = Arc::new(StringArray::from(vec!["theta"]));
+        for (id, ty, values) in [
+            (list_id, &types[0], list),
+            (map_id, &types[3], map),
+            (body_id, &body_ty, body),
+            (label_id, &types[1], label_values),
+        ] {
             let pool = ConstantPool::try_new(
                 Arc::new(ty.try_to_field("statistics_constant").unwrap()),
                 ty.clone(),
@@ -7225,7 +7236,10 @@ pub(crate) mod tests {
             .add_expression(
                 root,
                 types[1].clone(),
-                ExprKind::Literal(LiteralValue::Utf8("theta".into())),
+                ExprKind::Constant(ConstantReference {
+                    pool: label_id,
+                    ordinal: 0,
+                }),
             )
             .unwrap();
         builder

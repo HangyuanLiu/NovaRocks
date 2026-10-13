@@ -89,10 +89,16 @@ fn format_shared_plan_node_header(
         | LogicalPlanKind::AssertOneRow(_) => {
             let diagnostic = completed::RenderDiagnostic::new(control);
             let mut output = completed::ExplainRenderOutput::new_observed(
-                completed::ExplainRenderBudget::default(), control,
+                completed::ExplainRenderBudget::default(),
+                control,
             )?;
-            let result = output.push(format_args!("{}", logical::Header(kind, stage, Some(&diagnostic))));
-            if let Some(error) = diagnostic.take_error() { return Err(error); }
+            let result = output.push(format_args!(
+                "{}",
+                logical::Header(kind, stage, Some(&diagnostic))
+            ));
+            if let Some(error) = diagnostic.take_error() {
+                return Err(error);
+            }
             result?;
             Ok(output.finish_observed()?.pop())
         }
@@ -658,7 +664,8 @@ mod tests {
     fn logical_borrowed_expression_bytes_preserve_literals_cases_and_aliases() {
         let control = crate::compiler::SqlCompileControl::unbounded();
         let format_expr = |expr: &TypedExpr| super::format_expr(expr, &control).unwrap();
-        let format_project_item = |item: &ProjectItem| super::format_project_item(item, &control).unwrap();
+        let format_project_item =
+            |item: &ProjectItem| super::format_project_item(item, &control).unwrap();
         let typed = |kind| TypedExpr {
             kind,
             value_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
@@ -737,7 +744,10 @@ mod tests {
                 LogicalPlanKind::Filter(PlanFilterNode {
                     predicate: TypedExpr {
                         kind: ExprKind::Literal(literal),
-                        value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+                        value_type: novarocks_type_contract::FunctionValueType::new(
+                            DataType::Utf8,
+                            false,
+                        ),
                     },
                 }),
                 vec![empty_values_for_test()],
@@ -753,7 +763,10 @@ mod tests {
                         list: (0..1024).map(int_literal).collect(),
                         negated: true,
                     },
-                    value_type: novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
+                    value_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Boolean,
+                        false,
+                    ),
                 },
             }),
             vec![empty_values_for_test()],
@@ -798,7 +811,14 @@ mod tests {
                 None,
             );
         }
-        assert!(super::explain_plan_checked(&plan, ExplainLevel::Normal, &crate::compiler::SqlCompileControl::unbounded()).is_ok());
+        assert!(
+            super::explain_plan_checked(
+                &plan,
+                ExplainLevel::Normal,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .is_ok()
+        );
         let too_deep = LogicalPlanNode::new(
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: int_literal(1),
@@ -807,7 +827,11 @@ mod tests {
             None,
         );
         let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            super::explain_plan_checked(&too_deep, ExplainLevel::Normal, &crate::compiler::SqlCompileControl::unbounded())
+            super::explain_plan_checked(
+                &too_deep,
+                ExplainLevel::Normal,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
         }));
         assert!(
             failure
@@ -828,7 +852,14 @@ mod tests {
             vec![empty_values_for_test()],
             None,
         );
-        assert!(super::explain_plan_checked(&too_deep, ExplainLevel::Normal, &crate::compiler::SqlCompileControl::unbounded()).is_err());
+        assert!(
+            super::explain_plan_checked(
+                &too_deep,
+                ExplainLevel::Normal,
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .is_err()
+        );
     }
 
     #[test]

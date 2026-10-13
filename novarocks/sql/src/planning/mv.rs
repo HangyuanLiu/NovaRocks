@@ -491,7 +491,10 @@ mod refresh_property_facade_tests {
             parse_query("SELECT bitmap_to_binary(to_bitmap(id)) AS external FROM fact_east");
         let (resolved, _, factory) =
             crate::analyzer::analyze(&query, &TestIcebergCatalog, "sales").unwrap();
-        assert_eq!(resolved.output_columns[0].value_type.data_type, DataType::Binary);
+        assert_eq!(
+            resolved.output_columns[0].value_type.data_type,
+            DataType::Binary
+        );
         validate_persistable_output(&resolved, &factory)
             .expect("ordinary external Binary is not an opaque domain");
     }

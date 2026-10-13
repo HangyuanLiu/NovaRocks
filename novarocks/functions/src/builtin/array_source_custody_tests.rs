@@ -18,8 +18,8 @@
 //! Actual borrowed geometry and all typed refusal positions of source custody.
 //! The Execution companion proves the real original Chunk accounting lifetime.
 use super::*;
-use crate::arrow_result_custody::{retain_source_backing, SourceBackingOwner};
 use crate::array_backing_geometry::source_metadata_bytes;
+use crate::arrow_result_custody::{SourceBackingOwner, retain_source_backing};
 use arrow_array::StringViewArray;
 use arrow_buffer::Buffer;
 

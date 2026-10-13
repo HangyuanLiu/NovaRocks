@@ -18,16 +18,16 @@
 //! Borrow actual immutable Arrow structure before its allocating to_data route.
 //! These are table facts, not a value decoder, retained payload grant, SQL type
 //! coercion, or a row-dependent string estimate.
+use crate::KernelFailure;
 use crate::kernel_control::invalid;
 use crate::kernel_input::EvaluationCheckpoints;
-use crate::KernelFailure;
+use arrow_array::types::{
+    Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+};
 use arrow_array::{
     Array, BinaryViewArray, DictionaryArray, FixedSizeListArray, LargeListArray,
     LargeListViewArray, ListArray, ListViewArray, MapArray, RunArray, StringViewArray, StructArray,
     UnionArray,
-};
-use arrow_array::types::{
-    Int8Type, Int16Type, Int32Type, Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
 };
 use arrow_schema::{DataType, UnionMode};
 

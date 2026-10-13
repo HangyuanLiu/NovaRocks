@@ -17,9 +17,9 @@
 
 //! Original Arrow take's diagnostic allocation and full-text last-Drop
 //! custody. This is host geometry, not another error renderer or value decoder.
-use super::{CopyError, add, mul, buffer_extent};
-use crate::opaque_memory::{OpaqueReservation, OpaqueRetainedCharge};
+use super::{CopyError, add, buffer_extent, mul};
 use crate::KernelFailure;
+use crate::opaque_memory::{OpaqueReservation, OpaqueRetainedCharge};
 use arrow_schema::ArrowError;
 use std::fmt::{self, Write};
 

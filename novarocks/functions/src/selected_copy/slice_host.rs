@@ -17,13 +17,13 @@
 
 //! Exact original Array::slice under actual metadata admission. Slicing does
 //! not mint source payload capacity; the original source lease is transferred.
+use super::take_host::{CopyOperationError, CopyOperationFacts};
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::opaque_memory::OpaqueRetainedCharge;
 use crate::{AggregateStateAllocator, KernelControlObservation, KernelEvaluationControl};
 use arrow_array::{Array, ArrayRef};
 use std::sync::Arc;
-use super::take_host::{CopyOperationError, CopyOperationFacts};
 
 struct SliceSource<C> {
     source: ArrayRef,

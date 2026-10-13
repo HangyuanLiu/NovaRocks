@@ -10236,7 +10236,6 @@ mod tests {
             "select array_reverse([1,2]) where false",
             "select array_to_string([1,2], ',') where false",
             "select isnull(1) where false",
-            "select next_day('2020-01-01') where false",
             "select cosh(1) where false",
         ] {
             let error = analyze_projection_expr(sql).unwrap_err();
@@ -10248,6 +10247,44 @@ mod tests {
         let unknown =
             analyze_projection_expr("select not_an_advertised_builtin(1) where false").unwrap_err();
         assert!(unknown.contains("Unknown function"), "{unknown}");
+    }
+
+    #[test]
+    fn installed_next_day_binds_two_arguments_before_false_filter_pruning() {
+        use novarocks_functions::builtin::intrinsic::{BuiltinDisposition, builtin_disposition};
+
+        assert!(matches!(
+            builtin_disposition("next_day"),
+            Some(BuiltinDisposition::InstalledScalar(_))
+        ));
+        let expression =
+            analyze_projection_expr("select next_day('2020-01-01', 'MONDAY') where false")
+                .expect("installed next_day must bind its declared two-argument profile");
+        assert_eq!(expression.value_type.data_type, DataType::Date32);
+        let ExprKind::FunctionCall {
+            name,
+            args,
+            binding,
+            ..
+        } = &expression.kind
+        else {
+            panic!("next_day must retain its exact scalar binding");
+        };
+        assert_eq!(name, "next_day");
+        assert_eq!(args.len(), 2);
+        assert_eq!(binding.logical_argument_count, 2);
+        assert_eq!(binding.function_id.as_str(), "builtin.scalar/next_day/v1");
+    }
+
+    #[test]
+    fn next_day_invalid_arity_is_rejected_before_false_filter_pruning() {
+        let error =
+            analyze_projection_expr("select next_day('2020-01-01') where false").unwrap_err();
+        assert!(
+            error.contains("cannot bind scalar function `next_day`"),
+            "{error}"
+        );
+        assert!(error.contains("no matching declared overload"), "{error}");
     }
 
     #[test]

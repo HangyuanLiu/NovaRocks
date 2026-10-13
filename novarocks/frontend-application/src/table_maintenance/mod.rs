@@ -234,7 +234,8 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                         if cancelled {
                             return Err(
                                 "OPTIMIZE statement cancelled; optimize job has actually exited"
-                                    .to_string().into(),
+                                    .to_string()
+                                    .into(),
                             );
                         }
                         if terminal != MaintenanceJobState::Finished {

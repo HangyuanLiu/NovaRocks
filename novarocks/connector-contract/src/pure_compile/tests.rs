@@ -409,7 +409,8 @@ fn private_hook_entry_and_positive_quantum_controls_remain_outer_typed_control()
             if positive_only {
                 assert!(work.contains(&(true, 256)));
             } else {
-                assert_eq!(*work, [(false, 0), (true, 0)]);
+                // Entry and the explicit owner-handoff flush both check control.
+                assert_eq!(*work, [(false, 0), (false, 0), (true, 0)]);
             }
             let compiler = Compiler::normal();
             let control = compiler.control(Some(failure), positive_only, Target::Hook);
@@ -422,7 +423,8 @@ fn private_hook_entry_and_positive_quantum_controls_remain_outer_typed_control()
             if positive_only {
                 assert!(work.contains(&(true, 256)));
             } else {
-                assert_eq!(*work, [(false, 0), (true, 0)]);
+                // Entry and the explicit owner-handoff flush both check control.
+                assert_eq!(*work, [(false, 0), (false, 0), (true, 0)]);
             }
         }
     }

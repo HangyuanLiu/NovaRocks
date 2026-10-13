@@ -17,8 +17,8 @@
 //! Installed COUNT AggregateWindowV1 vs original analytic count and frame author.
 //! Mount as a cfg(test) child of analytic_shared, no production visibility changes.
 use super::*;
-use arrow::array::{Int64Array, StringArray};
 use arrow::array::{DictionaryArray, Int8Array, NullArray};
+use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::Int8Type;
 use novarocks_functions as f;
 use novarocks_type_contract as t;

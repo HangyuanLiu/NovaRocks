@@ -1894,7 +1894,9 @@ mod tests {
 
     use super::{BlockedReason, DriverState, Observable, PipelineDriver};
     use crate::exec::chunk::Chunk;
-    use crate::exec::pipeline::operator::{FinishWatch, FinishingWait, Operator, ProcessorOperator};
+    use crate::exec::pipeline::operator::{
+        FinishWatch, FinishingWait, Operator, ProcessorOperator,
+    };
     use crate::runtime::runtime_state::RuntimeState;
 
     /// A source that is finished before the driver's first turn, so the edge
@@ -3124,7 +3126,9 @@ mod terminal_signal_tests {
 
     #[test]
     fn typed_failure_push_admission_and_finishing_preserve_cause_and_exact_operator_context() {
-        use crate::runtime::fragment::{ExecutionFailure, ExecutionFailureContext, PipelineOperation};
+        use crate::runtime::fragment::{
+            ExecutionFailure, ExecutionFailureContext, PipelineOperation,
+        };
         for operation in [
             PipelineOperation::Push,
             PipelineOperation::Admission,

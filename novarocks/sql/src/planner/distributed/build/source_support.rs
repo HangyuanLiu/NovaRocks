@@ -77,8 +77,14 @@ fn admit_loan(
     // Original lexical facts are retained even when the actual emitted
     // request carries canonical types. IDs/values are the original sparse
     // parameter author, never guessed from the function name or data.
-    let environment = loan.original_binding().group_concat_source().map(|facts| facts.environment());
-    let references = environment.as_ref().map(|refs| refs.as_slice()).unwrap_or(&[]);
+    let environment = loan
+        .original_binding()
+        .group_concat_source()
+        .map(|facts| facts.environment());
+    let references = environment
+        .as_ref()
+        .map(|refs| refs.as_slice())
+        .unwrap_or(&[]);
     functions
         .admit_bound_environment_observed(binding.resolved(), references, parameters, control)
         .map_err(SqlSourceSupportError::Binding)
@@ -133,7 +139,13 @@ fn check_source_definitions(
                             work,
                         )
                         .map_err(SqlSourceSupportError::Journal)?;
-                    admit_loan(functions.as_ref(), loan, owner.plan().parameters(), lifecycle, control)
+                    admit_loan(
+                        functions.as_ref(),
+                        loan,
+                        owner.plan().parameters(),
+                        lifecycle,
+                        control,
+                    )
                 }
                 FragmentDefinitionSource::Request {
                     definition: PhysicalCallDefinition::Expression(_),
@@ -200,7 +212,13 @@ fn check_source_definitions(
                     let loan = owner
                         .borrow_call_dependency_observed(source, work)
                         .map_err(SqlSourceSupportError::Journal)?;
-                    admit_loan(functions.as_ref(), loan, owner.plan().parameters(), lifecycle, control)
+                    admit_loan(
+                        functions.as_ref(),
+                        loan,
+                        owner.plan().parameters(),
+                        lifecycle,
+                        control,
+                    )
                 }
             }
         })?;

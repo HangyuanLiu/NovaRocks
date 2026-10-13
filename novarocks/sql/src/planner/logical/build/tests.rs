@@ -1001,8 +1001,13 @@ fn computed_aggregate_in_predicate_preserves_projection_nullability() {
         "SELECT x.a FROM t x INNER JOIN t y ON x.a = y.a AND y.b IN (SELECT MAX(b) - 501 FROM t)",
     )
     .unwrap();
-    let plan = plan_query(resolved, registry, &mut factory, &crate::compiler::SqlCompileControl::unbounded())
-        .expect("computed aggregate IN predicate must preserve its output contract");
+    let plan = plan_query(
+        resolved,
+        registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .expect("computed aggregate IN predicate must preserve its output contract");
     fn find_indicator(node: &LogicalPlanNode) -> Option<&ProjectItem> {
         if let LogicalPlanKind::Project(project) = &node.kind
             && let Some(item) = project.items.iter().find(|item| {
@@ -3240,8 +3245,13 @@ fn assert_m07_planned_domains(sql: &str, expected: Vec<Option<novarocks_types::s
         .iter()
         .map(|id| factory.has_json_list_provenance(*id))
         .collect();
-    let plan = plan_query(resolved, registry, &mut factory, &crate::compiler::SqlCompileControl::unbounded())
-        .unwrap_or_else(|error| panic!("{sql}: {error}"));
+    let plan = plan_query(
+        resolved,
+        registry,
+        &mut factory,
+        &crate::compiler::SqlCompileControl::unbounded(),
+    )
+    .unwrap_or_else(|error| panic!("{sql}: {error}"));
     let columns = plan_output_columns(&plan).unwrap();
     assert_eq!(
         columns
@@ -3324,7 +3334,13 @@ fn m07_aggregate_symbol_rewrites_keep_original_output_domains() {
     ] {
         assert_m07_planned_domains(sql, expected);
         let (resolved, registry, mut factory) = parse_analyze_query(sql).unwrap();
-        let plan = plan_query(resolved, registry, &mut factory, &crate::compiler::SqlCompileControl::unbounded()).unwrap();
+        let plan = plan_query(
+            resolved,
+            registry,
+            &mut factory,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
         let columns = plan_output_columns(&plan).unwrap();
         assert_ne!(
             columns[0].column_id, columns[1].column_id,
@@ -3387,9 +3403,17 @@ fn m07_shared_aggregate_symbol_refuses_conflicting_occurrence_facts() {
         for ordinal in [0, 1] {
             let (resolved, registry, mut factory) = parse_analyze_query(sql).unwrap();
             factory.set_logical_type(resolved.output_columns[ordinal].column_id, conflict.clone());
-            let error = plan_query(resolved, registry, &mut factory, &crate::compiler::SqlCompileControl::unbounded()).unwrap_err();
+            let error = plan_query(
+                resolved,
+                registry,
+                &mut factory,
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .unwrap_err();
             assert!(
-                error.to_string().contains("merged conflicting source domains"),
+                error
+                    .to_string()
+                    .contains("merged conflicting source domains"),
                 "{error}"
             );
         }
@@ -3400,23 +3424,39 @@ fn m07_shared_aggregate_symbol_refuses_conflicting_occurrence_facts() {
 fn m07_same_value_transfer_checks_carrier_nullability_and_existing_facts() {
     use novarocks_types::schema::SqlType;
     let mut factory = ColumnRefFactory::new();
-    let source = factory.create(None, "source".into(), novarocks_type_contract::FunctionValueType::new(DataType::Binary, true));
+    let source = factory.create(
+        None,
+        "source".into(),
+        novarocks_type_contract::FunctionValueType::new(DataType::Binary, true),
+    );
     factory.set_logical_type(source, Some(SqlType::Hll));
-    let wrong_type = factory.create(None, "wrong".into(), novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true));
+    let wrong_type = factory.create(
+        None,
+        "wrong".into(),
+        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+    );
     assert!(
         factory
             .transfer_value_provenance(source, wrong_type)
             .unwrap_err()
             .contains("carrier")
     );
-    let narrowed = factory.create(None, "narrowed".into(), novarocks_type_contract::FunctionValueType::new(DataType::Binary, false));
+    let narrowed = factory.create(
+        None,
+        "narrowed".into(),
+        novarocks_type_contract::FunctionValueType::new(DataType::Binary, false),
+    );
     assert!(
         factory
             .transfer_value_provenance(source, narrowed)
             .unwrap_err()
             .contains("nullability")
     );
-    let conflict = factory.create(None, "conflict".into(), novarocks_type_contract::FunctionValueType::new(DataType::Binary, true));
+    let conflict = factory.create(
+        None,
+        "conflict".into(),
+        novarocks_type_contract::FunctionValueType::new(DataType::Binary, true),
+    );
     factory.set_logical_type(conflict, Some(SqlType::Bitmap));
     assert!(
         factory
@@ -3424,7 +3464,11 @@ fn m07_same_value_transfer_checks_carrier_nullability_and_existing_facts() {
             .unwrap_err()
             .contains("logical domains")
     );
-    let target = factory.create(None, "target".into(), novarocks_type_contract::FunctionValueType::new(DataType::Binary, true));
+    let target = factory.create(
+        None,
+        "target".into(),
+        novarocks_type_contract::FunctionValueType::new(DataType::Binary, true),
+    );
     factory.transfer_value_provenance(source, target).unwrap();
     assert_eq!(factory.logical_type(target), Some(SqlType::Hll));
 }

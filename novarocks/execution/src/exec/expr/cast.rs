@@ -3925,7 +3925,9 @@ mod tests {
 
     #[test]
     fn list_json_metadata_cast_preserves_sliced_values_offsets_and_validity_buffers() {
-        use novarocks_types::logical::{LogicalType, field_with_logical_type, logical_type_of_field};
+        use novarocks_types::logical::{
+            LogicalType, field_with_logical_type, logical_type_of_field,
+        };
         for values in [
             Arc::new(StringArray::from(vec![
                 Some("{\"a\":1}"),

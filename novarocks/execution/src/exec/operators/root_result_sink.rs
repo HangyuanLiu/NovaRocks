@@ -365,7 +365,9 @@ mod tests {
     use arrow::array::Int32Array;
     use novarocks_execution_contract::TaskIdentity;
     use novarocks_result_contract::{FrozenRootOutput, RootOutputContract, RootProfileId};
-    use novarocks_types::{AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId};
+    use novarocks_types::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use std::time::Duration;
 

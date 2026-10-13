@@ -17,20 +17,20 @@
 
 //! Child-reference probes forward every actual block and opaque reservation
 //! to the production expression host. Ledger storage is test diagnostics only.
-use super::{expression_allocation_host, MemTracker};
+use super::{MemTracker, expression_allocation_host};
 use arrow::array::{
     Array, ArrayRef, FixedSizeListArray, Int16Array, Int32Array, Int64Array, ListArray, MapArray,
     RunArray, StructArray, UnionArray,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use arrow::datatypes::{DataType, Field, UnionFields, Int16Type};
-use novarocks_functions::{
-    AggregateStateAllocator, KernelDiagnostic, KernelEvaluationControl, KernelFailure,
-    MAX_UNOBSERVED_KERNEL_WORK,
-};
+use arrow::datatypes::{DataType, Field, Int16Type, UnionFields};
 use novarocks_functions::opaque_memory::OpaqueAllocationHost;
 use novarocks_functions::selected_copy::{
     CopyError, TakeRootScratchFacts, preflight_take, preflight_take_child_tables_in,
+};
+use novarocks_functions::{
+    AggregateStateAllocator, KernelDiagnostic, KernelEvaluationControl, KernelFailure,
+    MAX_UNOBSERVED_KERNEL_WORK,
 };
 use std::{
     alloc::Layout,

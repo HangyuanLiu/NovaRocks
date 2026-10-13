@@ -16,12 +16,12 @@
 // under the License.
 
 use super::*;
-use std::sync::Arc;
 use arrow::array::new_empty_array;
 use arrow::datatypes::{DataType, Field, Schema};
 use novarocks_type_contract::owned_resources::metadata_materialization::{
     MaterializedMetadataMap, MetadataMaterializationError, SchemaMetadataMaterializations,
 };
+use std::sync::Arc;
 
 fn limits() -> RootArrayStorageLimits {
     RootArrayStorageLimits {
@@ -44,9 +44,9 @@ impl novarocks_type_contract::PureCompileControl for MaterializedLayoutControl {
 
 #[test]
 fn root_positive_source_structural_local_compiler_unknown_owner_and_materialized_layout() {
-    use crate::exec::expr::compiled_program::tests::{program, SeedMode};
+    use crate::exec::expr::compiled_program::tests::{SeedMode, program};
     use novarocks_type_contract::owned_resources::metadata_materialization::{
-        materialize_value_field, MaterializedFieldNamespace, TypedSchemaMaterializations,
+        MaterializedFieldNamespace, TypedSchemaMaterializations, materialize_value_field,
     };
     let program = program(SeedMode::Input, false);
     let structural = program.graph().nodes()[program.graph().root().index()].output_layout();

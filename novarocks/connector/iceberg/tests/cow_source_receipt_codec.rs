@@ -18,29 +18,29 @@
 // These are immutable typed-fact/codec laws, not an SDK observation or a
 // substitute for the native original COW producer/adoption source witness.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex},
-};
 use novarocks_connector_iceberg::{
-    delete_semantics::{ReadDomain, ReadObservationId, PinnedEndpointFacts},
+    delete_semantics::{PinnedEndpointFacts, ReadDomain, ReadObservationId},
     iceberg::spec::{NestedField, PrimitiveType, Schema, Type},
     provider_types::IcebergReadTypes,
+    typed_read::schema_binding::{
+        ALWAYS_BOUND_METADATA_COLUMNS, IcebergMetadataColumn, ROW_LINEAGE_METADATA_COLUMNS,
+    },
     typed_read::{
         IcebergColumnHandle, IcebergPinnedDataFileSet, IcebergRuntimeRelation, IcebergTableHandle,
         IcebergTableHandleParams,
     },
-    typed_read::schema_binding::{
-        IcebergMetadataColumn, ALWAYS_BOUND_METADATA_COLUMNS, ROW_LINEAGE_METADATA_COLUMNS,
-    },
-};
-use novarocks_spi::connector::{
-    CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorDecodeContext,
-    ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorEnvelopeHeader, ConnectorInstanceId,
-    ConnectorCodecErrorKind,
 };
 use novarocks_spi::connector::read_stack::{SchemaTableName, TupleDomain};
+use novarocks_spi::connector::{
+    CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecErrorKind,
+    ConnectorDecodeContext, ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorEnvelopeHeader,
+    ConnectorInstanceId,
+};
 use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
+};
 
 fn original_table_facts() -> IcebergTableHandle {
     let schema = Schema::builder()

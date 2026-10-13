@@ -21,11 +21,11 @@ use crate::exec::chunk::type_compatibility::{check_exact, nested_path_label};
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use novarocks_types::SlotId;
 use novarocks_type_contract::owned_resources::metadata_materialization::{
-    MaterializedMetadataMap, MetadataFieldLoan, OriginalFieldMaterialization, OriginalSharedField,
-    OriginalMetadataClone, SchemaMetadataMaterializations,
+    MaterializedMetadataMap, MetadataFieldLoan, OriginalFieldMaterialization,
+    OriginalMetadataClone, OriginalSharedField, SchemaMetadataMaterializations,
 };
+use novarocks_types::SlotId;
 use novarocks_types::arrow_metadata_owner::{
     ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnedSchema, MetadataOwnerLimits,
 };
@@ -531,7 +531,6 @@ pub struct ChunkSchema {
     field_metadata_origins: Option<FieldMetadataOrigins>,
     schema_metadata_origin: Option<MetadataOwnedSchema>,
 }
-
 
 pub type ChunkSchemaRef = Arc<ChunkSchema>;
 
@@ -1397,12 +1396,11 @@ pub(super) fn align_chunk_schema_to_batch(
                 expected.unique_id,
             )?);
         } else {
-            let reconciled_field =
-                reconcile_chunk_field_to_data_type(
-                    expected.field(),
-                    field.data_type(),
-                    field.is_nullable(),
-                )?;
+            let reconciled_field = reconcile_chunk_field_to_data_type(
+                expected.field(),
+                field.data_type(),
+                field.is_nullable(),
+            )?;
             slots.push(
                 expected.with_field_and_slot_id(
                     expected.slot_id(),

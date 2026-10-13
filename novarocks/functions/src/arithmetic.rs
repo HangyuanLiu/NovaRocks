@@ -24,10 +24,10 @@ use arrow_buffer::i256;
 use arrow_schema::DataType;
 #[path = "arithmetic_decimal.rs"]
 mod decimal;
-#[path = "arithmetic_largeint.rs"]
-mod largeint;
 #[path = "arithmetic_float.rs"]
 mod float;
+#[path = "arithmetic_largeint.rs"]
+mod largeint;
 use novarocks_type_contract::{
     ArithmeticOperator, CompileCheckpoints, CompileControlError, CompilePhase,
     DecimalOverflowPolicy, ExpressionEffectContext, ExpressionEffects, FunctionValueType,
@@ -201,9 +201,9 @@ impl ArithmeticAlgorithm {
                     recipe.validate_right(array)
                 }
             }
-            Self::Float(_) => unreachable!(
-                "floating arithmetic validates through its original CAST author"
-            ),
+            Self::Float(_) => {
+                unreachable!("floating arithmetic validates through its original CAST author")
+            }
         }
     }
 }
@@ -245,7 +245,12 @@ impl PreparedArithmeticRecipe {
             {
                 ArithmeticAlgorithm::Signed { left, right }
             } else if let Some(recipe) = float::FloatArithmetic::prepare(
-                operator, left, right, decimal_policy, allow_throw_exception, control,
+                operator,
+                left,
+                right,
+                decimal_policy,
+                allow_throw_exception,
+                control,
             )? {
                 ArithmeticAlgorithm::Float(recipe)
             } else if let Some(recipe) = decimal::DecimalArithmetic::prepare(
@@ -351,8 +356,13 @@ impl PreparedArithmeticRecipe {
     ) -> Result<ArithmeticRowResult, KernelFailure> {
         if let ArithmeticAlgorithm::Float(recipe) = &self.algorithm {
             return recipe.evaluate_row(
-                left, left_ordinal, left_logical_row,
-                right, right_ordinal, right_logical_row, control,
+                left,
+                left_ordinal,
+                left_logical_row,
+                right,
+                right_ordinal,
+                right_logical_row,
+                control,
             );
         }
         control.checkpoint(0)?;
@@ -432,9 +442,9 @@ impl PreparedArithmeticRecipe {
                     left_ordinal,
                     &mut work,
                 )?,
-                ArithmeticAlgorithm::Float(_) => unreachable!(
-                    "floating arithmetic uses its original CAST scalar entry"
-                ),
+                ArithmeticAlgorithm::Float(_) => {
+                    unreachable!("floating arithmetic uses its original CAST scalar entry")
+                }
             };
             Ok(output)
         })();

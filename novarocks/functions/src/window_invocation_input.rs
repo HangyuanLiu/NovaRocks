@@ -18,12 +18,12 @@
 //! Exact whole-invocation source loans. Multiple semantic partitions are
 //! never relabelled as one partition. Geometry is supplied by the one host
 //! ORDER/frame author; this checker performs no comparison or frame math.
-use crate::{
-    WindowCallContract, WindowRowRange, EvaluatedArgument, KernelEvaluationControl, KernelFailure,
-};
-use crate::window_call::validate_full_window_arguments;
 use crate::kernel_control::invalid;
 use crate::kernel_input::EvaluationCheckpoints;
+use crate::window_call::validate_full_window_arguments;
+use crate::{
+    EvaluatedArgument, KernelEvaluationControl, KernelFailure, WindowCallContract, WindowRowRange,
+};
 use novarocks_type_contract::WindowFrameExclusion;
 #[derive(Clone, Copy, Debug)]
 pub struct FullWindowInvocationInput<'input> {

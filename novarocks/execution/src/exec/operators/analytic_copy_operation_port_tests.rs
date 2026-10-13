@@ -17,8 +17,8 @@
 
 //! Actual original stage-loop copy occurrences. This test adapter observes
 //! operations and control; it is explicitly NOT a host allocation grant.
-use super::*;
 use super::stages::AnalyticCopyFailure;
+use super::*;
 use arrow::array::{RecordBatch, RecordBatchOptions, UInt32Array};
 
 #[derive(Clone, Debug, PartialEq, Eq)]

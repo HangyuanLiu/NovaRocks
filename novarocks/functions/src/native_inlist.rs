@@ -17,8 +17,8 @@
 //! Original IN state assembly and signed comparison. Scheduling stays outside
 //! this module; every input has already been evaluated by its original shell.
 //! Observation grants no memory. Raw entrypoints preserve complete data errors.
-use arrow_array::{Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array};
 use arrow_array::builder::BooleanBuilder;
+use arrow_array::{Array, ArrayRef, BooleanArray, Int8Array, Int16Array, Int32Array, Int64Array};
 use arrow_schema::DataType;
 use std::convert::Infallible;
 #[derive(Clone, Copy, Debug)]

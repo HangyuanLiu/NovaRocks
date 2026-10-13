@@ -25,7 +25,9 @@ use crate::runtime_filter as execution;
 
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::node::runtime_filter::{RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract};
+use crate::exec::node::runtime_filter::{
+    RuntimeFilterConsumerBinding, RuntimeFilterExecutionContract,
+};
 use crate::exec::pipeline::operator::{
     DriverBlockDeadline, Operator, ProcessorOperator, forward_observable,
 };

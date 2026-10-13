@@ -24,7 +24,9 @@ use novarocks_functions::{
 use novarocks_sql::compiler::{
     SqlCompileControl, SqlPhysicalEmissionMode, builtin_sql_function_catalog,
 };
-use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType};
+use novarocks_type_contract::{
+    CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
+};
 use std::sync::Mutex;
 #[test]
 fn e08s1_time_static_profile_actual_source_and_all_six_nullable_profiles_use_same_original_author()

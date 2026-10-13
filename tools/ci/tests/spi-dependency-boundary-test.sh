@@ -56,7 +56,8 @@ write_fixture() {
   # own the columnar vocabulary. Tokio is deliberately absent: the
   # state-store-conformance owner that used to justify it is gone.
   for dependency in arrow async-trait bytes novarocks-frontend-application novarocks-secret \
-      novarocks-state-store-api novarocks-types serde sha2 tokio tracing url uuid; do
+      novarocks-state-store-api novarocks-type-contract novarocks-result-contract \
+      novarocks-types serde sha2 tokio tracing url uuid; do
     write_dependency_package "$fixture_root" "$dependency"
   done
   cat >"$fixture_root/Cargo.toml" <<'EOF'
@@ -132,6 +133,29 @@ assert_accepted "$valid_root"
 extra_dependency_root="$(new_mutation extra-dependency)"
 append_dependency "$extra_dependency_root/Cargo.toml" 'tracing = { path = "deps/tracing" }'
 assert_accepted "$extra_dependency_root"
+
+# --- accept: pure type/result vocabulary through a neutral contract -------
+neutral_contract_root="$(new_mutation neutral-contract)"
+append_dependency "$neutral_contract_root/Cargo.toml" \
+  'novarocks-type-contract = { path = "deps/novarocks-type-contract" }'
+append_dependency "$neutral_contract_root/deps/novarocks-type-contract/Cargo.toml" \
+  'novarocks-result-contract = { path = "../novarocks-result-contract" }'
+assert_accepted "$neutral_contract_root"
+
+# Allow-list membership cannot hide a runtime or application owner downstream.
+neutral_runtime_root="$tmpdir/neutral-runtime"
+cp -R "$neutral_contract_root" "$neutral_runtime_root"
+append_dependency "$neutral_runtime_root/deps/novarocks-type-contract/Cargo.toml" \
+  'tokio = { path = "../tokio" }'
+assert_rejected "$neutral_runtime_root" \
+  "novarocks-spi normal dependency closure contains a forbidden async runtime: tokio"
+
+neutral_application_root="$tmpdir/neutral-application"
+cp -R "$neutral_contract_root" "$neutral_application_root"
+append_dependency "$neutral_application_root/deps/novarocks-result-contract/Cargo.toml" \
+  'novarocks-frontend-application = { path = "../novarocks-frontend-application" }'
+assert_rejected "$neutral_application_root" \
+  "novarocks-spi normal dependency closure contains a forbidden application/execution owner: novarocks-frontend-application"
 
 # --- reject: a declared async runtime, optional or not --------------------
 # The removed state-store-conformance feature was Tokio's only owner, so an

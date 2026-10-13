@@ -207,7 +207,6 @@ impl PureFunctionMetadataOwner for ConcatOwner {
             .map(|_| ())
             .map_err(|_| FunctionBindingError::UnavailableImplementation(selected.overload.clone()))
     }
-
 }
 impl FunctionEffectOwner for ConcatOwner {
     type Error = FunctionBindingError;

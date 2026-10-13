@@ -68,7 +68,9 @@ use novarocks_execution::runtime::fragment::{
 use novarocks_execution::runtime::operator_statistics::project_operator_statistics;
 use novarocks_execution::runtime::profile::{Profiler, RuntimeProfileTree, fragment_root_profiler};
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
-use novarocks_execution_contract::task_execution::creation::{PreparedTaskFacts, TaskCreationInput};
+use novarocks_execution_contract::task_execution::creation::{
+    PreparedTaskFacts, TaskCreationInput,
+};
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, DomainVersion};
 use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
@@ -2238,7 +2240,9 @@ mod tests {
     use novarocks_execution::exec::fragment::program::{FragmentNodeId, FragmentSinkKind};
     use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-    use novarocks_execution::runtime::execution_runtime::{ExecutionRuntime, ExecutionRuntimeConfig};
+    use novarocks_execution::runtime::execution_runtime::{
+        ExecutionRuntime, ExecutionRuntimeConfig,
+    };
     use novarocks_execution::runtime::fragment::io::{
         ExchangeDestinationKey, FragmentEvent, FragmentEventSink, FragmentProgress,
         NoopFragmentEventSink, UnavailableExchangeReceiverPort,
@@ -2918,10 +2922,9 @@ mod tests {
             novarocks_native_adapter::backend_test_support::test_backend_data_runtime();
         let completion_supervisor =
             TaskCompletionSupervisor::start(data_runtime.handle().clone(), 64);
+        let execution_runtime = test_execution_runtime();
         NativeTaskExecutionHost::new(
-            NativeFragmentQueryRuntime::global(
-                novarocks_native_adapter::backend_test_support::test_memory_authority(),
-            ),
+            NativeFragmentQueryRuntime::global(Arc::clone(execution_runtime.memory_authority())),
             facts,
             TaskInboundCapabilities::new(),
             novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
@@ -2937,7 +2940,7 @@ mod tests {
             pool,
             Arc::new(UnavailableExchangeReceiverPort),
             Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
-            test_execution_runtime(),
+            execution_runtime,
             novarocks_worker::ScanStreamHost::new(
                 novarocks_worker::ScanPreparationConfig::default(),
                 novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
@@ -3654,7 +3657,7 @@ mod tests {
         let mut host = host(Arc::new(StubContextFacts::default()));
         host.queries = NativeFragmentQueryRuntime::new_for_test(
             Arc::clone(&manager),
-            novarocks_native_adapter::backend_test_support::test_memory_authority(),
+            Arc::clone(host.execution_runtime.memory_authority()),
         );
         (host, manager)
     }
@@ -6402,7 +6405,9 @@ mod tests {
             PropertyProofProjectionLimits, ScanReadBudget, extract_fragment_packages,
         };
         use novarocks_plan_codec::physical_package_v2::encode_fragment_package;
-        use novarocks_plan_codec::physical_package_v2::test_support::{decode_limits, encode_limits};
+        use novarocks_plan_codec::physical_package_v2::test_support::{
+            decode_limits, encode_limits,
+        };
         use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
         use novarocks_sql::compiler::{
             DEFAULT_COMPLETION_LIMITS, SessionOptimizerSettings, SqlCompileControl,
@@ -6929,31 +6934,38 @@ mod tests {
             let limits = novarocks_worker::WorkerResultRetainedLimits::try_new(
                 256 * 1024 * 1024,
                 4 * 1024 * 1024 * 1024,
-            ).expect("valid root test limits");
-            let budget = novarocks_worker::result_buffer::ResultRetainedBudget::new(limits.per_process());
+            )
+            .expect("valid root test limits");
+            let budget =
+                novarocks_worker::result_buffer::ResultRetainedBudget::new(limits.per_process());
             let pool = RootProducerPool::try_new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(64).unwrap(),
                 1024 * 1024,
                 Arc::clone(&budget),
-            ).expect("finite test producer pool");
+            )
+            .expect("finite test producer pool");
+            let execution_runtime = test_execution_runtime();
             NativeTaskExecutionHost::new(
-                NativeFragmentQueryRuntime::global(
-                    novarocks_native_adapter::backend_test_support::test_memory_authority(),
-                ),
+                NativeFragmentQueryRuntime::global(Arc::clone(
+                    execution_runtime.memory_authority(),
+                )),
                 facts,
                 TaskInboundCapabilities::new(),
                 novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
                     data_runtime,
                     Duration::from_millis(120_000),
                 ),
-                novarocks_native_adapter::fragment_result_writer::native_result_writer(Arc::clone(&budget), limits.per_root()),
+                novarocks_native_adapter::fragment_result_writer::native_result_writer(
+                    Arc::clone(&budget),
+                    limits.per_root(),
+                ),
                 budget,
                 limits,
                 pool,
                 Arc::new(UnavailableExchangeReceiverPort),
                 Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
-                test_execution_runtime(),
+                execution_runtime,
                 novarocks_worker::ScanStreamHost::new(
                     novarocks_worker::ScanPreparationConfig::default(),
                     novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
@@ -7210,31 +7222,38 @@ mod tests {
             let limits = novarocks_worker::WorkerResultRetainedLimits::try_new(
                 256 * 1024 * 1024,
                 4 * 1024 * 1024 * 1024,
-            ).expect("valid root test limits");
-            let budget = novarocks_worker::result_buffer::ResultRetainedBudget::new(limits.per_process());
+            )
+            .expect("valid root test limits");
+            let budget =
+                novarocks_worker::result_buffer::ResultRetainedBudget::new(limits.per_process());
             let pool = RootProducerPool::try_new(
                 NonZeroUsize::new(1).unwrap(),
                 NonZeroUsize::new(64).unwrap(),
                 1024 * 1024,
                 Arc::clone(&budget),
-            ).expect("finite test producer pool");
+            )
+            .expect("finite test producer pool");
+            let execution_runtime = test_execution_runtime();
             NativeTaskExecutionHost::new(
-                NativeFragmentQueryRuntime::global(
-                    novarocks_native_adapter::backend_test_support::test_memory_authority(),
-                ),
+                NativeFragmentQueryRuntime::global(Arc::clone(
+                    execution_runtime.memory_authority(),
+                )),
                 facts,
                 TaskInboundCapabilities::new(),
                 novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
                     data_runtime,
                     Duration::from_millis(120_000),
                 ),
-                novarocks_native_adapter::fragment_result_writer::native_result_writer(Arc::clone(&budget), limits.per_root()),
+                novarocks_native_adapter::fragment_result_writer::native_result_writer(
+                    Arc::clone(&budget),
+                    limits.per_root(),
+                ),
                 budget,
                 limits,
                 pool,
                 Arc::new(UnavailableExchangeReceiverPort),
                 Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
-                test_execution_runtime(),
+                execution_runtime,
                 novarocks_worker::ScanStreamHost::new(
                     novarocks_worker::ScanPreparationConfig::default(),
                     novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),

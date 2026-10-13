@@ -781,7 +781,9 @@ mod tests {
     use novarocks_types::arrow_metadata_owner::{
         ArrowMetadataOwner, FieldMetadataOrigins, MetadataOwnedField, MetadataOwnerLimits,
     };
-    use novarocks_types::{AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId};
+    use novarocks_types::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
 
     fn metadata() -> ArrowMetadataOwner {
         ArrowMetadataOwner::try_new(
