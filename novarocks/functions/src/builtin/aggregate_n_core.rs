@@ -35,6 +35,15 @@ pub trait NSortResources {
         len: usize,
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<Self::Lease, crate::KernelFailure>;
+
+    /// A reached comparator may create one original discarded diagnostic.
+    /// Default callers retain their original unobserved comparison behavior.
+    fn before_comparison(
+        &mut self,
+        _work: &mut ScalarWork<'_, '_>,
+    ) -> Result<Option<Self::Lease>, crate::KernelFailure> {
+        Ok(None)
+    }
 }
 struct NoopSortResources;
 impl NSortResources for NoopSortResources {
@@ -179,14 +188,24 @@ impl<A: ScalarStateAllocator> NState<A> {
             if primary.is_some() {
                 return Ordering::Equal;
             }
-            match scalar::compare_tracked_scalar_values(left, right, work) {
+            let comparison_lease = match resources.before_comparison(work) {
+                Ok(lease) => lease,
+                Err(cause) => {
+                    primary = Some(ScalarStateError::Kernel(cause));
+                    return Ordering::Equal;
+                }
+            };
+            let ordering = match scalar::compare_tracked_scalar_values(left, right, work) {
                 Ok(order) => order,
                 Err(ScalarStateError::Legacy(_)) => Ordering::Equal,
                 Err(error) => {
                     primary = Some(error);
                     Ordering::Equal
                 }
-            }
+            };
+            // The discarded Legacy String has ended with the match statement.
+            drop(comparison_lease);
+            ordering
         });
         // The library's scratch has ended before the caller's owned scope.
         drop(lease);
@@ -533,3 +552,7 @@ fn decode_scalar<A: ScalarStateAllocator>(
 #[cfg(test)]
 #[path = "aggregate_n_core/sort_resource_tests.rs"]
 mod sort_resource_tests;
+
+#[cfg(test)]
+#[path = "aggregate_n_core/comparison_resource_tests.rs"]
+mod comparison_resource_tests;
