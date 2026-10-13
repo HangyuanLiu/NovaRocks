@@ -16,8 +16,6 @@
 // under the License.
 
 mod be_log_directive;
-pub mod benchmark;
-pub(crate) mod benchmark_bootstrap;
 mod cluster;
 mod config;
 mod dataset_fixture;
@@ -32,7 +30,6 @@ mod publication_service;
 mod query_stats_contract;
 mod results;
 mod runner;
-mod s3_trace;
 mod session;
 mod shell;
 mod sql_error_codes;
@@ -44,10 +41,10 @@ mod engine_error_codes;
 
 use crate::cluster::{ClusterMode, ServerHandle, launch_server, validate_cluster_args};
 use crate::config::{
-    FixtureEndpoints, TestLane, build_suite_configs, case_auto_db_name, env_optional,
-    env_or_default, list_sql_files, load_runner_config, placeholder_variables_with_run_id,
-    project_fixture_value, resolve_config_path, resolve_path, resolve_reference_port,
-    resolve_repo_root, resolve_target_port, suite_default_query_timeout,
+    FixtureEndpoints, build_suite_configs, case_auto_db_name, env_optional, env_or_default,
+    list_sql_files, load_runner_config, placeholder_variables, project_fixture_value,
+    resolve_config_path, resolve_path, resolve_reference_port, resolve_repo_root,
+    resolve_target_port, suite_default_query_timeout,
 };
 use crate::failure_artifacts::{FailureArtifactContext, FailureArtifactRecorder};
 use crate::parser::load_suite_hook;
@@ -69,7 +66,6 @@ use crate::suite_manifest::select_suite_names;
 use crate::types::*;
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, ValueEnum};
-use novarocks_cluster_harness::process_resources::ProcessResourceMonitor;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{BTreeMap, HashSet};
@@ -470,10 +466,6 @@ pub(crate) struct Cli {
     #[arg(long)]
     failure_artifact_dir: Option<String>,
 
-    /// Write exact FE/BE process RSS samples for this cross-process run.
-    #[arg(long)]
-    process_resource_output: Option<PathBuf>,
-
     #[arg(long)]
     only: Option<String>,
 
@@ -522,38 +514,6 @@ pub(crate) struct Cli {
 
     #[arg(long, action = ArgAction::SetTrue)]
     fail_fast: bool,
-
-    /// Internal machine-readable case timing output used by the benchmark lane.
-    #[arg(long, hide = true)]
-    case_timing_output: Option<String>,
-
-    /// Internal fixture warehouse override used by the benchmark lane.
-    #[arg(long, hide = true)]
-    benchmark_warehouse: Option<String>,
-
-    /// Internal destination for per-query EXPLAIN ANALYZE benchmark profiles.
-    #[arg(long, hide = true)]
-    benchmark_profile_dir: Option<String>,
-
-    /// Reuse a benchmark-owned cross-process cluster supplied through --host/--port.
-    #[arg(long, hide = true)]
-    benchmark_external_cluster: bool,
-
-    /// Skip the suite init hook for a later phase of one benchmark protocol.
-    #[arg(long, hide = true)]
-    benchmark_skip_init: bool,
-
-    /// Skip the suite cleanup hook until the last phase of one benchmark protocol.
-    #[arg(long, hide = true)]
-    benchmark_skip_cleanup: bool,
-
-    /// Run only the suite cleanup hook after an earlier benchmark phase failed.
-    #[arg(long, hide = true)]
-    benchmark_cleanup_only: bool,
-
-    /// Freeze suite placeholder identity across all phases of one benchmark workload.
-    #[arg(long, hide = true)]
-    benchmark_run_id: Option<String>,
 
     /// Number of parallel test workers.  0 = auto-detect (number of logical CPUs).
     /// 1 = serial execution (legacy behaviour).
@@ -634,10 +594,6 @@ struct SuiteRunContext {
     failure_artifacts: Arc<FailureArtifactRecorder>,
     publication_catalog_control: Option<publication_catalog::FixtureControl>,
     publication_service_control: Option<publication_service::Control>,
-    benchmark_profile_dir: Option<PathBuf>,
-    benchmark_skip_init: bool,
-    benchmark_skip_cleanup: bool,
-    benchmark_cleanup_only: bool,
 }
 
 struct CaseOutcome {
@@ -2135,27 +2091,6 @@ fn finish_expected_error_step(
 // Per-case execution
 // ---------------------------------------------------------------------------
 
-fn benchmark_profile_statement(sql: &str, enabled: bool) -> String {
-    if enabled {
-        format!("EXPLAIN ANALYZE {sql}")
-    } else {
-        sql.to_string()
-    }
-}
-
-fn write_benchmark_profile(
-    dir: &PathBuf,
-    case_id: &str,
-    query_number: usize,
-    execution: &QueryExecution,
-) -> Result<()> {
-    fs::create_dir_all(dir)
-        .with_context(|| format!("create benchmark profile directory {}", dir.display()))?;
-    let path = dir.join(format!("{case_id}.{query_number}.profile.txt"));
-    fs::write(&path, &execution.text_output)
-        .with_context(|| format!("write benchmark profile {}", path.display()))
-}
-
 fn mismatch_artifact_root(ctx: &SuiteRunContext, log: &mut String) -> Option<PathBuf> {
     match ctx
         .actual_artifact_dir
@@ -2761,10 +2696,6 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 let mut passed_execution: Option<QueryExecution> = None;
                 let mut last_execution: Option<QueryExecution> = None;
                 let mut last_failure = String::new();
-                let target_sql = benchmark_profile_statement(
-                    &step.sql,
-                    ctx.benchmark_profile_dir.is_some() && !shell::is_shell_step(&step.sql),
-                );
 
                 for attempt in 0..retry_count {
                     let (ok, execution, err_msg) = if shell::is_shell_step(&step.sql) {
@@ -2853,7 +2784,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             &ctx.server_handle,
                             &mut target_session,
                             ctx.query_timeout,
-                            &target_sql,
+                            &step.sql,
                             step.meta.db.as_deref(),
                             be_log_snapshot.evidence_deadline(),
                         )
@@ -3011,18 +2942,6 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         }
                     }
                 } else if let Some(execution) = passed_execution {
-                    if let Some(profile_dir) = ctx.benchmark_profile_dir.as_ref()
-                        && let Err(error) = write_benchmark_profile(
-                            profile_dir,
-                            &case.case_id,
-                            step.query_number,
-                            &execution,
-                        )
-                    {
-                        case_failed = true;
-                        let _ = writeln!(log, "    ❌ {error:#}");
-                        continue;
-                    }
                     if let Err(error) = run_post_step_server_actions(
                         step,
                         &ctx.server_handle,
@@ -3952,9 +3871,7 @@ fn run_suite_with_hooks(
     let fail_count = AtomicUsize::new(0);
 
     // --- suite init hook ---
-    if !ctx.benchmark_skip_init
-        && let Some(hook) = ps.init_hook.as_ref()
-    {
+    if let Some(hook) = ps.init_hook.as_ref() {
         {
             let _guard = stdout_lock.lock().unwrap();
             println!(
@@ -4105,9 +4022,7 @@ fn run_suite_with_hooks(
         }
     };
 
-    let outcomes: Vec<CaseOutcome> = if ctx.benchmark_cleanup_only {
-        Vec::new()
-    } else {
+    let outcomes: Vec<CaseOutcome> = {
         // Unloadable case files count as failures of themselves.
         let mut outcomes: Vec<CaseOutcome> =
             load_failure_outcomes(&ctx.suite_name, &ps.load_failures);
@@ -4138,9 +4053,7 @@ fn run_suite_with_hooks(
 
     // --- suite cleanup hook ---
     let mut cleanup_errors = Vec::new();
-    if !ctx.benchmark_skip_cleanup
-        && let Some(hook) = ps.cleanup_hook.as_ref()
-    {
+    if let Some(hook) = ps.cleanup_hook.as_ref() {
         {
             let _guard = stdout_lock.lock().unwrap();
             println!(
@@ -4204,26 +4117,6 @@ fn format_case_timings(timings: &[CaseTiming]) -> String {
         );
     }
     out
-}
-
-fn write_case_timing_csv(path: &std::path::Path, timings: &[CaseTiming]) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("case timing output path must have a parent directory")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("create case timing output directory {}", parent.display()))?;
-    let mut csv = String::from("suite,case,status,elapsed_seconds\n");
-    for timing in timings {
-        let _ = writeln!(
-            csv,
-            "{},{},{},{:.9}",
-            timing.suite_name,
-            timing.case_id,
-            case_status_label(timing.status),
-            timing.elapsed.as_secs_f64(),
-        );
-    }
-    fs::write(path, csv).with_context(|| format!("write case timings to {}", path.display()))
 }
 
 fn cases_have_fault_directives(cases: &[SqlCase]) -> bool {
@@ -4743,7 +4636,7 @@ fn selected_cases_require_cleanup_faults(
 // ---------------------------------------------------------------------------
 
 pub fn run_correctness() -> Result<()> {
-    let exit_code = run_cli(Cli::parse(), TestLane::Correctness, "correctness")?;
+    let exit_code = run_cli(Cli::parse())?;
     if exit_code != 0 {
         std::process::exit(exit_code);
     }
@@ -4849,19 +4742,12 @@ fn report_preserved_failure_artifacts(result: &Result<Option<PathBuf>>) {
 
 fn select_cluster_launch_profile(
     requested: Option<novarocks_cluster_harness::LaunchProfile>,
-    lane: TestLane,
     query_lifecycle_faults: bool,
     cleanup_faults: bool,
 ) -> Result<novarocks_cluster_harness::LaunchProfile> {
     use novarocks_cluster_harness::LaunchProfile;
     let has_faults = query_lifecycle_faults || cleanup_faults;
-    let profile = requested.unwrap_or_else(|| {
-        if lane == TestLane::Benchmark && !has_faults {
-            LaunchProfile::Performance
-        } else {
-            LaunchProfile::FaultScenario
-        }
-    });
+    let profile = requested.unwrap_or(LaunchProfile::FaultScenario);
     if profile == LaunchProfile::Performance && has_faults {
         bail!("performance launch profile refuses query-lifecycle or cleanup fault directives");
     }
@@ -4884,13 +4770,13 @@ fn validate_dataset_launch_profile(
     Ok(())
 }
 
-pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32> {
+pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
     let base_dir = resolve_repo_root()?;
-    let suite_configs = build_suite_configs(&base_dir, lane)?;
+    let suite_configs = build_suite_configs(&base_dir)?;
     if suite_configs.is_empty() {
         println!(
             "❌ ERROR: no suite directories found under {}",
-            lane.suite_root(&base_dir).display()
+            base_dir.join("tests/sql/correctness").display()
         );
         return Ok(1);
     }
@@ -4921,13 +4807,6 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
 
     let config_path = resolve_config_path(cli.config.as_deref(), &base_dir);
     let mut runner_config = load_runner_config(config_path.as_deref())?;
-    if let Some(warehouse) = cli.benchmark_warehouse.as_deref() {
-        runner_config.values.insert(
-            "benchmark_iceberg_catalog_warehouse".to_string(),
-            warehouse.to_string(),
-        );
-    }
-
     let suite_names = match select_suite_names(
         cli.suite
             .as_deref()
@@ -4948,24 +4827,11 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
         .unwrap_or_else(|| base_dir.join("logs/sql-test-failures"));
     let failure_artifacts = Arc::new(FailureArtifactRecorder::new(FailureArtifactContext {
         root: failure_artifact_root,
-        lane: lane_label.to_string(),
+        lane: "correctness".to_string(),
         suites: suite_names.clone(),
     }));
     let selected_cluster_mode = cli.cluster_mode;
     let selected_cluster_size = cli.cluster_size.unwrap_or(1);
-    if let Some(path) = cli.process_resource_output.as_deref() {
-        if !path.is_absolute()
-            || path.symlink_metadata().is_ok()
-            || !path.parent().is_some_and(|parent| parent.is_dir())
-            || cli.dry_run
-            || cli.benchmark_external_cluster
-            || selected_cluster_mode != ClusterMode::CrossProcess
-        {
-            bail!(
-                "--process-resource-output requires an unused absolute path and an owned cross-process cluster"
-            );
-        }
-    }
     if let Err(error) = validate_cluster_args(selected_cluster_mode, selected_cluster_size) {
         println!("❌ ERROR: {error}");
         return Ok(1);
@@ -5029,28 +4895,13 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
             dataset_bindings.insert(suite_name.clone(), binding);
         }
     }
-    // SAFETY: no runner-owned server, trace, proxy or case worker exists yet.
+    // SAFETY: no runner-owned server, proxy or case worker exists yet.
     // Publish the physical fixture projection once before starting those threads.
     unsafe {
         for (key, value) in &subprocess_environment {
             std::env::set_var(key, value);
         }
     }
-    let mut s3_trace = if let Some(path) = std::env::var_os("UEA7_SCALE_S3_TRACE_FILE") {
-        anyhow::ensure!(
-            suite_names.len() == 1 && suite_names[0] == "mv-storage-contract",
-            "UEA7_SCALE_S3_TRACE_FILE requires only the mv-storage-contract suite"
-        );
-        let fixture = isolated_rest_catalog
-            .as_ref()
-            .context("S3 trace requires an isolated REST and MinIO fixture")?;
-        let path = PathBuf::from(path);
-        let trace = s3_trace::S3TraceHandle::start(fixture, &path)?;
-        println!("  MinIO S3 request trace: {}", path.display());
-        Some(trace)
-    } else {
-        None
-    };
     let publication_service_control = if let Some(control_uri) = publication_control_uri {
         let fixture = isolated_rest_catalog
             .as_ref()
@@ -5103,7 +4954,6 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
         && selected_cases_require_cleanup_faults(&cli, &suite_names, &suite_configs, &base_dir)?;
     let launch_profile = select_cluster_launch_profile(
         cli.cluster_launch_profile,
-        lane,
         query_lifecycle_faults_enabled,
         cleanup_faults_enabled,
     )?;
@@ -5126,45 +4976,15 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
     } else {
         selected_cluster_size
     };
-    let server_handle = if cli.benchmark_external_cluster {
-        if lane != TestLane::Benchmark || cli.host.is_none() || cli.port.is_none() {
-            bail!(
-                "benchmark external cluster reuse requires the benchmark lane and explicit --host/--port"
-            );
-        }
-        launch_server(
-            ClusterMode::AllInOne,
-            1,
-            &base_dir,
-            &runner_config,
-            launch_profile,
-        )?
-    } else {
-        launch_server(
-            launch_cluster_mode,
-            launch_cluster_size,
-            &base_dir,
-            &runner_config,
-            launch_profile,
-        )?
-    };
+    let server_handle = launch_server(
+        launch_cluster_mode,
+        launch_cluster_size,
+        &base_dir,
+        &runner_config,
+        launch_profile,
+    )?;
     let launched_target_port = server_handle.target_port();
     let launched_target_host = server_handle.target_host().map(ToOwned::to_owned);
-    let process_resource_monitor = if let Some(path) = cli.process_resource_output.as_deref() {
-        let identities = server_handle
-            .process_resource_identities()?
-            .context("cross-process server has no exact process resource identities")?;
-        Some((
-            ProcessResourceMonitor::start_with_identities(
-                identities,
-                format!("sql-runner-{}", std::process::id()),
-                Duration::from_millis(100),
-            )?,
-            path.to_path_buf(),
-        ))
-    } else {
-        None
-    };
     let server_handle = Arc::new(Mutex::new(server_handle));
     let primary_result = (|| -> Result<i32> {
         // Resolve global connection params
@@ -5265,11 +5085,7 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
                 suite.sql_glob.clone()
             };
 
-            let mut placeholder_vars = placeholder_variables_with_run_id(
-                &runner_config,
-                &suite.name,
-                cli.benchmark_run_id.as_deref(),
-            );
+            let mut placeholder_vars = placeholder_variables(&runner_config, &suite.name);
             if let Some(binding) = dataset_bindings.get(suite_name) {
                 placeholder_vars.insert(
                     "dataset_iceberg_catalog_warehouse".to_string(),
@@ -5545,9 +5361,8 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
             // Print suite header
             println!("{}", "=".repeat(72));
             println!(
-                "📋 {} {} runner (jobs={})",
+                "📋 {} correctness runner (jobs={})",
                 suite.name.to_uppercase(),
-                lane_label,
                 jobs
             );
             println!("{}", "=".repeat(72));
@@ -5653,13 +5468,6 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
                 failure_artifacts: Arc::clone(&failure_artifacts),
                 publication_catalog_control: publication_catalog_control.clone(),
                 publication_service_control: publication_service_control.clone(),
-                benchmark_profile_dir: resolve_path(
-                    cli.benchmark_profile_dir.as_deref(),
-                    &base_dir,
-                ),
-                benchmark_skip_init: cli.benchmark_skip_init,
-                benchmark_skip_cleanup: cli.benchmark_skip_cleanup,
-                benchmark_cleanup_only: cli.benchmark_cleanup_only,
             };
 
             prepared_suites.push(PreparedSuite {
@@ -5794,9 +5602,6 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
                 .then_with(|| b.elapsed.cmp(&a.elapsed))
                 .then_with(|| a.case_id.cmp(&b.case_id))
         });
-        if let Some(path) = cli.case_timing_output.as_deref() {
-            write_case_timing_csv(PathBuf::from(path).as_path(), &all_case_timings)?;
-        }
         print!("{}", format_case_timings(&all_case_timings));
 
         if !all_failed_cases.is_empty() {
@@ -5819,50 +5624,8 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
 
         Ok(0)
     })();
-    let primary_result = if let Some((monitor, path)) = process_resource_monitor {
-        let sampled = monitor.finish(&path).and_then(|samples| {
-            for role in std::iter::once("fe".to_string())
-                .chain((0..selected_cluster_size).map(|index| format!("be-{index}")))
-            {
-                let high = samples
-                    .high_water(&role)
-                    .with_context(|| format!("no process resource sample for {role}"))?;
-                println!(
-                    "process resource high water {role}: rss_bytes={}",
-                    high.rss_bytes
-                );
-            }
-            println!("process resource samples: {}", path.display());
-            Ok(())
-        });
-        match (primary_result, sampled) {
-            (result, Ok(())) => result,
-            (Ok(_), Err(sample_error)) => Err(sample_error),
-            (Err(run_error), Err(sample_error)) => Err(anyhow::anyhow!(
-                "SQL run failed: {run_error:#}; process resource sampling failed: {sample_error:#}"
-            )),
-        }
-    } else {
-        primary_result
-    };
-    let mut outcome =
+    let outcome =
         finish_run_with_server_cleanup(server_handle, primary_result, failure_artifacts.as_ref());
-    if let Some(trace) = s3_trace.as_mut() {
-        let trace_result = trace.finish();
-        if trace_result.is_ok() {
-            println!(
-                "  isolated S3 object sizes: {}",
-                trace.object_sizes_artifact().display()
-            );
-        }
-        outcome = match (outcome, trace_result) {
-            (result, Ok(())) => result,
-            (Ok(_), Err(trace_error)) => Err(trace_error),
-            (Err(run_error), Err(trace_error)) => Err(anyhow::anyhow!(
-                "SQL run failed: {run_error:#}; S3 trace cleanup failed: {trace_error:#}"
-            )),
-        };
-    }
     // After the servers are down, so nothing is still talking to the catalog
     // while its containers go away.
     if let Some(fixture) = isolated_rest_catalog.as_mut() {
@@ -6025,7 +5788,7 @@ mod tests {
         discover_novarocks_binary_with_override, render_cross_process_config,
         startup_timeout_from_env, validate_cluster_args,
     };
-    use crate::config::{TestLane, substitute_placeholders};
+    use crate::config::substitute_placeholders;
     use crate::parser::{extract_suite_hook, load_sql_case_from_file};
     use crate::results::{load_expected_results, parse_output, write_result_file};
     use crate::runner::{is_transient_iceberg_commit_error, parse_selector_list};
@@ -6723,7 +6486,7 @@ mod tests {
     }
 
     #[test]
-    fn correctness_help_excludes_benchmark_bootstrap_options() {
+    fn correctness_cli_refuses_retired_measurement_options() {
         let help = <crate::Cli as clap::CommandFactory>::command()
             .render_long_help()
             .to_string();
@@ -6732,6 +6495,29 @@ mod tests {
         assert!(!help.contains("--benchmark-scale <BENCHMARK_SCALE>"));
         assert!(!help.contains("--benchmark-bootstrap-rebuild"));
         assert!(help.contains("--list-suites"));
+        for option in [
+            "--case-timing-output",
+            "--process-resource-output",
+            "--benchmark-warehouse",
+            "--benchmark-profile-dir",
+            "--benchmark-external-cluster",
+            "--benchmark-skip-init",
+            "--benchmark-skip-cleanup",
+            "--benchmark-cleanup-only",
+            "--benchmark-run-id",
+            "--no-auto-bootstrap-benchmark-data",
+            "--benchmark-scale",
+            "--benchmark-bootstrap-rebuild",
+        ] {
+            let error =
+                crate::Cli::try_parse_from(["novarocks-sql-test", "--suite", "decimal", option])
+                    .expect_err("retired measurement options must fail during argument parsing");
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{option}"
+            );
+        }
     }
 
     #[test]
@@ -6757,20 +6543,14 @@ mod tests {
         .expect("parse release-compatible launch profile");
         assert_eq!(cli.cluster_launch_profile, Some(LaunchProfile::Performance));
         assert_eq!(
-            super::select_cluster_launch_profile(
-                cli.cluster_launch_profile,
-                super::TestLane::Correctness,
-                false,
-                false,
-            )
-            .unwrap(),
+            super::select_cluster_launch_profile(cli.cluster_launch_profile, false, false,)
+                .unwrap(),
             LaunchProfile::Performance
         );
         for (query_faults, cleanup_faults) in [(true, false), (false, true), (true, true)] {
             assert!(
                 super::select_cluster_launch_profile(
                     cli.cluster_launch_profile,
-                    super::TestLane::Correctness,
                     query_faults,
                     cleanup_faults,
                 )
@@ -6778,8 +6558,7 @@ mod tests {
             );
         }
         assert_eq!(
-            super::select_cluster_launch_profile(None, super::TestLane::Correctness, false, false,)
-                .unwrap(),
+            super::select_cluster_launch_profile(None, false, false).unwrap(),
             LaunchProfile::FaultScenario
         );
     }
@@ -7143,10 +6922,6 @@ mod tests {
             failure_artifacts: artifacts,
             publication_catalog_control: None,
             publication_service_control: None,
-            benchmark_profile_dir: None,
-            benchmark_skip_init: false,
-            benchmark_skip_cleanup: false,
-            benchmark_cleanup_only: false,
         };
         let hook = |name: &str| SuiteHook {
             path: temp.path().join(name),
@@ -7207,21 +6982,15 @@ mod tests {
                 "/no/runtime/config",
             ],
         ] {
-            assert_eq!(
-                super::run_cli(Cli::parse_from(args), TestLane::Correctness, "correctness")
-                    .unwrap(),
-                0
-            );
+            assert_eq!(super::run_cli(Cli::parse_from(args)).unwrap(), 0);
         }
     }
 
     #[test]
     fn dataset_launch_profile_is_explicit_and_incompatible_selection_fails() {
-        let suites = crate::config::build_suite_configs(
-            &crate::config::resolve_repo_root().unwrap(),
-            TestLane::Correctness,
-        )
-        .unwrap();
+        let suites =
+            crate::config::build_suite_configs(&crate::config::resolve_repo_root().unwrap())
+                .unwrap();
         let selected = vec!["ssb".to_string()];
         assert!(
             super::validate_dataset_launch_profile(

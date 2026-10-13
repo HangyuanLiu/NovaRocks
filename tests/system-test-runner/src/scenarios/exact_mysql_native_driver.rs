@@ -382,14 +382,10 @@ impl Scenario for ExactNativeCase {
     fn is_explicit_stage(&self) -> bool {
         true
     }
-    fn validate_runner_inputs(
-        &self,
-        profile: LaunchProfile,
-        manifest: Option<&Path>,
-    ) -> Result<()> {
+    fn validate_runner_inputs(&self, profile: LaunchProfile) -> Result<()> {
         ensure!(
-            profile == LaunchProfile::FaultScenario && manifest.is_none(),
-            "exact native fixture requires fault-scenario without a performance workload"
+            profile == LaunchProfile::FaultScenario,
+            "exact native fixture requires the fault-scenario launch profile"
         );
         self.run.validate_shape()
     }

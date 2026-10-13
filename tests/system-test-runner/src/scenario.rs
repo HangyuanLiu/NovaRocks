@@ -36,16 +36,12 @@ pub trait Scenario: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Validates runner-wide inputs before any selected scenario launches a
-    /// process. Scenarios with special profiles or manifests fail here.
-    fn validate_runner_inputs(
-        &self,
-        _launch_profile: LaunchProfile,
-        _uea1_workload_manifest: Option<&Path>,
-    ) -> Result<()> {
+    /// process. Scenarios with special profiles fail here.
+    fn validate_runner_inputs(&self, _launch_profile: LaunchProfile) -> Result<()> {
         Ok(())
     }
 
-    /// Explicit stages, including external fixtures and performance baselines,
+    /// Explicit stages with external fixtures
     /// remain discoverable and runnable by exact selector without joining the
     /// default functional baseline.
     fn is_explicit_stage(&self) -> bool {
@@ -132,8 +128,6 @@ pub struct ScenarioContext {
     cluster_size: usize,
     startup_timeout: Duration,
     launch_profile: LaunchProfile,
-    uea1_workload_manifest: Option<PathBuf>,
-    uea1_preparation_diagnostic_secret: Option<String>,
     started_at: SystemTime,
 }
 
@@ -217,8 +211,6 @@ impl ScenarioContext {
         base_config_path: PathBuf,
         cluster_size: usize,
         launch_profile: LaunchProfile,
-        uea1_workload_manifest: Option<PathBuf>,
-        uea1_preparation_diagnostic_secret: Option<String>,
         exact_mysql_clock: Option<ExactMysqlPrelaunchClock>,
     ) -> Self {
         Self {
@@ -236,8 +228,6 @@ impl ScenarioContext {
             cluster_size,
             startup_timeout: timeout,
             launch_profile,
-            uea1_workload_manifest,
-            uea1_preparation_diagnostic_secret,
             started_at: exact_mysql_clock.map_or_else(SystemTime::now, |clock| clock.started_at()),
         }
     }
@@ -390,14 +380,6 @@ impl ScenarioContext {
 
     pub fn launch_profile(&self) -> LaunchProfile {
         self.launch_profile
-    }
-
-    pub fn uea1_workload_manifest(&self) -> Option<&Path> {
-        self.uea1_workload_manifest.as_deref()
-    }
-
-    pub fn uea1_preparation_diagnostic_secret(&self) -> Option<&str> {
-        self.uea1_preparation_diagnostic_secret.as_deref()
     }
 
     pub fn fe_http_port(&self) -> u16 {

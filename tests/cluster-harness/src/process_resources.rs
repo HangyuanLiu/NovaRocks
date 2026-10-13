@@ -255,12 +255,6 @@ struct ProcessReadings {
     cpu_system_nanos: u64,
 }
 
-#[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
-pub struct ProcessResourceHighWater {
-    pub rss_bytes: u64,
-    pub threads: Option<u64>,
-}
-
 /// Samples process resources without changing the process under observation.
 ///
 /// Missing thread counters remain `None`; callers must not turn unavailable
@@ -295,27 +289,6 @@ impl ProcessResourceMonitor {
     ) -> Result<Self> {
         let processes = identities.role_process_map()?;
         Self::start_with_processes(processes, run_id, interval)
-    }
-
-    /// Sample the scenario runner beside its native roles. A proxy hosted by
-    /// this runner shares the reading with client and orchestration work.
-    pub fn start_with_identities_and_runner(
-        identities: ClusterProcessIdentities,
-        run_id: impl Into<String>,
-        interval: Duration,
-    ) -> Result<Self> {
-        let mut processes = identities.role_process_map()?;
-        let pid = std::process::id();
-        let process_start_token =
-            read_process_start_token(pid).context("capture scenario runner process start token")?;
-        processes.insert(
-            "runner-proxy".to_string(),
-            ProcessResourceIdentity {
-                pid,
-                process_start_token,
-            },
-        );
-        Self::start_with_processes(validate_role_process_map(processes)?, run_id, interval)
     }
 
     fn start_with_processes(
@@ -459,26 +432,6 @@ impl ProcessResourceSampler {
 
     pub fn samples(&self) -> &[ProcessResourceSample] {
         &self.samples
-    }
-
-    pub fn high_water(&self, role: &str) -> Option<ProcessResourceHighWater> {
-        let matching = self
-            .samples
-            .iter()
-            .filter(|sample| sample.role == role)
-            .filter_map(|sample| sample.rss_bytes.map(|rss| (sample, rss)));
-        let mut high = ProcessResourceHighWater::default();
-        let mut found = false;
-        for (sample, rss_bytes) in matching {
-            found = true;
-            high.rss_bytes = high.rss_bytes.max(rss_bytes);
-            high.threads = match (high.threads, sample.threads) {
-                (Some(current), Some(next)) => Some(current.max(next)),
-                (None, Some(next)) => Some(next),
-                (current, None) => current,
-            };
-        }
-        found.then_some(high)
     }
 
     pub fn write_json(&self, path: &Path) -> Result<()> {
@@ -728,13 +681,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn samples_current_process_and_reports_high_water() {
+    fn samples_current_process_with_exact_resource_facts() {
         let mut sampler = ProcessResourceSampler::new();
         sampler.sample_cluster().expect("sample current process");
-        let high = sampler.high_water("fe").expect("high water exists");
-        assert!(high.rss_bytes > 0);
-        assert!(high.threads.is_some_and(|threads| threads > 0));
         assert_eq!(sampler.samples().len(), 1);
+        assert!(sampler.samples()[0].rss_bytes.is_some_and(|rss| rss > 0));
+        assert!(
+            sampler.samples()[0]
+                .threads
+                .is_some_and(|threads| threads > 0)
+        );
         assert!(sampler.samples()[0].unavailable_reason.is_none());
         assert!(sampler.samples()[0].cpu_user_nanos.is_some());
         assert!(sampler.samples()[0].cpu_system_nanos.is_some());
