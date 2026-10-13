@@ -81,3 +81,12 @@ No patches applied in the initial source commit.
 - Exit: IRU-13b removes this patch when the connector owns the REST update vocabulary.
 - Coverage: migrated `catalog::tests::test_add_schema` serde expectations for Some(3)/None; existing table metadata builder and update-schema tests adapted to the additive field.
 - Port adaptation: the new 0.11 SDK update-schema action emits `last_column_id: None`; its schema-match tests ignore the new field. No SDK mutation semantics changed.
+
+## P8 — authoritative staged-create initialization
+
+- Purpose: preserve `TableMetadata::staged_create_initialization_updates` verbatim from 0.9. It reconstructs initial updates solely from authoritative REST response metadata and rejects unrepresentable state.
+- Files: `src/spec/table_metadata.rs`.
+- Upstream status: no tracked upstream issue; rc.2 has no equivalent helper.
+- Production dependency: REST staged-create publication preserves UUID, location, IDs, format, properties, and high-watermarks supplied by the catalog; depends on U2.
+- Exit: IRU-13b removes this patch when the connector owns authoritative REST initialization.
+- Coverage: old core had no dedicated test. The old REST `catalog.rs:4383` test `test_staged_create_initialization_updates_preserve_v2_and_v3_format` and related authoritative staged-create tests are migrated by T3; existing connector staged-create tests cover consumption.
