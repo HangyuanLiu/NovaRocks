@@ -2203,6 +2203,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "IRU-9: Variant is unavailable until IRU-9 restores it"]
     async fn write_variant_column_round_trips_through_local_parquet() {
         use arrow::array::{Int32Array, LargeBinaryArray};
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};

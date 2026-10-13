@@ -1006,6 +1006,10 @@ pub(crate) mod preparer_tests {
     }
     impl Fixture {
         pub(crate) fn new() -> Self {
+            Self::new_with_limits(OperationLimits::default())
+        }
+
+        pub(crate) fn new_with_limits(limits: OperationLimits) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let location = format!("file://{}", directory.path().display());
             let runtime = tokio::runtime::Handle::current();
@@ -1028,7 +1032,7 @@ pub(crate) mod preparer_tests {
                 )
                 .unwrap(),
                 crate::resources::IcebergCatalogRuntime::new(runtime),
-                OperationLimits::default(),
+                limits,
             )
             .unwrap();
             Self {

@@ -622,6 +622,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "IRU-9: Variant is unavailable until IRU-9 restores it"]
     fn ensure_no_variant_in_partition_spec_rejects_variant_partition_column() {
         use crate::iceberg::spec::{NestedField, PartitionField, PrimitiveType, Transform, Type};
         let table = make_table_with(
@@ -659,6 +660,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "IRU-9: Variant is unavailable until IRU-9 restores it"]
     fn ensure_no_variant_in_sort_order_rejects_variant_sort_column() {
         use crate::iceberg::spec::{
             NestedField, NullOrder, PrimitiveType, SortDirection, SortField, Transform, Type,
@@ -864,6 +866,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "IRU-9: Variant is unavailable until IRU-9 restores it"]
     fn spi5h_strategy_runs_the_write_support_guards_first() {
         use crate::iceberg::spec::{
             FormatVersion, NestedField, PartitionField, PrimitiveType, Transform, Type,

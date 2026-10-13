@@ -1752,3 +1752,486 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod manifest_stream_tests {
+    //! Protect the SDK manifest/list streaming boundary and real operation ownership.
+    //! Expected allocation/admission/cleanup ordering comes from the 0.9 behavior
+    //! and ADR-0171, not from a replacement ledger. The only injected behavior is
+    //! splitting a real FileWrite and holding its second segment. Existing governed
+    //! MockWrite tests remain the canonical protection for an issued I/O step's exit.
+
+    use super::*;
+    use crate::commit::model::{
+        AddedContent, ArtifactClass, ArtifactKind, ArtifactWriteState, ArtifactWriter,
+        AttemptArtifacts, AttemptToken, CleanupRemainingReason, CleanupScope, IcebergCleanupReport,
+        ObjectIdentity,
+    };
+    use crate::commit::operation::{
+        CleanupBudget, IcebergCommitAttempt, IcebergCommitOperation, OperationLimits,
+    };
+    use crate::commit::overwrite::preparer_tests::Fixture;
+    use crate::iceberg::spec::{
+        FormatVersion, Manifest, ManifestContentType, ManifestList, Struct,
+    };
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[derive(Debug, Default)]
+    struct HalfWriteGate {
+        first_half_written: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+        bytes_written: AtomicUsize,
+        write_exited: AtomicBool,
+    }
+
+    #[derive(Debug)]
+    struct ManifestStreamProbe {
+        operation: IcebergCommitOperation,
+        original: FileIO,
+        gate: Option<Arc<HalfWriteGate>>,
+        atomic: Option<AtomicManifestWriterBoundary>,
+        writers: AtomicUsize,
+        whole_writes: AtomicUsize,
+        allocated_before_output: Mutex<Vec<ObjectIdentity>>,
+    }
+
+    #[derive(Debug)]
+    struct AtomicManifestWriterBoundary {
+        operator: Operator,
+        root: std::path::PathBuf,
+        temporary: std::path::PathBuf,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct ManifestProbeStorage {
+        #[serde(skip)]
+        probe: Option<Arc<ManifestStreamProbe>>,
+    }
+
+    impl ManifestProbeStorage {
+        fn probe(&self) -> &ManifestStreamProbe {
+            self.probe.as_deref().expect("initialized manifest probe")
+        }
+    }
+
+    #[async_trait]
+    #[typetag::serde]
+    impl Storage for ManifestProbeStorage {
+        async fn exists(&self, path: &str) -> Result<bool> {
+            self.probe().original.new_input(path)?.exists().await
+        }
+        async fn metadata(&self, path: &str) -> Result<FileMetadata> {
+            self.probe().original.new_input(path)?.metadata().await
+        }
+        async fn read(&self, path: &str) -> Result<Bytes> {
+            self.probe().original.new_input(path)?.read().await
+        }
+        async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
+            self.probe().original.new_input(path)?.reader().await
+        }
+        async fn write(&self, path: &str, bytes: Bytes) -> Result<()> {
+            self.probe().whole_writes.fetch_add(1, Ordering::SeqCst);
+            self.probe().original.new_output(path)?.write(bytes).await
+        }
+        async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
+            let probe = self.probe();
+            let inner: Box<dyn FileWrite> = if let Some(atomic) = &probe.atomic {
+                // Only the cancelled fixture substitutes the resolver's default
+                // local operator. Use a real private atomic FS backend (default
+                // FS abort is Unsupported), preserving the real operation's
+                // admission, WritePermit and IcebergFsFileWrite lifecycle.
+                let target = url::Url::parse(path).unwrap().to_file_path().unwrap();
+                let relative = target.strip_prefix(&atomic.root).unwrap().to_string_lossy();
+                let permit = probe
+                    .operation
+                    .write_admission_for_test()
+                    .admit(path)?
+                    .acquire()
+                    .await?;
+                permit.check_active()?;
+                IcebergFsStorage::ensure_parent_dir(&atomic.operator, &relative).await?;
+                permit.check_active()?;
+                // For this fresh owned path, append selects FS's serial writer
+                // while still creating an atomic temporary file. The default
+                // positional writer caches its first segment until a later write.
+                assert!(!target.exists(), "test artifact must be a fresh owned path");
+                let mut writer = atomic
+                    .operator
+                    .writer_with(&relative)
+                    .append(true)
+                    .await
+                    .map_err(|error| {
+                        Error::new(ErrorKind::Unexpected, "open atomic manifest test writer")
+                            .with_source(error)
+                    })?;
+                permit.stream_started.store(true, Ordering::Release);
+                if let Err(error) = permit.check_active() {
+                    return Err(abort_after_failure(&mut writer, error, Some(&permit)).await);
+                }
+                Box::new(IcebergFsFileWrite {
+                    writer: Some(writer),
+                    permit: Some(permit),
+                })
+            } else {
+                // Normal manifest and list outputs exercise the complete original
+                // IcebergFsStorage path, including resolution and writer opening.
+                probe.original.new_output(path)?.writer().await?
+            };
+            probe.writers.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                probe
+                    .operation
+                    .artifacts()?
+                    .iter()
+                    .any(|record| record.object.path() == path
+                        && record.write_state == ArtifactWriteState::Writing)
+            );
+            Ok(Box::new(ManifestProbeWriter {
+                inner,
+                gate: probe.gate.clone(),
+            }))
+        }
+        async fn delete(&self, path: &str) -> Result<()> {
+            self.probe().original.delete(path).await
+        }
+        async fn delete_prefix(&self, path: &str) -> Result<()> {
+            self.probe().original.delete_prefix(path).await
+        }
+        async fn delete_stream(
+            &self,
+            mut paths: futures::stream::BoxStream<'static, String>,
+        ) -> Result<()> {
+            while let Some(path) = paths.next().await {
+                self.delete(&path).await?;
+            }
+            Ok(())
+        }
+        fn new_input(&self, path: &str) -> Result<InputFile> {
+            Ok(InputFile::new(Arc::new(self.clone()), path.to_string()))
+        }
+        fn new_output(&self, path: &str) -> Result<OutputFile> {
+            let probe = self.probe();
+            let record = probe
+                .operation
+                .artifacts()?
+                .into_iter()
+                .find(|record| record.object.path() == path)
+                .expect("the real operation must register an output before SDK construction");
+            assert_eq!(record.write_state, ArtifactWriteState::Allocated);
+            probe
+                .allocated_before_output
+                .lock()
+                .unwrap()
+                .push(record.object);
+            Ok(OutputFile::new(Arc::new(self.clone()), path.to_string()))
+        }
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct ManifestProbeFactory {
+        #[serde(skip)]
+        probe: Option<Arc<ManifestStreamProbe>>,
+    }
+
+    #[typetag::serde]
+    impl StorageFactory for ManifestProbeFactory {
+        fn build(&self, _: &StorageConfig) -> Result<Arc<dyn Storage>> {
+            Ok(Arc::new(ManifestProbeStorage {
+                probe: self.probe.clone(),
+            }))
+        }
+    }
+
+    struct ManifestProbeWriter {
+        inner: Box<dyn FileWrite>,
+        gate: Option<Arc<HalfWriteGate>>,
+    }
+
+    #[async_trait]
+    impl FileWrite for ManifestProbeWriter {
+        async fn write(&mut self, bytes: Bytes) -> Result<()> {
+            let Some(gate) = self.gate.take() else {
+                return self.inner.write(bytes).await;
+            };
+            let split = bytes.len() / 2;
+            assert!(split > 0, "a manifest must have an actual first segment");
+            self.inner.write(bytes.slice(..split)).await?;
+            gate.bytes_written.store(split, Ordering::SeqCst);
+            gate.first_half_written.notify_one();
+            gate.resume.notified().await;
+            let result = self.inner.write(bytes.slice(split..)).await;
+            // A cancellation error is published only after the real writer
+            // has observed stop and awaited its abort/permit exit.
+            gate.write_exited.store(true, Ordering::SeqCst);
+            result
+        }
+        async fn close(&mut self) -> Result<()> {
+            self.inner.close().await
+        }
+    }
+
+    struct ManifestProbeArtifacts {
+        attempt: IcebergCommitAttempt,
+        file_io: FileIO,
+    }
+
+    impl ArtifactWriter for ManifestProbeArtifacts {
+        fn file_io(&self) -> &FileIO {
+            &self.file_io
+        }
+        fn attempt_token(&self) -> AttemptToken {
+            self.attempt.attempt_token()
+        }
+        fn check_active(&self) -> Result<()> {
+            self.attempt.check_active()
+        }
+        fn allocate(&self, class: ArtifactClass, kind: ArtifactKind) -> Result<ObjectIdentity> {
+            self.attempt.allocate(class, kind)
+        }
+        fn snapshot_artifacts(&self, references: &[ObjectIdentity]) -> Result<AttemptArtifacts> {
+            self.attempt.snapshot_artifacts(references)
+        }
+    }
+
+    fn probe_artifacts(
+        fixture: &Fixture,
+        gate: Option<Arc<HalfWriteGate>>,
+    ) -> (ManifestProbeArtifacts, Arc<ManifestStreamProbe>) {
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let atomic = gate.as_ref().map(|_| {
+            let root = fixture.directory.path().to_path_buf();
+            let temporary = root.join(".atomic");
+            std::fs::create_dir_all(&temporary).unwrap();
+            let operator = Operator::new(
+                crate::opendal::services::Fs::default()
+                    .root(root.to_str().unwrap())
+                    .atomic_write_dir(temporary.to_str().unwrap()),
+            )
+            .unwrap()
+            .finish();
+            AtomicManifestWriterBoundary {
+                operator,
+                root,
+                temporary,
+            }
+        });
+        let probe = Arc::new(ManifestStreamProbe {
+            operation: fixture.operation.clone(),
+            original: attempt.file_io().clone(),
+            gate,
+            atomic,
+            writers: AtomicUsize::new(0),
+            whole_writes: AtomicUsize::new(0),
+            allocated_before_output: Mutex::new(Vec::new()),
+        });
+        let file_io = FileIOBuilder::new(Arc::new(ManifestProbeFactory {
+            probe: Some(probe.clone()),
+        }))
+        .build();
+        (ManifestProbeArtifacts { attempt, file_io }, probe)
+    }
+
+    fn limits() -> OperationLimits {
+        OperationLimits {
+            io_requests: 1,
+            cleanup: CleanupBudget {
+                time: Duration::from_millis(100),
+                objects: 1,
+            },
+        }
+    }
+
+    async fn write_one_manifest(
+        artifacts: &dyn ArtifactWriter,
+        metadata: &crate::iceberg::spec::TableMetadata,
+    ) -> Result<crate::iceberg::spec::ManifestFile> {
+        let file = crate::commit::overwrite::preparer_tests::data(
+            &format!("{}/data/one.parquet", metadata.location()),
+            1,
+            Struct::empty(),
+        );
+        crate::commit::staging::write_manifest(
+            artifacts,
+            metadata.format_version(),
+            7,
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().as_ref().clone(),
+            ManifestContentType::Data,
+            [crate::commit::staging::ManifestEntryWrite::Added(
+                AddedContent::new_logical_data(file, metadata.default_partition_spec_id())?,
+            )],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn sdk_manifest_streams_register_before_admission_and_obey_cleanup_object_bound() {
+        let fixture = Fixture::new_with_limits(limits());
+        let metadata = fixture.metadata(FormatVersion::V3);
+        let (artifacts, probe) = probe_artifacts(&fixture, None);
+        let unregistered = format!(
+            "file://{}/unregistered.avro",
+            fixture.directory.path().display()
+        );
+        assert!(
+            artifacts
+                .attempt
+                .file_io()
+                .new_output(&unregistered)
+                .unwrap()
+                .writer()
+                .await
+                .is_err()
+        );
+        assert!(!fixture.directory.path().join("unregistered.avro").exists());
+
+        let manifest = write_one_manifest(&artifacts, &metadata).await.unwrap();
+        let bytes = artifacts
+            .file_io()
+            .new_input(&manifest.manifest_path)
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        assert_eq!(Manifest::parse_avro(&bytes).unwrap().entries().len(), 1);
+        let list = crate::commit::staging::write_manifest_list(
+            &artifacts,
+            &metadata,
+            7,
+            None,
+            [manifest.clone()],
+        )
+        .await
+        .unwrap();
+        let bytes = artifacts
+            .file_io()
+            .new_input(list.object.path())
+            .unwrap()
+            .read()
+            .await
+            .unwrap();
+        let parsed = ManifestList::parse_with_version(&bytes, FormatVersion::V3).unwrap();
+        assert_eq!(parsed.entries().len(), 1);
+        assert_eq!(parsed.entries()[0].manifest_path, manifest.manifest_path);
+        assert_eq!(probe.writers.load(Ordering::SeqCst), 2);
+        assert_eq!(probe.whole_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.allocated_before_output.lock().unwrap().len(), 2);
+        let records = fixture.operation.artifacts().unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.write_state == ArtifactWriteState::Written)
+        );
+
+        let report = fixture
+            .operation
+            .cleanup(CleanupScope::EntireOperation)
+            .await;
+        let IcebergCleanupReport::Partial {
+            deleted: 1,
+            remaining,
+        } = report
+        else {
+            panic!("cleanup must obey the one-object bound: {report:?}")
+        };
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].reason, CleanupRemainingReason::BudgetExhausted);
+        assert_eq!(fixture.operation.artifacts().unwrap().len(), 1);
+        assert!(matches!(
+            fixture
+                .operation
+                .cleanup(CleanupScope::EntireOperation)
+                .await,
+            IcebergCleanupReport::Complete { deleted: 1 }
+        ));
+        assert!(fixture.operation.artifacts().unwrap().is_empty());
+        for record in records {
+            assert!(!Path::new(record.object.path().strip_prefix("file://").unwrap()).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_manifest_half_write_cancellation_retains_owner_until_exit_and_cleanup() {
+        let fixture = Fixture::new_with_limits(limits());
+        let metadata = fixture.metadata(FormatVersion::V3);
+        let gate = Arc::new(HalfWriteGate::default());
+        let (artifacts, probe) = probe_artifacts(&fixture, Some(gate.clone()));
+        let task = tokio::spawn(async move { write_one_manifest(&artifacts, &metadata).await });
+        tokio::time::timeout(Duration::from_secs(1), gate.first_half_written.notified())
+            .await
+            .unwrap();
+        let expected_partial_bytes = gate.bytes_written.load(Ordering::SeqCst);
+        assert!(expected_partial_bytes > 0);
+        // Observe bytes in the private atomic temporary file before cancellation,
+        // so this case cannot pass by holding only an in-memory SDK buffer.
+        let temporary = &probe.atomic.as_ref().unwrap().temporary;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let entries = std::fs::read_dir(temporary)
+                    .unwrap()
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .unwrap();
+                if entries.len() == 1
+                    && std::fs::metadata(entries[0].path()).unwrap().len()
+                        == expected_partial_bytes as u64
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        fixture.cancel();
+        assert!(!task.is_finished());
+        let records = fixture.operation.artifacts().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].write_state, ArtifactWriteState::Writing);
+        let report = tokio::time::timeout(
+            Duration::from_secs(1),
+            fixture.operation.cleanup(CleanupScope::EntireOperation),
+        )
+        .await
+        .unwrap();
+        let IcebergCleanupReport::Partial {
+            deleted: 0,
+            remaining,
+        } = report
+        else {
+            panic!("pending stream cannot prove cleanup: {report:?}")
+        };
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].object, records[0].object);
+        assert_eq!(remaining[0].reason, CleanupRemainingReason::BudgetExhausted);
+        assert_eq!(fixture.operation.artifacts().unwrap(), records);
+        assert!(!task.is_finished());
+        assert!(!gate.write_exited.load(Ordering::SeqCst));
+        gate.resume.notify_one();
+        let write_error = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .expect_err("cancelled manifest write must fail");
+        assert!(gate.write_exited.load(Ordering::SeqCst));
+        assert!(
+            std::fs::read_dir(temporary).unwrap().next().is_none(),
+            "real abort must remove the atomic temporary file"
+        );
+        assert_eq!(probe.writers.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.whole_writes.load(Ordering::SeqCst), 0);
+        let final_cleanup = fixture
+            .operation
+            .cleanup(CleanupScope::EntireOperation)
+            .await;
+        assert!(
+            matches!(final_cleanup, IcebergCleanupReport::Complete { deleted: 1 }),
+            "final cleanup: {final_cleanup:?}; ledger: {:?}; write error: {write_error:?}",
+            fixture.operation.artifacts().unwrap()
+        );
+        assert!(fixture.operation.artifacts().unwrap().is_empty());
+        assert!(!Path::new(records[0].object.path().strip_prefix("file://").unwrap()).exists());
+    }
+}

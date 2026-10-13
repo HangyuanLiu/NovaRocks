@@ -429,7 +429,26 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     }
 
     async fn table_exists(&self, table: CatalogTableName) -> Result<bool, ConnectorError> {
-        self.delegate.table_exists(&table).await
+        match self.access_delegation {
+            RestAccessDelegationMode::Static => self.delegate.table_exists(&table).await,
+            RestAccessDelegationMode::Vended => {
+                let ident = super::delegate::table_ident(&table)?;
+                // An existence check needs metadata presence, not a storage
+                // capability. Do not materialize the deferred response before
+                // a query-attempt credential consumer has admitted its lease.
+                match self
+                    .client
+                    .load_table_deferred_with_access_delegation(&ident)
+                    .await
+                {
+                    Ok(_) => Ok(true),
+                    Err(error) if error.kind() == crate::iceberg::ErrorKind::TableNotFound => {
+                        Ok(false)
+                    }
+                    Err(error) => Err(super::error::map_read_error(&error)),
+                }
+            }
+        }
     }
 
     async fn load_table(
@@ -837,6 +856,11 @@ mod tests {
     //! ledger; Drop joins the server before releasing it. The catalog maintainer
     //! runs these with every connector test invocation; IRU-13a replaces the
     //! temporary error-kind proof tests with its typed evidence tests.
+    //! Existence-probe cases cover real CREATE/DROP prechecks against a catalog
+    //! without declared HEAD endpoints or a StorageFactory. Expected NoOp facts
+    //! come from create/drop policy; any FileIO materialization would fail.
+    //! They share the listener isolation/exit owner and connector test cadence
+    //! above; IRU-13a replaces the temporary delegated-existence implementation.
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -917,7 +941,7 @@ mod tests {
                                     .lock()
                                     .unwrap_or_else(|error| error.into_inner())
                                     .push(target.clone());
-                                response_body(request.lines().next().unwrap_or_default())
+                                response_body(&request)
                             };
                             let response = format!(
                                 "HTTP/1.1 {status} Scripted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1671,5 +1695,202 @@ mod tests {
             "{outcome:?}"
         );
         assert_eq!(server.list_requests().len(), 2);
+    }
+
+    fn existence_response() -> String {
+        use crate::iceberg::spec::{
+            FormatVersion, NestedField, PrimitiveType, Schema, SortOrder, TableMetadataBuilder,
+            Type, UnboundPartitionSpec,
+        };
+        let metadata = TableMetadataBuilder::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .unwrap(),
+            UnboundPartitionSpec::default(),
+            SortOrder::unsorted_order(),
+            "s3://warehouse/db/present".into(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        serde_json::json!({
+            "metadata-location": "s3://warehouse/db/present/metadata.json",
+            "metadata": metadata,
+        })
+        .to_string()
+    }
+
+    fn existence_provider(
+        server: &PagedTablesServer,
+    ) -> (tokio::runtime::Runtime, crate::metadata::IcebergMetadata) {
+        use crate::access_binding::IcebergReadBinding;
+        use crate::catalog_control::IcebergCatalogControlState;
+        use crate::resources::IcebergMetadataResources;
+        use novarocks_spi::connector::{
+            ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
+            ProviderBindingEpoch,
+        };
+        let executor = tokio::runtime::Runtime::new().unwrap();
+        // This real REST owner deliberately has no StorageFactory. A SDK
+        // materialization during an existence probe would therefore fail.
+        let owner = Arc::new(executor.block_on(server.catalog()));
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[
+                ("iceberg.catalog.type".into(), "rest".into()),
+                ("uri".into(), format!("http://{}", server.address)),
+            ],
+        )
+        .unwrap();
+        let binding = IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(
+                executor.handle().clone(),
+            )),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(
+                executor.handle().clone(),
+            )),
+        );
+        let runtime = crate::metadata_context::IcebergMetadataContext::with_catalog_for_test(
+            IcebergCatalogControlState::new(configuration),
+            IcebergMetadataResources::new(binding, executor.handle().clone()),
+            owner,
+        );
+        let provider = crate::metadata::IcebergMetadata::new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").unwrap(),
+                instance_id: ConnectorInstanceId::parse("ice").unwrap(),
+            },
+            ProviderBindingEpoch::from_bytes([9; 16]),
+            Arc::new(runtime),
+        );
+        (executor, provider)
+    }
+
+    #[test]
+    fn vended_create_and_drop_prechecks_without_head_declaration_do_not_materialize_file_io() {
+        use novarocks_spi::connector::{
+            ConnectorCatalogMutation, ConnectorCatalogMutationOperation,
+            ConnectorCatalogMutationRequest, ConnectorColumnDefinition, ConnectorDataType,
+            ConnectorDropTableDataDisposition, ConnectorMutationOperationId,
+            ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorStopOwner,
+            ConnectorTableIdentity, CreatePolicy, DropPolicy, ExternalMutationEffect,
+            ExternalMutationOutcome,
+        };
+        let response = existence_response();
+        let server = PagedTablesServer::start_http_response(move |request| {
+            assert!(
+                request.starts_with("GET "),
+                "unexpected mutation: {request}"
+            );
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("x-iceberg-access-delegation: vended-credentials")
+            );
+            if request.starts_with("GET /v1/namespaces/db/tables/present ") {
+                (200, response.clone())
+            } else {
+                assert!(request.starts_with("GET /v1/namespaces/db/tables/missing "));
+                (404, commit_response(404))
+            }
+        });
+        let (_executor, provider) = existence_provider(&server);
+        let table = |name: &str| ConnectorTableIdentity {
+            instance_id: provider.descriptor().instance_id.clone(),
+            namespace: Arc::from("db"),
+            table: Arc::from(name),
+        };
+        let operations = [
+            ConnectorCatalogMutationOperation::CreateTable {
+                table: table("present"),
+                columns: vec![ConnectorColumnDefinition {
+                    name: Arc::from("id"),
+                    data_type: ConnectorDataType::BigInt,
+                    nullable: false,
+                    aggregation: None,
+                    default: None,
+                }],
+                key: None,
+                partitioning: vec![],
+                properties: vec![],
+                policy: CreatePolicy::NoOpIfExists,
+            },
+            ConnectorCatalogMutationOperation::DropTable {
+                table: table("missing"),
+                policy: DropPolicy::NoOpIfMissing,
+                data_disposition: ConnectorDropTableDataDisposition::Retain,
+            },
+        ];
+        for operation in operations {
+            let stop = ConnectorStopOwner::new();
+            let context = ConnectorRequestContext::try_new(
+                std::time::Instant::now() + Duration::from_secs(30),
+                stop.view(),
+                64 * 1024,
+                256 * 1024,
+            )
+            .unwrap();
+            let outcome = ConnectorCatalogMutation::execute(
+                &provider,
+                ConnectorCatalogMutationRequest {
+                    operation_id: ConnectorMutationOperationId::new(),
+                    target: ConnectorProviderBindingKey {
+                        instance_id: provider.descriptor().instance_id.clone(),
+                        incarnation: provider.incarnation(),
+                    },
+                    operation,
+                    context,
+                },
+            )
+            .unwrap();
+            assert!(
+                matches!(
+                    outcome,
+                    ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::NoOp,
+                        ..
+                    }
+                ),
+                "{outcome:?}"
+            );
+        }
+        // DROP first observes existence while freezing evidence, then again
+        // at its own admission. Neither read creates a physical table.
+        assert_eq!(
+            server.list_requests(),
+            [
+                "/v1/namespaces/db/tables/present",
+                "/v1/namespaces/db/tables/missing",
+                "/v1/namespaces/db/tables/missing",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn vended_existence_probe_keeps_other_rest_errors_unavailable() {
+        for status in [400, 500] {
+            let server = PagedTablesServer::start_http_response(move |request| {
+                assert!(request.starts_with("GET "));
+                (status, commit_response(status))
+            });
+            let error = server
+                .catalog()
+                .await
+                .table_exists(crate::catalog::CatalogTableName::new("db", "t"))
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), ConnectorErrorKind::Unavailable);
+            assert_eq!(server.list_requests(), ["/v1/namespaces/db/tables/t"]);
+        }
     }
 }

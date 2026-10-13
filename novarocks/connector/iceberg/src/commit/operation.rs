@@ -155,6 +155,11 @@ impl IcebergCommitOperation {
     pub(crate) fn runtime(&self) -> &IcebergCatalogRuntime {
         &self.inner.runtime
     }
+
+    #[cfg(test)]
+    pub(crate) fn write_admission_for_test(&self) -> Arc<dyn IcebergWriteAdmission> {
+        self.inner.clone()
+    }
     pub(crate) fn check_active(&self) -> Result<()> {
         self.inner.check_active()
     }

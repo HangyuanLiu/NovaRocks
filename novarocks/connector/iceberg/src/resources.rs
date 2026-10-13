@@ -191,4 +191,63 @@ mod tests {
         let runtime = IcebergCatalogRuntime::new(tokio::runtime::Handle::current());
         assert_eq!(runtime.block_on(async { 11_u8 }), Ok(11));
     }
+
+    #[test]
+    fn injected_sdk_runtime_and_table_build_without_an_ambient_context() {
+        // The explicit Tokio owner outlives both the SDK handle and the table.
+        // This is the lowest-level protection for role-local Runtime capture;
+        // the expected result comes from the injected handle, not caller TLS.
+        let owner = tokio::runtime::Runtime::new().expect("runtime owner");
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let runtime = IcebergCatalogRuntime::new(owner.handle().clone());
+        std::thread::scope(|threads| {
+            threads
+                .spawn(|| {
+                    use crate::iceberg::spec::{
+                        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema,
+                        SortOrder, TableMetadataBuilder, Type,
+                    };
+                    assert!(tokio::runtime::Handle::try_current().is_err());
+                    let sdk = runtime.iceberg_runtime().clone();
+                    let metadata = TableMetadataBuilder::new(
+                        Schema::builder()
+                            .with_fields(vec![Arc::new(NestedField::required(
+                                1,
+                                "id",
+                                Type::Primitive(PrimitiveType::Long),
+                            ))])
+                            .build()
+                            .expect("schema"),
+                        PartitionSpec::unpartition_spec(),
+                        SortOrder::unsorted_order(),
+                        "memory://warehouse/db/t".to_string(),
+                        FormatVersion::V2,
+                        std::collections::HashMap::new(),
+                    )
+                    .expect("metadata builder")
+                    .build()
+                    .expect("metadata")
+                    .metadata;
+                    let table = crate::iceberg::table::Table::builder()
+                        .runtime(sdk.clone())
+                        .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
+                        .metadata(metadata)
+                        .file_io(crate::iceberg::io::FileIO::new_with_memory())
+                        .build()
+                        .expect("explicit runtime table");
+                    assert_eq!(table.identifier().name(), "t");
+                    let task = sdk.io().spawn(async { 11_u8 });
+                    assert_eq!(
+                        runtime
+                            .block_on(async move { task.await })
+                            .unwrap()
+                            .unwrap(),
+                        11
+                    );
+                    assert!(tokio::runtime::Handle::try_current().is_err());
+                })
+                .join()
+                .expect("runtime-independent thread");
+        });
+    }
 }
