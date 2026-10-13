@@ -1786,6 +1786,13 @@ mod tests {
         .expect("metadata")
         .metadata;
         let table = crate::iceberg::table::Table::builder()
+            .runtime(
+                runtime
+                    .resources()
+                    .catalog_runtime()
+                    .iceberg_runtime()
+                    .clone(),
+            )
             .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).expect("identifier"))
             .file_io(crate::fs_io::build_file_io_for_location(
                 location,
@@ -1825,6 +1832,7 @@ mod tests {
     fn publication_table_with_properties(
         prepared: &PreparedOperation,
         properties: HashMap<String, String>,
+        runtime: crate::iceberg::Runtime,
     ) -> crate::iceberg::table::Table {
         let metadata = prepared
             .staged
@@ -1838,6 +1846,7 @@ mod tests {
             .unwrap()
             .metadata;
         crate::iceberg::table::Table::builder()
+            .runtime(runtime)
             .identifier(prepared.staged.table.identifier().clone())
             .file_io(prepared.staged.table.file_io().clone())
             .metadata(metadata)
@@ -1873,7 +1882,15 @@ mod tests {
             CTAS_OPERATION_MARKER.to_string(),
             publication_marker(prepared.publication_id),
         );
-        let exact = publication_table_with_properties(&prepared, published_properties.clone());
+        let exact = publication_table_with_properties(
+            &prepared,
+            published_properties.clone(),
+            runtime
+                .resources()
+                .catalog_runtime()
+                .iceberg_runtime()
+                .clone(),
+        );
         assert!(publication_matches(
             &exact,
             prepared.operation_id(),
@@ -1883,7 +1900,15 @@ mod tests {
 
         published_properties
             .remove(crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY);
-        let partial = publication_table_with_properties(&prepared, published_properties.clone());
+        let partial = publication_table_with_properties(
+            &prepared,
+            published_properties.clone(),
+            runtime
+                .resources()
+                .catalog_runtime()
+                .iceberg_runtime()
+                .clone(),
+        );
         assert!(!publication_matches(
             &partial,
             prepared.operation_id(),
@@ -1895,7 +1920,15 @@ mod tests {
             crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY.to_string(),
             "other".to_string(),
         );
-        let mismatched = publication_table_with_properties(&prepared, published_properties);
+        let mismatched = publication_table_with_properties(
+            &prepared,
+            published_properties,
+            runtime
+                .resources()
+                .catalog_runtime()
+                .iceberg_runtime()
+                .clone(),
+        );
         assert!(!publication_matches(
             &mismatched,
             prepared.operation_id(),

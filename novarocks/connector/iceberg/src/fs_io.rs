@@ -623,6 +623,16 @@ impl Storage for IcebergFsStorage {
             })
     }
 
+    async fn delete_stream(
+        &self,
+        mut paths: futures::stream::BoxStream<'static, String>,
+    ) -> Result<()> {
+        while let Some(path) = paths.next().await {
+            self.delete(&path).await?;
+        }
+        Ok(())
+    }
+
     fn new_input(&self, path: &str) -> Result<InputFile> {
         Ok(InputFile::new(self.storage_arc(), path.to_string()))
     }

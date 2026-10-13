@@ -465,6 +465,7 @@ mod tests {
         let client = Arc::new(crate::hadoop_catalog::HadoopFileSystemCatalog::new(
             attempt.file_io().clone(),
             format!("file://{}", fixture.directory.path().display()),
+            crate::iceberg::Runtime::try_current().expect("test runtime"),
         ));
         let owner = super::super::hadoop::NovaRocksHadoopCatalog::new(client.clone());
         let default = CatalogDelegate::new(client.clone());

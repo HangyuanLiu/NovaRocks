@@ -954,6 +954,7 @@ mod tests {
                     format!("http://{}", self.address),
                 )]),
                 RestAccessDelegationMode::Vended,
+                crate::iceberg::Runtime::try_current().expect("test runtime"),
             )
             .await
             .expect("REST client");

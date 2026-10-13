@@ -95,8 +95,12 @@ fn stock_metadata() -> TableMetadata {
         .metadata
 }
 
-fn table(metadata: Arc<TableMetadata>) -> crate::iceberg::table::Table {
+fn table(
+    metadata: Arc<TableMetadata>,
+    runtime: crate::iceberg::Runtime,
+) -> crate::iceberg::table::Table {
     crate::iceberg::table::Table::builder()
+        .runtime(runtime)
         .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).expect("identifier"))
         .metadata(metadata)
         .file_io(crate::iceberg::io::FileIO::new_with_memory())
@@ -112,7 +116,11 @@ fn cow_statistics_retains_the_original_generation_after_table_and_admission_exit
     let original_address = Arc::as_ptr(&original);
     let uuid = original.uuid();
     let snapshot = original.current_snapshot_id();
-    let table = table(Arc::clone(&original));
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let table = table(
+        Arc::clone(&original),
+        crate::iceberg::Runtime::new(&runtime),
+    );
     let admission = IcebergAdmissionStatisticsMetadata::from_loaded_table(&table, true);
     let statistics = admission
         .for_statistics(None, true)
@@ -134,7 +142,11 @@ fn cow_statistics_retains_the_original_generation_after_table_and_admission_exit
 #[test]
 fn ordinary_metadata_keeps_its_owned_copy_and_cow_never_adopts_a_prospective_generation() {
     let original = Arc::new(stock_metadata());
-    let table = table(Arc::clone(&original));
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let table = table(
+        Arc::clone(&original),
+        crate::iceberg::Runtime::new(&runtime),
+    );
     let ordinary = IcebergAdmissionStatisticsMetadata::from_loaded_table(&table, false);
     assert!(!std::ptr::eq(ordinary.as_ref(), original.as_ref()));
     assert_eq!(
@@ -340,7 +352,11 @@ fn signed_and_frozen(
 #[test]
 fn original_stock_signer_and_append_freeze_are_identical_for_shared_and_previous_owned_metadata() {
     let original = Arc::new(stock_metadata());
-    let table = table(Arc::clone(&original));
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let table = table(
+        Arc::clone(&original),
+        crate::iceberg::Runtime::new(&runtime),
+    );
     let shared = IcebergAdmissionStatisticsMetadata::from_loaded_table(&table, true);
     let statistics = shared
         .for_statistics(None, true)
@@ -404,7 +420,11 @@ fn original_stock_signer_and_append_freeze_are_identical_for_shared_and_previous
 #[test]
 fn source_metadata_retains_the_exact_shared_generation() {
     let original = Arc::new(stock_metadata());
-    let table = table(Arc::clone(&original));
+    let runtime = tokio::runtime::Runtime::new().expect("test runtime");
+    let table = table(
+        Arc::clone(&original),
+        crate::iceberg::Runtime::new(&runtime),
+    );
     let source =
         IcebergAdmissionStatisticsMetadata::from_loaded_table(&table, true).into_source_metadata();
     assert!(Arc::ptr_eq(&original, &source));

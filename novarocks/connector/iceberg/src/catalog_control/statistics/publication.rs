@@ -917,6 +917,15 @@ mod tests {
         async fn delete_prefix(&self, path: &str) -> crate::iceberg::Result<()> {
             self.inner()?.delete_prefix(path).await
         }
+        async fn delete_stream(
+            &self,
+            mut paths: futures::stream::BoxStream<'static, String>,
+        ) -> crate::iceberg::Result<()> {
+            while let Some(path) = futures::StreamExt::next(&mut paths).await {
+                self.delete(&path).await?;
+            }
+            Ok(())
+        }
         fn new_input(&self, path: &str) -> crate::iceberg::Result<crate::iceberg::io::InputFile> {
             Ok(crate::iceberg::io::InputFile::new(
                 Arc::new(self.clone()),

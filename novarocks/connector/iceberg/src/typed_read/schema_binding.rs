@@ -906,7 +906,7 @@ fn expect_primitive(
 ) -> Result<(), ConnectorError> {
     match declared {
         Type::Primitive(primitive) if *primitive == expected => Ok(()),
-        Type::Primitive(_) | Type::Struct(_) | Type::List(_) | Type::Map(_) => {
+        Type::Primitive(_) | Type::Variant(_) | Type::Struct(_) | Type::List(_) | Type::Map(_) => {
             Err(invalid(format!(
                 "iceberg metadata column {} must be declared as {expected}",
                 metadata.column_name()

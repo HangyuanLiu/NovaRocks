@@ -18,10 +18,13 @@
 //! Provider-owned manifest facts used by statistics and mutation planning.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use crate::iceberg::io::FileIO;
 use crate::iceberg::spec::{
-    DataContentType, DataFileFormat, Literal as IcebergLiteral, ManifestContentType,
-    ManifestStatus, PrimitiveLiteral, TableMetadata, Transform,
+    DataContentType, DataFileFormat, Literal as IcebergLiteral, Manifest, ManifestContentType,
+    ManifestFile, ManifestList, ManifestStatus, PrimitiveLiteral, Snapshot, TableMetadata,
+    Transform,
 };
 use crate::iceberg::table::Table;
 #[cfg(test)]
@@ -30,6 +33,49 @@ use crate::scan_model::{
     IcebergColumnStats, IcebergDataFileInfo, IcebergDeleteFileContent, IcebergDeleteFileFormat,
     IcebergDeleteFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue,
 };
+
+/// Read a pinned manifest list directly through its admitted FileIO.
+/// This preserves the existing unencrypted metadata read boundary.
+pub async fn load_manifest_list(
+    snapshot: &Snapshot,
+    file_io: &FileIO,
+    metadata: &TableMetadata,
+) -> crate::iceberg::Result<ManifestList> {
+    let bytes = file_io.new_input(snapshot.manifest_list())?.read().await?;
+    ManifestList::parse_with_version(&bytes, metadata.format_version())
+}
+
+/// Read physical entries and inherit their snapshot and sequence facts from
+/// the manifest-list descriptor. Row-ID assignment remains with the provider's
+/// existing row-lineage owner; this read never assigns first_row_id or decrypts.
+pub async fn load_manifest(
+    descriptor: &ManifestFile,
+    file_io: &FileIO,
+) -> crate::iceberg::Result<Manifest> {
+    // Iceberg's initial sequence is zero; the SDK keeps this constant private.
+    const INITIAL_SEQUENCE_NUMBER: i64 = 0;
+    let bytes = file_io.new_input(&descriptor.manifest_path)?.read().await?;
+    let (entries, metadata) = Manifest::parse_avro(&bytes)?.into_parts();
+    let entries = entries
+        .into_iter()
+        .map(|entry| {
+            let mut entry = Arc::unwrap_or_clone(entry);
+            if entry.snapshot_id.is_none() {
+                entry.snapshot_id = Some(descriptor.added_snapshot_id);
+            }
+            let inherits_sequence = entry.status == ManifestStatus::Added
+                || descriptor.sequence_number == INITIAL_SEQUENCE_NUMBER;
+            if entry.sequence_number.is_none() && inherits_sequence {
+                entry.sequence_number = Some(descriptor.sequence_number);
+            }
+            if entry.file_sequence_number.is_none() && inherits_sequence {
+                entry.file_sequence_number = Some(descriptor.sequence_number);
+            }
+            entry
+        })
+        .collect();
+    Ok(Manifest::new(metadata, entries))
+}
 
 /// Data-file facts extracted from one pinned Iceberg manifest walk.
 #[derive(Clone)]
@@ -188,8 +234,7 @@ pub(crate) async fn current_equality_delete_column_names_with_control(
         .map(|field| (field.id, field.name.clone()))
         .collect();
     let file_io = table.file_io();
-    let manifest_list = snapshot
-        .load_manifest_list(file_io, metadata)
+    let manifest_list = crate::manifest::load_manifest_list(&snapshot, file_io, metadata)
         .await
         .map_err(|error| format!("load manifest list: {error}"))?;
     check_active()?;
@@ -199,8 +244,7 @@ pub(crate) async fn current_equality_delete_column_names_with_control(
         if manifest_file.content != ManifestContentType::Deletes {
             continue;
         }
-        let manifest = manifest_file
-            .load_manifest(file_io)
+        let manifest = crate::manifest::load_manifest(&manifest_file, file_io)
             .await
             .map_err(|error| format!("load manifest: {error}"))?;
         check_active()?;

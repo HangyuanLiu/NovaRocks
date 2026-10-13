@@ -27,11 +27,25 @@ use crate::access_binding::IcebergReadBinding;
 #[derive(Clone)]
 pub struct IcebergCatalogRuntime {
     handle: tokio::runtime::Handle,
+    iceberg_runtime: crate::iceberg::Runtime,
 }
 
 impl IcebergCatalogRuntime {
     pub fn new(handle: tokio::runtime::Handle) -> Self {
-        Self { handle }
+        let iceberg_runtime = {
+            let _guard = handle.enter();
+            crate::iceberg::Runtime::try_current()
+                .expect("explicit Iceberg Tokio runtime handle must establish a runtime context")
+        };
+        Self {
+            handle,
+            iceberg_runtime,
+        }
+    }
+
+    /// The SDK runtime captured once from this role-local runtime owner.
+    pub fn iceberg_runtime(&self) -> &crate::iceberg::Runtime {
+        &self.iceberg_runtime
     }
 
     /// Runs one provider future on the explicitly injected runtime without

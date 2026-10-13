@@ -124,7 +124,9 @@ impl StatsLoader {
         let input_file = file_io
             .new_input(puffin_path)
             .map_err(|error| format!("open Puffin {puffin_path}: {error}"))?;
-        let reader = PuffinReader::new(input_file);
+        let reader = PuffinReader::new(input_file)
+            .await
+            .map_err(|error| format!("open Puffin reader {puffin_path}: {error}"))?;
         let metadata = reader
             .file_metadata()
             .await

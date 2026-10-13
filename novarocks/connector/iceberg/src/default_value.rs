@@ -199,7 +199,7 @@ fn iceberg_literal_to_nested_column_default(
         (IcebergLiteral::Primitive(PrimitiveLiteral::AboveMax | PrimitiveLiteral::BelowMin), _) => {
             Err("Iceberg bound sentinel cannot be used as a column default".to_string())
         }
-        (_, Type::Primitive(PrimitiveType::Variant)) => {
+        (_, Type::Variant(crate::iceberg::spec::VariantType)) => {
             Err("Iceberg Variant column defaults are not supported".to_string())
         }
         (literal, iceberg_type) => Err(format!(
@@ -451,7 +451,7 @@ fn column_default_to_nested_iceberg_literal(
             }
             return Ok(Some(IcebergLiteral::Map(map)));
         }
-        (_, Type::Primitive(PrimitiveType::Variant)) => {
+        (_, Type::Variant(crate::iceberg::spec::VariantType)) => {
             return Err("Iceberg Variant column defaults are not supported".to_string());
         }
         (value, iceberg_type) => {
@@ -1101,7 +1101,7 @@ mod tests {
         assert!(
             iceberg_literal_to_column_default(
                 &IcebergLiteral::Primitive(PrimitiveLiteral::Binary(Vec::new())),
-                &Type::Primitive(PrimitiveType::Variant),
+                &Type::Variant(crate::iceberg::spec::VariantType),
             )
             .unwrap_err()
             .contains("Variant")

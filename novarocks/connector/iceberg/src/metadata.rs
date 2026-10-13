@@ -1568,7 +1568,7 @@ pub(crate) fn cow_projected_schema_upper(
                         + "entries".len()) as u64,
                 )?;
             }
-            Type::Primitive(_) => {}
+            Type::Primitive(_) | Type::Variant(_) => {}
         }
         Ok(n)
     }
@@ -1979,7 +1979,7 @@ fn split_name_mapping(table: &IcebergTablePayload) -> Result<Option<String>, Con
         .map_err(|error| corrupt(format!("decode Iceberg name mapping metadata: {error}")))?;
     metadata
         .properties()
-        .get(crate::iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
+        .get(crate::iceberg::spec::TableProperties::PROPERTY_DEFAULT_NAME_MAPPING)
         .map(|mapping| canonical_split_name_mapping(mapping))
         .transpose()
 }

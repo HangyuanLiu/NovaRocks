@@ -194,6 +194,10 @@ fn legacy_regexp_position_baseline_empty_pattern_end_position_and_nonpositive() 
     }
 }
 #[test]
+#[expect(
+    clippy::invalid_regex,
+    reason = "The test verifies malformed pattern errors and evaluation order."
+)]
 fn legacy_regexp_position_baseline_position_masks_regex_errors_before_compile() {
     for wide in [false, true] {
         assert_rows(

@@ -84,7 +84,7 @@ pub fn ensure_no_variant_in_partition_spec(table: &Table) -> Result<(), String> 
 pub fn ensure_no_variant_in_partition_spec_from_metadata(
     metadata: &TableMetadata,
 ) -> Result<(), String> {
-    use crate::iceberg::spec::{PrimitiveType, Type};
+    use crate::iceberg::spec::Type;
     let schema = metadata.current_schema();
     for f in metadata.default_partition_spec().fields() {
         let source = schema.field_by_id(f.source_id).ok_or_else(|| {
@@ -94,10 +94,7 @@ pub fn ensure_no_variant_in_partition_spec_from_metadata(
                 sid = f.source_id
             )
         })?;
-        if matches!(
-            source.field_type.as_ref(),
-            Type::Primitive(PrimitiveType::Variant)
-        ) {
+        if matches!(source.field_type.as_ref(), Type::Variant(_)) {
             return Err(format!(
                 "iceberg table column '{name}' is variant; variant columns cannot appear in the partition spec. \
                  Drop the partition transform on '{name}' before writing.",
@@ -117,7 +114,7 @@ pub fn ensure_no_variant_in_sort_order(table: &Table) -> Result<(), String> {
 pub fn ensure_no_variant_in_sort_order_from_metadata(
     metadata: &TableMetadata,
 ) -> Result<(), String> {
-    use crate::iceberg::spec::{PrimitiveType, Type};
+    use crate::iceberg::spec::Type;
     let schema = metadata.current_schema();
     for f in metadata.default_sort_order().fields.iter() {
         let source = schema.field_by_id(f.source_id).ok_or_else(|| {
@@ -126,10 +123,7 @@ pub fn ensure_no_variant_in_sort_order_from_metadata(
                 f.source_id
             )
         })?;
-        if matches!(
-            source.field_type.as_ref(),
-            Type::Primitive(PrimitiveType::Variant)
-        ) {
+        if matches!(source.field_type.as_ref(), Type::Variant(_)) {
             return Err(format!(
                 "iceberg table column '{name}' is variant; variant columns cannot appear in the sort order. \
                  Drop the sort key on '{name}' before writing.",
@@ -423,13 +417,6 @@ fn arrow_iceberg_types_compatible(
     arrow_ty: &arrow::datatypes::DataType,
     iceberg_ty: &crate::iceberg::spec::Type,
 ) -> bool {
-    use crate::iceberg::spec::{PrimitiveType, Type};
-    if matches!(iceberg_ty, Type::Primitive(PrimitiveType::Variant)) {
-        // NovaRocks execution layer carries variants as LargeBinary
-        // (see src/lower/compat/type_lowering.rs:89,170). The full struct shape
-        // is materialized later by transform_variant_columns_for_write.
-        return matches!(arrow_ty, arrow::datatypes::DataType::LargeBinary);
-    }
     match crate::iceberg::arrow::type_to_arrow_type(iceberg_ty) {
         Ok(expected) => &expected == arrow_ty,
         Err(_) => false,
@@ -438,18 +425,24 @@ fn arrow_iceberg_types_compatible(
 
 #[cfg(test)]
 mod tests {
+    fn test_runtime() -> &'static tokio::runtime::Runtime {
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("test runtime"))
+    }
+
+    fn test_iceberg_runtime() -> crate::iceberg::Runtime {
+        let _guard = test_runtime().enter();
+        crate::iceberg::Runtime::try_current().expect("test Iceberg runtime")
+    }
+
     use super::*;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
 
     use crate::commit::NOVAROCKS_UPDATE_MODE_MOR;
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
 
     fn local_test_binding() -> crate::access_binding::IcebergReadBinding {
-        static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-        let runtime = RUNTIME
-            .get_or_init(|| tokio::runtime::Runtime::new().expect("test runtime"))
-            .handle()
-            .clone();
+        let runtime = test_runtime().handle().clone();
         crate::access_binding::IcebergReadBinding::new(
             None,
             FsAccessResolver::new(),
@@ -623,6 +616,7 @@ mod tests {
                 local_test_binding(),
             ))
             .metadata(metadata)
+            .runtime(test_iceberg_runtime())
             .build()
             .expect("table")
     }
@@ -633,7 +627,8 @@ mod tests {
         let table = make_table_with(
             vec![
                 NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+                NestedField::optional(2, "v", Type::Variant(crate::iceberg::spec::VariantType))
+                    .into(),
             ],
             vec![PartitionField {
                 source_id: 2,
@@ -654,7 +649,8 @@ mod tests {
         let table = make_table_with(
             vec![
                 NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+                NestedField::optional(2, "v", Type::Variant(crate::iceberg::spec::VariantType))
+                    .into(),
             ],
             vec![],
             vec![],
@@ -670,7 +666,8 @@ mod tests {
         let table = make_table_with(
             vec![
                 NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+                NestedField::optional(2, "v", Type::Variant(crate::iceberg::spec::VariantType))
+                    .into(),
             ],
             vec![],
             vec![SortField {
@@ -877,7 +874,8 @@ mod tests {
         let table = make_table_with(
             vec![
                 NestedField::optional(1, "id", Type::Primitive(PrimitiveType::Int)).into(),
-                NestedField::optional(2, "v", Type::Primitive(PrimitiveType::Variant)).into(),
+                NestedField::optional(2, "v", Type::Variant(crate::iceberg::spec::VariantType))
+                    .into(),
             ],
             vec![PartitionField {
                 source_id: 2,
@@ -895,24 +893,5 @@ mod tests {
         )
         .expect_err("variant partition column must be rejected before a strategy is named");
         assert!(err.contains("variant"), "{err}");
-    }
-
-    #[test]
-    fn variant_iceberg_type_matches_largebinary_arrow_type() {
-        use crate::iceberg::spec::{PrimitiveType, Type};
-        use arrow::datatypes::DataType;
-        let iceberg_ty = Type::Primitive(PrimitiveType::Variant);
-        assert!(arrow_iceberg_types_compatible(
-            &DataType::LargeBinary,
-            &iceberg_ty
-        ));
-        assert!(!arrow_iceberg_types_compatible(
-            &DataType::Binary,
-            &iceberg_ty
-        ));
-        assert!(!arrow_iceberg_types_compatible(
-            &DataType::Utf8,
-            &iceberg_ty
-        ));
     }
 }

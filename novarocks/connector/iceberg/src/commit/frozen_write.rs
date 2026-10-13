@@ -458,7 +458,6 @@ fn iceberg_type_from_arrow_type(
         DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => Some(PrimitiveType::TimestamptzNs),
         DataType::Utf8 | DataType::LargeUtf8 => Some(PrimitiveType::String),
         DataType::Binary => Some(PrimitiveType::Binary),
-        DataType::LargeBinary => Some(PrimitiveType::Variant),
         DataType::FixedSizeBinary(size) => Some(PrimitiveType::Fixed(
             u64::try_from(*size).map_err(|_| {
                 FrozenWriteSchemaError::Source(format!(

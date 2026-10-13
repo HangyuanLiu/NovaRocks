@@ -17,9 +17,9 @@
 
 //! Minimal v2-compatible position-delete Parquet writer.
 //!
-//! iceberg-rust 0.9 ships `DataFileWriter` and `EqualityDeleteFileWriter` but
+//! iceberg-rust 0.11 ships `DataFileWriter` and `EqualityDeleteFileWriter` but
 //! does not yet expose a public `PositionDeleteFileWriter` (see the comment
-//! at [`vendor/iceberg-0.9.0/src/writer/base_writer/mod.rs:18`]). This module
+//! at [`vendor/iceberg-0.11.0/src/writer/base_writer/mod.rs:18`]). This module
 //! fills the gap with the minimum needed by `RowDeltaCommit` (Plan Task 14B):
 //! given a list of `(data_file_path, pos)` tuples already grouped by data
 //! file, write one Parquet file per group with the v2 position-delete schema

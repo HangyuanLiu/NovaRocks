@@ -18,7 +18,7 @@
 //! `crate::iceberg::spec::DataFile` re-construction shared by the
 //! commit-action implementations.
 //!
-//! `DataFile` fields are `pub(crate)` in iceberg-rust 0.9, so every
+//! `DataFile` fields are `pub(crate)` in iceberg-rust 0.11, so every
 //! reconstruction goes through `DataFileBuilder`.
 
 use crate::iceberg::spec::{DataFile, DataFileBuilder};

@@ -104,7 +104,7 @@ pub(crate) fn iceberg_type(
         ConnectorDataType::DateTime => primitive(PrimitiveType::Timestamp),
         ConnectorDataType::DateTimeNs => primitive(PrimitiveType::TimestampNs),
         ConnectorDataType::Time => primitive(PrimitiveType::Time),
-        ConnectorDataType::Variant => primitive(PrimitiveType::Variant),
+        ConnectorDataType::Variant => Ok(Type::Variant(crate::iceberg::spec::VariantType)),
         ConnectorDataType::Array(element) => {
             let element_id = allocate_id(next_id)?;
             let element_type = iceberg_type(element, next_id)?;

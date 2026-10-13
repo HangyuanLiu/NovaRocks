@@ -368,7 +368,6 @@ pub(crate) enum StagedCreateStart {
 pub(crate) enum StagedCommitResult {
     Committed(crate::iceberg::table::Table),
     Conflict(String),
-    KnownUncommitted(String),
     CommitUnknown(String),
     Unsupported(CatalogUnsupported),
 }

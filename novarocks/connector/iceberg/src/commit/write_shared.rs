@@ -142,18 +142,20 @@ mod tests {
 
     fn metadata(properties: HashMap<String, String>) -> TableMetadata {
         let fields = [
-            (1, "uuid", PrimitiveType::Uuid),
-            (2, "variant", PrimitiveType::Variant),
-            (3, "hll", PrimitiveType::Binary),
-            (4, "bitmap", PrimitiveType::Binary),
-            (5, "largeint", PrimitiveType::Fixed(16)),
-            (6, "plain_fixed", PrimitiveType::Fixed(16)),
-            (7, "plain_binary", PrimitiveType::Binary),
+            (1, "uuid", Type::Primitive(PrimitiveType::Uuid)),
+            (
+                2,
+                "variant",
+                Type::Variant(crate::iceberg::spec::VariantType),
+            ),
+            (3, "hll", Type::Primitive(PrimitiveType::Binary)),
+            (4, "bitmap", Type::Primitive(PrimitiveType::Binary)),
+            (5, "largeint", Type::Primitive(PrimitiveType::Fixed(16))),
+            (6, "plain_fixed", Type::Primitive(PrimitiveType::Fixed(16))),
+            (7, "plain_binary", Type::Primitive(PrimitiveType::Binary)),
         ]
         .into_iter()
-        .map(|(id, name, primitive)| {
-            Arc::new(NestedField::optional(id, name, Type::Primitive(primitive)))
-        })
+        .map(|(id, name, field_type)| Arc::new(NestedField::optional(id, name, field_type)))
         .collect::<Vec<_>>();
         TableMetadataBuilder::new(
             Schema::builder()

@@ -335,6 +335,10 @@ mod application_document_publication_trace_tests {
             self.inner.drop_table(table).await
         }
 
+        async fn purge_table(&self, table: &TableIdent) -> crate::iceberg::Result<()> {
+            self.inner.purge_table(table).await
+        }
+
         async fn table_exists(&self, table: &TableIdent) -> crate::iceberg::Result<bool> {
             self.inner.table_exists(table).await
         }
@@ -568,6 +572,9 @@ mod application_document_publication_trace_tests {
                 crate::fs_io::build_file_io_for_location(&warehouse_uri, binding.clone()),
                 warehouse_uri.clone(),
                 binding.clone(),
+                crate::resources::IcebergCatalogRuntime::new(tokio::runtime::Handle::current())
+                    .iceberg_runtime()
+                    .clone(),
             ),
         );
         let inner: Arc<dyn Catalog> = concrete.clone();

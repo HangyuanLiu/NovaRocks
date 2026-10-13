@@ -17,8 +17,8 @@
 
 use super::*;
 use arrow::array::{
-    Array, ArrayRef, BinaryArray, BinaryViewArray, Int8Array, Int16Array, Int32Array,
-    LargeBinaryArray, ListArray, MapArray, StructArray, TimestampMicrosecondArray,
+    Array, BinaryArray, Int8Array, Int16Array, Int32Array, ListArray, MapArray, StructArray,
+    TimestampMicrosecondArray,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::datatypes::TimeUnit;
@@ -72,19 +72,6 @@ fn frozen_facts(
     }
 }
 
-fn bytes_at(array: &ArrayRef, row: usize) -> &[u8] {
-    if let Some(array) = array.as_any().downcast_ref::<BinaryArray>() {
-        return array.value(row);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<LargeBinaryArray>() {
-        return array.value(row);
-    }
-    if let Some(array) = array.as_any().downcast_ref::<BinaryViewArray>() {
-        return array.value(row);
-    }
-    panic!("unexpected binary carrier {:?}", array.data_type());
-}
-
 fn field_with_marker(name: &str, data_type: DataType, nullable: bool) -> Field {
     Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
         "writer-regression".to_string(),
@@ -105,16 +92,6 @@ async fn frozen_narrow_context_writes_canonical_int32_parquet_and_preserves_othe
         DataType::Struct(vec![map_key.clone(), map_value.clone()].into()),
         false,
     ));
-    // The standard Iceberg writer marks VARIANT with this Arrow extension.
-    // Preserve that existing field metadata through integer canonicalization.
-    let variant_metadata = HashMap::from([
-        ("writer-regression".to_string(), "variant".to_string()),
-        (
-            "ARROW:extension:name".to_string(),
-            "arrow.parquet.variant".to_string(),
-        ),
-        ("ARROW:extension:metadata".to_string(), String::new()),
-    ]);
     let fields = vec![
         field_with_marker("tiny", DataType::Int8, true),
         field_with_marker("small", DataType::Int16, true),
@@ -131,7 +108,6 @@ async fn frozen_narrow_context_writes_canonical_int32_parquet_and_preserves_othe
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
             true,
         ),
-        Field::new("variant", DataType::LargeBinary, true).with_metadata(variant_metadata),
     ];
     let input_schema = Arc::new(Schema::new_with_metadata(
         fields,
@@ -157,7 +133,6 @@ async fn frozen_narrow_context_writes_canonical_int32_parquet_and_preserves_othe
             ),
             frozen_field(6, "raw", vec![]),
             frozen_field(7, "zoned", vec![]),
-            frozen_field(8, "variant", vec![]),
         ],
     );
     let ctx =
@@ -185,10 +160,6 @@ async fn frozen_narrow_context_writes_canonical_int32_parquet_and_preserves_othe
     assert_eq!(
         ctx.schema().field_by_id(7).unwrap().field_type.as_ref(),
         &Type::Primitive(PrimitiveType::Timestamptz)
-    );
-    assert_eq!(
-        ctx.schema().field_by_id(8).unwrap().field_type.as_ref(),
-        &Type::Primitive(PrimitiveType::Variant)
     );
     let parent_nulls = Some(NullBuffer::from(vec![true, false, true]));
     let list = ListArray::try_new(
@@ -225,9 +196,6 @@ async fn frozen_narrow_context_writes_canonical_int32_parquet_and_preserves_othe
         false,
     )
     .unwrap();
-    // Independent valid Iceberg VARIANT representation of the string "hello".
-    // Prefix=metadata length3 + value length6; metadata=empty dictionary v1.
-    let variant_payload = [9, 0, 0, 0, 1, 0, 0, 21, b'h', b'e', b'l', b'l', b'o'];
     let batch = RecordBatch::try_new(
         input_schema.clone(),
         vec![
@@ -245,11 +213,6 @@ async fn frozen_narrow_context_writes_canonical_int32_parquet_and_preserves_othe
                 TimestampMicrosecondArray::from(vec![Some(0), None, Some(123456789)])
                     .with_timezone("UTC"),
             ),
-            Arc::new(LargeBinaryArray::from(vec![
-                Some(variant_payload.as_slice()),
-                None,
-                Some(variant_payload.as_slice()),
-            ])),
         ],
     )
     .unwrap();
@@ -305,17 +268,6 @@ async fn frozen_narrow_context_writes_canonical_int32_parquet_and_preserves_othe
             "physical storage must not carry a narrow logical label"
         );
     }
-    let variant_field = builder
-        .parquet_schema()
-        .root_schema()
-        .get_fields()
-        .iter()
-        .find(|field| field.name() == "variant")
-        .unwrap();
-    assert!(matches!(
-        variant_field.get_basic_info().logical_type_ref(),
-        Some(LogicalType::Variant { .. })
-    ));
     let output_schema = builder.schema().clone();
     assert_eq!(output_schema.field(0).data_type(), &DataType::Int32);
     assert_eq!(output_schema.field(1).data_type(), &DataType::Int32);
@@ -326,20 +278,12 @@ async fn frozen_narrow_context_writes_canonical_int32_parquet_and_preserves_othe
     assert!(output_schema.field(0).is_nullable());
     assert_eq!(
         output_schema
-            .field(7)
-            .metadata()
-            .get("ARROW:extension:name")
-            .map(String::as_str),
-        Some("arrow.parquet.variant")
-    );
-    assert_eq!(
-        output_schema
             .metadata()
             .get("writer-schema-regression")
             .map(String::as_str),
         Some("preserved")
     );
-    for (index, id) in [1, 2, 3, 4, 5, 6, 7, 8].into_iter().enumerate() {
+    for (index, id) in [1, 2, 3, 4, 5, 6, 7].into_iter().enumerate() {
         assert_eq!(
             output_schema
                 .field(index)
@@ -422,22 +366,6 @@ async fn frozen_narrow_context_writes_canonical_int32_parquet_and_preserves_othe
         zoned.iter().collect::<Vec<_>>(),
         vec![Some(0), None, Some(123456789)]
     );
-    let variant = out
-        .column(7)
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .unwrap();
-    assert!(variant.is_null(1));
-    for row in [0, 2] {
-        assert_eq!(
-            bytes_at(variant.column_by_name("metadata").unwrap(), row),
-            &[1, 0, 0]
-        );
-        assert_eq!(
-            bytes_at(variant.column_by_name("value").unwrap(), row),
-            &[21, b'h', b'e', b'l', b'l', b'o']
-        );
-    }
 }
 
 #[tokio::test]

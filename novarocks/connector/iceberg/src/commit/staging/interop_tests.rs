@@ -512,8 +512,7 @@ async fn physical(
     attempt: &IcebergCommitAttempt,
 ) -> Vec<(ManifestFile, ManifestEntry)> {
     let snapshot = metadata.snapshot_by_id(snapshot_id).unwrap();
-    let list = snapshot
-        .load_manifest_list(attempt.file_io(), metadata)
+    let list = crate::manifest::load_manifest_list(&snapshot, attempt.file_io(), metadata)
         .await
         .unwrap();
     let mut raw = Vec::new();
@@ -808,7 +807,9 @@ async fn iru5_java_rest_d12_inheritance_and_physical_rewrite() {
     assert_eq!(raw[0].1.file_sequence_number, None);
     assert_eq!(raw[0].1.data_file().first_row_id(), None);
     assert_eq!(raw[0].0.first_row_id, source.first_row_id());
-    let inherited = raw[0].0.load_manifest(attempt.file_io()).await.unwrap();
+    let inherited = crate::manifest::load_manifest(&raw[0].0, attempt.file_io())
+        .await
+        .unwrap();
     assert_eq!(
         inherited.entries()[0].sequence_number,
         Some(source.sequence_number())
@@ -878,9 +879,7 @@ async fn iru5_java_rest_d12_inheritance_and_physical_rewrite() {
     );
     assert_eq!(replacement.1.file_sequence_number, None);
     assert_eq!(replacement.1.data_file().first_row_id(), Some(first));
-    let inherited = replacement
-        .0
-        .load_manifest(attempt.file_io())
+    let inherited = crate::manifest::load_manifest(&replacement.0, attempt.file_io())
         .await
         .unwrap();
     let replacement = inherited

@@ -314,6 +314,7 @@ async fn every_stage_equals_canonical_prefix_and_whole_request() {
             .contains(&TableRequirement::DefaultSpecIdMatch { default_spec_id: 0 })
     );
     let table = crate::iceberg::table::Table::builder()
+        .runtime(crate::iceberg::Runtime::try_current().expect("test runtime"))
         .identifier(intent.target().ident.clone())
         .metadata(base.clone())
         .file_io(writer.io.clone())

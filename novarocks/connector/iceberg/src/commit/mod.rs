@@ -57,7 +57,6 @@ pub(crate) mod truncate;
 pub mod types;
 mod update_cow;
 pub mod validation;
-pub mod variant_write;
 pub mod write_control;
 pub mod write_fence;
 pub mod write_io;

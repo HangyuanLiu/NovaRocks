@@ -273,9 +273,6 @@ impl Publisher for CreatePublisher {
             StagedCommitResult::Conflict(message) => {
                 CatalogOutcome::uncommitted(ConnectorMutationFailureKind::Conflict, message)
             }
-            StagedCommitResult::KnownUncommitted(message) => {
-                CatalogOutcome::uncommitted(ConnectorMutationFailureKind::Unavailable, message)
-            }
             StagedCommitResult::CommitUnknown(message) => {
                 CatalogOutcome::unknown(message, evidence())
             }
@@ -431,7 +428,7 @@ mod tests {
                     instance_id: ConnectorInstanceId::parse("ice").unwrap(),
                 },
                 ProviderBindingEpoch::new(),
-                runtime,
+                runtime.clone(),
             )))
             .unwrap();
             let schema = Schema::builder()
@@ -508,6 +505,13 @@ mod tests {
             .unwrap();
             let initialization_updates = metadata.staged_create_initialization_updates().unwrap();
             let table = crate::iceberg::table::Table::builder()
+                .runtime(
+                    runtime
+                        .resources()
+                        .catalog_runtime()
+                        .iceberg_runtime()
+                        .clone(),
+                )
                 .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
                 .file_io(crate::fs_io::build_file_io_for_location(&location, binding))
                 .metadata(metadata)

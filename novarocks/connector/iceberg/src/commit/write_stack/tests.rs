@@ -2886,6 +2886,13 @@ fn staged_target_handle(
     .expect("metadata")
     .metadata;
     let table = crate::iceberg::table::Table::builder()
+        .runtime(
+            runtime
+                .resources()
+                .catalog_runtime()
+                .iceberg_runtime()
+                .clone(),
+        )
         .identifier(crate::iceberg::TableIdent::from_strs(["db", "staged"]).expect("identifier"))
         .file_io(crate::fs_io::build_file_io_for_location(
             location,
@@ -3194,6 +3201,13 @@ fn scalar_integer_staged_target_handle(
     .expect("metadata")
     .metadata;
     let table = crate::iceberg::table::Table::builder()
+        .runtime(
+            runtime
+                .resources()
+                .catalog_runtime()
+                .iceberg_runtime()
+                .clone(),
+        )
         .identifier(crate::iceberg::TableIdent::from_strs(["db", "staged"]).expect("identifier"))
         .file_io(crate::fs_io::build_file_io_for_location(
             location,

@@ -132,6 +132,7 @@ enum HadoopCatalogTestFault {
 #[derive(Debug)]
 pub struct HadoopFileSystemCatalog {
     file_io: FileIO,
+    runtime: crate::iceberg::Runtime,
     warehouse_location: String,
     /// The exact provider-owned storage capability admitted for this catalog.
     /// It is process local and never serialized with the catalog client.
@@ -146,9 +147,14 @@ impl HadoopFileSystemCatalog {
     /// Compatibility constructor for storage-free tests. Production callers
     /// must use [`Self::new_with_binding`]. Any operation requiring a
     /// provider filesystem capability fails closed when constructed here.
-    pub fn new(file_io: FileIO, warehouse_location: String) -> Self {
+    pub fn new(
+        file_io: FileIO,
+        warehouse_location: String,
+        runtime: crate::iceberg::Runtime,
+    ) -> Self {
         Self {
             file_io,
+            runtime,
             warehouse_location: warehouse_location.trim_end_matches('/').to_string(),
             binding: None,
             tables: Mutex::new(HashMap::new()),
@@ -163,9 +169,11 @@ impl HadoopFileSystemCatalog {
         file_io: FileIO,
         warehouse_location: String,
         binding: crate::access_binding::IcebergReadBinding,
+        runtime: crate::iceberg::Runtime,
     ) -> Self {
         Self {
             file_io,
+            runtime,
             warehouse_location: warehouse_location.trim_end_matches('/').to_string(),
             binding: Some(binding),
             tables: Mutex::new(HashMap::new()),
@@ -547,15 +555,20 @@ impl HadoopFileSystemCatalog {
         version: u32,
     ) -> Result<String> {
         let metadata_path = Self::metadata_path(table_location, version);
-        metadata
-            .write_to(&self.file_io, &metadata_path)
-            .await
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("write metadata to {}: {}", metadata_path, e),
-                )
-            })?;
+        async {
+            let bytes = serde_json::to_vec(metadata)?;
+            self.file_io
+                .new_output(&metadata_path)?
+                .write(bytes.into())
+                .await
+        }
+        .await
+        .map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("write metadata to {}: {}", metadata_path, e),
+            )
+        })?;
         self.write_version_hint(table_location, version).await?;
         Ok(metadata_path)
     }
@@ -568,6 +581,7 @@ impl HadoopFileSystemCatalog {
         metadata_location: String,
     ) -> Result<Table> {
         Table::builder()
+            .runtime(self.runtime.clone())
             .file_io(self.file_io.clone())
             .metadata(Arc::new(metadata))
             .identifier(ident)
@@ -669,6 +683,7 @@ impl HadoopFileSystemCatalog {
             })?;
         check_active()?;
         Table::builder()
+            .runtime(self.runtime.clone())
             .file_io(file_io)
             .metadata(Arc::new(metadata))
             .identifier(table.clone())
@@ -1268,6 +1283,13 @@ impl Catalog for HadoopFileSystemCatalog {
         Ok(())
     }
 
+    async fn purge_table(&self, _table: &TableIdent) -> Result<()> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Hadoop catalog does not support purging tables",
+        ))
+    }
+
     async fn table_exists(&self, table: &TableIdent) -> Result<bool> {
         let key = Self::table_key(table);
         // The filesystem pointer is the catalog authority. Do not let a local
@@ -1385,13 +1407,13 @@ mod tests {
 
     use super::*;
 
-    fn local_test_binding() -> crate::access_binding::IcebergReadBinding {
-        // The binding stores handles into this runtime. Keep its owner alive for
-        // the whole test process: constructing and immediately dropping a
-        // runtime is illegal from these `#[tokio::test]` bodies.
+    fn local_test_runtime() -> &'static tokio::runtime::Runtime {
         static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-        let runtime = RUNTIME
-            .get_or_init(|| tokio::runtime::Runtime::new().expect("build local test runtime"));
+        RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("build local test runtime"))
+    }
+
+    fn local_test_binding() -> crate::access_binding::IcebergReadBinding {
+        let runtime = local_test_runtime();
         crate::access_binding::IcebergReadBinding::new(
             None,
             FsAccessResolver::new(),
@@ -1403,7 +1425,14 @@ mod tests {
     fn test_catalog(location: &str) -> HadoopFileSystemCatalog {
         let binding = local_test_binding();
         let file_io = crate::fs_io::build_file_io_for_location(location, binding.clone());
-        HadoopFileSystemCatalog::new_with_binding(file_io, location.to_string(), binding)
+        HadoopFileSystemCatalog::new_with_binding(
+            file_io,
+            location.to_string(),
+            binding,
+            crate::resources::IcebergCatalogRuntime::new(local_test_runtime().handle().clone())
+                .iceberg_runtime()
+                .clone(),
+        )
     }
 
     fn listing_error_kind(error: &Error) -> ConnectorErrorKind {
@@ -1585,6 +1614,7 @@ mod tests {
         let catalog = HadoopFileSystemCatalog::new(
             FileIO::new_with_fs(),
             warehouse.path().to_string_lossy().to_string(),
+            crate::iceberg::Runtime::try_current().expect("test runtime"),
         );
         assert_eq!(
             catalog

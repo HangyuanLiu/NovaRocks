@@ -79,7 +79,7 @@ pub async fn write_manifest(
     artifacts.check_active()?;
     let object = artifacts.allocate(ArtifactClass::Attempt, ArtifactKind::Manifest)?;
     let output = artifacts.file_io().new_output(object.path())?;
-    let builder = ManifestWriterBuilder::new(output, Some(snapshot_id), None, schema, spec.clone());
+    let builder = ManifestWriterBuilder::new(output, Some(snapshot_id), schema, spec.clone());
     let mut writer = match (version, content) {
         (FormatVersion::V1, ManifestContentType::Data) => builder.build_v1(),
         (FormatVersion::V1, ManifestContentType::Deletes) => {
@@ -167,12 +167,15 @@ pub async fn write_manifest_list(
     let output = artifacts.file_io().new_output(object.path())?;
     let first = metadata.next_row_id();
     let mut writer = match metadata.format_version() {
-        FormatVersion::V1 => ManifestListWriter::v1(output, snapshot_id, parent),
-        FormatVersion::V2 => {
-            ManifestListWriter::v2(output, snapshot_id, parent, metadata.next_sequence_number())
-        }
+        FormatVersion::V1 => ManifestListWriter::v1(output.writer().await?, snapshot_id, parent),
+        FormatVersion::V2 => ManifestListWriter::v2(
+            output.writer().await?,
+            snapshot_id,
+            parent,
+            metadata.next_sequence_number(),
+        ),
         FormatVersion::V3 => ManifestListWriter::v3(
-            output,
+            output.writer().await?,
             snapshot_id,
             parent,
             metadata.next_sequence_number(),

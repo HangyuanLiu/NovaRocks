@@ -572,7 +572,7 @@ fn apply_source_logical_schema(
                 .copied()
                 .unwrap_or_else(|| match storage.field_type.as_ref() {
                     Type::Primitive(PrimitiveType::Uuid) => ValueLogicalType::Uuid,
-                    Type::Primitive(PrimitiveType::Variant) => ValueLogicalType::Variant,
+                    Type::Variant(_) => ValueLogicalType::Variant,
                     _ => ValueLogicalType::Physical,
                 });
         let expected_carrier = match logical {
