@@ -140,3 +140,23 @@ accounting hooks. Only the approved protocol/API patch inventory may diverge.
 - Exit: IRU-13a replaces the vendored one-page protocol surface.
 - Coverage: four migrated single-page/token/parent-filter tests from 0.9.
 - Validation: standalone REST crate check/tests after all patches are ready.
+
+### R10: response and credential diagnostics stay redacted
+
+- Files: `src/client.rs`, `src/auth/oauth2.rs`, `src/types.rs`.
+- Purpose: keep raw response bodies, header values, server error messages/stacks
+  and credential config values out of Error/Debug. Header names-only formatting
+  makes disable-header-redaction inert. ErrorModel retains its parsed type,
+  code and stack depth, with the fixed message from the old patch.
+- Required 0.11 adaptation: opaque serde_json decoder source diagnostics may
+  echo response enum/known-field values. Those source payloads are suppressed
+  on REST/OAuth redaction paths; ErrorKind/status/retry classification is kept.
+  Parsed protocol category facts are deliberately preserved.
+- Upstream status: pinned upstream still prints body/context and header values.
+- Production dependency: all REST/OAuth errors and response/delegation Debug.
+- Exit: IRU-13a replaces the vendored redaction with closed adapter responses.
+- Coverage: migrated old error/body secret canaries and header assertions,
+  OAuth valid/invalid JSON and full opaque-source diagnostic canaries, and
+  DTO credential-value Debug canary. Conflicting upstream header tests now
+  assert names-only output even with redaction disabled.
+- Validation: standalone REST crate check/tests after this final patch is ready.
