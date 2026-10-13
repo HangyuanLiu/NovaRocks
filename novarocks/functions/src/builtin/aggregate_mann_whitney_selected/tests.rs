@@ -44,7 +44,7 @@ impl PureCompileControl for Compile {
         Ok(())
     }
 }
-// This fixture uses the actual catalogue binding without installing an owner.
+// This fixture uses the actual catalogue binding with a focused effect witness.
 // Its effect witness only constructs the Data-domain identity under test.
 struct Effects {
     id: FunctionId,
@@ -375,15 +375,19 @@ fn mann_whitney_selected_real_framework_state_iterator_keeps_order_and_last_alia
             &Compile,
         )
         .unwrap();
-    assert!(matches!(
-        catalog.pure_overload_declaration_observed(
+    let declaration = catalog
+        .pure_overload_declaration_observed(
             &bound.function_id,
             FunctionKind::Aggregate,
             &bound.selected.overload,
-            &Compile
-        ),
-        Err(FunctionSpecializationFailure::MissingPureImplementation(_))
-    ));
+            &Compile,
+        )
+        .unwrap();
+    assert_eq!(declaration.implementation().abi, PureKernelAbi::AggregateV1);
+    assert_eq!(
+        declaration.implementation().implementation.as_str(),
+        "builtin.aggregate/mann_whitney_u_test/selected-v1"
+    );
 }
 
 #[test]

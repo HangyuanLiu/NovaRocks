@@ -76,6 +76,7 @@ mod aggregate_hll_owner;
 pub mod aggregate_mann_whitney_core;
 mod aggregate_mann_whitney_emission;
 mod aggregate_mann_whitney_operation;
+mod aggregate_mann_whitney_owner;
 mod aggregate_mann_whitney_resources;
 mod aggregate_mann_whitney_selected;
 mod aggregate_n;
