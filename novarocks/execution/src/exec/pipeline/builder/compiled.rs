@@ -735,6 +735,9 @@ fn build_node<H: CompiledSchemaMetadataScope>(
         ProgramNodeKind::UnionAll { inputs } => {
             build_union_all(program, id, node_id, inputs, ctx, error, metadata)
         }
+        ProgramNodeKind::GroupedTopN { .. } => Err(
+            "compiled grouped-state TopN consumer is not installed".to_string().into()
+        ),
         ProgramNodeKind::Aggregate { input, .. } => {
             // Preserve the original driver-local Partial -> exchange -> Final
             // chronology. Grouped states hash actual emitted key slots; a
