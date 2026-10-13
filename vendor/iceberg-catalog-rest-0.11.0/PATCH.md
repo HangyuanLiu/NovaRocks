@@ -84,3 +84,14 @@ accounting hooks. Only the approved protocol/API patch inventory may diverge.
 - Exit: IRU-13a replaces the vendored credential renewal protocol surface.
 - Coverage: migrated `credential_refresh_uses_catalog_authentication_and_redacts_values`.
 - Validation: standalone REST crate tests after the shared Cargo window is free.
+
+### R2: authoritative staged-create result
+
+- Files: `src/catalog/extension.rs`, `src/catalog.rs`.
+- Purpose: retain StagedTableCreate and its table/initialization-update accessors
+  as the typed stage result; the unused untyped stage API is not restored.
+- Upstream status: no equivalent authoritative staged result at the baseline.
+- Production dependency: NovaRocks REST staged-create owner.
+- Exit: IRU-13a replaces the vendored staged-create protocol surface.
+- Coverage: authoritative staged-create component tests migrate with R3.
+- Validation: standalone REST crate tests after the shared Cargo window is free.

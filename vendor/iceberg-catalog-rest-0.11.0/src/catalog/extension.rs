@@ -19,6 +19,32 @@
 
 use super::*;
 
+/// A REST staged-create result and the authoritative initialization updates
+/// required by its first `assert-create` commit.
+#[derive(Debug)]
+pub struct StagedTableCreate {
+    table: Table,
+    initialization_updates: Vec<TableUpdate>,
+}
+
+impl StagedTableCreate {
+    /// Return the staged table. Its metadata location is absent because the
+    /// table has not been published yet.
+    pub fn table(&self) -> &Table {
+        &self.table
+    }
+
+    /// Return initialization updates reconstructed from the staged response.
+    pub fn initialization_updates(&self) -> &[TableUpdate] {
+        &self.initialization_updates
+    }
+
+    /// Consume this result into the staged table and initialization updates.
+    pub fn into_parts(self) -> (Table, Vec<TableUpdate>) {
+        (self.table, self.initialization_updates)
+    }
+}
+
 /// A redacted view of one prefix-scoped REST storage credential.
 ///
 /// Credential values remain private. Consumers can inspect only the keys they
