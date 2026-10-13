@@ -125,11 +125,6 @@ during, and after a runner-held ordinary Worker closure, so an available gate
 can be distinguished from an unknown, unimplemented source. The explicit
 `blocking-saturation-control` case fills the ordinary blocking pool and checks
 that a small Cancel still completes while a ninth ordinary request waits.
-`resident-envelope-calibration` records coarse BE process RSS before, during,
-and after one legal 48 MiB outer request plus seven small-body closures in
-`process-resources.json`. Its padding is a legal protobuf unknown field, not a
-retained FrozenFragment carrier; it does not establish a hard RSS bound or a
-mixed ordinary/control peak.
 `async-scheduling-pressure` runs four distributed SQL queries, waits for real
 Exchange shuffle bytes while one remains active, and checks a small control
 receipt; it is a liveness check under ordinary async work, not proof that all
