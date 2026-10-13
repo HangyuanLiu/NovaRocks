@@ -62,3 +62,12 @@ No patches applied in the initial source commit.
 - Production dependency: reading existing Spark REST v3 metadata without the field.
 - Exit: IRU-8 replaces the external semantic-identity compatibility boundary and removes this patch.
 - Coverage: migrated `test_table_metadata_v3_missing_next_row_id_defaults_to_initial`; existing v3 metadata serde tests.
+
+## U4 — direct child directory listing
+
+- Purpose: preserve the 0.9 directory-listing capability on Storage and FileIO, with local-filesystem and in-memory implementations.
+- Files: `src/io/storage/{mod,local_fs,memory}.rs`, `src/io/file_io.rs`.
+- Upstream status: no tracked upstream issue; rc.2 has no directory-listing method.
+- Production dependency: Hadoop catalog namespace/table discovery; unsupported storage backends return FeatureUnsupported.
+- Exit: IRU-6a removes this patch after the catalog storage boundary owns directory discovery without the SDK extension.
+- Coverage: existing connector Hadoop catalog discovery tests; V2 standalone core check. Old core has no dedicated directory-listing tests.
