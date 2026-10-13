@@ -272,7 +272,7 @@ pub trait PreparedAggregateKernel: Send + Sync + fmt::Debug + 'static {
     ) -> Result<ArrayRef, crate::EvaluationFailure>
     where
         Self::State: 'state,
-        I: ExactSizeIterator<Item = &'state Self::State>,
+        I: ExactSizeIterator<Item = &'state Self::State> + Clone,
     {
         self.build_intermediate_evaluation(states, control)
     }
@@ -284,7 +284,7 @@ pub trait PreparedAggregateKernel: Send + Sync + fmt::Debug + 'static {
     ) -> Result<ArrayRef, crate::EvaluationFailure>
     where
         Self::State: 'state,
-        I: ExactSizeIterator<Item = &'state Self::State>,
+        I: ExactSizeIterator<Item = &'state Self::State> + Clone,
     {
         self.build_final_evaluation(states, control)
     }
