@@ -82,7 +82,7 @@ cargo +1.98.1 package --no-verify --exclude-lockfile --offline \
 | property macro | 同源构建依赖，无源码补丁 | 依赖维护者在 registry 具有等价可用来源、来源闭包可重建时评估移除 path；不按协议补丁退出处理 |
 
 4. **Truth before cleanup**：REST 派发后，仅 `CatalogCommitConflicts`、`TableAlreadyExists`、`NamespaceAlreadyExists` 这三类收到的冲突错误参与确知未提交证明。404、400、解码无效的 200 和成功响应后的本地构造失败保留 Unknown，不授权清理。CTAS 最终提交把 SDK 的 `KnownNotDispatched` 与 `CommittedResponseInvalid` 也保守映射为 Unknown；stage 判定与 Hadoop 条件创建证明保持。该临时规则由 REST owner 的 `admits_uncommitted_proof` 选择，不全局收窄其它 catalog。
-5. **Explicit runtime and owned artifacts**：SDK Runtime 只在 role-local 资源 owner 构造处从注入句柄取得一次，向 catalog/table builder 传递；请求/retry recipe 保持资源中立。manifest 写出先登记产物再打开 writer，取消/超时仍等实际退出；读取保持既有继承规则。
+5. **Explicit runtime and owned artifacts**：SDK Runtime 只在 role-local 资源 owner 构造处从注入句柄取得一次，向 catalog/table builder 传递；请求/retry recipe 保持资源中立。在已有 `commit/operation` 与 `commit/staging` 写出路径中，manifest 产物先登记再打开 writer，取消/超时仍等实际退出。旧 direct `REWRITE MANIFESTS` 的 operation 接管与清理由 IRU-6a 承接，不属于本次已验证的登记/退出保证；本次保持其原有边界。读取保持既有继承规则。
 6. **Capability honesty**：Variant 的类型构造迁移到上游 `Type::Variant`，只保证编译；旧写出转换/shredding 与特殊兼容捷径退出，SDK writer 的 `FeatureUnsupported` 保持。用户文档、删除/忽略测试与 SQL 跳过必须明确其尚待恢复的能力。
 
 本 ADR 仅部分替代 ADR-0170 的 **patch allowlist**（增加 property macro）和当前 Iceberg **vendor 基线/代码锚点**。ADR-0170 仍保持 active；不为资源计量 fork 第三方库、registry/advisory 规则、外部 SDK 列表边界和现有序列化所有权原则继续适用。

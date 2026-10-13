@@ -616,23 +616,202 @@ mod routing_tests {
     /// without the peer's SETTINGS, so this counts physical connections.
     async fn counting_listener() -> (
         NativeEndpoint,
-        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::sync::watch::Receiver<usize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        counting_listener_with_gate(None).await
+    }
+
+    async fn counting_listener_with_gate(
+        accept_gate: Option<std::sync::Arc<tokio::sync::Semaphore>>,
+    ) -> (
+        NativeEndpoint,
+        tokio::sync::watch::Receiver<usize>,
         tokio::task::JoinHandle<()>,
     ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint =
             NativeEndpoint::from_host_port("127.0.0.1", listener.local_addr().unwrap().port())
                 .unwrap();
-        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counted = std::sync::Arc::clone(&accepted);
+        let (counted, accepted) = tokio::sync::watch::channel(0usize);
         let task = tokio::spawn(async move {
             let mut held = Vec::new();
-            while let Ok((socket, _)) = listener.accept().await {
-                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            loop {
+                if let Some(gate) = &accept_gate {
+                    let Ok(permit) = gate.acquire().await else {
+                        break;
+                    };
+                    permit.forget();
+                }
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                counted.send_modify(|count| *count += 1);
                 held.push(socket);
             }
         });
         (endpoint, accepted, task)
+    }
+
+    // The caller's original dial timeout covers both client IO and server accept.
+    async fn dial_with_accept_confirmation(
+        client: &Client,
+        method: NativeRpcMethod,
+        accepted: &tokio::sync::watch::Receiver<usize>,
+        expected_accepted: usize,
+        client_ready: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<(AuthenticatedNovaRocksGrpcClient, CachedNativeChannel), ChannelAcquisitionError>
+    {
+        let channel = client.grpc_with_channel_identity(method).await?;
+        if let Some(ready) = client_ready {
+            ready
+                .send(())
+                .expect("controlled dial observer remains live");
+        }
+        // Client IO can exist while the listener's accept loop is still waiting
+        // to run. The watch value preserves acceptance before this subscription.
+        let mut observed = accepted.clone();
+        observed
+            .wait_for(|count| *count >= expected_accepted)
+            .await
+            .map_err(|error| {
+                ChannelAcquisitionError::fatal(format!(
+                    "counting listener exited before acceptance: {error}"
+                ))
+            })?;
+        Ok(channel)
+    }
+
+    struct GatedResultLane {
+        runtime: FrontendDataRuntime,
+        client: Client,
+        accepted: tokio::sync::watch::Receiver<usize>,
+        accept_gate: std::sync::Arc<tokio::sync::Semaphore>,
+        listener_task: tokio::task::JoinHandle<()>,
+        peer: BackendProcessId,
+    }
+
+    impl GatedResultLane {
+        async fn with_three_accepted() -> Self {
+            use novarocks_proto_codec::native_rpc::FrontendNativeLane;
+            assert_eq!(
+                novarocks_native_adapter::native_lane::frontend_lane_connections(
+                    FrontendNativeLane::ResultData
+                ),
+                4
+            );
+            let runtime = FrontendDataRuntime::new(tokio::runtime::Handle::current());
+            let peer = BackendProcessId::new_v7();
+            let accept_gate = std::sync::Arc::new(tokio::sync::Semaphore::new(3));
+            let (endpoint, accepted, listener_task) =
+                counting_listener_with_gate(Some(std::sync::Arc::clone(&accept_gate))).await;
+            let client = Client::for_endpoint(
+                endpoint,
+                NativeEndpointDomain::BackendData,
+                peer,
+                runtime.clone(),
+            );
+            for index in 0..3 {
+                let (_, acquired) = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    dial_with_accept_confirmation(
+                        &client,
+                        NativeRpcMethod::FetchTaskResult,
+                        &accepted,
+                        index + 1,
+                        None,
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(acquired.slot.index, index);
+            }
+            assert_eq!(*accepted.borrow(), 3);
+            Self {
+                runtime,
+                client,
+                accepted,
+                accept_gate,
+                listener_task,
+                peer,
+            }
+        }
+
+        fn assert_four_client_channels_but_three_server_accepts(&self) {
+            let key = self
+                .client
+                .channel_key(NativeRpcMethod::FetchTaskResult)
+                .unwrap();
+            assert_eq!(self.runtime.cached_connections(&key), 4);
+            assert_eq!(*self.accepted.borrow(), 3);
+            // The old immediate counter oracle would deterministically fail 3 != 4.
+            assert_ne!(*self.accepted.borrow(), 4);
+        }
+    }
+
+    impl Drop for GatedResultLane {
+        fn drop(&mut self) {
+            self.runtime.invalidate_peer(self.peer);
+            self.listener_task.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frontend_lane_accept_barrier_waits_for_the_fourth_real_socket() {
+        let case = GatedResultLane::with_three_accepted().await;
+        let (ready, mut client_ready) = tokio::sync::oneshot::channel();
+        let mut fourth = Box::pin(tokio::time::timeout(
+            Duration::from_secs(10),
+            dial_with_accept_confirmation(
+                &case.client,
+                NativeRpcMethod::FetchTaskResult,
+                &case.accepted,
+                4,
+                Some(ready),
+            ),
+        ));
+        tokio::select! {
+            ready = &mut client_ready => ready.unwrap(),
+            _ = &mut fourth => panic!("fourth dial ended before the controlled accept gate opened"),
+        }
+        case.assert_four_client_channels_but_three_server_accepts();
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(fourth.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        case.accept_gate.add_permits(1);
+        let (_, acquired) = fourth.await.unwrap().unwrap();
+        assert_eq!(acquired.slot.index, 3);
+        assert_eq!(*case.accepted.borrow(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frontend_lane_accept_barrier_keeps_the_original_dial_deadline() {
+        let case = GatedResultLane::with_three_accepted().await;
+        let (ready, mut client_ready) = tokio::sync::oneshot::channel();
+        let started = tokio::time::Instant::now();
+        let mut fourth = Box::pin(tokio::time::timeout_at(
+            started + Duration::from_secs(10),
+            dial_with_accept_confirmation(
+                &case.client,
+                NativeRpcMethod::FetchTaskResult,
+                &case.accepted,
+                4,
+                Some(ready),
+            ),
+        ));
+        tokio::select! {
+            ready = &mut client_ready => ready.unwrap(),
+            _ = &mut fourth => panic!("fourth dial ended before the controlled accept gate opened"),
+        }
+        case.assert_four_client_channels_but_three_server_accepts();
+        // Leave the gate closed. Real time, without test-util or a new timer,
+        // must exhaust the same dial deadline while the accepted count is three.
+        assert!(fourth.await.is_err());
+        assert!(started.elapsed() >= Duration::from_secs(10));
+        assert_eq!(*case.accepted.borrow(), 3);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -685,14 +864,21 @@ mod routing_tests {
             ),
         ] {
             let connections = frontend_lane_connections(lane);
-            let before = accepted.load(std::sync::atomic::Ordering::SeqCst);
+            let before = *accepted.borrow();
             let mut slots = Vec::new();
             // Two full rotations: the first dials every connection once, the
             // second reuses them in the same order.
-            for _ in 0..2 * connections {
+            for rotation in 0..2 * connections {
+                let expected_accepted = before + (rotation + 1).min(connections);
                 let (_, acquired) = tokio::time::timeout(
                     Duration::from_secs(10),
-                    client.grpc_with_channel_identity(method),
+                    dial_with_accept_confirmation(
+                        client,
+                        method,
+                        accepted,
+                        expected_accepted,
+                        None,
+                    ),
                 )
                 .await
                 .unwrap()
@@ -704,7 +890,7 @@ mod routing_tests {
             let expected: Vec<_> = (0..connections).chain(0..connections).collect();
             assert_eq!(slots, expected, "{lane:?} rotates over its connections");
             assert_eq!(
-                accepted.load(std::sync::atomic::Ordering::SeqCst) - before,
+                *accepted.borrow() - before,
                 connections,
                 "{lane:?} opens exactly the geometry's connections"
             );
