@@ -20,7 +20,7 @@
 mod extension;
 pub use extension::{
     DeferredRestTableMaterialization, DeferredRestTableWithAccessDelegation,
-    DeferredStagedTableCreateWithAccessDelegation, RestAccessDelegation, StagedTableCreate, StorageCredentialDelegation,
+    DeferredStagedTableCreateWithAccessDelegation, RestAccessDelegation, StagedCommitError, StagedCreateError, StagedTableCreate, StorageCredentialDelegation,
 };
 
 use std::collections::{HashMap, HashSet};
