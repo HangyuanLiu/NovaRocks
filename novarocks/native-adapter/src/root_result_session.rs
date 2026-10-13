@@ -235,6 +235,10 @@ pub struct NativeRootResultSession {
     exited: AtomicBool,
     #[cfg(test)]
     terminal_observations: Mutex<Vec<&'static str>>,
+    #[cfg(test)]
+    before_finish_wake: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    before_pool_turn: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     _metadata: Arc<RootMetadataReservation>,
 }
 impl NativeRootResultSession {
@@ -308,6 +312,10 @@ impl NativeRootResultSession {
             exited: AtomicBool::new(true),
             #[cfg(test)]
             terminal_observations: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            before_finish_wake: Mutex::new(None),
+            #[cfg(test)]
+            before_pool_turn: Mutex::new(None),
             _metadata: metadata,
         });
         drop(
@@ -835,8 +843,18 @@ impl RootResultSession for NativeRootResultSession {
                 .failed
                 .get_or_insert("root readiness notification panicked");
         }
+        #[cfg(test)]
+        {
+            let hook = self.before_finish_wake.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        // Activate while the session lock still excludes a Complete turn.
+        // A normal End must not retire this registration before its wake.
+        let wake = self.wake();
         drop(state);
-        self.wake()?;
+        wake?;
         if notification_failed {
             return Err(io_error("root readiness notification panicked"));
         }
@@ -884,6 +902,13 @@ impl RootResultSession for NativeRootResultSession {
 }
 impl RootProducerJob for NativeRootResultSession {
     fn turn(&self) -> RootProducerTurn {
+        #[cfg(test)]
+        {
+            let hook = self.before_pool_turn.lock().unwrap().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let mut state = self.state();
         state.completed |= self.channel.snapshot().end_sequence.is_some();
         if state.completed {
@@ -1134,6 +1159,103 @@ mod terminal_observation_tests {
             self.release();
             let _ = self.pool.shutdown();
         }
+    }
+
+    #[test]
+    fn native_root_finish_wakes_before_a_queued_worker_can_retire_registration() {
+        let fixture = Fixture::new(true);
+        fixture.submit();
+        let entry = Arc::new(GatedTurn {
+            state: Mutex::new((false, false)),
+            changed: Condvar::new(),
+        });
+        let worker_entry = Arc::clone(&entry);
+        *fixture.session.before_pool_turn.lock().unwrap() = Some(Arc::new(move || {
+            // This is the real CPU worker, before it acquires the session lock.
+            RootProducerJob::turn(worker_entry.as_ref());
+        }));
+        let worker_entry = Arc::clone(&entry);
+        let blocker = Arc::clone(&fixture.blocker.as_ref().unwrap().0);
+        let session = Arc::downgrade(&fixture.session);
+        *fixture.session.before_finish_wake.lock().unwrap() = Some(Arc::new(move || {
+            blocker.release();
+            worker_entry.wait_entered();
+            let session = session.upgrade().unwrap();
+            let holds_state = matches!(
+                session.state.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            );
+            let not_exited = !session.producer_exited();
+            let no_end = session.channel().snapshot().end_sequence.is_none();
+            // Release before asserting so a failing old-source control still
+            // lets its real worker exit through the fixture's existing owner.
+            worker_entry.release();
+            assert!(
+                holds_state,
+                "finish must activate before releasing the session state"
+            );
+            assert!(not_exited, "the queued producer must not claim actual exit");
+            assert!(no_end, "the queued producer must not publish End yet");
+        }));
+        fixture.session.finish_input().unwrap();
+        fixture.wait_terminal("finished");
+        fixture.pool.shutdown().unwrap();
+        let snapshot = fixture
+            .session
+            .channel()
+            .try_ownership_snapshot()
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.ends_published, 1);
+        assert_eq!(snapshot.producers_running, 0);
+        assert_eq!(snapshot.producers_exited, 1);
+        assert!(fixture.session.producer_exited());
+        let state = fixture.session.state();
+        assert!(state.input.is_none());
+        assert!(state.builder.is_none());
+        assert!(state.producer.is_none());
+        drop(state);
+        assert_eq!(fixture.observations(), ["finished"]);
+    }
+
+    #[test]
+    fn native_root_finish_preserves_a_real_pool_shutdown_error() {
+        let fixture = Fixture::new(true);
+        fixture.submit();
+        let pool = Arc::downgrade(&fixture.pool);
+        let shutdown = Arc::new(Mutex::new(None));
+        let shutdown_owner = Arc::clone(&shutdown);
+        *fixture.session.before_finish_wake.lock().unwrap() = Some(Arc::new(move || {
+            let pool = pool.upgrade().unwrap();
+            let stopping_pool = Arc::clone(&pool);
+            *shutdown_owner.lock().unwrap() =
+                Some(std::thread::spawn(move || stopping_pool.shutdown()));
+            let probe = Arc::new(GatedTurn {
+                state: Mutex::new((false, true)),
+                changed: Condvar::new(),
+            }) as Arc<dyn RootProducerJob>;
+            let deadline = Instant::now() + WAIT;
+            loop {
+                match pool.register(Arc::downgrade(&probe)) {
+                    Err(error) if error == "root producer pool is shut down" => break,
+                    Ok(registration) => drop(registration),
+                    Err(error) => assert_eq!(error, "root producer pool positions are exhausted"),
+                }
+                assert!(Instant::now() < deadline, "the pool must begin shutdown");
+                std::thread::yield_now();
+            }
+        }));
+        let error = fixture.session.finish_input().unwrap_err();
+        assert!(error.to_string().contains("root CPU pool is closed"));
+        shutdown
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .join()
+            .unwrap()
+            .unwrap();
+        assert!(fixture.session.producer_exited());
     }
 
     #[test]
