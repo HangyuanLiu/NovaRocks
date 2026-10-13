@@ -131,7 +131,13 @@ impl Publisher for TransitionalPublisher {
                 }
             }
             Err(error) => {
-                crate::catalog::error::classify_dispatched_error(&error, || self.evidence.clone())
+                if self.catalog.admits_uncommitted_proof(&error) {
+                    crate::catalog::error::classify_dispatched_error(&error, || {
+                        self.evidence.clone()
+                    })
+                } else {
+                    CatalogOutcome::unknown(error.to_string(), self.evidence.clone())
+                }
             }
         }
     }

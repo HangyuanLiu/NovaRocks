@@ -19,9 +19,9 @@
 //!
 //! Design: ADR-0118 (docs/adr/ADR-0118-iceberg-provider-private-catalog-owner.md)
 //!
-//! Every concrete implementation owns an `Arc<dyn iceberg::Catalog>`, and for
-//! reads and single-frontier mutations they behave identically, so that
-//! behavior lives here once rather than three times.
+//! Every concrete implementation owns an `Arc<dyn iceberg::Catalog>`. Shared
+//! reads and single-frontier mutation mechanisms live here once; each owner
+//! selects which post-dispatch errors may prove a definite rejection.
 //!
 //! # Why views need no per-catalog code
 //!
@@ -76,11 +76,15 @@ pub(super) fn sorted_unique(mut names: Vec<String>) -> Vec<String> {
     names
 }
 
+/// An owner-selected rule for accepting dispatched-error proof.
+pub(super) type UncommittedProofRule = fn(&crate::iceberg::Error) -> bool;
+
 /// Delegation onto one concrete catalog client.
 #[derive(Debug)]
 pub(super) struct CatalogDelegate {
     client: Arc<dyn Catalog>,
     pub(super) listing: Arc<super::listing_admission::ListingAdmission>,
+    pub(super) admits: UncommittedProofRule,
 }
 
 impl CatalogDelegate {
@@ -88,7 +92,13 @@ impl CatalogDelegate {
         Self {
             client,
             listing: Default::default(),
+            admits: |_| true,
         }
+    }
+
+    pub(super) fn with_uncommitted_proof_rule(mut self, rule: UncommittedProofRule) -> Self {
+        self.admits = rule;
+        self
     }
 
     pub(super) fn client(&self) -> &Arc<dyn Catalog> {
@@ -430,9 +440,52 @@ impl CatalogDelegate {
         error: &crate::iceberg::Error,
         evidence: impl FnOnce() -> CatalogCommitEvidence,
     ) -> CatalogOutcome<T> {
-        if proves_uncommitted(error) {
+        if (self.admits)(error) && proves_uncommitted(error) {
             return CatalogOutcome::uncommitted(uncommitted_failure_kind(error), error.to_string());
         }
         CatalogOutcome::unknown(error.to_string(), evidence())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Local correctness oracle: default filesystem owners retain their
+    //! definite-rejection semantics while REST evidence cannot authorize
+    //! cleanup for post-dispatch non-conflicts. No external fixture is needed;
+    //! the connector test invocation maintains this coverage until IRU-13a.
+    use super::*;
+    use crate::commit::model::ArtifactWriter;
+    use crate::commit::overwrite::preparer_tests::Fixture;
+    use crate::iceberg::{Error, ErrorKind};
+
+    #[tokio::test]
+    async fn default_hadoop_owner_and_delegate_keep_definite_rejection_proofs() {
+        let fixture = Fixture::new();
+        let attempt = fixture.operation.begin_attempt().unwrap();
+        let client = Arc::new(crate::hadoop_catalog::HadoopFileSystemCatalog::new(
+            attempt.file_io().clone(),
+            format!("file://{}", fixture.directory.path().display()),
+        ));
+        let owner = super::super::hadoop::NovaRocksHadoopCatalog::new(client.clone());
+        let default = CatalogDelegate::new(client.clone());
+        let rest = CatalogDelegate::new(client)
+            .with_uncommitted_proof_rule(super::super::error::proves_received_conflict);
+        for kind in [
+            ErrorKind::TableNotFound,
+            ErrorKind::DataInvalid,
+            ErrorKind::FeatureUnsupported,
+        ] {
+            let error = Error::new(kind, "dispatched failure");
+            assert!(super::super::NovaRocksCatalog::admits_uncommitted_proof(
+                &owner, &error
+            ));
+            let outcome: CatalogOutcome<()> =
+                default.classify(&error, || panic!("definite rejection"));
+            assert!(outcome.permits_cleanup());
+            let outcome: CatalogOutcome<()> =
+                rest.classify(&error, || CatalogCommitEvidence::for_target("db.t"));
+            assert!(!outcome.permits_cleanup());
+            assert!(matches!(outcome, CatalogOutcome::CommitUnknown { .. }));
+        }
     }
 }

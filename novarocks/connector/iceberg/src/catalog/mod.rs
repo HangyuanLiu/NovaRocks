@@ -370,9 +370,6 @@ pub(crate) enum StagedCommitResult {
     Conflict(String),
     KnownUncommitted(String),
     CommitUnknown(String),
-    /// The server answered, but the answer does not prove the publication. The
-    /// create may well have landed, so this is not an uncommitted result.
-    CommittedResponseInvalid(String),
     Unsupported(CatalogUnsupported),
 }
 
@@ -398,6 +395,13 @@ pub(crate) enum StagedCommitResult {
 /// admission completes before the first side effect.
 #[async_trait]
 pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
+    /// Whether this owner accepts the client's error as evidence for a
+    /// dispatched mutation. This grants no proof by itself: callers must also
+    /// check the shared definite-rejection classifier.
+    fn admits_uncommitted_proof(&self, _error: &crate::iceberg::Error) -> bool {
+        true
+    }
+
     /// Human-readable implementation name, for diagnostics and log lines only.
     ///
     /// This must never be consulted to decide whether an operation is
@@ -752,13 +756,16 @@ fn start_update_table_transaction(
         Arc::clone(&request.target_ref),
         request.marker.clone(),
     ));
-    CatalogTransactionStart::Ready(Box::new(transaction::Transaction::new(
-        request.identity,
-        request.target,
-        transaction::TransactionShape::Existing,
-        evidence,
-        dispatch,
-    )))
+    CatalogTransactionStart::Ready(Box::new(
+        transaction::Transaction::new(
+            request.identity,
+            request.target,
+            transaction::TransactionShape::Existing,
+            evidence,
+            dispatch,
+        )
+        .with_uncommitted_proof_rule(delegate.admits),
+    ))
 }
 
 /// Begin a publication that creates a table through one catalog request.
@@ -796,13 +803,16 @@ fn start_create_table_transaction(
         request.creation,
         table_ident,
     ));
-    CatalogTransactionStart::Ready(Box::new(transaction::Transaction::new(
-        request.identity,
-        request.target,
-        transaction::TransactionShape::Create(request.intent),
-        evidence,
-        dispatch,
-    )))
+    CatalogTransactionStart::Ready(Box::new(
+        transaction::Transaction::new(
+            request.identity,
+            request.target,
+            transaction::TransactionShape::Create(request.intent),
+            evidence,
+            dispatch,
+        )
+        .with_uncommitted_proof_rule(delegate.admits),
+    ))
 }
 
 #[cfg(all(test, feature = "mem-1-m07-hms-listing-observe"))]

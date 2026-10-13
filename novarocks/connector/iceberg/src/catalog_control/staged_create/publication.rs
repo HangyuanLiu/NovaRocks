@@ -279,16 +279,6 @@ impl Publisher for CreatePublisher {
             StagedCommitResult::CommitUnknown(message) => {
                 CatalogOutcome::unknown(message, evidence())
             }
-            StagedCommitResult::CommittedResponseInvalid(message) => {
-                CatalogOutcome::KnownCommitted {
-                    effect: ExternalMutationEffect::Applied,
-                    receipt: CommitProof::applied(expected_snapshot_id)
-                        .with_table_uuid(self.prepared.staged.table.metadata().uuid().to_string()),
-                    finalization: cleanup_failed(format!(
-                        "REST staged-create publication committed but response finalization failed: {message}"
-                    )),
-                }
-            }
             StagedCommitResult::Unsupported(reason) => CatalogOutcome::uncommitted(
                 ConnectorMutationFailureKind::Unsupported,
                 reason.message(),

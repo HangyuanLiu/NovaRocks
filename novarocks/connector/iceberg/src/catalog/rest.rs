@@ -66,7 +66,8 @@ impl NovaRocksRestCatalog {
         access_delegation: RestAccessDelegationMode,
     ) -> Self {
         Self {
-            delegate: CatalogDelegate::new(client.clone()),
+            delegate: CatalogDelegate::new(client.clone())
+                .with_uncommitted_proof_rule(super::error::proves_received_conflict),
             client,
             warehouse,
             access_delegation,
@@ -171,6 +172,10 @@ fn accept_rest_page(
 
 #[async_trait]
 impl NovaRocksCatalog for NovaRocksRestCatalog {
+    fn admits_uncommitted_proof(&self, error: &crate::iceberg::Error) -> bool {
+        super::error::proves_received_conflict(error)
+    }
+
     fn listing_admission(&self) -> Arc<super::listing_admission::ListingAdmission> {
         Arc::clone(&self.delegate.listing)
     }
@@ -690,14 +695,14 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                 super::StagedCommitResult::Conflict(error.to_string())
             }
             Err(crate::iceberg_catalog_rest::StagedCommitError::KnownNotDispatched(error)) => {
-                super::StagedCommitResult::KnownUncommitted(error.to_string())
+                super::StagedCommitResult::CommitUnknown(error.to_string())
             }
             Err(crate::iceberg_catalog_rest::StagedCommitError::PossiblyDispatched(error)) => {
                 super::StagedCommitResult::CommitUnknown(error.to_string())
             }
             Err(crate::iceberg_catalog_rest::StagedCommitError::CommittedResponseInvalid(
                 error,
-            )) => super::StagedCommitResult::CommittedResponseInvalid(error.to_string()),
+            )) => super::StagedCommitResult::CommitUnknown(error.to_string()),
         }
     }
 
@@ -824,6 +829,14 @@ fn with_explicit_format_version(
 
 #[cfg(test)]
 mod tests {
+    //! REST publication correctness: after dispatch only a received conflict
+    //! authorizes cleanup or a fresh attempt. Earlier listing and lost-response
+    //! tests did not cover precise 404 errors or response construction failure.
+    //! Expectations follow the publication contract independently of the SDK.
+    //! Each component test owns a loopback ephemeral listener and temporary
+    //! ledger; Drop joins the server before releasing it. The catalog maintainer
+    //! runs these with every connector test invocation; IRU-13a replaces the
+    //! temporary error-kind proof tests with its typed evidence tests.
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -860,6 +873,15 @@ mod tests {
         }
 
         fn start_response(response_body: impl Fn(&str) -> String + Send + 'static) -> Self {
+            Self::start_http_response(move |request| {
+                let target = request.split_whitespace().nth(1).unwrap_or_default();
+                (200, response_body(target))
+            })
+        }
+
+        fn start_http_response(
+            response_body: impl Fn(&str) -> (u16, String) + Send + 'static,
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind paged REST catalog");
             listener
                 .set_nonblocking(true)
@@ -888,17 +910,17 @@ mod tests {
                                 .and_then(|line| line.split_whitespace().nth(1))
                                 .unwrap_or_default()
                                 .to_string();
-                            let body = if target.starts_with("/v1/config") {
-                                r#"{"defaults":{},"overrides":{}}"#.to_string()
+                            let (status, body) = if target.starts_with("/v1/config") {
+                                (200, r#"{"defaults":{},"overrides":{}}"#.to_string())
                             } else {
                                 thread_targets
                                     .lock()
                                     .unwrap_or_else(|error| error.into_inner())
                                     .push(target.clone());
-                                response_body(&target)
+                                response_body(request.lines().next().unwrap_or_default())
                             };
                             let response = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                "HTTP/1.1 {status} Scripted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                                 body.len()
                             );
                             let _ = stream.write_all(response.as_bytes());
@@ -1341,5 +1363,312 @@ mod tests {
                 super::super::listing_admission::LISTING_CONCURRENCY
             );
         }
+    }
+
+    fn commit_response(status: u16) -> String {
+        if status == 200 {
+            "<html>proxy replaced the response</html>".to_string()
+        } else {
+            serde_json::json!({"error": {"message": "scripted response", "type": "CommitFailedException", "code": status}}).to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_owner_and_delegate_require_received_conflict_proof() {
+        use crate::catalog::error::CatalogOutcome;
+        use crate::iceberg::{Error, ErrorKind};
+        for status in [404, 400, 200, 409] {
+            let server =
+                PagedTablesServer::start_http_response(move |_| (status, commit_response(status)));
+            let catalog = server.catalog().await;
+            for kind in [
+                ErrorKind::TableNotFound,
+                ErrorKind::DataInvalid,
+                ErrorKind::Unexpected,
+            ] {
+                assert!(!catalog.admits_uncommitted_proof(&Error::new(kind, "dispatched")));
+            }
+            assert!(
+                catalog.admits_uncommitted_proof(&Error::new(
+                    ErrorKind::CatalogCommitConflicts,
+                    "409"
+                ))
+            );
+            let outcome = catalog
+                .delegate
+                .register_table(
+                    crate::catalog::CatalogTableName::new("db", "t"),
+                    Arc::from("file:///owned/metadata.json"),
+                )
+                .await;
+            if status == 409 {
+                assert!(matches!(outcome, CatalogOutcome::KnownUncommitted { .. }));
+                assert!(outcome.permits_cleanup());
+            } else {
+                assert!(
+                    matches!(outcome, CatalogOutcome::CommitUnknown { .. }),
+                    "{status}: {outcome:?}"
+                );
+                assert!(!outcome.permits_cleanup());
+                assert!(outcome.into_known_committed().is_none());
+            }
+            assert_eq!(server.list_requests(), ["/v1/namespaces/db/register"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_transaction_and_staged_commit_keep_non_conflict_errors_unknown() {
+        use crate::catalog::error::CatalogOutcome;
+        use crate::catalog::transaction::{TransactionIdentity, TransactionRequest};
+        use crate::catalog::{CatalogTableName, CatalogTransactionStart, StagedCommitResult};
+        use crate::commit::model::{AddedContent, ArtifactWriter};
+        use crate::commit::overwrite::preparer_tests::{Fixture, data};
+        use crate::iceberg::spec::{FormatVersion, Struct};
+        for status in [404, 400, 200, 409] {
+            let server =
+                PagedTablesServer::start_http_response(move |_| (status, commit_response(status)));
+            let fixture = Fixture::new();
+            let metadata = fixture.metadata(FormatVersion::V2);
+            let intent = fixture.intent(
+                &metadata,
+                "main",
+                vec![
+                    AddedContent::new_logical_data(
+                        data(
+                            &format!("file://{}/data.parquet", fixture.directory.path().display()),
+                            1,
+                            Struct::empty(),
+                        ),
+                        0,
+                    )
+                    .unwrap(),
+                ],
+            );
+            let catalog = server.catalog().await;
+            let CatalogTransactionStart::Ready(mut tx) = catalog
+                .new_transaction(TransactionRequest {
+                    identity: TransactionIdentity::new("test", [7; 16]),
+                    target: CatalogTableName::new("db", "t"),
+                    target_ref: Arc::from("main"),
+                    base_snapshot_id: None,
+                    expected_table_uuid: Some(Arc::from(metadata.uuid().to_string())),
+                    marker: None,
+                })
+                .await
+            else {
+                panic!("transaction admission");
+            };
+            let (_, request) = fixture
+                .stage(
+                    metadata.clone(),
+                    &intent,
+                    &crate::commit::FastAppendPreparer,
+                )
+                .await;
+            tx.stage(request).unwrap();
+            let outcome = tx.commit().await;
+            if status == 409 {
+                assert!(
+                    matches!(outcome, CatalogOutcome::KnownUncommitted { ref failure } if failure.kind() == novarocks_spi::connector::ConnectorMutationFailureKind::Conflict)
+                );
+            } else {
+                assert!(
+                    matches!(outcome, CatalogOutcome::CommitUnknown { .. }),
+                    "{status}: {outcome:?}"
+                );
+                assert!(!outcome.permits_cleanup());
+                tx.abort().await.expect_err("unknown cannot clean up");
+                assert!(matches!(
+                    tx.commit().await,
+                    CatalogOutcome::CommitUnknown { .. }
+                ));
+            }
+            assert_eq!(server.list_requests(), ["/v1/namespaces/db/tables/t"]);
+
+            let (_, request) = fixture
+                .stage(metadata, &intent, &crate::commit::FastAppendPreparer)
+                .await;
+            let mut staged_owner = server.catalog().await;
+            staged_owner.warehouse = Some(Arc::from(format!(
+                "file://{}",
+                fixture.directory.path().display()
+            )));
+            let outcome = staged_owner
+                .commit_staged_table(
+                    request.into_table_commit(),
+                    fixture.operation.begin_attempt().unwrap().file_io().clone(),
+                )
+                .await;
+            if status == 409 {
+                assert!(matches!(outcome, StagedCommitResult::Conflict(_)));
+            } else {
+                assert!(
+                    matches!(outcome, StagedCommitResult::CommitUnknown(_)),
+                    "{status}: {outcome:?}"
+                );
+            }
+            assert_eq!(server.list_requests().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn rest_transitional_publisher_never_cleans_unknown_objects_and_retries_only_conflict() {
+        use crate::catalog::error::CatalogCommitEvidence;
+        use crate::commit::attempt::{RetryPolicy, TransitionalPublisher};
+        use crate::commit::model::{
+            AddedContent, IcebergCleanupReport, ObjectIdentity, PublicationOutcome,
+        };
+        use crate::commit::overwrite::preparer_tests::{Fixture, data};
+        use crate::commit::staging::PreparedChange;
+        use crate::iceberg::spec::{FormatVersion, Struct};
+        for statuses in [vec![404], vec![400], vec![200], vec![409, 404]] {
+            let fixture = Fixture::new();
+            let metadata = fixture.metadata(FormatVersion::V2);
+            let loaded = serde_json::json!({
+                "metadata-location": format!("file://{}/base.metadata.json", fixture.directory.path().display()),
+                "metadata": metadata,
+            }).to_string();
+            let dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls = Arc::clone(&dispatches);
+            let expected_dispatches = statuses.len();
+            let server = PagedTablesServer::start_http_response(move |request| {
+                if request.starts_with("GET ") {
+                    return (200, loaded.clone());
+                }
+                assert!(
+                    request.starts_with("POST "),
+                    "unexpected mutation: {request}"
+                );
+                let ordinal = calls.fetch_add(1, Ordering::SeqCst);
+                let status = statuses[ordinal];
+                (status, commit_response(status))
+            });
+            let file = format!("file://{}/data.parquet", fixture.directory.path().display());
+            std::fs::write(file.strip_prefix("file://").unwrap(), b"owned data").unwrap();
+            fixture
+                .operation
+                .adopt_session_data(ObjectIdentity::new(file.clone()).unwrap())
+                .unwrap();
+            let intent = fixture.intent(
+                &metadata,
+                "main",
+                vec![AddedContent::new_logical_data(data(&file, 1, Struct::empty()), 0).unwrap()],
+            );
+            let publisher = TransitionalPublisher {
+                catalog: Arc::new(server.catalog().await),
+                ident: crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap(),
+                target_ref: "main".to_string(),
+                evidence: CatalogCommitEvidence::for_target("db.t"),
+                recovery_preflight: Arc::new(|_, _| Ok(())),
+            };
+            let report = crate::commit::attempt::run(
+                &fixture.operation,
+                &intent,
+                &PreparedChange::default(),
+                &[&crate::commit::FastAppendPreparer],
+                &publisher,
+                RetryPolicy::from_properties(&HashMap::from([
+                    ("commit.retry.min-wait-ms".into(), "0".into()),
+                    ("commit.retry.max-wait-ms".into(), "0".into()),
+                ]))
+                .unwrap(),
+            )
+            .await;
+            let PublicationOutcome::Unknown { artifacts, .. } = report.publication else {
+                panic!("expected unknown publication");
+            };
+            assert_eq!(report.cleanup, IcebergCleanupReport::NotAttempted);
+            assert_eq!(dispatches.load(Ordering::SeqCst), expected_dispatches);
+            assert_eq!(artifacts.len(), 3);
+            for artifact in artifacts {
+                assert!(
+                    std::path::Path::new(artifact.object.path().strip_prefix("file://").unwrap())
+                        .exists()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_rest_response_followed_by_local_construction_failure_is_unknown() {
+        use crate::catalog::error::CatalogOutcome;
+        use crate::catalog::transaction::{CreateTableTransactionRequest, TransactionIdentity};
+        use crate::catalog::{
+            CatalogCreateIntent, CatalogTableName, CatalogTransactionStart, StagedCommitResult,
+        };
+        use crate::commit::model::{AddedContent, ArtifactWriter};
+        use crate::commit::overwrite::preparer_tests::{Fixture, data};
+        use crate::iceberg::spec::{FormatVersion, Struct};
+        let fixture = Fixture::new();
+        let metadata = fixture.metadata(FormatVersion::V2);
+        let response = serde_json::json!({
+            "metadata-location": format!("file://{}/published.metadata.json", fixture.directory.path().display()),
+            "metadata": metadata,
+        }).to_string();
+        let server = PagedTablesServer::start_http_response(move |_| (200, response.clone()));
+        let mut owner = server.catalog().await;
+        // The response is valid; this deliberately unbound test client cannot
+        // materialize a FileIO after publication. The outcome must retain the
+        // same uncertainty as any other post-dispatch construction error.
+        owner.access_delegation = RestAccessDelegationMode::Static;
+        owner.warehouse = Some(Arc::from(format!(
+            "file://{}",
+            fixture.directory.path().display()
+        )));
+        let creation = crate::iceberg::TableCreation::builder()
+            .name("t".into())
+            .location(metadata.location().to_string())
+            .schema(metadata.current_schema().as_ref().clone())
+            .build();
+        let CatalogTransactionStart::Ready(mut tx) = owner
+            .new_create_table_transaction(CreateTableTransactionRequest {
+                identity: TransactionIdentity::new("test", [8; 16]),
+                target: CatalogTableName::new("db", "t"),
+                intent: CatalogCreateIntent::EmptyTable,
+                creation,
+                warehouse: owner.warehouse.clone(),
+            })
+            .await
+        else {
+            panic!("creation admission");
+        };
+        let outcome = tx.commit().await;
+        assert!(
+            matches!(outcome, CatalogOutcome::CommitUnknown { .. }),
+            "{outcome:?}"
+        );
+        assert!(!outcome.permits_cleanup());
+        tx.abort().await.expect_err("unknown create cannot abort");
+        assert_eq!(server.list_requests(), ["/v1/namespaces/db/tables"]);
+
+        let intent = fixture.intent(
+            &metadata,
+            "main",
+            vec![
+                AddedContent::new_logical_data(
+                    data(
+                        &format!("file://{}/data.parquet", fixture.directory.path().display()),
+                        1,
+                        Struct::empty(),
+                    ),
+                    0,
+                )
+                .unwrap(),
+            ],
+        );
+        let (_, request) = fixture
+            .stage(metadata, &intent, &crate::commit::FastAppendPreparer)
+            .await;
+        let outcome = owner
+            .commit_staged_table(
+                request.into_table_commit(),
+                fixture.operation.begin_attempt().unwrap().file_io().clone(),
+            )
+            .await;
+        assert!(
+            matches!(outcome, StagedCommitResult::CommitUnknown(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(server.list_requests().len(), 2);
     }
 }

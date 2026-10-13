@@ -51,8 +51,7 @@ use novarocks_spi::connector::{
 };
 
 use super::error::{
-    CatalogCommitEvidence, CatalogOutcome, classify_dispatched_error, proves_uncommitted,
-    uncommitted_failure_kind,
+    CatalogCommitEvidence, CatalogOutcome, proves_uncommitted, uncommitted_failure_kind,
 };
 use super::{CatalogCreateIntent, CatalogTableName};
 
@@ -262,6 +261,7 @@ pub(crate) struct Transaction {
     shape: TransactionShape,
     evidence: CatalogCommitEvidence,
     dispatch: Arc<dyn CatalogCommitDispatch>,
+    admits: super::delegate::UncommittedProofRule,
     staged: Option<crate::commit::model::FrozenRequest>,
     admission: AdmissionFacts,
     state: TransactionState,
@@ -281,10 +281,19 @@ impl Transaction {
             shape,
             evidence,
             dispatch,
+            admits: |_| true,
             staged: None,
             admission: AdmissionFacts::default(),
             state: TransactionState::Admitted,
         }
+    }
+
+    pub(super) fn with_uncommitted_proof_rule(
+        mut self,
+        rule: super::delegate::UncommittedProofRule,
+    ) -> Self {
+        self.admits = rule;
+        self
     }
 
     /// Record what admission observed. Set by the constructor that admitted
@@ -400,7 +409,7 @@ impl Transaction {
                 CatalogOutcome::committed(proof, effect)
             }
             Err(error) => {
-                if proves_uncommitted(&error) {
+                if (self.admits)(&error) && proves_uncommitted(&error) {
                     self.state = TransactionState::Uncommitted;
                     return CatalogOutcome::KnownUncommitted {
                         failure: ConnectorMutationFailure::new(
@@ -411,7 +420,7 @@ impl Transaction {
                 }
                 let evidence = self.evidence.clone();
                 self.state = TransactionState::Unknown(evidence.clone());
-                classify_dispatched_error(&error, || evidence)
+                CatalogOutcome::unknown(error.to_string(), evidence)
             }
         }
     }
@@ -489,6 +498,12 @@ impl Transaction {
 
 #[cfg(test)]
 mod tests {
+    //! Publication-owner correctness coverage: a REST error without received
+    //! conflict proof closes authority and never reaches abort. Existing tests
+    //! cover lost responses, but not precise SDK errors after dispatch. The
+    //! independent oracle is the publication contract, not SDK retryability.
+    //! These in-memory tests run with every connector test invocation; the
+    //! catalog owner maintains them until IRU-13a replaces the evidence seam.
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -499,6 +514,7 @@ mod tests {
         Succeed,
         RejectDefinitely,
         LoseResponse,
+        Reject(ErrorKind),
     }
 
     #[derive(Debug)]
@@ -549,6 +565,7 @@ mod tests {
                 Behavior::LoseResponse => {
                     Err(IcebergError::new(ErrorKind::Unexpected, "connection reset"))
                 }
+                Behavior::Reject(kind) => Err(IcebergError::new(kind, "dispatched failure")),
             }
         }
 
@@ -560,6 +577,49 @@ mod tests {
         async fn abort_before_dispatch(&self) -> Result<(), ConnectorError> {
             self.aborts.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_rule_preserves_default_rejections_but_closes_rest_authority() {
+        for kind in [
+            ErrorKind::TableNotFound,
+            ErrorKind::NamespaceNotFound,
+            ErrorKind::DataInvalid,
+            ErrorKind::PreconditionFailed,
+            ErrorKind::FeatureUnsupported,
+        ] {
+            let default_dispatch = FakeDispatch::new(Behavior::Reject(kind));
+            let mut default = transaction(default_dispatch);
+            assert!(default.commit().await.permits_cleanup(), "{kind:?}");
+            default.abort().await.unwrap();
+
+            let dispatch = FakeDispatch::new(Behavior::Reject(kind));
+            let mut rest = transaction(Arc::clone(&dispatch))
+                .with_uncommitted_proof_rule(super::super::error::proves_received_conflict);
+            let first = rest.commit().await;
+            assert!(
+                matches!(first, CatalogOutcome::CommitUnknown { .. }),
+                "{kind:?}"
+            );
+            assert!(!first.permits_cleanup());
+            assert!(rest.mutation_authority_closed());
+            assert!(matches!(
+                rest.commit().await,
+                CatalogOutcome::CommitUnknown { .. }
+            ));
+            rest.abort().await.expect_err("unknown cannot abort");
+            assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 1);
+            assert_eq!(dispatch.aborts.load(Ordering::SeqCst), 0);
+        }
+        for kind in [
+            ErrorKind::CatalogCommitConflicts,
+            ErrorKind::TableAlreadyExists,
+            ErrorKind::NamespaceAlreadyExists,
+        ] {
+            let mut rest = transaction(FakeDispatch::new(Behavior::Reject(kind)))
+                .with_uncommitted_proof_rule(super::super::error::proves_received_conflict);
+            assert!(rest.commit().await.permits_cleanup(), "{kind:?}");
         }
     }
 
