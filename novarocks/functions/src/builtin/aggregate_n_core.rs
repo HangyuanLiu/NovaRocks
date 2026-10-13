@@ -25,6 +25,28 @@ use arrow_array::{Array, ArrayRef, BinaryArray, LargeBinaryArray, LargeStringArr
 use arrow_buffer::i256;
 use arrow_schema::DataType;
 use std::cmp::Ordering;
+
+/// Source-qualified consumers provide an owned scope around the original sort.
+/// This interface does not itself grant memory or cover other N operations.
+pub trait NSortResources {
+    type Lease;
+    fn before_sort(
+        &mut self,
+        len: usize,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<Self::Lease, crate::KernelFailure>;
+}
+struct NoopSortResources;
+impl NSortResources for NoopSortResources {
+    type Lease = ();
+    fn before_sort(
+        &mut self,
+        _len: usize,
+        _work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), crate::KernelFailure> {
+        Ok(())
+    }
+}
 #[derive(Debug)]
 pub struct NState<A: ScalarStateAllocator> {
     pub allocator: A,
@@ -78,6 +100,26 @@ impl<A: ScalarStateAllocator> NState<A> {
         keep_smallest: bool,
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<(), ScalarStateError> {
+        self.update_from_arrays_with_sort_resources(
+            values,
+            value_row,
+            limits,
+            limit_row,
+            keep_smallest,
+            &mut NoopSortResources,
+            work,
+        )
+    }
+    pub fn update_from_arrays_with_sort_resources<R: NSortResources>(
+        &mut self,
+        values: &ArrayRef,
+        value_row: usize,
+        limits: &ArrayRef,
+        limit_row: usize,
+        keep_smallest: bool,
+        resources: &mut R,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), ScalarStateError> {
         let limit = parse_limit(limits, limit_row, work)?;
         self.init_limit_if_needed(limit)?;
         let Some(value) =
@@ -85,13 +127,29 @@ impl<A: ScalarStateAllocator> NState<A> {
         else {
             return Ok(());
         };
-        self.push_value(value, keep_smallest, work)
+        self.push_value_with_sort_resources(value, keep_smallest, resources, work)
     }
     pub fn merge_from_array(
         &mut self,
         array: &ArrayRef,
         row: usize,
         keep_smallest: bool,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), ScalarStateError> {
+        self.merge_from_array_with_sort_resources(
+            array,
+            row,
+            keep_smallest,
+            &mut NoopSortResources,
+            work,
+        )
+    }
+    pub fn merge_from_array_with_sort_resources<R: NSortResources>(
+        &mut self,
+        array: &ArrayRef,
+        row: usize,
+        keep_smallest: bool,
+        resources: &mut R,
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<(), ScalarStateError> {
         let Some((limit, values)) = decode_payload_at(array, row, &self.allocator, work)? else {
@@ -103,12 +161,17 @@ impl<A: ScalarStateAllocator> NState<A> {
         self.init_limit_if_needed(limit)?;
         for value in values {
             work.step()?;
-            self.push_value(value, keep_smallest, work)?;
+            self.push_value_with_sort_resources(value, keep_smallest, resources, work)?;
         }
         Ok(())
     }
-    fn sort_values(&mut self, work: &mut ScalarWork<'_, '_>) -> Result<(), ScalarStateError> {
+    fn sort_values<R: NSortResources>(
+        &mut self,
+        resources: &mut R,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), ScalarStateError> {
         work.flush()?;
+        let lease = resources.before_sort(self.values.len(), work)?;
         let mut primary = None;
         // Keep the original library stable sort and its error->Equal rule.
         // Only observed host-control errors remain outer typed failures.
@@ -125,6 +188,8 @@ impl<A: ScalarStateAllocator> NState<A> {
                 }
             }
         });
+        // The library's scratch has ended before the caller's owned scope.
+        drop(lease);
         if let Some(error) = primary {
             return Err(error);
         }
@@ -135,6 +200,15 @@ impl<A: ScalarStateAllocator> NState<A> {
         &mut self,
         value: TrackedAggScalarValue<A>,
         keep_smallest: bool,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), ScalarStateError> {
+        self.push_value_with_sort_resources(value, keep_smallest, &mut NoopSortResources, work)
+    }
+    pub fn push_value_with_sort_resources<R: NSortResources>(
+        &mut self,
+        value: TrackedAggScalarValue<A>,
+        keep_smallest: bool,
+        resources: &mut R,
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<(), ScalarStateError> {
         if self.limit == 0 {
@@ -153,7 +227,7 @@ impl<A: ScalarStateAllocator> NState<A> {
             .payload_bytes
             .checked_add(retained)
             .ok_or(crate::KernelFailure::ResourceExhausted)?;
-        self.sort_values(work)?;
+        self.sort_values(resources, work)?;
         if !keep_smallest {
             work.flush()?;
             self.values.reverse();
@@ -168,7 +242,7 @@ impl<A: ScalarStateAllocator> NState<A> {
             self.values.truncate(self.limit);
             work.flush()?;
         }
-        self.sort_values(work)?;
+        self.sort_values(resources, work)?;
         Ok(())
     }
     pub fn serialize<B: ByEncodeBuffer>(
@@ -455,3 +529,7 @@ fn decode_scalar<A: ScalarStateAllocator>(
         other => Err(format!("min_n/max_n decode unknown tag {}", other).into()),
     }
 }
+
+#[cfg(test)]
+#[path = "aggregate_n_core/sort_resource_tests.rs"]
+mod sort_resource_tests;
