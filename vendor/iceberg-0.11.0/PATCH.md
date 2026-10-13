@@ -53,3 +53,12 @@ No patches applied in the initial source commit.
 - Production dependency: NovaRocks commit dependency validation observes the authoritative branch/tag reference set.
 - Exit: remove when upstream exposes the same complete reference-map accessor, or a reviewed consumer migration removes the need for it.
 - Coverage: existing connector commit dependency and ref tests; V2 standalone core check.
+
+## P7a — missing v3 next-row-id read compatibility
+
+- Purpose: preserve the 0.9 read default of `INITIAL_ROW_ID` when v3 metadata omits `next-row-id`; serialization continues emitting it.
+- Files: `src/spec/table_metadata.rs`.
+- Upstream status: no tracked upstream issue; rc.2 requires the field.
+- Production dependency: reading existing Spark REST v3 metadata without the field.
+- Exit: IRU-8 replaces the external semantic-identity compatibility boundary and removes this patch.
+- Coverage: migrated `test_table_metadata_v3_missing_next_row_id_defaults_to_initial`; existing v3 metadata serde tests.
