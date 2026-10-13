@@ -123,6 +123,12 @@ impl ViewMetadataBuilder {
             default_namespace,
             summary,
         } = view_creation;
+        let location = location.ok_or_else(|| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                "ViewCreation.location is required for filesystem-backed catalogs",
+            )
+        })?;
         let version = ViewVersion::builder()
             .with_default_catalog(default_catalog)
             .with_default_namespace(default_namespace)

@@ -100,3 +100,13 @@ No patches applied in the initial source commit.
 - Exit: IRU-9 reviews and replaces the physical-layout boundary, then removes this patch.
 - Coverage: existing Parquet writer tests and connector writer tests; old core has no dedicated schema-override test.
 - Port adaptation: preserve rc.2 encryption-manager/key-metadata initialization while carrying the optional Arrow schema.
+
+## View API — catalog view boundary
+
+- Purpose: preserve the 0.9 Catalog view methods with default FeatureUnsupported results, public ViewCommit/ViewRequirement vocabulary, optional ViewCreation.location, and public ViewRepresentations constructor.
+- Files: `src/catalog/mod.rs`, `src/spec/{view_metadata_builder,view_metadata,view_version}.rs`.
+- Upstream status: no tracked upstream issue; rc.2 lacks Catalog view methods and commit vocabulary.
+- Production dependency: REST-backed view control operations; filesystem-backed view metadata construction explicitly rejects an absent location.
+- Exit: IRU-13b removes this patch when the connector owns the REST view protocol boundary.
+- Coverage: existing view metadata builder/serde tests (creation location adapted to Some), existing connector view tests, and the REST view tests migrated by T3.
+- Port adaptation: SessionCatalog remains upstream; Catalog public signatures are identical to the 0.9 patch.

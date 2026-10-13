@@ -179,6 +179,11 @@ impl ViewRepresentations {
     pub fn iter(&self) -> impl ExactSizeIterator<Item = &'_ ViewRepresentation> {
         self.0.iter()
     }
+
+    /// Create a list of view representations.
+    pub fn new(representations: Vec<ViewRepresentation>) -> Self {
+        Self(representations)
+    }
 }
 
 // Iterator for ViewRepresentations
