@@ -33,9 +33,10 @@ use async_trait::async_trait;
 use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
 use iceberg::table::Table;
+use iceberg::spec::ViewMetadata;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, Runtime,
-    SessionCatalog, SessionContext, TableCommit, TableCreation, TableIdent,
+    SessionCatalog, SessionContext, TableCommit, TableCreation, TableIdent, ViewCommit, ViewCreation,
 };
 use itertools::Itertools;
 use reqwest::header::{
@@ -688,6 +689,36 @@ impl Catalog for RestCatalog {
 
     async fn update_table(&self, commit: TableCommit) -> Result<Table> {
         self.inner.update_table(&self.session_context, commit).await
+    }
+
+    async fn create_view(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: ViewCreation,
+    ) -> Result<ViewMetadata> {
+        self.inner
+            .create_view(&self.session_context, namespace, creation)
+            .await
+    }
+
+    async fn load_view(&self, view: &TableIdent) -> Result<ViewMetadata> {
+        self.inner.load_view(&self.session_context, view).await
+    }
+
+    async fn update_view(&self, commit: ViewCommit) -> Result<ViewMetadata> {
+        self.inner.update_view(&self.session_context, commit).await
+    }
+
+    async fn drop_view(&self, view: &TableIdent) -> Result<()> {
+        self.inner.drop_view(&self.session_context, view).await
+    }
+
+    async fn view_exists(&self, view: &TableIdent) -> Result<bool> {
+        self.inner.view_exists(&self.session_context, view).await
+    }
+
+    async fn list_views(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
+        self.inner.list_views(&self.session_context, namespace).await
     }
 }
 

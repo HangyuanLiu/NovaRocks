@@ -26,6 +26,8 @@ use iceberg::{
 use serde_derive::{Deserialize, Serialize};
 
 use crate::endpoint::Endpoint;
+use iceberg::spec::{ViewMetadata, ViewVersion};
+use iceberg::{ViewRequirement, ViewUpdate};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct CatalogConfig {
@@ -346,6 +348,51 @@ impl std::fmt::Debug for LoadCredentialsResult {
             .finish()
     }
 }
+
+/// Request body for `POST .../namespaces/{ns}/views`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub struct CreateViewRequest {
+    /// Name of the view to create
+    pub name: String,
+    /// Optional view location. If not provided, the server will choose a location.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<String>,
+    /// View schema
+    pub schema: Schema,
+    /// Initial view version describing the view definition
+    pub view_version: ViewVersion,
+    /// Properties to set on the view
+    pub properties: HashMap<String, String>,
+}
+
+/// Response body shared by view create / load / commit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub struct LoadViewResult {
+    /// Location of the view metadata file
+    pub metadata_location: String,
+    /// The view's full metadata
+    pub metadata: ViewMetadata,
+    /// View-specific configuration overriding catalog configuration
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub config: HashMap<String, String>,
+}
+
+/// Request body for `POST .../namespaces/{ns}/views/{view}` (view commit).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommitViewRequest {
+    /// View identifier to update
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identifier: Option<TableIdent>,
+    /// List of requirements that must be satisfied before committing changes
+    pub requirements: Vec<ViewRequirement>,
+    /// List of updates to apply to the view metadata
+    pub updates: Vec<ViewUpdate>,
+}
+
+/// `GET .../namespaces/{ns}/views` shares the list-tables wire shape.
+pub type ListViewsResponse = ListTablesResponse;
 
 #[cfg(test)]
 mod tests {

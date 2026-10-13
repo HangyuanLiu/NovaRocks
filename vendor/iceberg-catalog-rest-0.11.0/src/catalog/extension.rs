@@ -132,8 +132,12 @@ impl Debug for RestAccessDelegation {
     }
 }
 
-use crate::types::LoadCredentialsResult;
+use crate::types::{
+    CommitViewRequest, CreateViewRequest, ListViewsResponse, LoadCredentialsResult, LoadViewResult,
+};
 use iceberg::TableUpdate;
+use iceberg::spec::{ViewMetadata, ViewVersion};
+use iceberg::{ViewCommit, ViewCreation};
 
 /// A table response whose immutable metadata has not yet been associated with
 /// a [`FileIO`].
@@ -637,6 +641,259 @@ impl RestSessionCatalog {
             runtime: self.runtime.clone(),
             kms_client: self.kms_client.clone(),
         })
+    }
+}
+
+impl RestCatalogConfig {
+    fn views_endpoint(&self, ns: &NamespaceIdent) -> String {
+        self.url_prefixed(&["namespaces", &ns.to_url_string(), "views"])
+    }
+
+    fn view_endpoint(&self, view: &TableIdent) -> String {
+        self.url_prefixed(&[
+            "namespaces",
+            &view.namespace.to_url_string(),
+            "views",
+            &view.name,
+        ])
+    }
+}
+
+impl RestSessionCatalog {
+    /// Create a new view inside the namespace.
+    pub async fn create_view(
+        &self,
+        _context: &SessionContext,
+        namespace: &NamespaceIdent,
+        creation: ViewCreation,
+    ) -> Result<ViewMetadata> {
+        let client = self.client().await?;
+
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("system clock before epoch: {e}"),
+                )
+            })?
+            .as_millis() as i64;
+        let view_version = ViewVersion::builder()
+            .with_version_id(1)
+            .with_schema_id(creation.schema.schema_id())
+            .with_timestamp_ms(timestamp_ms)
+            .with_summary(creation.summary)
+            .with_representations(creation.representations)
+            .with_default_catalog(creation.default_catalog)
+            .with_default_namespace(creation.default_namespace)
+            .build();
+
+        let request = HttpRequest::build(
+            client
+                .http_client
+                .request(Method::POST, client.config.views_endpoint(namespace))
+                .json(&CreateViewRequest {
+                    name: creation.name,
+                    location: creation.location,
+                    schema: creation.schema,
+                    view_version,
+                    properties: creation.properties,
+                }),
+        )?;
+
+        let http_response = client.query_catalog(request).await?;
+
+        match http_response.status() {
+            StatusCode::OK => {
+                let response = deserialize_catalog_response::<LoadViewResult>(http_response)?;
+                Ok(response.metadata)
+            }
+            StatusCode::NOT_FOUND => Err(Error::new(
+                ErrorKind::NamespaceNotFound,
+                "Tried to create a view under a namespace that does not exist",
+            )),
+            StatusCode::CONFLICT => {
+                Err(Error::new(ErrorKind::Unexpected, "The view already exists"))
+            }
+            _ => Err(deserialize_unexpected_catalog_error(
+                http_response,
+                client.http_client.disable_header_redaction(),
+            )),
+        }
+    }
+
+    /// Load a view's metadata from the catalog.
+    pub async fn load_view(
+        &self,
+        _context: &SessionContext,
+        view: &TableIdent,
+    ) -> Result<ViewMetadata> {
+        let client = self.client().await?;
+
+        let request = HttpRequest::build(
+            client
+                .http_client
+                .request(Method::GET, client.config.view_endpoint(view)),
+        )?;
+
+        let http_response = client.query_catalog(request).await?;
+
+        match http_response.status() {
+            StatusCode::OK => {
+                let response = deserialize_catalog_response::<LoadViewResult>(http_response)?;
+                Ok(response.metadata)
+            }
+            StatusCode::NOT_FOUND => Err(Error::new(
+                ErrorKind::Unexpected,
+                "Tried to load a view that does not exist",
+            )),
+            _ => Err(deserialize_unexpected_catalog_error(
+                http_response,
+                client.http_client.disable_header_redaction(),
+            )),
+        }
+    }
+
+    /// Commit updates to an existing view.
+    pub async fn update_view(
+        &self,
+        _context: &SessionContext,
+        mut commit: ViewCommit,
+    ) -> Result<ViewMetadata> {
+        let client = self.client().await?;
+
+        let request = HttpRequest::build(
+            client
+                .http_client
+                .request(
+                    Method::POST,
+                    client.config.view_endpoint(commit.identifier()),
+                )
+                .json(&CommitViewRequest {
+                    identifier: Some(commit.identifier().clone()),
+                    requirements: commit.take_requirements(),
+                    updates: commit.take_updates(),
+                }),
+        )?;
+
+        let http_response = client.query_catalog(request).await?;
+
+        match http_response.status() {
+            StatusCode::OK => {
+                let response = deserialize_catalog_response::<LoadViewResult>(http_response)?;
+                Ok(response.metadata)
+            }
+            StatusCode::NOT_FOUND => Err(Error::new(
+                ErrorKind::Unexpected,
+                "Tried to update a view that does not exist",
+            )),
+            StatusCode::CONFLICT => Err(Error::new(
+                ErrorKind::CatalogCommitConflicts,
+                "View commit failed due to a conflicting update",
+            )
+            .with_retryable(true)),
+            _ => Err(deserialize_unexpected_catalog_error(
+                http_response,
+                client.http_client.disable_header_redaction(),
+            )),
+        }
+    }
+
+    /// Drop a view from the catalog.
+    pub async fn drop_view(&self, _context: &SessionContext, view: &TableIdent) -> Result<()> {
+        let client = self.client().await?;
+
+        let request = HttpRequest::build(
+            client
+                .http_client
+                .request(Method::DELETE, client.config.view_endpoint(view)),
+        )?;
+
+        let http_response = client.query_catalog(request).await?;
+
+        match http_response.status() {
+            StatusCode::OK | StatusCode::NO_CONTENT => Ok(()),
+            StatusCode::NOT_FOUND => Err(Error::new(
+                ErrorKind::Unexpected,
+                "Tried to drop a view that does not exist",
+            )),
+            _ => Err(deserialize_unexpected_catalog_error(
+                http_response,
+                client.http_client.disable_header_redaction(),
+            )),
+        }
+    }
+
+    /// Check if a view exists in the catalog.
+    pub async fn view_exists(&self, _context: &SessionContext, view: &TableIdent) -> Result<bool> {
+        let client = self.client().await?;
+
+        let request = HttpRequest::build(
+            client
+                .http_client
+                .request(Method::HEAD, client.config.view_endpoint(view)),
+        )?;
+
+        let http_response = client.query_catalog(request).await?;
+
+        match http_response.status() {
+            StatusCode::OK | StatusCode::NO_CONTENT => Ok(true),
+            StatusCode::NOT_FOUND => Ok(false),
+            _ => Err(deserialize_unexpected_catalog_error(
+                http_response,
+                client.http_client.disable_header_redaction(),
+            )),
+        }
+    }
+
+    /// List views in the namespace.
+    pub async fn list_views(
+        &self,
+        _context: &SessionContext,
+        namespace: &NamespaceIdent,
+    ) -> Result<Vec<TableIdent>> {
+        let client = self.client().await?;
+        let endpoint = client.config.views_endpoint(namespace);
+        let mut identifiers = Vec::new();
+        let mut next_token = None;
+
+        loop {
+            let mut request = client.http_client.request(Method::GET, endpoint.clone());
+
+            if let Some(token) = next_token {
+                request = request.query(&[("pageToken", token)]);
+            }
+
+            let http_response = client.query_catalog(HttpRequest::build(request)?).await?;
+
+            match http_response.status() {
+                StatusCode::OK => {
+                    let response =
+                        deserialize_catalog_response::<ListViewsResponse>(http_response)?;
+
+                    identifiers.extend(response.identifiers);
+
+                    match response.next_page_token {
+                        Some(token) => next_token = Some(token),
+                        None => break,
+                    }
+                }
+                StatusCode::NOT_FOUND => {
+                    return Err(Error::new(
+                        ErrorKind::NamespaceNotFound,
+                        "Tried to list views under a namespace that does not exist",
+                    ));
+                }
+                _ => {
+                    return Err(deserialize_unexpected_catalog_error(
+                        http_response,
+                        client.http_client.disable_header_redaction(),
+                    ));
+                }
+            }
+        }
+
+        Ok(identifiers)
     }
 }
 
