@@ -90,3 +90,13 @@ No patches applied in the initial source commit.
 - Production dependency: REST staged-create publication preserves UUID, location, IDs, format, properties, and high-watermarks supplied by the catalog; depends on U2.
 - Exit: IRU-13b removes this patch when the connector owns authoritative REST initialization.
 - Coverage: old core had no dedicated test. The old REST `catalog.rs:4383` test `test_staged_create_initialization_updates_preserve_v2_and_v3_format` and related authoritative staged-create tests are migrated by T3; existing connector staged-create tests cover consumption.
+
+## U8 — physical Arrow writer schema override
+
+- Purpose: preserve the 0.9 `ParquetWriterBuilder::with_arrow_schema_override` API and the schema used for lazy Parquet writer initialization.
+- Files: `src/writer/file_writer/parquet_writer.rs`.
+- Upstream status: no tracked upstream issue; rc.2 has no equivalent override.
+- Production dependency: retained physical-layout extension seam; Variant functionality remains unavailable in IRU-3 and no upstream Variant writer restriction is changed.
+- Exit: IRU-9 reviews and replaces the physical-layout boundary, then removes this patch.
+- Coverage: existing Parquet writer tests and connector writer tests; old core has no dedicated schema-override test.
+- Port adaptation: preserve rc.2 encryption-manager/key-metadata initialization while carrying the optional Arrow schema.
