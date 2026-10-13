@@ -44,3 +44,17 @@ accounting hooks. Only the approved protocol/API patch inventory may diverge.
 - Exit: IRU-13a replaces the vendored REST evidence and credential handoff.
 - Coverage: `catalog::extension::tests::storage_delegation_exposes_exact_keys_without_debug_secrets`.
 - Validation: standalone REST crate tests once the shared Cargo window is free.
+
+### R7: deferred table materialization bound to the loading owner
+
+- Files: `src/catalog/extension.rs`, `src/catalog.rs`.
+- Purpose: keep deferred table/staged-create response facts opaque until the
+  provider chooses an admitted FileIO; capture Runtime and KMS from the loading
+  RestSessionCatalog and pass them to TableBuilder without ambient discovery.
+- Upstream status: no equivalent deferred credential handoff at the baseline.
+- Production dependency: NovaRocks `loaded_table.rs`, `catalog/rest.rs`, and
+  execution credential acquisition materialize the response with their FileIO.
+- Exit: IRU-13a replaces the vendored materialization and evidence surface.
+- Coverage: `catalog::extension::tests::deferred_materialization_retains_loading_runtime_and_kms_without_ambient_runtime`;
+  deferred load/stage component tests migrate with R5 and R3.
+- Validation: standalone REST crate tests after the shared Cargo window is free.

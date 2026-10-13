@@ -18,7 +18,10 @@
 //! This module contains the iceberg REST catalog implementation.
 
 mod extension;
-pub use extension::{RestAccessDelegation, StorageCredentialDelegation};
+pub use extension::{
+    DeferredRestTableMaterialization, DeferredRestTableWithAccessDelegation,
+    DeferredStagedTableCreateWithAccessDelegation, RestAccessDelegation, StorageCredentialDelegation,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
