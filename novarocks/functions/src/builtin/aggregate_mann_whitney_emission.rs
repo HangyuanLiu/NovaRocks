@@ -40,6 +40,10 @@ use std::sync::Arc;
 /// The concrete owner keeps its core private and !Sync. Each call opens just
 /// one short state borrow; no sample or owned temporary escapes the callback.
 pub(super) trait MannEmissionAccess {
+    fn validate_host(
+        &self,
+        host: &Arc<dyn crate::AggregateStateAllocator>,
+    ) -> Result<(), KernelFailure>;
     fn extents(&self) -> Result<MannStateExtents, KernelFailure>;
     fn with_core(
         &self,
@@ -124,6 +128,7 @@ where
     let mut resources = MannEmissionResources::new(kind, rows);
     for state in states.clone() {
         work.step()?;
+        state.validate_host(host)?;
         resources
             .add_state(state.extents()?, source)
             .map_err(resource_failure)?;

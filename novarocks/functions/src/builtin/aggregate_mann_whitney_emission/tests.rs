@@ -288,6 +288,16 @@ struct State {
     renders: std::cell::Cell<usize>,
 }
 impl MannEmissionAccess for State {
+    fn validate_host(&self, host: &Arc<dyn AggregateStateAllocator>) -> Result<(), KernelFailure> {
+        let core = self
+            .core
+            .try_borrow()
+            .map_err(|_| internal("test state borrow conflict"))?;
+        if !core.allocator.has_host_authority(host) {
+            return Err(invalid("test state emission has another host authority"));
+        }
+        Ok(())
+    }
     fn extents(&self) -> Result<MannStateExtents, KernelFailure> {
         self.visits.set(self.visits.get() + 1);
         let core = self
