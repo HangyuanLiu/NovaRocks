@@ -317,13 +317,30 @@ pub(super) fn compile(package: Arc<FragmentPackage>, dop: usize) -> Arc<LocalPro
 /// Prepare and run the program with its frozen driver count; a preparation
 /// or execution failure is returned as text.
 pub(super) fn try_run(program: &Arc<LocalProgram>) -> Result<Vec<Chunk>, String> {
+    try_run_in(program, None)
+}
+
+/// A declared original query tracker for resource-owning component fixtures.
+/// Other family fixtures keep their original untracked inputs unchanged.
+pub(super) fn run_with_tracker(
+    program: &Arc<LocalProgram>,
+    tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
+) -> Vec<Chunk> {
+    try_run_in(program, Some(tracker))
+        .unwrap_or_else(|error| panic!("tracked compiled program runs: {error}"))
+}
+fn try_run_in(
+    program: &Arc<LocalProgram>,
+    tracker: Option<Arc<crate::runtime::mem_tracker::MemTracker>>,
+) -> Result<Vec<Chunk>, String> {
+    let tracked = tracker.is_some();
     let state = Arc::new(RuntimeState::new(
         None,
         None,
         None,
         None,
         None,
-        None,
+        tracker,
         Some(crate::runtime::execution_runtime::test_execution_runtime()),
     ));
     let output = ResultSinkHandle::new();
@@ -339,7 +356,14 @@ pub(super) fn try_run(program: &Arc<LocalProgram>) -> Result<Vec<Chunk>, String>
         Arc::new(NoopFragmentEventSink),
     )
     .map_err(|error| error.to_string())?;
-    prepared.start().join().map_err(|error| error.to_string())?;
+    let running = prepared.start();
+    running.join().map_err(|error| error.to_string())?;
+    if tracked {
+        assert!(
+            running.stopped_fact().is_some(),
+            "successful join proves actual driver exit"
+        );
+    }
     Ok(output.take_chunks())
 }
 

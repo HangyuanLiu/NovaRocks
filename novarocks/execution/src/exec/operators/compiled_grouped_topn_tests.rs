@@ -93,24 +93,62 @@ fn fixture_with_keys(
     ranking: &[(usize, bool, bool)],
     limit: usize,
 ) -> Fixture {
+    fixture_with_calls(key_types, rows, ranking, limit, false)
+}
+
+fn largeint_type() -> FunctionValueType {
+    FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        true,
+        ValueLogicalType::LargeInt,
+    )
+    .unwrap()
+}
+
+fn fixture_with_calls(
+    key_types: &[FunctionValueType],
+    rows: &[Vec<LiteralValue>],
+    ranking: &[(usize, bool, bool)],
+    limit: usize,
+    n_lists: bool,
+) -> Fixture {
     let groups = key_types.len();
     assert_eq!(ranking.len(), groups);
-    let catalog = aggregate_catalog(&[
-        ("count", PureKernelAbi::AggregateWindowV1),
-        ("sum", PureKernelAbi::AggregateWindowV1),
-        ("min", PureKernelAbi::AggregateWindowV1),
-        ("max", PureKernelAbi::AggregateWindowV1),
-    ]);
-    let bounds = [
-        bind(&catalog, "count", &[]),
-        bind(&catalog, "sum", &[int64(true)]),
-        bind(&catalog, "min", &[int64(true)]),
-        bind(&catalog, "max", &[int64(true)]),
-    ];
+    let owners: &[(&str, PureKernelAbi)] = if n_lists {
+        &[
+            ("min_n", PureKernelAbi::AggregateV1),
+            ("max_n", PureKernelAbi::AggregateV1),
+        ]
+    } else {
+        &[
+            ("count", PureKernelAbi::AggregateWindowV1),
+            ("sum", PureKernelAbi::AggregateWindowV1),
+            ("min", PureKernelAbi::AggregateWindowV1),
+            ("max", PureKernelAbi::AggregateWindowV1),
+        ]
+    };
+    let catalog = aggregate_catalog(owners);
+    let bounds = owners
+        .iter()
+        .map(|(name, _)| {
+            let arguments = if n_lists {
+                vec![largeint_type(), int64(false)]
+            } else if *name == "count" {
+                vec![]
+            } else {
+                vec![int64(true)]
+            };
+            bind(&catalog, name, &arguments)
+        })
+        .collect::<Vec<_>>();
     let mut builder = FragmentBuilder::new(FragmentId::new(1));
     let source = builder.reserve_node_id().unwrap();
     let mut types = key_types.to_vec();
-    types.push(int64(true));
+    if n_lists {
+        types.extend([largeint_type(), int64(false)]);
+    } else {
+        types.push(int64(true));
+    }
     let (columns, constants) = declared_values(&mut builder, source, &types, rows);
     let sequence = |ordinal: usize| AggregateSequenceId::new(41 + ordinal as u32);
     let partial_calls = bounds
@@ -123,7 +161,9 @@ fn fixture_with_keys(
                 sequence: sequence(ordinal),
             },
             distinct: false,
-            arguments: if ordinal == 0 {
+            arguments: if n_lists {
+                vec![columns[groups], columns[groups + 1]]
+            } else if ordinal == 0 {
                 vec![]
             } else {
                 vec![columns[groups]]
@@ -523,6 +563,9 @@ fn oracle(limit: usize, asc: bool, nulls_first: bool) -> Vec<Output> {
     rows
 }
 fn final_chunks(f: &Fixture, chunks: Vec<Chunk>) -> Vec<Chunk> {
+    final_chunks_tracked(f, chunks, MemTracker::new_root("grouped-fixture-final"))
+}
+fn final_chunks_tracked(f: &Fixture, chunks: Vec<Chunk>, tracker: Arc<MemTracker>) -> Vec<Chunk> {
     let factory = CompiledAggregateProcessorFactory::try_new(
         Arc::clone(&f.program),
         f.final_node,
@@ -530,7 +573,7 @@ fn final_chunks(f: &Fixture, chunks: Vec<Chunk>) -> Vec<Chunk> {
     )
     .unwrap();
     let mut operator = factory.create(1, 0);
-    operator.set_mem_tracker(MemTracker::new_root("grouped-fixture-final"));
+    operator.set_mem_tracker(tracker);
     let state = RuntimeState::default();
     let processor = operator.as_processor_mut().unwrap();
     for chunk in chunks {
@@ -545,8 +588,11 @@ fn final_chunks(f: &Fixture, chunks: Vec<Chunk>) -> Vec<Chunk> {
 }
 
 fn collect_final(f: &Fixture, chunks: Vec<Chunk>) -> Vec<Output> {
+    read_final_rows(final_chunks(f, chunks))
+}
+fn read_final_rows(chunks: Vec<Chunk>) -> Vec<Output> {
     let mut result = Vec::new();
-    for chunk in final_chunks(f, chunks) {
+    for chunk in chunks {
         let columns = chunk
             .batch
             .columns()
@@ -995,3 +1041,6 @@ fn compiled_grouped_topn_complete_key_domains_preserve_order_types_and_contribut
         }
     }
 }
+
+#[path = "compiled_grouped_topn_state_tests.rs"]
+mod state_tests;
