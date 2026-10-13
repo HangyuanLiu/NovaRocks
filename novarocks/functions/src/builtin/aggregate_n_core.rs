@@ -56,6 +56,51 @@ impl NSortResources for NoopSortResources {
         Ok(())
     }
 }
+/// A reached decimal codec call owns its external scope until the original
+/// call and its temporary output end. Default callers add no observations.
+pub trait NCodecResources {
+    type Lease;
+    fn before_decimal256_format(
+        &mut self,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<Self::Lease, crate::KernelFailure>;
+    fn after_decimal256_format(
+        &mut self,
+        _text: &str,
+        _capacity: usize,
+        _work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), crate::KernelFailure> {
+        Ok(())
+    }
+    fn before_decimal256_parse(
+        &mut self,
+        text_bytes: usize,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<Self::Lease, crate::KernelFailure>;
+    fn after_decimal256_parse(
+        &mut self,
+        _work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), crate::KernelFailure> {
+        Ok(())
+    }
+}
+struct NoopCodecResources;
+impl NCodecResources for NoopCodecResources {
+    type Lease = ();
+    fn before_decimal256_format(
+        &mut self,
+        _work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), crate::KernelFailure> {
+        Ok(())
+    }
+    fn before_decimal256_parse(
+        &mut self,
+        _text_bytes: usize,
+        _work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), crate::KernelFailure> {
+        Ok(())
+    }
+}
 #[derive(Debug)]
 pub struct NState<A: ScalarStateAllocator> {
     pub allocator: A,
@@ -161,7 +206,32 @@ impl<A: ScalarStateAllocator> NState<A> {
         resources: &mut R,
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<(), ScalarStateError> {
-        let Some((limit, values)) = decode_payload_at(array, row, &self.allocator, work)? else {
+        self.merge_from_array_with_resources(
+            array,
+            row,
+            keep_smallest,
+            resources,
+            &mut NoopCodecResources,
+            work,
+        )
+    }
+    pub fn merge_from_array_with_resources<S: NSortResources, C: NCodecResources>(
+        &mut self,
+        array: &ArrayRef,
+        row: usize,
+        keep_smallest: bool,
+        sort_resources: &mut S,
+        codec_resources: &mut C,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), ScalarStateError> {
+        let Some((limit, values)) = decode_payload_at_with_codec_resources(
+            array,
+            row,
+            &self.allocator,
+            codec_resources,
+            work,
+        )?
+        else {
             return Ok(());
         };
         if limit == 0 {
@@ -170,7 +240,7 @@ impl<A: ScalarStateAllocator> NState<A> {
         self.init_limit_if_needed(limit)?;
         for value in values {
             work.step()?;
-            self.push_value_with_sort_resources(value, keep_smallest, resources, work)?;
+            self.push_value_with_sort_resources(value, keep_smallest, sort_resources, work)?;
         }
         Ok(())
     }
@@ -269,11 +339,19 @@ impl<A: ScalarStateAllocator> NState<A> {
         out: &mut B,
         work: &mut ScalarWork<'_, '_>,
     ) -> Result<(), ScalarStateError> {
+        self.serialize_with_codec_resources(out, &mut NoopCodecResources, work)
+    }
+    pub fn serialize_with_codec_resources<B: ByEncodeBuffer, R: NCodecResources>(
+        &self,
+        out: &mut B,
+        resources: &mut R,
+        work: &mut ScalarWork<'_, '_>,
+    ) -> Result<(), ScalarStateError> {
         out.append(&(self.limit as u32).to_le_bytes(), work)?;
         out.append(&(self.values.len() as u32).to_le_bytes(), work)?;
         for value in &self.values {
             work.step()?;
-            encode_scalar(out, value, work)?;
+            encode_scalar(out, value, resources, work)?;
         }
         Ok(())
     }
@@ -309,6 +387,15 @@ pub fn decode_payload_at<A: ScalarStateAllocator>(
     array: &ArrayRef,
     row: usize,
     allocator: &A,
+    work: &mut ScalarWork<'_, '_>,
+) -> Result<Option<(usize, ScalarVec<TrackedAggScalarValue<A>, A>)>, ScalarStateError> {
+    decode_payload_at_with_codec_resources(array, row, allocator, &mut NoopCodecResources, work)
+}
+pub fn decode_payload_at_with_codec_resources<A: ScalarStateAllocator, R: NCodecResources>(
+    array: &ArrayRef,
+    row: usize,
+    allocator: &A,
+    resources: &mut R,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<Option<(usize, ScalarVec<TrackedAggScalarValue<A>, A>)>, ScalarStateError> {
     work.step()?;
@@ -364,7 +451,9 @@ pub fn decode_payload_at<A: ScalarStateAllocator>(
     )?;
     for _ in 0..count {
         work.step()?;
-        values.push(decode_scalar(payload, &mut pos, allocator, work)?);
+        values.push(decode_scalar(
+            payload, &mut pos, allocator, resources, work,
+        )?);
     }
     Ok(Some((limit, values)))
 }
@@ -394,9 +483,10 @@ fn need_len(bytes: &[u8], pos: usize, need: usize, label: &str) -> Result<(), Sc
     Ok(())
 }
 
-fn encode_scalar<A: ScalarStateAllocator, B: ByEncodeBuffer>(
+fn encode_scalar<A: ScalarStateAllocator, B: ByEncodeBuffer, R: NCodecResources>(
     out: &mut B,
     value: &TrackedAggScalarValue<A>,
+    resources: &mut R,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<(), ScalarStateError> {
     work.step()?;
@@ -434,11 +524,17 @@ fn encode_scalar<A: ScalarStateAllocator, B: ByEncodeBuffer>(
         }
         TrackedAggScalarValue::Decimal256(v) => {
             out.push(11)?;
+            let lease = resources.before_decimal256_format(work)?;
             let text = v.to_string();
+            resources.after_decimal256_format(&text, text.capacity(), work)?;
             let len = u32::try_from(text.len())
                 .map_err(|_| "min_n/max_n decimal256 length overflow".to_string())?;
             out.append(&len.to_le_bytes(), work)?;
             out.append(text.as_bytes(), work)?;
+            // The returned OWN String ends before either reservation.
+            // On an error, reverse declaration order preserves the same rule.
+            drop(text);
+            drop(lease);
         }
         other => {
             return Err(
@@ -449,10 +545,11 @@ fn encode_scalar<A: ScalarStateAllocator, B: ByEncodeBuffer>(
     Ok(())
 }
 
-fn decode_scalar<A: ScalarStateAllocator>(
+fn decode_scalar<A: ScalarStateAllocator, R: NCodecResources>(
     bytes: &[u8],
     pos: &mut usize,
     allocator: &A,
+    resources: &mut R,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<TrackedAggScalarValue<A>, ScalarStateError> {
     work.step()?;
@@ -540,9 +637,12 @@ fn decode_scalar<A: ScalarStateAllocator>(
             let text = std::str::from_utf8(&bytes[*pos..*pos + len])
                 .map_err(|e| format!("min_n/max_n decimal256 decode failed: {}", e))?;
             *pos += len;
+            let lease = resources.before_decimal256_parse(text.len(), work)?;
             let value = text
                 .parse::<i256>()
                 .map_err(|_| "min_n/max_n decimal256 parse failed".to_string())?;
+            resources.after_decimal256_parse(work)?;
+            drop(lease);
             Ok(TrackedAggScalarValue::Decimal256(value))
         }
         other => Err(format!("min_n/max_n decode unknown tag {}", other).into()),

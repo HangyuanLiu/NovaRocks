@@ -81,6 +81,7 @@ mod aggregate_mann_whitney_resources;
 mod aggregate_mann_whitney_selected;
 mod aggregate_n;
 pub mod aggregate_n_core;
+mod aggregate_n_largeint_resources;
 mod aggregate_n_owner;
 mod aggregate_percentile;
 mod aggregate_percentile_owner;
