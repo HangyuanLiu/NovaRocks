@@ -3674,6 +3674,7 @@ dependencies = [
  "iceberg-catalog-rest",
  "novarocks-connector-contract",
  "novarocks-connector-iceberg-functions",
+ "novarocks-failpoint",
  "novarocks-fs",
  "novarocks-proto-codec",
  "novarocks-proto-models",
@@ -3808,6 +3809,7 @@ dependencies = [
  "novarocks-connector-iceberg",
  "novarocks-connector-iceberg-functions",
  "novarocks-execution-contract",
+ "novarocks-failpoint",
  "novarocks-functions",
  "novarocks-local-compiler",
  "novarocks-local-program",
@@ -3858,7 +3860,11 @@ dependencies = [
 name = "novarocks-failpoint"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "novarocks-types",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -3945,6 +3951,7 @@ dependencies = [
  "futures",
  "http",
  "libc",
+ "novarocks-failpoint",
  "novarocks-secret",
  "novarocks-spi",
  "opendal",
@@ -4061,6 +4068,7 @@ dependencies = [
  "futures",
  "hex",
  "novarocks-catalog-application",
+ "novarocks-failpoint",
  "novarocks-query-application",
  "novarocks-spi",
  "novarocks-sql",
@@ -4091,6 +4099,7 @@ dependencies = [
  "libc",
  "mysql_common 0.32.4",
  "novarocks-execution-contract",
+ "novarocks-failpoint",
  "novarocks-parser",
  "novarocks-query-application",
  "novarocks-result-contract",
@@ -4268,6 +4277,7 @@ dependencies = [
  "bytes",
  "novarocks-connector-contract",
  "novarocks-execution-contract",
+ "novarocks-failpoint",
  "novarocks-parser",
  "novarocks-physical-plan",
  "novarocks-result-contract",
@@ -4685,6 +4695,7 @@ dependencies = [
  "futures",
  "novarocks-execution",
  "novarocks-execution-contract",
+ "novarocks-failpoint",
  "novarocks-memory",
  "novarocks-result-contract",
  "novarocks-spi",

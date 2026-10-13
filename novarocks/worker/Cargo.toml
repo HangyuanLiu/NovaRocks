@@ -11,9 +11,12 @@ workspace = true
 doctest = false
 
 [features]
+normal-build = ["novarocks-execution/normal-build", "novarocks-failpoint?/normal-build"]
+test-controls = ["novarocks-execution/test-controls", "dep:novarocks-failpoint", "novarocks-failpoint/test-controls"]
 test-support = []
 
 [dependencies]
+novarocks-failpoint = { workspace = true, optional = true }
 arrow.workspace = true
 async-trait.workspace = true
 bytes.workspace = true

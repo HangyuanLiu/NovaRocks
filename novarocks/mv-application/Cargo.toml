@@ -8,9 +8,12 @@ license.workspace = true
 workspace = true
 
 [features]
+normal-build = ["novarocks-query-application/normal-build", "novarocks-failpoint?/normal-build"]
+test-controls = ["novarocks-query-application/test-controls", "dep:novarocks-failpoint", "novarocks-failpoint/test-controls"]
 test-support = []
 
 [dependencies]
+novarocks-failpoint = { workspace = true, optional = true }
 novarocks-type-contract.workspace = true
 apache-avro.workspace = true
 async-trait.workspace = true

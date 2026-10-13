@@ -51,6 +51,7 @@ futures.workspace = true
 hex.workspace = true
 libc.workspace = true
 serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "sync", "time"] }
 toml.workspace = true
 tracing.workspace = true
@@ -68,16 +69,17 @@ tikv-jemallocator = { workspace = true, optional = true }
 tikv-jemallocator = { workspace = true, optional = true, features = ["background_threads"] }
 
 [features]
+normal-build = ["novarocks-connector-iceberg/normal-build", "novarocks-execution/normal-build", "novarocks-failpoint/normal-build", "novarocks-frontend-application/normal-build", "novarocks-fs/normal-build", "novarocks-mv-application/normal-build", "novarocks-mysql-adapter/normal-build", "novarocks-native-adapter/normal-build", "novarocks-query-application/normal-build", "novarocks-version/normal-build", "novarocks-worker/normal-build"]
+test-controls = ["novarocks-connector-iceberg/test-controls", "novarocks-execution/test-controls", "novarocks-failpoint/test-controls", "novarocks-frontend-application/test-controls", "novarocks-fs/test-controls", "novarocks-mv-application/test-controls", "novarocks-mysql-adapter/test-controls", "novarocks-native-adapter/test-controls", "novarocks-query-application/test-controls", "novarocks-version/test-controls", "novarocks-worker/test-controls"]
 mem-1-m07-hms-listing-observe = ["novarocks-connector-iceberg/mem-1-m07-hms-listing-observe", "novarocks-frontend-application/mem-1-m07-hms-listing-observe"]
 mem-1-m07-closing-pressure = ["novarocks-frontend-application/mem-1-m07-closing-pressure"]
 mem-1-m07-root-observation = ["novarocks-frontend-application/mem-1-m07-root-observation"]
 mem-1-m07-exact-mysql-write = ["novarocks-frontend-application/mem-1-m07-exact-mysql-write"]
-default = ["jemalloc"]
+default = ["jemalloc", "normal-build"]
 # jemalloc is the only supported production allocator. Building without this
 # feature keeps the system allocator for same-revision baselines and for tools
 # that require it; such a build is not a supported deployment.
 jemalloc = ["dep:tikv-jemalloc-ctl", "dep:tikv-jemallocator"]
-mv-first-refresh-staging-test-support = []
 native-compatibility-test-fixture = ["novarocks-version/native-compatibility-test-fixture"]
 # Debug-only candidate island for physical wire v2: every role in the binary
 # composes the compiled-package static plan interpreter instead of the plan
@@ -89,7 +91,6 @@ physical-wire-v2-candidate = ["dep:novarocks-arrow-ipc-frame", "dep:novarocks-pl
 
 [dev-dependencies]
 arrow-schema.workspace = true
-serde_json.workspace = true
 # `server_binary_smoke` spawns the real `novarocks` binary and drives it over
 # MySQL; `state_store_app_config` asserts config/composition by direct call.
 # Domain behaviour belongs to its owner crate, the SQL suites or the system

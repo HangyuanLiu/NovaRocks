@@ -15,13 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Test-only fault vocabulary and token protocol shared by role processes and
-//! their cross-process harness.  The vocabulary below has no crate
-//! dependencies; the default `typed` feature additionally validates a token
-//! against a native query execution identity.  Role hooks keep their existing
-//! `debug_assertions` gates, cleanup claims keep their runtime behavior, and
-//! release startup rejects the environment variables.  This crate introduces
-//! no additional activation gate.
+//! Shared test vocabulary and bounded role-session protocol.
+//! Mechanical declarations and runner clients do not grant product control.
+//! The role receiver and finite action scopes exist only with `test-controls`;
+//! domain owners retain exact target matching and product lifecycle ownership.
+
+#[cfg(all(feature = "normal-build", feature = "test-controls"))]
+compile_error!("normal-build cannot include test-controls");
+
+/// Capabilities compiled by this owner; activation still requires a role session.
+pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
+    (
+        env!("CARGO_PKG_NAME"),
+        &[
+            #[cfg(feature = "test-controls")]
+            "test-controls",
+        ],
+    )
+}
+
+#[cfg(all(unix, feature = "typed"))]
+pub mod liveness;
+#[cfg(feature = "test-controls")]
+pub mod scope;
+pub mod session;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1236,3 +1253,6 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove root");
     }
 }
+
+#[cfg(all(test, unix, feature = "test-controls"))]
+mod session_tests;

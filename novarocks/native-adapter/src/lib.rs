@@ -17,6 +17,17 @@
 
 //! Server-resolved Native transport capabilities and protocol adapters.
 
+#[cfg(all(feature = "normal-build", feature = "test-controls"))]
+compile_error!("normal-build cannot include test-controls");
+
+/// Capabilities compiled by this owner; activation still requires a role session.
+pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
+    (env!("CARGO_PKG_NAME"), &[
+        #[cfg(feature = "test-controls")]
+        "test-controls",
+    ])
+}
+
 extern crate self as novarocks_native_adapter;
 
 pub mod backend_announce;

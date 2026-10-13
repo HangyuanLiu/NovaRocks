@@ -11,9 +11,12 @@ workspace = true
 doctest = false
 
 [features]
+normal-build = ["novarocks-failpoint?/normal-build"]
+test-controls = ["dep:novarocks-failpoint", "novarocks-failpoint/test-controls"]
 core-pipeline-integration = []
 
 [dependencies]
+novarocks-failpoint = { workspace = true, optional = true }
 novarocks-result-contract.workspace = true
 arrow.workspace = true
 arrow-buffer.workspace = true

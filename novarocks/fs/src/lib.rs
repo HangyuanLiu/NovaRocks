@@ -21,6 +21,17 @@
 //! correctness. Connector implementations bind authorized storage access and
 //! ask this crate to read physical Parquet or ORC columns.
 
+#[cfg(all(feature = "normal-build", feature = "test-controls"))]
+compile_error!("normal-build cannot include test-controls");
+
+/// Capabilities compiled by this owner; activation still requires a role session.
+pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
+    (env!("CARGO_PKG_NAME"), &[
+        #[cfg(feature = "test-controls")]
+        "test-controls",
+    ])
+}
+
 mod access;
 mod cache;
 mod catalog_properties;

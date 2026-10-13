@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod build_information;
 mod be_log_directive;
 mod cluster;
 mod config;
@@ -4636,6 +4637,10 @@ fn selected_cases_require_cleanup_faults(
 // ---------------------------------------------------------------------------
 
 pub fn run_correctness() -> Result<()> {
+    if std::env::args().skip(1).eq(["--build-info"]) {
+        println!("{}", build_information::value(cfg!(debug_assertions), cfg!(panic = "unwind")));
+        return Ok(());
+    }
     let exit_code = run_cli(Cli::parse())?;
     if exit_code != 0 {
         std::process::exit(exit_code);

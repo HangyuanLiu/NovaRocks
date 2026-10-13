@@ -25,6 +25,21 @@
 //! execution modules.
 
 /// Stable provider identity used by server composition and SPI declarations.
+#[cfg(all(feature = "normal-build", feature = "test-controls"))]
+compile_error!("normal-build cannot include test-controls");
+#[cfg(all(feature = "mem-1-m07-hms-listing-observe", not(feature = "test-controls")))]
+compile_error!("mem-1-m07-hms-listing-observe requires test-controls");
+
+/// Capabilities compiled by this owner; activation still requires a role session.
+pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
+    (env!("CARGO_PKG_NAME"), &[
+        #[cfg(feature = "test-controls")]
+        "test-controls",
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+        "mem-1-m07-hms-listing-observe",
+    ])
+}
+
 pub const PROVIDER_ID: &str = "iceberg";
 
 pub mod access_binding;

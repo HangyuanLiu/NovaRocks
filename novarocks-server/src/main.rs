@@ -557,6 +557,10 @@ mod tests {
 
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.as_slice() == ["--build-info"] {
+        println!("{}", novarocks_server::build_information::value(cfg!(debug_assertions), cfg!(panic = "unwind")));
+        return;
+    }
     #[cfg(feature = "mem-1-m07-hms-listing-observe")]
     if args.as_slice() == ["--mem-1-m07-hms-listing-build-identity"] {
         println!(
