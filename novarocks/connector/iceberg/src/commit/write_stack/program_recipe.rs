@@ -220,6 +220,7 @@ fn validate_data(
         )
     })?;
     let facts = FrozenDataWriteFacts {
+        format_version: handle.table().format_version(),
         table_location: copy_text(handle.table().table_location(), work)?,
         data_location: copy_text(handle.table().data_location(), work)?,
         target_partition_spec_id: handle.table().default_partition_spec_id(),

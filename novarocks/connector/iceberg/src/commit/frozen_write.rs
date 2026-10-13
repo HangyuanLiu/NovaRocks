@@ -37,6 +37,7 @@ use crate::schema_mapping::annotate_schema_from_scan_model;
 /// Secret-free DATA writer facts decoded from one exact-generation handle.
 #[derive(Clone, Debug)]
 pub struct FrozenDataWriteFacts {
+    pub format_version: u8,
     pub table_location: String,
     pub data_location: String,
     pub target_partition_spec_id: i32,
@@ -344,6 +345,16 @@ fn build_target_table_metadata(
     writer_schema: &crate::iceberg::spec::Schema,
     work: &mut SchemaWork<'_>,
 ) -> Result<TableMetadata, FrozenWriteSchemaError> {
+    let format_version = match facts.format_version {
+        1 => crate::iceberg::spec::FormatVersion::V1,
+        2 => crate::iceberg::spec::FormatVersion::V2,
+        3 => crate::iceberg::spec::FormatVersion::V3,
+        version => {
+            return Err(FrozenWriteSchemaError::Source(format!(
+                "Frozen Iceberg writer format version must be 1, 2, or 3; got {version}"
+            )));
+        }
+    };
     let partition_spec = build_staged_partition_spec(
         writer_schema,
         facts.target_partition_spec_id,
@@ -369,7 +380,7 @@ fn build_target_table_metadata(
             PartitionSpec::unpartition_spec(),
             SortOrder::unsorted_order(),
             facts.table_location.clone(),
-            crate::iceberg::spec::FormatVersion::V2,
+            format_version,
             properties,
         )
         .map_err(|error| format!("build staged Iceberg table metadata: {error}"))?
@@ -768,6 +779,7 @@ mod pure_schema_tests {
     }
     fn facts(fields: Vec<IcebergSchemaFieldDef>) -> FrozenDataWriteFacts {
         FrozenDataWriteFacts {
+            format_version: 2,
             table_location: "file:///tmp/frozen-schema-pure".to_string(),
             data_location: "file:///tmp/frozen-schema-pure/data".to_string(),
             target_partition_spec_id: 7,
@@ -778,6 +790,120 @@ mod pure_schema_tests {
             parquet_row_group_size_bytes: Some(1024),
         }
     }
+    #[test]
+    fn frozen_writer_ordinary_schema_preserves_exact_v1_and_v2_format() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        for (number, expected) in [
+            (1, crate::iceberg::spec::FormatVersion::V1),
+            (2, crate::iceberg::spec::FormatVersion::V2),
+        ] {
+            let mut data = facts(vec![frozen_field(1, "id", vec![])]);
+            data.format_version = number;
+            data.target_partition_spec_id = 0;
+            let prepared =
+                prepare_frozen_write_schema(&schema, &data, &Control::default()).unwrap();
+            assert_eq!(prepared.metadata.format_version(), expected);
+            assert_eq!(prepared.metadata.default_partition_spec_id(), 0);
+            assert_eq!(
+                prepared
+                    .writer_schema
+                    .field_by_id(1)
+                    .unwrap()
+                    .field_type
+                    .as_ref(),
+                &Type::Primitive(PrimitiveType::Long)
+            );
+            let execution = prepare_schema_core(&schema, &data, &mut SchemaWork(None)).unwrap();
+            assert_eq!(execution.metadata.format_version(), expected);
+        }
+    }
+
+    #[test]
+    fn frozen_writer_v3_accepts_nanoseconds_and_v2_rejects_them() {
+        use arrow::datatypes::TimeUnit;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Nanosecond, None), true),
+            Field::new(
+                "zoned",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+        ]));
+        let mut data = facts(vec![
+            frozen_field(1, "ts", vec![]),
+            frozen_field(2, "zoned", vec![]),
+        ]);
+        data.format_version = 3;
+        let prepared = prepare_frozen_write_schema(&schema, &data, &Control::default()).unwrap();
+        assert_eq!(
+            prepared.metadata.format_version(),
+            crate::iceberg::spec::FormatVersion::V3
+        );
+        assert_eq!(prepared.metadata.default_partition_spec_id(), 7);
+        assert_eq!(prepared.metadata.default_sort_order_id(), 0);
+        for (id, expected) in [
+            (1, PrimitiveType::TimestampNs),
+            (2, PrimitiveType::TimestamptzNs),
+        ] {
+            assert_eq!(
+                prepared
+                    .writer_schema
+                    .field_by_id(id)
+                    .unwrap()
+                    .field_type
+                    .as_ref(),
+                &Type::Primitive(expected)
+            );
+        }
+        assert_eq!(
+            prepared.arrow_schema.fields()[0].data_type(),
+            schema.fields()[0].data_type()
+        );
+        assert_eq!(
+            prepared.arrow_schema.fields()[1].data_type(),
+            schema.fields()[1].data_type()
+        );
+        let execution = prepare_schema_core(&schema, &data, &mut SchemaWork(None)).unwrap();
+        assert_eq!(
+            execution.metadata.format_version(),
+            crate::iceberg::spec::FormatVersion::V3
+        );
+        data.format_version = 2;
+        let message = source_error(prepare_frozen_write_schema(
+            &schema,
+            &data,
+            &Control::default(),
+        ));
+        assert!(message.contains("Invalid schema for v2"), "{message}");
+        assert!(message.contains("timestamp_ns"), "{message}");
+        let message = source_error(prepare_schema_core(&schema, &data, &mut SchemaWork(None)));
+        assert!(message.contains("Invalid schema for v2"), "{message}");
+        assert!(message.contains("timestamp_ns"), "{message}");
+    }
+
+    #[test]
+    fn frozen_writer_invalid_format_never_uses_a_default() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)]));
+        for version in [0, 4, u8::MAX] {
+            let mut data = facts(vec![frozen_field(1, "id", vec![])]);
+            data.format_version = version;
+            let expected =
+                format!("Frozen Iceberg writer format version must be 1, 2, or 3; got {version}");
+            assert_eq!(
+                source_error(prepare_frozen_write_schema(
+                    &schema,
+                    &data,
+                    &Control::default()
+                )),
+                expected
+            );
+            assert_eq!(
+                source_error(prepare_schema_core(&schema, &data, &mut SchemaWork(None))),
+                expected
+            );
+        }
+    }
+
     fn marker(name: &str, ty: DataType, nullable: bool) -> Field {
         Field::new(name, ty, nullable).with_metadata(HashMap::from([(
             "source-marker".to_string(),

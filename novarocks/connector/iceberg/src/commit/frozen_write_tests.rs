@@ -61,6 +61,7 @@ fn frozen_facts(
     fields: Vec<crate::scan_model::IcebergSchemaFieldDef>,
 ) -> FrozenDataWriteFacts {
     FrozenDataWriteFacts {
+        format_version: 2,
         table_location: location.to_string(),
         data_location: format!("{location}/data"),
         target_partition_spec_id: 7,
