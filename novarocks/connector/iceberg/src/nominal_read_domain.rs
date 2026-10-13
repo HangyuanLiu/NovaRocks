@@ -104,9 +104,11 @@ impl NominalReadDomain {
                 "Iceberg nominal read field identity conflicts with its declaration",
             ));
         }
-        let mut metadata = field.metadata().clone();
-        metadata.insert(NR_LOGICAL_TYPE_KEY.into(), self.name().into());
-        Ok(field.clone().with_metadata(metadata))
+        let mut annotated = field.clone();
+        annotated
+            .metadata_mut()
+            .insert(NR_LOGICAL_TYPE_KEY.into(), self.name().into());
+        Ok(annotated)
     }
 }
 
