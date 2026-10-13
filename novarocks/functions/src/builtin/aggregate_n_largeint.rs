@@ -51,6 +51,9 @@ fn allocator_retained(allocator: &HostAggregateAllocator) -> Result<usize, Kerne
     )
 }
 impl NLargeIntState {
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.retained.get()
+    }
     fn account(
         &self,
         core: &CoreNState<HostAggregateAllocator>,
@@ -82,6 +85,9 @@ impl NLargeIntState {
     }
 }
 impl NEmissionAccess for NLargeIntState {
+    fn latch(&self) {
+        NLargeIntState::latch(self);
+    }
     fn validate(
         &self,
         contract: &Arc<AggregateCallContract>,
@@ -134,6 +140,16 @@ pub(super) struct NLargeIntMerge<'a> {
     charge: OpaqueRetainedCharge,
     retained: usize,
 }
+impl NLargeIntUpdate<'_> {
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.retained
+    }
+}
+impl NLargeIntMerge<'_> {
+    pub(super) fn retained_bytes(&self) -> usize {
+        self.retained
+    }
+}
 #[derive(Debug)]
 pub(super) struct NLargeIntKernel {
     pub(super) contract: Arc<AggregateCallContract>,
@@ -154,7 +170,7 @@ impl NLargeIntKernel {
             keep_smallest,
         })
     }
-    fn emit<'s, I>(
+    pub(super) fn emit<'s, S, I>(
         &self,
         states: I,
         expected: AggregateInvocationPhase,
@@ -162,7 +178,8 @@ impl NLargeIntKernel {
         control: &dyn KernelEvaluationControl,
     ) -> Result<ArrayRef, EvaluationFailure>
     where
-        I: ExactSizeIterator<Item = &'s NLargeIntState> + Clone,
+        S: NEmissionAccess + 's,
+        I: ExactSizeIterator<Item = &'s S> + Clone,
     {
         let result = (|| {
             if context.phase() != expected {

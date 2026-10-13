@@ -36,6 +36,7 @@ use arrow_array::{ArrayRef, builder::BinaryBuilder};
 use std::sync::Arc;
 
 pub(super) trait NEmissionAccess {
+    fn latch(&self);
     fn validate(
         &self,
         contract: &Arc<AggregateCallContract>,
