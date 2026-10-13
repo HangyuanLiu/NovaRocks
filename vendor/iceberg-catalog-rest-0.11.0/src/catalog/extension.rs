@@ -132,12 +132,12 @@ impl Debug for RestAccessDelegation {
     }
 }
 
+use iceberg::spec::{ViewMetadata, ViewVersion};
+use iceberg::{TableUpdate, ViewCommit, ViewCreation};
+
 use crate::types::{
     CommitViewRequest, CreateViewRequest, ListViewsResponse, LoadCredentialsResult, LoadViewResult,
 };
-use iceberg::TableUpdate;
-use iceberg::spec::{ViewMetadata, ViewVersion};
-use iceberg::{ViewCommit, ViewCreation};
 
 /// A table response whose immutable metadata has not yet been associated with
 /// a [`FileIO`].
@@ -1063,7 +1063,6 @@ mod tests {
     //! the NovaRocks connector maintainer owns it until IRU-13a replaces R6.
     //! Scripted HTTP cases each own a mockito listener and join its lifetime
     //! on drop; they preserve the prior credential response and opt-in oracle.
-    use super::*;
     use iceberg::TableRequirement;
     use iceberg::io::LocalFsStorageFactory;
     use iceberg::spec::{
@@ -1074,6 +1073,8 @@ mod tests {
     use mockito::{Matcher, Mock, Server, ServerGuard};
     use serde_json::json;
     use uuid::uuid;
+
+    use super::*;
 
     async fn create_config_mock(server: &mut ServerGuard) -> Mock {
         server
@@ -1131,14 +1132,29 @@ mod tests {
             Runtime::try_current().unwrap()
         };
         for has_kms in [false, true] {
-            let mut response: serde_json::Value =
-                serde_json::from_str(include_str!("../../testdata/create_table_response.json"))
-                    .unwrap();
-            response["metadata"]["format-version"] = serde_json::json!(3);
-            response["metadata"]["next-row-id"] = serde_json::json!(0);
-            response["metadata"]["properties"]["encryption.key-id"] =
-                serde_json::json!("table-key");
-            let response: LoadTableResult = serde_json::from_value(response).unwrap();
+            let metadata = TableMetadataBuilder::new(
+                Schema::builder()
+                    .with_fields(vec![
+                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    ])
+                    .build()
+                    .unwrap(),
+                UnboundPartitionSpec::default(),
+                SortOrder::unsorted_order(),
+                "s3://warehouse/data/".into(),
+                FormatVersion::V3,
+                HashMap::from([("encryption.key-id".into(), "table-key".into())]),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+            let response = LoadTableResult {
+                metadata_location: Some("s3://warehouse/data/metadata.json".into()),
+                metadata,
+                config: HashMap::new(),
+                storage_credentials: None,
+            };
             let kms_client = has_kms.then(|| {
                 Arc::new(iceberg::encryption::kms::MemoryKeyManagementClient::new())
                     as Arc<dyn KeyManagementClient>
@@ -1296,7 +1312,7 @@ mod tests {
         let stage_create_mock = server
             .mock("POST", "/v1/namespaces/ns1/tables")
             .match_header("x-iceberg-access-delegation", "vended-credentials")
-            .match_body(mockito::Matcher::PartialJson(json!({
+            .match_body(Matcher::PartialJson(json!({
                 "name": "test1",
                 "stage-create": true,
                 "properties": {"owner": "request-owner"}
@@ -1419,7 +1435,7 @@ mod tests {
         });
         let commit_mock = server
             .mock("POST", "/v1/namespaces/ns1/tables/test1")
-            .match_body(mockito::Matcher::Json(
+            .match_body(Matcher::Json(
                 serde_json::to_value(&expected_request).unwrap(),
             ))
             .with_status(200)

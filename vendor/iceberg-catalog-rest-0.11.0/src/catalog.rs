@@ -18,11 +18,6 @@
 //! This module contains the iceberg REST catalog implementation.
 
 mod extension;
-pub use extension::{
-    DeferredRestTableMaterialization, DeferredRestTableWithAccessDelegation,
-    DeferredStagedTableCreateWithAccessDelegation, RestAccessDelegation, StagedCommitError, StagedCreateError, StagedTableCreate, StorageCredentialDelegation,
-};
-
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
@@ -30,13 +25,19 @@ use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
+pub use extension::{
+    DeferredRestTableMaterialization, DeferredRestTableWithAccessDelegation,
+    DeferredStagedTableCreateWithAccessDelegation, RestAccessDelegation, StagedCommitError,
+    StagedCreateError, StagedTableCreate, StorageCredentialDelegation,
+};
 use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
-use iceberg::table::Table;
 use iceberg::spec::ViewMetadata;
+use iceberg::table::Table;
 use iceberg::{
     Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result, Runtime,
-    SessionCatalog, SessionContext, TableCommit, TableCreation, TableIdent, ViewCommit, ViewCreation,
+    SessionCatalog, SessionContext, TableCommit, TableCreation, TableIdent, ViewCommit,
+    ViewCreation,
 };
 use itertools::Itertools;
 use reqwest::header::{
@@ -718,7 +719,9 @@ impl Catalog for RestCatalog {
     }
 
     async fn list_views(&self, namespace: &NamespaceIdent) -> Result<Vec<TableIdent>> {
-        self.inner.list_views(&self.session_context, namespace).await
+        self.inner
+            .list_views(&self.session_context, namespace)
+            .await
     }
 }
 

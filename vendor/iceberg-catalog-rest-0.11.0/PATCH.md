@@ -32,6 +32,28 @@ accounting hooks. Only the approved protocol/API patch inventory may diverge.
 - Independently check this crate with sibling Iceberg patches when resolvable;
   record unavailable upstream development dependencies as a validation gap.
 
+Standalone validation uses the root development profile parameters and sibling
+patches. From this crate directory:
+
+```sh
+export CARGO_PROFILE_DEV_DEBUG=line-tables-only
+export CARGO_PROFILE_DEV_OPT_DEBUG=line-tables-only
+cargo check --lib --profile dev-opt --target-dir ../../target \
+  --config 'patch.crates-io.iceberg.path="../iceberg-0.11.0"' \
+  --config 'patch.crates-io.iceberg-property-macro.path="../iceberg-property-macro-0.11.0"' \
+  --config 'profile.dev-opt.inherits="dev"' \
+  --config 'profile.dev-opt.opt-level=1' --config 'profile.dev-opt.debug=1' \
+  --config 'profile.dev-opt.incremental=true' --config 'profile.dev-opt.lto=false' \
+  --config 'profile.dev-opt.codegen-units=256'
+# Repeat the same arguments with `cargo test --locked --lib`.
+```
+
+The final cutover validation ran the standalone check and the complete library
+suite: **102 passed, 0 failed, 0 ignored**. Earlier compilation failures from
+unused import qualifications are retained with their corrected reruns in the
+IRU-3 execution evidence. The generated standalone lock is retained outside
+source control; package content and dependency resolution remain reproducible.
+
 ## Patch inventory
 
 ### R6: redacted storage-delegation handoff

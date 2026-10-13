@@ -20,15 +20,16 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 
-use iceberg::spec::{Schema, SortOrder, TableMetadata, UnboundPartitionSpec};
+use iceberg::spec::{
+    Schema, SortOrder, TableMetadata, UnboundPartitionSpec, ViewMetadata, ViewVersion,
+};
 use iceberg::{
     Error, ErrorKind, Namespace, NamespaceIdent, TableIdent, TableRequirement, TableUpdate,
+    ViewRequirement, ViewUpdate,
 };
 use serde_derive::{Deserialize, Serialize};
 
 use crate::endpoint::Endpoint;
-use iceberg::spec::{ViewMetadata, ViewVersion};
-use iceberg::{ViewRequirement, ViewUpdate};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct CatalogConfig {
@@ -381,8 +382,8 @@ pub struct LoadCredentialsResult {
     pub storage_credentials: Option<Vec<StorageCredential>>,
 }
 
-impl std::fmt::Debug for LoadCredentialsResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for LoadCredentialsResult {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LoadCredentialsResult")
             .field(
                 "storage_credentials",
