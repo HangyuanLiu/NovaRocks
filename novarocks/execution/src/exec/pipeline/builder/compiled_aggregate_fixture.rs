@@ -918,21 +918,58 @@ pub(super) fn try_run(
     bindings: ExchangeBindings,
     instance: UniqueId,
 ) -> Result<(), String> {
+    try_run_in(program, sink, bindings, instance, runtime_state(), false)
+}
+
+/// The same original local execution lane with an explicit declared query
+/// tracker. This is test input wiring, not a new source, control or executor.
+pub(super) fn try_run_with_tracker(
+    program: &Arc<LocalProgram>,
+    sink: Box<dyn OperatorFactory>,
+    bindings: ExchangeBindings,
+    instance: UniqueId,
+    tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
+) -> Result<(), String> {
+    let state = Arc::new(RuntimeState::new(
+        None,
+        None,
+        None,
+        Some(instance),
+        None,
+        Some(tracker),
+        Some(crate::runtime::execution_runtime::test_execution_runtime()),
+    ));
+    try_run_in(program, sink, bindings, instance, state, true)
+}
+fn try_run_in(
+    program: &Arc<LocalProgram>,
+    sink: Box<dyn OperatorFactory>,
+    bindings: ExchangeBindings,
+    instance: UniqueId,
+    state: Arc<RuntimeState>,
+    tracked: bool,
+) -> Result<(), String> {
     let dop = i32::try_from(program.graph().profile().pipeline_dop().get()).unwrap();
-    prepare_compiled_program_pipeline_execution(
+    let running = prepare_compiled_program_pipeline_execution(
         Arc::clone(program),
         Duration::from_millis(10),
         sink,
         bindings,
         Some((instance.high(), instance.low())),
         dop,
-        runtime_state(),
+        state,
         Arc::new(NoopFragmentEventSink),
     )
     .map_err(|error| error.to_string())?
-    .start()
-    .join()
-    .map_err(|error| error.to_string())
+    .start();
+    running.join().map_err(|error| error.to_string())?;
+    if tracked {
+        assert!(
+            running.stopped_fact().is_some(),
+            "successful join proves actual driver exit"
+        );
+    }
+    Ok(())
 }
 
 /// The single receiver of `program`, registered for `instance` with

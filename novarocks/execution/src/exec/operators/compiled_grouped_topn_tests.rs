@@ -1044,3 +1044,6 @@ fn compiled_grouped_topn_complete_key_domains_preserve_order_types_and_contribut
 
 #[path = "compiled_grouped_topn_state_tests.rs"]
 mod state_tests;
+
+#[path = "compiled_grouped_topn_exchange_tests.rs"]
+mod exchange_tests;
