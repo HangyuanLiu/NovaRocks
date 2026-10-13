@@ -17,6 +17,9 @@
 
 //! This module contains the iceberg REST catalog implementation.
 
+mod extension;
+pub use extension::{RestAccessDelegation, StorageCredentialDelegation};
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::future::Future;

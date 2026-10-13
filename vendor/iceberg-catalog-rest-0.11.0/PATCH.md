@@ -34,4 +34,13 @@ accounting hooks. Only the approved protocol/API patch inventory may diverge.
 
 ## Patch inventory
 
-No patches applied in the initial source commit.
+### R6: redacted storage-delegation handoff
+
+- Files: `src/catalog/extension.rs`, `src/catalog.rs`.
+- Purpose: retain `StorageCredentialDelegation` and `RestAccessDelegation` with
+  exact-key lookup and credential-free Debug output; no raw map or serialization.
+- Upstream status: no equivalent closed handoff surface at the pinned baseline.
+- Production dependency: NovaRocks credential parsing in `loaded_table.rs`.
+- Exit: IRU-13a replaces the vendored REST evidence and credential handoff.
+- Coverage: `catalog::extension::tests::storage_delegation_exposes_exact_keys_without_debug_secrets`.
+- Validation: standalone REST crate tests once the shared Cargo window is free.
