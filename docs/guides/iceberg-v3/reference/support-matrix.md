@@ -93,10 +93,10 @@ under the License.
 
 | 能力 | 状态 | 备注 |
 | --- | --- | --- |
-| variant（读） | ✅ | `src/exec/variant.rs` |
-| variant（INSERT 写） | ✅ | PR #87；`INSERT INTO ... VALUES (parse_json(...))` / `INSERT INTO ... SELECT` 均 OK；PR6 支持显式 shredding 表属性 |
-| variant（OVERWRITE / DELETE / UPDATE / MERGE / equality-delete 写） | ❌ | PR #87 fail-fast，错误信息明确指向非目标边界 |
-| variant shredding（`typed_value` 子树） | ✅ | 读已支持；INSERT 写通过 `write.parquet.variant-shredding.<col>` 显式开启 |
+| variant（读） | 🚧 待恢复 | iceberg-rust 0.11 切换仅保证编译，无 Iceberg 读取功能承诺；见 [Variant](../variant.md) |
+| variant（INSERT 写） | ❌ 暂不可用 | 旧转换已退出，上游 writer 拒绝 Variant；等待正式物理布局接缝恢复 |
+| variant（OVERWRITE / DELETE / UPDATE / MERGE / equality-delete 写） | ❌ 暂不可用 | 当前不支持 Variant 数据路径 |
+| variant shredding（`typed_value` 子树） | 🚧 读待恢复 / ❌ 写 | 不声明 Iceberg 读能力；旧属性解析与写出转换已删除 |
 | variant default value（`initial-default` / `write-default`） | ❌ | |
 | variant 在 partition spec / sort order / equality_ids | ❌ | spec 禁止；NovaRocks reject |
 | variant predicate pushdown 到 parquet | ❌ | 当前在 BE 层 evaluate |

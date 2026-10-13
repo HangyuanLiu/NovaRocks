@@ -34,6 +34,7 @@ use crate::scan_model::{
     IcebergDeleteFileInfo, IcebergPartitionFieldValue, IcebergPartitionValue,
 };
 
+// Design: ADR-0174 (docs/adr/ADR-0174-vendored-iceberg-baseline-and-patch-policy.md)
 /// Read a pinned manifest list directly through its admitted FileIO.
 /// This preserves the existing unencrypted metadata read boundary.
 pub async fn load_manifest_list(

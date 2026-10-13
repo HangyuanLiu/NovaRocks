@@ -65,7 +65,7 @@ datasketches = { version = "=0.5.0", default-features = false }
 flatbuffers = "25.9.23"
 futures = "0.3"
 h2 = "0.4"
-hashbrown = "0.14"
+hashbrown = "0.14.5"
 hex = "0.4"
 hmac = "0.12"
 http = "1"
@@ -191,6 +191,7 @@ incremental = true
 lto = false
 codegen-units = 256
 
+# Design: ADR-0174 (docs/adr/ADR-0174-vendored-iceberg-baseline-and-patch-policy.md)
 # Vendored iceberg-rust 0.11 retains format/read primitives, view support and
 # authoritative staged-create facts. NovaRocks owns commit preparation and
 # retry; the public TableCommit builder remains its terminal owner boundary.

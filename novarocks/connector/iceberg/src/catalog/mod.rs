@@ -397,6 +397,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     /// Whether this owner accepts the client's error as evidence for a
     /// dispatched mutation. This grants no proof by itself: callers must also
     /// check the shared definite-rejection classifier.
+    // Design: ADR-0174 (docs/adr/ADR-0174-vendored-iceberg-baseline-and-patch-policy.md)
     fn admits_uncommitted_proof(&self, _error: &crate::iceberg::Error) -> bool {
         true
     }

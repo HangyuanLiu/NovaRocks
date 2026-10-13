@@ -49,6 +49,23 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
 
 这是验收命令入口，文档更新本身不是套件通过证据。
 
+## REST 认证
+
+当前使用 vendored iceberg-rust `0.11.0` 的 `AuthManager`。`rest.auth.type` 现在会生效，按 ASCII 大小写不敏感匹配：
+
+| 用户属性 | 行为 |
+|---|---|
+| `rest.auth.type=none` | 不添加 OAuth2/Bearer 认证；服务端 `/v1/config` 返回 token 也不会自行启用认证 |
+| `rest.auth.type=oauth2` | 选择 SDK OAuth2 会话；已配置 token 优先，否则通过已配置 credential 换取并缓存 token |
+| 未配置 `rest.auth.type` | 只从用户配置的 `token`、`credential`、`oauth2-server-uri` 推断；存在任一项则选 OAuth2，否则为 none |
+| 其它值 | 操作初始化失败，明确报告未知认证类型；不会回退到匿名方式 |
+
+OAuth2 的隐式推断会在初始化时记告警。明确写 `rest.auth.type` 可避免这条告警；只填写 `oauth2-server-uri` 并不会创造认证凭据。
+
+FE catalog 定义不能直接保存 token/credential。默认选择 `none` 时，不再像旧版本那样因 `/v1/config` 下发 token 而启用认证；依赖这种下发行为的服务需要调整认证配置。已经显式选择或推断为 OAuth2 时，SDK 会话仍按合并后的属性消费服务端 token，当前尚未由新的 Connector 会话权威关闭该覆盖。不要把服务端下发属性当成另一条 FE 凭据配置入口。
+
+BE 使用消费方已有 token/credential 的注入方式保持。SDK 缓存的认证 token 不自动刷新；对象存储委派凭据的续租另由消费方 `StorageAuthority`/凭据租约驱动，两者不是同一个凭据生命周期。`header.*` 仍在认证之后合并，显式 Authorization header 可覆盖生成的 token header。后续会话所有权迁移需要单独验证这些行为，不能从本地匿名 fixture 推断远程认证能力。
+
 ## Hadoop 与 Hive
 
 Hadoop 实现入口为 `novarocks/connector/iceberg/src/hadoop_catalog.rs`；使用 `iceberg.catalog.type=hadoop` 和明确 warehouse。它的 metadata/commit 约定由该实现管理，不应把 warehouse 当作可以绕过原 catalog 协调直接写入的路径。
