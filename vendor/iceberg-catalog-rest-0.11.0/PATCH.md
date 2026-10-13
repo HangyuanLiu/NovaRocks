@@ -127,3 +127,16 @@ accounting hooks. Only the approved protocol/API patch inventory may diverge.
 - Coverage: existing NovaRocks view connector/SQL tests; list-view protocol
   component test migrates with U1r (0.9 has no other view-specific unit test).
 - Validation: standalone REST crate check/tests after the shared window is free.
+
+### U1r: bounded single-page REST listings
+
+- Files: `src/catalog/extension.rs`.
+- Purpose: restore one-page tables/namespaces/views methods with unchanged
+  facade signatures; query ordering remains pageSize, optional parent, then
+  opaque pageToken. The connector owns accumulation and repeated-token refusal.
+  Preserve the old 404 error kinds rather than inheriting new list API mapping.
+- Upstream status: only accumulating list APIs exist at the pinned baseline.
+- Production dependency: NovaRocks catalog listing-admission and discovery.
+- Exit: IRU-13a replaces the vendored one-page protocol surface.
+- Coverage: four migrated single-page/token/parent-filter tests from 0.9.
+- Validation: standalone REST crate check/tests after all patches are ready.
