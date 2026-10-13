@@ -44,3 +44,12 @@ No patches applied in the initial source commit.
 - Production dependency: NovaRocks FrozenRequest converts one complete terminal request for `Catalog::update_table`; SDK actions do not own publication.
 - Exit: IRU-6a removes this patch when its publication boundary no longer needs the SDK terminal builder.
 - Coverage: existing connector FrozenRequest and commit tests; V2 standalone core check.
+
+## U3 — snapshot reference map accessor
+
+- Purpose: preserve the 0.9 `TableMetadata::refs()` read-only accessor.
+- Files: `src/spec/table_metadata.rs`.
+- Upstream status: no tracked upstream issue; rc.2 exposes only individual reference lookup.
+- Production dependency: NovaRocks commit dependency validation observes the authoritative branch/tag reference set.
+- Exit: remove when upstream exposes the same complete reference-map accessor, or a reviewed consumer migration removes the need for it.
+- Coverage: existing connector commit dependency and ref tests; V2 standalone core check.

@@ -346,6 +346,12 @@ impl TableMetadata {
         })
     }
 
+    /// Return a reference to the snapshot refs map (branch and tag references).
+    #[inline]
+    pub fn refs(&self) -> &HashMap<String, SnapshotReference> {
+        &self.refs
+    }
+
     /// Return all sort orders.
     #[inline]
     pub fn sort_orders_iter(&self) -> impl ExactSizeIterator<Item = &SortOrderRef> {
