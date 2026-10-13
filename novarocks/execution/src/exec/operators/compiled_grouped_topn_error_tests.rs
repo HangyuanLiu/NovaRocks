@@ -321,3 +321,91 @@ fn compiled_grouped_topn_second_call_merge_data_survives_state_drop_and_keeps_fi
     drop(first);
     assert_eq!(tracker.current(), 0);
 }
+
+#[test]
+fn compiled_grouped_topn_actual_storage_refuses_replacement_coexistence_and_new_state() {
+    // Existing generic growth coverage rejects even the final enlarged block.
+    // These actual consumer containers instead get enough room for replacement
+    // AFTER old-block release, but cannot admit both blocks simultaneously.
+    // This is a storage-component gate through existing private owners/APIs,
+    // not an injected allocation trace of a complete push or private Arrow peak.
+    for storage in ["candidates", "key", "inline-state"] {
+        let f = fixture(2, true, true);
+        let tracker = MemTracker::new_root("grouped-owned-storage-refusal");
+        let mut processor = populated(&f, tracker.clone());
+        let before = tracker.current();
+        let set = processor.candidates.as_mut().unwrap();
+        let original_keys = set
+            .entries
+            .iter()
+            .map(|entry| entry.key.to_vec())
+            .collect::<Vec<_>>();
+        let failure = match storage {
+            "candidates" => {
+                let capacity = set.entries.capacity();
+                let len = set.entries.len();
+                let old = std::alloc::Layout::array::<Candidate>(capacity)
+                    .unwrap()
+                    .size();
+                let replacement = std::alloc::Layout::array::<Candidate>(len + capacity)
+                    .unwrap()
+                    .size();
+                let limit =
+                    before - i64::try_from(old).unwrap() + i64::try_from(replacement).unwrap();
+                tracker.install_limit_once(limit).unwrap();
+                assert!(set.entries.try_reserve_exact(capacity).is_err());
+                assert_eq!(set.entries.capacity(), capacity);
+                assert_eq!(set.entries.len(), len);
+                KernelFailure::ResourceExhausted
+            }
+            "key" => {
+                let key = &mut set.entries[0].key;
+                let capacity = key.capacity();
+                let len = key.len();
+                let limit = before - i64::try_from(capacity).unwrap()
+                    + i64::try_from(len + capacity).unwrap();
+                tracker.install_limit_once(limit).unwrap();
+                assert!(key.try_reserve_exact(capacity).is_err());
+                assert_eq!(key.capacity(), capacity);
+                assert_eq!(key.len(), len);
+                KernelFailure::ResourceExhausted
+            }
+            "inline-state" => {
+                let handle = processor.plan.calls[0].handle.clone();
+                let layout = handle.state_layout().pad_to_align();
+                assert!(layout.size() > 0);
+                tracker
+                    .install_limit_once(before + i64::try_from(layout.size()).unwrap() - 1)
+                    .unwrap();
+                OwnedAggregateState::try_new(handle, set.host.clone(), &processor.control)
+                    .unwrap_err()
+            }
+            _ => unreachable!(),
+        };
+        assert_eq!(failure, KernelFailure::ResourceExhausted);
+        assert_eq!(
+            tracker.current(),
+            before,
+            "refused request preserves existing stock"
+        );
+        assert_eq!(
+            set.entries
+                .iter()
+                .map(|entry| entry.key.to_vec())
+                .collect::<Vec<_>>(),
+            original_keys
+        );
+        let first = processor.latch::<()>(Err(failure.into())).unwrap_err();
+        assert!(!processor.has_output());
+        assert_eq!(
+            tracker.current(),
+            0,
+            "real storage and typed states destroyed"
+        );
+        assert_eq!(
+            processor.pull_chunk(&RuntimeState::default()).unwrap_err(),
+            first
+        );
+        assert_eq!(processor.close().unwrap_err(), first);
+    }
+}
