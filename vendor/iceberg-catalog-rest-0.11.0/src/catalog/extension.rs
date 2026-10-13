@@ -106,6 +106,7 @@ impl Debug for RestAccessDelegation {
     }
 }
 
+use crate::types::LoadCredentialsResult;
 use iceberg::TableUpdate;
 
 /// A table response whose immutable metadata has not yet been associated with
@@ -294,6 +295,45 @@ impl RestSessionCatalog {
     }
 }
 
+impl RestCatalog {
+    /// Renew storage delegation without re-observing table metadata.
+    pub async fn load_credentials_with_access_delegation(
+        &self,
+        credentials_endpoint: &str,
+    ) -> Result<RestAccessDelegation> {
+        self.inner
+            .load_credentials_with_access_delegation(&self.session_context, credentials_endpoint)
+            .await
+    }
+}
+
+impl RestSessionCatalog {
+    /// Renew credentials using this session owner's authenticated HTTP client.
+    pub async fn load_credentials_with_access_delegation(
+        &self,
+        _context: &SessionContext,
+        credentials_endpoint: &str,
+    ) -> Result<RestAccessDelegation> {
+        let client = self.client().await?;
+        let request = HttpRequest::build(
+            client
+                .http_client
+                .request(Method::GET, credentials_endpoint),
+        )?;
+        let response = client.query_catalog(request).await?;
+        match response.status() {
+            StatusCode::OK => {
+                let response = deserialize_catalog_response::<LoadCredentialsResult>(response)?;
+                Ok(RestAccessDelegation::new(response.storage_credentials))
+            }
+            _ => Err(deserialize_unexpected_catalog_error(
+                response,
+                client.http_client.disable_header_redaction(),
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Credential-handoff correctness coverage: exact-key reads preserve the
@@ -461,5 +501,55 @@ mod tests {
         config_mock.assert_async().await;
         ordinary.assert_async().await;
         delegated.assert_async().await;
+    }
+    #[tokio::test]
+    async fn credential_refresh_uses_catalog_authentication_and_redacts_values() {
+        let mut server = Server::new_async().await;
+        let config_mock = create_config_mock(&mut server).await;
+        let credentials = server
+            .mock("GET", "/credentials")
+            .match_header("authorization", "Bearer refresh-token")
+            .with_status(200)
+            .with_body(
+                r#"{
+                    "storage-credentials": [{
+                        "prefix": "s3://warehouse/data/",
+                        "config": {
+                            "s3.access-key-id": "access-canary",
+                            "s3.secret-access-key": "secret-canary"
+                        }
+                    }]
+                }"#,
+            )
+            .create_async()
+            .await;
+        let catalog = catalog(
+            RestCatalogConfig::builder()
+                .uri(server.url())
+                .props(HashMap::from([(
+                    "token".to_string(),
+                    "refresh-token".to_string(),
+                )]))
+                .build(),
+            Some(Arc::new(LocalFsStorageFactory)),
+        );
+
+        let delegation = catalog
+            .load_credentials_with_access_delegation(&format!("{}/credentials", server.url()))
+            .await
+            .expect("refresh response");
+        assert!(delegation.is_present());
+        assert_eq!(delegation.len(), 1);
+        let credential = delegation.credentials().next().expect("credential");
+        assert_eq!(credential.prefix(), "s3://warehouse/data/");
+        assert_eq!(
+            credential.config_value("s3.access-key-id"),
+            Some("access-canary")
+        );
+        assert!(!format!("{credential:?}").contains("secret-canary"));
+        assert!(!format!("{delegation:?}").contains("secret-canary"));
+
+        config_mock.assert_async().await;
+        credentials.assert_async().await;
     }
 }

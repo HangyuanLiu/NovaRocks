@@ -72,3 +72,15 @@ accounting hooks. Only the approved protocol/API patch inventory may diverge.
 - Exit: IRU-13a replaces the vendored deferred handoff.
 - Coverage: migrated `access_delegation_is_opt_in_and_preserves_redacted_facts`.
 - Validation: standalone REST crate tests after the shared Cargo window is free.
+
+### R8: authenticated credential renewal without table observation
+
+- Files: `src/catalog/extension.rs`, `src/types.rs`.
+- Purpose: retain the credential-only wire response and renewal GET through the
+  initialized authenticated client, without table metadata or FileIO selection.
+  Renewal is not gated by config endpoint declarations.
+- Upstream status: no equivalent closed renewal handoff at the baseline.
+- Production dependency: NovaRocks loaded-table and execution lease renewal.
+- Exit: IRU-13a replaces the vendored credential renewal protocol surface.
+- Coverage: migrated `credential_refresh_uses_catalog_authentication_and_redacts_values`.
+- Validation: standalone REST crate tests after the shared Cargo window is free.
