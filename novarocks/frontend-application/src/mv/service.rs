@@ -206,11 +206,6 @@ impl FrontendMvProductAdapter {
     ) -> Result<(), MvApplicationError> {
         let _gate_lease = self.acquire_activity_lease(&target, owner, execution)?;
         let attempt = self.product_service.reserve_refresh_attempt();
-        let publication_id = attempt.publication_id.as_uuid();
-        let _diagnostic_scope = crate::preparation_diagnostics::enter_product_work(
-            format!("mv-publication:{publication_id}"),
-            format!("mv-publication:{publication_id}"),
-        );
         let prepared = preparation
             .prepare_step(MvRefreshPreparationRequest {
                 statement,
@@ -677,11 +672,6 @@ fn execute_scheduled_refresh(
             return ScheduledRefreshDisposition::ShutdownCancelled(None);
         }
         let attempt = dependencies.product_service.reserve_refresh_attempt();
-        let publication_id = attempt.publication_id.as_uuid();
-        let _diagnostic_scope = crate::preparation_diagnostics::enter_product_work(
-            format!("mv-publication:{publication_id}"),
-            format!("mv-publication:{publication_id}"),
-        );
         let prepared =
             match dependencies
                 .background_engine

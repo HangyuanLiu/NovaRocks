@@ -252,14 +252,6 @@ pub(crate) fn frontend_management_router_with_readers(
     let router = if crate::preparation_diagnostics::enabled() {
         router
             .route(
-                "/v1/diagnostics/preparation/arm",
-                post(arm_preparation_diagnostics),
-            )
-            .route(
-                "/v1/diagnostics/preparation/drain",
-                post(drain_preparation_diagnostics),
-            )
-            .route(
                 "/v1/diagnostics/preparation/statement/arm",
                 post(arm_statement_observation),
             )
@@ -275,32 +267,6 @@ pub(crate) fn frontend_management_router_with_readers(
         router
     };
     router.with_state(state)
-}
-
-async fn arm_preparation_diagnostics(
-    headers: HeaderMap,
-    Json(request): Json<crate::preparation_diagnostics::ControlRequest>,
-) -> axum::response::Response {
-    if !preparation_diagnostic_authorized(&headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    match crate::preparation_diagnostics::arm(request.run_token) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => (StatusCode::CONFLICT, error).into_response(),
-    }
-}
-
-async fn drain_preparation_diagnostics(
-    headers: HeaderMap,
-    Json(request): Json<crate::preparation_diagnostics::ControlRequest>,
-) -> axum::response::Response {
-    if !preparation_diagnostic_authorized(&headers) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    match crate::preparation_diagnostics::drain(&request.run_token) {
-        Ok(response) => Json(response).into_response(),
-        Err(error) => (StatusCode::CONFLICT, error).into_response(),
-    }
 }
 
 async fn arm_statement_observation(
