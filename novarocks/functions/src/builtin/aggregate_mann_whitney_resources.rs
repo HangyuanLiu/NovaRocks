@@ -499,6 +499,9 @@ pub(crate) struct MannEmissionFacts {
     pub(crate) operation_global_requests: RequestUpper,
     pub(crate) operation_global_peak: usize,
     pub(crate) global_output_retained: usize,
+    // Existing custody charges a conservative metadata invoice in addition to
+    // the original carrier stock; this is distinct from physical backing.
+    pub(crate) global_settlement_charge_upper: usize,
     pub(crate) typed_custody_peak: usize,
     pub(crate) typed_output_retained: usize,
 }
@@ -560,6 +563,10 @@ impl MannEmissionResources {
                 add(flat.custody_global_peak_extra, bytes::<i32>(4)?)?,
             )?);
         let diagnostic = crate::MAX_ROW_ERROR_MESSAGE_BYTES;
+        let settlement = add(
+            add(payload.retained, flat.original_metadata_stock_upper)?,
+            flat.settlement_metadata_upper,
+        )?;
         let clone = RequestUpper {
             bytes: diagnostic,
             requests: 1,
@@ -582,8 +589,9 @@ impl MannEmissionResources {
                 )?,
                 clone,
             )?,
-            operation_global_peak: add(peak, mul(2, diagnostic)?)?,
+            operation_global_peak: add(peak.max(settlement), mul(2, diagnostic)?)?,
             global_output_retained: add(payload.retained, flat.global_retained_metadata_upper)?,
+            global_settlement_charge_upper: settlement,
             typed_custody_peak: flat.custody_typed_peak_extra,
             typed_output_retained: flat.typed_retained_metadata_upper,
         })
