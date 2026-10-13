@@ -1,77 +1,24 @@
-# UEA-4A-4 Catalog planning short regression
+# Catalog planning 功能fixture
 
-本目录定义 FE Connector metadata/planning 的短时原生 `1FE+3BE` 对照负载。`workload.json` 的
-SHA-256、两个真实 provider 的 READY manifest、对象清单、运行二进制和渲染配置都必须随运行证据保存。
-同一 controller 在 B0 与 candidate 上运行；B0 必须包含 UEA-4A-1，且两次只替换 server binary。
-此检查只用于排除大幅性能回退，不能代替手动性能测试或作为精确基准。
+保留的Iceberg/Paimon producer为原生planning/queue/取消功能场景提供真实READY输入；旧计时workload、B0/candidate比较器和短窗口协议已退出。目录名是历史布局，当前只维护功能与数据正确性。
 
-场景名为 `uea4/catalog-planning-performance`，需要 `--launch-profile performance` 和
-`--cluster-size 3`。它从 `NOVAROCKS_UEA4A4_WORKLOAD_MANIFEST` 读取负载；未指定时使用本目录的
-`workload.json`。`NOVAROCKS_UEA4A4_ICEBERG_FIXTURE_MANIFEST` 与
-`NOVAROCKS_UEA4A4_PAIMON_FIXTURE_MANIFEST` 必须指向预先发布的不可变真实输入。
-本目录的 `iceberg_fixture.py` 与 `paimon_fixture.py` 分别通过已验证的 Spark/Iceberg REST 和
-Spark/Paimon 写入任务私有表。两个 manifest 均需原始字节 SHA-256 的 `READY`、校验后的 `objects.json`、真实
-snapshot/schema ID、至少 16 个数据文件和非零行。Iceberg manifest 还需 `rest_uri`。
-两者都包含 `warehouse_uri`、`s3_endpoint`、`region`、`credential_name`、
-`credential_generation`、`database`、`table`、`snapshot_id`、`schema_id`、
-`data_file_count`、`row_count` 与 `objects_sha256`。`s3_endpoint` 必须是本机 HTTP；
-controller 在此基础上建立任务私有延迟代理，并只让慢远端 catalog 使用它。
-
-先启动各 fixture 已验证的容器环境，再发布输入。两个发布器均支持 `prepare`、`verify`、
-`cleanup`；`cleanup` 需要与 READY manifest 完全一致的 `--run-id`，只删除该次任务的对象前缀。
-Iceberg 默认做 24 次确定性追加，至少留下 16 个真实 Parquet 文件，并用 Spark 聚合生成行数、
-键范围及校验和 oracle。`--dry-run` 仅渲染并检查作用域，不写入远端。发布后保存两个
-`manifest.json` 的绝对路径，供上述环境变量使用。示例：
+`iceberg_fixture.py`、`paimon_fixture.py`经已验证的本机fixture publication和真实Spark写入任务私有表。manifest绑定snapshot/schema、至少16真实datafiles、行数及独立oracle、objects.json hash和READY。Iceberg还记录REST URI；两者记录warehouse、S3 endpoint与credential身份，不保存密钥。不能从旧smoke绝对路径推定当前健康。
 
 ```bash
 python3 tests/benchmarks/uea4a4/iceberg_fixture.py prepare \
-  --run-id uea4a4-c00-example --output-dir /tmp/uea4a4-iceberg-example
+  --run-id "$run_id" --output-dir "$attempt/iceberg-input" --env-file "$NOVA_ENV_REST_ENV_FILE"
 python3 tests/benchmarks/uea4a4/iceberg_fixture.py verify \
-  --output-dir /tmp/uea4a4-iceberg-example
-
+  --output-dir "$attempt/iceberg-input" --env-file "$NOVA_ENV_REST_ENV_FILE"
 python3 tests/benchmarks/uea4a4/paimon_fixture.py prepare \
-  --run-id uea4a4-c00-example --output-dir /tmp/uea4a4-paimon-example
+  --run-id "$run_id" --output-dir "$attempt/paimon-input" --env-file "$NOVA_ENV_REST_ENV_FILE"
 python3 tests/benchmarks/uea4a4/paimon_fixture.py verify \
-  --output-dir /tmp/uea4a4-paimon-example
+  --output-dir "$attempt/paimon-input" --env-file "$NOVA_ENV_REST_ENV_FILE"
 ```
 
-本工作树的一次真实 smoke 输入已发布在
-`/tmp/uea4a4-iceberg-c00-20260923-7dfc/manifest.json` 和
-`/tmp/uea4a4-paimon-smoke/manifest.json`。可分别对对应 output directory 运行上面的
-`verify` 命令，再用于 B0 config smoke；这两个 READY 输入应保留供 B0/candidate 对照。
-新一轮对照建议换用新的任务私有 run ID 与 output directory；既有 smoke 输入可用于验证场景接线。
+`attempt`为仓库外独占目录，`run_id`使用新的合法私有身份。prepare和verify是分开的输入owner动作；verify不补供给。cleanup要求与READY完全一致的run-id，只删除所属对象，失败保留原材料。`--dry-run`只渲染作用域，不算供给成功。
 
-运行前将两个 fixture manifest 的对象仓库静态凭据放入
-`AWS_S3_ACCESS_KEY_ID`、`AWS_S3_SECRET_ACCESS_KEY`；性能启动会清空继承环境，controller
-通过 FE/BE child environment 显式投射这两个值。两个 fixture 必须使用同一组凭据。
-先用 `uea4/catalog-planning-smoke` 对 B0 和 candidate 运行同一套配置与真实输入，核对
-`scenario-evidence.json` 中的原生拓扑和成功退出。然后各运行一次短时场景：每个 provider
-的正常与 5 ms 慢远端模式各预热至少 3 秒、测量 20 秒，总计四个窗口。远端查询
-可能使最后一次预热请求超出目标时间；报告会记录实际预热耗时。两次运行必须使用同一
-runner、workload、fixture、基础配置和平台，且顺序执行。
+消费环境变量为 `NOVAROCKS_UEA4A4_ICEBERG_FIXTURE_MANIFEST`、`NOVAROCKS_UEA4A4_PAIMON_FIXTURE_MANIFEST`，以及既有 `NOVAROCKS_UEA4A4_S3_ACCESS_KEY_ID`/`NOVAROCKS_UEA4A4_S3_SECRET_ACCESS_KEY`。功能consumer拒绝缺READY/hash/对象/凭据，使用私有proxy明确区分metadata与data请求，不读取旧workload时间窗或门限。
 
-```bash
-source docker/iceberg-rest/runtime/current/env.sh
-export NOVAROCKS_UEA4A4_ICEBERG_FIXTURE_MANIFEST=/tmp/uea4a4-iceberg-c00-20260923-7dfc/manifest.json
-export NOVAROCKS_UEA4A4_PAIMON_FIXTURE_MANIFEST=/tmp/uea4a4-paimon-smoke/manifest.json
+保留selector：`uea4/catalog-planning-smoke`、`uea4/catalog-planning-responsibility`、`uea4/catalog-planning-no-fe-quota`、`uea4/iceberg-held-read-cancellation`、`catalog/provider-read-queued-progress`。它们使用clean `--launch-profile performance --cluster-size 3`，验证真实请求、provider进展、精确hold终态/取消与FE/BE owner收敛；profile名称不是性能实验。所有actor失败须cancel、release hold并实际join，原始错误与cleanup错误保留。
 
-RUNNER=target/debug/novarocks-system-tests
-COMMON_ARGS=(--config "$PWD/tools/ci/fixtures/system-scenarios-base.toml"
-  --cluster-size 3 --timeout-secs 300 --launch-profile performance
-  --only uea4/catalog-planning-performance)
-"$RUNNER" --binary "$UEA4A4_B0_BINARY" --artifact-root "$PWD/reports/uea4a4-b0" "${COMMON_ARGS[@]}"
-"$RUNNER" --binary "$PWD/target/release/novarocks" --artifact-root "$PWD/reports/uea4a4-candidate" "${COMMON_ARGS[@]}"
-
-python3 tests/benchmarks/uea4a4/compare.py \
-  --baseline "$PWD/reports/uea4a4-b0/uea4-catalog-planning-performance" \
-  --candidate "$PWD/reports/uea4a4-candidate/uea4-catalog-planning-performance"
-```
-
-运行报告记录四个窗口的吞吐、p95、完成数、错误数、窗口后完成、预热时长、慢远端
-S3 GET/HEAD 增量和 FE/三个 BE 的 RSS 峰值；`process-resources.json` 留存原始采样。
-每个慢窗口必须真的命中延迟代理，所有窗口均须有完成请求且无错误。比较器逐个
-provider/mode 检查 candidate 吞吐不低于 B0 的 50%、p95 不高于 B0 的两倍；RSS
-只记录供人工判断。它要求场景成功、同一 workload/fixture/基础配置/lockfile/平台/runner，
-并核对每次报告与自身渲染配置的 SHA。两次渲染配置 SHA 可因任务私有慢速 S3 代理端口
-而不同。比较器还验证两个不同 server binary 的 SHA。短窗口的波动可能较大，比较通过只表示未发现
-大幅回退；后续性能细节由人工测试。
+FE/planning/provider/admission或fixture修改必跑对应功能组；成本为真实两个provider输入和独立1FE+3BE，每周领域维护者手工轮次，不扩默认CI，自动调度尚未交付。命令骨架与材料位置见 [system指南](../../system-test-runner/README.md)。

@@ -379,7 +379,7 @@ groups:
           summary: "Allocation attribution lifetime fault on {{ $labels.instance }}"
 ```
 
-unsafe 与性能验收分别需要模型/Miri 和用户 Linux 正式成本结论；指标可读、原生场景通过或入口 smoke 不关闭这两道门。详见 [memory 核心边界](../development/memory-boundary.md) 与 [attribution harness](../../../tools/memory-attribution-bench/README.md)。
+unsafe 的地址、别名和生命周期要求继续由模型/Miri 与静态复核承担；指标可读、原生场景通过或 smoke 不代替它们。当前阶段仅维护功能与数据正确性，旧内存测量入口已退出，不作 Linux 性能达标结论。详见 [memory 核心边界](../development/memory-boundary.md) 与 [memory tests](../../../novarocks/memory/tests/README.md)。
 
 ## Native trust 与传输选择
 

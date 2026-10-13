@@ -84,3 +84,9 @@ code-anchors:
 - 需要透明切换在线消费者或自动回收时，单独设计可验证的租约、退出协调与 GC 权威；不能放宽引用/外部连接检查来模拟这些能力。
 - 新平台不能保证要求的锁、文件落盘与原子 pointer 替换，或 Docker daemon 不支持本机网络连接/aliases 时，重新裁决存储和网络边界，不引入固定端点 fallback。
 - 需要退出旧项目或迁移其数据时，明确授权、资源清单与迁移验收单独成事；不扩大普通 up/down 的权力。
+
+## 2026-10-13：G7c 已有 READY 消费者的范围补充
+
+第 9 条的 actual Spark/BOM producer 核验继续适用于显式供给（`ensure/rebuild`）。原生正确性 suite 的已有 READY 消费者通过独立 check-only 入口读取一次不可变 publication，严格核对 dataset identity、READY/manifest/producer fingerprint 及对象事实；校验不附着或恢复 runtime，不启动 Spark，不生产缺失数据。它不宣称当前 Spark 实例重新验真，也不以保存的 ready 证明当前服务健康。缺失、unbound 或不匹配即前置失败，后续供给属于另一个显式动作。其余实例所有权、原子 publication、数据引用和清理规则继续成立。
+
+实际消费者见 [`bind_prepared_dataset`](../../tests/sql/runner/src/dataset_fixture.rs)，供给与只读检查见 [SQL 测试入口](../../tests/sql/README.md)。这项补充只限定第 9 条的检查责任，保留以上历史决策与显式 producer 要求。

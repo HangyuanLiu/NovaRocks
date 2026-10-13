@@ -20,3 +20,5 @@ cargo test --locked -p novarocks-fs --test writer_corpus_conformance
 Spark 数据也供 system 的短 range 功能输入 owner 使用。在线 fixture 需显式准备并生成本次环境的独占 manifest/READY；此处 frozen receipt 不能代替在线 READY 验证。消费与准备相互独立，验证失败不能重写本目录输入。
 
 FS reader、Parquet 类型/位置合同或这些输入变更时运行本测试；成本为本地四文件读取，无集群和外部服务，沿已有 Rust 测试链路维护。输入版本变化必须来自真实 producer 输出并独立核对 oracle，不能用重录 expected 掩盖结果差异。
+
+当前阶段只维护功能与数据正确性；本目录不承接历史吞吐/RSS采样或比较协议。旧来源receipt保留原字节，产品FS conformance为本地canonical消费者；online短表需由保留的显式producer在本次环境供给，不能覆盖此处历史输入。
