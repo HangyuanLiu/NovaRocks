@@ -22,9 +22,10 @@
 
 use std::{io, time::Duration};
 
+use crate::active_delivery_budget::ACTIVE_DELIVERY_WORK_BUDGET;
 use crate::connection_registry::{MysqlConnectionClass, frozen_connection_positions};
 use crate::query_application_shim::{MysqlInputPolicy, mysql_input_policy};
-use crate::relay_result_writer::{ACTIVE_WRITE_DEADLINE, CLOSING_DEADLINE, CLOSING_OBJECT_BYTES};
+use crate::relay_result_writer::{CLOSING_DEADLINE, CLOSING_OBJECT_BYTES};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MysqlInputLimits {
@@ -117,8 +118,8 @@ pub struct MysqlStartupParameters {
     pub control_positions: usize,
     pub ordinary: MysqlInputStartupParameters,
     pub control: MysqlInputStartupParameters,
-    /// The original result writer clock, not the command-read clock.
-    pub active_write_deadline: Duration,
+    /// The cumulative finite response delivery work budget, excluding producer waits.
+    pub active_delivery_work_budget: Duration,
     /// The independent original Closing writer clock.
     pub closing_deadline: Duration,
     pub closing_object_bytes: u64,
@@ -153,7 +154,7 @@ impl MysqlStartupParameters {
             .ok_or_else(|| invalid("MySQL startup connection positions overflow"))?;
         self.ordinary.validate()?;
         self.control.validate()?;
-        exact_positive_milliseconds(self.active_write_deadline)?;
+        exact_positive_milliseconds(self.active_delivery_work_budget)?;
         exact_positive_milliseconds(self.closing_deadline)?;
         Ok(())
     }
@@ -170,7 +171,7 @@ pub fn frozen_mysql_startup_parameters() -> io::Result<MysqlStartupParameters> {
         control: MysqlInputStartupParameters::from_original(mysql_input_policy(
             MysqlConnectionClass::Control,
         )),
-        active_write_deadline: ACTIVE_WRITE_DEADLINE,
+        active_delivery_work_budget: ACTIVE_DELIVERY_WORK_BUDGET,
         closing_deadline: CLOSING_DEADLINE,
         closing_object_bytes: CLOSING_OBJECT_BYTES,
     };
@@ -200,7 +201,10 @@ mod tests {
             [projection.ordinary_positions, projection.control_positions],
             frozen_connection_positions()
         );
-        assert_eq!(projection.active_write_deadline, ACTIVE_WRITE_DEADLINE);
+        assert_eq!(
+            projection.active_delivery_work_budget,
+            ACTIVE_DELIVERY_WORK_BUDGET
+        );
         assert_eq!(projection.closing_deadline, CLOSING_DEADLINE);
         assert_eq!(projection.closing_object_bytes, CLOSING_OBJECT_BYTES);
     }
@@ -261,7 +265,7 @@ mod tests {
             assert_eq!(input.command_timeout, Duration::from_secs(10));
             assert_eq!(input.response_write_timeout, Duration::from_secs(30));
         }
-        assert_eq!(p.active_write_deadline, Duration::from_secs(30));
+        assert_eq!(p.active_delivery_work_budget, Duration::from_secs(30));
         assert_eq!(p.closing_deadline, Duration::from_secs(5));
         assert_eq!(p.closing_object_bytes, 8 * 1024 * 1024);
     }
@@ -284,7 +288,7 @@ mod tests {
             Duration::from_secs(u64::MAX),
         ] {
             let mut p = frozen_mysql_startup_parameters().unwrap();
-            p.active_write_deadline = deadline;
+            p.active_delivery_work_budget = deadline;
             assert!(p.validate().is_err());
             p = frozen_mysql_startup_parameters().unwrap();
             p.ordinary.auth_timeout = deadline;

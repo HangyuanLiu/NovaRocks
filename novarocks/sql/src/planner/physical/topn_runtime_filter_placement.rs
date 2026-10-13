@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Placement tests for Aggregate TopN runtime-filter intents.
+//! Ordered-bound placement for a Rows Partial TopN over complete global groups.
 
 use std::num::NonZeroU32;
 
@@ -124,7 +124,7 @@ fn prove_topn_placement(
     let PhysicalPlanKind::TopN(topn) = &topn_node.kind else {
         return None;
     };
-    if topn.phase != TopNPhase::Partial || !topn.is_split || topn.items.len() != 1 {
+    if topn.phase != TopNPhase::Partial || topn.items.len() != 1 {
         return None;
     }
     let limit = topn.limit.and_then(|limit| u32::try_from(limit).ok())?;
@@ -153,7 +153,7 @@ fn prove_topn_placement(
     let PhysicalPlanKind::HashAggregate(aggregate) = &aggregate_node.kind else {
         return None;
     };
-    if aggregate.mode != AggMode::Local
+    if aggregate.mode != AggMode::Global
         || aggregate_node.children.len() != 1
         || aggregate.group_by.len() != 1
         || aggregate.output_layout.group_key_columns.len() != 1
@@ -241,6 +241,42 @@ fn trace_exact_source_probes(
             }
             node_path.push(0);
             let probes = trace_exact_source_probes(&node.children[0], &input_expr, node_path);
+            node_path.pop();
+            probes
+        }
+        PhysicalPlanKind::HashAggregate(aggregate)
+            if aggregate.mode == AggMode::Local
+                && node.children.len() == 1
+                && aggregate.group_by.len() == 1
+                && aggregate.output_layout.group_key_columns.len() == 1 =>
+        {
+            // The Global producer consumes the Local stage's grouping value,
+            // not any aggregate state. Follow that exact output occurrence
+            // back to its direct input key before annotating the source scan.
+            let output = &aggregate.output_layout.group_key_columns[0];
+            if !is_exact_column_ref(&probe_expr, output)
+                || node
+                    .output_columns
+                    .iter()
+                    .filter(|column| is_same_column(column, output))
+                    .count()
+                    != 1
+                || aggregate
+                    .output_columns
+                    .iter()
+                    .filter(|column| is_same_column(column, output))
+                    .count()
+                    != 1
+            {
+                return None;
+            }
+            let input =
+                bind_exact_column_ref(&aggregate.group_by[0], &node.children[0].output_columns)?;
+            if input.value_type != probe_expr.value_type {
+                return None;
+            }
+            node_path.push(0);
+            let probes = trace_exact_source_probes(&node.children[0], &input, node_path);
             node_path.pop();
             probes
         }
@@ -387,7 +423,7 @@ mod tests {
     use novarocks_types::schema::ColumnDef;
 
     #[test]
-    fn places_single_key_partial_topn_on_local_aggregate_atomically() {
+    fn places_single_key_rows_partial_topn_on_global_aggregate_atomically() {
         let mut plan = eligible_topn_plan(DataType::Int32, true, false);
         let mut next_filter_id = 0;
 
@@ -533,6 +569,85 @@ mod tests {
     }
 
     #[test]
+    fn traces_global_key_through_hash_exchange_and_local_group_output() {
+        let mut plan = eligible_topn_plan(DataType::Int64, true, false);
+        let local_output = output(10, "local_key", DataType::Int64, false);
+        let local = PhysicalPlanNode {
+            kind: PhysicalPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
+                mode: AggMode::Local,
+                group_by: vec![column(11, "source_key", DataType::Int64, false)],
+                aggregates: Vec::new(),
+                is_merge: Vec::new(),
+                output_layout: AggregateOutputLayout::new(vec![local_output.clone()], Vec::new()),
+                output_columns: vec![local_output.clone()],
+                topn_runtime_filter_builds: Vec::new(),
+            })),
+            children: vec![leaf(11, "source_key", DataType::Int64, false)],
+            output_columns: vec![local_output.clone()],
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let exchanged = PhysicalPlanNode {
+            kind: PhysicalPlanKind::Redistribute(RedistributeNode {
+                mode: RedistributeMode::Hash {
+                    cols: vec![local_output.column_id],
+                    source: HashSource::ShuffleAgg,
+                },
+                partition_exprs: vec![column(10, "local_key", DataType::Int64, false)],
+                output_columns: vec![local_output.clone()],
+            }),
+            children: vec![local],
+            output_columns: vec![local_output],
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        };
+        aggregate_child_mut(&mut plan).children[0] = exchanged;
+        aggregate_mut(&mut plan).group_by[0] = column(10, "local_key", DataType::Int64, false);
+        let mut next_filter_id = 0;
+
+        place_aggregate_topn_runtime_filters(&mut plan, &mut next_filter_id, 1024);
+
+        let builds = aggregate_topn_builds(&plan);
+        assert_eq!(builds.len(), 1);
+        assert!(is_exact_column_ref(
+            &builds[0].group_key_expr,
+            &output(10, "local_key", DataType::Int64, false)
+        ));
+        let probes = source_probes(&plan);
+        assert_eq!(probes.len(), 1);
+        assert!(is_exact_column_ref(
+            &probes[0].probe_expr,
+            &output(11, "source_key", DataType::Int64, false)
+        ));
+        assert_eq!(probes[0].filter_id, builds[0].filter_id);
+
+        // A computed Local grouping is not an identity mapping. Do not keep
+        // only the Global annotation when its source proof is unsupported.
+        let mut inexact = plan;
+        aggregate_mut(&mut inexact)
+            .topn_runtime_filter_builds
+            .clear();
+        let local = &mut aggregate_child_mut(&mut inexact).children[0].children[0];
+        local.children[0].probe_runtime_filters.clear();
+        let PhysicalPlanKind::HashAggregate(local) = &mut local.kind else {
+            unreachable!()
+        };
+        let input = local.group_by[0].clone();
+        local.group_by[0] = TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(input.clone()),
+                target: input.value_type.data_type.clone(),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            value_type: input.value_type,
+        };
+        place_aggregate_topn_runtime_filters(&mut inexact, &mut next_filter_id, 1024);
+        assert!(aggregate_topn_builds(&inexact).is_empty());
+        assert!(source_probes(&inexact).is_empty());
+        assert_eq!(next_filter_id, 1);
+    }
+
+    #[test]
     fn rejects_ineligible_or_inexact_shapes_atomically() {
         type PlanMutation = Box<dyn Fn(&mut PhysicalPlanNode)>;
         let cases: Vec<(&str, PlanMutation)> = vec![
@@ -563,12 +678,8 @@ mod tests {
                 Box::new(|plan| topn_mut(plan).phase = TopNPhase::Final),
             ),
             (
-                "unsplit topn",
-                Box::new(|plan| topn_mut(plan).is_split = false),
-            ),
-            (
-                "nonlocal aggregate",
-                Box::new(|plan| aggregate_mut(plan).mode = AggMode::Global),
+                "partial local aggregate",
+                Box::new(|plan| aggregate_mut(plan).mode = AggMode::Local),
             ),
             (
                 "multiple group keys",
@@ -688,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_local_aggregate_with_multiple_inputs_atomically() {
+    fn rejects_global_aggregate_with_multiple_inputs_atomically() {
         let mut plan = eligible_topn_plan(DataType::Int64, true, false);
         aggregate_child_mut(&mut plan).children.push(leaf(
             1,
@@ -777,7 +888,7 @@ mod tests {
         let source = leaf(1, "key", data_type.clone(), false);
         let aggregate = PhysicalPlanNode {
             kind: PhysicalPlanKind::HashAggregate(Box::new(PhysicalHashAggregateNode {
-                mode: AggMode::Local,
+                mode: AggMode::Global,
                 group_by: vec![column(1, "key", data_type.clone(), false)],
                 aggregates: Vec::new(),
                 is_merge: Vec::new(),
@@ -800,7 +911,7 @@ mod tests {
                 limit: Some(10),
                 offset: Some(0),
                 phase: TopNPhase::Partial,
-                is_split: true,
+                is_split: false,
             }),
             children: vec![aggregate],
             output_columns: vec![key],

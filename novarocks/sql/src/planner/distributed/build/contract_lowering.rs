@@ -467,7 +467,6 @@ struct ContractLoweringVisitor<'a> {
     annotated_values: BTreeMap<(FragmentId, ValueId), String>,
     runtime_filter_builds: BTreeMap<i32, PendingRuntimeFilterBuild>,
     runtime_filter_probes: BTreeMap<i32, Vec<PendingRuntimeFilterProbe>>,
-    runtime_filter_attachments: BTreeSet<(FragmentId, RuntimeFilterId)>,
     edges: BTreeMap<EdgeId, Edge>,
 }
 
@@ -508,6 +507,53 @@ struct PendingRuntimeFilterProbe {
     node: NodeId,
     value: ValueId,
     scan_source: bool,
+}
+
+enum PendingRuntimeFilterConsumerPlacement {
+    Scan(PendingRuntimeFilterProbe),
+    JoinProbe,
+}
+
+struct PendingRuntimeFilterPlacement {
+    producer_fragment: FragmentId,
+    consumers: Vec<PendingRuntimeFilterConsumerPlacement>,
+}
+
+/// One placement policy authors both fragment references and final endpoints.
+/// Non-scan legacy occurrences only request the producer Join's probe endpoint.
+fn runtime_filter_placement(
+    legacy_id: i32,
+    build: &PendingRuntimeFilterBuild,
+    probes: &[PendingRuntimeFilterProbe],
+) -> Result<PendingRuntimeFilterPlacement, ContractLoweringError> {
+    let (producer_fragment, join) = match build {
+        PendingRuntimeFilterBuild::Join { fragment, .. } => (*fragment, true),
+        PendingRuntimeFilterBuild::AggregateTopN { fragment, .. } => (*fragment, false),
+    };
+    let mut consumers = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut needs_join = false;
+    for probe in probes {
+        if probe.scan_source {
+            if seen.insert((probe.fragment, probe.node, probe.value)) {
+                consumers.push(PendingRuntimeFilterConsumerPlacement::Scan(*probe));
+            }
+        } else if join {
+            needs_join = true;
+        } else {
+            return Err(ContractLoweringError::InvalidRuntimeFilter {
+                id: legacy_id,
+                detail: "Aggregate TopN consumer is not an exact scan source".to_string(),
+            });
+        }
+    }
+    if join && (needs_join || consumers.is_empty()) {
+        consumers.push(PendingRuntimeFilterConsumerPlacement::JoinProbe);
+    }
+    Ok(PendingRuntimeFilterPlacement {
+        producer_fragment,
+        consumers,
+    })
 }
 
 /// The plan identity of one runtime filter the placement numbered.
@@ -942,6 +988,7 @@ fn materialize_runtime_filter(
     edges: &BTreeMap<EdgeId, Edge>,
 ) -> Result<RuntimeFilter, ContractLoweringError> {
     let id = runtime_filter_id(legacy_id)?;
+    let placement = runtime_filter_placement(legacy_id, build, probes)?;
     let witness = RuntimeFilterWitnessId::new(id.get());
     let policy = RuntimeFilterPolicy {
         max_contribution_bytes: 1024,
@@ -983,16 +1030,10 @@ fn materialize_runtime_filter(
             let equality = RuntimeFilterEqualityWitnessId::new(id.get());
             let coverage = join_runtime_filter_coverage(witness, *execution_mode);
             let mut consumers = Vec::new();
-            let mut seen_scans = BTreeSet::new();
-            let mut needs_join_consumer = false;
-            for probe in probes {
-                if !probe.scan_source {
-                    needs_join_consumer = true;
+            for consumer in &placement.consumers {
+                let PendingRuntimeFilterConsumerPlacement::Scan(probe) = consumer else {
                     continue;
-                }
-                if !seen_scans.insert((probe.fragment, probe.node, probe.value)) {
-                    continue;
-                }
+                };
                 let mut dead_end = None;
                 let lineage = runtime_filter_scan_lineage(
                     fragments,
@@ -1027,7 +1068,9 @@ fn materialize_runtime_filter(
                     target: RuntimeFilterConsumerTarget::ScanField { equality, lineage },
                 });
             }
-            if needs_join_consumer || consumers.is_empty() {
+            if placement.consumers.iter().any(|consumer| {
+                matches!(consumer, PendingRuntimeFilterConsumerPlacement::JoinProbe)
+            }) {
                 consumers.push(RuntimeFilterConsumer {
                     endpoint: RuntimeFilterEndpoint {
                         fragment: *fragment,
@@ -1155,16 +1198,10 @@ fn materialize_runtime_filter(
                 .ok_or_else(|| invalid("producer aggregate has no input".to_string()))?;
             let input_edges = subtree_inbound_edges(producer_fragment, input_root);
             let mut consumers = Vec::new();
-            let mut seen = BTreeSet::new();
-            for probe in probes {
-                if !probe.scan_source || !seen.insert((probe.fragment, probe.node, probe.value)) {
-                    if !probe.scan_source {
-                        return Err(invalid(
-                            "Aggregate TopN consumer is not an exact scan source".to_string(),
-                        ));
-                    }
-                    continue;
-                }
+            for consumer in &placement.consumers {
+                let PendingRuntimeFilterConsumerPlacement::Scan(probe) = consumer else {
+                    unreachable!("Aggregate TopN placement accepts only scan endpoints")
+                };
                 let mut dead_end = None;
                 let lineage = runtime_filter_scan_lineage(
                     fragments,
@@ -1344,6 +1381,7 @@ fn resolve_runtime_filter_activations(
             index
         },
     );
+    let mut multicast_waits = BTreeSet::new();
     for source in fragments.values() {
         let FragmentSink::Multicast { edges: branches } = source.sink() else {
             continue;
@@ -1370,13 +1408,14 @@ fn resolve_runtime_filter_activations(
                     && reachable.contains(&consumer.endpoint.fragment)
             })
         {
+            let source_node = RuntimeFilterWaitNode::Physical(source.id(), source.root());
+            let consumer_node =
+                RuntimeFilterWaitNode::Physical(consumer.endpoint.fragment, consumer.endpoint.node);
             dependencies
-                .entry(RuntimeFilterWaitNode::Physical(source.id(), source.root()))
+                .entry(source_node)
                 .or_default()
-                .insert(RuntimeFilterWaitNode::Physical(
-                    consumer.endpoint.fragment,
-                    consumer.endpoint.node,
-                ));
+                .insert(consumer_node);
+            multicast_waits.insert((source_node, consumer_node));
         }
     }
 
@@ -1442,7 +1481,19 @@ fn resolve_runtime_filter_activations(
                     consumer.endpoint.node,
                 ))
                 .copied();
-            if filter_component.is_some() && filter_component == consumer_component {
+            let consumer_node =
+                RuntimeFilterWaitNode::Physical(consumer.endpoint.fragment, consumer.endpoint.node);
+            // A multicast may itself wait on a blocked downstream consumer,
+            // even when that consumer's own filter has an independent build.
+            // Break that physical cycle as well as filter-containing cycles.
+            let multicast_cycle = consumer_component.is_some()
+                && multicast_waits.iter().any(|(source, target)| {
+                    *target == consumer_node
+                        && component_by_node.get(source).copied() == consumer_component
+                });
+            if (filter_component.is_some() && filter_component == consumer_component)
+                || multicast_cycle
+            {
                 if matches!(
                     consumer.target,
                     RuntimeFilterConsumerTarget::AggregateTopNScanField { .. }
@@ -1517,7 +1568,6 @@ impl<'a> ContractLoweringVisitor<'a> {
             annotated_values: BTreeMap::new(),
             runtime_filter_builds: BTreeMap::new(),
             runtime_filter_probes: BTreeMap::new(),
-            runtime_filter_attachments: BTreeSet::new(),
             edges: BTreeMap::new(),
         })
     }
@@ -1551,12 +1601,30 @@ impl<'a> ContractLoweringVisitor<'a> {
             .ok_or(ContractLoweringError::IdentitySpaceExhausted("value"))
     }
 
-    fn attach_runtime_filter(
-        &mut self,
-        fragment: FragmentId,
-        filter: RuntimeFilterId,
-    ) -> Result<(), ContractLoweringError> {
-        if self.runtime_filter_attachments.insert((fragment, filter)) {
+    fn attach_runtime_filter_endpoints(&mut self) -> Result<(), ContractLoweringError> {
+        let mut attachments = BTreeSet::new();
+        for (legacy_id, build) in &self.runtime_filter_builds {
+            self.work.step()?;
+            let probes = self.runtime_filter_probes.get(legacy_id).ok_or_else(|| {
+                ContractLoweringError::InvalidRuntimeFilter {
+                    id: *legacy_id,
+                    detail: "producer has no static consumer witness".to_string(),
+                }
+            })?;
+            let filter = runtime_filter_id(*legacy_id)?;
+            let placement = runtime_filter_placement(*legacy_id, build, probes)?;
+            attachments.insert((placement.producer_fragment, filter));
+            for consumer in placement.consumers {
+                self.work.step()?;
+                let fragment = match consumer {
+                    PendingRuntimeFilterConsumerPlacement::Scan(probe) => probe.fragment,
+                    PendingRuntimeFilterConsumerPlacement::JoinProbe => placement.producer_fragment,
+                };
+                attachments.insert((fragment, filter));
+            }
+        }
+        for (fragment, filter) in attachments {
+            self.work.step()?;
             self.fragments
                 .get_mut(&fragment)
                 .expect("runtime-filter endpoint fragment has been allocated")
@@ -1968,6 +2036,7 @@ impl<'a> ContractLoweringVisitor<'a> {
         };
         let result: Result<Option<SemanticParameters>, ContractLoweringError> = (|| {
             self.plan_builder.set_result_port(result_port)?;
+            self.attach_runtime_filter_endpoints()?;
             let mut finished_fragments = BTreeMap::new();
             for (fragment_id, builder) in std::mem::take(&mut self.fragments) {
                 self.work.step()?;
@@ -2223,7 +2292,6 @@ impl<'a> ContractLoweringVisitor<'a> {
                     detail: format!("probe ColumnId {} has no lowered ValueId", column.0),
                 }
             })?;
-            self.attach_runtime_filter(lowered.fragment, runtime_filter_id(intent.filter_id)?)?;
             self.runtime_filter_probes
                 .entry(intent.filter_id)
                 .or_default()
@@ -4786,7 +4854,6 @@ impl<'a> ContractLoweringVisitor<'a> {
         }
 
         let required_inputs = hash_join_required_inputs(HashJoinRequirement {
-            plan,
             kind,
             build_side,
             distribution,
@@ -4901,8 +4968,6 @@ impl<'a> ContractLoweringVisitor<'a> {
                     detail: "producer intent differs from the exact frozen join key".to_string(),
                 });
             }
-            let filter_id = runtime_filter_id(intent.filter_id)?;
-            self.attach_runtime_filter(self.current_fragment, filter_id)?;
             let pending = PendingRuntimeFilterBuild::Join {
                 fragment: self.current_fragment,
                 node,
@@ -6175,8 +6240,6 @@ impl<'a> ContractLoweringVisitor<'a> {
                         .to_string(),
                 });
             }
-            let filter_id = runtime_filter_id(intent.filter_id)?;
-            self.attach_runtime_filter(self.current_fragment, filter_id)?;
             let pending = PendingRuntimeFilterBuild::AggregateTopN {
                 fragment: self.current_fragment,
                 node,
@@ -10180,7 +10243,6 @@ struct LoweredOrdering {
 }
 
 struct HashJoinRequirement<'a> {
-    plan: &'a PhysicalPlanNode,
     kind: ContractJoinKind,
     build_side: ContractJoinSide,
     distribution: ContractJoinDistribution,
@@ -10716,7 +10778,6 @@ fn hash_join_required_inputs(
     requirement: HashJoinRequirement<'_>,
 ) -> Result<Box<[PhysicalProperties]>, ContractLoweringError> {
     let HashJoinRequirement {
-        plan,
         kind,
         build_side,
         distribution,
@@ -10745,20 +10806,9 @@ fn hash_join_required_inputs(
 
     match distribution {
         ContractJoinDistribution::BroadcastBuild => {
-            let build_ordinal = match build_side {
-                ContractJoinSide::Left => 0,
-                ContractJoinSide::Right => 1,
-            };
-            if !matches!(
-                &plan.children[build_ordinal].kind,
-                PhysicalPlanKind::Redistribute(redistribute)
-                    if redistribute.mode == RedistributeMode::Broadcast
-            ) {
-                return Err(ContractLoweringError::MissingPlannerFact {
-                    node: "HashJoin",
-                    fact: "explicit broadcast exchange on the build input",
-                });
-            }
+            // An exchange establishes replication. Deterministic projects
+            // and filters can preserve it above that exchange, so the join
+            // consumes the exact lowered properties rather than its spelling.
             let safe = match kind {
                 ContractJoinKind::Inner => true,
                 ContractJoinKind::LeftOuter
@@ -15902,6 +15952,84 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_hash_join_accepts_replication_preserved_by_project_and_filter() {
+        let left = column(1, "left_key", DataType::Int64, false);
+        let right = column(2, "right_key", DataType::Int64, false);
+        for exchanged in [true, false] {
+            let source = values(vec![right.clone()], vec![vec![literal_int(1)]]);
+            let source = if exchanged {
+                redistribute(source, RedistributeMode::Broadcast)
+            } else {
+                source
+            };
+            let filtered = PhysicalPlanNode {
+                kind: PhysicalPlanKind::Filter(PlanFilterNode {
+                    predicate: literal_bool(true),
+                }),
+                children: vec![source],
+                output_columns: vec![right.clone()],
+                stats: stats(),
+                probe_runtime_filters: Vec::new(),
+            };
+            let projected = PhysicalPlanNode {
+                kind: PhysicalPlanKind::Project(PlanProjectNode {
+                    items: vec![ProjectItem {
+                        expr: column_ref(&right),
+                        output_name: right.name.clone(),
+                        output_column_id: right.column_id,
+                    }],
+                    output_qualifier: None,
+                }),
+                children: vec![filtered],
+                output_columns: vec![right.clone()],
+                stats: stats(),
+                probe_runtime_filters: Vec::new(),
+            };
+            let joined = hash_join(
+                crate::common::JoinKind::Inner,
+                PhysicalHashJoinBuildSide::Right,
+                SqlJoinDistribution::Broadcast,
+                Some(JoinExecutionMode::Broadcast),
+                values(vec![left.clone()], vec![vec![literal_int(1)]]),
+                projected,
+                vec![left.clone(), right.clone()],
+            );
+            if exchanged {
+                let plan = finish_for_test(&joined).unwrap();
+                let fragment = &plan.fragments()[&ROOT_FRAGMENT_ID];
+                let root = &fragment.nodes()[&fragment.root()];
+                assert_eq!(
+                    root.required_inputs[1].distribution,
+                    Distribution::Broadcast
+                );
+                assert_eq!(
+                    root.required_inputs[1].row_multiplicity,
+                    RowMultiplicity::Replicated
+                );
+                assert_eq!(
+                    root.required_inputs[0].row_multiplicity,
+                    RowMultiplicity::SingleCopy
+                );
+                assert!(plan.edges().values().any(|edge| {
+                    edge.partitioning.destination == Distribution::Broadcast
+                        && edge.partitioning.destination_multiplicity == RowMultiplicity::Replicated
+                }));
+            } else {
+                assert!(
+                    matches!(
+                        finish_for_test(&joined),
+                        Err(ContractLoweringError::PropertyRequirementUnsatisfied {
+                            node: "HashJoin",
+                            ..
+                        })
+                    ),
+                    "the planner's Broadcast mode cannot manufacture replication"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn shuffle_hash_join_allocates_one_shared_key_aligned_scheme() {
         let left = column(1, "left_key", DataType::Int64, false);
         let right = column(2, "right_key", DataType::Int64, false);
@@ -16238,6 +16366,113 @@ mod tests {
             finish_for_test(&hash_join),
             Err(ContractLoweringError::InvalidRuntimeFilter { id: 9, detail })
                 if detail == "producer has no static consumer witness"
+        ));
+    }
+
+    fn assert_runtime_filter_attachments_match_endpoints(plan: &PhysicalPlan) {
+        let actual = plan
+            .fragments()
+            .values()
+            .flat_map(|fragment| {
+                fragment
+                    .runtime_filters()
+                    .iter()
+                    .map(move |filter| (fragment.id(), *filter))
+            })
+            .collect::<BTreeSet<_>>();
+        let expected = plan
+            .runtime_filters()
+            .values()
+            .flat_map(|filter| {
+                filter
+                    .producers
+                    .iter()
+                    .map(|producer| producer.endpoint.fragment)
+                    .chain(
+                        filter
+                            .consumers
+                            .iter()
+                            .map(|consumer| consumer.endpoint.fragment),
+                    )
+                    .map(move |fragment| (fragment, filter.id))
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn runtime_filter_non_scan_occurrence_does_not_attach_an_unbound_fragment() {
+        let probe_column = column(1, "probe", DataType::Int64, false);
+        let build_column = column(2, "build", DataType::Int64, false);
+        let mut probe = redistribute(
+            values(vec![probe_column.clone()], vec![vec![literal_int(9)]]),
+            RedistributeMode::Gather,
+        );
+        probe.children[0].probe_runtime_filters.push(
+            crate::planner::physical::runtime_filter::RuntimeFilterProbeIntent {
+                filter_id: 91,
+                probe_expr: column_ref(&probe_column),
+            },
+        );
+        let mut join = hash_join(
+            crate::common::JoinKind::Inner,
+            PhysicalHashJoinBuildSide::Right,
+            SqlJoinDistribution::Singleton,
+            Some(JoinExecutionMode::Singleton),
+            probe,
+            values(vec![build_column.clone()], vec![vec![literal_int(9)]]),
+            vec![probe_column, build_column],
+        );
+        attach_singleton_join_runtime_filter(&mut join, 91, false, true);
+        let plan = finish_for_test(&join).expect("legacy occurrences must not invent endpoints");
+        let filter = &plan.runtime_filters()[&RuntimeFilterId::new(92)];
+        assert_eq!(filter.consumers.len(), 1);
+        assert!(matches!(
+            filter.consumers[0].target,
+            RuntimeFilterConsumerTarget::JoinProbeKey { .. }
+        ));
+        assert_runtime_filter_attachments_match_endpoints(&plan);
+        assert!(
+            plan.fragments()
+                .values()
+                .any(|fragment| fragment.runtime_filters().is_empty())
+        );
+    }
+
+    #[test]
+    fn runtime_filter_placement_preserves_mixed_scan_and_join_consumers() {
+        let build = PendingRuntimeFilterBuild::Join {
+            fragment: FragmentId::new(10),
+            node: NodeId::new(2),
+            key_ordinal: 0,
+            build_side: ContractJoinSide::Right,
+            execution_mode: JoinExecutionMode::Singleton,
+            build_value: ValueId::new(1),
+            probe_value: ValueId::new(2),
+            null_semantics: RuntimeFilterNullSemantics::NeverMatches,
+        };
+        let scan = PendingRuntimeFilterProbe {
+            fragment: FragmentId::new(11),
+            node: NodeId::new(3),
+            value: ValueId::new(4),
+            scan_source: true,
+        };
+        let occurrence = PendingRuntimeFilterProbe {
+            fragment: FragmentId::new(12),
+            node: NodeId::new(5),
+            value: ValueId::new(6),
+            scan_source: false,
+        };
+        let placement = runtime_filter_placement(9, &build, &[scan, scan, occurrence]).unwrap();
+        assert_eq!(placement.producer_fragment, FragmentId::new(10));
+        assert!(matches!(placement.consumers.as_slice(), [
+            PendingRuntimeFilterConsumerPlacement::Scan(probe),
+            PendingRuntimeFilterConsumerPlacement::JoinProbe,
+        ] if (probe.fragment, probe.node, probe.value) == (scan.fragment, scan.node, scan.value)));
+        let scan_only = runtime_filter_placement(9, &build, &[scan]).unwrap();
+        assert!(matches!(
+            scan_only.consumers.as_slice(),
+            [PendingRuntimeFilterConsumerPlacement::Scan(_)]
         ));
     }
 
@@ -17343,6 +17578,93 @@ mod tests {
             assert_eq!(edge.source.projection.as_ref(), &[producer_value]);
             assert!(destination_nodes.insert(edge.destination.node));
         }
+    }
+
+    #[test]
+    fn multicast_physical_wait_cycle_late_applies_only_its_blocked_consumers() {
+        let cte_id = 81;
+        let producer_column = column(1, "shared_key", DataType::Int64, false);
+        let produce = cte_produce(
+            cte_id,
+            vec![producer_column.clone()],
+            values(vec![producer_column.clone()], vec![vec![literal_int(9)]]),
+        );
+        let mut branches = Vec::new();
+        let mut branch_outputs = Vec::new();
+        for (filter_id, raw, shared) in [(81, 10, true), (82, 20, true), (83, 30, false)] {
+            let probe = column(raw, "probe", DataType::Int64, false);
+            let build = column(raw + 1, "build", DataType::Int64, false);
+            let probe_plan = if shared {
+                // A CTE import preserves single-copy rows but does not promise
+                // singleton distribution. Gather establishes the Join's input
+                // requirement without changing the shared multicast ancestry.
+                redistribute(
+                    cte_consume(
+                        cte_id,
+                        "shared",
+                        vec![probe.clone()],
+                        vec![producer_column.column_id],
+                    ),
+                    RedistributeMode::Gather,
+                )
+            } else {
+                values(vec![probe.clone()], vec![vec![literal_int(9)]])
+            };
+            let mut branch = hash_join(
+                crate::common::JoinKind::Inner,
+                PhysicalHashJoinBuildSide::Right,
+                SqlJoinDistribution::Singleton,
+                Some(JoinExecutionMode::Singleton),
+                probe_plan,
+                values(vec![build], vec![vec![literal_int(9)]]),
+                vec![probe.clone()],
+            );
+            attach_singleton_join_runtime_filter(&mut branch, filter_id, false, true);
+            branches.push(branch);
+            branch_outputs.push(vec![probe]);
+        }
+        let output = column(40, "key", DataType::Int64, false);
+        let body = PhysicalPlanNode {
+            kind: PhysicalPlanKind::SetOp(crate::planner::physical::PhysicalSetOpNode {
+                kind: PlanSetOpKind::UnionAll,
+                output_columns: vec![output.clone()],
+                child_output_columns: branch_outputs,
+            }),
+            children: branches,
+            output_columns: vec![output],
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let plan = finish_for_test(&cte_anchor(cte_id, produce, body))
+            .expect("independent RF builds must not leave the shared multicast blocked");
+        assert_runtime_filter_attachments_match_endpoints(&plan);
+        assert!(plan.fragments().values().any(|fragment| {
+            matches!(fragment.sink(), FragmentSink::Multicast { edges } if edges.len() == 2)
+        }));
+        for id in [82, 83] {
+            let filter = &plan.runtime_filters()[&RuntimeFilterId::new(id)];
+            let producer = &filter.producers[0];
+            let fragment = &plan.fragments()[&producer.endpoint.fragment];
+            let join = &fragment.nodes()[&producer.endpoint.node];
+            assert!(
+                matches!(
+                    fragment.nodes()[&join.inputs[1]].kind,
+                    NodeKind::Values { .. }
+                ),
+                "the filter build is independent of the shared multicast"
+            );
+            assert_eq!(filter.consumers.len(), 1);
+            assert_eq!(
+                filter.consumers[0].activation,
+                RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
+                    late_apply: novarocks_physical_plan::LateApplyGranularity::Batch,
+                }
+            );
+        }
+        assert_eq!(
+            plan.runtime_filters()[&RuntimeFilterId::new(84)].consumers[0].activation,
+            RuntimeFilterConsumerActivation::BlockingSnapshot
+        );
     }
 
     #[test]

@@ -741,9 +741,7 @@ impl BackendRuntimeFilterSession {
                                     Arc::new(query),
                                 ),
                             )),
-                            Err(_) => SnapshotAcquireOutcome::Unavailable(
-                                UnavailableReason::MaterializationFailed,
-                            ),
+                            Err(error) => artifact_query_failure(error)?,
                         }
                     }
                     worker_runtime_filter::materializer::MaterializationOutcome::Unsupported(_) => {
@@ -751,8 +749,8 @@ impl BackendRuntimeFilterSession {
                             novarocks_execution::runtime_filter::ArtifactUnsupportedReason::NoAcceptedRepresentation,
                         )
                     }
-                    worker_runtime_filter::materializer::MaterializationOutcome::Unavailable(_) => {
-                        SnapshotAcquireOutcome::Unavailable(UnavailableReason::MaterializationFailed)
+                    worker_runtime_filter::materializer::MaterializationOutcome::Unavailable(reason) => {
+                        SnapshotAcquireOutcome::Unavailable(materialization_unavailable_reason(reason))
                     }
                 },
                 (
@@ -780,9 +778,7 @@ impl BackendRuntimeFilterSession {
                                 Arc::new(query),
                             ),
                         )),
-                        Err(_) => SnapshotAcquireOutcome::Unavailable(
-                            UnavailableReason::MaterializationFailed,
-                        ),
+                        Err(error) => artifact_query_failure(error)?,
                     },
                     Err(_) => SnapshotAcquireOutcome::Unavailable(
                         UnavailableReason::MaterializationFailed,
@@ -1015,9 +1011,9 @@ impl BackendRuntimeFilterSession {
                         )
                         .map_err(|error| materialization_violation(error.to_string()))?
                     }
-                    worker_runtime_filter::materializer::MaterializationOutcome::Unavailable(_) => {
+                    worker_runtime_filter::materializer::MaterializationOutcome::Unavailable(reason) => {
                         worker_runtime_filter::codec::artifact::encode_unavailable(
-                            UnavailableReason::MaterializationFailed,
+                            materialization_unavailable_reason(reason),
                             group.profile(),
                             worker_runtime_filter::codec::artifact::max_encoded_len_for_artifact_budget(
                                 self.channel.max_artifact_bytes(),
@@ -1409,6 +1405,37 @@ fn materialization_violation(detail: impl Into<Arc<str>>) -> RuntimeFilterContra
     )
 }
 
+fn materialization_unavailable_reason(
+    reason: worker_runtime_filter::materializer::MaterializationUnavailable,
+) -> UnavailableReason {
+    match reason {
+        worker_runtime_filter::materializer::MaterializationUnavailable::ResourceLimit => {
+            UnavailableReason::ResourceLimit
+        }
+        worker_runtime_filter::materializer::MaterializationUnavailable::MaterializationFailed => {
+            UnavailableReason::MaterializationFailed
+        }
+    }
+}
+
+fn artifact_query_failure(
+    error: novarocks_execution::runtime_filter::RuntimeFilterArtifactQueryError,
+) -> Result<SnapshotAcquireOutcome, RuntimeFilterContractViolation> {
+    use novarocks_execution::runtime_filter::RuntimeFilterArtifactQueryError;
+    match error {
+        RuntimeFilterArtifactQueryError::Unsupported => Ok(SnapshotAcquireOutcome::Unsupported(
+            novarocks_execution::runtime_filter::ArtifactUnsupportedReason::NoAcceptedRepresentation,
+        )),
+        RuntimeFilterArtifactQueryError::ResourceUnavailable => Ok(SnapshotAcquireOutcome::Unavailable(
+            UnavailableReason::ResourceLimit,
+        )),
+        RuntimeFilterArtifactQueryError::ContractViolation => Err(contract_violation(
+            RuntimeFilterContractViolationKind::ContractMismatch,
+            "materialized runtime-filter artifact query violates the frozen consumer contract",
+        )),
+    }
+}
+
 fn placeholder_membership_schema() -> Result<
     novarocks_execution::runtime_filter::RuntimeFilterMembershipSchema,
     RuntimeFilterContractViolation,
@@ -1483,8 +1510,11 @@ mod tests {
             1024,
         )
         .unwrap();
-        let profile =
-            ConsumerArtifactProfile::new(BTreeSet::from([ArtifactKind::ValueSet]), None).unwrap();
+        let profile = ConsumerArtifactProfile::new(
+            BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+            None,
+        )
+        .unwrap();
         let blocking = BackendConsumerInstall::new(
             RuntimeFilterConsumerContract::membership_blocking(
                 RuntimeFilterBindingId::new(70),
@@ -1808,6 +1838,263 @@ mod tests {
         assert_eq!(
             session.materialized_logical_version(&second),
             LogicalVersion::FIRST
+        );
+    }
+
+    #[derive(Default)]
+    struct CollectingMaterializedDeliveries(Mutex<Vec<BackendMaterializedDelivery>>);
+
+    impl BackendMaterializedDeliverySink for CollectingMaterializedDeliveries {
+        fn dispatch(
+            &self,
+            delivery: BackendMaterializedDelivery,
+        ) -> Result<(), RuntimeFilterContractViolation> {
+            self.0.lock().unwrap().push(delivery);
+            Ok(())
+        }
+    }
+
+    fn owned_complete_once_session(
+        max_artifact_bytes: usize,
+        profile: ConsumerArtifactProfile,
+    ) -> (
+        Arc<BackendRuntimeFilterSession>,
+        BackendRuntimeFilterFixture,
+        Arc<CollectingMaterializedDeliveries>,
+    ) {
+        use crate::runtime_filter::domain::{
+            BackendMaterializationOwner, BackendOutboundMaterializationGroup,
+        };
+        let fixture = BackendRuntimeFilterFixture::membership();
+        let schema = fixture.producer_contract().contract().clone();
+        let witness = BackendCoverageWitnessId::new(29);
+        let route = BackendRouteEdgeId::new(101);
+        let producer =
+            BackendProducerInstall::new(fixture.producer_contract(), witness, [instance(37)], 1024)
+                .unwrap();
+        let consumer = BackendConsumerInstall::new(
+            RuntimeFilterConsumerContract::membership_live(
+                RuntimeFilterBindingId::new(71),
+                RuntimeFilterChannelId::new(11),
+                RuntimeFilterLateApplyGranularity::Batch,
+                schema.clone(),
+            )
+            .unwrap(),
+            profile.clone(),
+            [route],
+            [instance(53)],
+        )
+        .unwrap();
+        let channel = BackendChannelInstall::new(
+            RuntimeFilterChannelId::new(11),
+            schema,
+            BackendChannelLifecycle::CompleteOnce,
+            BackendCoverage::witness(witness),
+            BackendCoverage::witness(witness),
+            BackendMaterializationPolicy::new(8, 3, 5, 1, 4096, 4096, 1).unwrap(),
+            4096,
+            max_artifact_bytes,
+            [producer],
+            [consumer],
+            [BackendOutboundMaterializationGroup::new(
+                BackendMaterializationOwner::DirectSource,
+                profile,
+                [route],
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        let session = Arc::new(
+            BackendRuntimeFilterSession::from_channel_install(
+                fixture.identity(),
+                channel,
+                Arc::new(CollectingBackendRuntimeFilterEventObserver::default()),
+            )
+            .unwrap(),
+        );
+        let deliveries = Arc::new(CollectingMaterializedDeliveries::default());
+        session.set_materialized_delivery_sink(deliveries.clone());
+        (session, fixture, deliveries)
+    }
+
+    #[test]
+    fn complete_once_final_artifact_or_resource_unavailable_agrees_locally_and_remotely() {
+        use crate::runtime_filter::{
+            codec::{artifact, leaf},
+            domain::BackendEnvelopeKind,
+        };
+        use novarocks_execution::runtime_filter::LivePollOutcome;
+        for budget in [128, 4096] {
+            let profile = ConsumerArtifactProfile::new(
+                BTreeSet::from([ArtifactKind::ValueSet, ArtifactKind::EmptyDomain]),
+                None,
+            )
+            .unwrap();
+            let (session, fixture, deliveries) =
+                owned_complete_once_session(budget, profile.clone());
+            let contract = fixture.producer_contract().contract().clone();
+            let RuntimeFilterBindOutcome::Bound(RuntimeFilterSubscriptionHandle::Live(
+                subscription,
+            )) = session
+                .subscribe(
+                    instance(53),
+                    RuntimeFilterSubscriptionRequest::new(
+                        RuntimeFilterConsumerContract::membership_live(
+                            RuntimeFilterBindingId::new(71),
+                            RuntimeFilterChannelId::new(11),
+                            RuntimeFilterLateApplyGranularity::Batch,
+                            contract.clone(),
+                        )
+                        .unwrap(),
+                    ),
+                )
+                .unwrap()
+            else {
+                panic!("installed live consumer must bind")
+            };
+            let RuntimeFilterExecutionContract::Membership(schema) = contract else {
+                panic!("membership fixture must declare a membership schema")
+            };
+            let RuntimeFilterBindOutcome::Bound(producer) = session
+                .open_producer(
+                    instance(37),
+                    RuntimeFilterProducerOpenRequest::new(fixture.producer_contract(), 1),
+                )
+                .unwrap()
+            else {
+                panic!("installed producer must bind")
+            };
+            let publication = session
+                .submit(
+                    fixture.producer_contract().binding_id(),
+                    instance(37),
+                    PartitionId::new(0),
+                    ProducerSequence::new(0),
+                    fixture.membership_contribution_with_values([3, 9]),
+                )
+                .unwrap()
+                .publication
+                .unwrap();
+            if budget == 128 {
+                let BackendReducedLogicalDomain::Membership(domain) = publication.domain() else {
+                    panic!("membership publication")
+                };
+                let encoded =
+                    leaf::encode_membership_leaf(domain, &schema, LogicalVersion::FIRST).unwrap();
+                assert!(
+                    encoded.len() <= budget,
+                    "encoded leaf fits the frozen budget"
+                );
+                let decoded = leaf::decode_leaf(
+                    &encoded,
+                    leaf::ArtifactDecodeExpectations {
+                        expected_kind: ArtifactKind::ValueSet,
+                        schema: &schema,
+                        expected_logical_version: LogicalVersion::FIRST,
+                        expected_hash_contract: None,
+                    },
+                    budget,
+                )
+                .unwrap();
+                assert!(
+                    crate::runtime_filter::artifact::ArtifactBundle::accounted_resident_bytes(
+                        &profile,
+                        &[(ArtifactKind::ValueSet, decoded)],
+                    )
+                    .unwrap()
+                        > budget,
+                    "only retained admission is exhausted"
+                );
+            }
+            assert_eq!(
+                producer
+                    .close_partition(PartitionId::new(0), ProducerSequence::new(1))
+                    .unwrap(),
+                RuntimeFilterSubmitOutcome::PendingFinalSnapshot
+            );
+            assert_eq!(
+                session.availability_progress(),
+                BackendCoverageProgress::Satisfied
+            );
+            let deliveries = deliveries.0.lock().unwrap();
+            assert_eq!(deliveries.len(), 1);
+            let delivery = &deliveries[0];
+            let max_encoded = artifact::max_encoded_len_for_artifact_budget(budget).unwrap();
+            if budget == 128 {
+                assert!(matches!(
+                    subscription.poll_after(None),
+                    LivePollOutcome::Idle {
+                        latest_version: None,
+                        terminal: Some(LiveTerminal::Unavailable(UnavailableReason::ResourceLimit)),
+                    }
+                ));
+                assert_eq!(delivery.kind(), BackendEnvelopeKind::Unavailable);
+                assert_eq!(
+                    artifact::decode_unavailable(
+                        delivery.payload(),
+                        &delivery.schema_digest(),
+                        &profile,
+                        max_encoded
+                    )
+                    .unwrap(),
+                    UnavailableReason::ResourceLimit
+                );
+            } else {
+                assert!(matches!(
+                    subscription.poll_after(None),
+                    LivePollOutcome::Updated {
+                        terminal: Some(LiveTerminal::Completed),
+                        ..
+                    }
+                ));
+                assert_eq!(delivery.kind(), BackendEnvelopeKind::FinalArtifact);
+                let bundle = artifact::decode_artifact_bundle(
+                    delivery.payload(),
+                    &delivery.schema_digest(),
+                    artifact::ArtifactDecodeExpectation {
+                        profile: &profile,
+                        schema: &schema,
+                        order_contract: None,
+                    },
+                    max_encoded,
+                )
+                .unwrap();
+                assert_eq!(bundle.version(), LogicalVersion::FIRST);
+            }
+        }
+    }
+
+    #[test]
+    fn completed_materialization_rejects_artifact_query_contract_violation() {
+        let profile =
+            ConsumerArtifactProfile::new(BTreeSet::from([ArtifactKind::ValueSet]), None).unwrap();
+        let (session, fixture, deliveries) = owned_complete_once_session(4096, profile);
+        let RuntimeFilterBindOutcome::Bound(producer) = session
+            .open_producer(
+                instance(37),
+                RuntimeFilterProducerOpenRequest::new(fixture.producer_contract(), 1),
+            )
+            .unwrap()
+        else {
+            panic!("installed producer must bind")
+        };
+        producer
+            .submit(
+                PartitionId::new(0),
+                ProducerSequence::new(0),
+                fixture.membership_contribution_with_values([3, 9]),
+            )
+            .unwrap();
+        let error = producer
+            .close_partition(PartitionId::new(0), ProducerSequence::new(1))
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            RuntimeFilterContractViolationKind::ContractMismatch
+        );
+        assert!(
+            deliveries.0.lock().unwrap().is_empty(),
+            "contract failure cannot publish unavailable"
         );
     }
 

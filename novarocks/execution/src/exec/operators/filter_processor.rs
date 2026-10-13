@@ -343,7 +343,7 @@ impl ProcessorOperator for FilterProcessorOperator {
                 .into());
         }
         if chunk.is_empty() {
-            self.pending_output = Some(Chunk::default());
+            self.pending_output = Some(chunk);
             return Ok(());
         }
 
@@ -458,6 +458,51 @@ mod tests {
                 if key_type.as_ref() == &DataType::Int32
                     && value_type.as_ref() == &DataType::Utf8
         ));
+    }
+
+    #[test]
+    fn filter_empty_input_preserves_slot_schema_for_downstream_readers() {
+        let original = filter_test_chunk();
+        let empty = Chunk::new_like(original.batch.slice(0, 0), &original);
+        let mut arena = ExprArena::default();
+        let status = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Utf8);
+        let absent = utf8_literal(&mut arena, "ABSENT");
+        let predicate = arena.push_typed(ExprNode::Eq(status, absent), DataType::Boolean);
+        let amount = arena.push_typed(ExprNode::SlotId(SlotId::new(3)), DataType::Int32);
+        let arena = Arc::new(arena);
+        let factory = FilterProcessorFactory::new(7, Arc::clone(&arena), predicate);
+        let state = RuntimeState::default();
+        for input in [empty, original] {
+            let mut first = factory.create(1, 0);
+            let processor = first.as_processor_mut().expect("filter processor");
+            processor.push_chunk(&state, input).expect("filter");
+            let filtered = processor
+                .pull_chunk(&state)
+                .unwrap()
+                .expect("filtered batch");
+            assert!(filtered.is_empty());
+            let expected_schema = filtered.batch.schema();
+            let expected_slots = filtered.chunk_schema_ref();
+            let mut second = factory.create(1, 0);
+            let processor = second.as_processor_mut().expect("second filter processor");
+            processor
+                .push_chunk(&state, filtered)
+                .expect("typed empty filter");
+            let output = processor.pull_chunk(&state).unwrap().expect("empty output");
+            assert!(output.is_empty());
+            assert_eq!(output.batch.schema(), expected_schema);
+            assert!(Arc::ptr_eq(&output.chunk_schema_ref(), &expected_slots));
+            assert_eq!(output.column_by_slot_id(SlotId::new(1)).unwrap().len(), 0);
+            assert_eq!(
+                arena
+                    .eval(amount, &output)
+                    .expect("downstream slot expression")
+                    .len(),
+                0
+            );
+            processor.set_finishing(&state).expect("normal finish");
+            assert!(second.is_finished());
+        }
     }
 
     #[test]

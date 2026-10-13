@@ -22,14 +22,11 @@ use crate::governed_result_writer::{
     governed_cancelled_query_result_delivery, is_terminal_cancellation,
 };
 use crate::relay_result_writer::{
-    ACTIVE_WRITE_DEADLINE, CLOSING_DEADLINE, CLOSING_OBJECT_BYTES, error_payload, invalid,
-    io_error, resident_tail, success_payload, timeout_error, write_body,
+    CLOSING_DEADLINE, CLOSING_OBJECT_BYTES, error_payload, invalid, io_error, resident_tail,
+    success_payload, timeout_error, write_body,
 };
 use novarocks_query_application::{
-    api::{
-        LocalColumnKind, LocalRenderCursor, OwnedLocalResult, QueryExecutionError,
-        QueryExecutionErrorKind,
-    },
+    api::{LocalColumnKind, LocalRenderCursor, OwnedLocalResult, QueryExecutionError},
     cancellation::QueryCancellationReason,
     protocol_delivery::{GovernedImmediateStatementResult, GovernedProtocolOwner},
     session_control::GovernedStatementVisibilitySealOutcome,
@@ -69,7 +66,7 @@ pub(crate) async fn write_local_result_one<'writer, W: AsyncWrite + Unpin>(
         )
         .await;
     }
-    let deadline = Instant::now() + ACTIVE_WRITE_DEADLINE;
+    let mut budget = crate::active_delivery_budget::ActiveDeliveryWorkBudget::new();
     // The complete producer window was admitted before the source callback.
     // Metadata, render scratch and socket work retain that same window.
     let cancellation = protocol.cancellation();
@@ -77,42 +74,53 @@ pub(crate) async fn write_local_result_one<'writer, W: AsyncWrite + Unpin>(
         drop(graph);
         return close_initial(protocol, results, cancelled(reason)).await;
     }
-    let metadata = local_metadata(&graph, capabilities, limits);
+    let metadata = budget.run_sync(|| local_metadata(&graph, capabilities, limits));
     let metadata = match metadata {
         Ok(metadata) => metadata,
         Err(error) => {
             drop(graph);
+            if error.kind() == io::ErrorKind::TimedOut {
+                drop(results);
+                let _ = protocol.client_disconnected();
+                return Err(error);
+            }
             return close_initial(protocol, results, invalid(error.to_string())).await;
         }
     };
-    let cursor = graph.into_cursor();
-    let mut buffers = LocalProtocolBuffers {
-        _window: cursor.retain_physical_guard(),
-        cursor,
-        bytes: vec![0; RootProfileV1::SEGMENT_BYTES],
-        metadata: Some(metadata),
+    let mut buffers = match budget.run_sync(|| {
+        let cursor = graph.into_cursor();
+        Ok(LocalProtocolBuffers {
+            _window: cursor.retain_physical_guard(),
+            cursor,
+            bytes: vec![0; RootProfileV1::SEGMENT_BYTES],
+            metadata: Some(metadata),
+        })
+    }) {
+        Ok(buffers) => buffers,
+        Err(error) => {
+            drop(results);
+            let _ = protocol.client_disconnected();
+            return Err(error);
+        }
     };
     // From this point all socket/coalescer/metadata work is finite and the
     // actual writer task retains the same producer window throughout.
-    let mut lease = match tokio::time::timeout_at(deadline, results.into_streaming_result()).await {
-        Ok(Ok(lease)) => lease,
-        outcome => {
+    let mut lease = match budget.run(results.into_streaming_result()).await {
+        Ok(lease) => lease,
+        Err(error) => {
             drop(buffers);
             let _ = protocol.client_disconnected();
-            return Err(match outcome {
-                Ok(Err(error)) => error,
-                _ => timeout_error(),
-            });
+            return Err(error);
         }
     };
-    lease
-        .writer()
-        .start_metadata(buffers.metadata.take().expect("frozen Local metadata"))?;
     let cancellation = protocol.cancellation();
     let started = tokio::select! {
         biased;
         reason = cancellation.cancelled() => Err(LocalWriteInterruption::Query(cancelled(reason))),
-        outcome = tokio::time::timeout_at(deadline, lease.writer().finish_metadata()) => finite_write(outcome),
+        outcome = budget.run(async {
+            lease.writer().start_metadata(buffers.metadata.take().expect("frozen Local metadata"))?;
+            lease.writer().finish_metadata().await
+        }) => outcome.map_err(LocalWriteInterruption::Io),
     };
     if let Err(error) = started {
         return interrupt(protocol, lease, buffers, error, None).await;
@@ -123,22 +131,24 @@ pub(crate) async fn write_local_result_one<'writer, W: AsyncWrite + Unpin>(
         if let Some(reason) = protocol.cancellation().reason() {
             return close_local(protocol, lease, buffers, cancelled(reason), None).await;
         }
-        if Instant::now() >= deadline {
-            return close_local(
-                protocol,
-                lease,
-                buffers,
-                QueryExecutionError::new(
-                    QueryExecutionErrorKind::DeadlineExceeded,
-                    "MySQL response write deadline expired",
-                ),
-                None,
-            )
-            .await;
-        }
-        let turn = match buffers.cursor.step(&mut buffers.bytes) {
+        let turn = match budget.run_sync(|| {
+            buffers
+                .cursor
+                .step(&mut buffers.bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+        }) {
             Ok(turn) => turn,
             Err(error) => {
+                if error.kind() == io::ErrorKind::TimedOut {
+                    return interrupt(
+                        protocol,
+                        lease,
+                        buffers,
+                        LocalWriteInterruption::Io(error),
+                        None,
+                    )
+                    .await;
+                }
                 return close_local(protocol, lease, buffers, invalid(error.to_string()), None)
                     .await;
             }
@@ -150,9 +160,23 @@ pub(crate) async fn write_local_result_one<'writer, W: AsyncWrite + Unpin>(
             return close_local(protocol, lease, buffers, cancelled(reason), None).await;
         }
         if turn.emitted_bytes != 0 {
-            let body = match frontier.validate_body(profile, &buffers.bytes[..turn.emitted_bytes]) {
+            let body = match budget.run_sync(|| {
+                frontier
+                    .validate_body(profile, &buffers.bytes[..turn.emitted_bytes])
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+            }) {
                 Ok(body) => body,
                 Err(error) => {
+                    if error.kind() == io::ErrorKind::TimedOut {
+                        return interrupt(
+                            protocol,
+                            lease,
+                            buffers,
+                            LocalWriteInterruption::Io(error),
+                            None,
+                        )
+                        .await;
+                    }
                     return close_local(protocol, lease, buffers, invalid(error.to_string()), None)
                         .await;
                 }
@@ -170,7 +194,7 @@ pub(crate) async fn write_local_result_one<'writer, W: AsyncWrite + Unpin>(
             let written = tokio::select! {
                 biased;
                 reason = cancellation.cancelled() => Err(LocalWriteInterruption::Query(cancelled(reason))),
-                outcome = tokio::time::timeout_at(deadline, write_body(lease.writer(), &body)) => finite_write(outcome),
+                outcome = budget.run(write_body(lease.writer(), &body)) => outcome.map_err(LocalWriteInterruption::Io),
             };
             if let Err(error) = written {
                 return interrupt(
@@ -214,23 +238,23 @@ pub(crate) async fn write_local_result_one<'writer, W: AsyncWrite + Unpin>(
                     .await;
                 }
             }
-            let terminal = success_payload(capabilities, more_results);
-            let written = tokio::time::timeout_at(deadline, lease.finish(&terminal)).await;
-            drop(terminal);
+            let written = budget
+                .run(async {
+                    let terminal = success_payload(capabilities, more_results);
+                    lease.finish(&terminal).await
+                })
+                .await;
             // The segment, encoder/schema and legacy protection precede the
             // original statement grant even on a failed terminal write.
             drop(buffers);
             return match written {
-                Ok(Ok(writer)) => {
+                Ok(writer) => {
                     let _ = protocol.complete();
                     Ok(MysqlStatementWriteOutcome::Continue(writer))
                 }
-                outcome => {
+                Err(error) => {
                     let _ = protocol.client_disconnected();
-                    Err(match outcome {
-                        Ok(Err(error)) => error,
-                        _ => timeout_error(),
-                    })
+                    Err(error)
                 }
             };
         }
@@ -281,14 +305,6 @@ fn local_metadata(
 enum LocalWriteInterruption {
     Query(QueryExecutionError),
     Io(io::Error),
-}
-fn finite_write(
-    outcome: Result<io::Result<()>, tokio::time::error::Elapsed>,
-) -> Result<(), LocalWriteInterruption> {
-    outcome
-        .map_err(|_| timeout_error())
-        .and_then(|outcome| outcome)
-        .map_err(LocalWriteInterruption::Io)
 }
 async fn interrupt<'writer, W: AsyncWrite + Unpin>(
     mut protocol: GovernedProtocolOwner,
@@ -617,14 +633,18 @@ mod tests {
     struct WriteGate {
         remaining: std::sync::atomic::AtomicUsize,
         pause_flush: std::sync::atomic::AtomicBool,
+        flushes_before_pause: std::sync::atomic::AtomicUsize,
         waiter: std::sync::Mutex<Option<std::task::Waker>>,
+        blocked: tokio::sync::Notify,
     }
     impl WriteGate {
         fn new() -> Self {
             Self {
                 remaining: std::sync::atomic::AtomicUsize::new(usize::MAX),
                 pause_flush: std::sync::atomic::AtomicBool::new(false),
+                flushes_before_pause: std::sync::atomic::AtomicUsize::new(0),
                 waiter: std::sync::Mutex::new(None),
+                blocked: tokio::sync::Notify::new(),
             }
         }
         fn release(&self) {
@@ -653,6 +673,7 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst);
             if remaining == 0 {
                 *self.gate.waiter.lock().unwrap() = Some(cx.waker().clone());
+                self.gate.blocked.notify_one();
                 return std::task::Poll::Pending;
             }
             let count = bytes.len().min(remaining);
@@ -670,12 +691,28 @@ mod tests {
             mut self: std::pin::Pin<&mut Self>,
             cx: &mut std::task::Context<'_>,
         ) -> std::task::Poll<io::Result<()>> {
+            let countdown = self
+                .gate
+                .flushes_before_pause
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if countdown != 0
+                && self
+                    .gate
+                    .flushes_before_pause
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+                    == 1
+            {
+                self.gate
+                    .pause_flush
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             if self
                 .gate
                 .pause_flush
                 .load(std::sync::atomic::Ordering::SeqCst)
             {
                 *self.gate.waiter.lock().unwrap() = Some(cx.waker().clone());
+                self.gate.blocked.notify_one();
                 return std::task::Poll::Pending;
             }
             std::pin::Pin::new(&mut self.inner).poll_flush(cx)
@@ -736,6 +773,64 @@ mod tests {
             query: &'a str,
             results: QueryResultWriter<'a, W>,
         ) -> io::Result<()> {
+            if matches!(query, "relay-wait" | "relay-query-timeout" | "relay-budget") {
+                use crate::governed_result_writer::streaming_result_tests::{
+                    fixture_with_admission_deadline, string_fields, text_body,
+                };
+                let seconds = if query == "relay-query-timeout" {
+                    2
+                } else {
+                    120
+                };
+                let mut fixture = fixture_with_admission_deadline(
+                    string_fields(),
+                    Some(Instant::now() + std::time::Duration::from_secs(seconds)),
+                    Some(seconds * 1_000),
+                );
+                if query == "relay-budget" {
+                    self.gate
+                        .remaining
+                        .store(0, std::sync::atomic::Ordering::SeqCst);
+                }
+                let result = fixture.result.take().unwrap();
+                let produce = async {
+                    if query != "relay-budget" {
+                        tokio::time::sleep(std::time::Duration::from_secs(35)).await;
+                    }
+                    let receipt = fixture
+                        .producer
+                        .enqueue_client_body(0, text_body("1"), 1)
+                        .await
+                        .unwrap();
+                    receipt.wait().await;
+                    let receipt = fixture.producer.enqueue_end(1).await;
+                    receipt.wait().await;
+                    std::future::pending::<()>().await;
+                };
+                let written = tokio::select! {
+                    biased;
+                    written = crate::governed_result_writer::write_streaming_query_result_one(result, results) => written,
+                    _ = produce => unreachable!("producer remains live until writer exit"),
+                };
+                assert_eq!(
+                    fixture.protocol_capacity.snapshot().held_positions,
+                    [0; 4],
+                    "the actual response/Closing writer must exit before its capacity is released"
+                );
+                fixture.producer.finish();
+                return match written? {
+                    MysqlStatementWriteOutcome::Continue(writer) => writer.no_more_results().await,
+                    MysqlStatementWriteOutcome::Terminated => Ok(()),
+                };
+            }
+            if query == "local-budget" {
+                self.gate
+                    .remaining
+                    .store(0, std::sync::atomic::Ordering::SeqCst);
+                self.gate
+                    .flushes_before_pause
+                    .store(2, std::sync::atomic::Ordering::SeqCst);
+            }
             if matches!(
                 query,
                 "terminal"
@@ -859,7 +954,7 @@ mod tests {
             }
         }
     }
-    async fn read_packet(client: &mut TcpStream) -> (u8, Vec<u8>) {
+    async fn read_packet<C: tokio::io::AsyncRead + Unpin>(client: &mut C) -> (u8, Vec<u8>) {
         let mut header = [0; 4];
         client.read_exact(&mut header).await.unwrap();
         let len =
@@ -868,7 +963,7 @@ mod tests {
         client.read_exact(&mut bytes).await.unwrap();
         (header[3], bytes)
     }
-    async fn packet(client: &mut TcpStream, sequence: u8, bytes: &[u8]) {
+    async fn packet<C: AsyncWrite + Unpin>(client: &mut C, sequence: u8, bytes: &[u8]) {
         let size = bytes.len() as u32;
         let mut header = size.to_le_bytes();
         header[3] = sequence;
@@ -899,7 +994,11 @@ mod tests {
             .await
         });
         let mut client = TcpStream::connect(address).await.unwrap();
-        let (sequence, greeting) = read_packet(&mut client).await;
+        handshake(&mut client).await;
+        (client, server)
+    }
+    async fn handshake<C: tokio::io::AsyncRead + AsyncWrite + Unpin>(client: &mut C) {
+        let (sequence, greeting) = read_packet(client).await;
         assert_eq!(sequence, 0);
         assert_eq!(greeting[0], 10);
         let capabilities = CapabilityFlags::CLIENT_PROTOCOL_41
@@ -913,11 +1012,143 @@ mod tests {
         response.extend_from_slice(b"root\0");
         response.push(0);
         response.extend_from_slice(b"mysql_native_password\0");
-        packet(&mut client, 1, &response).await;
-        assert_eq!(read_packet(&mut client).await.1[0], 0);
+        packet(client, 1, &response).await;
+        assert_eq!(read_packet(client).await.1[0], 0);
+    }
+    async fn duplex_socket_with(
+        fixture: Fixture,
+        gate: Arc<WriteGate>,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<io::Result<()>>,
+    ) {
+        let (mut client, stream) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let (read, write) = tokio::io::split(stream);
+            AsyncMysqlIntermediary::run_with_options(
+                Shim {
+                    fixture,
+                    gate: Arc::clone(&gate),
+                },
+                read,
+                GatedWrite { inner: write, gate },
+                &crate::MYSQL_INTERMEDIARY_OPTIONS,
+            )
+            .await
+        });
+        handshake(&mut client).await;
         (client, server)
     }
-    async fn read_result(client: &mut TcpStream, first_sequence: u8) -> (Vec<u8>, Vec<u8>, u8) {
+    async fn wait_for_write_gate(gate: &WriteGate) {
+        loop {
+            let notified = gate.blocked.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if gate.waiter.lock().unwrap().is_some() {
+                return;
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(300), notified)
+                .await
+                .expect("actual writer did not reach its controlled gate");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_producer_gap_excludes_active_budget_and_keeps_the_connection() {
+        let (mut client, server) =
+            duplex_socket_with(Fixture::new(), Arc::new(WriteGate::new())).await;
+        let started = Instant::now();
+        packet(&mut client, 0, b"\x03relay-wait").await;
+        assert_eq!(read_result(&mut client, 1).await.0, b"\x011");
+        assert!(started.elapsed() >= std::time::Duration::from_secs(35));
+        packet(&mut client, 0, b"\x03again").await;
+        assert_eq!(read_result(&mut client, 1).await.0, b"\x05again");
+        packet(&mut client, 0, &[1]).await;
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_producer_gap_observes_the_original_admission_deadline() {
+        let (mut client, server) =
+            duplex_socket_with(Fixture::new(), Arc::new(WriteGate::new())).await;
+        let started = Instant::now();
+        packet(&mut client, 0, b"\x03relay-query-timeout").await;
+        for _ in 0..3 {
+            read_packet(&mut client).await;
+        }
+        let (_, error) = read_packet(&mut client).await;
+        assert_eq!(&error[..3], &[0xff, 0x25, 0x05]);
+        assert!(String::from_utf8_lossy(&error).contains("query timed out after 2000 ms"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        packet(&mut client, 0, b"\x03again").await;
+        assert_eq!(read_result(&mut client, 1).await.0, b"\x05again");
+        packet(&mut client, 0, &[1]).await;
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relay_metadata_and_data_share_twenty_plus_eleven_budget() {
+        let gate = Arc::new(WriteGate::new());
+        let (mut client, server) = duplex_socket_with(Fixture::new(), Arc::clone(&gate)).await;
+        packet(&mut client, 0, b"\x03relay-budget").await;
+        wait_for_write_gate(&gate).await;
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        // Exactly the three metadata packets; the next actual row write blocks.
+        gate.remaining
+            .store(45, std::sync::atomic::Ordering::SeqCst);
+        if let Some(waker) = gate.waiter.lock().unwrap().take() {
+            waker.wake();
+        }
+        for _ in 0..3 {
+            read_packet(&mut client).await;
+        }
+        wait_for_write_gate(&gate).await;
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
+        let error = server.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        assert!(
+            bytes.is_empty(),
+            "no row may be published after budget exhaustion"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_metadata_and_terminal_flush_share_budget_and_retain_generation() {
+        let fixture = Fixture::new();
+        let capacity = fixture.capacity.clone();
+        let control = fixture.control.clone();
+        let session = fixture.session.token();
+        let gate = Arc::new(WriteGate::new());
+        let (mut client, server) = duplex_socket_with(fixture, Arc::clone(&gate)).await;
+        packet(&mut client, 0, b"\x03local-budget").await;
+        wait_for_write_gate(&gate).await;
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        gate.release();
+        assert_eq!(read_result(&mut client, 1).await.0, b"\x0clocal-budget");
+        wait_for_write_gate(&gate).await;
+        assert_eq!(capacity.snapshot().held_positions, [0, 1, 0, 0]);
+        assert!(
+            control.begin_statement(session).is_err(),
+            "terminal bytes are not flush exit"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(11)).await;
+        assert_eq!(
+            server.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+        assert!(
+            control.list_processes().is_empty(),
+            "physical writer and connection exit release the session generation"
+        );
+    }
+
+    async fn read_result<C: tokio::io::AsyncRead + Unpin>(
+        client: &mut C,
+        first_sequence: u8,
+    ) -> (Vec<u8>, Vec<u8>, u8) {
         let count = read_packet(client).await;
         assert_eq!(count, (first_sequence, vec![1]));
         let definition = read_packet(client).await;

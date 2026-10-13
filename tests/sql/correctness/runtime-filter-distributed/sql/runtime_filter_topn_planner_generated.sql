@@ -17,7 +17,8 @@
 
 -- @order_sensitive=true
 -- @tags=runtime_filter,cross_process,distributed
--- Aggregate TopN runtime-filter placement is produced by the normal planner.
+-- The normal planner publishes a key bound from Global complete groups under
+-- a Rows Partial TopN. Every accepted key retains its full SUM contribution.
 
 CREATE TABLE ${case_db}.rf_topn_source (
     k INT,
@@ -64,7 +65,7 @@ GROUP BY k
 ORDER BY k ASC NULLS LAST
 LIMIT 2;
 
-SET disable_optimizer_rules = 'PushDownTopNToPreAgg';
+SET disable_optimizer_rules = 'SplitTopN';
 -- @explain_not_contains=domain = OrderedBound
 SELECT k, SUM(v) AS total
 FROM ${case_db}.rf_topn_source

@@ -273,4 +273,69 @@ mod tests {
             .unwrap();
         assert!(out.is_empty(), "no limit => out of scope");
     }
+
+    #[test]
+    fn grouped_topn_completes_with_rows_budgets_after_global_aggregation() {
+        use novarocks_physical_plan::{AggregateGrouping, NodeKind, TopNReduction};
+
+        for sql in [
+            "SELECT order_key, COUNT(*), MIN(order_key), MAX(order_key) FROM orders GROUP BY order_key ORDER BY order_key LIMIT 2",
+            "SELECT DISTINCT order_key FROM orders ORDER BY order_key DESC LIMIT 2",
+        ] {
+            // This drives the real optimizer and physical completion with a
+            // runtime-split provider and a distributed DOP domain. Completion
+            // must prove the TopN and aggregate sequences, not just memo shape.
+            let owner = crate::compiler::compile_authored_aggregate_for_test(sql);
+            let plan = owner.plan();
+            assert!(plan.fragments().values().any(|fragment| {
+                fragment.nodes().values().any(|node| {
+                    matches!(
+                        node.kind,
+                        NodeKind::Aggregate {
+                            grouping: AggregateGrouping::Complete,
+                            ..
+                        }
+                    )
+                })
+            }));
+            let mut topn_count = 0;
+            for fragment in plan.fragments().values() {
+                for node in fragment.nodes().values() {
+                    if let NodeKind::TopN {
+                        reduction, phase, ..
+                    } = &node.kind
+                    {
+                        topn_count += 1;
+                        assert!(matches!(reduction, TopNReduction::Rows));
+                        if matches!(phase, novarocks_physical_plan::TopNPhase::Partial { .. }) {
+                            let input = &fragment.nodes()[&node.inputs[0]];
+                            assert!(
+                                matches!(
+                                    input.kind,
+                                    NodeKind::Aggregate {
+                                        grouping: AggregateGrouping::Complete,
+                                        ..
+                                    }
+                                ),
+                                "a grouped row budget must read complete groups"
+                            );
+                            assert!(plan.runtime_filters().values().any(|filter| {
+                                filter.producers.iter().any(|producer| {
+                                    producer.endpoint.fragment == fragment.id()
+                                        && producer.endpoint.node == input.id
+                                        && matches!(producer.target,
+                                            novarocks_physical_plan::RuntimeFilterProducerTarget::AggregateTopNKey { topn, .. }
+                                                if topn == node.id)
+                                }) && filter.consumers.iter().all(|consumer| {
+                                    matches!(consumer.activation,
+                                        novarocks_physical_plan::RuntimeFilterConsumerActivation::NonBlockingLive { .. })
+                                })
+                            }), "the normal planner must publish a nonblocking key bound from the complete aggregate");
+                        }
+                    }
+                }
+            }
+            assert!(topn_count > 0, "the grouped query must retain its TopN");
+        }
+    }
 }

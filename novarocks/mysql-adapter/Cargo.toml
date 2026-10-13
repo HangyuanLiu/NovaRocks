@@ -34,4 +34,4 @@ novarocks-parser.workspace = true
 novarocks-query-application = { workspace = true, features = ["test-support"] }
 novarocks-sql.workspace = true
 novarocks-user-error.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "test-util"] }

@@ -17,6 +17,7 @@
 
 //! MySQL protocol adaptation for Query Application contracts.
 
+mod active_delivery_budget;
 mod authentication;
 #[cfg(feature = "mem-1-m07-closing-pressure")]
 mod closing_pressure_control;

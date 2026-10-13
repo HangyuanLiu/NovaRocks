@@ -18,9 +18,9 @@
 -- @order_sensitive=true
 -- @tags=aggregate,topn,optimizer,session_rule_disable
 -- Test Objective:
--- 1. Validate PushDownTopNToPreAgg preserves grouped TopN results.
--- 2. Compare the same deterministic GROUP BY city ORDER BY city LIMIT query
---    with the rule enabled and disabled.
+-- 1. Preserve all contributions for the returned complete grouping keys.
+-- 2. Compare normal SplitTopN with a single-stage Rows budget. The independent
+--    union-all sums are a=26, b=12, c=14 for both plans.
 
 CREATE TABLE ${case_db}.t_pushdown_topn_preagg_result (
     city VARCHAR(16),
@@ -56,7 +56,7 @@ GROUP BY city
 ORDER BY city
 LIMIT 3;
 
-SET disable_optimizer_rules = 'PushDownTopNToPreAgg';
+SET disable_optimizer_rules = 'SplitTopN';
 
 SELECT city, SUM(sales) AS total_sales
 FROM (

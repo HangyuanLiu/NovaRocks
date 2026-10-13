@@ -72,6 +72,15 @@ remove the generated runtime directory.
 
 ## In CI
 
+两个按需期限场景为 `result-delivery/producer-wait-query-deadline-separation`
+与 `result-delivery/original-query-deadline-cancels-producer-wait`。分别用正常
+MySQL session 的 `query_timeout=120` 和 `2` 执行 `SLEEP(35)`，验证独立预期
+Boolean true / 原 ERR 1317，再在同一 socket 执行 `SELECT 1`。每例独占
+native 1FE+3BE，使用 `--launch-profile performance --timeout-secs 300` 和独立
+artifact root；不构建数据 fixture，不参与默认基线。公开 root census、BE
+query owner 计数与双零 FE/BE barrier 分别证明实际排空；ERR、客户端关闭和
+进程 shutdown 保留为不同事实。35 秒是旧期限错误的复现输入，不是性能门。
+
 `result-delivery/many-small-rows-cross-segment` 验证 200000 小行跨 Native
 1 MiB 段时的准确顺序与字节；`result-delivery/large-row-cross-u24` 验证一个
 17825860 字节大行跨 MySQL U24 packet（17 个合法 1 MiB 字符串字段）。输入在

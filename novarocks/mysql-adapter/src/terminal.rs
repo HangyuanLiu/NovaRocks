@@ -19,9 +19,7 @@
 
 use std::io;
 
-use crate::relay_result_writer::{
-    ACTIVE_WRITE_DEADLINE, CLOSING_DEADLINE, CLOSING_OBJECT_BYTES, timeout_error,
-};
+use crate::relay_result_writer::{CLOSING_DEADLINE, CLOSING_OBJECT_BYTES, timeout_error};
 use novarocks_query_application::cancellation::QueryCancellationReason;
 use novarocks_query_application::protocol_delivery::GovernedProtocolOwner;
 use novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome;
@@ -199,35 +197,32 @@ async fn write_success<'writer, W: AsyncWrite + Unpin>(
         }
     }
     let capabilities = writer.capabilities();
-    let deadline = Instant::now() + ACTIVE_WRITE_DEADLINE;
-    let lease = match tokio::time::timeout_at(deadline, writer.transfer()).await {
-        Ok(Ok(lease)) => lease,
-        outcome => {
+    let mut budget = crate::active_delivery_budget::ActiveDeliveryWorkBudget::new();
+    let lease = match budget.run(writer.transfer()).await {
+        Ok(lease) => lease,
+        Err(error) => {
             drop(writer);
             let _ = protocol.client_disconnected();
-            return Err(match outcome {
-                Ok(Err(error)) => error,
-                _ => timeout_error(),
-            });
+            return Err(error);
         }
     };
     // The explicit negotiated flag replaces deferred complete_one. Every
     // successful owner remains alive through its own packet and socket flush.
-    let payload = ok_payload(capabilities, more_results);
-    let outcome = tokio::time::timeout_at(deadline, lease.finish(&payload)).await;
-    drop(payload);
+    let outcome = budget
+        .run(async {
+            let payload = ok_payload(capabilities, more_results);
+            lease.finish(&payload).await
+        })
+        .await;
     drop(writer);
     match outcome {
-        Ok(Ok(writer)) => {
+        Ok(writer) => {
             let _ = protocol.complete();
             Ok(crate::MysqlStatementWriteOutcome::Continue(writer))
         }
-        outcome => {
+        Err(error) => {
             let _ = protocol.client_disconnected();
-            Err(match outcome {
-                Ok(Err(error)) => error,
-                _ => timeout_error(),
-            })
+            Err(error)
         }
     }
 }

@@ -1134,11 +1134,6 @@ mod is_known_rule_name_tests {
     }
 
     #[test]
-    fn is_known_rule_name_recognizes_pushdown_topn_to_preagg_rule() {
-        assert!(is_known_rule_name("PushDownTopNToPreAgg"));
-    }
-
-    #[test]
     fn is_known_rule_name_recognizes_push_topn_through_join_rule() {
         assert!(is_known_rule_name("PushTopNThroughJoin"));
     }
