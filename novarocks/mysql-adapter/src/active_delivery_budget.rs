@@ -22,6 +22,7 @@ use tokio::time::Instant;
 
 pub(crate) const ACTIVE_DELIVERY_WORK_BUDGET: Duration = Duration::from_secs(30);
 
+// Design: ADR-0172 (docs/adr/ADR-0172-mysql-query-deadlines-and-active-delivery-work-budgets.md)
 pub(crate) struct ActiveDeliveryWorkBudget {
     remaining: Duration,
 }
