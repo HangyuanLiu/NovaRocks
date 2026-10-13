@@ -112,6 +112,18 @@ fn fixture_with_calls(
     limit: usize,
     n_lists: bool,
 ) -> Fixture {
+    fixture_with_independent_limits(key_types, rows, ranking, limit, n_lists, false)
+}
+
+fn fixture_with_independent_limits(
+    key_types: &[FunctionValueType],
+    rows: &[Vec<LiteralValue>],
+    ranking: &[(usize, bool, bool)],
+    limit: usize,
+    n_lists: bool,
+    independent_n_limits: bool,
+) -> Fixture {
+    assert!(!independent_n_limits || n_lists);
     let groups = key_types.len();
     assert_eq!(ranking.len(), groups);
     let owners: &[(&str, PureKernelAbi)] = if n_lists {
@@ -146,6 +158,9 @@ fn fixture_with_calls(
     let mut types = key_types.to_vec();
     if n_lists {
         types.extend([largeint_type(), int64(false)]);
+        if independent_n_limits {
+            types.push(int64(false));
+        }
     } else {
         types.push(int64(true));
     }
@@ -162,7 +177,8 @@ fn fixture_with_calls(
             },
             distinct: false,
             arguments: if n_lists {
-                vec![columns[groups], columns[groups + 1]]
+                let limit_column = groups + 1 + usize::from(independent_n_limits && ordinal == 1);
+                vec![columns[groups], columns[limit_column]]
             } else if ordinal == 0 {
                 vec![]
             } else {
@@ -566,25 +582,31 @@ fn final_chunks(f: &Fixture, chunks: Vec<Chunk>) -> Vec<Chunk> {
     final_chunks_tracked(f, chunks, MemTracker::new_root("grouped-fixture-final"))
 }
 fn final_chunks_tracked(f: &Fixture, chunks: Vec<Chunk>, tracker: Arc<MemTracker>) -> Vec<Chunk> {
+    try_final_chunks_tracked(f, chunks, tracker).unwrap()
+}
+fn try_final_chunks_tracked(
+    f: &Fixture,
+    chunks: Vec<Chunk>,
+    tracker: Arc<MemTracker>,
+) -> ExecutionResult<Vec<Chunk>> {
     let factory = CompiledAggregateProcessorFactory::try_new(
         Arc::clone(&f.program),
         f.final_node,
         Arc::new(RuntimeErrorState::default()),
-    )
-    .unwrap();
+    )?;
     let mut operator = factory.create(1, 0);
     operator.set_mem_tracker(tracker);
     let state = RuntimeState::default();
     let processor = operator.as_processor_mut().unwrap();
     for chunk in chunks {
-        processor.push_chunk(&state, chunk).unwrap();
+        processor.push_chunk(&state, chunk)?;
     }
-    processor.set_finishing(&state).unwrap();
+    processor.set_finishing(&state)?;
     let mut output = Vec::new();
-    while let Some(chunk) = processor.pull_chunk(&state).unwrap() {
+    while let Some(chunk) = processor.pull_chunk(&state)? {
         output.push(chunk);
     }
-    output
+    Ok(output)
 }
 
 fn collect_final(f: &Fixture, chunks: Vec<Chunk>) -> Vec<Output> {
@@ -1047,3 +1069,6 @@ mod state_tests;
 
 #[path = "compiled_grouped_topn_exchange_tests.rs"]
 mod exchange_tests;
+
+#[path = "compiled_grouped_topn_error_tests.rs"]
+mod error_tests;
