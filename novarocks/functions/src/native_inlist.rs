@@ -324,7 +324,7 @@ pub fn signed_equality_observed<E>(
     Ok(Some(result))
 }
 
-/// Exactly checked signed native IN domain. Other original comparison branches
+/// Exactly checked signed and Utf8 native IN domains. Other comparison branches
 /// remain explicit unsupported preparation shapes pending their original author.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedNativeInListRecipe {
@@ -349,7 +349,8 @@ impl PreparedNativeInListRecipe {
             crate::kernel_input::validate_type_observed(result, &mut work)
                 .map_err(crate::ComparisonPrepareError::Kernel)?;
             if source.logical_type != ValueLogicalType::Physical
-                || !is_signed_integer_type(&source.data_type)
+                || !(is_signed_integer_type(&source.data_type)
+                    || source.data_type == DataType::Utf8)
             {
                 return Err(crate::ComparisonPrepareError::Unsupported);
             }

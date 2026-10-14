@@ -19,7 +19,7 @@
 use super::borrowed_value_footprint::Failure;
 use super::recipe::SkeletonEvidence;
 use super::skeleton_shape::{self as shape, Expression as E, Factor};
-use super::type_footprint::exact_type_heap;
+use super::type_footprint::exact_field_type_heap;
 use arrow::datatypes::Field;
 type Result<T> = std::result::Result<T, Failure>;
 fn add(a: u64, b: u64) -> Result<u64> {
@@ -47,7 +47,7 @@ pub fn append(
         alias_bytes = add(alias_bytes, alias_len)?;
         let expression = E::cast(
             E::column("__nr_values".len() as u64, alias_len)?,
-            exact_type_heap(column.writer.data_type())?,
+            exact_field_type_heap(column.writer)?,
         )?;
         projection_heap = add(
             projection_heap,
@@ -55,7 +55,7 @@ pub fn append(
         )?;
         selected_type_heap = add(
             selected_type_heap,
-            exact_type_heap(column.signed_selection.data_type())?,
+            exact_field_type_heap(column.signed_selection)?,
         )?;
     }
     // Zero cell sum means omit only row Expr storage, not row Vec headers.
@@ -147,7 +147,7 @@ pub fn rewrite(spec: Rewrite<'_>) -> Result<SkeletonEvidence> {
             )?,
             RewriteValue::InheritWrittenVersion => E::case(matched()?, E::literal(0)?, scan)?,
         };
-        let cast = E::cast(value, exact_type_heap(column.writer.data_type())?)?;
+        let cast = E::cast(value, exact_field_type_heap(column.writer)?)?;
         projection_heap = add(
             projection_heap,
             shape::item_heap(cast, column.writer.name().len() as u64)?,
@@ -181,10 +181,10 @@ pub fn rewrite(spec: Rewrite<'_>) -> Result<SkeletonEvidence> {
         E::literal(delete_len)?
     };
     let where_clause = E::binary(E::is_null(effect()?)?, E::binary(effect()?, delete_shape)?)?;
-    let mut selected_type_heap = exact_type_heap(spec.signed_effect_field.data_type())?;
+    let mut selected_type_heap = exact_field_type_heap(spec.signed_effect_field)?;
     let mut alias_bytes = add("__nr_matched".len() as u64, "__nr_effect".len() as u64)?;
     for (ordinal, field) in spec.original_values_fields.iter().enumerate() {
-        selected_type_heap = add(selected_type_heap, exact_type_heap(field.data_type())?)?;
+        selected_type_heap = add(selected_type_heap, exact_field_type_heap(field)?)?;
         alias_bytes = add(
             alias_bytes,
             shape::generated_value_alias_bytes(ordinal as u64),

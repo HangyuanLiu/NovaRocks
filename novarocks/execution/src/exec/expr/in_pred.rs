@@ -226,32 +226,13 @@ fn eq_with_candidate(
             let scalar = BooleanArray::new_scalar(arr.value(row_index(0, arr.len())));
             eq(&array.as_ref() as &dyn arrow::array::Datum, &scalar).map_err(|e| e.to_string())
         }
-        DataType::Utf8 => {
-            let values = candidate.as_any().downcast_ref::<StringArray>().unwrap();
-            let input = array
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| "failed to downcast IN input to StringArray".to_string())?;
-            let mut builder = BooleanBuilder::with_capacity(input.len());
-            for i in 0..input.len() {
-                let value_idx = row_index(i, values.len());
-                if input.is_null(i) || values.is_null(value_idx) {
-                    builder.append_null();
-                    continue;
-                }
-                let lhs = input.value(i);
-                let rhs = values.value(value_idx);
-                if let (Some(lhs_json), Some(rhs_json)) = (
-                    json_value_from_text_or_variant(lhs),
-                    json_value_from_text_or_variant(rhs),
-                ) {
-                    builder.append_value(lhs_json == rhs_json);
-                } else {
-                    builder.append_value(lhs == rhs);
-                }
-            }
-            Ok(builder.finish())
-        }
+        DataType::Utf8 => match utf8_equality_observed(&array, &candidate, &mut |_| {
+            Ok::<_, std::convert::Infallible>(())
+        }) {
+            Ok(result) => Ok(result),
+            Err(novarocks_functions::native_inlist::InError::Data(message)) => Err(message),
+            Err(novarocks_functions::native_inlist::InError::Host(never)) => match never {},
+        },
         DataType::LargeBinary => {
             let values = candidate
                 .as_any()
@@ -444,6 +425,61 @@ fn eq_with_candidate(
         }
         other => Err(format!("unsupported IN predicate type: {:?}", other)),
     }
+}
+
+/// The original Utf8 IN author, shared by the arena and the governed frame.
+/// JSON/Variant equality precedes byte equality exactly as in the arena path.
+pub(super) fn utf8_equality_observed<E>(
+    array: &ArrayRef,
+    candidate: &ArrayRef,
+    observe: &mut dyn FnMut(novarocks_functions::native_inlist::InObservation) -> Result<(), E>,
+) -> Result<BooleanArray, novarocks_functions::native_inlist::InError<E>> {
+    use novarocks_functions::native_inlist::{InError, InObservation};
+    let input = array
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| InError::Data("failed to downcast IN input to StringArray".to_string()))?;
+    let values = candidate
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            InError::Data("failed to downcast IN candidate to StringArray".to_string())
+        })?;
+    if values.len() != 1 && values.len() != input.len() {
+        return Err(InError::Data(format!(
+            "IN predicate value length mismatch: input has {}, value has {}",
+            input.len(),
+            values.len()
+        )));
+    }
+    observe(InObservation::OpaqueBoundary).map_err(InError::Host)?;
+    let mut builder = BooleanBuilder::with_capacity(input.len());
+    observe(InObservation::OpaqueBoundary).map_err(InError::Host)?;
+    for row in 0..input.len() {
+        observe(InObservation::Step).map_err(InError::Host)?;
+        let candidate_row = row_index(row, values.len());
+        if input.is_null(row) || values.is_null(candidate_row) {
+            builder.append_null();
+            continue;
+        }
+        let lhs = input.value(row);
+        let rhs = values.value(candidate_row);
+        observe(InObservation::OpaqueBoundary).map_err(InError::Host)?;
+        let equal = if let (Some(lhs_json), Some(rhs_json)) = (
+            json_value_from_text_or_variant(lhs),
+            json_value_from_text_or_variant(rhs),
+        ) {
+            lhs_json == rhs_json
+        } else {
+            lhs == rhs
+        };
+        observe(InObservation::OpaqueBoundary).map_err(InError::Host)?;
+        builder.append_value(equal);
+    }
+    observe(InObservation::OpaqueBoundary).map_err(InError::Host)?;
+    let result = builder.finish();
+    observe(InObservation::OpaqueBoundary).map_err(InError::Host)?;
+    Ok(result)
 }
 
 fn is_numeric_json_candidate(data_type: &DataType) -> bool {
@@ -894,6 +930,69 @@ fn json_value_from_text_or_variant(text: &str) -> Option<JsonValue> {
 mod tests {
     use super::*;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
+
+    #[test]
+    fn observed_utf8_in_preserves_original_json_text_nulls_and_scalar_broadcast() {
+        let source: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("{\"a\":1,\"b\":2}"),
+            Some("ASIA"),
+            None,
+            Some("x"),
+        ]));
+        let column: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("{\"b\":2,\"a\":1}"),
+            Some("AMERICA"),
+            Some("ASIA"),
+            None,
+        ]));
+        let actual = utf8_equality_observed(&source, &column, &mut |_| Ok::<_, ()>(())).unwrap();
+        assert_eq!(
+            actual.iter().collect::<Vec<_>>(),
+            vec![Some(true), Some(false), None, None]
+        );
+        let scalar: ArrayRef = Arc::new(StringArray::from(vec![Some("ASIA")]));
+        let actual = utf8_equality_observed(&source, &scalar, &mut |_| Ok::<_, ()>(())).unwrap();
+        assert_eq!(
+            actual.iter().collect::<Vec<_>>(),
+            vec![Some(false), Some(true), None, Some(false)]
+        );
+        assert_eq!(
+            eq_with_candidate(&source, &column, false, false).unwrap(),
+            utf8_equality_observed(&source, &column, &mut |_| Ok::<_, ()>(())).unwrap(),
+        );
+    }
+
+    #[test]
+    fn observed_utf8_in_retains_control_cause_at_original_opaque_boundaries() {
+        use novarocks_functions::native_inlist::{InError, InObservation};
+        let source: ArrayRef = Arc::new(StringArray::from(vec![Some("{\"a\":1}")]));
+        let mut observations = Vec::new();
+        utf8_equality_observed(&source, &source, &mut |event| {
+            observations.push(event);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+        for stop in 0..observations.len() {
+            let mut reached = 0;
+            let error = utf8_equality_observed(&source, &source, &mut |_| {
+                let current = reached;
+                reached += 1;
+                if current == stop {
+                    Err("original cancellation")
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            assert!(matches!(error, InError::Host("original cancellation")));
+            assert_eq!(reached, stop + 1);
+        }
+        assert!(
+            observations
+                .iter()
+                .any(|event| matches!(event, InObservation::Step))
+        );
+    }
     use arrow::array::{
         DictionaryArray, Int32Builder, Int64Array, Int64Builder, LargeStringDictionaryBuilder,
         ListArray, MapArray, MapBuilder, MapFieldNames, PrimitiveDictionaryBuilder, RecordBatch,

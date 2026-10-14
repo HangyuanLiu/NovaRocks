@@ -120,16 +120,12 @@ fn legacy_decimal_float_original_complete_legal_type_domain_expr_matches_project
         let max = if wide { 76 } else { 38 };
         for p in 1..=max {
             for s in i8::MIN..=p as i8 {
-                // Full signed-scale admission is retained; the original -128 i8 panic has its own immutable raw oracle below.
+                // Full signed-scale admission includes the minimum scale without overflow.
                 let a = input(
                     wide,
                     p,
                     s,
-                    if wide && s == i8::MIN {
-                        vec![None]
-                    } else {
-                        vec![Some(i128::MIN), Some(i128::MAX), Some(1), Some(-1), None]
-                    },
+                    vec![Some(i128::MIN), Some(i128::MAX), Some(1), Some(-1), None],
                 );
                 let expected = project(&a).unwrap();
                 for policy in [
@@ -216,47 +212,39 @@ fn legacy_decimal_float_original_empty_slice_hidden_null_and_full_256_carrier() 
     assert_same(&project(&ext).unwrap(), &expected);
 }
 #[test]
-fn legacy_decimal_float_original_min_scale_debug_panic_or_release_wrapping_not_fixed() {
-    for p in [1, 76] {
-        let a = input(true, p, i8::MIN, vec![Some(1)]);
-        let old = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| project(&a).unwrap()));
-        if cfg!(debug_assertions) {
-            assert!(
-                old.is_err(),
-                "original -scale i8 debug overflow must remain"
-            );
-        } else {
-            let result = old.unwrap();
-            assert_eq!(
-                result
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .unwrap()
-                    .value(0)
-                    .to_bits(),
-                (10f64.powi(-128)).to_bits()
-            );
-        }
-        for policy in [
-            DecimalOverflowPolicy::OutputNull,
-            DecimalOverflowPolicy::ReportError,
-        ] {
-            for allow in [false, true] {
-                let old = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    actual(&a, policy, allow).unwrap()
-                }));
-                assert_eq!(old.is_err(), cfg!(debug_assertions));
+fn legacy_decimal_float_minimum_scale_preserves_mathematical_and_carrier_contracts() {
+    // This historical failure now witnesses the repaired full signed-scale
+    // contract in both profiles, rather than requiring the former panic.
+    for wide in [false, true] {
+        for p in [1, if wide { 76 } else { 38 }] {
+            let a = input(wide, p, i8::MIN, vec![Some(1), Some(-1), Some(0), None]);
+            let result = project(&a).unwrap();
+            let values = result.as_any().downcast_ref::<Float64Array>().unwrap();
+            for (row, expected) in [(0, 1e128), (1, -1e128), (2, 0.0)] {
+                assert!(values.value(row).is_finite());
+                assert!(
+                    (values.value(row) - expected).abs() <= expected.abs() * f64::EPSILON * 4.0,
+                    "minimum-scale value {row} differs from its mathematical value"
+                );
             }
+            assert!(values.is_null(3));
+            for policy in [
+                DecimalOverflowPolicy::OutputNull,
+                DecimalOverflowPolicy::ReportError,
+            ] {
+                for allow in [false, true] {
+                    assert_same(&actual(&a, policy, allow).unwrap(), &result);
+                }
+            }
+            // Retain each carrier's distinct arithmetic order. Prevent rustc
+            // folding powi with different rounding from the runtime operation.
+            let exponent = std::hint::black_box(i32::from(i8::MIN));
+            let expected = if wide {
+                10f64.powi(-exponent)
+            } else {
+                1f64 / 10f64.powi(exponent)
+            };
+            assert_eq!(values.value(0).to_bits(), expected.to_bits());
         }
     }
-    let a = input(false, 38, i8::MIN, vec![Some(1)]);
-    let old = project(&a).unwrap();
-    assert_eq!(
-        old.as_any()
-            .downcast_ref::<Float64Array>()
-            .unwrap()
-            .value(0)
-            .to_bits(),
-        (1f64 / 10f64.powi(-128)).to_bits()
-    );
 }

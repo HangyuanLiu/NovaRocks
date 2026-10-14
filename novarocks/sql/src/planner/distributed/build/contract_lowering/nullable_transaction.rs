@@ -548,8 +548,12 @@ impl ContractLoweringVisitor<'_> {
             });
             self.work.step()?;
         }
+        let scalar_schema = match (&original.scalar_schema, fields.as_slice()) {
+            (Some(schema), [field]) => Some(schema.clone().with_nullability(field.ty.nullable)),
+            _ => original.scalar_schema.clone(),
+        };
         Ok(ResultPort {
-            scalar_schema: original.scalar_schema.clone(),
+            scalar_schema,
             fragment: original.fragment,
             output: original.output.clone(),
             fields: fields.into_boxed_slice(),

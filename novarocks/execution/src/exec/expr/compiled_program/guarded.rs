@@ -579,12 +579,20 @@ impl Frame {
             &parents,
             &mut |event| in_event(event, work),
         ))?;
-        let equalities = in_observed(signed_equality_observed(
-            left.values(),
-            right.values(),
-            &mut |event| in_event(event, work),
-        ))?
-        .ok_or_else(|| invalid("checked signed IN comparison lost its domain"))?;
+        let equalities = if expected.data_type == DataType::Utf8 {
+            in_observed(crate::exec::expr::in_pred::utf8_equality_observed(
+                left.values(),
+                right.values(),
+                &mut |event| in_event(event, work),
+            ))?
+        } else {
+            in_observed(signed_equality_observed(
+                left.values(),
+                right.values(),
+                &mut |event| in_event(event, work),
+            ))?
+            .ok_or_else(|| invalid("checked signed IN comparison lost its domain"))?
+        };
         in_observed(
             state.equalities_selected_observed(&equalities, &parents, &mut |event| {
                 in_event(event, work)

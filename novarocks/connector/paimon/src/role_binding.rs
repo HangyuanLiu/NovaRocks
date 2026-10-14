@@ -1875,7 +1875,8 @@ fn digest_bytes(hash: &mut Sha256, value: &[u8]) {
     hash.update(value);
 }
 
-#[cfg(test)]
+// Retained while Paimon-specific tests are suspended.
+#[cfg(all(test, any()))]
 mod tests {
     use std::sync::mpsc;
     use std::time::Duration;

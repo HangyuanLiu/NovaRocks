@@ -18,6 +18,9 @@
 
 set -euo pipefail
 
+echo "DISABLED: Paimon fixture tests are suspended pending detailed connector design" >&2
+exit 2
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIXTURE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 

@@ -123,7 +123,9 @@ HMS 由 `docker/iceberg-hive/` 的 owner 管理，按精确 catalog 接网；它
 python3 docker/iceberg-rest/rest-mv/probe.py contract --manifest "$NOVA_ENV_MANIFEST"
 ```
 
-探针创建独立 namespace，检查 `rest-mv` 保存字段、只改指针产生不同版本、显式 null，以及 stock `rest` 丢弃字段的对照和普通 view/table 行为；退出时清理本次对象，不重启共享服务。CI 每轮在记录运行端点后、Paimon 与 Cargo 阶段前运行它；合约或环境错误归为准备阶段的 VERIFY FAILED。重建容器的 `lifecycle` 检查仅接受私有隔离栈。配方、维护工具及三种探针模式见 [rest-mv README](rest-mv/README.md)。
+探针创建独立 namespace，检查 `rest-mv` 保存字段、只改指针产生不同版本、显式 null，以及 stock `rest` 丢弃字段的对照和普通 view/table 行为；退出时清理本次对象，不重启共享服务。CI 每轮在记录运行端点后、Cargo 阶段前运行它；合约或环境错误归为准备阶段的 VERIFY FAILED。重建容器的 `lifecycle` 检查仅接受私有隔离栈。配方、维护工具及三种探针模式见 [rest-mv README](rest-mv/README.md)。
+
+Paimon 产品测试已暂停，等待详细 connector 设计；CI 不准备 Paimon fixture，BOM 验证只消费 `iceberg-rest` 的依赖闭包。Paimon SQL suite 及 13 个依赖 Paimon 的 system 场景（六个 connector、五个 mixed catalog-planning、两个 scan-readiness）均明确拒绝选择。手工 fixture prepare/verify 配方、原始 SQL/oracle 和生产 provider 保留；cleanup 仍可清理匹配身份的既有私有 fixture，暂停不代表验收通过。
 
 引入 `rest-mv` 的 lock 采用一次 0/1 切换：合入后每台机器按新 lock 执行一次 `docker/fixture-inputs/provision.sh`，各 worktree rebase 后重新运行 `docker/iceberg-rest/up.sh` 并加载新 publication。旧 lock 的 worktree 会在 verify 时 BLOCKED（75）；已运行的旧 catalog 可以继续存在。新 catalog key 包含 `rest-mv`，对象存储输入与 benchmark contract ID 不变，因此复用同一 owner 下的对象存储和已有标准数据。
 

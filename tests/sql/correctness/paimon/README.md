@@ -1,10 +1,16 @@
 # Paimon correctness suite
 
+**DISABLED** pending a detailed Paimon connector design. Cases, expected results,
+fixture writers, and production provider registration are retained. SQL runner
+selection refuses `--suite paimon`, including explicit requests; full CI neither
+selects this suite nor prepares its Spark/Paimon fixture. The commands below
+are the retained historical recipe, not an enabled validation entrypoint.
+
 This explicit suite reads the immutable fixture published by
 `docker/paimon-read/prepare.sh`. Spark/Paimon is the external writer and oracle;
 NovaRocks only reads the published Filesystem Catalog.
 
-Run it with the generated runner configuration:
+Historical fixture and suite recipe:
 
 ```bash
 docker/paimon-read/prepare.sh --run-id "$RUN_ID" --output-dir "$OUTPUT_DIR"

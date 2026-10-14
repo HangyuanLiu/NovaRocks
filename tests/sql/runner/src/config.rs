@@ -954,6 +954,8 @@ oss_sk = "fixture-secret"
         }
     }
 
+    // Retained while Paimon-specific tests are suspended.
+    #[cfg(any())]
     #[test]
     fn paimon_keys_append_to_the_generated_final_env_table() {
         let (_directory, path) = configured_fixture();

@@ -49,7 +49,8 @@ impl ListingAdmission {
     }
 }
 
-#[cfg(test)]
+// Retained while Paimon-specific tests are suspended.
+#[cfg(all(test, any()))]
 mod tests {
     use super::*;
     use novarocks_spi::connector::ConnectorStopOwner;

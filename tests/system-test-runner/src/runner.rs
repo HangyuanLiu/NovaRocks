@@ -23,7 +23,11 @@ fn run_dispatch(cli: Cli) -> Result<()> {
     let scenarios = scenarios::all();
     if cli.list || cli.list_default {
         for scenario in list_scenarios(&scenarios, cli.list_default)? {
-            println!("{}", scenario.name());
+            if let Some(reason) = scenarios::disabled_reason(scenario.name()) {
+                println!("{} [DISABLED: {reason}]", scenario.name());
+            } else {
+                println!("{}", scenario.name());
+            }
         }
         return Ok(());
     }
@@ -191,7 +195,10 @@ fn select<'a>(
     if only.is_empty() {
         return Ok(scenarios
             .iter()
-            .filter(|scenario| !scenario.is_explicit_stage())
+            .filter(|scenario| {
+                !scenario.is_explicit_stage()
+                    && scenarios::disabled_reason(scenario.name()).is_none()
+            })
             .map(|scenario| scenario.as_ref())
             .collect());
     }
@@ -202,12 +209,18 @@ fn select<'a>(
             .find(|scenario| scenario.name() == requested)
             .map(|scenario| scenario.as_ref())
             .with_context(|| format!("unknown system scenario {requested}"))?;
+        if let Some(reason) = scenarios::disabled_reason(scenario.name()) {
+            bail!("system scenario {requested} is disabled: {reason}");
+        }
         selected.push(scenario);
     }
     Ok(selected)
 }
 
 fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
+    if let Some(reason) = scenarios::disabled_reason(scenario.name()) {
+        bail!("system scenario {} is disabled: {reason}", scenario.name());
+    }
     let scenario_root = config.artifact_root.join(scenario.name().replace('/', "-"));
     fs::create_dir_all(&scenario_root)
         .with_context(|| format!("create scenario artifact root {}", scenario_root.display()))?;
@@ -672,6 +685,13 @@ mod tests {
         assert_eq!(all.len(), defaults.len() + explicit.len());
         for scenario in explicit {
             assert!(!names(&defaults).contains(&scenario.name()));
+            if let Some(reason) = crate::scenarios::disabled_reason(scenario.name()) {
+                let error = select(&scenarios, &[scenario.name().to_string()])
+                    .err()
+                    .expect("disabled scenario must refuse explicit selection");
+                assert!(error.to_string().contains(reason));
+                continue;
+            }
             let selected =
                 select(&scenarios, &[scenario.name().to_string()]).expect("explicit opt-in");
             assert_eq!(names(&selected), vec![scenario.name()]);

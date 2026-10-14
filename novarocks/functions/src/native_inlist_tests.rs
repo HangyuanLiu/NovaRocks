@@ -193,6 +193,7 @@ fn inlist_recipe_exact_signed_widths_nullable_result_and_foreign_carriers() {
         DataType::Int16,
         DataType::Int32,
         DataType::Int64,
+        DataType::Utf8,
     ] {
         let input = FunctionValueType::new(data_type.clone(), false);
         let nullable = FunctionValueType::new(data_type, true);
@@ -223,12 +224,7 @@ fn inlist_recipe_exact_signed_widths_nullable_result_and_foreign_carriers() {
             );
         }
     }
-    for ty in [
-        DataType::Utf8,
-        DataType::UInt64,
-        DataType::Null,
-        DataType::Decimal128(4, 0),
-    ] {
+    for ty in [DataType::UInt64, DataType::Null, DataType::Decimal128(4, 0)] {
         let input = FunctionValueType::new(ty, true);
         assert_eq!(
             PreparedNativeInListRecipe::try_new(

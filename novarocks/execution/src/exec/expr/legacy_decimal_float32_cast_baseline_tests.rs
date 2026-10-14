@@ -181,11 +181,7 @@ fn legacy_decimal_float32_original_complete_p_signed_scale_paths_keep_distinct_p
                     wide,
                     p,
                     scale,
-                    if wide && scale == i8::MIN {
-                        vec![None]
-                    } else {
-                        vec![Some(i128::MIN), Some(i128::MAX), Some(1), Some(0), None]
-                    },
+                    vec![Some(i128::MIN), Some(i128::MAX), Some(1), Some(0), None],
                 );
                 let projected = project(&a).unwrap();
                 let projected_array = projected.as_any().downcast_ref::<Float32Array>().unwrap();
@@ -223,7 +219,7 @@ fn legacy_decimal_float32_original_complete_p_signed_scale_paths_keep_distinct_p
     }
 }
 #[test]
-fn legacy_decimal_float32_original_hidden_payload_slice_empty_and_min_scale_panic() {
+fn legacy_decimal_float32_original_hidden_payload_slice_empty_and_min_scale_values() {
     let hidden: ArrayRef = Arc::new(
         Decimal128Array::new(
             vec![i128::MAX, 1].into(),
@@ -255,42 +251,21 @@ fn legacy_decimal_float32_original_hidden_payload_slice_empty_and_min_scale_pani
         }
     }
     for p in [1, 76] {
-        let a = input(true, p, i8::MIN, vec![Some(0)]);
-        let caught =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| project(&a).unwrap()));
-        assert_eq!(caught.is_err(), cfg!(debug_assertions));
-        if let Ok(out) = caught {
-            assert_eq!(
-                out.as_any()
-                    .downcast_ref::<Float32Array>()
-                    .unwrap()
-                    .value(0)
-                    .to_bits(),
-                0.0_f32.to_bits()
-            );
-        }
+        let a = input(true, p, i8::MIN, vec![Some(0), Some(1), Some(-1), None]);
+        let expected: ArrayRef = Arc::new(Float32Array::from(vec![
+            Some(0.0),
+            Some(f32::INFINITY),
+            Some(f32::NEG_INFINITY),
+            None,
+        ]));
+        assert_same(&project(&a).unwrap(), &expected);
         for policy in [
             DecimalOverflowPolicy::ReportError,
             DecimalOverflowPolicy::OutputNull,
         ] {
             for allow in [false, true] {
-                assert_eq!(
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| actual(
-                        &a, policy, allow
-                    )
-                    .unwrap()))
-                    .is_err(),
-                    cfg!(debug_assertions)
-                );
+                assert_same(&actual(&a, policy, allow).unwrap(), &expected);
             }
         }
-        let null = input(true, p, i8::MIN, vec![None]);
-        assert_eq!(project(&null).unwrap().null_count(), 1);
-        assert_eq!(
-            actual(&null, DecimalOverflowPolicy::ReportError, true)
-                .unwrap()
-                .null_count(),
-            1
-        );
     }
 }

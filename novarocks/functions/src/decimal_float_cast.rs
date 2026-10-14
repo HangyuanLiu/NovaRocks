@@ -43,7 +43,8 @@ pub fn decimal256_to_f64(value: i256, scale: i8) -> f64 {
     //   *to_value = static_cast<To>(static_cast<double>(value) / static_cast<double>(scale_factor));
     let unscaled_f64 = value.to_f64().unwrap_or(f64::NAN);
     if scale <= 0 {
-        let factor = 10f64.powi((-scale) as i32);
+        // Widen before negating: every signed Arrow scale, including -128, is legal.
+        let factor = 10f64.powi(-i32::from(scale));
         unscaled_f64 * factor
     } else {
         let factor = 10f64.powi(scale as i32);

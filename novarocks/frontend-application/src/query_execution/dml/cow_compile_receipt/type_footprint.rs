@@ -17,7 +17,7 @@
 
 // Returns heap only: TypeName inline is already part of Expr::Cast.
 use super::borrowed_value_footprint::Failure;
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{DataType, Field, TimeUnit};
 use novarocks_parser::ast::{Ident, TypeNameArgument};
 use std::mem::size_of;
 
@@ -54,11 +54,7 @@ pub fn exact_type_heap(dt: &DataType) -> Result<u64> {
         DataType::Int16 => Some("SMALLINT"),
         DataType::Int32 => Some("INT"),
         DataType::Int64 => Some("BIGINT"),
-        DataType::FixedSizeBinary(width)
-            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            Some("LARGEINT")
-        }
+        DataType::FixedSizeBinary(_) => Some("VARBINARY"),
         DataType::Float32 => Some("FLOAT"),
         DataType::Float64 => Some("DOUBLE"),
         DataType::Utf8 | DataType::LargeUtf8 => Some("STRING"),
@@ -66,8 +62,7 @@ pub fn exact_type_heap(dt: &DataType) -> Result<u64> {
         DataType::Timestamp(TimeUnit::Microsecond, _) => Some("DATETIME"),
         DataType::Timestamp(TimeUnit::Nanosecond, _) => Some("DATETIME_NS"),
         DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond) => Some("TIME"),
-        DataType::Binary => Some("VARBINARY"),
-        DataType::LargeBinary => Some("VARIANT"),
+        DataType::Binary | DataType::LargeBinary => Some("VARBINARY"),
         _ => None,
     };
     if let Some(s) = primitive {
@@ -87,7 +82,7 @@ pub fn exact_type_heap(dt: &DataType) -> Result<u64> {
         }
         DataType::List(field) => add(
             add(name("ARRAY")?, arguments(1)?)?,
-            exact_type_heap(field.data_type())?,
+            exact_field_type_heap(field)?,
         ),
         DataType::Map(entries, _) => {
             let DataType::Struct(fields) = entries.data_type() else {
@@ -103,9 +98,9 @@ pub fn exact_type_heap(dt: &DataType) -> Result<u64> {
             add(
                 add(
                     add(name("MAP")?, arguments(2)?)?,
-                    exact_type_heap(fields[0].data_type())?,
+                    exact_field_type_heap(&fields[0])?,
                 )?,
-                exact_type_heap(fields[1].data_type())?,
+                exact_field_type_heap(&fields[1])?,
             )
         }
         DataType::Struct(fields) => {
@@ -118,7 +113,7 @@ pub fn exact_type_heap(dt: &DataType) -> Result<u64> {
                 // slot already charged by arguments(); only heap is added.
                 total = add(
                     add(total, field.name().len() as u64)?,
-                    exact_type_heap(field.data_type())?,
+                    exact_field_type_heap(field)?,
                 )?;
             }
             Ok(total)
@@ -126,5 +121,32 @@ pub fn exact_type_heap(dt: &DataType) -> Result<u64> {
         _ => Err(Failure::OriginalSemantic(
             "unsupported Arrow type for INSERT default conversion",
         )),
+    }
+}
+
+// Read the authored field identity without cloning its Arrow carrier or metadata.
+pub fn logical_type_name(field: &Field) -> Result<Option<&'static str>> {
+    use novarocks_type_contract::ValueLogicalType;
+    let logical = novarocks_type_contract::field_logical_type(field)
+        .map_err(|_| Failure::OriginalSemantic("invalid COW field logical type"))?;
+    Ok(match logical {
+        ValueLogicalType::Physical => None,
+        ValueLogicalType::Json => Some("JSON"),
+        ValueLogicalType::Variant => Some("VARIANT"),
+        ValueLogicalType::Hll => Some("HLL"),
+        ValueLogicalType::Bitmap => Some("BITMAP"),
+        ValueLogicalType::LargeInt => Some("LARGEINT"),
+        ValueLogicalType::Uuid | ValueLogicalType::Object | ValueLogicalType::Percentile => {
+            return Err(Failure::OriginalSemantic(
+                "COW field logical type has no SQL declaration",
+            ));
+        }
+    })
+}
+
+pub fn exact_field_type_heap(field: &Field) -> Result<u64> {
+    match logical_type_name(field)? {
+        Some(logical) => name(logical),
+        None => exact_type_heap(field.data_type()),
     }
 }

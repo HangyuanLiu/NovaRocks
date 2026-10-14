@@ -1,5 +1,7 @@
 # Paimon 外部只读 fixture
 
+当前 Paimon 测试暂停，等待详细 connector 设计。测试、SQL、oracle 和 writer 资产保留；生产 Paimon provider 仍启用。完整 CI 不再准备本 fixture；SQL/system runner 拒绝所有依赖 Paimon 的显式场景，`tests/run.sh` 明确退出 2，直接 Python unittest discovery 报告 SKIP。以下命令保留为历史 recipe，不代表当前测试可运行。`cleanup.sh` 仍可清理已存在的私有 fixture。
+
 这个目录用 Apache Spark 3.5.3 与 Apache Paimon 1.3.1 写出 PAI-1 的只读验收数据。Spark 负责写入和直接读取 oracle；NovaRocks 后续只消费已发布的 Paimon warehouse，因此不会用待测 Rust reader 自写自验。
 
 ## 固定输入

@@ -4997,7 +4997,11 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
         let listed = if let Some(requested) = cli.suite.as_deref() {
             select_suite_names(requested, &suite_configs)?
         } else {
-            suite_configs.keys().cloned().collect()
+            suite_configs
+                .iter()
+                .filter(|(_, suite)| suite.manifest.disabled_reason.is_none())
+                .map(|(name, _)| name.clone())
+                .collect()
         };
         for suite_name in listed {
             println!("{suite_name}");

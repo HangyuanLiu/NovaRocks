@@ -929,11 +929,9 @@ impl PreparedCastRecipe {
                 source: DecimalTextSource::Decimal256,
                 ..
             } => false,
-            // The original Decimal256 -scale expression panics for i8::MIN
-            // in checked builds. Retain failure awareness without converting it.
-            CastBody::DecimalFloat { source, scale, .. } => {
-                source == DecimalTextSource::Decimal256 && scale == i8::MIN
-            }
+            // Decimal float authors admit every signed scale. Float32 narrowing
+            // retains the separate carrier NULL projection without a row error.
+            CastBody::DecimalFloat { .. } => false,
             CastBody::TemporalCarrier { .. } => {
                 matches!(self.result.data_type, DataType::Date32 | DataType::Utf8)
             }
