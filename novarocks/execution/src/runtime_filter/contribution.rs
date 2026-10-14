@@ -909,11 +909,16 @@ impl RuntimeOrderContract {
         left: &OrderedTuple,
         right: &OrderedTuple,
     ) -> Result<Ordering, OrderedTupleError> {
-        match self.compare_borrowed_controlled(
-            OrderedTupleRef::Owned(left),
-            OrderedTupleRef::Owned(right),
-            &LegacyOrderControl,
-        ) {
+        self.compare_borrowed(OrderedTupleRef::Owned(left), OrderedTupleRef::Owned(right))
+    }
+
+    /// The legacy no-refusal wrapper also accepts an allocation-free view.
+    pub fn compare_borrowed(
+        &self,
+        left: OrderedTupleRef<'_>,
+        right: OrderedTupleRef<'_>,
+    ) -> Result<Ordering, OrderedTupleError> {
+        match self.compare_borrowed_controlled(left, right, &LegacyOrderControl) {
             Ok(ordering) => Ok(ordering),
             Err(ControlledOrderedTupleError::Tuple(error)) => Err(error),
             Err(ControlledOrderedTupleError::Kernel(_)) => {

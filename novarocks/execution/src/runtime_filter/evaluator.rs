@@ -68,6 +68,40 @@ pub enum RuntimeFilterArtifactQueryError {
     ContractViolation,
 }
 
+/// The controlled scalar port preserves interruption separately from the
+/// artifact owner's original immutable query verdicts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeFilterControlledQueryError {
+    Artifact(RuntimeFilterArtifactQueryError),
+    Kernel(novarocks_functions::KernelFailure),
+}
+impl From<RuntimeFilterArtifactQueryError> for RuntimeFilterControlledQueryError {
+    fn from(error: RuntimeFilterArtifactQueryError) -> Self {
+        Self::Artifact(error)
+    }
+}
+impl From<novarocks_functions::KernelFailure> for RuntimeFilterControlledQueryError {
+    fn from(error: novarocks_functions::KernelFailure) -> Self {
+        Self::Kernel(error)
+    }
+}
+
+/// Explicitly installed computation capability. It owns no row mask/effect
+/// and accepts neither Arrow nor Task/scan facts. Absence is not a fallback
+/// to the original uncontrolled query methods.
+pub trait RuntimeFilterControlledScalarQuery: Send + Sync {
+    fn matches_null_controlled(
+        &self,
+        control: &dyn novarocks_functions::KernelEvaluationControl,
+    ) -> Result<bool, RuntimeFilterControlledQueryError>;
+
+    fn non_null_value_may_match_controlled(
+        &self,
+        value: RuntimeFilterScalarRef<'_>,
+        control: &dyn novarocks_functions::KernelEvaluationControl,
+    ) -> Result<bool, RuntimeFilterControlledQueryError>;
+}
+
 /// Neutral, immutable queries over one retained runtime-filter artifact.
 ///
 /// Implementations belong to the participant owner.  This trait deliberately
@@ -77,6 +111,12 @@ pub enum RuntimeFilterArtifactQueryError {
 pub trait RuntimeFilterArtifactQuery: Send + Sync {
     /// The exact, frozen Arrow data type accepted by this artifact.
     fn data_type(&self) -> &DataType;
+
+    /// None explicitly identifies an uninstalled controlled capability. New
+    /// compiled consumers must refuse it, including on an all-NULL batch.
+    fn controlled_scalar_query(&self) -> Option<&dyn RuntimeFilterControlledScalarQuery> {
+        None
+    }
 
     /// Whether a null input value can match the artifact under its frozen null
     /// semantics.

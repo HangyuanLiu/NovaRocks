@@ -32,10 +32,14 @@ pub mod evaluator;
 pub mod feedback_domain;
 pub mod row_group_domain;
 
+// These are the original Functions control/cause types used by the neutral
+// controlled artifact-query port, not a second Worker control vocabulary.
+pub use novarocks_functions::{KernelEvaluationControl, KernelFailure};
+
 pub use evaluator::{
-    RuntimeFilterArtifactQuery, RuntimeFilterArtifactQueryError, RuntimeFilterRowEffect,
-    RuntimeFilterRowEvaluation, RuntimeFilterRowNotEvaluatedReason, RuntimeFilterRowOutcome,
-    RuntimeFilterScalarRef,
+    RuntimeFilterArtifactQuery, RuntimeFilterArtifactQueryError, RuntimeFilterControlledQueryError,
+    RuntimeFilterControlledScalarQuery, RuntimeFilterRowEffect, RuntimeFilterRowEvaluation,
+    RuntimeFilterRowNotEvaluatedReason, RuntimeFilterRowOutcome, RuntimeFilterScalarRef,
 };
 
 macro_rules! id {
