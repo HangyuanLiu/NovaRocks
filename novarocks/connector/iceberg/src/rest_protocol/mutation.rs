@@ -383,3 +383,537 @@ fn read_failure(error: BodyReadError) -> BodyReadFailure {
         BodyReadError::Transport => BodyReadFailure::Transport,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! D13 evidence end to end: every NovaRocks mutation endpoint against every
+    //! observation of spec 5.7, through the real session and HTTP layer. The
+    //! oracle below is written from the spec's tables, independently of the
+    //! classifier, and the IRU-5 consequence is checked as `permits_cleanup`.
+    //! Each case owns a loopback scripted server; Drop joins it.
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use novarocks_spi::connector::ConnectorMutationFailureKind as Kind;
+    use uuid::Uuid;
+
+    use super::MutationOutcome;
+    use crate::catalog::error::CatalogCommitEvidence;
+    use crate::iceberg::spec::{
+        NestedField, PrimitiveType, Schema, SqlViewRepresentation, Type, ViewRepresentation,
+        ViewRepresentations,
+    };
+    use crate::iceberg::{
+        NamespaceIdent, TableCommit, TableIdent, TableRequirement, ViewCommit, ViewCreation,
+        ViewRequirement,
+    };
+    use crate::rest_protocol::endpoints::RestEndpoints;
+    use crate::rest_protocol::evidence::{AttributionExpectation, ExpectedSnapshot, RestEvidence};
+    use crate::rest_protocol::test_server::{BodyPlan, Reply, Script, TestServer};
+
+    const TABLE_UUID: &str = "1a2b3c4d-0000-4000-8000-000000000001";
+    const VIEW_UUID: &str = "1a2b3c4d-0000-4000-8000-000000000002";
+    const SNAPSHOT: i64 = 6;
+    const MARKER: (&str, &str) = ("novarocks.ctas.operation-id", "op-1");
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum Endpoint {
+        TableCommit,
+        CtasFinalCommit,
+        CreateTable,
+        StageCreate,
+        CreateNamespace,
+        DropNamespace,
+        DropTable,
+        CreateView,
+        ReplaceView,
+        DropView,
+    }
+
+    const ENDPOINTS: [Endpoint; 10] = [
+        Endpoint::TableCommit,
+        Endpoint::CtasFinalCommit,
+        Endpoint::CreateTable,
+        Endpoint::StageCreate,
+        Endpoint::CreateNamespace,
+        Endpoint::DropNamespace,
+        Endpoint::DropTable,
+        Endpoint::CreateView,
+        Endpoint::ReplaceView,
+        Endpoint::DropView,
+    ];
+
+    impl Endpoint {
+        fn route(self) -> (&'static str, &'static str) {
+            match self {
+                Self::TableCommit | Self::CtasFinalCommit => ("POST", "/v1/namespaces/db/tables/t"),
+                Self::CreateTable | Self::StageCreate => ("POST", "/v1/namespaces/db/tables"),
+                Self::CreateNamespace => ("POST", "/v1/namespaces"),
+                Self::DropNamespace => ("DELETE", "/v1/namespaces/db"),
+                Self::DropTable => ("DELETE", "/v1/namespaces/db/tables/t"),
+                Self::CreateView => ("POST", "/v1/namespaces/db/views"),
+                Self::ReplaceView => ("POST", "/v1/namespaces/db/views/v"),
+                Self::DropView => ("DELETE", "/v1/namespaces/db/views/v"),
+            }
+        }
+
+        fn is_drop(self) -> bool {
+            matches!(self, Self::DropNamespace | Self::DropTable | Self::DropView)
+        }
+
+        fn creates(self) -> bool {
+            matches!(
+                self,
+                Self::CtasFinalCommit
+                    | Self::CreateTable
+                    | Self::StageCreate
+                    | Self::CreateNamespace
+                    | Self::CreateView
+            )
+        }
+
+        /// A body that satisfies every attribution item for this endpoint.
+        fn attributable_body(self) -> Option<serde_json::Value> {
+            let table = |location: serde_json::Value| {
+                serde_json::json!({
+                    "metadata-location": location,
+                    "metadata": {
+                        "table-uuid": TABLE_UUID,
+                        "snapshots": [{"snapshot-id": 5}, {"snapshot-id": SNAPSHOT}],
+                        "refs": {"main": {"snapshot-id": SNAPSHOT, "type": "branch"}},
+                        "properties": {MARKER.0: MARKER.1},
+                    },
+                })
+            };
+            match self {
+                Self::TableCommit | Self::CtasFinalCommit | Self::CreateTable => Some(table(
+                    serde_json::json!("s3://warehouse/db/t/metadata/2.json"),
+                )),
+                Self::StageCreate => Some(table(serde_json::Value::Null)),
+                Self::CreateNamespace => {
+                    Some(serde_json::json!({"namespace": ["db"], "properties": {}}))
+                }
+                Self::CreateView | Self::ReplaceView => Some(serde_json::json!({
+                    "metadata-location": "s3://warehouse/db/v/metadata/1.json",
+                    "metadata": {"view-uuid": VIEW_UUID},
+                })),
+                Self::DropNamespace | Self::DropTable | Self::DropView => None,
+            }
+        }
+    }
+
+    /// What spec 5.7 prescribes for a status line, independent of the code.
+    #[derive(Debug, Eq, PartialEq)]
+    enum Expected {
+        NotDispatched(Kind),
+        Rejected(Kind),
+        Applied,
+        Unknown,
+    }
+
+    fn oracle(endpoint: Endpoint, status: u16) -> Expected {
+        let success = if endpoint.is_drop() { 204 } else { 200 };
+        match status {
+            status if status == success => Expected::Applied,
+            409 if endpoint.creates() => Expected::Rejected(Kind::AlreadyExists),
+            409 => Expected::Rejected(Kind::Conflict),
+            401 | 419 => Expected::Rejected(Kind::Unauthenticated),
+            403 => Expected::Rejected(Kind::PermissionDenied),
+            _ => Expected::Unknown,
+        }
+    }
+
+    fn observed(evidence: &RestEvidence) -> Expected {
+        match evidence {
+            RestEvidence::NotDispatched { kind, .. } => Expected::NotDispatched(*kind),
+            RestEvidence::Rejected { kind, .. } => Expected::Rejected(*kind),
+            RestEvidence::Applied { .. } => Expected::Applied,
+            RestEvidence::Unknown { .. } => Expected::Unknown,
+        }
+    }
+
+    async fn endpoints(server: &TestServer, extra: &[(&str, &str)]) -> Arc<RestEndpoints> {
+        let mut properties: HashMap<String, String> = extra
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        properties.insert("uri".to_string(), server.url());
+        crate::catalog_runtime::build_vended_rest_generation_for_test(
+            properties,
+            None,
+            crate::iceberg::Runtime::try_current().expect("test runtime"),
+        )
+        .await
+        .expect("REST generation")
+        .1
+    }
+
+    fn uuid(text: &str) -> Uuid {
+        Uuid::parse_str(text).unwrap()
+    }
+
+    fn table() -> TableIdent {
+        TableIdent::new(NamespaceIdent::new("db".to_string()), "t".to_string())
+    }
+
+    fn schema() -> Schema {
+        Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .unwrap()
+    }
+
+    fn create_request() -> crate::iceberg_catalog_rest::CreateTableRequest {
+        crate::iceberg_catalog_rest::CreateTableRequest {
+            name: "t".to_string(),
+            location: None,
+            schema: schema(),
+            partition_spec: None,
+            write_order: None,
+            stage_create: None,
+            properties: HashMap::new(),
+        }
+    }
+
+    fn view_creation() -> ViewCreation {
+        ViewCreation::builder()
+            .name("v".to_string())
+            .location(None)
+            .representations(ViewRepresentations::new(vec![ViewRepresentation::Sql(
+                SqlViewRepresentation {
+                    sql: "select 1".to_string(),
+                    dialect: "starrocks".to_string(),
+                },
+            )]))
+            .schema(schema())
+            .properties(HashMap::new())
+            .default_namespace(NamespaceIdent::new("db".to_string()))
+            .default_catalog(None)
+            .summary(HashMap::new())
+            .build()
+    }
+
+    async fn dispatch(endpoints: &RestEndpoints, endpoint: Endpoint) -> MutationOutcome {
+        let db = NamespaceIdent::new("db".to_string());
+        let snapshot = || Some(ExpectedSnapshot::new(SNAPSHOT, Some("main".to_string())));
+        match endpoint {
+            Endpoint::TableCommit => {
+                let commit = TableCommit::builder()
+                    .ident(table())
+                    .requirements(vec![TableRequirement::UuidMatch {
+                        uuid: uuid(TABLE_UUID),
+                    }])
+                    .updates(vec![])
+                    .build();
+                let expect =
+                    AttributionExpectation::table_commit(uuid(TABLE_UUID), snapshot()).unwrap();
+                endpoints.commit_table(commit, &expect, false).await
+            }
+            Endpoint::CtasFinalCommit => {
+                let commit = TableCommit::builder()
+                    .ident(table())
+                    .requirements(vec![TableRequirement::NotExist])
+                    .updates(vec![])
+                    .build();
+                let expect = AttributionExpectation::ctas_final_commit(
+                    uuid(TABLE_UUID),
+                    snapshot(),
+                    vec![(MARKER.0.to_string(), MARKER.1.to_string())],
+                )
+                .unwrap();
+                endpoints.commit_table(commit, &expect, false).await
+            }
+            Endpoint::CreateTable => endpoints.create_table(&db, create_request()).await,
+            Endpoint::StageCreate => endpoints.stage_create(&db, create_request()).await,
+            Endpoint::CreateNamespace => endpoints.create_namespace(&db, HashMap::new()).await,
+            Endpoint::DropNamespace => endpoints.drop_namespace(&db).await,
+            Endpoint::DropTable => endpoints.drop_table(&table()).await,
+            Endpoint::CreateView => endpoints.create_view(&db, view_creation()).await,
+            Endpoint::ReplaceView => {
+                let commit = ViewCommit::builder()
+                    .ident(TableIdent::new(db.clone(), "v".to_string()))
+                    .requirements(vec![ViewRequirement::UuidMatch {
+                        uuid: uuid(VIEW_UUID),
+                    }])
+                    .updates(vec![])
+                    .build();
+                endpoints
+                    .replace_view(
+                        commit,
+                        &AttributionExpectation::replace_view(uuid(VIEW_UUID)),
+                    )
+                    .await
+            }
+            Endpoint::DropView => {
+                endpoints
+                    .drop_view(&TableIdent::new(db, "v".to_string()))
+                    .await
+            }
+        }
+    }
+
+    /// Run one endpoint against one scripted reply on a fresh session.
+    async fn observe(endpoint: Endpoint, reply: Reply) -> (MutationOutcome, TestServer) {
+        let (method, path) = endpoint.route();
+        let server = TestServer::start(
+            Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on(method, path, reply)
+                .on("GET", "/redirected", Reply::status(200))
+                .on("POST", "/redirected", Reply::status(200)),
+        );
+        let endpoints = endpoints(&server, &[]).await;
+        let outcome = dispatch(&endpoints, endpoint).await;
+        (outcome, server)
+    }
+
+    fn assert_cleanup_follows_evidence(outcome: &MutationOutcome) {
+        let permits = outcome
+            .evidence
+            .clone()
+            .into_catalog_outcome(CatalogCommitEvidence::for_target("db.t"))
+            .permits_cleanup();
+        let proven_not_applied = matches!(
+            outcome.evidence,
+            RestEvidence::NotDispatched { .. } | RestEvidence::Rejected { .. }
+        );
+        assert_eq!(permits, proven_not_applied, "{:?}", outcome.evidence);
+    }
+
+    fn status_reply(endpoint: Endpoint, status: u16) -> Reply {
+        let success = if endpoint.is_drop() { 204 } else { 200 };
+        match endpoint.attributable_body() {
+            Some(body) if status == success => Reply::json(status, &body),
+            _ => Reply::json(
+                status,
+                &serde_json::json!({"error": {"message": "secret-canary", "type": "X", "code": status}}),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn every_endpoint_maps_every_status_line_as_spec_5_7_prescribes() {
+        let statuses = [
+            200, 201, 202, 204, 400, 401, 403, 404, 408, 409, 419, 429, 500, 501, 502, 503, 504,
+            505,
+        ];
+        for endpoint in ENDPOINTS {
+            for status in statuses {
+                let (outcome, server) = observe(endpoint, status_reply(endpoint, status)).await;
+                assert_eq!(
+                    observed(&outcome.evidence),
+                    oracle(endpoint, status),
+                    "{endpoint:?} HTTP {status}"
+                );
+                assert_cleanup_follows_evidence(&outcome);
+                assert!(!outcome.evidence.message().contains("secret-canary"));
+                let (method, path) = endpoint.route();
+                assert_eq!(server.count(method, path), 1, "written once: {endpoint:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn redirects_are_unknown_and_never_followed() {
+        for endpoint in ENDPOINTS {
+            for status in [301, 302, 303, 307, 308] {
+                let (outcome, server) =
+                    observe(endpoint, Reply::redirect(status, "/redirected")).await;
+                assert_eq!(
+                    observed(&outcome.evidence),
+                    Expected::Unknown,
+                    "{endpoint:?}"
+                );
+                assert_eq!(server.count("GET", "/redirected"), 0);
+                assert_eq!(server.count("POST", "/redirected"), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn success_bodies_must_be_complete_and_attributable() {
+        for endpoint in ENDPOINTS {
+            if endpoint.is_drop() {
+                // A drop's success is 204 only; any 200, HTML included, is
+                // unknown (L24).
+                for body in [b"".to_vec(), b"<html>ok</html>".to_vec()] {
+                    let (outcome, _server) = observe(endpoint, Reply::bytes(200, body)).await;
+                    assert_eq!(
+                        observed(&outcome.evidence),
+                        Expected::Unknown,
+                        "{endpoint:?}"
+                    );
+                }
+                continue;
+            }
+            let good = endpoint.attributable_body().unwrap().to_string();
+            let mut bad: Vec<(&str, Vec<u8>)> = vec![
+                ("html", b"<html>gateway</html>".to_vec()),
+                ("truncated", good.as_bytes()[..good.len() / 2].to_vec()),
+                ("trailing", format!("{good} {{}}").into_bytes()),
+            ];
+            let mut value: serde_json::Value = serde_json::from_str(&good).unwrap();
+            match endpoint {
+                Endpoint::CreateNamespace => {
+                    value["namespace"] = serde_json::json!(["other"]);
+                    bad.push(("namespace mismatch", value.to_string().into_bytes()));
+                }
+                Endpoint::CreateView | Endpoint::ReplaceView => {
+                    let mut missing = value.clone();
+                    missing.as_object_mut().unwrap().remove("metadata-location");
+                    bad.push(("missing location", missing.to_string().into_bytes()));
+                    if endpoint == Endpoint::ReplaceView {
+                        value["metadata"]["view-uuid"] =
+                            serde_json::json!("ffffffff-0000-4000-8000-000000000000");
+                        bad.push(("uuid mismatch", value.to_string().into_bytes()));
+                    }
+                }
+                _ => {
+                    if endpoint != Endpoint::StageCreate {
+                        let mut missing = value.clone();
+                        missing.as_object_mut().unwrap().remove("metadata-location");
+                        bad.push(("missing location", missing.to_string().into_bytes()));
+                    }
+                    if matches!(endpoint, Endpoint::TableCommit | Endpoint::CtasFinalCommit) {
+                        let mut other = value.clone();
+                        other["metadata"]["table-uuid"] =
+                            serde_json::json!("ffffffff-0000-4000-8000-000000000000");
+                        bad.push(("uuid mismatch", other.to_string().into_bytes()));
+                        let mut absent = value.clone();
+                        absent["metadata"]["snapshots"] = serde_json::json!([{"snapshot-id": 5}]);
+                        bad.push(("snapshot absent", absent.to_string().into_bytes()));
+                    }
+                    if endpoint == Endpoint::CtasFinalCommit {
+                        let mut unmarked = value.clone();
+                        unmarked["metadata"]["properties"] = serde_json::json!({});
+                        bad.push(("marker absent", unmarked.to_string().into_bytes()));
+                    }
+                }
+            }
+            for (label, body) in bad {
+                let (outcome, _server) = observe(endpoint, Reply::bytes(200, body)).await;
+                assert_eq!(
+                    observed(&outcome.evidence),
+                    Expected::Unknown,
+                    "{endpoint:?} {label}"
+                );
+                assert_cleanup_follows_evidence(&outcome);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refreshed_commit_response_is_applied() {
+        // S is present but `main` already points at a later commit.
+        let mut body = Endpoint::TableCommit.attributable_body().unwrap();
+        body["metadata"]["snapshots"] =
+            serde_json::json!([{"snapshot-id": SNAPSHOT}, {"snapshot-id": 7}]);
+        body["metadata"]["refs"]["main"]["snapshot-id"] = serde_json::json!(7);
+        let (outcome, _server) = observe(Endpoint::TableCommit, Reply::json(200, &body)).await;
+        let RestEvidence::Applied { receipt } = &outcome.evidence else {
+            panic!("refreshed response must be applied: {:?}", outcome.evidence);
+        };
+        assert_eq!(receipt.snapshot_id, Some(SNAPSHOT));
+    }
+
+    #[tokio::test]
+    async fn a_success_body_arriving_in_chunks_is_still_attributed() {
+        let body = Endpoint::TableCommit
+            .attributable_body()
+            .unwrap()
+            .to_string()
+            .into_bytes();
+        let chunks = body
+            .chunks(7)
+            .map(|chunk| (std::time::Duration::from_millis(1), chunk.to_vec()))
+            .collect();
+        let (outcome, _server) = observe(
+            Endpoint::TableCommit,
+            Reply::status(200).with_body(BodyPlan::Chunked(chunks)),
+        )
+        .await;
+        assert_eq!(observed(&outcome.evidence), Expected::Applied);
+    }
+
+    #[tokio::test]
+    async fn written_requests_without_a_status_line_are_unknown() {
+        for endpoint in ENDPOINTS {
+            let (outcome, _server) = observe(endpoint, Reply::CloseAfterRequest).await;
+            assert_eq!(
+                observed(&outcome.evidence),
+                Expected::Unknown,
+                "{endpoint:?}"
+            );
+            assert_cleanup_follows_evidence(&outcome);
+        }
+    }
+
+    #[tokio::test]
+    async fn establishment_failures_are_not_dispatched_with_their_step_kind() {
+        let cases: Vec<(&str, Script, Expected)> = vec![
+            (
+                "token rejected",
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on("POST", "/v1/oauth/tokens", Reply::status(401)),
+                Expected::NotDispatched(Kind::Unauthenticated),
+            ),
+            (
+                "token unavailable",
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on("POST", "/v1/oauth/tokens", Reply::status(503)),
+                Expected::NotDispatched(Kind::Unavailable),
+            ),
+            (
+                "config failure",
+                Script::new()
+                    .on("POST", "/v1/oauth/tokens", Reply::token("tok"))
+                    .on("GET", "/v1/config", Reply::status(500)),
+                Expected::NotDispatched(Kind::Unavailable),
+            ),
+            (
+                "server-sent token",
+                Script::new()
+                    .on("POST", "/v1/oauth/tokens", Reply::token("tok"))
+                    .on(
+                        "GET",
+                        "/v1/config",
+                        Reply::config(&[("token", "x")], &[], None),
+                    ),
+                Expected::NotDispatched(Kind::Unsupported),
+            ),
+        ];
+        for (label, script, expected) in cases {
+            let server = TestServer::start(script.on(
+                "POST",
+                "/v1/namespaces/db/tables/t",
+                Reply::status(500),
+            ));
+            let mut properties = HashMap::new();
+            properties.insert("uri".to_string(), server.url());
+            let endpoints = crate::catalog_runtime::build_vended_rest_generation_for_test(
+                properties,
+                Some(crate::rest_protocol::test_server::oauth2_identity(
+                    "fe", "secret",
+                )),
+                crate::iceberg::Runtime::try_current().unwrap(),
+            )
+            .await
+            .unwrap()
+            .1;
+            let outcome = dispatch(&endpoints, Endpoint::TableCommit).await;
+            assert_eq!(observed(&outcome.evidence), expected, "{label}");
+            assert_eq!(
+                server.count("POST", "/v1/namespaces/db/tables/t"),
+                0,
+                "{label}"
+            );
+            assert_cleanup_follows_evidence(&outcome);
+        }
+    }
+}

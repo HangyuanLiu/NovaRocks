@@ -5845,4 +5845,33 @@ mod tests {
             .expect("reload replacement table");
         assert_eq!(after.table.metadata(), replacement.table.metadata());
     }
+
+    #[test]
+    fn a_rest_failure_reaches_the_direct_path_classifier_as_unknown_unless_409() {
+        use crate::rest_protocol::adapter::RestEvidenceCarrier;
+        use crate::rest_protocol::evidence::{
+            AttributionExpectation, BodyRead, DispatchStage, classify,
+        };
+        let adapter_error = |kind, status| {
+            let evidence = classify(
+                &DispatchStage::Status {
+                    code: status,
+                    header_names: Vec::new(),
+                },
+                BodyRead::NotRead,
+                &AttributionExpectation::drop_table(),
+            );
+            crate::iceberg::Error::new(kind, "adapter failure")
+                .with_source(RestEvidenceCarrier::new(evidence))
+        };
+        // The adapter never raises TableNotFound for a 404 (L13), so the
+        // direct path's own classifier reports an unknown outcome.
+        let not_found = map_iceberg(adapter_error(crate::iceberg::ErrorKind::Unexpected, 404));
+        assert!(commit_may_be_unknown(not_found.kind()));
+        let conflict = map_iceberg(adapter_error(
+            crate::iceberg::ErrorKind::CatalogCommitConflicts,
+            409,
+        ));
+        assert!(!commit_may_be_unknown(conflict.kind()));
+    }
 }

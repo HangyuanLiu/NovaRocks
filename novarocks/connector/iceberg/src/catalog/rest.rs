@@ -2080,3 +2080,401 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod evidence_tests {
+    //! The REST owner on D13 evidence (L12, L18, L19, L24, L32): the typed
+    //! commit dispatch (a vended success is applied without any FileIO), the
+    //! delegate's DDL through the transitional adapter, view owner methods and
+    //! both CTAS steps. Each test owns a loopback scripted server.
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use novarocks_spi::connector::ConnectorMutationFailureKind as Kind;
+    use uuid::Uuid;
+
+    use super::NovaRocksRestCatalog;
+    use crate::catalog::error::CatalogOutcome;
+    use crate::catalog::transaction::CommitDispatchResult;
+    use crate::catalog::{
+        CatalogNamespaceName, CatalogTableName, NovaRocksCatalog, StagedCommitResult,
+        StagedCreateStart, StagedPublicationExpectation,
+    };
+    use crate::catalog_runtime::RestAccessDelegationMode;
+    use crate::commit::model::{
+        AttemptArtifacts, AttemptToken, BaseIdentity, FrozenRequest, FrozenRequestParts,
+        OperationToken, RequestShape,
+    };
+    use crate::iceberg::spec::{SnapshotReference, SnapshotRetention};
+    use crate::iceberg::{NamespaceIdent, TableIdent, TableRequirement, TableUpdate, ViewCommit};
+    use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+
+    const TABLE_UUID: u128 = 1;
+
+    async fn owner(server: &TestServer) -> NovaRocksRestCatalog {
+        let (_upstream, endpoints) = crate::catalog_runtime::build_vended_rest_generation_for_test(
+            HashMap::from([("uri".to_string(), server.url())]),
+            None,
+            crate::iceberg::Runtime::try_current().expect("test runtime"),
+        )
+        .await
+        .expect("REST generation");
+        NovaRocksRestCatalog::new(
+            endpoints,
+            Some(Arc::from("s3://warehouse")),
+            RestAccessDelegationMode::Vended,
+        )
+    }
+
+    fn scripted(method: &str, path: &str, reply: Reply) -> TestServer {
+        TestServer::start(
+            Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on(method, path, reply),
+        )
+    }
+
+    fn frozen_append(snapshot: i64) -> FrozenRequest {
+        let uuid = Uuid::from_u128(TABLE_UUID);
+        let token = OperationToken::from_write(
+            novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([1; 16]),
+        );
+        FrozenRequest::new(FrozenRequestParts {
+            shape: RequestShape::SnapshotProducing,
+            target: TableIdent::new(NamespaceIdent::new("db".into()), "t".into()),
+            target_ref: "main".into(),
+            base: BaseIdentity::Existing {
+                uuid,
+                parent: Some(10),
+                metadata_location: "s3://warehouse/db/t/metadata/1.json".into(),
+            },
+            requirements: vec![
+                TableRequirement::UuidMatch { uuid },
+                TableRequirement::RefSnapshotIdMatch {
+                    r#ref: "main".into(),
+                    snapshot_id: Some(10),
+                },
+            ],
+            updates: vec![TableUpdate::SetSnapshotRef {
+                ref_name: "main".into(),
+                reference: SnapshotReference::new(
+                    snapshot,
+                    SnapshotRetention::Branch {
+                        min_snapshots_to_keep: None,
+                        max_snapshot_age_ms: None,
+                        max_ref_age_ms: None,
+                    },
+                ),
+            }],
+            artifacts: AttemptArtifacts::empty(AttemptToken::new(token, 0)),
+        })
+        .expect("frozen request")
+    }
+
+    fn commit_response(snapshots: &[i64]) -> serde_json::Value {
+        serde_json::json!({
+            "metadata-location": "s3://warehouse/db/t/metadata/2.json",
+            "metadata": {
+                "table-uuid": Uuid::from_u128(TABLE_UUID).to_string(),
+                "snapshots": snapshots.iter().map(|id| serde_json::json!({"snapshot-id": id})).collect::<Vec<_>>(),
+                "refs": {"main": {"snapshot-id": snapshots.last(), "type": "branch"}},
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn the_owner_commit_dispatch_follows_d13_and_applies_a_vended_success() {
+        let cases: Vec<(Reply, &str)> = vec![
+            (Reply::json(200, &commit_response(&[10, 20])), "applied"),
+            (Reply::status(401), "unauthenticated"),
+            (Reply::status(403), "denied"),
+            (Reply::status(409), "conflict"),
+            (Reply::status(404), "unknown"),
+            (Reply::status(400), "unknown"),
+            (Reply::bytes(200, b"<html>proxy</html>".to_vec()), "unknown"),
+            (Reply::json(200, &commit_response(&[10])), "unknown"),
+        ];
+        for (reply, expected) in cases {
+            let server = scripted("POST", "/v1/namespaces/db/tables/t", reply);
+            let owner = owner(&server).await;
+            let dispatch = owner.commit_dispatch(
+                TableIdent::new(NamespaceIdent::new("db".into()), "t".into()),
+                Arc::from("main"),
+                None,
+            );
+            let result = dispatch.dispatch_once(Some(&frozen_append(20))).await;
+            match (expected, result) {
+                ("applied", CommitDispatchResult::Applied(proof)) => {
+                    assert_eq!(proof.snapshot_id, Some(20));
+                    assert_eq!(
+                        proof.table_uuid.as_deref(),
+                        Some(Uuid::from_u128(TABLE_UUID).to_string().as_str())
+                    );
+                }
+                ("unauthenticated", CommitDispatchResult::Uncommitted { failure }) => {
+                    assert_eq!(failure.kind(), Kind::Unauthenticated)
+                }
+                ("denied", CommitDispatchResult::Uncommitted { failure }) => {
+                    assert_eq!(failure.kind(), Kind::PermissionDenied)
+                }
+                ("conflict", CommitDispatchResult::Uncommitted { failure }) => {
+                    assert_eq!(failure.kind(), Kind::Conflict)
+                }
+                ("unknown", CommitDispatchResult::Unknown { .. }) => {}
+                (expected, result) => panic!("expected {expected}, got {result:?}"),
+            }
+            assert_eq!(server.count("POST", "/v1/namespaces/db/tables/t"), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_ddl_reads_typed_evidence_through_the_adapter() {
+        let namespace = || CatalogNamespaceName::new("db");
+        for (status, expected) in [
+            (409, "already exists"),
+            (401, "unauthenticated"),
+            (404, "unknown"),
+            (400, "unknown"),
+        ] {
+            let server = scripted("POST", "/v1/namespaces", Reply::status(status));
+            let outcome = owner(&server).await.create_namespace(namespace()).await;
+            match (expected, &outcome) {
+                ("already exists", CatalogOutcome::KnownUncommitted { failure }) => {
+                    assert_eq!(failure.kind(), Kind::AlreadyExists)
+                }
+                ("unauthenticated", CatalogOutcome::KnownUncommitted { failure }) => {
+                    assert_eq!(failure.kind(), Kind::Unauthenticated)
+                }
+                ("unknown", CatalogOutcome::CommitUnknown { .. }) => {}
+                _ => panic!("HTTP {status}: expected {expected}, got {outcome:?}"),
+            }
+            assert_eq!(outcome.permits_cleanup(), expected != "unknown");
+        }
+        // A drop succeeds only with 204; a 200 is unknown (L24).
+        for (status, applied) in [(204, true), (200, false)] {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "DELETE",
+                        "/v1/namespaces/db/tables/t",
+                        Reply::status(status),
+                    ),
+            );
+            let outcome = owner(&server)
+                .await
+                .drop_table(CatalogTableName::new("db", "t"))
+                .await;
+            assert_eq!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                applied,
+                "HTTP {status}: {outcome:?}"
+            );
+            let deletes = server.requests_to("DELETE", "/v1/namespaces/db/tables/t");
+            assert_eq!(deletes.len(), 1);
+            assert_eq!(deletes[0].query(), None, "purgeRequested is never sent");
+        }
+    }
+
+    #[tokio::test]
+    async fn view_owner_methods_report_d13_outcomes() {
+        let server = scripted("DELETE", "/v1/namespaces/db/views/v", Reply::status(404));
+        let outcome = owner(&server)
+            .await
+            .drop_view(CatalogTableName::new("db", "v"))
+            .await;
+        assert!(
+            matches!(outcome, CatalogOutcome::CommitUnknown { .. }),
+            "{outcome:?}"
+        );
+
+        // A replacement without a frozen view UUID is never sent.
+        let server = scripted("POST", "/v1/namespaces/db/views/v", Reply::status(200));
+        let commit = ViewCommit::builder()
+            .ident(TableIdent::new(
+                NamespaceIdent::new("db".into()),
+                "v".into(),
+            ))
+            .requirements(vec![])
+            .updates(vec![])
+            .build();
+        let outcome = owner(&server).await.replace_view(commit).await;
+        let CatalogOutcome::KnownUncommitted { failure } = &outcome else {
+            panic!("expected a local refusal, got {outcome:?}");
+        };
+        assert_eq!(failure.kind(), Kind::Internal);
+        assert_eq!(server.count("POST", "/v1/namespaces/db/views/v"), 0);
+    }
+
+    fn staged_response() -> serde_json::Value {
+        use crate::iceberg::spec::{
+            FormatVersion, NestedField, PrimitiveType, Schema, SortOrder, TableMetadataBuilder,
+            Type, UnboundPartitionSpec,
+        };
+        let metadata = TableMetadataBuilder::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .unwrap(),
+            UnboundPartitionSpec::default(),
+            SortOrder::unsorted_order(),
+            "s3://warehouse/.staging/t".into(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let expires = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            + 3_600_000)
+            .to_string();
+        serde_json::json!({
+            "metadata-location": null,
+            "metadata": metadata,
+            "storage-credentials": [{
+                "prefix": "s3://warehouse/.staging/t",
+                "config": {
+                    "s3.access-key-id": "AKIA-staged",
+                    "s3.secret-access-key": "secret",
+                    "s3.session-token": "session",
+                    "s3.session-token-expires-at-ms": expires,
+                },
+            }],
+        })
+    }
+
+    fn creation() -> crate::iceberg::TableCreation {
+        crate::iceberg::TableCreation::builder()
+            .name("t".to_string())
+            .location("s3://warehouse/.staging/t".to_string())
+            .schema(
+                crate::iceberg::spec::Schema::builder()
+                    .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
+                        1,
+                        "id",
+                        crate::iceberg::spec::Type::Primitive(
+                            crate::iceberg::spec::PrimitiveType::Long,
+                        ),
+                    ))])
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+    }
+
+    #[tokio::test]
+    async fn the_stage_maps_onto_the_saga_branches_of_l19() {
+        for (reply, expected) in [
+            (Reply::status(401), "uncommitted"),
+            (Reply::status(409), "conflict"),
+            (Reply::status(400), "unknown"),
+            (Reply::status(404), "unknown"),
+            (Reply::bytes(200, b"<html/>".to_vec()), "unknown"),
+            (Reply::json(200, &staged_response()), "staged"),
+        ] {
+            let server = scripted("POST", "/v1/namespaces/db/tables", reply);
+            let start = owner(&server)
+                .await
+                .stage_create_table(CatalogNamespaceName::new("db"), creation())
+                .await;
+            match (expected, start) {
+                ("uncommitted", StagedCreateStart::KnownUncommitted(failure)) => {
+                    assert_eq!(failure.kind(), Kind::Unauthenticated)
+                }
+                ("conflict", StagedCreateStart::Conflict(_)) => {}
+                ("unknown", StagedCreateStart::CommitUnknown(_)) => {}
+                (
+                    "staged",
+                    StagedCreateStart::Staged {
+                        table,
+                        initialization_updates,
+                        access_delegation,
+                    },
+                ) => {
+                    assert!(matches!(
+                        table,
+                        crate::loaded_table::IcebergLoadedTableMaterialization::DeferredRest(_)
+                    ));
+                    assert!(!initialization_updates.is_empty());
+                    assert!(access_delegation.into_vended_lease_seed().is_some());
+                }
+                (expected, _) => panic!("expected {expected}"),
+            }
+            let stages = server.requests_to("POST", "/v1/namespaces/db/tables");
+            assert_eq!(stages.len(), 1);
+            assert_eq!(
+                stages[0].header("x-iceberg-access-delegation"),
+                Some("vended-credentials")
+            );
+            let body: serde_json::Value = serde_json::from_slice(&stages[0].body).unwrap();
+            assert_eq!(body["stage-create"], serde_json::json!(true));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_ctas_publication_is_attributed_before_it_is_reported() {
+        let staged_uuid = Uuid::from_u128(TABLE_UUID);
+        let marker = (
+            "novarocks.ctas.operation-id".to_string(),
+            "op-1".to_string(),
+        );
+        let body = |marked: bool| {
+            let mut response = commit_response(&[30]);
+            if marked {
+                response["metadata"]["properties"] =
+                    serde_json::json!({"novarocks.ctas.operation-id": "op-1"});
+            }
+            response
+        };
+        for (reply, expected) in [
+            (Reply::json(200, &body(true)), "committed"),
+            (Reply::json(200, &body(false)), "unknown"),
+            (Reply::bytes(200, b"<html/>".to_vec()), "unknown"),
+            (Reply::status(409), "conflict"),
+            (Reply::status(403), "uncommitted"),
+            (Reply::status(404), "unknown"),
+        ] {
+            let server = scripted("POST", "/v1/namespaces/db/tables/t", reply);
+            let commit = crate::iceberg::TableCommit::builder()
+                .ident(TableIdent::new(
+                    NamespaceIdent::new("db".into()),
+                    "t".into(),
+                ))
+                .requirements(vec![TableRequirement::NotExist])
+                .updates(vec![])
+                .build();
+            let result = owner(&server)
+                .await
+                .commit_staged_table(
+                    commit,
+                    StagedPublicationExpectation {
+                        staged_table_uuid: staged_uuid,
+                        snapshot_id: Some(30),
+                        properties: vec![marker.clone()],
+                    },
+                )
+                .await;
+            match (expected, result) {
+                ("committed", StagedCommitResult::Committed(proof)) => {
+                    assert_eq!(proof.snapshot_id, Some(30))
+                }
+                ("conflict", StagedCommitResult::Conflict(failure)) => {
+                    assert_eq!(failure.kind(), Kind::AlreadyExists)
+                }
+                ("uncommitted", StagedCommitResult::KnownUncommitted(failure)) => {
+                    assert_eq!(failure.kind(), Kind::PermissionDenied)
+                }
+                ("unknown", StagedCommitResult::CommitUnknown(_)) => {}
+                (expected, result) => panic!("expected {expected}, got {result:?}"),
+            }
+        }
+    }
+}

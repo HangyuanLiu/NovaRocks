@@ -429,3 +429,185 @@ impl Catalog for RestTransitionalAdapter {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! The transitional adapter's two error shapes (L13) and its refusal of
+    //! an existing-table commit without a frozen UUID (L34), against a
+    //! scripted server through the real session.
+    use std::collections::HashMap;
+
+    use novarocks_spi::connector::ConnectorMutationFailureKind as Kind;
+
+    use super::{RestTransitionalAdapter, rest_evidence};
+    use crate::iceberg::{
+        Catalog, ErrorKind, NamespaceIdent, TableCommit, TableIdent, TableRequirement,
+    };
+    use crate::rest_protocol::evidence::RestEvidence;
+    use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+
+    const UUID: &str = "1a2b3c4d-0000-4000-8000-000000000001";
+
+    async fn adapter(server: &TestServer) -> RestTransitionalAdapter {
+        let (_upstream, endpoints) = crate::catalog_runtime::build_vended_rest_generation_for_test(
+            HashMap::from([("uri".to_string(), server.url())]),
+            None,
+            crate::iceberg::Runtime::try_current().expect("test runtime"),
+        )
+        .await
+        .expect("REST generation");
+        RestTransitionalAdapter::new(endpoints)
+    }
+
+    fn scripted(method: &str, path: &str, reply: Reply) -> TestServer {
+        TestServer::start(
+            Script::new()
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on(method, path, reply),
+        )
+    }
+
+    fn commit(requirements: Vec<TableRequirement>) -> TableCommit {
+        TableCommit::builder()
+            .ident(TableIdent::new(
+                NamespaceIdent::new("db".into()),
+                "t".into(),
+            ))
+            .requirements(requirements)
+            .updates(vec![])
+            .build()
+    }
+
+    fn frozen() -> Vec<TableRequirement> {
+        vec![TableRequirement::UuidMatch {
+            uuid: uuid::Uuid::parse_str(UUID).unwrap(),
+        }]
+    }
+
+    #[tokio::test]
+    async fn mutation_errors_are_a_409_kind_or_unexpected_with_evidence() {
+        let db = NamespaceIdent::new("db".into());
+        for status in [409, 401, 403, 404, 400, 500, 419] {
+            let server = scripted("POST", "/v1/namespaces/db/tables/t", Reply::status(status));
+            let error = adapter(&server)
+                .await
+                .update_table(commit(frozen()))
+                .await
+                .expect_err("not applied");
+            let expected = if status == 409 {
+                ErrorKind::CatalogCommitConflicts
+            } else {
+                ErrorKind::Unexpected
+            };
+            assert_eq!(error.kind(), expected, "commit HTTP {status}");
+            assert!(rest_evidence(&error).is_some(), "commit HTTP {status}");
+
+            let server = scripted("POST", "/v1/namespaces", Reply::status(status));
+            let error = adapter(&server)
+                .await
+                .create_namespace(&db, HashMap::new())
+                .await
+                .expect_err("not applied");
+            let expected = if status == 409 {
+                ErrorKind::NamespaceAlreadyExists
+            } else {
+                ErrorKind::Unexpected
+            };
+            assert_eq!(error.kind(), expected, "namespace HTTP {status}");
+
+            let server = scripted(
+                "DELETE",
+                "/v1/namespaces/db/tables/t",
+                Reply::status(status),
+            );
+            let error = adapter(&server)
+                .await
+                .drop_table(&TableIdent::new(db.clone(), "t".into()))
+                .await
+                .expect_err("not applied");
+            // A drop has no dedicated 409 kind; the evidence still says
+            // rejected, so the shared judgment proves "not applied".
+            assert_eq!(error.kind(), ErrorKind::Unexpected, "drop HTTP {status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_404_never_becomes_a_definite_rejection_for_the_direct_paths() {
+        let server = scripted("POST", "/v1/namespaces/db/tables/t", Reply::status(404));
+        let error = adapter(&server)
+            .await
+            .update_table(commit(frozen()))
+            .await
+            .expect_err("unknown");
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(matches!(
+            rest_evidence(&error),
+            Some(RestEvidence::Unknown { .. })
+        ));
+        assert!(!crate::catalog::error::proves_uncommitted(&error));
+    }
+
+    #[tokio::test]
+    async fn an_existing_table_commit_without_a_frozen_uuid_is_never_sent() {
+        let server = scripted("POST", "/v1/namespaces/db/tables/t", Reply::status(200));
+        let error = adapter(&server)
+            .await
+            .update_table(commit(vec![]))
+            .await
+            .expect_err("refused");
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        let Some(RestEvidence::NotDispatched { kind, .. }) = rest_evidence(&error) else {
+            panic!("expected not-dispatched evidence: {error:?}");
+        };
+        assert_eq!(*kind, Kind::Internal);
+        assert_eq!(server.count("POST", "/v1/namespaces/db/tables/t"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_response_for_another_table_incarnation_is_a_protocol_anomaly() {
+        let response = serde_json::json!({
+            "metadata-location": "s3://warehouse/db/t/metadata/2.json",
+            "metadata": {"table-uuid": "ffffffff-0000-4000-8000-000000000000"},
+        });
+        let server = scripted(
+            "POST",
+            "/v1/namespaces/db/tables/t",
+            Reply::json(200, &response),
+        );
+        let error = adapter(&server)
+            .await
+            .update_table(commit(frozen()))
+            .await
+            .expect_err("unknown");
+        assert!(matches!(
+            rest_evidence(&error),
+            Some(RestEvidence::Unknown { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_vended_success_without_a_table_object_stays_applied_evidence() {
+        let metadata = serde_json::json!({
+            "metadata-location": "s3://warehouse/db/t/metadata/2.json",
+            "metadata": {"table-uuid": UUID},
+        });
+        let server = scripted(
+            "POST",
+            "/v1/namespaces/db/tables/t",
+            Reply::json(200, &metadata),
+        );
+        let error = adapter(&server)
+            .await
+            .update_table(commit(frozen()))
+            .await
+            .expect_err("no table object in a vended generation");
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
+        assert!(matches!(
+            rest_evidence(&error),
+            Some(RestEvidence::Applied { .. })
+        ));
+        // Applied is not a proof of "not applied": the direct path reports
+        // an unknown outcome, as before.
+        assert!(!crate::catalog::error::proves_uncommitted(&error));
+    }
+}
