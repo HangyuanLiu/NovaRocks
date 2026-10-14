@@ -287,23 +287,24 @@ impl ClientCredentialsConfig {
         let body = response.body();
 
         let auth_res: TokenResponse = if status == StatusCode::OK {
-            // Decoder diagnostics can include server-provided values.
-            Ok(serde_json::from_slice(body).map_err(|_| {
+            Ok(serde_json::from_slice(body).map_err(|e| {
                 Error::new(
                     ErrorKind::Unexpected,
                     "Failed to parse response from rest catalog server!",
                 )
                 .with_context("operation", "auth")
                 .with_context("url", self.token_endpoint.clone())
-                .with_context("response_body", "[REDACTED]")
+                .with_context("json", String::from_utf8_lossy(body))
+                .with_source(e)
             })?)
         } else {
-            let e: ErrorResponse = serde_json::from_slice(body).map_err(|_| {
+            let e: ErrorResponse = serde_json::from_slice(body).map_err(|e| {
                 Error::new(ErrorKind::Unexpected, "Received unexpected response")
                     .with_context("code", status.to_string())
                     .with_context("operation", "auth")
                     .with_context("url", self.token_endpoint.clone())
-                    .with_context("response_body", "[REDACTED]")
+                    .with_context("json", String::from_utf8_lossy(body))
+                    .with_source(e)
             })?;
             Err(Error::from(e))
         }?;
@@ -378,58 +379,5 @@ mod tests {
             req.headers().get("authorization").unwrap(),
             "Bearer tok-static"
         );
-    }
-
-    #[tokio::test]
-    async fn token_response_values_never_enter_decode_error_source() {
-        let canary = "oauth-server-message-canary";
-        for status in [200, 400] {
-            let mut server = mockito::Server::new_async().await;
-            // A known numeric field receiving a string makes serde echo it.
-            let body = if status == 200 {
-                serde_json::json!({
-                    "access_token": "unused",
-                    "token_type": "Bearer",
-                    "expires_in": canary,
-                })
-            } else {
-                serde_json::json!({
-                    "error": {
-                        "message": "unused",
-                        "type": "unused",
-                        "code": canary,
-                    },
-                })
-            };
-            let mock = server
-                .mock("POST", "/token")
-                .with_status(status)
-                .with_body(body.to_string())
-                .create_async()
-                .await;
-            let client = test_client();
-            let manager = OAuth2Manager::new(format!("{}/token", server.url()))
-                .with_credential(None, "client-secret".to_string());
-            let session = manager
-                .init_session(&client, &HashMap::new())
-                .await
-                .unwrap();
-            let mut request = HttpRequest::new(
-                Client::new()
-                    .get("http://localhost/unused")
-                    .build()
-                    .unwrap(),
-            );
-            let error = session.authenticate(&mut request).await.unwrap_err();
-            assert!(!error.to_string().contains(canary));
-            assert!(!format!("{error:?}").contains(canary));
-            let mut source = std::error::Error::source(&error);
-            while let Some(error) = source {
-                assert!(!error.to_string().contains(canary));
-                assert!(!format!("{error:?}").contains(canary));
-                source = error.source();
-            }
-            mock.assert_async().await;
-        }
     }
 }

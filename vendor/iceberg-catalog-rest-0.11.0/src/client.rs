@@ -201,24 +201,59 @@ pub(crate) fn deserialize_catalog_response<R: DeserializeOwned>(
 ) -> Result<R> {
     let bytes = response.body();
 
-    // JSON decoder errors can quote response values, so their opaque source is withheld.
-    serde_json::from_slice::<R>(bytes).map_err(|_| {
+    serde_json::from_slice::<R>(bytes).map_err(|e| {
         Error::new(
             ErrorKind::Unexpected,
             "Failed to parse response from rest catalog server",
         )
-        .with_context("response_body", "[REDACTED]")
+        .with_context("json", String::from_utf8_lossy(bytes))
+        .with_source(e)
     })
 }
 
-/// Returns response header names only. Error paths must not make arbitrary
-/// REST response values observable because servers may return credentials in
-/// a non-success response body or extension header.
-pub(crate) fn format_headers_redacted(headers: &HeaderMap, _disable_redaction: bool) -> String {
-    format!(
-        "{:?}",
-        headers.keys().map(|name| name.as_str()).collect::<Vec<_>>()
-    )
+/// Returns true if the header may carry a secret (matched by substring, so
+/// e.g. `x-client-secret` is covered along with `authorization`).
+fn is_sensitive_header(name: &str) -> bool {
+    let name_lower = name.to_lowercase();
+    [
+        "auth",
+        "token",
+        "secret",
+        "key",
+        "password",
+        "cookie",
+        "credential",
+    ]
+    .iter()
+    .any(|pattern| name_lower.contains(pattern))
+}
+
+/// Redacts sensitive headers and returns a debug-formatted string.
+///
+/// If `disable_redaction` is true, returns all headers without redaction.
+/// Otherwise, replaces sensitive header values with `[REDACTED]`.
+pub(crate) fn format_headers_redacted(headers: &HeaderMap, disable_redaction: bool) -> String {
+    if disable_redaction {
+        // Return all headers as-is without redaction
+        let all: HashMap<&str, &str> = headers
+            .iter()
+            .filter_map(|(name, value)| value.to_str().ok().map(|v| (name.as_str(), v)))
+            .collect();
+        return format!("{all:?}");
+    }
+
+    // Redact sensitive headers by replacing their values with "[REDACTED]"
+    let redacted: HashMap<&str, &str> = headers
+        .iter()
+        .filter_map(|(name, value)| {
+            if is_sensitive_header(name.as_str()) {
+                Some((name.as_str(), "[REDACTED]"))
+            } else {
+                value.to_str().ok().map(|v| (name.as_str(), v))
+            }
+        })
+        .collect();
+    format!("{redacted:?}")
 }
 
 /// Deserializes a unexpected catalog response into an error.
@@ -236,7 +271,11 @@ pub(crate) fn deserialize_unexpected_catalog_error(
         format_headers_redacted(response.headers(), disable_header_redaction),
     );
 
-    err.with_context("response_body", "[REDACTED]")
+    let bytes = response.body();
+    if bytes.is_empty() {
+        return err;
+    }
+    err.with_context("json", String::from_utf8_lossy(bytes))
 }
 
 #[cfg(test)]
@@ -312,8 +351,9 @@ mod tests {
     }
 
     #[test]
-    fn test_unexpected_error_carries_status_and_header_names_only() {
-        // Retain status and header names without disclosing response values.
+    fn test_unexpected_error_carries_status_headers_and_body() {
+        // Everything a user needs to diagnose an unexpected status, with the
+        // sensitive headers held back.
         let mut headers = HeaderMap::new();
         headers.insert("authorization", "Bearer leaked".parse().unwrap());
         headers.insert("x-request-id", "abc123".parse().unwrap());
@@ -330,9 +370,8 @@ mod tests {
 
         assert!(err.contains("418"), "{err}");
         assert!(err.contains("x-request-id"), "{err}");
-        assert!(!err.contains("abc123"), "{err}");
-        assert!(!err.contains("nope"), "{err}");
-        assert!(err.contains("[REDACTED]"), "{err}");
+        assert!(err.contains("abc123"), "{err}");
+        assert!(err.contains("nope"), "{err}");
         assert!(!err.contains("leaked"), "{err}");
     }
 
@@ -377,11 +416,11 @@ mod tests {
     fn test_format_headers_redacted_empty() {
         let headers = HeaderMap::new();
         let result = format_headers_redacted(&headers, false);
-        assert_eq!(result, "[]");
+        assert_eq!(result, "{}");
     }
 
     #[test]
-    fn test_format_headers_redacted_keeps_names_not_values() {
+    fn test_format_headers_redacted_non_sensitive() {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "application/json".parse().unwrap());
         headers.insert("x-request-id", "abc123".parse().unwrap());
@@ -389,144 +428,9 @@ mod tests {
         let result = format_headers_redacted(&headers, false);
 
         assert!(result.contains("content-type"));
+        assert!(result.contains("application/json"));
         assert!(result.contains("x-request-id"));
-        assert!(!result.contains("application/json"));
-        assert!(!result.contains("abc123"));
-    }
-
-    #[test]
-    fn test_format_headers_redacted_filters_sensitive() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer secret-token".parse().unwrap());
-        headers.insert("content-type", "application/json".parse().unwrap());
-
-        let result = format_headers_redacted(&headers, false);
-
-        // Sensitive header names remain, without their values.
-        assert!(result.contains("authorization"));
-        assert!(!result.contains("[REDACTED]"));
-        // Sensitive value should NOT be present
-        assert!(!result.contains("secret-token"));
-        // Header names remain observable for diagnostics, never values.
-        assert!(result.contains("content-type"));
-        assert!(!result.contains("application/json"));
-    }
-
-    #[test]
-    fn test_format_headers_redacted_filters_set_cookie() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "set-cookie",
-            "CF_Authorization=sensitive-session-token; Path=/; Secure;"
-                .parse()
-                .unwrap(),
-        );
-        headers.insert("server", "cloudflare".parse().unwrap());
-
-        let result = format_headers_redacted(&headers, false);
-
-        // Sensitive header names remain, without their values.
-        assert!(result.contains("set-cookie"));
-        assert!(!result.contains("[REDACTED]"));
-        // Sensitive value should NOT be present
-        assert!(!result.contains("sensitive-session-token"));
-        // Non-sensitive header names are present but values are not.
-        assert!(result.contains("server"));
-        assert!(!result.contains("cloudflare"));
-    }
-
-    #[test]
-    fn test_format_headers_redacted_filters_all_sensitive() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer token".parse().unwrap());
-        headers.insert("proxy-authorization", "Basic creds".parse().unwrap());
-        headers.insert("set-cookie", "session=abc".parse().unwrap());
-        headers.insert("cookie", "session=abc".parse().unwrap());
-        headers.insert("x-api-key", "api-key-123".parse().unwrap());
-        headers.insert("x-auth-token", "auth-token-456".parse().unwrap());
-        headers.insert("x-request-id", "req-123".parse().unwrap());
-
-        let result = format_headers_redacted(&headers, false);
-
-        // All sensitive header names remain, without their values.
-        assert!(result.contains("authorization"));
-        assert!(result.contains("proxy-authorization"));
-        assert!(result.contains("set-cookie"));
-        assert!(result.contains("cookie"));
-        assert!(result.contains("x-api-key"));
-        assert!(result.contains("x-auth-token"));
-        assert!(!result.contains("[REDACTED]"));
-
-        // Ensure no sensitive values leaked
-        assert!(!result.contains("Bearer token"));
-        assert!(!result.contains("Basic creds"));
-        assert!(!result.contains("session=abc"));
-        assert!(!result.contains("api-key-123"));
-        assert!(!result.contains("auth-token-456"));
-
-        // Non-sensitive header names remain, but their values do not.
-        assert!(result.contains("x-request-id"));
-        assert!(!result.contains("req-123"));
-    }
-
-    #[test]
-    fn test_format_headers_never_discloses_values_when_redaction_disabled() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer secret-token".parse().unwrap());
-        headers.insert("x-api-key", "api-key-123".parse().unwrap());
-        headers.insert("content-type", "application/json".parse().unwrap());
-
-        let result = format_headers_redacted(&headers, true);
-
-        // Response values are never logged, even for the legacy debugging knob.
-        assert!(result.contains("authorization"));
-        assert!(result.contains("x-api-key"));
-        assert!(result.contains("content-type"));
-        assert!(!result.contains("Bearer secret-token"));
-        assert!(!result.contains("api-key-123"));
-        assert!(!result.contains("application/json"));
-        assert!(!result.contains("[REDACTED]"));
-    }
-
-    fn assert_error_redacted(error: &Error, canary: &str) {
-        assert!(!error.to_string().contains(canary));
-        assert!(!format!("{error:?}").contains(canary));
-        let mut source = std::error::Error::source(error);
-        while let Some(error) = source {
-            assert!(!error.to_string().contains(canary));
-            assert!(!format!("{error:?}").contains(canary));
-            source = error.source();
-        }
-    }
-
-    #[test]
-    fn response_body_canary_never_enters_decode_error() {
-        let canary = "storage-secret-canary";
-        let response = HttpResponse::new(
-            http::StatusCode::OK,
-            HeaderMap::new(),
-            canary.as_bytes().to_vec(),
-        );
-        let error = deserialize_catalog_response::<crate::types::LoadTableResult>(response)
-            .expect_err("invalid response must fail");
-        assert_error_redacted(&error, canary);
-    }
-
-    #[test]
-    fn response_enum_canary_never_enters_decode_error_source() {
-        #[derive(Debug, serde::Deserialize)]
-        enum KnownValue {
-            Expected,
-        }
-
-        let canary = "storage-secret-known-value-canary";
-        let body = serde_json::to_vec(canary).unwrap();
-        // This shape makes serde's diagnostic quote the rejected server value.
-        let unredacted = serde_json::from_slice::<KnownValue>(&body).unwrap_err();
-        assert!(unredacted.to_string().contains(canary));
-        let response = HttpResponse::new(http::StatusCode::OK, HeaderMap::new(), body);
-        let error = deserialize_catalog_response::<KnownValue>(response).unwrap_err();
-        assert_error_redacted(&error, canary);
+        assert!(result.contains("abc123"));
     }
 
     #[tokio::test]
@@ -551,9 +455,101 @@ mod tests {
         assert!(!out.contains("Basic xyz"));
         assert!(!out.contains("shh-secret"));
         assert!(!out.contains("cred-value"));
-        assert!(!out.contains("[REDACTED]"));
-        assert!(out.contains("authorization"));
-        assert!(out.contains("x-client-secret"));
-        assert!(out.contains("x-client-credential"));
+        assert!(out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn test_format_headers_redacted_filters_sensitive() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer secret-token".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        let result = format_headers_redacted(&headers, false);
+
+        // Sensitive header should be present but with redacted value
+        assert!(result.contains("authorization"));
+        assert!(result.contains("[REDACTED]"));
+        // Sensitive value should NOT be present
+        assert!(!result.contains("secret-token"));
+        // Non-sensitive header should be present with actual value
+        assert!(result.contains("content-type"));
+        assert!(result.contains("application/json"));
+    }
+
+    #[test]
+    fn test_format_headers_redacted_filters_set_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "set-cookie",
+            "CF_Authorization=sensitive-session-token; Path=/; Secure;"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("server", "cloudflare".parse().unwrap());
+
+        let result = format_headers_redacted(&headers, false);
+
+        // Sensitive header should be present but with redacted value
+        assert!(result.contains("set-cookie"));
+        assert!(result.contains("[REDACTED]"));
+        // Sensitive value should NOT be present
+        assert!(!result.contains("sensitive-session-token"));
+        // Non-sensitive header should be present with actual value
+        assert!(result.contains("server"));
+        assert!(result.contains("cloudflare"));
+    }
+
+    #[test]
+    fn test_format_headers_redacted_filters_all_sensitive() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer token".parse().unwrap());
+        headers.insert("proxy-authorization", "Basic creds".parse().unwrap());
+        headers.insert("set-cookie", "session=abc".parse().unwrap());
+        headers.insert("cookie", "session=abc".parse().unwrap());
+        headers.insert("x-api-key", "api-key-123".parse().unwrap());
+        headers.insert("x-auth-token", "auth-token-456".parse().unwrap());
+        headers.insert("x-request-id", "req-123".parse().unwrap());
+
+        let result = format_headers_redacted(&headers, false);
+
+        // All sensitive headers should be present but with redacted values
+        assert!(result.contains("authorization"));
+        assert!(result.contains("proxy-authorization"));
+        assert!(result.contains("set-cookie"));
+        assert!(result.contains("cookie"));
+        assert!(result.contains("x-api-key"));
+        assert!(result.contains("x-auth-token"));
+        assert!(result.contains("[REDACTED]"));
+
+        // Ensure no sensitive values leaked
+        assert!(!result.contains("Bearer token"));
+        assert!(!result.contains("Basic creds"));
+        assert!(!result.contains("session=abc"));
+        assert!(!result.contains("api-key-123"));
+        assert!(!result.contains("auth-token-456"));
+
+        // Non-sensitive header should be present with actual value
+        assert!(result.contains("x-request-id"));
+        assert!(result.contains("req-123"));
+    }
+
+    #[test]
+    fn test_format_headers_with_redaction_disabled() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer secret-token".parse().unwrap());
+        headers.insert("x-api-key", "api-key-123".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        let result = format_headers_redacted(&headers, true);
+
+        // When redaction is disabled, all headers and values should be present
+        assert!(result.contains("authorization"));
+        assert!(result.contains("Bearer secret-token"));
+        assert!(result.contains("x-api-key"));
+        assert!(result.contains("api-key-123"));
+        assert!(result.contains("content-type"));
+        assert!(result.contains("application/json"));
+        // [REDACTED] should NOT be present when redaction is disabled
+        assert!(!result.contains("[REDACTED]"));
     }
 }
