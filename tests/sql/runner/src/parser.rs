@@ -176,6 +176,7 @@ fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatal
     };
     let fault = match fault.trim() {
         "before-dispatch" => PublicationCatalogFault::BeforeDispatch,
+        "before-dispatch-forbidden" => PublicationCatalogFault::BeforeDispatchForbidden,
         "before-dispatch-hold-for-concurrent-shell" => {
             PublicationCatalogFault::BeforeDispatchHoldForConcurrentShell
         }
@@ -189,7 +190,7 @@ fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatal
         "incomplete-discovery" => PublicationCatalogFault::IncompleteDiscovery,
         "corrupt-package" => PublicationCatalogFault::CorruptPackage,
         other => anyhow::bail!(
-            "invalid @publication_catalog_fault fault `{other}`; expected before-dispatch, before-dispatch-hold-for-concurrent-shell, before-requirement-check-hold-for-concurrent-shell, after-commit-before-response, after-commit-hold-for-frontend-kill, incomplete-discovery, corrupt-package"
+            "invalid @publication_catalog_fault fault `{other}`; expected before-dispatch, before-dispatch-forbidden, before-dispatch-hold-for-concurrent-shell, before-requirement-check-hold-for-concurrent-shell, after-commit-before-response, after-commit-hold-for-frontend-kill, incomplete-discovery, corrupt-package"
         ),
     };
     let compatible = matches!(
@@ -197,6 +198,7 @@ fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatal
         (
             PublicationCatalogAction::StageCreate | PublicationCatalogAction::TableCommit,
             PublicationCatalogFault::BeforeDispatch
+                | PublicationCatalogFault::BeforeDispatchForbidden
                 | PublicationCatalogFault::AfterCommitBeforeResponse
                 | PublicationCatalogFault::AfterCommitHoldForFrontendKill
         ) | (
@@ -1516,6 +1518,58 @@ mod opt5_directive_tests {
             error.to_string().contains("action/fault combination"),
             "{error:#}"
         );
+    }
+
+    #[test]
+    fn parse_meta_parses_forbidden_before_dispatch_fault_for_mutations_only() {
+        let re = meta_re();
+        for (action_name, action) in [
+            ("stage-create", PublicationCatalogAction::StageCreate),
+            ("table-commit", PublicationCatalogAction::TableCommit),
+        ] {
+            let meta = parse_meta(
+                &[format!(
+                    "-- @publication_catalog_fault={action_name},before-dispatch-forbidden"
+                )],
+                &re,
+            )
+            .expect("parse forbidden before-dispatch fault");
+            assert_eq!(
+                meta.publication_catalog_fault,
+                Some(PublicationCatalogFaultDirective {
+                    action,
+                    fault: PublicationCatalogFault::BeforeDispatchForbidden,
+                })
+            );
+            assert_eq!(
+                meta.publication_catalog_fault.unwrap().fault.as_str(),
+                "before-dispatch-forbidden"
+            );
+        }
+        // The existing 400 fault keeps its own name and meaning.
+        let meta = parse_meta(
+            &["-- @publication_catalog_fault=stage-create,before-dispatch".to_string()],
+            &re,
+        )
+        .expect("parse before-dispatch fault");
+        assert_eq!(
+            meta.publication_catalog_fault
+                .map(|directive| directive.fault),
+            Some(PublicationCatalogFault::BeforeDispatch)
+        );
+        for action_name in ["namespace-list", "table-load"] {
+            let error = parse_meta(
+                &[format!(
+                    "-- @publication_catalog_fault={action_name},before-dispatch-forbidden"
+                )],
+                &re,
+            )
+            .expect_err("a forbidden answer applies only to a mutation request");
+            assert!(
+                error.to_string().contains("action/fault combination"),
+                "{error:#}"
+            );
+        }
     }
 
     #[test]

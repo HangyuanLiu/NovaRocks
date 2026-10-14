@@ -20,9 +20,11 @@
 //! The proxy forwards every standard catalog operation to a real downstream
 //! catalog. It changes only successful vended table-load and staged-create
 //! responses by attaching standard Iceberg `storage-credentials`, then serves
-//! one local refresh endpoint with a rotated credential. Audit state records
-//! counters and public key ids only; it never retains HTTP headers, bodies, or
-//! secret values.
+//! one local refresh endpoint with a rotated credential. A scenario may also
+//! configure one test-only answer replacement that applies after the
+//! downstream catalog has applied a mutation. Audit state records counters
+//! and public key ids only; it never retains HTTP headers, bodies, or secret
+//! values.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -128,8 +130,10 @@ pub struct VendedRestCatalogConfig {
     /// catalog responses are always forwarded unchanged except for the
     /// standard vended credential injection described by this fixture.
     pub refresh_behavior: VendedRefreshBehavior,
-    /// Test-only result after a downstream table commit has succeeded. This
-    /// models losing the response without issuing a replayed catalog mutation.
+    /// Test-only result after a downstream mutation has succeeded. This
+    /// models losing or replacing the response without issuing a replayed
+    /// catalog mutation. Every mode except `ReplaceAfterSideEffect` applies to
+    /// existing-table commits only.
     pub table_commit_response_behavior: VendedTableCommitResponseBehavior,
     /// Holds exactly one successful existing-table commit response after the
     /// downstream catalog has applied it. This models a response-loss window
@@ -152,6 +156,42 @@ pub enum VendedTableCommitResponseBehavior {
     #[default]
     Forward,
     FailUnavailableAfterSideEffect,
+    /// Forwards every request of one mutation class to the downstream catalog
+    /// and, only when the downstream answered with success, replaces that
+    /// answer. The side effect is real and applied exactly once; only the
+    /// response the client observes is replaced. Downstream failures and
+    /// every other request are forwarded unchanged.
+    ReplaceAfterSideEffect(VendedResponseReplacement),
+}
+
+/// One post-side-effect response replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VendedResponseReplacement {
+    pub request: VendedMutationRequest,
+    pub answer: VendedReplacementAnswer,
+}
+
+/// A standard Iceberg REST mutation request class, recognized by method and
+/// path shape (`/v1[/{prefix}]/namespaces/...`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VendedMutationRequest {
+    /// `POST .../namespaces/{namespace}/tables/{table}`.
+    TableCommit,
+    /// `POST .../namespaces/{namespace}/tables` with `"stage-create": true`.
+    StageCreate,
+    /// `POST .../namespaces`.
+    NamespaceCreate,
+}
+
+/// The answer that replaces a downstream success.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VendedReplacementAnswer {
+    /// HTTP 404 with a standard Iceberg REST `ErrorModel` body.
+    NotFound,
+    /// HTTP 400 with a standard Iceberg REST `ErrorModel` body.
+    BadRequest,
+    /// HTTP 200 whose body is an HTML document instead of a catalog response.
+    HtmlOk,
 }
 
 impl VendedRestCatalogConfig {
@@ -176,6 +216,19 @@ impl VendedRestCatalogConfig {
             self.initial.access_key_id != self.rotated.access_key_id,
             "vended REST fixture initial and rotated key ids must differ"
         );
+        ensure!(
+            !(self.hold_first_table_commit_response
+                && matches!(
+                    self.table_commit_response_behavior,
+                    VendedTableCommitResponseBehavior::ReplaceAfterSideEffect(
+                        VendedResponseReplacement {
+                            request: VendedMutationRequest::TableCommit,
+                            ..
+                        }
+                    )
+                )),
+            "vended REST fixture cannot both hold and replace a table commit response"
+        );
         Ok(())
     }
 }
@@ -189,6 +242,11 @@ pub struct VendedRestCatalogAudit {
     pub refreshes: u64,
     pub refresh_failures: u64,
     pub issued_key_ids: BTreeMap<String, u64>,
+    /// Requests of the configured replacement class that were forwarded to
+    /// the downstream catalog, whatever the downstream answered.
+    pub replacement_class_requests: u64,
+    /// Downstream successes whose response was replaced after the side effect.
+    pub replaced_responses: u64,
 }
 
 /// One consumer identity bound to this fixture's exact refresh capability.
@@ -1096,7 +1154,23 @@ async fn dispatch(State(state): State<Arc<AppState>>, request: Request) -> Respo
     let hold_table_commit = is_table_commit
         .then(|| state.commit_response_hold.clone())
         .flatten();
+    let replacement = match state.table_commit_response_behavior {
+        VendedTableCommitResponseBehavior::ReplaceAfterSideEffect(replacement)
+            if mutation_request(&parts.method, &parts.uri, &bytes) == Some(replacement.request) =>
+        {
+            Some(replacement)
+        }
+        _ => None,
+    };
     let response = proxy_request(&state, parts.method, parts.uri, parts.headers, bytes).await;
+    if let Some(replacement) = replacement {
+        let replaced = response.status().is_success();
+        record_replacement(&state.audit, replacement.request, replaced);
+        if replaced {
+            return replacement_response(replacement);
+        }
+        return response;
+    }
     if response.status().is_success() {
         if let Some(hold) = hold_table_commit {
             record_issue(&state.audit, VendedAction::TableCommit, "");
@@ -1157,6 +1231,102 @@ fn vended_action(
         .ok()
         .filter(|value| value.get("stage-create").and_then(Value::as_bool) == Some(true))
         .map(|_| VendedAction::StagedCreate)
+}
+
+/// Classifies one standard Iceberg REST mutation by its exact path shape:
+/// `/v1[/{prefix}]/namespaces[/{namespace}/tables[/{table}]]`. Anything else,
+/// including `/v1/tables/rename` and table sub-resources such as metrics, is
+/// not a replacement candidate.
+fn mutation_request(method: &Method, uri: &Uri, body: &[u8]) -> Option<VendedMutationRequest> {
+    if method != Method::POST {
+        return None;
+    }
+    let segments = uri.path().strip_prefix('/')?.split('/').collect::<Vec<_>>();
+    let tail = match segments.as_slice() {
+        ["v1", "namespaces", tail @ ..] => tail,
+        ["v1", prefix, "namespaces", tail @ ..] if !prefix.is_empty() => tail,
+        _ => return None,
+    };
+    match tail {
+        [] => Some(VendedMutationRequest::NamespaceCreate),
+        [namespace, "tables"] if !namespace.is_empty() => serde_json::from_slice::<Value>(body)
+            .ok()
+            .filter(|value| value.get("stage-create").and_then(Value::as_bool) == Some(true))
+            .map(|_| VendedMutationRequest::StageCreate),
+        [namespace, "tables", table] if !namespace.is_empty() && !table.is_empty() => {
+            Some(VendedMutationRequest::TableCommit)
+        }
+        _ => None,
+    }
+}
+
+fn record_replacement(
+    audit: &Mutex<VendedRestCatalogAudit>,
+    request: VendedMutationRequest,
+    replaced: bool,
+) {
+    let mut audit = audit
+        .lock()
+        .expect("vended REST catalog fixture audit lock poisoned");
+    audit.replacement_class_requests += 1;
+    if replaced {
+        audit.replaced_responses += 1;
+        if request == VendedMutationRequest::TableCommit {
+            audit.table_commits += 1;
+        }
+    }
+}
+
+/// The replacement answer for one downstream success. Error answers use the
+/// standard Iceberg REST `ErrorModel`, so a client parses them exactly as it
+/// would parse a real server rejection.
+fn replacement_response(replacement: VendedResponseReplacement) -> Response {
+    const MESSAGE: &str = "fixture replaced the answer after the downstream catalog applied it";
+    let (status, body, content_type) = match replacement.answer {
+        VendedReplacementAnswer::NotFound => {
+            let error_type = match replacement.request {
+                VendedMutationRequest::TableCommit => "NoSuchTableException",
+                VendedMutationRequest::StageCreate | VendedMutationRequest::NamespaceCreate => {
+                    "NoSuchNamespaceException"
+                }
+            };
+            (
+                StatusCode::NOT_FOUND,
+                error_model(StatusCode::NOT_FOUND, error_type, MESSAGE),
+                "application/json",
+            )
+        }
+        VendedReplacementAnswer::BadRequest => (
+            StatusCode::BAD_REQUEST,
+            error_model(StatusCode::BAD_REQUEST, "BadRequestException", MESSAGE),
+            "application/json",
+        ),
+        VendedReplacementAnswer::HtmlOk => (
+            StatusCode::OK,
+            "<!DOCTYPE html><html><head><title>Gateway</title></head>\
+             <body><p>Request accepted.</p></body></html>"
+                .to_string(),
+            "text/html; charset=utf-8",
+        ),
+    };
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(content_type),
+    );
+    response
+}
+
+fn error_model(status: StatusCode, error_type: &str, message: &str) -> String {
+    json!({
+        "error": {
+            "message": message,
+            "type": error_type,
+            "code": status.as_u16(),
+        }
+    })
+    .to_string()
 }
 
 async fn proxy_request(
@@ -2019,5 +2189,388 @@ mod tests {
         assert_eq!(audit.refreshes, 0);
         assert_eq!(audit.refresh_failures, 0);
         let _ = shutdown.send(());
+    }
+
+    /// A downstream catalog that answers every request with one fixed status
+    /// and records the method and path it received.
+    async fn scripted_downstream(
+        status: StatusCode,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Sender<()>,
+        Arc<Mutex<Vec<(Method, String)>>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind scripted downstream");
+        let address = listener.local_addr().expect("scripted downstream address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&requests);
+        let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let app = Router::new().fallback(any(move |request: Request| {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push((request.method().clone(), request.uri().path().to_string()));
+                    let mut response = json_response(json!({
+                        "metadata-location": "s3://fixture/warehouse/db/t/metadata/v2.json",
+                        "metadata": {"table-uuid": "downstream"},
+                        "namespace": ["db"],
+                    }));
+                    *response.status_mut() = status;
+                    response
+                }
+            }));
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("serve scripted downstream");
+        });
+        (format!("http://{address}"), shutdown, requests)
+    }
+
+    fn replacement_fixture(
+        downstream: String,
+        request: VendedMutationRequest,
+        answer: VendedReplacementAnswer,
+    ) -> VendedRestCatalogFixture {
+        VendedRestCatalogFixture::start(VendedRestCatalogConfig {
+            downstream,
+            scope_prefix: "s3://fixture/warehouse/".to_string(),
+            initial: credential("initial-key"),
+            rotated: credential("rotated-key"),
+            initial_ttl: Duration::from_secs(30),
+            refresh_ttl: Duration::from_secs(30),
+            refresh_behavior: Default::default(),
+            table_commit_response_behavior:
+                VendedTableCommitResponseBehavior::ReplaceAfterSideEffect(
+                    VendedResponseReplacement { request, answer },
+                ),
+            hold_first_table_commit_response: false,
+        })
+        .expect("replacement fixture")
+    }
+
+    fn uri(path: &str) -> Uri {
+        path.parse().expect("test URI")
+    }
+
+    #[test]
+    fn mutation_requests_are_classified_by_standard_rest_path_shape() {
+        let stage = br#"{"name":"t","stage-create":true}"#;
+        let create = br#"{"name":"t"}"#;
+        for (method, path, body, expected) in [
+            (
+                Method::POST,
+                "/v1/namespaces/db/tables/t",
+                &b"{}"[..],
+                Some(VendedMutationRequest::TableCommit),
+            ),
+            (
+                Method::POST,
+                "/v1/warehouse-prefix/namespaces/db/tables/t",
+                &b"{}"[..],
+                Some(VendedMutationRequest::TableCommit),
+            ),
+            (
+                Method::POST,
+                "/v1/namespaces/db/tables",
+                &stage[..],
+                Some(VendedMutationRequest::StageCreate),
+            ),
+            (
+                Method::POST,
+                "/v1/warehouse-prefix/namespaces/db/tables",
+                &stage[..],
+                Some(VendedMutationRequest::StageCreate),
+            ),
+            (Method::POST, "/v1/namespaces/db/tables", &create[..], None),
+            (
+                Method::POST,
+                "/v1/namespaces",
+                &b"{}"[..],
+                Some(VendedMutationRequest::NamespaceCreate),
+            ),
+            (
+                Method::POST,
+                "/v1/warehouse-prefix/namespaces",
+                &b"{}"[..],
+                Some(VendedMutationRequest::NamespaceCreate),
+            ),
+            (Method::POST, "/v1/tables/rename", &b"{}"[..], None),
+            (
+                Method::POST,
+                "/v1/namespaces/db/tables/t/metrics",
+                &b"{}"[..],
+                None,
+            ),
+            (
+                Method::POST,
+                "/v1/namespaces/db/properties",
+                &b"{}"[..],
+                None,
+            ),
+            (Method::POST, "/v1/namespaces/db/views/v", &b"{}"[..], None),
+            (Method::POST, "/v1/transactions/commit", &b"{}"[..], None),
+            (Method::GET, "/v1/namespaces/db/tables/t", &b""[..], None),
+            (Method::GET, "/v1/namespaces", &b""[..], None),
+            (Method::DELETE, "/v1/namespaces/db/tables/t", &b""[..], None),
+            (Method::POST, "/v2/namespaces/db/tables/t", &b"{}"[..], None),
+        ] {
+            assert_eq!(
+                mutation_request(&method, &uri(path), body),
+                expected,
+                "{method} {path}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn successful_mutation_is_applied_once_before_its_answer_is_replaced() {
+        let stage = json!({"name": "t", "stage-create": true});
+        for (request, method_path, body) in [
+            (
+                VendedMutationRequest::TableCommit,
+                "/v1/namespaces/db/tables/t",
+                json!({"requirements": [], "updates": []}),
+            ),
+            (
+                VendedMutationRequest::StageCreate,
+                "/v1/namespaces/db/tables",
+                stage.clone(),
+            ),
+            (
+                VendedMutationRequest::NamespaceCreate,
+                "/v1/namespaces",
+                json!({"namespace": ["db"], "properties": {}}),
+            ),
+        ] {
+            for answer in [
+                VendedReplacementAnswer::NotFound,
+                VendedReplacementAnswer::BadRequest,
+                VendedReplacementAnswer::HtmlOk,
+            ] {
+                let (downstream, shutdown, requests) = scripted_downstream(StatusCode::OK).await;
+                let fixture = replacement_fixture(downstream, request, answer);
+                let response = reqwest::Client::builder()
+                    .no_proxy()
+                    .build()
+                    .unwrap()
+                    .post(format!("{}{method_path}", fixture.uri()))
+                    .header(ACCESS_DELEGATION_HEADER, VENDED_CREDENTIALS)
+                    .json(&body)
+                    .send()
+                    .await
+                    .expect("replaced response");
+                let status = response.status();
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let text = response.text().await.expect("replaced body");
+                match answer {
+                    VendedReplacementAnswer::NotFound | VendedReplacementAnswer::BadRequest => {
+                        let expected = if answer == VendedReplacementAnswer::NotFound {
+                            reqwest::StatusCode::NOT_FOUND
+                        } else {
+                            reqwest::StatusCode::BAD_REQUEST
+                        };
+                        assert_eq!(status, expected, "{request:?} {answer:?}");
+                        assert_eq!(content_type, "application/json");
+                        let model: Value = serde_json::from_str(&text).expect("ErrorModel JSON");
+                        assert_eq!(
+                            model.pointer("/error/code"),
+                            Some(&json!(expected.as_u16())),
+                            "{model}"
+                        );
+                        let error_type = model
+                            .pointer("/error/type")
+                            .and_then(Value::as_str)
+                            .expect("ErrorModel type");
+                        let expected_type = match (answer, request) {
+                            (VendedReplacementAnswer::BadRequest, _) => "BadRequestException",
+                            (_, VendedMutationRequest::TableCommit) => "NoSuchTableException",
+                            _ => "NoSuchNamespaceException",
+                        };
+                        assert_eq!(error_type, expected_type);
+                        assert!(
+                            model
+                                .pointer("/error/message")
+                                .and_then(Value::as_str)
+                                .is_some_and(|message| !message.is_empty())
+                        );
+                        assert!(model.get("metadata-location").is_none());
+                    }
+                    VendedReplacementAnswer::HtmlOk => {
+                        assert_eq!(status, reqwest::StatusCode::OK);
+                        assert!(content_type.starts_with("text/html"), "{content_type}");
+                        assert!(text.starts_with("<!DOCTYPE html>"), "{text}");
+                        assert!(serde_json::from_str::<Value>(&text).is_err());
+                    }
+                }
+                assert_eq!(
+                    requests.lock().unwrap().as_slice(),
+                    &[(Method::POST, method_path.to_string())],
+                    "the replaced mutation must reach downstream exactly once"
+                );
+                let audit = fixture.audit();
+                assert_eq!(audit.replacement_class_requests, 1);
+                assert_eq!(audit.replaced_responses, 1);
+                assert_eq!(
+                    audit.table_commits,
+                    u64::from(request == VendedMutationRequest::TableCommit)
+                );
+                assert_eq!(audit.staged_creates, 0, "a replaced stage issues no lease");
+                assert!(audit.issued_key_ids.is_empty());
+                drop(fixture);
+                let _ = shutdown.send(());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn downstream_failure_of_the_replacement_class_is_forwarded_unchanged() {
+        let (downstream, shutdown, requests) = scripted_downstream(StatusCode::CONFLICT).await;
+        let fixture = replacement_fixture(
+            downstream,
+            VendedMutationRequest::TableCommit,
+            VendedReplacementAnswer::NotFound,
+        );
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("{}/v1/namespaces/db/tables/t", fixture.uri()))
+            .json(&json!({"requirements": [], "updates": []}))
+            .send()
+            .await
+            .expect("conflict response");
+        assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
+        let body: Value = response.json().await.expect("downstream body");
+        assert_eq!(
+            body.pointer("/metadata/table-uuid"),
+            Some(&json!("downstream"))
+        );
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        let audit = fixture.audit();
+        assert_eq!(audit.replacement_class_requests, 1);
+        assert_eq!(audit.replaced_responses, 0);
+        assert_eq!(audit.table_commits, 0);
+        drop(fixture);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replacement_leaves_other_request_classes_untouched() {
+        let (downstream, shutdown, requests) = scripted_downstream(StatusCode::OK).await;
+        let fixture = replacement_fixture(
+            downstream,
+            VendedMutationRequest::NamespaceCreate,
+            VendedReplacementAnswer::BadRequest,
+        );
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let commit: Value = client
+            .post(format!("{}/v1/namespaces/db/tables/t", fixture.uri()))
+            .json(&json!({"requirements": [], "updates": []}))
+            .send()
+            .await
+            .expect("commit response")
+            .error_for_status()
+            .expect("forwarded commit status")
+            .json()
+            .await
+            .expect("forwarded commit body");
+        assert_eq!(
+            commit.get("metadata-location"),
+            Some(&json!("s3://fixture/warehouse/db/t/metadata/v2.json"))
+        );
+        let load: Value = client
+            .get(format!("{}/v1/namespaces/db/tables/t", fixture.uri()))
+            .header(ACCESS_DELEGATION_HEADER, VENDED_CREDENTIALS)
+            .send()
+            .await
+            .expect("load response")
+            .error_for_status()
+            .expect("forwarded load status")
+            .json()
+            .await
+            .expect("vended load body");
+        assert_eq!(
+            load.pointer("/storage-credentials/0/config/s3.access-key-id"),
+            Some(&json!("initial-key"))
+        );
+        let staged: Value = client
+            .post(format!("{}/v1/namespaces/db/tables", fixture.uri()))
+            .header(ACCESS_DELEGATION_HEADER, VENDED_CREDENTIALS)
+            .json(&json!({"name": "t", "stage-create": true}))
+            .send()
+            .await
+            .expect("stage response")
+            .error_for_status()
+            .expect("forwarded stage status")
+            .json()
+            .await
+            .expect("vended stage body");
+        assert_eq!(
+            staged.pointer("/storage-credentials/0/config/s3.access-key-id"),
+            Some(&json!("initial-key"))
+        );
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        let audit = fixture.audit();
+        assert_eq!(audit.replacement_class_requests, 0);
+        assert_eq!(audit.replaced_responses, 0);
+        assert_eq!(audit.table_commits, 0);
+        assert_eq!(audit.table_loads, 1);
+        assert_eq!(audit.staged_creates, 1);
+        drop(fixture);
+        let _ = shutdown.send(());
+    }
+
+    #[test]
+    fn a_table_commit_cannot_be_both_held_and_replaced() {
+        let config = VendedRestCatalogConfig {
+            downstream: "http://127.0.0.1:1".to_string(),
+            scope_prefix: "s3://fixture/warehouse/".to_string(),
+            initial: credential("initial-key"),
+            rotated: credential("rotated-key"),
+            initial_ttl: Duration::from_secs(30),
+            refresh_ttl: Duration::from_secs(30),
+            refresh_behavior: Default::default(),
+            table_commit_response_behavior:
+                VendedTableCommitResponseBehavior::ReplaceAfterSideEffect(
+                    VendedResponseReplacement {
+                        request: VendedMutationRequest::TableCommit,
+                        answer: VendedReplacementAnswer::NotFound,
+                    },
+                ),
+            hold_first_table_commit_response: true,
+        };
+        let error = config
+            .validate()
+            .expect_err("hold and replace are exclusive");
+        assert!(
+            error.to_string().contains("both hold and replace"),
+            "{error:#}"
+        );
+        let namespace = VendedRestCatalogConfig {
+            table_commit_response_behavior:
+                VendedTableCommitResponseBehavior::ReplaceAfterSideEffect(
+                    VendedResponseReplacement {
+                        request: VendedMutationRequest::NamespaceCreate,
+                        answer: VendedReplacementAnswer::NotFound,
+                    },
+                ),
+            ..config
+        };
+        namespace
+            .validate()
+            .expect("holding a table commit does not conflict with a namespace replacement");
     }
 }

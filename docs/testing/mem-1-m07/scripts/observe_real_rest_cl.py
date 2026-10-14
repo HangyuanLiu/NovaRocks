@@ -19,8 +19,8 @@
 """Bounded stdlib observer for actual normal REST CL; never a provider or injector.
 
 Read-only integration evidence:
-* tests/cluster-harness/src/vended_rest_catalog.rs:1162 proxies a real catalog,
-  but :1203 injects credentials and its audit lacks CL counters. Do not use its
+* tests/cluster-harness/src/vended_rest_catalog.rs:1332 proxies a real catalog,
+  but :1373 injects credentials and its audit lacks CL counters. Do not use its
   response rewriting for this observer.
 * tests/system-test-runner/src/scenarios/mv_uea7.rs:49-115 binds catalog URI and
   FE/BE credentials to one IsolatedIcebergRestFixture. Replace only that catalog
