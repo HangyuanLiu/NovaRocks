@@ -217,7 +217,7 @@ impl IcebergCleanupMaintenanceAdapter {
             .invalidate_table(&payload.namespace, &payload.table);
         let physical = self
             .runtime
-            .load_table_for_request(&payload.namespace, &payload.table, context)
+            .observe_table_for_request(&payload.namespace, &payload.table, context)
             .map_err(unavailable)?;
         if physical.table.metadata().uuid().to_string() != payload.table_uuid {
             return Err(corrupt(
@@ -1703,9 +1703,15 @@ mod tests {
     fn replaced_table_uuid_refuses_page_prepare_and_execute_before_delete() {
         let (executor, _warehouse, runtime) = local_runtime();
         let (adapter, plan, table, root) = real_cleanup_plan(&executor, runtime.clone(), true);
+        let shared_context = context();
+        let old = runtime
+            .load_table_for_request("orphan_test", "t", &shared_context)
+            .unwrap();
+        assert_eq!(old.table.metadata().uuid(), table.metadata().uuid());
         let prepared = adapter
             .prepare_batch(
-                ConnectorCleanupPrepareRequest::try_new(plan.clone(), 0, context()).unwrap(),
+                ConnectorCleanupPrepareRequest::try_new(plan.clone(), 0, shared_context.clone())
+                    .unwrap(),
             )
             .unwrap();
         // Replace only the persisted table incarnation, retaining the paths and
@@ -1716,21 +1722,42 @@ mod tests {
             serde_json::from_slice(&fs::read(metadata_path.path()).unwrap()).unwrap();
         metadata["table-uuid"] = Value::String(uuid::Uuid::new_v4().to_string());
         fs::write(metadata_path.path(), serde_json::to_vec(&metadata).unwrap()).unwrap();
+        assert_eq!(
+            runtime
+                .load_table_for_request("orphan_test", "t", &shared_context)
+                .unwrap()
+                .table
+                .metadata()
+                .uuid(),
+            table.metadata().uuid(),
+            "shared planning cache intentionally retains the old UUID"
+        );
         for result in [
             adapter
                 .read_candidate_page(
-                    ConnectorCleanupCandidatePageRequest::try_new(plan.clone(), 0, 10, context())
-                        .unwrap(),
+                    ConnectorCleanupCandidatePageRequest::try_new(
+                        plan.clone(),
+                        0,
+                        10,
+                        shared_context.clone(),
+                    )
+                    .unwrap(),
                 )
                 .map(|_| ()),
             adapter
                 .prepare_batch(
-                    ConnectorCleanupPrepareRequest::try_new(plan.clone(), 0, context()).unwrap(),
+                    ConnectorCleanupPrepareRequest::try_new(
+                        plan.clone(),
+                        0,
+                        shared_context.clone(),
+                    )
+                    .unwrap(),
                 )
                 .map(|_| ()),
             adapter
                 .execute_batch(
-                    ConnectorCleanupExecuteRequest::try_new(plan, prepared, context()).unwrap(),
+                    ConnectorCleanupExecuteRequest::try_new(plan, prepared, shared_context.clone())
+                        .unwrap(),
                 )
                 .map(|_| ()),
         ] {

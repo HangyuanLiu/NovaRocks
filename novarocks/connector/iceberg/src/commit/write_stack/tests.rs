@@ -3755,6 +3755,9 @@ struct FrozenRewriteLake {
 }
 impl FrozenRewriteLake {
     fn new() -> Self {
+        Self::new_version(crate::iceberg::spec::FormatVersion::V2)
+    }
+    fn new_version(version: crate::iceberg::spec::FormatVersion) -> Self {
         let executor = tokio::runtime::Runtime::new().unwrap();
         let warehouse = tempfile::tempdir().unwrap();
         let configuration = crate::catalog_config::parse_catalog_configuration(
@@ -3821,7 +3824,7 @@ impl FrozenRewriteLake {
                     crate::iceberg::TableCreation::builder()
                         .name("t".to_string())
                         .schema(schema)
-                        .format_version(crate::iceberg::spec::FormatVersion::V2)
+                        .format_version(version)
                         .properties(std::collections::HashMap::from([
                             (
                                 "write.metadata.metrics.default".to_string(),
@@ -4282,4 +4285,237 @@ fn distributed_rewrite_refuses_foreign_missing_and_mismatched_frozen_inputs() {
         assert_eq!(lake.inventory(), before);
     }
     assert_eq!(lake.rows(), vec![1]);
+}
+
+#[test]
+fn distributed_rewrite_position_inputs_reach_real_table_execute_splits_without_artifacts() {
+    use novarocks_spi::connector::read_stack::{
+        ConnectorReadConstraint, ConnectorReadDynamicFilterSnapshot,
+        ConnectorReadFrozenRewriteGroup, ConnectorReadRequestControlFactory,
+        ConnectorReadTableExecuteProcedure, ConnectorSession, SchemaTableName,
+    };
+    use novarocks_spi::connector::write_stack::{
+        ConnectorWriteFinishPublication, ConnectorWriteFinishRequest,
+    };
+    use novarocks_spi::connector::{
+        ConnectorFrozenRewriteGroup, ConnectorPlanningContext, ConnectorProcessLocalPayload,
+        ConnectorRewriteCohortRead,
+    };
+    let lake = FrozenRewriteLake::new_version(crate::iceberg::spec::FormatVersion::V3);
+    lake.write_rows(
+        novarocks_spi::connector::ConnectorWriteIntent::Append,
+        &[1, 2],
+        "first",
+    );
+    lake.write_rows(
+        novarocks_spi::connector::ConnectorWriteIntent::Append,
+        &[3, 4],
+        "second",
+    );
+    let table = lake.table();
+    let files = lake
+        .executor
+        .block_on(crate::manifest::extract_data_files_with_stats(&table))
+        .unwrap();
+    for (index, file) in files.iter().enumerate() {
+        let input = novarocks_spi::connector::ConnectorWriteInputRequest::DeletionVector {
+            identity_fields: vec![
+                novarocks_spi::connector::ConnectorWriteFieldRequest::new(Field::new(
+                    "_file",
+                    DataType::Utf8,
+                    false,
+                )),
+                novarocks_spi::connector::ConnectorWriteFieldRequest::new(Field::new(
+                    "_pos",
+                    DataType::Int64,
+                    false,
+                )),
+            ],
+            partition_source_fields: Vec::new(),
+        };
+        let session = lake
+            .control
+            .begin_write(ConnectorWriteBeginRequest {
+                table: Arc::from("db.t"),
+                target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+                intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
+                purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                input,
+                base: None,
+                flavor: ConnectorWriteSessionFlavor::Ordinary,
+                context: request_context(),
+            })
+            .unwrap();
+        let path = format!("{}/data/vector-{index}.puffin", table.metadata().location());
+        let mut vector = crate::commit::DeletionVector::new();
+        vector.insert(0).unwrap();
+        let written = lake
+            .executor
+            .block_on(crate::commit::write_single_deletion_vector_puffin(
+                table.file_io(),
+                &path,
+                &file.path,
+                &vector,
+            ))
+            .unwrap();
+        let fragment = IcebergCommitFragment::deletion_vector(
+            dv_artifact(
+                &written.path,
+                &file.path,
+                written.cardinality,
+                written.file_size_in_bytes,
+                written.content_offset,
+                written.content_size_in_bytes,
+            )
+            .unwrap(),
+        );
+        let target = session
+            .targets()
+            .iter()
+            .find(|target| {
+                lake.adapter
+                    .writer_handle(target.handle())
+                    .unwrap()
+                    .branch()
+                    == IcebergWriteBranch::DeletionVector
+            })
+            .unwrap();
+        let set = prepared(
+            &lake.adapter,
+            vec![(target.ordinal(), fragment)],
+            &session.expected_targets(),
+        );
+        let result = lake
+            .control
+            .finish_write(ConnectorWriteFinishRequest {
+                commit: session.commit_handle(),
+                prepared: set,
+                statistics: Vec::new(),
+                publication: ConnectorWriteFinishPublication::None,
+                context: request_context(),
+            })
+            .unwrap();
+        assert!(
+            matches!(result, ExternalMutationOutcome::KnownCommitted { .. }),
+            "{result:?}"
+        );
+    }
+    let before = lake.inventory();
+    let plan = lake.plan(true);
+    assert_eq!(plan.cohorts().len(), 2);
+    assert_eq!(lake.inventory(), before);
+    let descriptor = descriptor("rewrite-local");
+    let catalog = CatalogHandle::new(
+        descriptor.instance_id.clone(),
+        CatalogVersion::from_bytes([6; 32]),
+    );
+    let boundary = Arc::new(crate::typed_boundary::IcebergTypedBoundary::new(
+        descriptor,
+        lake.control.binding_key().incarnation,
+        catalog,
+        crate::typed_read::HiveTransactionHandle::new(true, [1; 16]),
+        lake.runtime.clone(),
+    ));
+    let factory = crate::typed_boundary::IcebergTypedRequestControlFactory::new(boundary);
+    let control = factory
+        .for_planning(&ConnectorPlanningContext::try_from_request(request_context()).unwrap())
+        .unwrap();
+    let metadata = control.metadata();
+    let split_manager = control.splits();
+    let session = ConnectorSession::try_new(
+        "rewrite-test",
+        "user",
+        "UTC",
+        "en_US",
+        std::time::SystemTime::now(),
+    )
+    .unwrap();
+    let name = SchemaTableName::try_new("db", "t").unwrap();
+    let content = plan
+        .frozen()
+        .value::<crate::distributed_rewrite::FrozenRewritePlanContent>("rewrite-local")
+        .unwrap();
+    let weak = Arc::downgrade(content);
+    for cohort in plan.cohorts() {
+        let ConnectorRewriteCohortRead::DeleteArtifactGroup(group) = cohort.read() else {
+            panic!("position rewrite")
+        };
+        let procedure = ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(
+            ConnectorReadFrozenRewriteGroup::from_cohort(group, cohort.group_digest()),
+        );
+        let opened = metadata
+            .get_table_execute_plan(&session, &name, procedure)
+            .unwrap()
+            .unwrap();
+        let mut source = split_manager
+            .get_splits(
+                &session,
+                &opened,
+                &[],
+                &std::collections::BTreeSet::new(),
+                &ConnectorReadConstraint::of_summary(
+                    novarocks_spi::connector::read_stack::TupleDomain::all(),
+                ),
+            )
+            .unwrap();
+        let batch = source
+            .next_batch(1, &ConnectorReadDynamicFilterSnapshot::all_complete())
+            .unwrap();
+        assert_eq!(batch.splits().len(), 1);
+        assert!(source.is_finished());
+        source.close().unwrap();
+        assert_eq!(lake.inventory(), before);
+    }
+    let group = match plan.cohorts()[0].read() {
+        ConnectorRewriteCohortRead::DeleteArtifactGroup(g) => g,
+        _ => unreachable!(),
+    };
+    for case in 0..8 {
+        let mut owner = lake.control.binding_key().clone();
+        let mut private = content.as_ref().clone();
+        let mut op = group.operation_id();
+        let mut digest = group.artifact_digest();
+        let mut group_digest = plan.cohorts()[0].group_digest();
+        match case {
+            0 => owner.instance_id = ConnectorInstanceId::parse("foreign").unwrap(),
+            1 => {}
+            2 => op = novarocks_spi::connector::ConnectorWriteOperationId::new(),
+            3 => digest = [255; 32],
+            4 => group_digest = [255; 32],
+            5 => private.artifact.table_uuid = "different".to_string(),
+            6 => private.artifact.schema_id += 1,
+            7 => private.artifact.base_snapshot_id = None,
+            _ => unreachable!(),
+        }
+        let payload = if case == 1 {
+            ConnectorProcessLocalPayload::new(owner, Arc::new(()))
+        } else {
+            ConnectorProcessLocalPayload::new(owner, Arc::new(private))
+        };
+        let wrong = ConnectorFrozenRewriteGroup::try_new("db", "t", op, digest, payload).unwrap();
+        let error = metadata
+            .get_table_execute_plan(
+                &session,
+                &name,
+                ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(
+                    ConnectorReadFrozenRewriteGroup::from_cohort(&wrong, group_digest),
+                ),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            if case < 5 {
+                ConnectorErrorKind::Internal
+            } else {
+                ConnectorErrorKind::InvalidRequest
+            },
+            "case {case}: {error}"
+        );
+        assert_eq!(lake.inventory(), before);
+    }
+    drop(plan);
+    assert!(
+        weak.upgrade().is_none(),
+        "read and split scopes must release content after their actual exit"
+    );
 }
