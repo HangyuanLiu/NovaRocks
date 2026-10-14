@@ -108,7 +108,7 @@ impl BackendRuntimeFilterFixture {
     }
 
     pub fn contribution_with_digest(&self, digest: [u8; 32]) -> RuntimeFilterContribution {
-        RuntimeFilterContribution::new(
+        RuntimeFilterContribution::from_shared(
             RuntimeFilterContributionKind::Membership,
             digest,
             self.membership_contribution.canonical_bytes().clone(),

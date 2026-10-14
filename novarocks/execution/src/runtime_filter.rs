@@ -340,7 +340,7 @@ pub enum RuntimeFilterContributionKind {
 pub struct RuntimeFilterContribution {
     kind: RuntimeFilterContributionKind,
     contract_digest: [u8; 32],
-    canonical_bytes: Arc<[u8]>,
+    canonical_bytes: CanonicalContributionBytes,
 }
 
 /// A frozen, fragment-local membership domain submitted through a final-domain
@@ -415,10 +415,20 @@ impl RuntimeFilterContribution {
         contract_digest: [u8; 32],
         canonical_bytes: impl Into<Arc<[u8]>>,
     ) -> Self {
+        Self::from_shared(kind, contract_digest, canonical_bytes.into().into())
+    }
+
+    /// Keep the complete immutable carrier through local/outbound/ingress
+    /// handoff. Canonical validation remains the installed reducer's concern.
+    pub fn from_shared(
+        kind: RuntimeFilterContributionKind,
+        contract_digest: [u8; 32],
+        canonical_bytes: CanonicalContributionBytes,
+    ) -> Self {
         Self {
             kind,
             contract_digest,
-            canonical_bytes: canonical_bytes.into(),
+            canonical_bytes,
         }
     }
 
@@ -426,7 +436,7 @@ impl RuntimeFilterContribution {
         self.kind
     }
 
-    pub const fn canonical_bytes(&self) -> &Arc<[u8]> {
+    pub const fn canonical_bytes(&self) -> &CanonicalContributionBytes {
         &self.canonical_bytes
     }
 

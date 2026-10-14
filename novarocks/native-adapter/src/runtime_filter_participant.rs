@@ -34,7 +34,6 @@ use novarocks_execution::runtime_filter::{
 };
 use novarocks_proto_codec::lifecycle::{QueryExecutionId, QueryTerminationReason};
 use novarocks_types::UniqueId;
-use prost::Message;
 
 use crate::{
     BackendDataRuntime,
@@ -43,7 +42,7 @@ use crate::{
         BackendNativeContributionRouteIdentity, BackendNativeDeliveryRouteIdentity,
         BackendNativeProducerInstanceRouteIdentity, BackendNativeRouteIdentity,
         BackendNativeRuntimeFilterEnvelope, BackendRuntimeFilterEnvelopeIngress,
-        encode_runtime_filter_envelope,
+        runtime_filter_envelope_encoded_len,
     },
     runtime_filter_transport::{
         BackendNativeRuntimeFilterTransportEnvelope, BackendRuntimeFilterEnvelopeSink,
@@ -455,7 +454,7 @@ impl RuntimeFilterParticipant {
             BackendEnvelopeKind::Contribution => {
                 participant_ingress::ProducerIngressCommand::Contribution {
                     schema_digest: *envelope.schema_digest(),
-                    payload: Arc::<[u8]>::from(envelope.payload()),
+                    payload: envelope.payload_carrier().clone_for_local_ingress(),
                 }
             }
             BackendEnvelopeKind::ProducerClosed => {
@@ -727,7 +726,7 @@ impl BackendParticipantOutbound {
         for route in decision.remote_routes() {
             let envelope =
                 self.delivery_envelope(&delivery, route.edge_id(), self.next_delivery_sequence())?;
-            self.submit_remote(route.clone(), envelope, binding_id);
+            self.submit_remote(route.clone(), envelope, binding_id)?;
         }
         Ok(())
     }
@@ -769,7 +768,7 @@ impl BackendParticipantOutbound {
         binding_id: novarocks_execution::runtime_filter::RuntimeFilterBindingId,
     ) -> Result<(), RuntimeFilterContractViolation> {
         for route in decision.remote_routes() {
-            self.submit_remote(route.clone(), envelope.clone(), binding_id);
+            self.submit_remote(route.clone(), envelope.clone(), binding_id)?;
         }
         Ok(())
     }
@@ -779,7 +778,7 @@ impl BackendParticipantOutbound {
         route: novarocks_worker::runtime_filter::domain::BackendRemoteRoute,
         envelope: BackendNativeRuntimeFilterEnvelope,
         binding_id: novarocks_execution::runtime_filter::RuntimeFilterBindingId,
-    ) {
+    ) -> Result<(), RuntimeFilterContractViolation> {
         self.drain_transport_completions();
         let identity = BackendTransportEventIdentity::new(
             BackendChannelIdentity::new(
@@ -789,7 +788,8 @@ impl BackendParticipantOutbound {
             ),
             route.edge_id(),
         );
-        let bytes = encode_runtime_filter_envelope(&envelope).encoded_len();
+        let bytes = runtime_filter_envelope_encoded_len(&envelope)
+            .map_err(|error| outbound_violation(error.to_string()))?;
         let route_identity = *envelope.route_identity();
         let Ok(envelope) = BackendNativeRuntimeFilterTransportEnvelope::new(
             Arc::new(envelope),
@@ -802,7 +802,7 @@ impl BackendParticipantOutbound {
                 ),
                 bytes,
             );
-            return;
+            return Ok(());
         };
         match self.transport_sink.try_send(route, envelope) {
             BackendRuntimeFilterSinkSubmitOutcome::Submitted => {
@@ -823,6 +823,7 @@ impl BackendParticipantOutbound {
                 );
             }
         }
+        Ok(())
     }
 
     fn transport_binding_id(

@@ -22,11 +22,12 @@ use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 use novarocks_execution::runtime_filter::{
-    LiveTerminal, PartitionId, ProducerSequence, RuntimeFilterBindingId, RuntimeFilterChannelId,
-    RuntimeFilterContribution, RuntimeFilterContributionKind, RuntimeFilterExecutionContract,
-    RuntimeFilterMembershipSchema, RuntimeFilterNullSemantics, RuntimeFilterProducerFailure,
-    RuntimeFilterProducerKind, RuntimeFilterProducerOpenRequest, RuntimeFilterSnapshot,
-    RuntimeFilterSubmitOutcome, SnapshotAcquireOutcome, UnavailableReason,
+    CanonicalContributionBytes, LiveTerminal, PartitionId, ProducerSequence,
+    RuntimeFilterBindingId, RuntimeFilterChannelId, RuntimeFilterContribution,
+    RuntimeFilterContributionKind, RuntimeFilterExecutionContract, RuntimeFilterMembershipSchema,
+    RuntimeFilterNullSemantics, RuntimeFilterProducerFailure, RuntimeFilterProducerKind,
+    RuntimeFilterProducerOpenRequest, RuntimeFilterSnapshot, RuntimeFilterSubmitOutcome,
+    SnapshotAcquireOutcome, UnavailableReason,
 };
 use novarocks_types::UniqueId;
 use sha2::{Digest, Sha256};
@@ -310,7 +311,7 @@ impl ProducerIngressRoute {
 pub enum ProducerIngressCommand {
     Contribution {
         schema_digest: [u8; 32],
-        payload: Arc<[u8]>,
+        payload: CanonicalContributionBytes,
     },
     Closed,
 }
@@ -388,7 +389,7 @@ pub fn dispatch_producer_frame(
             route.fragment_instance_id,
             route.partition,
             route.sequence,
-            RuntimeFilterContribution::new(
+            RuntimeFilterContribution::from_shared(
                 contribution_kind(channel_install.contract().kind()),
                 schema_digest,
                 payload,

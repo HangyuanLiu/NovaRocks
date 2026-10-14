@@ -165,6 +165,48 @@ fn ordered_topn_owned_canonical_bytes_use_original_codec_and_whole_aliases() {
 }
 
 #[test]
+fn ordered_topn_owned_contribution_clone_keeps_the_original_paid_payload() {
+    let tracker = MemTracker::new_root("ordered-contribution-shared-payload");
+    let host = OrderedTopNAllocationHost::new(tracker.clone());
+    let contract = RuntimeOrderContract::new([RuntimeOrderKey::new(DataType::Utf8)], [3; 32]);
+    let value = "x".repeat(4096);
+    let contribution = host
+        .ordered_contribution(
+            OrderedTupleRef::Single(Some(OrderedScalarRef::Utf8(&value))),
+            &contract,
+            8192,
+            &Control::pass(),
+        )
+        .unwrap();
+    assert_eq!(
+        contribution.kind(),
+        super::super::RuntimeFilterContributionKind::OrderedBound
+    );
+    assert_eq!(contribution.contract_digest(), contract.digest());
+    let held = tracker.current();
+    let local = contribution.clone();
+    let outbound = contribution.canonical_bytes().clone();
+    assert_eq!(
+        contribution.canonical_bytes().as_ptr(),
+        local.canonical_bytes().as_ptr()
+    );
+    assert_eq!(tracker.current(), held);
+    let legacy = super::super::RuntimeFilterContribution::new(
+        contribution.kind(),
+        contribution.contract_digest(),
+        Arc::<[u8]>::from(contribution.canonical_bytes().as_slice()),
+    );
+    assert_eq!(contribution, legacy);
+    assert_eq!(format!("{contribution:?}"), format!("{legacy:?}"));
+    drop(contribution);
+    drop(local);
+    drop(host);
+    assert_eq!(tracker.current(), held);
+    std::thread::spawn(move || drop(outbound)).join().unwrap();
+    assert_eq!(tracker.current(), 0);
+}
+
+#[test]
 fn ordered_topn_owned_real_limits_refuse_prefix_vector_and_late_holder_without_stock() {
     let text = "x".repeat(4096);
     let prefix = source_custody_prefix_facts().requests().bytes();

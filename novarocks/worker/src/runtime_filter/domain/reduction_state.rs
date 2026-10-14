@@ -533,7 +533,7 @@ mod tests {
             (BackendReductionApply::SequenceAdvancedEqual, None)
         );
 
-        let digest_mismatch = RuntimeFilterContribution::new(
+        let digest_mismatch = RuntimeFilterContribution::from_shared(
             RuntimeFilterContributionKind::TopKSummary,
             [0xF1; 32],
             first.canonical_bytes().clone(),

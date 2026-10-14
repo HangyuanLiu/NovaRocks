@@ -77,6 +77,11 @@ impl From<Vec<u8>> for CanonicalContributionBytes {
         Self::from(Arc::<[u8]>::from(bytes))
     }
 }
+impl From<Box<[u8]>> for CanonicalContributionBytes {
+    fn from(bytes: Box<[u8]>) -> Self {
+        Self::from(Arc::<[u8]>::from(bytes))
+    }
+}
 impl From<&[u8]> for CanonicalContributionBytes {
     fn from(bytes: &[u8]) -> Self {
         Self::from(Arc::<[u8]>::from(bytes))
@@ -85,6 +90,11 @@ impl From<&[u8]> for CanonicalContributionBytes {
 impl<const N: usize> From<[u8; N]> for CanonicalContributionBytes {
     fn from(bytes: [u8; N]) -> Self {
         Self::from(Arc::<[u8]>::from(bytes))
+    }
+}
+impl<const N: usize> From<&[u8; N]> for CanonicalContributionBytes {
+    fn from(bytes: &[u8; N]) -> Self {
+        Self::from(bytes.as_slice())
     }
 }
 impl AsRef<[u8]> for CanonicalContributionBytes {
@@ -227,6 +237,21 @@ impl OrderedTopNAllocationHost {
             Ok::<_, ControlledContributionCodecError>(bytes)
         })?;
         Ok(CanonicalContributionBytes(ByteStorage::Owned(owner)))
+    }
+
+    pub(crate) fn ordered_contribution(
+        &self,
+        tuple: OrderedTupleRef<'_>,
+        contract: &RuntimeOrderContract,
+        cap: usize,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<super::RuntimeFilterContribution, ControlledContributionCodecError> {
+        let bytes = self.encode_ordered_bound(tuple, contract, cap, control)?;
+        Ok(super::RuntimeFilterContribution::from_shared(
+            super::RuntimeFilterContributionKind::OrderedBound,
+            contract.digest(),
+            bytes,
+        ))
     }
 }
 
