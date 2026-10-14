@@ -20,30 +20,21 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-static EXCHANGE_SNAPSHOT_MARKERS_ENABLED: OnceLock<bool> = OnceLock::new();
-static EXCHANGE_SNAPSHOT_MARKER_COUNT: AtomicUsize = AtomicUsize::new(0);
-const MAX_EXCHANGE_SNAPSHOT_MARKERS: usize = 16_384;
-
-pub(crate) fn exchange_snapshot_markers_enabled() -> bool {
-    *EXCHANGE_SNAPSHOT_MARKERS_ENABLED.get_or_init(|| {
-        std::env::var("NOVAROCKS_SQL_TEST_EMIT_EXCHANGE_SNAPSHOT_MARKER")
-            .ok()
-            .is_some_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-    })
+/// A live, bounded test observation supplied by the exact application owner.
+/// This interface knows no action vocabulary and grants no authority itself.
+#[cfg(feature = "test-controls")]
+pub trait TestEventObserver: Send + Sync + std::fmt::Debug {
+    fn is_active(&self) -> bool;
+    fn observe(&self, event: &str);
 }
 
-pub(crate) fn emit_exchange_snapshot_marker(build: impl FnOnce() -> String) {
-    if !exchange_snapshot_markers_enabled() {
-        return;
-    }
-    let index = EXCHANGE_SNAPSHOT_MARKER_COUNT.fetch_add(1, Ordering::Relaxed);
-    if index < MAX_EXCHANGE_SNAPSHOT_MARKERS {
-        eprintln!("NOVAROCKS_EXCHANGE_SNAPSHOT {}", build());
+#[cfg(feature = "test-controls")]
+pub(crate) fn emit_exchange_snapshot_marker(
+    observer: Option<&dyn TestEventObserver>,
+    build: impl FnOnce() -> String,
+) {
+    if let Some(observer) = observer.filter(|observer| observer.is_active()) {
+        observer.observe(&format!("NOVAROCKS_EXCHANGE_SNAPSHOT {}", build()));
     }
 }
 
@@ -283,6 +274,8 @@ struct DecodedExchangePayload<'a> {
 #[derive(Default)]
 struct ReceiverState {
     expected_senders: usize,
+    #[cfg(feature = "test-controls")]
+    test_observer: Option<Arc<dyn TestEventObserver>>,
     expected: Option<ExpectedReceiverSchema>,
     sender_wire_meta: HashMap<ExchangeSenderIdentity, ExchangeWireMeta>,
     finished: HashSet<ExchangeSenderIdentity>,
@@ -331,6 +324,33 @@ fn get_or_create(registry: &ExecutionExchangeRegistry, key: ExchangeKey) -> Arc<
 /// Adds tombstones so late-arriving sender data is rejected, but does NOT
 /// wake any blocked waiters (none should exist on the success path).
 impl ExecutionExchangeRegistry {
+    #[cfg(feature = "test-controls")]
+    pub fn install_test_observer(
+        &self,
+        key: ExchangeKey,
+        observer: Arc<dyn TestEventObserver>,
+    ) -> Result<(), String> {
+        let receiver = self
+            .receivers
+            .lock()
+            .map_err(|_| "exchange registry lock failed")?
+            .get(&key)
+            .cloned()
+            .ok_or("test observer requires the exact registered receiver")?;
+        let mut state = receiver
+            .mu
+            .lock()
+            .map_err(|_| "exchange receiver lock failed")?;
+        if let Some(existing) = &state.test_observer {
+            if Arc::ptr_eq(existing, &observer) {
+                return Ok(());
+            }
+            return Err("exchange receiver already has another test observation".into());
+        }
+        state.test_observer = Some(observer);
+        Ok(())
+    }
+
     pub fn remove_fragment(&self, finst_id_hi: i64, finst_id_lo: i64) {
         let mut guard = self.receivers.lock().expect("exchange lock");
         let keys: Vec<ExchangeKey> = guard
@@ -663,7 +683,7 @@ impl ExecutionExchangeRegistry {
             }
             st.chunks.extend(chunks);
         }
-        let eos_snapshot = if eos {
+        if eos {
             st.finished.insert(sender);
             debug!(
                 "push_chunks: sender={} marked as FINISHED, total finished={}/{}",
@@ -671,25 +691,34 @@ impl ExecutionExchangeRegistry {
                 st.finished.len(),
                 st.expected_senders
             );
-            exchange_snapshot_markers_enabled().then(|| {
-                let mut finished = st.finished.iter().copied().collect::<Vec<_>>();
-                finished.sort_unstable();
-                let queued_rows = st.chunks.iter().map(Chunk::len).sum::<usize>();
-                (
-                    st.expected_senders,
-                    finished,
-                    st.chunks.len(),
-                    queued_rows,
-                    r.observable.generation(),
-                )
-            })
+        }
+        #[cfg(feature = "test-controls")]
+        let eos_snapshot = if eos {
+            st.test_observer
+                .clone()
+                .filter(|observer| observer.is_active())
+                .map(|observer| {
+                    let mut finished = st.finished.iter().copied().collect::<Vec<_>>();
+                    finished.sort_unstable();
+                    let queued_rows = st.chunks.iter().map(Chunk::len).sum::<usize>();
+                    (
+                        observer,
+                        st.expected_senders,
+                        finished,
+                        st.chunks.len(),
+                        queued_rows,
+                        r.observable.generation(),
+                    )
+                })
         } else {
             None
         };
         r.cv.notify_all();
         drop(st);
         let hold_time = hold_start.elapsed();
+        #[cfg(feature = "test-controls")]
         if let Some((
+            observer,
             expected_senders,
             finished,
             queued_chunks,
@@ -697,7 +726,7 @@ impl ExecutionExchangeRegistry {
             receiver_generation_before_notify,
         )) = eos_snapshot
         {
-            emit_exchange_snapshot_marker(|| {
+            emit_exchange_snapshot_marker(Some(observer.as_ref()), || {
                 format!(
                     "event=push_eos finst={} node_id={} sender={} expected_senders={} finished_senders={:?} queued_chunks={} queued_rows={} receiver_generation_before_notify={}",
                     key.finst_uuid(),

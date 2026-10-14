@@ -40,7 +40,6 @@ use crate::{
     backend_announce::BackendAnnounceSupervisor, backend_heartbeat::BackendHeartbeatResponder,
     backend_readiness::wait_for_backend_native_endpoint_ready,
     runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress, task_protocol::TaskExecutionIngress,
-    task_protocol_fault::RestartAfterEstablishTaskCreationGate,
 };
 use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
 use novarocks_execution::runtime::fragment::io::{
@@ -82,6 +81,8 @@ const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const TASK_DEADLINE_TICK_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct BackendServerConfig {
+    #[cfg(feature = "test-controls")]
+    pub test_session: Option<crate::backend_test_session::BackendTestSessionConfig>,
     pub bind_host: String,
     pub grpc_port: u16,
     pub control_grpc_port: u16,
@@ -259,6 +260,8 @@ impl fmt::Display for BackendApplicationError {
 impl std::error::Error for BackendApplicationError {}
 
 pub struct BackendApplicationHost {
+    #[cfg(feature = "test-controls")]
+    test_session: Option<crate::backend_test_session::BackendTestSession>,
     ready_marker: String,
     grpc_server: NativeRpcServerHandle,
     control_grpc_server: NativeRpcServerHandle,
@@ -446,6 +449,9 @@ fn compose_backend_application_services(
     catalog_manager_config: CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
     static_plan_interpreter: BackendStaticPlanInterpreter,
+    #[cfg(feature = "test-controls")] test_session: Option<
+        &crate::backend_test_session::BackendTestSession,
+    >,
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
     let BackendExecutionRuntimeInput {
         config: execution_runtime_config,
@@ -490,14 +496,25 @@ fn compose_backend_application_services(
     // One task protocol owner per process, on this process's own identity and
     // its monotonic clock, routed to the real execution owners.
     let runtime_filter_factory = NativeRuntimeFilterParticipantFactory::new(data_runtime.clone());
-    let context_host = Arc::new(crate::backend_task_execution::NativeQueryContextHost::new(
+    let context_host = crate::backend_task_execution::NativeQueryContextHost::new(
         Arc::clone(&catalog_manager),
         Arc::clone(&execution_role_binding_factories),
         Arc::new(move |execution_id, contribution| {
             runtime_filter_factory.install(execution_id, contribution)
         }),
         data_runtime.clone(),
-    ));
+    );
+    #[cfg(feature = "test-controls")]
+    let context_host = match test_session {
+        Some(session) => context_host.with_test_controls(Some(session.native.clone())),
+        None => context_host,
+    };
+    #[cfg(feature = "test-controls")]
+    let context_host = match test_session.and_then(|session| session.observation.as_ref()) {
+        Some(observation) => context_host.with_observation_controls(Some(observation.clone())),
+        None => context_host,
+    };
+    let context_host = Arc::new(context_host);
     let inbound_capabilities =
         novarocks_worker::TaskInboundCapabilities::with_capacity_limits(inbound_capability_limits);
     let root_producer_pool = RootProducerPool::try_new(
@@ -544,15 +561,29 @@ fn compose_backend_application_services(
             admission,
         }) => (Some(compiler), Some(admission)),
     };
-    let execution_host = crate::backend_task_execution::NativeTaskExecutionHost::new(
+    let queries =
         novarocks_native_adapter::native_fragment_query::NativeFragmentQueryRuntime::global(
             Arc::clone(&memory_authority),
-        ),
+        );
+    #[cfg(feature = "test-controls")]
+    let queries = match test_session {
+        Some(session) => queries.with_test_controls(Some(session.native.clone())),
+        None => queries,
+    };
+    #[cfg(feature = "test-controls")]
+    let queries = match test_session.and_then(|session| session.observation.as_ref()) {
+        Some(observation) => queries.with_observation_controls(Some(observation.clone())),
+        None => queries,
+    };
+    let execution_host = crate::backend_task_execution::NativeTaskExecutionHost::new(
+        queries,
         Arc::clone(&context_host) as Arc<dyn crate::backend_task_execution::TaskQueryContextFacts>,
         Arc::clone(&inbound_capabilities),
         novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
             data_runtime.clone(),
             Duration::from_millis(execution_runtime.config().exchange_wait_ms),
+            #[cfg(feature = "test-controls")]
+            test_session.and_then(|session| session.observation.clone()),
         ),
         native_result_writer(
             Arc::clone(&result_retained_budget),
@@ -569,18 +600,37 @@ fn compose_backend_application_services(
         scan_stream_host,
         Arc::clone(&task_completion_supervisor),
     );
+    #[cfg(feature = "test-controls")]
+    let execution_host = match test_session {
+        Some(session) => execution_host.with_test_controls(session.native.clone()),
+        None => execution_host,
+    };
     let execution_host = Arc::new(match compiled_package_compiler {
         None => execution_host,
         Some(compiler) => execution_host.with_compiled_package_compiler(compiler),
     });
+    let task_creation_gate: Arc<dyn novarocks_worker::TaskCreationGate> =
+        Arc::new(novarocks_worker::NoopTaskCreationGate);
+    #[cfg(feature = "test-controls")]
+    let task_creation_gate = match test_session {
+        Some(session) => Arc::new(
+            crate::task_protocol_fault::RestartAfterEstablishTaskCreationGate(
+                session.native.clone(),
+            ),
+        ) as Arc<dyn novarocks_worker::TaskCreationGate>,
+        None => task_creation_gate,
+    };
     let task_execution_registry = TaskExecutionRegistry::with_process_clock_and_task_creation_gate(
         task_execution_registry_config,
         Arc::clone(&context_host) as Arc<dyn QueryContextHost>,
         execution_host,
-        backend_task_execution_ports(),
-        Arc::new(RestartAfterEstablishTaskCreationGate),
+        backend_task_execution_ports(
+            #[cfg(feature = "test-controls")]
+            test_session.and_then(|session| session.observation.clone()),
+        ),
+        task_creation_gate,
     );
-    let task_execution_ingress: Arc<dyn TaskExecutionIngress> = match static_package_admission {
+    let task_execution_ingress = match static_package_admission {
         None => RegistryTaskExecutionIngress::new(
             Arc::clone(&task_execution_registry),
             native_compatibility_id,
@@ -591,6 +641,22 @@ fn compose_backend_application_services(
             admission,
         ),
     };
+    #[cfg(feature = "test-controls")]
+    if let Some(session) = test_session {
+        task_execution_ingress
+            .install_test_controls(session.native.clone())
+            .map_err(|error| {
+                BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
+            })?;
+        if let Some(observation) = &session.observation {
+            task_execution_ingress
+                .install_observation_controls(observation.clone())
+                .map_err(|error| {
+                    BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
+                })?;
+        }
+    }
+    let task_execution_ingress: Arc<dyn TaskExecutionIngress> = task_execution_ingress;
     Ok(BackendApplicationServices {
         backend_process_id,
         drain,
@@ -694,6 +760,11 @@ impl BackendApplicationHost {
     }
 
     pub fn shutdown(mut self) -> Result<(), BackendApplicationError> {
+        #[cfg(feature = "test-controls")]
+        let controls_result = self
+            .test_session
+            .as_mut()
+            .map_or(Ok(()), |session| session.close_and_join());
         self.announce_task.stop();
         self.task_deadline_tick.stop();
         // Close ingress before draining drivers, so no CreateTask can
@@ -706,6 +777,8 @@ impl BackendApplicationHost {
         // Completion of this join does not free pool backings; their owner is
         // still retained here until Host destruction.
         let producer_result = self.root_producer_pool.shutdown();
+        #[cfg(feature = "test-controls")]
+        let producer_result = combine_shutdown_results(controls_result, producer_result);
         let execution_result = self.execution_runtime.shutdown_driver_execution();
         // Driver shutdown publishes every actual-stop fact. Only after that
         // may the fixed completion owner drain its exact slots and return.
@@ -730,6 +803,8 @@ impl BackendApplicationHost {
         readiness_timeout: Duration,
     ) -> Result<Self, BackendApplicationError> {
         let BackendServerConfig {
+            #[cfg(feature = "test-controls")]
+            test_session,
             bind_host,
             grpc_port,
             control_grpc_port,
@@ -884,6 +959,14 @@ impl BackendApplicationHost {
                     format!("compose Native channel cache: {error}"),
                 )
             })?;
+        #[cfg(feature = "test-controls")]
+        let test_session = test_session
+            .as_ref()
+            .map(|config| config.bind(backend_process_id))
+            .transpose()
+            .map_err(|error| {
+                BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
+            })?;
         let readiness_runtime = data_runtime.clone();
         let services = compose_backend_application_services(
             data_runtime,
@@ -904,6 +987,8 @@ impl BackendApplicationHost {
             catalog_manager_config,
             &execution_role_binding_factories,
             static_plan_interpreter,
+            #[cfg(feature = "test-controls")]
+            test_session.as_ref(),
         )?;
         let process_descriptor = BackendProcessDescriptor::try_new(
             services.backend_process_id,
@@ -997,8 +1082,18 @@ impl BackendApplicationHost {
         let runtime_filter_authority: Arc<
             dyn crate::runtime_filter_ingress::BackendRuntimeFilterParticipantAuthority,
         > = services.query_context_host.clone();
-        let runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress> =
+        let runtime_filter_ingress =
             native_runtime_filter_envelope_ingress(runtime_filter_authority);
+        #[cfg(feature = "test-controls")]
+        if let Some(session) = &test_session {
+            runtime_filter_ingress
+                .install_test_controls(session.native.clone())
+                .map_err(|error| {
+                    BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
+                })?;
+        }
+        let runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress> =
+            runtime_filter_ingress;
         let admission_epoch: Arc<dyn WorkerAdmissionEpochAuthority> =
             services.task_execution_registry.clone();
         let control_queue_capacity = native_ingress
@@ -1031,6 +1126,11 @@ impl BackendApplicationHost {
             ),
             control_executor,
         );
+        #[cfg(feature = "test-controls")]
+        let service = match &test_session {
+            Some(session) => service.with_test_controls(session.native.clone()),
+            None => service,
+        };
         let mut grpc_server = match NativeRpcServerHandle::start_with_admission(
             &bind_host,
             grpc_port,
@@ -1134,6 +1234,8 @@ impl BackendApplicationHost {
         );
 
         Ok(Self {
+            #[cfg(feature = "test-controls")]
+            test_session,
             ready_marker: format!(
                 "NOVAROCKS_READY role=be grpc_port={grpc_port} control_grpc_port={control_grpc_port} advertise_host={} pid={}",
                 advertise_endpoint.host,
@@ -1206,6 +1308,7 @@ mod tests {
         CompiledStaticPlan, QueryContextRef, UnroutedQueryContextHost, UnroutedTaskExecutionHost,
         combine_primary_and_shutdown, compose_backend_application_services,
     };
+    use crate::runtime_filter_rpc::BackendRuntimeFilterEnvelopeIngress;
     use novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet;
     use novarocks_execution::runtime::execution_runtime::ExecutionRuntimeConfig;
     use novarocks_native_adapter::backend_test_support::test_backend_native_trust;
@@ -1290,7 +1393,10 @@ mod tests {
             Arc::clone(&clock) as Arc<dyn WorkerMonotonicClock>,
             Arc::new(UnroutedQueryContextHost),
             Arc::new(UnroutedTaskExecutionHost),
-            novarocks_native_adapter::task_execution_observation::backend_task_execution_ports(),
+            novarocks_native_adapter::task_execution_observation::backend_task_execution_ports(
+                #[cfg(feature = "test-controls")]
+                None,
+            ),
         );
         let context = QueryContextRef::new(
             QueryExecutionId::new(
@@ -1348,6 +1454,8 @@ mod tests {
     fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         let control_grpc_port = unused_port();
         BackendServerConfig {
+            #[cfg(feature = "test-controls")]
+            test_session: None,
             memory_authority: novarocks_native_adapter::backend_test_support::test_memory_authority(
             ),
             bind_host: "127.0.0.1".to_string(),
@@ -1494,6 +1602,8 @@ mod tests {
             CatalogManagerConfig::default(),
             &[],
             BackendStaticPlanInterpreter::PlanTree,
+            #[cfg(feature = "test-controls")]
+            None,
         )
         .expect("compose backend application services");
 
@@ -1980,6 +2090,8 @@ mod tests {
             CatalogManagerConfig::default(),
             &[],
             BackendStaticPlanInterpreter::CompiledPackage(plan),
+            #[cfg(feature = "test-controls")]
+            None,
         )
         .expect("compose compiled-package backend services");
 

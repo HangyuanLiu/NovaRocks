@@ -277,6 +277,25 @@ impl FixtureHandle {
         })
     }
 
+    pub(crate) fn shutdown(&mut self) -> Result<()> {
+        let mut failures = Vec::new();
+        if let Some(shutdown) = self.shutdown.take() {
+            if shutdown.send(()).is_err() {
+                failures.push("publication fixture exited before its shutdown request");
+            }
+        }
+        if let Some(thread) = self.thread.take() {
+            if thread.join().is_err() {
+                failures.push("publication fixture owner panicked during actual join");
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(failures.join("; "))
+        }
+    }
+
     pub(crate) fn uri(&self) -> &str {
         &self.uri
     }
@@ -501,11 +520,8 @@ impl Drop for FixtureFaultGuard {
 
 impl Drop for FixtureHandle {
     fn drop(&mut self) {
-        if let Some(shutdown) = self.shutdown.take() {
-            let _ = shutdown.send(());
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Err(error) = self.shutdown() {
+            eprintln!("publication fixture cleanup failed: {error:#}");
         }
     }
 }

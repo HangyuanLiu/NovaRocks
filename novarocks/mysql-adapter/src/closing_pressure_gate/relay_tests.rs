@@ -41,11 +41,58 @@ struct Fixture {
     _session: QuerySessionLease,
     protocol: Option<GovernedProtocolOwner>,
     owner: Arc<PressureOwner>,
-    controller: PressureController,
+    controller: FixtureController,
     hook: PressureRelayHook,
+}
+// The component keeps either the existing kernel owner or the original authorized fixture.
+// This is a test-local composition seam, never a second production controller.
+enum FixtureController {
+    Kernel(PressureController),
+    Authorized(crate::closing_pressure_fixture::ClosingPressureFixture),
+}
+impl FixtureController {
+    fn snapshot(&self, slot: usize) -> io::Result<SlotSnapshot> {
+        match self {
+            Self::Kernel(owner) => owner.snapshot(slot),
+            Self::Authorized(owner) => owner.snapshot(slot),
+        }
+    }
+    fn release(&mut self, slot: usize) -> io::Result<()> {
+        match self {
+            Self::Kernel(owner) => owner.release(slot),
+            Self::Authorized(owner) => owner.release(slot),
+        }
+    }
+    fn stop(&mut self) {
+        match self {
+            Self::Kernel(owner) => owner.stop(),
+            Self::Authorized(owner) => owner.stop(),
+        }
+    }
+    fn inspect_after_original_join(&mut self) -> io::Result<()> {
+        match self {
+            Self::Kernel(owner) => owner.inspect_after_original_join(),
+            Self::Authorized(owner) => owner
+                .finish_after_original_listener_join()
+                .map_err(io::Error::other),
+        }
+    }
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_authorization(
+            None,
+            FrontendProcessId::new_v7(),
+            Instant::now() + Duration::from_secs(20),
+        )
+        .await
+        .unwrap()
+    }
+    async fn with_authorization(
+        authorization: Option<crate::test_fixture_authorization::MysqlFixtureAuthorization>,
+        fe: FrontendProcessId,
+        original_deadline: Instant,
+    ) -> io::Result<Self> {
         let host = WorkloadControl::try_new_counted(WorkloadConfig::default())
             .unwrap()
             .owner;
@@ -71,21 +118,38 @@ impl Fixture {
             .unwrap();
         let protocol = GovernedProtocolOwner::new(statement);
         let actual_statement = protocol.statement_token().unwrap();
-        let fe = FrontendProcessId::new_v7();
-        let (owner, mut controller) =
-            PressureOwner::new(fe, Instant::now() + Duration::from_secs(20)).unwrap();
-        let owner = Arc::new(owner);
         // Unused entries exercise finite geometry only: they are NOT sixty-four real statements.
         let targets = std::array::from_fn(|i| ArmInput {
             handshake_connection_id: 100 + i as u32,
             original_sql_sha256: ORIGINAL_SQL_SHA256,
         });
-        controller.arm_targets(fe, targets).unwrap();
+        let (owner, controller) = match authorization {
+            None => {
+                let (owner, mut controller) = PressureOwner::new(fe, original_deadline)?;
+                controller.arm_targets(fe, targets)?;
+                (Arc::new(owner), FixtureController::Kernel(controller))
+            }
+            Some(authorization) => {
+                let mut fixture =
+                    crate::closing_pressure_fixture::ClosingPressureFixture::bind_authorized(
+                        authorization,
+                        fe,
+                        host.observation(),
+                    )
+                    .map_err(io::Error::other)?;
+                let binding = fixture.listener_binding().map_err(io::Error::other)?;
+                fixture.arm_targets(fe, targets)?;
+                (
+                    Arc::clone(&binding.owner),
+                    FixtureController::Authorized(fixture),
+                )
+            }
+        };
         let hook = owner
             .bind_relay(connection, actual_statement, ORIGINAL_SQL_SHA256)
             .unwrap()
             .unwrap();
-        Self {
+        Ok(Self {
             _host: host,
             capacity,
             control,
@@ -94,7 +158,7 @@ impl Fixture {
             owner,
             controller,
             hook,
-        }
+        })
     }
     fn framer(&self) -> Framer {
         OwnedStreamingMysqlWriter::new(
@@ -620,4 +684,259 @@ async fn cancelled_borrowed_same_carrier_invalidates_hold_before_writer_and_gran
         fixture.controller.snapshot(0).unwrap().failure,
         Some(Failure::Transition)
     );
+}
+
+#[tokio::test]
+async fn scoped_fe_authorization_hits_real_governed_closing_and_end_waits_for_actual_tail_exit()
+-> io::Result<()> {
+    use crate::test_fixture_authorization::MysqlFixtureAuthorization;
+    use novarocks_failpoint::{
+        liveness::{PreparedRoleSession, RunnerSession},
+        scope::ProcessBinding,
+        session::{DECLARATION_VERSION, DomainGrant, SessionDeclaration, SessionRole},
+    };
+    use std::os::unix::fs::DirBuilderExt;
+    #[derive(Debug)]
+    struct OwnedErrors(Vec<io::Error>);
+    impl std::fmt::Display for OwnedErrors {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "scoped real Closing owner failures: {}", self.0.len())
+        }
+    }
+    impl std::error::Error for OwnedErrors {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.0.first().map(|e| e as _)
+        }
+    }
+    struct OriginalPanic(std::sync::Mutex<Box<dyn std::any::Any + Send>>);
+    impl std::fmt::Debug for OriginalPanic {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            let _retained = &self.0;
+            f.write_str("OriginalScopedClosingPanic { payload_retained: true }")
+        }
+    }
+    impl std::fmt::Display for OriginalPanic {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::fmt::Debug::fmt(self, f)
+        }
+    }
+    impl std::error::Error for OriginalPanic {}
+    let original_deadline = Instant::now() + Duration::from_secs(10);
+    let frontend = FrontendProcessId::new_v7();
+    let root = std::path::PathBuf::from(format!("/tmp/nr-real-closing-{}", frontend));
+    std::fs::DirBuilder::new().mode(0o700).create(&root)?;
+    let socket = root.join("pressure.sock");
+    let path = root.join("declaration.json");
+    let declaration = SessionDeclaration {
+        schema_version: DECLARATION_VERSION,
+        session_id: "real-closing-session".into(),
+        launch_id: "real-closing-launch".into(),
+        role: SessionRole::Fe,
+        lifetime_millis: 10_000,
+        liveness_socket: root.join("live.sock"),
+        handshake_secret: "abcdefghijklmnopqrstuvwxyz0123456789".into(),
+        domain_grants: vec![DomainGrant {
+            domain: MysqlFixtureAuthorization::DOMAIN.into(),
+            grant_id: "closing-once".into(),
+            parameters: serde_json::json!({"action":"closing-pressure", "socket":socket, "nonce_hex":"01010101010101010101010101010101"}),
+        }],
+    };
+    declaration.write_private(&path)?;
+    let prepared = PreparedRoleSession::read_and_claim(&path, SessionRole::Fe)?;
+    let mut runner = RunnerSession::start_until(declaration, original_deadline)?;
+    let mut role = match prepared.bind(ProcessBinding::Frontend(frontend)) {
+        Ok(role) => role,
+        Err(primary) => {
+            let mut failures = vec![primary];
+            if let Err(error) = runner.end_and_join() {
+                failures.push(error);
+            }
+            return Err(io::Error::other(OwnedErrors(failures)));
+        }
+    };
+    let scope = role.scope().clone();
+    let mut fixture_owner = None;
+    let mut closing_owner = None;
+    let mut original_stop_error = None;
+    let primary = {
+        let body = async {
+            assert!(MysqlFixtureAuthorization::from_grants(Vec::new())?.is_none());
+            assert!(!socket.exists());
+            let authorization = MysqlFixtureAuthorization::from_grants(
+                scope.grants_for(MysqlFixtureAuthorization::DOMAIN),
+            )?
+            .unwrap();
+            fixture_owner = Some(
+                Fixture::with_authorization(Some(authorization), frontend, original_deadline)
+                    .await?,
+            );
+            let fixture = fixture_owner.as_mut().unwrap();
+            let FixtureController::Authorized(original_fixture) = &fixture.controller else {
+                unreachable!()
+            };
+            let cancellation = original_fixture.control_cancellation().unwrap();
+            assert!(cancellation.deadline() <= original_deadline);
+            assert!(socket.exists());
+            let mut writer = fixture.framer();
+            let actual = fixture.real_rows_cut(&mut writer).await?;
+            assert_eq!(
+                scope
+                    .observations()
+                    .iter()
+                    .filter(|o| o.event == "hit")
+                    .count(),
+                0,
+                "Rows do not credit Closing"
+            );
+            closing_owner = Some(fixture.closing(writer));
+            assert_eq!(fixture.capacity.snapshot().held_positions, [0, 0, 0, 1]);
+            let original_error = {
+                let closing = closing_owner.as_mut().unwrap();
+                let work =
+                    tokio::time::timeout(crate::relay_result_writer::CLOSING_DEADLINE, async {
+                        fixture.hook.scope.observe_installed_closing(
+                            fixture.hook.statement,
+                            actual,
+                            closing,
+                        )?;
+                        let original = closing.writer_mut().finish();
+                        tokio::pin!(original);
+                        paired_finish(&fixture.hook.scope, original).await
+                    });
+                tokio::pin!(work);
+                assert!(first_poll(work.as_mut()).await.is_pending());
+                let facts = fixture.controller.snapshot(0)?;
+                assert!(
+                    facts.real_closing_observed
+                        && facts.paired_closing_polls > 0
+                        && facts.closing_write_blocked
+                );
+                assert!(!facts.writer_destructor_returned);
+                assert_eq!(
+                    scope
+                        .observations()
+                        .iter()
+                        .filter(|o| o.event == "hit")
+                        .count(),
+                    1
+                );
+                assert_eq!(fixture.capacity.snapshot().held_positions, [0, 0, 0, 1]);
+                runner.end_and_join()?;
+                cancellation.cancelled().await;
+                assert!(!cancellation.is_active());
+                // The original role owner explicitly stops its fixture on scope closure.
+                // Scope closure alone does not settle the still-live protocol/Closing grant.
+                fixture.controller.stop();
+                assert_eq!(fixture.capacity.snapshot().held_positions, [0, 0, 0, 1]);
+                let result = work.await.map_err(|_| error(Failure::Deadline))?;
+                match result {
+                    Err(original) => original,
+                    Ok(original_writer) => {
+                        drop(original_writer);
+                        return Err(io::Error::other(
+                            "stopped original Closing unexpectedly completed",
+                        ));
+                    }
+                }
+            };
+            assert_eq!(original_error.kind(), io::ErrorKind::Interrupted);
+            eprintln!(
+                "expected original scoped Closing stop retained: kind={:?}",
+                original_error.kind()
+            );
+            original_stop_error = Some(original_error);
+            assert!(fixture.controller.snapshot(0)?.writer_destructor_returned);
+            // The physical writer has exited, but the original outer tail still owns capacity and generation.
+            assert_eq!(fixture.capacity.snapshot().held_positions, [0, 0, 0, 1]);
+            assert!(matches!(
+                fixture.control.begin_statement(fixture._session.token()),
+                Err(novarocks_query_application::session_control::QueryControlError::StatementBusy)
+            ));
+            drop(closing_owner.take());
+            assert_eq!(fixture.capacity.snapshot().held_positions, [0; 4]);
+            assert!(
+                fixture
+                    .control
+                    .begin_statement(fixture._session.token())
+                    .is_ok()
+            );
+            Ok::<_, io::Error>(())
+        };
+        tokio::pin!(body);
+        poll_fn(|cx| {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body.as_mut().poll(cx)))
+            {
+                Ok(poll) => poll,
+                Err(original) => Poll::Ready(Err(io::Error::other(OriginalPanic(
+                    std::sync::Mutex::new(original),
+                )))),
+            }
+        })
+        .await
+    };
+    let mut failures = Vec::new();
+    if let Err(error) = primary {
+        failures.push(error);
+    }
+    // Every original borrowed work future has left scope before physical tail cleanup.
+    drop(closing_owner.take());
+    if let Some(fixture) = fixture_owner.as_mut() {
+        fixture.controller.stop();
+        if fixture.capacity.snapshot().held_positions != [0; 4] {
+            failures.push(io::Error::other(
+                "Closing capacity survived actual owner cleanup",
+            ));
+        }
+        if let FixtureController::Authorized(owner) = &mut fixture.controller {
+            if let Err(error) = owner.close_control() {
+                failures.push(io::Error::other(error));
+            }
+        }
+    }
+    if let Err(error) = runner.end_and_join() {
+        failures.push(error);
+    }
+    scope.wait_closed();
+    if let Err(error) = role.close_and_join() {
+        failures.push(error);
+    }
+    drop(fixture_owner);
+    for event in ["claimed", "hit", "claim-released"] {
+        if scope
+            .observations()
+            .iter()
+            .filter(|o| o.event == event)
+            .count()
+            != 1
+        {
+            failures.push(io::Error::other(format!(
+                "real Closing did not record exactly one {event}"
+            )));
+        }
+    }
+    if socket.exists() || root.join("live.sock").exists() {
+        failures.push(io::Error::other(
+            "original real Closing owner socket remained",
+        ));
+    }
+    for artifact in [
+        runner.process_receipt_path().to_path_buf(),
+        path.with_extension("claimed"),
+        path,
+    ] {
+        if let Err(error) = std::fs::remove_file(artifact) {
+            failures.push(error);
+        }
+    }
+    if let Err(error) = std::fs::remove_dir(root) {
+        failures.push(error);
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        if let Some(original) = original_stop_error {
+            failures.push(original);
+        }
+        Err(io::Error::other(OwnedErrors(failures)))
+    }
 }

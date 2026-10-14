@@ -15,6 +15,8 @@ use novarocks_mv_application::readiness::{
     MvCurrentProjectionSource, MvDropReadiness, MvProjectionDeleteGuard, MvProjectionError,
     MvProjectionInstallOutcome, MvReadOnlyCurrentProjectionSource, MvReadinessService,
 };
+#[cfg(feature = "test-controls")]
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::mv::activity::canonical_mv_target;
@@ -41,6 +43,8 @@ use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 pub struct MvReadinessPort {
     service: MvReadinessService,
     handle: tokio::runtime::Handle,
+    #[cfg(feature = "test-controls")]
+    controls: Option<Arc<crate::mv::test_controls::MvTestControls>>,
 }
 
 pub(crate) struct MvLocalProjectionInventory {
@@ -113,7 +117,33 @@ impl MvReadinessPort {
         service: MvReadinessService,
         handle: tokio::runtime::Handle,
     ) -> Self {
-        Self { service, handle }
+        Self {
+            service,
+            handle,
+            #[cfg(feature = "test-controls")]
+            controls: None,
+        }
+    }
+
+    #[cfg(feature = "test-controls")]
+    pub(crate) fn with_test_controls(
+        mut self,
+        controls: Arc<crate::mv::test_controls::MvTestControls>,
+    ) -> Self {
+        self.controls = Some(controls);
+        self
+    }
+
+    #[cfg(feature = "test-controls")]
+    pub(crate) fn test_controls(&self) -> Option<&crate::mv::test_controls::MvTestControls> {
+        self.controls.as_deref()
+    }
+
+    #[cfg(feature = "test-controls")]
+    pub(crate) fn test_controls_owner(
+        &self,
+    ) -> Option<Arc<crate::mv::test_controls::MvTestControls>> {
+        self.controls.clone()
     }
 
     /// Construct the separate query inventory from the same product-owned
@@ -329,30 +359,36 @@ impl MvReadinessPort {
     /// Reject the test/harness-only whole-family Accelerator wipe while this
     /// FE owns any publication. A wipe has no distributed coordination role;
     /// the runner immediately restarts this FE after the wipe succeeds.
+    #[cfg(feature = "test-controls")]
     pub(crate) fn ensure_no_active_publications(&self) -> Result<(), MvRepositoryError> {
         self.service.ensure_no_active_publications()
     }
 
-    /// Test/harness-only wipe of the whole current Accelerator family.
-    ///
-    /// Process readiness is deliberately left untouched: the wipe procedure's
-    /// contract is that the runner restarts this FE immediately afterwards, and
-    /// startup observation is the only permitted rebuild path.
-    pub(crate) fn wipe_accelerator(&self, operation_id: Uuid) -> Result<(), MvProjectionError> {
-        self.block_on(self.service.wipe_accelerator(operation_id))
-    }
-
-    /// Test/harness-only wipe of one target's rebuildable projection, used by
-    /// the stateless-rebuild round-trip to prove the lake alone can restore it.
-    pub(crate) fn wipe_projection(
+    // Design: ADR-0174 (docs/adr/ADR-0174-test-capabilities-and-finite-role-authorization.md)
+    /// Permanently stop MV admission and join the existing product workers
+    /// before the authorized whole-family wipe. The caller must stop/reap this
+    /// FE immediately; this operation cannot resume its old MV runtime.
+    #[cfg(feature = "test-controls")]
+    pub(crate) fn wipe_accelerator_for_test(
         &self,
+        product: &novarocks_mv_application::service::MvProductService,
         operation_id: Uuid,
-        target: &MvTarget,
-    ) -> Result<bool, MvProjectionError> {
-        self.block_on(
-            self.service
-                .wipe_projection(operation_id, &canonical_mv_target(target)),
-        )
+        claim: &mut novarocks_failpoint::scope::ActionClaim,
+    ) -> Result<(), String> {
+        if !claim.cancellation().is_active() {
+            return Err("MV wipe authorization expired before stopping".into());
+        }
+        product.begin_stopping();
+        self.block_on(product.shutdown_background_workers_until(claim.cancellation().deadline()))
+            .map_err(|error| format!("stop MV background work before wipe: {error}"))?;
+        self.ensure_no_active_publications()
+            .map_err(|error| error.to_string())?;
+        if !claim.cancellation().is_active() {
+            return Err("MV wipe authorization expired before destructive action".into());
+        }
+        self.block_on(self.service.wipe_accelerator(operation_id))
+            .map_err(|error| format!("wipe MV Accelerator family: {error}"))?;
+        claim.record_hit().map_err(|error| error.to_string())
     }
 }
 
@@ -389,4 +425,171 @@ fn canonical_target(package: &MvLakePackageObservation) -> CanonicalMvTarget {
         &package.table.namespace,
         &package.table.table,
     )
+}
+
+#[cfg(all(test, unix, feature = "test-controls"))]
+mod controlled_wipe_tests {
+    use super::*;
+    use crate::mv::test_controls::tests::{TestSession, wipe_grant};
+    use novarocks_failpoint::session::SessionRole;
+    use novarocks_mv_application::{
+        activity::{MvActivityGateError, MvActivityOwner},
+        process_runtime::{MvBackgroundRuntime, ProcessRuntime},
+        product::MvTarget,
+        repository::MvRepository,
+        scheduler::MvSchedulerConfig,
+        service::MvProductService,
+        test_repository::InMemoryMvRepository,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    async fn product_and_port() -> (MvProductService, MvReadinessPort, Arc<InMemoryMvRepository>) {
+        let repository = Arc::new(InMemoryMvRepository::default());
+        repository
+            .create_projection(
+                Uuid::now_v7(),
+                novarocks_mv_application::persistence::test_support::sample_projection(
+                    MvTarget::from_parts(Some("ice"), "sales", "orders"),
+                    Some(7),
+                )
+                .into(),
+            )
+            .await
+            .unwrap();
+        let product = MvProductService::new_with_readiness_runtime(
+            MvSchedulerConfig::default(),
+            repository.clone(),
+            Arc::<ProcessRuntime<MvTarget, novarocks_spi::connector::LakePublicationId>>::default(),
+        );
+        let port = MvReadinessPort::from_product(
+            product.readiness_service().unwrap(),
+            tokio::runtime::Handle::current(),
+        );
+        (product, port, repository)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_actual_exit_precedes_wipe_and_old_admission_stays_stopped() {
+        let session = TestSession::new(vec![wipe_grant()], SessionRole::Fe, 3000);
+        let controls = session.controls().unwrap();
+        let mut claim = controls
+            .claim_call("ice", "sales", "orders", "wipe")
+            .unwrap();
+        let (product, port, repository) = product_and_port().await;
+        let (refresh_stop_tx, refresh_stop_rx) = mpsc::channel();
+        let (maintenance_stop_tx, maintenance_stop_rx) = mpsc::channel();
+        let (wakeup_tx, _wakeup_rx) = mpsc::sync_channel(1);
+        let refresh_exited = Arc::new(AtomicBool::new(false));
+        let maintenance_exited = Arc::new(AtomicBool::new(false));
+        let refresh_fact = refresh_exited.clone();
+        let maintenance_fact = maintenance_exited.clone();
+        let runtime = MvBackgroundRuntime::new(
+            refresh_stop_tx,
+            std::thread::spawn(move || {
+                refresh_stop_rx.recv().unwrap();
+                refresh_fact.store(true, Ordering::Release);
+            }),
+            maintenance_stop_tx,
+            wakeup_tx,
+            std::thread::spawn(move || {
+                maintenance_stop_rx.recv().unwrap();
+                maintenance_fact.store(true, Ordering::Release);
+            }),
+        );
+        product
+            .begin_background_start()
+            .unwrap()
+            .install(runtime)
+            .unwrap();
+        port.wipe_accelerator_for_test(&product, Uuid::now_v7(), &mut claim)
+            .unwrap();
+        assert!(refresh_exited.load(Ordering::Acquire));
+        assert!(maintenance_exited.load(Ordering::Acquire));
+        assert!(repository.list_projections().await.unwrap().is_empty());
+        assert!(matches!(
+            product.request_activity(
+                canonical_mv_target(&novarocks_sql::planning::mv::SqlMvTarget {
+                    catalog: Some("ice".into()),
+                    database: "sales".into(),
+                    name: "orders".into()
+                }),
+                MvActivityOwner::ScheduledRefresh
+            ),
+            Err(MvActivityGateError::Stopping)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unjoined_background_worker_preserves_accelerator_and_joins_on_cleanup() {
+        let session = TestSession::new(vec![wipe_grant()], SessionRole::Fe, 400);
+        let controls = session.controls().unwrap();
+        let mut claim = controls
+            .claim_call("ice", "sales", "orders", "wipe")
+            .unwrap();
+        let (product, port, repository) = product_and_port().await;
+        let before = repository.list_projections().await.unwrap();
+        let (refresh_stop_tx, _refresh_stop_rx) = mpsc::channel();
+        let (maintenance_stop_tx, _maintenance_stop_rx) = mpsc::channel();
+        let (wakeup_tx, _wakeup_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel();
+        let runtime = MvBackgroundRuntime::new(
+            refresh_stop_tx,
+            std::thread::spawn(move || {
+                release_rx.recv().unwrap();
+            }),
+            maintenance_stop_tx,
+            wakeup_tx,
+            std::thread::spawn(|| {}),
+        );
+        product
+            .begin_background_start()
+            .unwrap()
+            .install(runtime)
+            .unwrap();
+        let result = port.wipe_accelerator_for_test(&product, Uuid::now_v7(), &mut claim);
+        release_tx.send(()).unwrap();
+        product
+            .shutdown_background_workers_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(result.unwrap_err().contains("shared shutdown deadline"));
+        assert_eq!(repository.list_projections().await.unwrap(), before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_join_failure_preserves_accelerator() {
+        let session = TestSession::new(vec![wipe_grant()], SessionRole::Fe, 3000);
+        let controls = session.controls().unwrap();
+        let mut claim = controls
+            .claim_call("ice", "sales", "orders", "wipe")
+            .unwrap();
+        let (product, port, repository) = product_and_port().await;
+        let before = repository.list_projections().await.unwrap();
+        let (refresh_stop_tx, _refresh_stop_rx) = mpsc::channel();
+        let (maintenance_stop_tx, _maintenance_stop_rx) = mpsc::channel();
+        let (wakeup_tx, _wakeup_rx) = mpsc::sync_channel(1);
+        let runtime = MvBackgroundRuntime::new(
+            refresh_stop_tx,
+            std::thread::spawn(|| {
+                panic!("injected MV worker panic");
+            }),
+            maintenance_stop_tx,
+            wakeup_tx,
+            std::thread::spawn(|| {}),
+        );
+        product
+            .begin_background_start()
+            .unwrap()
+            .install(runtime)
+            .unwrap();
+        let result = port.wipe_accelerator_for_test(&product, Uuid::now_v7(), &mut claim);
+        product
+            .shutdown_background_workers_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(result.unwrap_err().contains("panicked"));
+        assert_eq!(repository.list_projections().await.unwrap(), before);
+    }
 }

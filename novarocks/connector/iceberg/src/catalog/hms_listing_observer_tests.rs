@@ -71,15 +71,21 @@ fn settled(record: crate::catalog::hms_listing_observer::InvocationRecord) {
 
 #[tokio::test]
 async fn actual_ready_future_drops_before_wrapper_and_permit_return() {
-    let gate = ListingAdmission::default();
+    let gate = ListingAdmission::observed_test_fixture();
     let stop = ConnectorStopOwner::new();
     let ctx = context(&stop, Instant::now() + Duration::from_secs(5));
     let drops = Arc::new(AtomicUsize::new(0));
-    gate.run_hms(&ctx, HmsListingOperation::Tables, Some([7; 32]), |invoke| {
-        let gate = &gate;
-        let drops = &drops;
-        async move { sdk_call(Some(&invoke), actual(gate, drops, true)).await }
-    })
+    gate.run_hms(
+        &ctx,
+        gate.active_observer().unwrap(),
+        HmsListingOperation::Tables,
+        Some([7; 32]),
+        |invoke| {
+            let gate = &gate;
+            let drops = &drops;
+            async move { sdk_call(Some(&invoke), actual(gate, drops, true)).await }
+        },
+    )
     .await
     .unwrap();
     let snapshot = gate.hms_snapshot().unwrap();
@@ -99,17 +105,23 @@ async fn actual_ready_future_drops_before_wrapper_and_permit_return() {
 
 #[tokio::test]
 async fn eight_real_objects_ninth_waiting_and_same_domain_reuse_without_tasks() {
-    let gate = ListingAdmission::default();
+    let gate = ListingAdmission::observed_test_fixture();
     let stop = ConnectorStopOwner::new();
     let ctx = context(&stop, Instant::now() + Duration::from_secs(5));
     let drops = Arc::new(AtomicUsize::new(0));
     let mut calls = Vec::new();
     for _ in 0..9 {
-        let call = gate.run_hms(&ctx, HmsListingOperation::Tables, Some([3; 32]), |invoke| {
-            let gate = &gate;
-            let drops = &drops;
-            async move { sdk_call(Some(&invoke), actual(gate, drops, false)).await }
-        });
+        let call = gate.run_hms(
+            &ctx,
+            gate.active_observer().unwrap(),
+            HmsListingOperation::Tables,
+            Some([3; 32]),
+            |invoke| {
+                let gate = &gate;
+                let drops = &drops;
+                async move { sdk_call(Some(&invoke), actual(gate, drops, false)).await }
+            },
+        );
         calls.push(Box::pin(call));
     }
     for call in &mut calls {
@@ -161,11 +173,17 @@ async fn eight_real_objects_ninth_waiting_and_same_domain_reuse_without_tasks() 
         .unwrap();
     let healthy = ConnectorStopOwner::new();
     let ctx = context(&healthy, ctx.deadline());
-    gate.run_hms(&ctx, HmsListingOperation::Tables, None, |invoke| {
-        let gate = &gate;
-        let drops = &drops;
-        async move { sdk_call(Some(&invoke), actual(gate, drops, true)).await }
-    })
+    gate.run_hms(
+        &ctx,
+        gate.active_observer().unwrap(),
+        HmsListingOperation::Tables,
+        None,
+        |invoke| {
+            let gate = &gate;
+            let drops = &drops;
+            async move { sdk_call(Some(&invoke), actual(gate, drops, true)).await }
+        },
+    )
     .await
     .unwrap();
     let reused = gate.hms_snapshot().unwrap();
@@ -180,17 +198,21 @@ async fn eight_real_objects_ninth_waiting_and_same_domain_reuse_without_tasks() 
 
 #[tokio::test]
 async fn original_deadline_drops_pending_sdk_object_before_return() {
-    let gate = ListingAdmission::default();
+    let gate = ListingAdmission::observed_test_fixture();
     let stop = ConnectorStopOwner::new();
     let ctx = context(&stop, Instant::now() + Duration::from_millis(100));
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut call = Box::pin(
-        gate.run_hms(&ctx, HmsListingOperation::Namespaces, None, |invoke| {
+    let mut call = Box::pin(gate.run_hms(
+        &ctx,
+        gate.active_observer().unwrap(),
+        HmsListingOperation::Namespaces,
+        None,
+        |invoke| {
             let gate = &gate;
             let drops = &drops;
             async move { sdk_call(Some(&invoke), actual(gate, drops, false)).await }
-        }),
-    );
+        },
+    ));
     assert!(futures::poll!(call.as_mut()).is_pending());
     let active = gate.hms_snapshot().unwrap();
     let active_record = active.records[0].unwrap();
@@ -231,13 +253,17 @@ async fn actual_sdk_poll_panic_preserves_payload_returns_permit_and_invalidates_
         }
     }
 
-    let gate = ListingAdmission::default();
+    let gate = ListingAdmission::observed_test_fixture();
     let stop = ConnectorStopOwner::new();
     let ctx = context(&stop, Instant::now() + Duration::from_secs(5));
     let drops = Arc::new(AtomicUsize::new(0));
     let payload = Arc::new(17_u8);
-    let panic = AssertUnwindSafe(
-        gate.run_hms(&ctx, HmsListingOperation::Tables, None, |invoke| {
+    let panic = AssertUnwindSafe(gate.run_hms(
+        &ctx,
+        gate.active_observer().unwrap(),
+        HmsListingOperation::Tables,
+        None,
+        |invoke| {
             let gate = &gate;
             let drops = &drops;
             let payload = &payload;
@@ -251,8 +277,8 @@ async fn actual_sdk_poll_panic_preserves_payload_returns_permit_and_invalidates_
                 )
                 .await
             }
-        }),
-    )
+        },
+    ))
     .catch_unwind()
     .await
     .unwrap_err();
@@ -262,11 +288,17 @@ async fn actual_sdk_poll_panic_preserves_payload_returns_permit_and_invalidates_
     assert_eq!(gate.positions.available_permits(), 8);
     assert!(gate.hms_snapshot().is_err());
     // Observation failure does not replace a later original business outcome.
-    gate.run_hms(&ctx, HmsListingOperation::Tables, None, |invoke| {
-        let gate = &gate;
-        let drops = &drops;
-        async move { sdk_call(Some(&invoke), actual(gate, drops, true)).await }
-    })
+    gate.run_hms(
+        &ctx,
+        gate.active_observer().unwrap(),
+        HmsListingOperation::Tables,
+        None,
+        |invoke| {
+            let gate = &gate;
+            let drops = &drops;
+            async move { sdk_call(Some(&invoke), actual(gate, drops, true)).await }
+        },
+    )
     .await
     .unwrap();
     assert_eq!(drops.load(Ordering::SeqCst), 2);
@@ -275,19 +307,22 @@ async fn actual_sdk_poll_panic_preserves_payload_returns_permit_and_invalidates_
 
 #[tokio::test]
 async fn both_ready_waiting_stop_keeps_original_biased_selection_and_never_calls_sdk() {
-    let gate = ListingAdmission::default();
+    let gate = ListingAdmission::observed_test_fixture();
     let occupied = gate.positions.clone().acquire_many_owned(8).await.unwrap();
     let stop = ConnectorStopOwner::new();
     let ctx = context(&stop, Instant::now() + Duration::from_millis(20));
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut call =
-        Box::pin(
-            gate.run_hms(&ctx, HmsListingOperation::Views, Some([9; 32]), |invoke| {
-                let gate = &gate;
-                let drops = &drops;
-                async move { sdk_call(Some(&invoke), actual(gate, drops, false)).await }
-            }),
-        );
+    let mut call = Box::pin(gate.run_hms(
+        &ctx,
+        gate.active_observer().unwrap(),
+        HmsListingOperation::Views,
+        Some([9; 32]),
+        |invoke| {
+            let gate = &gate;
+            let drops = &drops;
+            async move { sdk_call(Some(&invoke), actual(gate, drops, false)).await }
+        },
+    ));
     assert!(futures::poll!(call.as_mut()).is_pending());
     tokio::time::sleep(Duration::from_millis(25)).await;
     stop.request_stop();
@@ -307,17 +342,21 @@ async fn both_ready_waiting_stop_keeps_original_biased_selection_and_never_calls
 
 #[tokio::test]
 async fn dropping_the_outer_future_still_drops_the_actual_sdk_before_permit() {
-    let gate = ListingAdmission::default();
+    let gate = ListingAdmission::observed_test_fixture();
     let stop = ConnectorStopOwner::new();
     let ctx = context(&stop, Instant::now() + Duration::from_secs(5));
     let drops = Arc::new(AtomicUsize::new(0));
-    let mut call = Box::pin(
-        gate.run_hms(&ctx, HmsListingOperation::Tables, None, |invoke| {
+    let mut call = Box::pin(gate.run_hms(
+        &ctx,
+        gate.active_observer().unwrap(),
+        HmsListingOperation::Tables,
+        None,
+        |invoke| {
             let gate = &gate;
             let drops = &drops;
             async move { sdk_call(Some(&invoke), actual(gate, drops, false)).await }
-        }),
-    );
+        },
+    ));
     assert!(futures::poll!(call.as_mut()).is_pending());
     drop(call);
     let snapshot = gate.hms_snapshot().unwrap();
@@ -330,12 +369,13 @@ async fn dropping_the_outer_future_still_drops_the_actual_sdk_before_permit() {
 
 #[tokio::test]
 async fn ready_error_and_unsupported_are_original_failures_not_synthetic_success() {
-    let gate = ListingAdmission::default();
+    let gate = ListingAdmission::observed_test_fixture();
     let stop = ConnectorStopOwner::new();
     let ctx = context(&stop, Instant::now() + Duration::from_secs(5));
     let result: Result<(), ConnectorError> = gate
         .run_hms(
             &ctx,
+            gate.active_observer().unwrap(),
             HmsListingOperation::Views,
             None,
             |invoke| async move {
@@ -359,12 +399,13 @@ async fn ready_error_and_unsupported_are_original_failures_not_synthetic_success
 
 #[tokio::test]
 async fn journal_full_cannot_overwrite_history_or_be_reset_into_valid_evidence() {
-    let gate = ListingAdmission::default();
+    let gate = ListingAdmission::observed_test_fixture();
     let stop = ConnectorStopOwner::new();
     let ctx = context(&stop, Instant::now() + Duration::from_secs(60));
     for _ in 0..crate::catalog::hms_listing_observer::JOURNAL_CAPACITY {
         gate.run_hms(
             &ctx,
+            gate.active_observer().unwrap(),
             HmsListingOperation::Tables,
             None,
             |invoke| async move { sdk_call(Some(&invoke), async { Ok(()) }).await },
@@ -376,6 +417,7 @@ async fn journal_full_cannot_overwrite_history_or_be_reset_into_valid_evidence()
     assert_eq!(full.used, 1024);
     gate.run_hms(
         &ctx,
+        gate.active_observer().unwrap(),
         HmsListingOperation::Tables,
         None,
         |invoke| async move { sdk_call(Some(&invoke), async { Ok(()) }).await },
@@ -392,7 +434,7 @@ async fn journal_full_cannot_overwrite_history_or_be_reset_into_valid_evidence()
 
 #[tokio::test]
 async fn ordinary_run_cannot_be_mislabelled_as_an_hms_sdk_invocation() {
-    let gate = ListingAdmission::default();
+    let gate = ListingAdmission::observed_test_fixture();
     let stop = ConnectorStopOwner::new();
     let ctx = context(&stop, Instant::now() + Duration::from_secs(5));
     gate.run(&ctx, async { Ok(()) }).await.unwrap();
@@ -404,16 +446,22 @@ async fn ordinary_run_cannot_be_mislabelled_as_an_hms_sdk_invocation() {
 
 #[tokio::test]
 async fn rejection_before_sdk_construction_cannot_claim_sdk_drop() {
-    let gate = ListingAdmission::default();
+    let gate = ListingAdmission::observed_test_fixture();
     let stop = ConnectorStopOwner::new();
     let ctx = context(&stop, Instant::now() + Duration::from_secs(5));
     let result: Result<(), ConnectorError> = gate
-        .run_hms(&ctx, HmsListingOperation::Tables, None, |_invoke| async {
-            Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "component pre-SDK refusal",
-            ))
-        })
+        .run_hms(
+            &ctx,
+            gate.active_observer().unwrap(),
+            HmsListingOperation::Tables,
+            None,
+            |_invoke| async {
+                Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "component pre-SDK refusal",
+                ))
+            },
+        )
         .await;
     assert_eq!(
         result.unwrap_err().kind(),
@@ -427,4 +475,12 @@ async fn rejection_before_sdk_construction_cannot_claim_sdk_drop() {
     assert_eq!(record.sdk_dropped, 0);
     assert!(record.wrapper_dropped < record.permit_returned);
     assert_eq!(snapshot.available_positions_sample, Some(8));
+}
+
+#[test]
+fn compiled_observation_does_not_create_an_observer_without_a_grant() {
+    let gate = ListingAdmission::default();
+    assert!(!gate.hms_observation_active());
+    assert!(gate.observer.lock().unwrap().is_none());
+    assert!(gate.hms_snapshot().is_err());
 }

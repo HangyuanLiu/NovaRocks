@@ -1026,6 +1026,7 @@ impl MvReadinessService {
             publication_id,
         })
     }
+    #[cfg(any(test, feature = "test-controls"))]
     pub fn ensure_no_active_publications(&self) -> Result<(), MvRepositoryError> {
         if self.runtime.has_active_publications() {
             Err(MvRepositoryError::new(
@@ -1036,6 +1037,7 @@ impl MvReadinessService {
             Ok(())
         }
     }
+    #[cfg(any(test, feature = "test-controls"))]
     pub async fn wipe_accelerator(&self, operation_id: Uuid) -> Result<(), MvProjectionError> {
         self.ensure_no_active_publications()?;
         for target in self.runtime.projection_targets() {
@@ -1045,18 +1047,6 @@ impl MvReadinessService {
         self.repository.wipe_accelerator(operation_id).await?;
         Ok(())
     }
-    pub async fn wipe_projection(
-        &self,
-        operation_id: Uuid,
-        target: &MvTarget,
-    ) -> Result<bool, MvProjectionError> {
-        let guard = self.reserve_projection_delete(target.clone()).await?;
-        Ok(matches!(
-            self.delete_after_provider_drop(operation_id, guard).await?,
-            MvProjectionInstallOutcome::Removed
-        ))
-    }
-
     #[cfg(any(test, feature = "test-support"))]
     #[doc(hidden)]
     pub async fn seed_projection(

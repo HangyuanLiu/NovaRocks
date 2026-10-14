@@ -199,42 +199,103 @@ impl ActiveQueryFaultState {
     }
 }
 
-pub(crate) struct QueryLifecycleFaultStepGuard {
-    server: Option<Arc<Mutex<Box<dyn ServerHandle>>>>,
+/// Retains cleanup failures when a step exits before explicit settlement.
+/// The case owner consumes these before publishing its verdict.
+#[derive(Clone, Default)]
+pub(crate) struct FaultStepCleanupErrors(Arc<Mutex<Vec<(usize, String)>>>);
+
+impl FaultStepCleanupErrors {
+    pub(crate) fn take(&self) -> Vec<(usize, String)> {
+        let mut failures = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *failures)
+    }
 }
 
-pub(crate) struct CleanupFaultStepGuard {
+#[derive(Clone, Copy)]
+enum FaultStepCleanupKind {
+    QueryLifecycle,
+    ConnectorCleanup,
+}
+
+pub(crate) struct FaultStepGuard {
     server: Option<Arc<Mutex<Box<dyn ServerHandle>>>>,
+    kind: FaultStepCleanupKind,
+    query_number: usize,
+    fallback_errors: FaultStepCleanupErrors,
+}
+
+impl FaultStepGuard {
+    fn clear(&mut self) -> Result<()> {
+        let Some(server) = self.server.take() else {
+            return Ok(());
+        };
+        let (mut server, poisoned) = match server.lock() {
+            Ok(server) => (server, false),
+            Err(poisoned) => (poisoned.into_inner(), true),
+        };
+        // Even a poisoned handle must attempt the actual cleanup. Poisoning
+        // remains a failure after that attempt rather than hiding its result.
+        let result = match self.kind {
+            FaultStepCleanupKind::QueryLifecycle => server.clear_query_lifecycle_faults(),
+            FaultStepCleanupKind::ConnectorCleanup => server.clear_cleanup_faults(),
+        };
+        match (poisoned, result) {
+            (false, result) => result,
+            (true, Ok(())) => {
+                bail!("fault step server handle mutex is poisoned; cleanup attempted")
+            }
+            (true, Err(error)) => {
+                bail!("fault step server handle mutex is poisoned; cleanup failed: {error:#}")
+            }
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Result<()> {
+        self.clear()
+    }
+}
+
+impl Drop for FaultStepGuard {
+    fn drop(&mut self) {
+        if let Err(error) = self.clear() {
+            let action = match self.kind {
+                FaultStepCleanupKind::QueryLifecycle => "query lifecycle",
+                FaultStepCleanupKind::ConnectorCleanup => "connector cleanup",
+            };
+            let message = format!("{action} fault cleanup: {error:#}");
+            eprintln!("failed SQL step {} cleanup: {message}", self.query_number);
+            self.fallback_errors
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((self.query_number, message));
+        }
+    }
 }
 
 pub(crate) fn cleanup_fault_step_guard(
     meta: &QueryMeta,
     server: Arc<Mutex<Box<dyn ServerHandle>>>,
-) -> CleanupFaultStepGuard {
-    CleanupFaultStepGuard {
+    query_number: usize,
+    fallback_errors: FaultStepCleanupErrors,
+) -> FaultStepGuard {
+    FaultStepGuard {
         server: meta.cleanup_fault.is_some().then_some(server),
-    }
-}
-
-impl Drop for CleanupFaultStepGuard {
-    fn drop(&mut self) {
-        let Some(server) = self.server.take() else {
-            return;
-        };
-        let mut server = match server.lock() {
-            Ok(server) => server,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Err(error) = server.clear_cleanup_faults() {
-            eprintln!("failed to clear connector cleanup fault triggers after SQL step: {error:#}");
-        }
+        kind: FaultStepCleanupKind::ConnectorCleanup,
+        query_number,
+        fallback_errors,
     }
 }
 
 pub(crate) fn query_lifecycle_fault_step_guard(
     meta: &QueryMeta,
     server: Arc<Mutex<Box<dyn ServerHandle>>>,
-) -> QueryLifecycleFaultStepGuard {
+    query_number: usize,
+    fallback_errors: FaultStepCleanupErrors,
+) -> FaultStepGuard {
     let armed = meta.kill_fe_after_mv_known_committed_before_projector_cas
         || meta.restart_be_after_establish_context_index.is_some()
         || meta.kill_query_after_be_log_contains.is_some()
@@ -245,23 +306,11 @@ pub(crate) fn query_lifecycle_fault_step_guard(
         || meta.kill_query_at_lifecycle_phase.is_some()
         || meta.kill_be_at_lifecycle_phase.is_some()
         || meta.query_control_fragment_backend_limit.is_some();
-    QueryLifecycleFaultStepGuard {
+    FaultStepGuard {
         server: armed.then_some(server),
-    }
-}
-
-impl Drop for QueryLifecycleFaultStepGuard {
-    fn drop(&mut self) {
-        let Some(server) = self.server.take() else {
-            return;
-        };
-        let mut server = match server.lock() {
-            Ok(server) => server,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Err(error) = server.clear_query_lifecycle_faults() {
-            eprintln!("failed to clear query lifecycle fault triggers after SQL step: {error:#}");
-        }
+        kind: FaultStepCleanupKind::QueryLifecycle,
+        query_number,
+        fallback_errors,
     }
 }
 
@@ -282,7 +331,7 @@ pub(crate) fn has_fault(meta: &QueryMeta) -> bool {
         || meta.query_control_fragment_backend_limit.is_some()
 }
 
-fn configured_query_lifecycle_faults(
+pub(crate) fn configured_query_lifecycle_faults(
     meta: &QueryMeta,
 ) -> Vec<crate::types::QueryLifecycleFaultDirective> {
     if meta.query_lifecycle_faults.is_empty() {
@@ -293,6 +342,29 @@ fn configured_query_lifecycle_faults(
 }
 
 pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -> Result<()> {
+    apply_pre_query_with_token(meta, server, None, None)
+}
+fn sleep_with_original_deadline(delay: Duration, deadline: Option<Instant>) -> Result<()> {
+    if let Some(deadline) = deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("pre-query original deadline expired");
+        }
+        sleep(delay.min(remaining));
+        if Instant::now() >= deadline {
+            bail!("pre-query delay reached the original deadline");
+        }
+    } else {
+        sleep(delay);
+    }
+    Ok(())
+}
+pub(crate) fn apply_pre_query_with_token(
+    meta: &QueryMeta,
+    server: &mut dyn ServerHandle,
+    token: Option<&str>,
+    deadline: Option<Instant>,
+) -> Result<()> {
     if let Some(kind) = &meta.cleanup_fault {
         server.arm_cleanup_fault(kind)?;
     }
@@ -401,13 +473,27 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
         // dedicated harness method: the arm file, its token and its cleanup
         // are already the same for every kind, and a second bespoke method
         // would only duplicate them under a new name.
-        server.arm_query_lifecycle_fault(index, RESTART_AFTER_ESTABLISH_CONTEXT)?;
+        match token {
+            Some(token) => server.arm_selected_query_lifecycle_fault(
+                index,
+                RESTART_AFTER_ESTABLISH_CONTEXT,
+                token,
+            )?,
+            None => server.arm_query_lifecycle_fault(index, RESTART_AFTER_ESTABLISH_CONTEXT)?,
+        }
     }
     if let Some(index) = meta.terminal_snapshot_conflict_be_index {
         server.arm_terminal_snapshot_conflict(index)?;
     }
     for fault in configured_query_lifecycle_faults(meta) {
-        server.arm_query_lifecycle_fault(fault.be_index, fault.kind.as_str())?;
+        match token {
+            Some(token) => server.arm_selected_query_lifecycle_fault(
+                fault.be_index,
+                fault.kind.as_str(),
+                token,
+            )?,
+            None => server.arm_query_lifecycle_fault(fault.be_index, fault.kind.as_str())?,
+        }
     }
     if let Some(phase) = meta.kill_query_at_lifecycle_phase {
         server.arm_kill_query_at_lifecycle_phase(phase)?;
@@ -422,13 +508,13 @@ pub(crate) fn apply_pre_query(meta: &QueryMeta, server: &mut dyn ServerHandle) -
     if let Some(index) = meta.kill_be_index {
         server.kill_be(index)?;
         if let Some(delay_ms) = meta.restart_be_delay_ms {
-            sleep(Duration::from_millis(delay_ms));
+            sleep_with_original_deadline(Duration::from_millis(delay_ms), deadline)?;
             server.restart_be(index)?;
         }
     }
 
     if let Some(delay_ms) = meta.heartbeat_delay_ms {
-        sleep(Duration::from_millis(delay_ms));
+        sleep_with_original_deadline(Duration::from_millis(delay_ms), deadline)?;
     }
 
     Ok(())
@@ -1147,6 +1233,92 @@ mod tests {
             self.events.push(format!("arm-fragment-limit:{limit}"));
             Ok(())
         }
+    }
+
+    struct FailingCleanupServer(Arc<Mutex<Vec<&'static str>>>);
+
+    impl ServerHandle for FailingCleanupServer {
+        fn target_host(&self) -> Option<&str> {
+            None
+        }
+        fn target_port(&self) -> Option<u16> {
+            None
+        }
+        fn clear_query_lifecycle_faults(&mut self) -> Result<()> {
+            self.0.lock().unwrap().push("lifecycle");
+            bail!("original role controller close failed")
+        }
+        fn clear_cleanup_faults(&mut self) -> Result<()> {
+            self.0.lock().unwrap().push("connector");
+            bail!("cleanup permission retirement failed")
+        }
+    }
+
+    fn failing_cleanup_guards() -> (
+        FaultStepGuard,
+        FaultStepGuard,
+        FaultStepCleanupErrors,
+        Arc<Mutex<Vec<&'static str>>>,
+    ) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let server: Arc<Mutex<Box<dyn ServerHandle>>> =
+            Arc::new(Mutex::new(Box::new(FailingCleanupServer(calls.clone()))));
+        let errors = FaultStepCleanupErrors::default();
+        let meta = QueryMeta {
+            restart_be_after_establish_context_index: Some(0),
+            ..QueryMeta::default()
+        };
+        let lifecycle = query_lifecycle_fault_step_guard(&meta, server.clone(), 7, errors.clone());
+        // The cleanup directive's parsed value is irrelevant to ending the
+        // already armed permission; use the exact owner guard directly.
+        let cleanup = FaultStepGuard {
+            server: Some(server),
+            kind: FaultStepCleanupKind::ConnectorCleanup,
+            query_number: 7,
+            fallback_errors: errors.clone(),
+        };
+        (lifecycle, cleanup, errors, calls)
+    }
+
+    #[test]
+    fn explicit_fault_step_settlement_preserves_both_owner_failures_once() {
+        let (lifecycle, cleanup, errors, calls) = failing_cleanup_guards();
+        let results = [lifecycle.finish(), cleanup.finish()];
+        assert!(
+            format!("{:#}", results[0].as_ref().unwrap_err())
+                .contains("original role controller close failed")
+        );
+        assert!(
+            format!("{:#}", results[1].as_ref().unwrap_err())
+                .contains("cleanup permission retirement failed")
+        );
+        assert_eq!(*calls.lock().unwrap(), ["lifecycle", "connector"]);
+        assert!(
+            errors.take().is_empty(),
+            "explicit errors must not be duplicated by Drop"
+        );
+    }
+
+    #[test]
+    fn early_step_exit_retains_cleanup_errors_for_case_verdict() {
+        let (lifecycle, cleanup, errors, calls) = failing_cleanup_guards();
+        drop(lifecycle);
+        drop(cleanup);
+        let failures = errors.take();
+        assert_eq!(*calls.lock().unwrap(), ["lifecycle", "connector"]);
+        assert_eq!(failures.len(), 2);
+        assert!(failures.iter().all(|(query, _)| *query == 7));
+        assert!(
+            failures[0]
+                .1
+                .contains("original role controller close failed")
+        );
+        assert!(
+            failures[1]
+                .1
+                .contains("cleanup permission retirement failed")
+        );
+        assert!(errors.take().is_empty());
     }
 
     #[test]

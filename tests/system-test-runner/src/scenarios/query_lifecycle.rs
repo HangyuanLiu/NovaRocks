@@ -1,6 +1,6 @@
 use crate::actors::mysql as mysql_actor;
 use crate::actors::mysql_stream::MysqlStream;
-use crate::scenario::{Scenario, ScenarioContext};
+use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use crate::scenarios::task_evidence;
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
@@ -10,9 +10,14 @@ use novarocks_cluster_harness::{
     native_fault_proxy::{ProxyDirection, ProxyMode},
 };
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::mpsc;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[path = "native_sql_controls.rs"]
+pub(super) mod native_sql_controls;
+use native_sql_controls::{SelectedStatement, SqlIntentOwner, StatementSpec};
 
 mod limit_zero;
 
@@ -31,17 +36,34 @@ const BASELINE_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t
 pub(super) const NID2_FENCE_QUERY: &str =
     "SELECT v FROM (SELECT sleep(10) AS v UNION ALL SELECT sleep(10)) t ORDER BY v";
 
+fn observed_statement(sql: &str) -> StatementSpec {
+    StatementSpec {
+        sql: sql.into(),
+        faults: vec![],
+        observations: (0..REQUIRED_BACKENDS)
+            .map(|index| (index, "grpc-fragment", None))
+            .collect(),
+    }
+}
+fn fault_statement(sql: &str, fault: &'static str) -> StatementSpec {
+    StatementSpec {
+        sql: sql.into(),
+        faults: (0..REQUIRED_BACKENDS).map(|index| (index, fault)).collect(),
+        observations: vec![],
+    }
+}
+
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
-        Box::new(DistributedBaseline),
+        Box::new(DistributedBaseline::default()),
         Box::new(MysqlDisconnect),
         Box::new(QueryTimeout),
-        Box::new(NoEffectReadAfterBackendExit),
-        Box::new(LiveBackendPartition),
-        Box::new(limit_zero::LimitZeroUnknownSender),
-        Box::new(Nid2CreateRejected),
-        Box::new(Nid2CreateReceiptForeignTask),
-        Box::new(Nid2ForeignStatusProcess),
+        Box::new(NoEffectReadAfterBackendExit::default()),
+        Box::new(LiveBackendPartition::default()),
+        Box::new(limit_zero::LimitZeroUnknownSender::default()),
+        Box::new(Nid2CreateRejected::default()),
+        Box::new(Nid2CreateReceiptForeignTask::default()),
+        Box::new(Nid2ForeignStatusProcess::default()),
     ]
 }
 
@@ -53,7 +75,10 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
 /// admission without replacing its process identity. The old read is kept
 /// unread and must remain nonterminal until its path is restored; a new read
 /// then proves the revoked backend cannot contaminate a fresh attempt.
-struct LiveBackendPartition;
+#[derive(Default)]
+struct LiveBackendPartition {
+    intent: SqlIntentOwner,
+}
 
 impl Scenario for LiveBackendPartition {
     fn name(&self) -> &'static str {
@@ -74,10 +99,32 @@ impl Scenario for LiveBackendPartition {
         })
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(self.intent.freeze(
+            vec![
+                observed_statement(NID2_FENCE_QUERY),
+                observed_statement(BASELINE_QUERY),
+            ],
+            &[],
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_snapshot(context)?;
-        let before_old_execution = latest_execution_id(context)?;
         let create_counts = (0..context.handle().be_count())
             .map(|index| {
                 context
@@ -86,11 +133,16 @@ impl Scenario for LiveBackendPartition {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let old_read = start_partitioned_read(
+        let old_connection = mysql_actor::connect_until(
             context.mysql_user(),
             context.mysql_port(),
-            context.remaining("start the old live-partition read")?,
+            context.deadline(),
         )?;
+        let old_observation =
+            self.intent
+                .take(0)?
+                .arm(context, old_connection.connection_id(), NID2_FENCE_QUERY)?;
+        let old_read = start_partitioned_read(old_connection)?;
         context.action(
             "started an unread distributed read whose admitted backend will be partitioned",
         );
@@ -125,15 +177,28 @@ impl Scenario for LiveBackendPartition {
             }
         }
 
-        let before_new_execution = latest_execution_id(context)?;
-        let mut independent = mysql_actor::connect(
+        let mut independent = mysql_actor::connect_until(
             context.mysql_user(),
             context.mysql_port(),
-            bounded_io_timeout(context, "connect independent post-partition read")?,
+            context.deadline(),
         )?;
+        let independent_observation =
+            self.intent
+                .take(1)?
+                .arm(context, independent.connection_id(), BASELINE_QUERY)?;
         execute_baseline_query(&mut independent, "post-partition independent")?;
-        let independent_terminal =
-            await_terminal_snapshot(context, before_new_execution.as_deref())?;
+        independent.finish()?;
+        let deadline = context.deadline();
+        let independent_terminal = context
+            .handle()
+            .await_query_lifecycle_statement_observation(
+                &independent_observation,
+                true,
+                deadline,
+            )?;
+        context
+            .handle()
+            .drain_query_lifecycle_statement_observation(&independent_observation)?;
         let independent_participants = task_evidence::assert_query_completed_across_boundary(
             context,
             &independent_terminal,
@@ -164,7 +229,13 @@ impl Scenario for LiveBackendPartition {
             old_rows == vec![1, 1],
             "restored old read returned unexpected rows: {old_rows:?}"
         );
-        let old_terminal = await_terminal_snapshot(context, before_old_execution.as_deref())?;
+        let deadline = context.deadline();
+        let old_terminal = context
+            .handle()
+            .await_query_lifecycle_statement_observation(&old_observation, true, deadline)?;
+        context
+            .handle()
+            .drain_query_lifecycle_statement_observation(&old_observation)?;
         ensure!(
             old_terminal.attempt_id == 1,
             "restored old read unexpectedly replaced its attempt: {}",
@@ -181,59 +252,245 @@ impl Scenario for LiveBackendPartition {
     }
 }
 
+struct JoinedClientThread(Option<thread::JoinHandle<Result<()>>>);
+impl JoinedClientThread {
+    fn join(mut self) -> std::thread::Result<Result<()>> {
+        self.0.take().expect("Native SQL client exists").join()
+    }
+}
+impl Drop for JoinedClientThread {
+    fn drop(&mut self) {
+        if let Some(client) = self.0.take() {
+            match client.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("Original SQL actor cleanup failed: {error:#}"),
+                Err(_) => eprintln!("Original SQL actor panicked during actual join"),
+            }
+        }
+    }
+}
+
 struct PendingPartitionedRead {
-    thread: thread::JoinHandle<Result<()>>,
+    thread: JoinedClientThread,
     done: mpsc::Receiver<Result<Vec<i64>, mysql::Error>>,
 }
 
 fn start_partitioned_read(
-    user: &str,
-    port: u16,
-    connect_timeout: Duration,
+    connection: mysql_actor::DeadlineConnection,
 ) -> Result<PendingPartitionedRead> {
     let (done_tx, done) = mpsc::sync_channel(1);
-    let user = user.to_owned();
     let thread = thread::Builder::new()
         .name("live-backend-partition-read".to_string())
         .spawn(move || -> Result<()> {
-            let mut connection =
-                mysql_actor::connect_for_cancellation(&user, port, connect_timeout)?;
-            let outcome = connection.query(NID2_FENCE_QUERY);
-            done_tx
-                .send(outcome)
-                .context("publish live-partition read result")
+            connection.run(|connection| {
+                let outcome = connection.query(NID2_FENCE_QUERY);
+                done_tx
+                    .send(outcome)
+                    .context("publish live-partition read result")
+            })
         })
         .context("start live-partition read actor")?;
-    Ok(PendingPartitionedRead { thread, done })
+    Ok(PendingPartitionedRead {
+        thread: JoinedClientThread(Some(thread)),
+        done,
+    })
 }
 
-struct DistributedBaseline;
+#[derive(Default)]
+struct DistributedBaseline {
+    intent: SqlIntentOwner,
+    ordinary_binary: Mutex<Option<PathBuf>>,
+}
+
+impl DistributedBaseline {
+    fn run_ordinary_baseline(&self, context: &mut ScenarioContext) -> Result<()> {
+        use novarocks_cluster_harness::test_sessions::{ClusterTestSessionPlan, RoleSlot};
+
+        let ordinary = self
+            .ordinary_binary
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ordinary baseline artifact owner poisoned"))?
+            .take()
+            .context("ordinary baseline artifact was not frozen before launch")?;
+        let deadline = context.deadline();
+        let mut plan = ClusterTestSessionPlan::new(deadline)?;
+        let frontend = plan.reserve_launch(RoleSlot::Frontend)?;
+        let backends = (0..REQUIRED_BACKENDS)
+            .map(|index| plan.reserve_launch(RoleSlot::Backend(index)))
+            .collect::<Result<Vec<_>>>()?;
+        plan.authorize_ordinary_launch(&frontend, ordinary.clone())?;
+        for backend in &backends {
+            plan.authorize_ordinary_launch(backend, ordinary.clone())?;
+        }
+        let mut peer = context.launch_peer_cluster_with_test_session(
+            "ordinary-baseline",
+            ScenarioLaunchConfig::default(),
+            plan,
+        )?;
+        let primary = (|| -> Result<()> {
+            ensure!(
+                peer.be_count() == REQUIRED_BACKENDS,
+                "ordinary baseline requires native 1FE+3BE, got 1FE+{}BE",
+                peer.be_count()
+            );
+            let baseline = peer.query_execution_resource_snapshot()?.context(
+                "ordinary baseline peer did not expose the public query-resource oracle",
+            )?;
+            context.action("captured ordinary artifact native 1FE+3BE query-resource baseline");
+            let query = mysql_actor::connect_until(
+                peer.mysql_user(),
+                peer.runtime().fe_mysql_port,
+                deadline,
+            )
+            .and_then(|connection| {
+                connection.run(|connection| {
+                    for level in ["package", "wipe"] {
+                        let sql = format!(
+                            "CALL test_control_probe.system.novarocks_imv_stateless_rebuild(table => 'ns.mv', level => '{level}')"
+                        );
+                        match connection.query_drop(&sql) {
+                            Err(mysql::Error::MySqlError(error)) => {
+                                ensure!(
+                                    error.message.contains("unsupported")
+                                        && error.message.contains("novarocks_imv_stateless_rebuild"),
+                                    "ordinary test-only CALL returned another SQL failure: {error}"
+                                );
+                            }
+                            Err(error) => {
+                                return Err(anyhow::Error::new(error)
+                                    .context("ordinary test-only CALL did not return a public SQL error"));
+                            }
+                            Ok(()) => bail!("ordinary artifact accepted test-only {level} CALL"),
+                        }
+                    }
+                    for ordinal in ["ordinary first", "ordinary second", "ordinary third"] {
+                        execute_baseline_query(connection, ordinal)?;
+                    }
+                    Ok(())
+                })
+            });
+            let convergence = peer
+                .await_query_execution_resource_convergence(&baseline, deadline)
+                .context("await ordinary baseline public query-resource convergence");
+            match (query, convergence) {
+                (Ok(()), Ok(())) => {
+                    ensure!(
+                        Instant::now() < deadline,
+                        "ordinary baseline original deadline expired before resource convergence completed"
+                    );
+                    context.action(
+                        "ordinary artifact rejected package/wipe CALL through public SQL errors, then returned [1, 2] for all three baseline queries; its socket joined and query resources converged",
+                    );
+                    Ok(())
+                }
+                (Err(primary), Err(cleanup)) => {
+                    bail!("{primary:#}; ordinary baseline resource convergence: {cleanup:#}")
+                }
+                (Err(error), _) | (_, Err(error)) => Err(error),
+            }
+        })();
+        if primary.is_err() {
+            peer.retain_runtime_artifacts();
+        }
+        let cleanup = ServerHandle::shutdown(&mut peer);
+        match (primary, cleanup) {
+            (Ok(()), Ok(())) => {
+                context.action("ordinary baseline peer roles actually stopped and reaped");
+                Ok(())
+            }
+            (Err(primary), Err(cleanup)) => {
+                bail!("{primary:#}; ordinary baseline peer shutdown: {cleanup:#}")
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    }
+}
 
 impl Scenario for DistributedBaseline {
     fn name(&self) -> &'static str {
         "query-lifecycle/distributed-baseline"
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let mut ordinary_binary = self
+            .ordinary_binary
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ordinary baseline artifact owner poisoned"))?;
+        ensure!(
+            ordinary_binary.is_none(),
+            "ordinary baseline artifact was already frozen"
+        );
+        let plan = self.intent.freeze(
+            (0..3).map(|_| observed_statement(BASELINE_QUERY)).collect(),
+            &[],
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?;
+        *ordinary_binary = Some(ordinary.to_path_buf());
+        Ok(Some(plan))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
+        self.run_ordinary_baseline(context)?;
         let baseline = resource_snapshot(context)?;
         context.action("captured query-resource baseline");
 
-        let connect_timeout = bounded_io_timeout(context, "connect baseline MySQL client")?;
-        let mut connection =
-            mysql_actor::connect(context.mysql_user(), context.mysql_port(), connect_timeout)?;
+        let mut connection = mysql_actor::connect_until(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.deadline(),
+        )?;
         context.action("connected baseline client through public MySQL protocol");
 
-        let before_first = latest_execution_id(context)?;
+        let first_observation =
+            self.intent
+                .take(0)?
+                .arm(context, connection.connection_id(), BASELINE_QUERY)?;
         execute_baseline_query(&mut connection, "first")?;
-        let first = await_terminal_snapshot(context, before_first.as_deref())?;
+        let deadline = context.deadline();
+        let first = context
+            .handle()
+            .await_query_lifecycle_statement_observation(&first_observation, true, deadline)?;
+        context
+            .handle()
+            .drain_query_lifecycle_statement_observation(&first_observation)?;
 
-        let before_second = first.execution_id.clone();
+        let second_observation =
+            self.intent
+                .take(1)?
+                .arm(context, connection.connection_id(), BASELINE_QUERY)?;
         execute_baseline_query(&mut connection, "second")?;
-        let second = await_terminal_snapshot(context, before_second.as_deref())?;
-        let before_third = second.execution_id.clone();
+        let deadline = context.deadline();
+        let second = context
+            .handle()
+            .await_query_lifecycle_statement_observation(&second_observation, true, deadline)?;
+        context
+            .handle()
+            .drain_query_lifecycle_statement_observation(&second_observation)?;
+        let third_observation =
+            self.intent
+                .take(2)?
+                .arm(context, connection.connection_id(), BASELINE_QUERY)?;
         execute_baseline_query(&mut connection, "third")?;
-        let third = await_terminal_snapshot(context, before_third.as_deref())?;
+        let deadline = context.deadline();
+        let third = context
+            .handle()
+            .await_query_lifecycle_statement_observation(&third_observation, true, deadline)?;
+        context
+            .handle()
+            .drain_query_lifecycle_statement_observation(&third_observation)?;
         let snapshots = [&first, &second, &third];
         assert_process_attribution(&snapshots)?;
         assert_process_attribution_diagnostics(context, &snapshots)?;
@@ -245,6 +502,7 @@ impl Scenario for DistributedBaseline {
             third.local_sequence,
         ));
 
+        connection.finish()?;
         await_resource_convergence(context, &baseline)
     }
 }
@@ -324,17 +582,48 @@ impl Scenario for QueryTimeout {
 /// it identifies the process that accepted this exact in-flight attempt without
 /// guessing a scheduler placement. The slow expression is workload, not the
 /// oracle; the marker is what orders the kill after task admission.
-struct NoEffectReadAfterBackendExit;
+#[derive(Default)]
+struct NoEffectReadAfterBackendExit {
+    intent: SqlIntentOwner,
+}
 
 impl Scenario for NoEffectReadAfterBackendExit {
     fn name(&self) -> &'static str {
         "query-lifecycle/no-effect-read-after-backend-exit"
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let statement = StatementSpec {
+            sql: NID2_FENCE_QUERY.into(),
+            faults: vec![],
+            observations: (0..REQUIRED_BACKENDS)
+                .flat_map(|index| {
+                    [1, 2].map(move |attempt| (index, "grpc-fragment", Some(attempt)))
+                })
+                .collect(),
+        };
+        Ok(Some(self.intent.freeze(
+            vec![statement],
+            &[0, 1, 2],
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_snapshot(context)?;
-        let before_execution = latest_execution_id(context)?;
         let create_counts = (0..context.handle().be_count())
             .map(|index| {
                 context
@@ -343,15 +632,16 @@ impl Scenario for NoEffectReadAfterBackendExit {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let mut stream = MysqlStream::query(
+        let mut stream = MysqlStream::connect(
             context.mysql_user(),
             context.mysql_port(),
-            NID2_FENCE_QUERY,
-            // The second attempt repeats the deliberate ten-second workload.
-            // A generic ten-second socket cap would therefore abort the public
-            // client before a healthy replacement can send its first row.
             context.remaining("open no-effect recovery MySQL client")?,
         )?;
+        let observation =
+            self.intent
+                .take(0)?
+                .arm(context, stream.connection_id()?, NID2_FENCE_QUERY)?;
+        stream.send_query(NID2_FENCE_QUERY)?;
         context.action(
             "sent an unread no-effect distributed read through a raw public MySQL connection",
         );
@@ -370,7 +660,13 @@ impl Scenario for NoEffectReadAfterBackendExit {
         ));
 
         assert_two_sleep_rows(&mut stream)?;
-        let terminal = await_terminal_snapshot(context, before_execution.as_deref())?;
+        let deadline = context.deadline();
+        let terminal = context
+            .handle()
+            .await_query_lifecycle_statement_observation(&observation, true, deadline)?;
+        context
+            .handle()
+            .drain_query_lifecycle_statement_observation(&observation)?;
         ensure!(
             terminal.attempt_id == 2,
             "no-effect read after BE exit must complete on replacement attempt 2, got attempt {}",
@@ -451,16 +747,43 @@ struct Nid2Fence {
 /// reason this case can fail: the task is admitted and running on that backend,
 /// so a frontend that retried the refusal or ignored it would find working
 /// state behind the lie and the statement would return rows.
-struct Nid2CreateRejected;
+#[derive(Default)]
+struct Nid2CreateRejected {
+    intent: SqlIntentOwner,
+}
 
 impl Scenario for Nid2CreateRejected {
     fn name(&self) -> &'static str {
         "query-lifecycle/nid-2-create-rejected"
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(self.intent.freeze(
+            vec![fault_statement(
+                NID2_FENCE_QUERY,
+                "create-task-rejected-after-apply",
+            )],
+            &[],
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         run_nid2_fence(
             context,
+            &self.intent.take(0)?,
             &Nid2Fence {
                 fault: "create-task-rejected-after-apply",
                 marker: "NOVAROCKS_TASK_CREATE_REJECTED_AFTER_APPLY",
@@ -505,16 +828,43 @@ impl Scenario for Nid2CreateRejected {
 /// A frontend that adopted the foreign receipt would mark this attempt's task
 /// created and the statement would return rows, so the refusal is what the case
 /// rests on.
-struct Nid2CreateReceiptForeignTask;
+#[derive(Default)]
+struct Nid2CreateReceiptForeignTask {
+    intent: SqlIntentOwner,
+}
 
 impl Scenario for Nid2CreateReceiptForeignTask {
     fn name(&self) -> &'static str {
         "query-lifecycle/nid-2-create-receipt-foreign-task"
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(self.intent.freeze(
+            vec![fault_statement(
+                NID2_FENCE_QUERY,
+                "create-task-receipt-foreign-task",
+            )],
+            &[],
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         run_nid2_fence(
             context,
+            &self.intent.take(0)?,
             &Nid2Fence {
                 fault: "create-task-receipt-foreign-task",
                 marker: "NOVAROCKS_TASK_CREATE_RECEIPT_FOREIGN_TASK",
@@ -555,16 +905,43 @@ impl Scenario for Nid2CreateReceiptForeignTask {
 /// `a_status_event_from_another_process_is_fatal` in that module asserts the
 /// intake stayed empty. What only a cluster can show is that the fence fires at
 /// all on a real subscription --- which is this case.
-struct Nid2ForeignStatusProcess;
+#[derive(Default)]
+struct Nid2ForeignStatusProcess {
+    intent: SqlIntentOwner,
+}
 
 impl Scenario for Nid2ForeignStatusProcess {
     fn name(&self) -> &'static str {
         "query-lifecycle/nid-2-foreign-status-process"
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(self.intent.freeze(
+            vec![fault_statement(
+                NID2_FENCE_QUERY,
+                "task-status-foreign-process",
+            )],
+            &[],
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         run_nid2_fence(
             context,
+            &self.intent.take(0)?,
             &Nid2Fence {
                 fault: "task-status-foreign-process",
                 marker: "NOVAROCKS_TASK_STATUS_FOREIGN_PROCESS",
@@ -584,13 +961,20 @@ impl Scenario for Nid2ForeignStatusProcess {
 /// three *unbound* arms behind, and the scheduler binds whatever it finds to
 /// the next attempt it plans. That would perturb an unrelated scenario, and the
 /// failure would be attributed to it.
-fn run_nid2_fence(context: &mut ScenarioContext, fence: &Nid2Fence) -> Result<()> {
+fn run_nid2_fence(
+    context: &mut ScenarioContext,
+    selected: &SelectedStatement,
+    fence: &Nid2Fence,
+) -> Result<()> {
     require_three_backends(context)?;
     let baseline = resource_snapshot(context)?;
-    let connect_timeout = bounded_io_timeout(context, "connect NID-2 identity-fence client")?;
-    let mut connection =
-        mysql_actor::connect(context.mysql_user(), context.mysql_port(), connect_timeout)?;
-    let tokens = arm_on_every_backend(context, fence.fault)?;
+    let mut connection = mysql_actor::connect_until(
+        context.mysql_user(),
+        context.mysql_port(),
+        context.deadline(),
+    )?;
+    selected.arm(context, connection.connection_id(), NID2_FENCE_QUERY)?;
+    let tokens = vec![selected.token.clone(); REQUIRED_BACKENDS];
     context.action(format!(
         "armed NID-2 {} across every Backend participant with tokens {tokens:?}",
         fence.fault
@@ -601,8 +985,10 @@ fn run_nid2_fence(context: &mut ScenarioContext, fence: &Nid2Fence) -> Result<()
         .handle()
         .clear_query_lifecycle_faults()
         .with_context(|| format!("clear {} tokens", fence.fault));
-    let (backend, error) = observed?;
-    cleared?;
+    let closed = connection.finish();
+    let cleanup = crate::scenarios::paimon::scan_statement_actor::combine(cleared, closed);
+    let (backend, error) =
+        crate::scenarios::paimon::scan_statement_actor::combine(observed, cleanup)?;
     await_resource_convergence(context, &baseline)?;
     context.action(format!(
         "BE[{backend}] published {} and the frontend fenced {}: {error}",

@@ -1,20 +1,28 @@
 use super::mv_uea7::ManagedMvRestFixture;
+use super::query_lifecycle::native_sql_controls::SelectedStatement;
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use ::mysql::prelude::{FromRow, Queryable};
 use ::mysql::{Conn, Row};
-use anyhow::{Context, Result, bail};
-use novarocks_cluster_harness::ServerHandle;
+use anyhow::{Context, Result, bail, ensure};
+use novarocks_cluster_harness::{
+    ServerHandle,
+    test_sessions::{ClusterTestSessionPlan, RoleLaunchReference, RoleSlot},
+};
+use novarocks_failpoint::{
+    session::DomainGrant,
+    target_binding::{RoleProcessReceipt, StatementWorkNomination},
+};
+use serde::Deserialize;
+use serde_json::json;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-const TEST_DIR_ENV: &str = "NOVAROCKS_STAT2F_MAINTENANCE_TEST_DIR";
-const MARKER_PREFIX: &str = "stat2f-maintenance-optimize-";
-const READY_SUFFIX: &str = ".before-rebind.ready";
+const OPTIMIZE_SQL: &str = "ALTER TABLE orders OPTIMIZE";
 const CATALOG: &str = "system_stat2f_maintenance";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
@@ -24,6 +32,14 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
 #[derive(Default)]
 struct OptimizeTargetReplacement {
     fixture: Mutex<Option<ManagedMvRestFixture>>,
+    intent: Mutex<Option<MaintenanceIntent>>,
+}
+
+#[derive(Clone)]
+struct MaintenanceIntent {
+    root: PathBuf,
+    statements: [SelectedStatement; 2],
+    frontend: RoleLaunchReference,
 }
 
 impl Scenario for OptimizeTargetReplacement {
@@ -32,22 +48,11 @@ impl Scenario for OptimizeTargetReplacement {
     }
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        let test_dir = scenario_root.join("stat2f-maintenance-barrier");
-        fs::create_dir_all(&test_dir).with_context(|| {
-            format!(
-                "create STAT-2F maintenance barrier directory {}",
-                test_dir.display()
-            )
-        })?;
         // REST admits detached maintenance, allowing replacement while the
         // worker is paused. Hadoop requires the submitting statement to await
         // actual worker exit to preserve its single-writer contract.
-        let (rest, mut launch) = ManagedMvRestFixture::start(scenario_root, CATALOG)
+        let (rest, launch) = ManagedMvRestFixture::start(scenario_root, CATALOG)
             .context("start private REST fixture for optimize target replacement")?;
-        launch.child_environment.fe.insert(
-            TEST_DIR_ENV.to_string(),
-            test_dir.to_string_lossy().into_owned(),
-        );
         let mut fixture = self
             .fixture
             .lock()
@@ -57,6 +62,77 @@ impl Scenario for OptimizeTargetReplacement {
         }
         *fixture = Some(rest);
         Ok(launch)
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<ClusterTestSessionPlan>> {
+        ensure!(
+            cluster_size == 3,
+            "maintenance race requires native 1FE+3BE"
+        );
+        let controlled = controlled_binary
+            .context("maintenance rendezvous requires an explicit test-controls artifact")?;
+        let mut intent = self
+            .intent
+            .lock()
+            .map_err(|_| anyhow::anyhow!("maintenance intent lock poisoned"))?;
+        ensure!(intent.is_none(), "maintenance intent already frozen");
+        let mut plan = ClusterTestSessionPlan::new(original_deadline)?;
+        let root = plan.reserve_transport("maintenance-rendezvous")?;
+        let frontend = plan.reserve_launch(RoleSlot::Frontend)?;
+        let successor = plan.reserve_launch(RoleSlot::Frontend)?;
+        plan.authorize_ordinary_launch(&successor, ordinary_binary.to_path_buf())?;
+        for index in 0..cluster_size {
+            let backend = plan.reserve_launch(RoleSlot::Backend(index))?;
+            plan.authorize_ordinary_launch(&backend, ordinary_binary.to_path_buf())?;
+        }
+        let mut statements: [SelectedStatement; 2] = std::array::from_fn(|_| SelectedStatement {
+            sql: OPTIMIZE_SQL.to_owned(),
+            token: String::new(),
+            faults: vec![],
+            deadline: original_deadline,
+        });
+        let mut grants = vec![DomainGrant {
+            domain: "statement-observation".into(),
+            grant_id: "maintenance-statements".into(),
+            parameters: json!({"action":"observe","bearer_secret":plan.fresh_domain_secret()?}),
+        }];
+        for (ordinal, selected) in statements.iter_mut().enumerate() {
+            selected.token = plan.fresh_domain_secret()?;
+            for action in ["hold-before-rebind", "dispatch-count"] {
+                grants.push(DomainGrant {
+                    domain: "table-maintenance".into(), grant_id: format!("maintenance-{ordinal}-{action}"),
+                    parameters: json!({"action":action,"root":root,"statement_run_token":selected.token,
+                        "catalog":CATALOG,"namespace":"ns","table":"orders"}),
+                });
+            }
+        }
+        plan.authorize_launch(
+            &frontend,
+            grants,
+            vec![
+                ("novarocks-server".into(), "test-controls".into()),
+                (
+                    "novarocks-frontend-application".into(),
+                    "test-controls".into(),
+                ),
+            ],
+        )?;
+        plan.set_launch_binary(&frontend, controlled.to_path_buf())?;
+        *intent = Some(MaintenanceIntent {
+            root,
+            statements,
+            frontend,
+        });
+        Ok(Some(plan))
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -70,67 +146,72 @@ impl Scenario for OptimizeTargetReplacement {
             .context("maintenance REST fixture is missing after cluster launch")?
             .create_catalog_sql()
             .to_owned();
-        let barrier_dir = context.scenario_root().join("stat2f-maintenance-barrier");
-        let mut conn = connect(context)?;
-        setup_orders_fixture(context, &mut conn, catalog, &create_catalog_sql)?;
+        let intent = self
+            .intent
+            .lock()
+            .map_err(|_| anyhow::anyhow!("maintenance intent lock poisoned"))?
+            .clone()
+            .context("maintenance finite intent is missing")?;
+        let conn = connect(context)?;
+        let phase = conn.run(|conn| {
+        setup_orders_fixture(context, conn, catalog, &create_catalog_sql)?;
 
-        execute(
-            context,
-            &mut conn,
-            "submit optimize for the original table incarnation",
-            "ALTER TABLE orders OPTIMIZE",
-        )?;
-        let first = wait_for_ready_marker(context, &barrier_dir, None)?;
+        submit_optimize(context, conn, &intent.statements[0], "submit optimize for the original table incarnation")?;
+        let first = wait_for_ready_marker(context, &intent, 0, None)?;
         context.action("observed process-local optimize claim before its first rebind");
 
         execute(
             context,
-            &mut conn,
+            conn,
             "drop original optimize target incarnation",
             "DROP TABLE orders FORCE",
         )?;
         execute(
             context,
-            &mut conn,
+            conn,
             "recreate optimize target under the same logical name",
             "CREATE TABLE orders (k1 INT, v2 BIGINT) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
         )?;
         execute(
             context,
-            &mut conn,
+            conn,
             "seed replacement optimize target table",
             "INSERT INTO orders VALUES (9, 90)",
         )?;
         write_resume(&first)?;
         context.action("released optimize rebind barrier after same-name replacement");
 
-        wait_for_job_state(context, &mut conn, catalog, first.job_id, "TARGET_REPLACED")?;
+        wait_for_job_state(context, conn, catalog, first.job_id, "TARGET_REPLACED")?;
         assert_dispatch_count(context, &first, 0)?;
         context.action("verified replacement became TARGET_REPLACED with zero provider dispatch");
 
-        execute(
-            context,
-            &mut conn,
-            "submit a new optimize to prove the terminal job released its active fence",
-            "ALTER TABLE orders OPTIMIZE",
-        )?;
-        let second = wait_for_ready_marker(context, &barrier_dir, Some(first.job_id))?;
+        submit_optimize(context, conn, &intent.statements[1], "submit a new optimize to prove the terminal job released its active fence")?;
+        let second = wait_for_ready_marker(context, &intent, 1, Some(first.job_id))?;
         write_resume(&second)?;
         context.action("a second process-local optimize claim acquired the same table fence");
-        wait_for_terminal_job(context, &mut conn, catalog, second.job_id)?;
+        wait_for_terminal_job(context, conn, catalog, second.job_id)?;
 
-        drop(conn);
+        Ok(first.job_id)
+        });
+        let first_job_id = match phase {
+            Ok(job_id) => job_id,
+            Err(primary) => {
+                let released = release_ready_barriers(&intent);
+                let stopped = context.shutdown();
+                return with_cleanup(with_cleanup(Err(primary), released), stopped);
+            }
+        };
         restart_frontend(
             context,
             "restart FE after process-local TARGET_REPLACED transition",
         )?;
-        let mut conn = connect(context)?;
-        select_catalog_and_database(context, &mut conn, catalog)?;
-        assert_job_not_listed(context, &mut conn, catalog, first.job_id)?;
-        context.action(
-            "verified the restarted FE discards process-local optimize history in native 1FE+3BE",
-        );
-        Ok(())
+        let conn = connect(context)?;
+        conn.run(|conn| {
+            select_catalog_and_database(context, conn, catalog)?;
+            assert_job_not_listed(context, conn, catalog, first_job_id)?;
+            context.action("verified the restarted FE discards process-local optimize history in native 1FE+3BE");
+            Ok(())
+        })
     }
 
     fn teardown(&self) -> Result<()> {
@@ -159,10 +240,57 @@ fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
     Ok(())
 }
 
-fn connect(context: &mut ScenarioContext) -> Result<Conn> {
-    let timeout = context.remaining("connect MySQL client")?;
+fn connect(context: &mut ScenarioContext) -> Result<mysql_actor::DeadlineConnection> {
     context.action("connect through public MySQL protocol");
-    mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)
+    mysql_actor::connect_until(
+        context.mysql_user(),
+        context.mysql_port(),
+        context.deadline(),
+    )
+}
+
+fn submit_optimize(
+    context: &mut ScenarioContext,
+    conn: &mut Conn,
+    selected: &SelectedStatement,
+    action: &str,
+) -> Result<()> {
+    context.action(action);
+    let observation = selected.arm(context, conn.connection_id(), OPTIMIZE_SQL)?;
+    let result = conn.query_drop(OPTIMIZE_SQL).map_err(anyhow::Error::from);
+    let drained = context
+        .handle()
+        .drain_query_lifecycle_statement_binding(&observation, selected.deadline);
+    with_cleanup(result, drained)
+}
+fn with_cleanup<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
+    match (primary, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(primary), Err(cleanup)) => {
+            Err(anyhow::anyhow!("{primary:#}; cleanup failed: {cleanup:#}"))
+        }
+    }
+}
+fn release_ready_barriers(intent: &MaintenanceIntent) -> Result<()> {
+    let mut result = Ok(());
+    for selected in &intent.statements {
+        if intent
+            .root
+            .join(format!("{}.before-rebind.ready", selected.token))
+            .exists()
+        {
+            let resumed = fs::write(
+                intent
+                    .root
+                    .join(format!("{}.before-rebind.resume", selected.token)),
+                "resume\n",
+            )
+            .context("release owned maintenance barrier during error cleanup");
+            result = with_cleanup(result, resumed);
+        }
+    }
+    result
 }
 
 fn setup_orders_fixture(
@@ -237,51 +365,107 @@ struct BarrierPaths {
     dispatch_count: PathBuf,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadyReceipt {
+    schema_version: u32,
+    job_id: i64,
+    work_id: u64,
+    phase: String,
+    catalog: String,
+    namespace: String,
+    table: String,
+    object_id: Vec<u8>,
+    launch_id: String,
+    #[serde(deserialize_with = "read_ready_nomination")]
+    nomination: StatementWorkNomination,
+}
+
+fn read_ready_nomination<'de, D>(
+    deserializer: D,
+) -> std::result::Result<StatementWorkNomination, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct WireNomination {
+        target_session_id: String,
+        statement_run_token: String,
+        frontend_process_id: String,
+        connection_id: u32,
+        session_epoch: u64,
+        statement_generation: u64,
+    }
+    let wire = WireNomination::deserialize(deserializer)?;
+    Ok(StatementWorkNomination {
+        target_session_id: wire.target_session_id,
+        statement_run_token: wire.statement_run_token,
+        frontend_process_id: wire.frontend_process_id,
+        connection_id: wire.connection_id,
+        session_epoch: wire.session_epoch,
+        statement_generation: wire.statement_generation,
+    })
+}
+
 fn wait_for_ready_marker(
     context: &mut ScenarioContext,
-    directory: &Path,
+    intent: &MaintenanceIntent,
+    ordinal: usize,
     excluded_job_id: Option<i64>,
 ) -> Result<BarrierPaths> {
     context.action("wait for STAT-2F optimize before-rebind barrier");
+    let selected = &intent.statements[ordinal];
+    let deadline = context.deadline();
+    let ready = intent
+        .root
+        .join(format!("{}.before-rebind.ready", selected.token));
     loop {
-        if let Some(paths) = find_ready_marker(directory, excluded_job_id)? {
-            return Ok(paths);
+        if ready.exists() {
+            let metadata = fs::symlink_metadata(&ready)?;
+            ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 8192,
+                "maintenance ready receipt is not bounded regular data"
+            );
+            let receipt: ReadyReceipt = serde_json::from_slice(&fs::read(&ready)?)
+                .context("decode exact maintenance receipt")?;
+            receipt.nomination.validate()?;
+            let role = RoleProcessReceipt::read_private(&intent.frontend.process_receipt)?;
+            ensure!(
+                receipt.schema_version == 1
+                    && receipt.job_id > 0
+                    && receipt.work_id > 0
+                    && Some(receipt.job_id) != excluded_job_id
+                    && receipt.phase == "after-claim-before-rebind"
+                    && receipt.catalog == CATALOG
+                    && receipt.namespace == "ns"
+                    && receipt.table == "orders"
+                    && !receipt.object_id.is_empty()
+                    && receipt.nomination.statement_run_token == selected.token
+                    && receipt.nomination.target_session_id == intent.frontend.session_id
+                    && role.session_id == intent.frontend.session_id
+                    && role.launch_id == receipt.launch_id
+                    && role.role == novarocks_failpoint::session::SessionRole::Fe
+                    && role.process_id == receipt.nomination.frontend_process()?.to_string(),
+                "maintenance ready receipt differs from its exact finite job/role target"
+            );
+            return Ok(BarrierPaths {
+                job_id: receipt.job_id,
+                resume: intent
+                    .root
+                    .join(format!("{}.before-rebind.resume", selected.token)),
+                dispatch_count: intent
+                    .root
+                    .join(format!("{}.dispatch-count", selected.token)),
+            });
         }
+        ensure!(
+            Instant::now() < deadline,
+            "timed out waiting for exact maintenance before-rebind receipt"
+        );
         context.remaining("wait for STAT-2F optimize before-rebind barrier")?;
-        thread::sleep(POLL_INTERVAL);
+        thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
     }
-}
-
-fn find_ready_marker(
-    directory: &Path,
-    excluded_job_id: Option<i64>,
-) -> Result<Option<BarrierPaths>> {
-    for entry in fs::read_dir(directory)
-        .with_context(|| format!("read maintenance barrier directory {}", directory.display()))?
-    {
-        let entry = entry.with_context(|| {
-            format!("read maintenance barrier entry in {}", directory.display())
-        })?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let Some(job_id) = name
-            .strip_prefix(MARKER_PREFIX)
-            .and_then(|raw| raw.strip_suffix(READY_SUFFIX))
-            .and_then(|raw| raw.parse::<i64>().ok())
-        else {
-            continue;
-        };
-        if Some(job_id) == excluded_job_id {
-            continue;
-        }
-        let stem = format!("{MARKER_PREFIX}{job_id}");
-        return Ok(Some(BarrierPaths {
-            job_id,
-            resume: directory.join(format!("{stem}.before-rebind.resume")),
-            dispatch_count: directory.join(format!("{stem}.dispatch-count")),
-        }));
-    }
-    Ok(None)
 }
 
 fn write_resume(paths: &BarrierPaths) -> Result<()> {

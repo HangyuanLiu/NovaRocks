@@ -760,6 +760,7 @@ fn a_closed_authority_does_not_return_a_held_success_to_waiter() {
     });
 }
 
+#[cfg(feature = "test-controls")]
 #[test]
 fn debug_close_requires_exact_authority_identity() {
     let fixture = fixture_with(identity("https://catalog/credentials"), vec![], policy());
@@ -778,15 +779,6 @@ fn debug_close_requires_exact_authority_identity() {
         &fixture.authority.shared,
         &exact
     ));
-}
-
-#[test]
-fn debug_close_is_disabled_without_runner_trigger() {
-    use std::path::PathBuf;
-    let configured = super::debug_close::configured_scope;
-    assert!(configured(None, Some(PathBuf::from("/tmp")), Some("0")).is_none());
-    assert!(configured(Some("1"), None, Some("0")).is_none());
-    assert!(configured(Some("1"), Some(PathBuf::from("/tmp")), None).is_none());
 }
 
 #[test]
@@ -1274,4 +1266,535 @@ fn the_validity_margin_is_a_clamped_fraction_not_a_fixed_span() {
         policy.validity_margin_for(Duration::from_secs(200)),
         Duration::from_secs(10)
     );
+}
+
+#[cfg(feature = "test-controls")]
+#[test]
+fn session_authority_close_is_exact_once_and_observer_is_joined() {
+    use novarocks_failpoint::liveness::{PreparedRoleSession, RunnerSession};
+    use novarocks_failpoint::scope::ProcessBinding;
+    use novarocks_failpoint::session::{DomainGrant, SessionDeclaration, SessionRole};
+    let directory = tempfile::Builder::new()
+        .prefix("g2-fs-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let declaration = SessionDeclaration {
+        schema_version: 1,
+        session_id: "authority-test".into(),
+        launch_id: "authority-launch".into(),
+        role: SessionRole::Be,
+        lifetime_millis: 10_000,
+        liveness_socket: directory.path().join("live.sock"),
+        handshake_secret: "01234567890123456789012345678901".into(),
+        domain_grants: ["observe", "close"]
+            .into_iter()
+            .map(|action| DomainGrant {
+                domain: "storage-authority".into(),
+                grant_id: action.into(),
+                parameters: authority_control_parameters_for_test(action, directory.path()),
+            })
+            .collect(),
+    };
+    let path = directory.path().join("declaration.json");
+    declaration.write_private(&path).unwrap();
+    let mut runner = RunnerSession::start(declaration).unwrap();
+    let process = "018f0000-0000-7000-8000-000000000001".parse().unwrap();
+    let mut role = PreparedRoleSession::read_and_claim(&path, SessionRole::Be)
+        .unwrap()
+        .bind(ProcessBinding::Backend(process))
+        .unwrap();
+    let controls = super::StorageAuthorityCloseControls::from_grants(
+        role.scope().grants_for("storage-authority"),
+    )
+    .unwrap();
+    let fixture = fixture_with(identity("https://catalog/credentials"), vec![], policy());
+    controls.register(&fixture.authority).unwrap();
+    let trigger = directory
+        .path()
+        .join("be-0.storage-authority-close.trigger");
+    std::fs::write(
+        &trigger,
+        super::debug_close::control_key(&identity("https://catalog/other-credentials")),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(fixture.authority.shared.lock_state().closed.is_none());
+    assert!(
+        !role
+            .scope()
+            .observations()
+            .iter()
+            .any(|event| event.grant_id == "close"),
+        "wrong identity consumes no close permission"
+    );
+    std::fs::write(
+        &trigger,
+        super::debug_close::control_key(fixture.authority.id()),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while fixture.authority.shared.lock_state().closed.is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(fixture.authority.shared.lock_state().closed.is_some());
+    runner.end_and_join().unwrap();
+    controls.close_and_join().unwrap();
+    role.close_and_join().unwrap();
+    assert_eq!(controls.worker_count_for_test(), 0);
+    assert_eq!(
+        role.scope()
+            .observations()
+            .iter()
+            .filter(|event| event.event == "hit")
+            .count(),
+        2
+    );
+    assert!(
+        !directory
+            .path()
+            .join("be-0.storage-authority-0.identity")
+            .exists(),
+        "join completed identity cleanup"
+    );
+}
+
+#[cfg(feature = "test-controls")]
+fn authority_control_parameters_for_test(
+    action: &str,
+    root: &std::path::Path,
+) -> serde_json::Value {
+    serde_json::json!({
+        "action": action,
+        "root": root,
+        "backend_index": 0,
+        "target": {
+            "catalog": "lake",
+            "scope": "s3://warehouse/sales/orders/",
+            "principal_name": "vending",
+            "principal_generation": "g1",
+            "capability": "credentials-endpoint",
+            "endpoint": "https://catalog/credentials"
+        }
+    })
+}
+
+#[cfg(feature = "test-controls")]
+fn authority_close_session_for_cleanup_test() -> (
+    tempfile::TempDir,
+    novarocks_failpoint::liveness::RunnerSession,
+    novarocks_failpoint::liveness::RoleSessionOwner,
+    super::StorageAuthorityCloseControls,
+) {
+    authority_control_session_for_test(&["observe", "close"])
+}
+
+#[cfg(feature = "test-controls")]
+fn authority_control_session_for_test(
+    actions: &[&str],
+) -> (
+    tempfile::TempDir,
+    novarocks_failpoint::liveness::RunnerSession,
+    novarocks_failpoint::liveness::RoleSessionOwner,
+    super::StorageAuthorityCloseControls,
+) {
+    use novarocks_failpoint::liveness::{PreparedRoleSession, RunnerSession};
+    use novarocks_failpoint::scope::ProcessBinding;
+    use novarocks_failpoint::session::{DomainGrant, SessionDeclaration, SessionRole};
+    let directory = tempfile::Builder::new()
+        .prefix("g2-close-errors-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let declaration = SessionDeclaration {
+        schema_version: 1,
+        session_id: "close-cleanup".into(),
+        launch_id: "close-cleanup-launch".into(),
+        role: SessionRole::Be,
+        lifetime_millis: 10_000,
+        liveness_socket: directory.path().join("live.sock"),
+        handshake_secret: "01234567890123456789012345678901".into(),
+        domain_grants: actions
+            .iter()
+            .map(|action| DomainGrant {
+                domain: "storage-authority".into(),
+                grant_id: (*action).into(),
+                parameters: authority_control_parameters_for_test(action, directory.path()),
+            })
+            .collect(),
+    };
+    let path = directory.path().join("declaration.json");
+    declaration.write_private(&path).unwrap();
+    let runner = RunnerSession::start(declaration).unwrap();
+    let process = "018f0000-0000-7000-8000-000000000001".parse().unwrap();
+    let role = PreparedRoleSession::read_and_claim(&path, SessionRole::Be)
+        .unwrap()
+        .bind(ProcessBinding::Backend(process))
+        .unwrap();
+    let controls = super::StorageAuthorityCloseControls::from_grants(
+        role.scope().grants_for("storage-authority"),
+    )
+    .unwrap();
+    (directory, runner, role, controls)
+}
+
+#[cfg(feature = "test-controls")]
+fn wait_for_authority_close_identity(directory: &std::path::Path) -> std::path::PathBuf {
+    let path = directory.join("be-0.storage-authority-0.identity");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        path.is_file(),
+        "actual observer did not register its identity"
+    );
+    path
+}
+
+#[cfg(feature = "test-controls")]
+#[test]
+fn natural_scope_end_with_poisoned_targets_still_cleans_identity_and_repeats_the_error() {
+    let (directory, mut runner, mut role, controls) = authority_close_session_for_cleanup_test();
+    let fixture = fixture_with(identity("https://catalog/credentials"), vec![], policy());
+    controls.register(&fixture.authority).unwrap();
+    let identity_path = wait_for_authority_close_identity(directory.path());
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        controls.poison_authorities_while_for_test(|| {
+            runner.end_and_join().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while role.scope().is_active() && Instant::now() < deadline {
+                std::thread::yield_now();
+            }
+            assert!(
+                !role.scope().is_active(),
+                "runner end must reach the original scope"
+            );
+        });
+    }));
+    assert!(poisoned.is_err());
+    let first = controls
+        .close_and_join()
+        .expect_err("poison remains a failed attempt");
+    assert!(first.contains("natural target cleanup lock poisoned"));
+    assert!(
+        !identity_path.exists(),
+        "poison cannot skip owned identity cleanup"
+    );
+    assert_eq!(
+        controls.worker_count_for_test(),
+        0,
+        "real observer was joined"
+    );
+    assert_eq!(
+        Arc::strong_count(&fixture.authority.shared),
+        1,
+        "cleanup released poisoned target retention"
+    );
+    assert_eq!(
+        controls.close_and_join().unwrap_err(),
+        first,
+        "a repeated join retains the failure"
+    );
+    assert!(
+        !role
+            .scope()
+            .observations()
+            .iter()
+            .any(|event| event.grant_id == "close"),
+        "cleanup never injected authority closure"
+    );
+    role.close_and_join().unwrap();
+}
+
+#[cfg(feature = "test-controls")]
+#[test]
+fn observer_primary_and_identity_cleanup_failures_are_retained_after_the_filesystem_is_repaired() {
+    let (directory, mut runner, mut role, controls) = authority_close_session_for_cleanup_test();
+    let fixture = fixture_with(identity("https://catalog/credentials"), vec![], policy());
+    controls.register(&fixture.authority).unwrap();
+    let identity_path = wait_for_authority_close_identity(directory.path());
+    // This test owns the registered file. Replacing it with a directory
+    // deliberately makes the observer's real remove_file cleanup fail.
+    std::fs::remove_file(&identity_path).unwrap();
+    std::fs::create_dir(&identity_path).unwrap();
+    std::fs::write(
+        directory
+            .path()
+            .join("be-0.storage-authority-close.trigger"),
+        "x".repeat(66),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !controls.workers_returned_for_test() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        controls.workers_returned_for_test(),
+        "actual invalid-transport observer must return before session end"
+    );
+    runner.end_and_join().unwrap();
+    let first = controls.close_and_join().unwrap_err();
+    assert!(
+        first.contains("bounded digest file"),
+        "primary invalid transport error: {first}"
+    );
+    assert!(
+        first.contains("remove authority identity"),
+        "cleanup error must survive the primary error: {first}"
+    );
+    assert_eq!(controls.worker_count_for_test(), 0);
+    std::fs::remove_dir(&identity_path).unwrap();
+    assert_eq!(
+        controls.close_and_join().unwrap_err(),
+        first,
+        "repair does not erase raw failure"
+    );
+    assert!(fixture.authority.shared.lock_state().closed.is_none());
+    role.close_and_join().unwrap();
+}
+
+#[cfg(feature = "test-controls")]
+#[test]
+fn poisoned_join_bookkeeping_still_joins_the_real_observer_and_preserves_history() {
+    let (directory, mut runner, mut role, controls) = authority_close_session_for_cleanup_test();
+    let fixture = fixture_with(identity("https://catalog/credentials"), vec![], policy());
+    controls.register(&fixture.authority).unwrap();
+    let identity_path = wait_for_authority_close_identity(directory.path());
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        controls.poison_join_history_for_test()
+    }));
+    assert!(poisoned.is_err());
+    let first = controls.close_and_join().unwrap_err();
+    assert!(first.contains("preexisting authority close failure"));
+    assert!(first.contains("worker lock poisoned"));
+    assert!(first.contains("failure history lock poisoned"));
+    assert!(!identity_path.exists());
+    assert_eq!(controls.worker_count_for_test(), 0);
+    assert_eq!(Arc::strong_count(&fixture.authority.shared), 1);
+    assert_eq!(controls.close_and_join().unwrap_err(), first);
+    runner.end_and_join().unwrap();
+    role.close_and_join().unwrap();
+}
+
+#[cfg(feature = "test-controls")]
+#[test]
+fn authority_identity_observation_cannot_close_and_ignores_unrelated_targets() {
+    let (directory, mut runner, mut role, controls) =
+        authority_control_session_for_test(&["observe"]);
+    let unrelated = fixture_with(identity("https://catalog/other"), vec![], policy());
+    controls.register(&unrelated.authority).unwrap();
+    assert_eq!(Arc::strong_count(&unrelated.authority.shared), 1);
+    let fixture = fixture_with(identity("https://catalog/credentials"), vec![], policy());
+    controls.register(&fixture.authority).unwrap();
+    let identity_path = wait_for_authority_close_identity(directory.path());
+    let record = std::fs::read_to_string(&identity_path).unwrap();
+    assert!(record.contains(&super::debug_close::control_key(fixture.authority.id())));
+    assert!(!record.contains("https://catalog/credentials"));
+    let trigger = directory
+        .path()
+        .join("be-0.storage-authority-close.trigger");
+    std::fs::write(
+        &trigger,
+        super::debug_close::control_key(fixture.authority.id()),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(fixture.authority.shared.lock_state().closed.is_none());
+    // Even malformed close transport is outside the observation-only owner.
+    std::fs::write(&trigger, "x".repeat(66)).unwrap();
+    std::thread::sleep(Duration::from_millis(60));
+    runner.end_and_join().unwrap();
+    controls.close_and_join().unwrap();
+    assert!(fixture.authority.shared.lock_state().closed.is_none());
+    assert!(unrelated.authority.shared.lock_state().closed.is_none());
+    let observations = role.scope().observations();
+    assert!(observations.iter().all(|event| event.grant_id == "observe"));
+    assert_eq!(
+        observations
+            .iter()
+            .filter(|event| event.event == "hit")
+            .count(),
+        1
+    );
+    assert!(!identity_path.exists());
+    assert_eq!(controls.worker_count_for_test(), 0);
+    assert_eq!(Arc::strong_count(&fixture.authority.shared), 1);
+    controls.register(&fixture.authority).unwrap();
+    assert_eq!(Arc::strong_count(&fixture.authority.shared), 1);
+    controls.close_and_join().unwrap();
+    role.close_and_join().unwrap();
+}
+
+#[cfg(feature = "test-controls")]
+#[test]
+fn authority_close_permission_does_not_grant_identity_observation() {
+    let (directory, mut runner, mut role, controls) =
+        authority_control_session_for_test(&["close"]);
+    let fixture = fixture_with(identity("https://catalog/credentials"), vec![], policy());
+    controls.register(&fixture.authority).unwrap();
+    let trigger = directory
+        .path()
+        .join("be-0.storage-authority-close.trigger");
+    std::fs::write(
+        &trigger,
+        super::debug_close::control_key(fixture.authority.id()),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while fixture.authority.shared.lock_state().closed.is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(fixture.authority.shared.lock_state().closed.is_some());
+    runner.end_and_join().unwrap();
+    controls.close_and_join().unwrap();
+    assert!(
+        !directory
+            .path()
+            .join("be-0.storage-authority-0.identity")
+            .exists(),
+        "close cannot disclose identity without an independent observation grant"
+    );
+    let observations = role.scope().observations();
+    assert!(observations.iter().all(|event| event.grant_id == "close"));
+    assert_eq!(
+        observations
+            .iter()
+            .filter(|event| event.event == "hit")
+            .count(),
+        1
+    );
+    assert_eq!(controls.worker_count_for_test(), 0);
+    assert_eq!(Arc::strong_count(&fixture.authority.shared), 1);
+    role.close_and_join().unwrap();
+}
+
+#[cfg(feature = "test-controls")]
+#[test]
+fn authority_target_intent_pins_full_generation_before_any_action_claim() {
+    let (directory, mut runner, mut role, controls) =
+        authority_control_session_for_test(&["close"]);
+    let first = fixture_with(identity("https://catalog/credentials"), vec![], policy());
+    let replacement_id = StorageAuthorityId::new(
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("lake").unwrap(),
+            CatalogVersion::from_bytes([8; 32]),
+        ),
+        prefix("s3://warehouse/sales/orders/"),
+        endpoint_capability("https://catalog/credentials"),
+    );
+    let replacement = fixture_with(replacement_id, vec![], policy());
+    controls.register(&first.authority).unwrap();
+    controls.register(&first.authority).unwrap();
+    assert!(
+        controls
+            .register(&replacement.authority)
+            .unwrap_err()
+            .contains("already pinned")
+    );
+    assert_eq!(Arc::strong_count(&replacement.authority.shared), 1);
+    assert!(role.scope().observations().is_empty());
+    let trigger = directory
+        .path()
+        .join("be-0.storage-authority-close.trigger");
+    std::fs::write(
+        &trigger,
+        super::debug_close::control_key(replacement.authority.id()),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(60));
+    assert!(role.scope().observations().is_empty());
+    assert!(first.authority.shared.lock_state().closed.is_none());
+    assert!(replacement.authority.shared.lock_state().closed.is_none());
+    std::fs::write(
+        &trigger,
+        super::debug_close::control_key(first.authority.id()),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while first.authority.shared.lock_state().closed.is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(first.authority.shared.lock_state().closed.is_some());
+    assert!(replacement.authority.shared.lock_state().closed.is_none());
+    runner.end_and_join().unwrap();
+    controls.close_and_join().unwrap();
+    role.close_and_join().unwrap();
+}
+
+#[cfg(feature = "test-controls")]
+#[test]
+fn authority_controls_reject_missing_or_conflicting_predeclared_intent_before_activation() {
+    use novarocks_failpoint::liveness::{PreparedRoleSession, RunnerSession};
+    use novarocks_failpoint::scope::ProcessBinding;
+    use novarocks_failpoint::session::{DomainGrant, SessionDeclaration, SessionRole};
+    for case in ["missing", "capability", "endpoint", "conflict"] {
+        let directory = tempfile::Builder::new()
+            .prefix("g2-authority-invalid-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let mut parameters = authority_control_parameters_for_test("observe", directory.path());
+        let mut grants = Vec::new();
+        let expected = match case {
+            "missing" => {
+                parameters.as_object_mut().unwrap().remove("target");
+                "requires action, root, backend_index and target"
+            }
+            "capability" => {
+                parameters["target"]["capability"] = "arbitrary-provider".into();
+                "capability is unsupported"
+            }
+            "endpoint" => {
+                parameters["target"]["endpoint"] = "https://secret@catalog/credentials".into();
+                "endpoint is invalid"
+            }
+            "conflict" => {
+                let mut close = authority_control_parameters_for_test("close", directory.path());
+                close["target"]["endpoint"] = "https://catalog/other".into();
+                grants.push(DomainGrant {
+                    domain: "storage-authority".into(),
+                    grant_id: "close".into(),
+                    parameters: close,
+                });
+                "transport targets conflict"
+            }
+            _ => unreachable!(),
+        };
+        grants.push(DomainGrant {
+            domain: "storage-authority".into(),
+            grant_id: "observe".into(),
+            parameters,
+        });
+        let declaration = SessionDeclaration {
+            schema_version: 1,
+            session_id: "authority-invalid".into(),
+            launch_id: "authority-invalid-launch".into(),
+            role: SessionRole::Be,
+            lifetime_millis: 10_000,
+            liveness_socket: directory.path().join("live.sock"),
+            handshake_secret: "01234567890123456789012345678901".into(),
+            domain_grants: grants,
+        };
+        let path = directory.path().join("declaration.json");
+        declaration.write_private(&path).unwrap();
+        let mut runner = RunnerSession::start(declaration).unwrap();
+        let process = "018f0000-0000-7000-8000-000000000001".parse().unwrap();
+        let mut role = PreparedRoleSession::read_and_claim(&path, SessionRole::Be)
+            .unwrap()
+            .bind(ProcessBinding::Backend(process))
+            .unwrap();
+        let error = super::StorageAuthorityCloseControls::from_grants(
+            role.scope().grants_for("storage-authority"),
+        )
+        .unwrap_err();
+        assert!(error.contains(expected), "{case}: {error}");
+        assert!(!error.contains("secret"));
+        assert!(role.scope().observations().is_empty());
+        assert!(
+            !directory
+                .path()
+                .join("be-0.storage-authority-0.identity")
+                .exists()
+        );
+        runner.end_and_join().unwrap();
+        role.close_and_join().unwrap();
+    }
 }

@@ -211,7 +211,7 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
     let scenario_root = config.artifact_root.join(scenario.name().replace('/', "-"));
     fs::create_dir_all(&scenario_root)
         .with_context(|| format!("create scenario artifact root {}", scenario_root.display()))?;
-    let launch_config = match scenario.launch_config(&scenario_root) {
+    let mut launch_config = match scenario.launch_config(&scenario_root) {
         Ok(config) => config,
         Err(error) => {
             return finish_exact_mysql_scenario(Some(error), Ok(()), scenario.teardown());
@@ -241,6 +241,25 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         );
     }
     let bounded_original = exact_mysql_clock.is_some() || root_observation_clock.is_some();
+    let scenario_deadline = match std::time::Instant::now().checked_add(config.timeout) {
+        Some(deadline) => deadline,
+        None => {
+            return finish_exact_mysql_scenario(
+                Some(anyhow::anyhow!(
+                    "system original scenario deadline overflow"
+                )),
+                Ok(()),
+                scenario.teardown(),
+            );
+        }
+    };
+    let original_deadline = exact_mysql_clock
+        .map(|clock| clock.deadline())
+        .or(root_observation_clock)
+        .map_or(scenario_deadline, |deadline| {
+            deadline.min(scenario_deadline)
+        });
+
     let preparation = (|| -> Result<_> {
         if bounded_original {
             crate::scenario::ExactMysqlPrelaunchClock::validate_launch(
@@ -267,8 +286,31 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         Err(error) if bounded_original => {
             return finish_exact_mysql_scenario(Some(error), Ok(()), scenario.teardown());
         }
-        Err(error) => return Err(error),
+        Err(error) => return finish_exact_mysql_scenario(Some(error), Ok(()), scenario.teardown()),
     };
+    launch_config.resolved_artifacts = Some(crate::scenario::ResolvedScenarioArtifacts {
+        frontend: fe_binary.clone().unwrap_or_else(|| config.binary.clone()),
+        backends: if be_binaries.is_empty() {
+            vec![config.binary.clone(); config.cluster_size]
+        } else {
+            be_binaries.clone()
+        },
+        compatible: config.compatible_binary.clone(),
+        other_island: config.other_island_binary.clone(),
+    });
+    let test_sessions = match scenario.test_session_plan(
+        &launch_config,
+        &scenario_root,
+        config.cluster_size,
+        &config.binary,
+        config.ordinary_binary.as_deref().unwrap_or(&config.binary),
+        config.test_control_binary.as_deref(),
+        original_deadline,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => return finish_exact_mysql_scenario(Some(error), Ok(()), scenario.teardown()),
+    };
+
     let cluster_options = CrossProcessClusterOptions {
         binary: config.binary.clone(),
         fe_binary,
@@ -286,7 +328,67 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         config_overlay: launch_config.config_overlay,
         native_trust_fixture: launch_config.native_trust_fixture,
     };
-    let handle = if let Some(clock) = exact_mysql_clock {
+    if bounded_original
+        && (launch_config.native_root_reply_fault.is_some()
+            || !launch_config
+                .native_fault_proxies
+                .backend_retained_byte_limits
+                .is_empty())
+    {
+        return finish_exact_mysql_scenario(
+            Some(anyhow::anyhow!(
+                "original exact/neutral config freeze requires direct original roles"
+            )),
+            Ok(()),
+            scenario.teardown(),
+        );
+    }
+    let handle = if let Some(plan) = test_sessions {
+        let prepared_check =
+            |artifact: &novarocks_cluster_harness::EffectiveLaunchConfigEvidence| -> Result<()> {
+                anyhow::ensure!(
+                    std::time::Instant::now() < original_deadline,
+                    "original system preparation deadline expired"
+                );
+                if bounded_original {
+                    scenario.freeze_prepared_exact_config(
+                        artifact,
+                        &scenario_root,
+                        original_deadline,
+                    )?;
+                }
+                Ok(())
+            };
+        let log_check = |role: &str,
+                         source: &novarocks_cluster_harness::ManagedProcessLogSource|
+         -> Result<()> {
+            anyhow::ensure!(
+                std::time::Instant::now() < original_deadline,
+                "original system log source deadline expired"
+            );
+            let (device, inode) = source.original_durable_log_identity()?;
+            scenario.observe_original_durable_log_owner(role, device, inode)
+        };
+        CrossProcessServerHandle::launch_with_test_sessions_and_checks(
+            cluster_options,
+            plan,
+            launch_config.native_fault_proxies,
+            launch_config.native_root_reply_fault,
+            bounded_original.then_some(
+                &prepared_check
+                    as &dyn Fn(
+                        &novarocks_cluster_harness::EffectiveLaunchConfigEvidence,
+                    ) -> Result<()>,
+            ),
+            config.held_live_collector_fences.then_some(
+                &log_check
+                    as &dyn Fn(
+                        &str,
+                        &novarocks_cluster_harness::ManagedProcessLogSource,
+                    ) -> Result<()>,
+            ),
+        )
+    } else if let Some(clock) = exact_mysql_clock {
         if launch_config.native_root_reply_fault.is_some()
             || !launch_config
                 .native_fault_proxies
@@ -400,6 +502,7 @@ fn run_one(scenario: &dyn Scenario, config: &RunnerConfig) -> Result<()> {
         handle,
         scenario_root,
         config.timeout,
+        original_deadline,
         config.binary.clone(),
         config.compatible_binary.clone(),
         config.other_island_binary.clone(),
@@ -816,6 +919,8 @@ mod exact_mysql_prelaunch_teardown_tests {
         let root =
             std::env::temp_dir().join(format!("novarocks-exact-prelaunch-{}", std::process::id()));
         let mut config = RunnerConfig {
+            ordinary_binary: None,
+            test_control_binary: None,
             binary: root.join("deliberately-no-binary"),
             compatible_binary: None,
             other_island_binary: None,
@@ -972,6 +1077,8 @@ mod neutral_root_prelaunch_tests {
     }
     fn configuration(root: &std::path::Path) -> RunnerConfig {
         RunnerConfig {
+            ordinary_binary: None,
+            test_control_binary: None,
             binary: root.join("no-binary"),
             compatible_binary: None,
             other_island_binary: None,

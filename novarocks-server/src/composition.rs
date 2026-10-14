@@ -463,6 +463,9 @@ pub fn compose_backend_server_config(
     memory_authority: std::sync::Arc<novarocks_memory::MemoryAuthority>,
     runtime: tokio::runtime::Handle,
     scan_io: &ScanIoServices,
+    #[cfg(feature = "test-controls")] test_session: Option<
+        novarocks_failpoint::liveness::PreparedRoleSession,
+    >,
 ) -> anyhow::Result<BackendServerConfig> {
     crate::sdk_listing_profile::validate_current()?;
     config
@@ -499,7 +502,15 @@ pub fn compose_backend_server_config(
         .ok_or_else(|| anyhow::anyhow!("role=be requires [cluster].frontend_endpoint"))?
         .parse::<novarocks_types::NativeEndpoint>()
         .map_err(|error| anyhow::anyhow!("parse [cluster].frontend_endpoint: {error}"))?;
+    #[cfg(feature = "test-controls")]
+    let test_slots = crate::provider_test_slots::ProviderTestSlots::default();
     Ok(BackendServerConfig {
+        #[cfg(feature = "test-controls")]
+        test_session: test_session.map(|prepared| {
+            let slots = test_slots.clone();
+            novarocks_native_adapter::backend_test_session::BackendTestSessionConfig::new(prepared)
+                .with_provider_bind(std::sync::Arc::new(move |scope| slots.bind_backend(scope)))
+        }),
         bind_host: config.server.host.clone(),
         grpc_port: config.server.grpc_port,
         control_grpc_port,
@@ -573,8 +584,13 @@ pub fn compose_backend_server_config(
                 runtime_config.catalog_bind_provider_min_interval_ms,
             ),
         },
-        execution_role_binding_factories: provider_manifest
-            .compose_execution_factories(config, runtime, scan_io)?,
+        execution_role_binding_factories: provider_manifest.compose_execution_factories(
+            config,
+            runtime,
+            scan_io,
+            #[cfg(feature = "test-controls")]
+            &test_slots,
+        )?,
         static_plan_interpreter: static_plan.backend_interpreter()?,
         process_memory: backend_process_memory_observation(memory_authority),
     })
@@ -636,6 +652,9 @@ pub fn compose_frontend_role_config(
     provider_manifest: std::sync::Arc<ServerProviderManifest>,
     memory_authority: std::sync::Arc<novarocks_memory::MemoryAuthority>,
     runtime: tokio::runtime::Handle,
+    #[cfg(feature = "test-controls")] test_session: Option<
+        novarocks_failpoint::liveness::PreparedRoleSession,
+    >,
 ) -> anyhow::Result<FrontendRoleConfig> {
     crate::sdk_listing_profile::validate_current()?;
     let runtime_config = &config.runtime;
@@ -798,13 +817,27 @@ pub fn compose_frontend_role_config(
     .map_err(|error| anyhow::anyhow!("resolve MySQL listener settings: {error}"))?;
     let state_store_provider_registry = state_store_provider_registry(config)?;
     let state_store_input = state_store_input(config)?;
+    #[cfg(feature = "test-controls")]
+    let test_slots = crate::provider_test_slots::ProviderTestSlots::default();
+    #[cfg(feature = "test-controls")]
+    if let Some(prepared) = test_session {
+        let slots = test_slots.clone();
+        execution = execution.with_test_session(
+            novarocks_frontend_application::test_session::FrontendTestSessionConfig::new(prepared)
+                .with_provider_bind(std::sync::Arc::new(move |scope| slots.bind_frontend(scope))),
+        );
+    }
     Ok(FrontendRoleConfig {
         memory_authority: std::sync::Arc::clone(&memory_authority),
         application: FrontendApplicationOpenConfig {
             execution,
             backend_open,
-            connector_control_role_factories: provider_manifest
-                .compose_control_factories(config, runtime)?,
+            connector_control_role_factories: provider_manifest.compose_control_factories(
+                config,
+                runtime,
+                #[cfg(feature = "test-controls")]
+                &test_slots,
+            )?,
             state_store_input,
             state_store_provider_registry,
             native_trust: std::sync::Arc::clone(native_trust.trust()),
@@ -817,24 +850,7 @@ pub fn compose_frontend_role_config(
             memory_authority: std::sync::Arc::clone(&memory_authority),
             process_memory: Some(frontend_process_memory_observation()),
             #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            hms_listing_observation: provider_manifest.hms_listing_probe().map(|probe| {
-                let selected = std::sync::Arc::clone(&probe);
-                novarocks_frontend_application::HmsListingObservationSetup::new(
-                    std::sync::Arc::new(move |body: &[u8]| probe.handle_json(body)),
-                    std::sync::Arc::new(move |observation| {
-                        selected
-                            .captured_admission_owner(&observation.instance_id)
-                            .map(|owner| {
-                                owner.map(|(handle, incarnation)| {
-                                    novarocks_frontend_application::HmsAdmissionInstalledOwner {
-                                        handle,
-                                        incarnation,
-                                    }
-                                })
-                            })
-                    }),
-                )
-            }),
+            hms_listing_observation: None,
         },
         serving: FrontendServingConfig {
             report_bind_host: config.server.host.clone(),
@@ -1180,7 +1196,7 @@ pub(crate) fn compose_paimon_execution_access_factory(
     ))
 }
 
-fn compose_paimon_access_factory_with_resources(
+pub(crate) fn compose_paimon_access_factory_with_resources(
     config: &NovaRocksConfig,
     role: ClusterRole,
     resources: FsAccessResources,

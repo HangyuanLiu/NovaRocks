@@ -58,11 +58,12 @@ pub(crate) fn launch_server(
     repo_root: &Path,
     runner_config: &RunnerConfig,
     launch_profile: LaunchProfile,
+    test_sessions: Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>,
 ) -> Result<Box<dyn ServerHandle>> {
     match mode {
         ClusterMode::AllInOne => Ok(Box::new(NoopServerHandle)),
-        ClusterMode::CrossProcess => Ok(Box::new(CrossProcessServerHandle::launch(
-            CrossProcessClusterOptions {
+        ClusterMode::CrossProcess => {
+            let options = CrossProcessClusterOptions {
                 binary: discover_novarocks_binary(repo_root)?,
                 fe_binary: None,
                 be_binaries: Vec::new(),
@@ -72,15 +73,15 @@ pub(crate) fn launch_server(
                 cluster_size,
                 launch_profile,
                 startup_timeout: startup_timeout(),
-                child_environment: if launch_profile == LaunchProfile::FaultScenario {
-                    novarocks_cluster_harness::statement_lifecycle_observation_environment()?
-                } else {
-                    resolve_fixture_credential_environment()?
-                },
+                child_environment: resolve_fixture_credential_environment()?,
                 config_overlay: resolve_role_scoped_connector_overlay()?,
                 native_trust_fixture: Default::default(),
-            },
-        )?)),
+            };
+            Ok(Box::new(match test_sessions {
+                Some(plan) => CrossProcessServerHandle::launch_with_test_sessions(options, plan)?,
+                None => CrossProcessServerHandle::launch(options)?,
+            }))
+        }
     }
 }
 
@@ -173,6 +174,20 @@ pub(crate) fn discover_novarocks_binary(repo_root: &Path) -> Result<PathBuf> {
         repo_root,
         std::env::var_os("NOVAROCKS_BIN").map(PathBuf::from),
     )
+}
+
+pub(crate) fn discover_controlled_novarocks_binary(repo_root: &Path) -> Result<PathBuf> {
+    let path = std::env::var_os("NOVAROCKS_TEST_CONTROL_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root.join("target/test-controls/dev-opt/novarocks"));
+    if path.is_file() {
+        Ok(path)
+    } else {
+        bail!(
+            "controlled SQL requires NOVAROCKS_TEST_CONTROL_BIN with an actual test-controls binary; missing {}",
+            path.display()
+        )
+    }
 }
 
 pub(crate) fn discover_novarocks_binary_with_override(
@@ -277,7 +292,7 @@ fn connector_overlay_from_config(source: &str) -> Result<Option<String>> {
         .context("serialize backend connector overlay")
 }
 
-fn startup_timeout() -> Duration {
+pub(crate) fn startup_timeout() -> Duration {
     startup_timeout_from_env(
         std::env::var("NOVAROCKS_STARTUP_TIMEOUT_SECS")
             .ok()

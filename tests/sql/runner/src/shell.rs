@@ -38,44 +38,143 @@ pub fn execute_shell_step(sql: &str) -> (bool, Option<QueryExecution>, String) {
     execute_command(Command::new("sh").arg("-c").arg(cmd))
 }
 
+/// The controlled caller supplies its existing absolute scenario clock.
+pub(crate) fn execute_shell_step_until(
+    sql: &str,
+    deadline: Option<Instant>,
+) -> (bool, Option<QueryExecution>, String) {
+    let Some(deadline) = deadline else {
+        return execute_shell_step(sql);
+    };
+    #[cfg(not(unix))]
+    {
+        let _ = deadline;
+        return (
+            false,
+            None,
+            "bounded shell commands require Unix process ownership".into(),
+        );
+    }
+    #[cfg(unix)]
+    {
+        let started = Instant::now();
+        let directory = match tempfile::Builder::new()
+            .prefix("nr-sql-shell-")
+            .tempdir_in("/tmp")
+        {
+            Ok(directory) => directory,
+            Err(error) => return (false, None, format!("prepare shell output: {error}")),
+        };
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            sql.trim_start()
+                .strip_prefix("shell:")
+                .expect("shell step")
+                .trim(),
+        );
+        let capture = (|| -> anyhow::Result<_> {
+            use std::os::unix::fs::OpenOptionsExt;
+            let stdout = std::fs::OpenOptions::new()
+                .write(true)
+                .read(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(directory.path().join("stdout"))?;
+            let stderr = std::fs::OpenOptions::new()
+                .write(true)
+                .read(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(directory.path().join("stderr"))?;
+            novarocks_test_support::capture_command_until(command, stdout, stderr, deadline)
+        })();
+        match capture {
+            Ok(outcome) => {
+                let timed_out = outcome.timed_out || Instant::now() >= deadline;
+                let failures = outcome.failures;
+                let result = render_command_output(outcome.output, started.elapsed());
+                if timed_out || Instant::now() >= deadline || !failures.is_empty() {
+                    let path = directory.keep();
+                    return (
+                        false,
+                        result.1,
+                        format!(
+                            "shell original deadline expired={timed_out}; cleanup={failures:?}; actual output retained at {}",
+                            path.display()
+                        ),
+                    );
+                }
+                if !result.0 {
+                    let path = directory.keep();
+                    return (
+                        result.0,
+                        result.1,
+                        format!(
+                            "{}\nactual shell output retained at {}",
+                            result.2,
+                            path.display()
+                        ),
+                    );
+                }
+                result
+            }
+            Err(error) => {
+                let path = directory.keep();
+                (
+                    false,
+                    None,
+                    format!(
+                        "bounded shell command failed: {error:#}; original output retained at {}",
+                        path.display()
+                    ),
+                )
+            }
+        }
+    }
+}
+
+fn render_command_output(
+    out: std::process::Output,
+    elapsed: std::time::Duration,
+) -> (bool, Option<QueryExecution>, String) {
+    let code = out.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout_trimmed = stdout.trim_end_matches('\n');
+    let text = if stdout_trimmed.is_empty() {
+        code.to_string()
+    } else {
+        format!("{code}\n{stdout_trimmed}")
+    };
+    let (header, rows) = parse_output(&text);
+    let execution = QueryExecution {
+        text_output: text,
+        header,
+        rows,
+        elapsed,
+    };
+    if out.status.success() {
+        (true, Some(execution), String::new())
+    } else {
+        (
+            false,
+            Some(execution),
+            format!(
+                "shell command exited with status {code}\nstdout:\n{}\nstderr:\n{}",
+                stdout.trim_end(),
+                stderr.trim_end()
+            ),
+        )
+    }
+}
+
 fn execute_command(command: &mut Command) -> (bool, Option<QueryExecution>, String) {
     let started = Instant::now();
     let result = command.output();
     let elapsed = started.elapsed();
 
     match result {
-        Ok(out) => {
-            let code = out.status.code().unwrap_or(-1);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let stdout_trimmed = stdout.trim_end_matches('\n');
-            let text = if stdout_trimmed.is_empty() {
-                code.to_string()
-            } else {
-                format!("{}\n{}", code, stdout_trimmed)
-            };
-            let (header, rows) = parse_output(&text);
-            let execution = QueryExecution {
-                text_output: text,
-                header,
-                rows,
-                elapsed,
-            };
-
-            if out.status.success() {
-                (true, Some(execution), String::new())
-            } else {
-                (
-                    false,
-                    Some(execution),
-                    format!(
-                        "shell command exited with status {code}\nstdout:\n{}\nstderr:\n{}",
-                        stdout.trim_end(),
-                        stderr.trim_end(),
-                    ),
-                )
-            }
-        }
+        Ok(out) => render_command_output(out, elapsed),
         Err(err) => (false, None, format!("failed to start shell command: {err}")),
     }
 }
@@ -121,5 +220,62 @@ mod tests {
         assert!(!ok);
         assert!(execution.is_none());
         assert!(error.contains("failed to start shell command"), "{error}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod bounded_tests {
+    use super::*;
+    use std::time::Duration;
+    #[test]
+    fn foreground_golden_is_identical_with_complete_large_stdout_and_stderr() {
+        let sql = "shell: printf 'head\n'; i=0; while [ $i -lt 12000 ]; do printf x; printf y >&2; i=$((i+1)); done; printf tail";
+        let ordinary = execute_shell_step(sql);
+        let bounded = execute_shell_step_until(sql, Some(Instant::now() + Duration::from_secs(5)));
+        assert!(ordinary.0 && bounded.0, "{}", bounded.2);
+        assert_eq!(
+            ordinary.1.unwrap().text_output,
+            bounded.1.unwrap().text_output
+        );
+    }
+    #[test]
+    fn nonzero_and_signal_status_remain_failures_with_original_diagnostics() {
+        let result = execute_shell_step_until(
+            "shell: printf 'OUT'; printf 'ERR' >&2; exit 7",
+            Some(Instant::now() + Duration::from_secs(2)),
+        );
+        assert!(!result.0);
+        assert_eq!(result.1.unwrap().text_output, "7\nOUT");
+        assert!(result.2.contains("status 7") && result.2.contains("ERR"));
+        let signal = execute_shell_step_until(
+            "shell: kill -TERM $$",
+            Some(Instant::now() + Duration::from_secs(2)),
+        );
+        assert!(!signal.0);
+        assert_eq!(signal.1.unwrap().text_output, "-1");
+    }
+    #[test]
+    fn expired_clock_never_spawns_and_timeout_stops_the_owned_group() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let marker = directory.path().join("spawned");
+        let sql = format!("shell: printf created > '{}'", marker.display());
+        let result = execute_shell_step_until(&sql, Some(Instant::now()));
+        assert!(!result.0);
+        assert!(!marker.exists());
+        let later = directory.path().join("late-descendant");
+        let sql = format!(
+            "shell: (sleep 0.3; printf late > '{}') & wait",
+            later.display()
+        );
+        let began = Instant::now();
+        let deadline = began + Duration::from_millis(50);
+        let result = execute_shell_step_until(&sql, Some(deadline));
+        assert!(!result.0 && result.2.contains("deadline"), "{}", result.2);
+        assert!(began.elapsed() < Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            !later.exists(),
+            "the created descendant must not outlive actual group cleanup"
+        );
     }
 }

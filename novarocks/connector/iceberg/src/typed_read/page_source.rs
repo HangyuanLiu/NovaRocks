@@ -558,43 +558,37 @@ fn consult_dynamic_filter(
     DynamicFilterVerdict::ReadEverything
 }
 
-/// Whether this build emits connector-reader evidence markers.
-///
-/// This mirrors the backend's `debug_emit_connector_reader_marker` gate: same
-/// variable, and compiled out of release builds so a production binary cannot
-/// print one. A connector must not depend on the backend crate, so the gate is
-/// restated rather than imported.
-#[cfg(debug_assertions)]
-fn connector_reader_marker_enabled() -> bool {
-    std::env::var_os("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER").is_some()
-}
-
-#[cfg(not(debug_assertions))]
-const fn connector_reader_marker_enabled() -> bool {
-    false
-}
-
 /// Report one pruned row group by identity only.
 ///
 /// The marker carries the scheduled-split sequence, the row-group ordinal, and
 /// the checkpoint that decided. It never carries a bound, a value, or anything
 /// else derived from the filter's key material.
+#[cfg(feature = "test-controls")]
 fn emit_row_group_pruned_marker(
+    binding: &IcebergReadBinding,
     row_group: DynamicFilterRowGroupId,
     checkpoint: DynamicFilterCheckpoint,
 ) {
-    if !connector_reader_marker_enabled() {
+    let Some(slot) = binding.test_observation() else {
         return;
-    }
+    };
+    let Some(scope) = binding
+        .request_context()
+        .and_then(|context| context.range_scope())
+    else {
+        return;
+    };
     let checkpoint = match checkpoint {
         DynamicFilterCheckpoint::Footer => "footer",
         DynamicFilterCheckpoint::FirstRowGroup => "first_row_group",
         DynamicFilterCheckpoint::NextRowGroup => "next_row_group",
     };
+    slot.reader(scope, || {
     println!(
         "NOVAROCKS_RUNTIME_FILTER_ROW_GROUP_PRUNED scheduled_split_sequence_id={} row_group_ordinal={} checkpoint={checkpoint}",
         row_group.scheduled_split_sequence_id, row_group.row_group_ordinal
     );
+    });
 }
 
 /// The half-open absolute row-position window a split actually read.
@@ -1648,10 +1642,11 @@ impl IcebergParquetPageSource {
     }
 
     /// Log and report the row groups this split proved it need not read.
-    fn record_pruned(&mut self, ordinals: &[u32], checkpoint: DynamicFilterCheckpoint) {
+    fn record_pruned(&mut self, ordinals: &[u32], _checkpoint: DynamicFilterCheckpoint) {
         for ordinal in ordinals {
             let row_group = self.dynamic_filter.row_group(*ordinal);
-            emit_row_group_pruned_marker(row_group, checkpoint);
+            #[cfg(feature = "test-controls")]
+            emit_row_group_pruned_marker(&self.access_binding, row_group, _checkpoint);
             self.pruned_row_groups.push(row_group);
         }
     }

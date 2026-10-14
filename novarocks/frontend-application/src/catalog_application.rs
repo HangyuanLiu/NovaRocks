@@ -128,7 +128,7 @@ pub struct CatalogRuntimeProjection {
     query_catalog: Mutex<Option<QueryCatalogBinding>>,
     admission_observers: Mutex<Vec<std::sync::Weak<dyn CatalogAdmissionObserver>>>,
     #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    admission_completion: Arc<admission_completion::AdmissionCompletion>,
+    admission_completion: Mutex<Option<Arc<admission_completion::AdmissionCompletion>>>,
 }
 
 impl CatalogRuntimeProjection {
@@ -137,12 +137,32 @@ impl CatalogRuntimeProjection {
         &self,
         selector: admission_completion::OwnerSelector,
     ) -> Result<(), &'static str> {
-        self.admission_completion.bind_selector(selector)
+        let mut installed = self
+            .admission_completion
+            .lock()
+            .map_err(|_| "HMS admission slot lock failed")?;
+        if installed.is_some() {
+            return Err("HMS admission selector already bound");
+        }
+        let owner = admission_completion::AdmissionCompletion::new();
+        owner.bind_selector(selector)?;
+        *installed = Some(owner);
+        Ok(())
     }
 
     #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub fn hms_admission_completion(&self) -> Arc<admission_completion::AdmissionCompletion> {
-        Arc::clone(&self.admission_completion)
+    pub fn hms_admission_completion(
+        &self,
+    ) -> Option<Arc<admission_completion::AdmissionCompletion>> {
+        self.admission_completion.lock().ok()?.clone()
+    }
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub(crate) fn close_hms_admission_observation(&self) {
+        if let Ok(mut slot) = self.admission_completion.lock() {
+            if let Some(owner) = slot.take() {
+                owner.close();
+            }
+        }
     }
 
     pub fn new() -> Arc<Self> {
@@ -151,7 +171,7 @@ impl CatalogRuntimeProjection {
             query_catalog: Mutex::new(None),
             admission_observers: Mutex::new(Vec::new()),
             #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            admission_completion: admission_completion::AdmissionCompletion::new(),
+            admission_completion: Mutex::new(None),
         })
     }
 
@@ -202,9 +222,10 @@ impl CatalogRuntimeProjection {
             .ok()
             .and_then(|published| published.get(instance_id).cloned());
         #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        let sweep = observed
-            .as_ref()
-            .and_then(|observation| self.admission_completion.queue(observation));
+        let sweep = observed.as_ref().and_then(|observation| {
+            self.hms_admission_completion()
+                .and_then(|owner| owner.queue(observation))
+        });
         for observer in observers.iter().filter_map(std::sync::Weak::upgrade) {
             #[cfg(feature = "mem-1-m07-hms-listing-observe")]
             if let Some(observation) = observed.as_ref() {
@@ -365,7 +386,9 @@ impl CatalogRuntimePublisherSink for CatalogRuntimeProjection {
         {
             published.remove(instance_id);
             #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            self.admission_completion.retired(instance_id, generation);
+            if let Some(owner) = self.hms_admission_completion() {
+                owner.retired(instance_id, generation);
+            }
             // Revoking the SQL name before the caller retires its local
             // generation is what stops new admission for a dropped catalog.
             if let Some(binding) = self

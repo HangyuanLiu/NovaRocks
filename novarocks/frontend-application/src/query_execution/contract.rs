@@ -215,6 +215,9 @@ pub enum DistributedQueryIntent {
 /// unrelated prepared/native artifacts or replace its cancellation/completion
 /// capabilities.
 pub struct DistributedQueryRequest {
+    #[cfg(feature = "test-controls")]
+    test_statement_nomination:
+        Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
     result_capacity:
         Option<novarocks_query_application::admitted_query_context::QueryResultCapacityBinding>,
     cow_match: Option<crate::query_execution::row_mutation::CowMatchRootConsumer>,
@@ -260,6 +263,8 @@ impl RestartableReadExecution {
         execution: &QueryExecutionContext,
     ) -> DistributedQueryRequest {
         DistributedQueryRequest {
+            #[cfg(feature = "test-controls")]
+            test_statement_nomination: execution.test_statement_nomination().cloned(),
             result_capacity: execution.result_capacity().cloned(),
             cow_match: None,
             payload: DistributedQueryPayload::RestartableRead(Arc::clone(self)),
@@ -389,6 +394,8 @@ impl DistributedQueryRequest {
             } => (description, artifacts, options),
         };
         DistributedQueryRequestParts {
+            #[cfg(feature = "test-controls")]
+            test_statement_nomination: self.test_statement_nomination,
             result_capacity: self.result_capacity,
             cow_match: self.cow_match,
             description,
@@ -408,6 +415,9 @@ impl DistributedQueryRequest {
 /// Consuming frontend handoff. There is deliberately no constructor,
 /// `Clone`, or inverse recombination API.
 pub struct DistributedQueryRequestParts {
+    #[cfg(feature = "test-controls")]
+    pub(crate) test_statement_nomination:
+        Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
     pub(crate) result_capacity:
         Option<novarocks_query_application::admitted_query_context::QueryResultCapacityBinding>,
     pub(crate) cow_match: Option<crate::query_execution::row_mutation::CowMatchRootConsumer>,
@@ -478,6 +488,8 @@ pub(crate) fn build_request_from_finalized_execution(
         }
     };
     Ok(DistributedQueryRequest {
+        #[cfg(feature = "test-controls")]
+        test_statement_nomination: execution.test_statement_nomination().cloned(),
         result_capacity: execution.result_capacity().cloned(),
         cow_match: None,
         payload,

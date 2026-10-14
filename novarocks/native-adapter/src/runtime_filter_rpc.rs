@@ -22,10 +22,10 @@ use std::sync::Arc;
 use novarocks_execution::runtime_filter::{
     PartitionId, RuntimeFilterBindingId, RuntimeFilterChannelId,
 };
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
 use novarocks_proto_models as proto;
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 use novarocks_types::QueryId;
 use novarocks_types::UniqueId;
 
@@ -38,18 +38,24 @@ use novarocks_worker::runtime_filter::domain::{
 /// lifecycle registry owns the later install/routing authorization; this port
 /// only receives a wire-valid envelope and reports its exact ACK disposition.
 pub trait BackendRuntimeFilterEnvelopeIngress: Send + Sync {
+    #[cfg(feature = "test-controls")]
+    fn test_controls(&self) -> Option<std::sync::Arc<crate::test_controls::NativeTestControls>> {
+        None
+    }
+
     fn accept(&self, envelope: BackendNativeRuntimeFilterEnvelope) -> BackendIngressResult;
 
     /// Arms a debug-only rendezvous on the exact participant that just
     /// accepted a Contribution whose response will be dropped. The normal
     /// production protocol has no such hold: it exists only so the system
     /// scenario can prove the exact retry reaches a still-live receiver.
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     fn arm_accepted_contribution_retry_rendezvous(
         &self,
         _participant: BackendParticipantIdentity,
         _channel_id: RuntimeFilterChannelId,
         _route: BackendNativeContributionRouteIdentity,
+        _claim: crate::test_controls::NativeFaultClaim,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -486,6 +492,7 @@ pub fn handle_runtime_filter_envelope(
 
     let acked_route_identity = Some(route_identity);
     let result = ingress.accept(envelope);
+    #[cfg(feature = "test-controls")]
     if drop_accepted_contribution_response(
         ingress.as_ref(),
         &result,
@@ -528,7 +535,7 @@ pub fn handle_runtime_filter_envelope(
 /// admitted a Contribution.  The token is consumed before the error is
 /// returned, so the exact retry reaches the ordinary domain dedupe owner and
 /// receives its Duplicate acknowledgement.
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 #[expect(
     clippy::result_large_err,
     reason = "The native transport adapter returns tonic status directly."
@@ -546,28 +553,17 @@ fn drop_accepted_contribution_response(
     {
         return Ok(false);
     }
-    let Some(root) = novarocks_failpoint::configured_root() else {
+    let Some(controls) = ingress.test_controls() else {
         return Ok(false);
     };
     let execution_id = runtime_filter_fault_execution_id(query_id, deployment_epoch)?;
-    let (_scope, rendezvous) = if let Some(scope) = novarocks_failpoint::claim_matching_receiver_agnostic_fault(
-        &root,
-        novarocks_failpoint::QueryLifecycleFaultKind::RuntimeFilterContributionAckDropRendezvous,
-        execution_id,
-    )
-    .map_err(tonic::Status::failed_precondition)? {
-        (scope, true)
-    } else {
-        let Some(scope) = novarocks_failpoint::claim_matching_receiver_agnostic_fault(
-            &root,
-            novarocks_failpoint::QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,
-            execution_id,
-        )
-        .map_err(tonic::Status::failed_precondition)? else {
-            return Ok(false);
-        };
-        (scope, false)
+    let (scope,rendezvous)=if let Some(scope)=controls.claim_receiver(novarocks_failpoint::QueryLifecycleFaultKind::RuntimeFilterContributionAckDropRendezvous,execution_id).map_err(tonic::Status::failed_precondition)?{(scope,true)}else{
+        let Some(scope)=controls.claim_receiver(novarocks_failpoint::QueryLifecycleFaultKind::RuntimeFilterContributionAckDrop,execution_id).map_err(tonic::Status::failed_precondition)? else{return Ok(false);};
+        (scope,false)
     };
+    scope
+        .record_hit()
+        .map_err(tonic::Status::failed_precondition)?;
     if rendezvous {
         ingress
             .arm_accepted_contribution_retry_rendezvous(
@@ -577,13 +573,14 @@ fn drop_accepted_contribution_response(
                     BackendNativeRouteIdentity::Contribution(route) => route,
                     _ => unreachable!("only contribution routes reach the ACK-drop rendezvous"),
                 },
+                scope,
             )
             .map_err(tonic::Status::failed_precondition)?;
     }
     Ok(true)
 }
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 #[expect(
     clippy::result_large_err,
     reason = "The native transport adapter returns tonic status directly."
@@ -605,19 +602,6 @@ fn runtime_filter_fault_execution_id(
             "runtime filter fault execution identity is invalid: {error}"
         ))
     })
-}
-
-#[cfg(not(debug_assertions))]
-fn drop_accepted_contribution_response(
-    _ingress: &dyn BackendRuntimeFilterEnvelopeIngress,
-    _result: &BackendIngressResult,
-    _kind: BackendEnvelopeKind,
-    _query_id: UniqueId,
-    _deployment_epoch: u64,
-    _channel_id: RuntimeFilterChannelId,
-    _route: BackendNativeRouteIdentity,
-) -> Result<bool, tonic::Status> {
-    Ok(false)
 }
 
 #[expect(
@@ -841,15 +825,15 @@ mod tests {
         BackendTransportSequence as ProducerSequence,
     };
 
-    #[cfg(debug_assertions)]
-    use super::runtime_filter_fault_execution_id;
     use super::{
         BackendNativeContributionRouteIdentity, BackendNativeRouteIdentity,
         BackendNativeRuntimeFilterEnvelope as RuntimeFilterEnvelope,
         BackendRuntimeFilterEnvelopeIngress as RuntimeFilterEnvelopeIngress, decode_route_identity,
-        decode_runtime_filter_envelope_response, drop_accepted_contribution_response,
-        encode_runtime_filter_envelope, handle_runtime_filter_envelope,
+        decode_runtime_filter_envelope_response, encode_runtime_filter_envelope,
+        handle_runtime_filter_envelope,
     };
+    #[cfg(feature = "test-controls")]
+    use super::{drop_accepted_contribution_response, runtime_filter_fault_execution_id};
 
     #[derive(Debug)]
     struct RecordingIngress {
@@ -1325,7 +1309,7 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     #[test]
     fn contribution_ack_drop_fault_never_claims_non_accepted_or_non_contribution_results() {
         let query_id = UniqueId::new(11, 12);
@@ -1360,7 +1344,7 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     #[test]
     fn contribution_ack_drop_fault_uses_the_native_query_and_attempt_identity() {
         let execution_id = runtime_filter_fault_execution_id(UniqueId::new(11, 12), 14)

@@ -362,6 +362,9 @@ impl FrontendQueryCompiler {
         context: &RequestContext,
         query_options: Option<QueryOptions>,
         scope: &novarocks_workload_control::WorkScope,
+        #[cfg(feature = "test-controls")] rewrite_statement: Option<
+            &crate::mv::test_controls::MvRewriteStatementTarget,
+        >,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
         purpose.validate(statement)?;
         let connector_planning_context = connector_planning_context_for_query_on_runtime(
@@ -508,6 +511,8 @@ impl FrontendQueryCompiler {
                     context.execution(),
                     context,
                     scope,
+                    #[cfg(feature = "test-controls")]
+                    rewrite_statement,
                 )
             }
             _ => Err(FrontendQueryCompilerError::Engine(
@@ -668,6 +673,9 @@ impl FrontendQueryCompiler {
         execution: &QueryExecutionContext,
         context: &RequestContext,
         scope: &novarocks_workload_control::WorkScope,
+        #[cfg(feature = "test-controls")] rewrite_statement: Option<
+            &crate::mv::test_controls::MvRewriteStatementTarget,
+        >,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
         use novarocks_query_application::preparation::FinalPlanCompletionDriver;
 
@@ -766,7 +774,7 @@ impl FrontendQueryCompiler {
                 completed.candidate(),
             )
             .map_err(FrontendQueryCompilerError::Engine)?;
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "test-controls")]
         let selected_mv_rewrite = completed
             .candidate()
             .plan()
@@ -809,9 +817,19 @@ impl FrontendQueryCompiler {
                 ),
             )
             .map_err(FrontendQueryCompilerError::Engine)?;
-        #[cfg(debug_assertions)]
-        completed_mv_rewrite_test_barrier(selected_mv_rewrite)
-            .map_err(FrontendQueryCompilerError::Engine)?;
+        #[cfg(feature = "test-controls")]
+        if let Some(controls) = self.mv_readiness.test_controls() {
+            controls
+                .rewrite(
+                    current_catalog,
+                    current_database,
+                    query,
+                    selected_mv_rewrite,
+                    rewrite_statement,
+                    execution.cancellation(),
+                )
+                .map_err(FrontendQueryCompilerError::Engine)?;
+        }
         Ok(PreparedQueryOperation::LogicalRead(
             crate::query_execution::completion::PreparedLogicalRead::new(
                 description,
@@ -962,23 +980,26 @@ impl FrontendQueryCompiler {
                 std::time::Instant::now(),
                 encoding_control.clone(),
             );
+        let statement = StatementAdmissionContext::new(
+            current_catalog.map(str::to_string),
+            current_database.to_string(),
+            execution.role(),
+            execution.deadline(),
+            execution.cancellation().clone(),
+            execution.optimizer_settings().clone(),
+            execution.sql_semantics().clone(),
+        )
+        .with_optional_fold_dependency_observer(execution.fold_dependency_observer().cloned());
+        #[cfg(feature = "test-controls")]
+        let statement = statement
+            .with_test_statement_nomination(execution.test_statement_nomination().cloned())
+            .map_err(FrontendQueryCompilerError::Engine)?;
         let operation =
             PreparedQueryDistributedOperation::new(request, completion, logical_reservation)
                 .with_attempt_factory(Box::new(FrontendDistributedAttemptFactory {
                     logical_execution,
                     result_capacity: execution.result_capacity().cloned(),
-                    statement: StatementAdmissionContext::new(
-                        current_catalog.map(str::to_string),
-                        current_database.to_string(),
-                        execution.role(),
-                        execution.deadline(),
-                        execution.cancellation().clone(),
-                        execution.optimizer_settings().clone(),
-                        execution.sql_semantics().clone(),
-                    )
-                    .with_optional_fold_dependency_observer(
-                        execution.fold_dependency_observer().cloned(),
-                    ),
+                    statement,
                     profile_plan: plan,
                     profile_annotations: annotations,
                     profile_control: encoding_control,
@@ -1106,42 +1127,6 @@ impl FrontendQueryCompiler {
             planning_start,
         )
     }
-}
-
-/// System-test seam after one completed query plan, its wire encoding, read
-/// access and frozen description have been paired. A test may hold dispatch
-/// here while another statement publishes a newer MV snapshot.
-#[cfg(debug_assertions)]
-fn completed_mv_rewrite_test_barrier(selected_mv_rewrite: bool) -> Result<(), String> {
-    if !selected_mv_rewrite {
-        return Ok(());
-    }
-    let Some(directory) = std::env::var_os("NOVAROCKS_MVX4_REWRITE_TEST_DIR") else {
-        return Ok(());
-    };
-    let directory = std::path::PathBuf::from(directory);
-    let hold = directory.join("mvx4-rewrite-hold.trigger");
-    if !hold.exists() {
-        return Ok(());
-    }
-    let marker = directory.join("mvx4-completed-mv-target-frozen.marker");
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&marker)
-    {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-        Err(error) => return Err(format!("create frozen MV target marker: {error}")),
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    while hold.exists() {
-        if std::time::Instant::now() >= deadline {
-            return Err("timed out holding completed MV rewrite".to_string());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    Ok(())
 }
 
 fn query_options_for_explain_analyze(query_options: Option<QueryOptions>) -> QueryOptions {

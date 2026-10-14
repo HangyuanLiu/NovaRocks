@@ -9,8 +9,21 @@ publish = false
 workspace = true
 
 [features]
+normal-build = []
+test-controls = ["typed", "dep:tokio", "dep:libc", "dep:socket2"]
 default = ["typed"]
-typed = ["dep:novarocks-types"]
+typed = ["dep:novarocks-types", "dep:libc"]
 
 [dependencies]
 novarocks-types = { workspace = true, optional = true }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, optional = true, features = ["macros", "sync", "time"] }
+
+libc = { workspace = true, optional = true }
+
+socket2 = { version = "0.6.5", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }

@@ -16,8 +16,10 @@
 // under the License.
 
 mod be_log_directive;
+mod build_information;
 mod cluster;
 mod config;
+mod control_plan;
 mod dataset_fixture;
 mod extension_manifest;
 mod failure_artifacts;
@@ -32,7 +34,10 @@ mod results;
 mod runner;
 mod session;
 mod shell;
+#[cfg(unix)]
+mod socket_deadline;
 mod sql_error_codes;
+mod statement_controls;
 mod suite_manifest;
 mod types;
 
@@ -58,13 +63,13 @@ use crate::runner::{
     error_message_matches, extract_engine_error_code, extract_sql_error_code,
     extract_sql_error_location, parse_selector_list, summarize_connection,
 };
-use crate::session::{MysqlSession, drop_case_database, execute_suite_hook, reset_case_database};
+use crate::session::MysqlSession;
 use crate::sql_error_codes::{
     SqlErrorDescriptor, SqlErrorPhase, is_sql_error_code_token, lookup_sql_error_descriptor,
 };
 use crate::suite_manifest::select_suite_names;
 use crate::types::*;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{ArgAction, Parser, ValueEnum};
 use rayon::prelude::*;
 use regex::Regex;
@@ -570,6 +575,7 @@ fn execute_target_session_sql_with<S>(
 /// Shared, read-only context for running cases within a suite.
 struct SuiteRunContext {
     suite_name: String,
+    controls: Option<Arc<control_plan::SqlControlExecution>>,
     mode: Mode,
     record_from: RecordFrom,
     target_conn_base: ConnectionConfig,
@@ -626,6 +632,23 @@ struct CaseTiming {
     case_id: String,
     status: CaseStatus,
     elapsed: Duration,
+}
+
+/// Once-resolved inputs shared by prelaunch authorization and actual execution.
+struct PreparedSqlInputs {
+    suite_name: String,
+    sql_dir: PathBuf,
+    result_dir: Option<PathBuf>,
+    sql_glob: String,
+    suite_catalog_override: Option<String>,
+    target_db_default: String,
+    ref_db_default: String,
+    verify_enabled: bool,
+    query_timeout: u64,
+    cases: Vec<SqlCase>,
+    load_failures: Vec<CaseLoadFailure>,
+    suite_init_hook: Option<SuiteHook>,
+    suite_cleanup_hook: Option<SuiteHook>,
 }
 
 /// Everything needed to run a suite: context + prepared cases + hooks.
@@ -1266,30 +1289,6 @@ impl Drop for LifecycleStatementObservationGuard {
     }
 }
 
-fn arm_lifecycle_statement_observation(
-    meta: &QueryMeta,
-    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
-    connection_id: u32,
-    sql: &str,
-) -> Result<Option<LifecycleStatementObservationGuard>> {
-    if meta.query_lifecycle_structured_assertion.is_none() {
-        return Ok(None);
-    }
-    let statements = session::split_sql_statements(sql)?;
-    if statements.len() != 1 {
-        bail!("structured lifecycle assertions require exactly one submitted SQL statement");
-    }
-    let observation = server_handle
-        .lock()
-        .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?
-        .arm_query_lifecycle_statement_observation(connection_id, &statements[0])?;
-    Ok(Some(LifecycleStatementObservationGuard {
-        server_handle: Arc::clone(server_handle),
-        observation,
-        drained: false,
-    }))
-}
-
 fn await_lifecycle_statement_observation(
     meta: &QueryMeta,
     guard: &LifecycleStatementObservationGuard,
@@ -1496,13 +1495,99 @@ fn execute_target_query_with_fault(
     db: Option<&str>,
     fault_deadline: Option<Instant>,
 ) -> (bool, Option<QueryExecution>, String) {
+    execute_target_query_with_selected_control(
+        meta,
+        server_handle,
+        session,
+        query_timeout,
+        sql,
+        db,
+        fault_deadline,
+        None,
+        &mut None,
+    )
+}
+
+fn execute_target_query_with_selected_control(
+    meta: &QueryMeta,
+    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    session: &mut MysqlSession,
+    query_timeout: u64,
+    sql: &str,
+    db: Option<&str>,
+    fault_deadline: Option<Instant>,
+    selected: Option<(&control_plan::StepControl, usize, Instant)>,
+    guard: &mut Option<LifecycleStatementObservationGuard>,
+) -> (bool, Option<QueryExecution>, String) {
+    #[cfg(unix)]
+    let mut operation_owner = match fault_deadline
+        .map(|deadline| {
+            crate::socket_deadline::SocketDeadlineOwner::duplicate(
+                &session.conn,
+                session
+                    .original_deadline()
+                    .map_or(deadline, |original| deadline.min(original)),
+            )
+        })
+        .transpose()
+    {
+        Ok(owner) => owner,
+        Err(error) => {
+            return (
+                false,
+                None,
+                format!("FAIL (runner query socket deadline): {error:#}"),
+            );
+        }
+    };
     let query_timeout = bounded_fault_query_timeout(query_timeout, fault_deadline);
-    let result = fault_injection::execute_with_post_fragment_start_fault(
+    let mut result = fault_injection::execute_with_post_fragment_start_fault(
         meta,
         server_handle,
         Some(session.connection_id()),
         fault_deadline,
-        || session.execute_query(query_timeout, sql, db),
+        || {
+            session.execute_query_with_before_submit(
+                query_timeout,
+                sql,
+                db,
+                |transient, statement_index, connection_id, submitted| {
+                    let Some((control, outer, deadline)) = selected else {
+                        return Ok(());
+                    };
+                    let target = control
+                        .submissions
+                        .iter()
+                        .find(|target| {
+                            target.outer_attempt == outer
+                                && target.transient_attempt == transient
+                                && target.statement_index == statement_index
+                        })
+                        .context("actual SQL submission has no frozen control target")?;
+                    target.validate_sql(submitted)?;
+                    if let Some(mut previous) = guard.take() {
+                        previous.drain()?;
+                    }
+                    if control.needs_nomination {
+                        let observation = server_handle
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))?
+                            .arm_selected_statement_observation(
+                                &target.run_token,
+                                connection_id,
+                                submitted,
+                                deadline,
+                            )?;
+                        *guard = Some(LifecycleStatementObservationGuard {
+                            server_handle: Arc::clone(server_handle),
+                            observation,
+                            drained: false,
+                        });
+                    }
+                    Ok(())
+                },
+            )
+        },
     )
     .unwrap_or_else(|error| {
         (
@@ -1511,6 +1596,13 @@ fn execute_target_query_with_fault(
             format!("FAIL (runner fault injection): {error:#}"),
         )
     });
+    #[cfg(unix)]
+    if let Some(owner) = &mut operation_owner {
+        if let Err(error) = owner.close_and_join() {
+            result.0 = false;
+            result.2 = format!("{}; query socket owner cleanup: {error:#}", result.2);
+        }
+    }
     if meta.kill_fe_after_mv_known_committed_before_projector_cas
         || meta.kill_fe_after_be_log_contains.is_some()
     {
@@ -1552,6 +1644,7 @@ struct InflightPublicationFrontendKill<'a> {
     meta: &'a QueryMeta,
     server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
     session_config: ConnectionConfig,
+    original_deadline: Option<Instant>,
     session_to_reconnect: &'a mut MysqlSession,
     query_timeout: u64,
     sql: String,
@@ -1565,6 +1658,7 @@ struct InflightPublicationConcurrentShell<'a> {
     meta: &'a QueryMeta,
     server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
     session_config: ConnectionConfig,
+    original_deadline: Option<Instant>,
     query_timeout: u64,
     sql: String,
     db: Option<String>,
@@ -1578,6 +1672,7 @@ struct InflightPublicationServiceShell<'a> {
     meta: &'a QueryMeta,
     server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
     session_config: ConnectionConfig,
+    original_deadline: Option<Instant>,
     query_timeout: u64,
     sql: String,
     db: Option<String>,
@@ -1593,6 +1688,7 @@ fn execute_target_query_with_inflight_publication_service_shell(
         meta,
         server_handle,
         session_config,
+        original_deadline,
         query_timeout,
         sql,
         db,
@@ -1600,24 +1696,28 @@ fn execute_target_query_with_inflight_publication_service_shell(
         shell,
         log,
     } = request;
-    let deadline = Instant::now() + Duration::from_secs(query_timeout.saturating_add(10));
+    let action_deadline = Instant::now() + Duration::from_secs(query_timeout.saturating_add(10));
+    let deadline =
+        original_deadline.map_or(action_deadline, |original| original.min(action_deadline));
     let thread_meta = meta.clone();
     let thread_server = Arc::clone(server_handle);
-    let query_thread = std::thread::spawn(move || match MysqlSession::new(&session_config) {
-        Ok(mut session) => execute_target_query_with_fault(
-            &thread_meta,
-            &thread_server,
-            &mut session,
-            query_timeout,
-            &sql,
-            db.as_deref(),
-            Some(deadline),
-        ),
-        Err(error) => (
-            false,
-            None,
-            format!("FAIL (runner service hold): open query session: {error:#}"),
-        ),
+    let query_thread = std::thread::spawn(move || {
+        match MysqlSession::new_with_deadline(&session_config, Some(deadline)) {
+            Ok(mut session) => execute_target_query_with_fault(
+                &thread_meta,
+                &thread_server,
+                &mut session,
+                query_timeout,
+                &sql,
+                db.as_deref(),
+                Some(deadline),
+            ),
+            Err(error) => (
+                false,
+                None,
+                format!("FAIL (runner service hold): open query session: {error:#}"),
+            ),
+        }
     });
     if let Err(error) = hold.wait_until_held(deadline) {
         let _ = hold.release();
@@ -1635,7 +1735,8 @@ fn execute_target_query_with_inflight_publication_service_shell(
         log,
         "    @publication_service_hold post-requirements boundary reached"
     );
-    let (companion_ok, _, companion_error) = shell::execute_shell_step(&format!("shell: {shell}"));
+    let (companion_ok, _, companion_error) =
+        shell::execute_shell_step_until(&format!("shell: {shell}"), Some(deadline));
     if !companion_ok {
         let _ = hold.release();
         let _ = query_thread.join();
@@ -1690,6 +1791,7 @@ fn execute_target_query_while_publication_service_holds_shell(
         meta,
         server_handle,
         session_config,
+        original_deadline,
         query_timeout,
         sql,
         db,
@@ -1697,9 +1799,12 @@ fn execute_target_query_while_publication_service_holds_shell(
         shell,
         log,
     } = request;
-    let deadline = Instant::now() + Duration::from_secs(query_timeout.saturating_add(10));
+    let action_deadline = Instant::now() + Duration::from_secs(query_timeout.saturating_add(10));
+    let deadline =
+        original_deadline.map_or(action_deadline, |original| original.min(action_deadline));
     let shell = format!("shell: {shell}");
-    let shell_thread = std::thread::spawn(move || shell::execute_shell_step(&shell));
+    let shell_thread =
+        std::thread::spawn(move || shell::execute_shell_step_until(&shell, Some(deadline)));
     if let Err(error) = hold.wait_until_held(deadline) {
         let _ = hold.release();
         let _ = shell_thread.join();
@@ -1713,7 +1818,7 @@ fn execute_target_query_while_publication_service_holds_shell(
         log,
         "    @publication_service_hold external request reached post-requirements boundary"
     );
-    let query_result = match MysqlSession::new(&session_config) {
+    let query_result = match MysqlSession::new_with_deadline(&session_config, Some(deadline)) {
         Ok(mut session) => execute_target_query_with_fault(
             meta,
             server_handle,
@@ -1780,6 +1885,7 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
         meta,
         server_handle,
         session_config,
+        original_deadline,
         query_timeout,
         sql,
         db,
@@ -1788,26 +1894,30 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
         shell,
         log,
     } = request;
-    let deadline = fault_deadline
+    let action_deadline = fault_deadline
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(query_timeout.saturating_add(10)));
+    let deadline =
+        original_deadline.map_or(action_deadline, |original| original.min(action_deadline));
     let thread_meta = meta.clone();
     let thread_server = Arc::clone(server_handle);
     let query_timeout = bounded_fault_query_timeout(query_timeout, Some(deadline));
-    let query_thread = std::thread::spawn(move || match MysqlSession::new(&session_config) {
-        Ok(mut session) => execute_target_query_with_fault(
-            &thread_meta,
-            &thread_server,
-            &mut session,
-            query_timeout,
-            &sql,
-            db.as_deref(),
-            Some(deadline),
-        ),
-        Err(error) => (
-            false,
-            None,
-            format!("FAIL (runner publication hold): open query session: {error:#}"),
-        ),
+    let query_thread = std::thread::spawn(move || {
+        match MysqlSession::new_with_deadline(&session_config, Some(deadline)) {
+            Ok(mut session) => execute_target_query_with_fault(
+                &thread_meta,
+                &thread_server,
+                &mut session,
+                query_timeout,
+                &sql,
+                db.as_deref(),
+                Some(deadline),
+            ),
+            Err(error) => (
+                false,
+                None,
+                format!("FAIL (runner publication hold): open query session: {error:#}"),
+            ),
+        }
     });
 
     if let Err(error) = fault_guard.wait_until_entered(deadline) {
@@ -1830,7 +1940,8 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
         "    @publication_catalog_fault before-dispatch hold reached"
     );
 
-    let (companion_ok, _, companion_error) = shell::execute_shell_step(&format!("shell: {shell}"));
+    let (companion_ok, _, companion_error) =
+        shell::execute_shell_step_until(&format!("shell: {shell}"), Some(deadline));
     if !companion_ok {
         if fault_guard.release().is_ok() {
             let _ = query_thread.join();
@@ -1873,6 +1984,7 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
         meta,
         server_handle,
         session_config,
+        original_deadline,
         session_to_reconnect,
         query_timeout,
         sql,
@@ -1881,8 +1993,10 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
         fault_deadline,
         log,
     } = request;
-    let deadline = fault_deadline
+    let action_deadline = fault_deadline
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(query_timeout.saturating_add(10)));
+    let deadline =
+        original_deadline.map_or(action_deadline, |original| original.min(action_deadline));
     let be_count = match server_handle.lock() {
         Ok(server) => server.be_count(),
         Err(_) => {
@@ -1905,21 +2019,23 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
     let thread_meta = meta.clone();
     let thread_server = Arc::clone(server_handle);
     let query_timeout = bounded_fault_query_timeout(query_timeout, Some(deadline));
-    let query_thread = std::thread::spawn(move || match MysqlSession::new(&session_config) {
-        Ok(mut session) => execute_target_query_with_fault(
-            &thread_meta,
-            &thread_server,
-            &mut session,
-            query_timeout,
-            &sql,
-            db.as_deref(),
-            Some(deadline),
-        ),
-        Err(error) => (
-            false,
-            None,
-            format!("FAIL (runner publication hold): open query session: {error:#}"),
-        ),
+    let query_thread = std::thread::spawn(move || {
+        match MysqlSession::new_with_deadline(&session_config, Some(deadline)) {
+            Ok(mut session) => execute_target_query_with_fault(
+                &thread_meta,
+                &thread_server,
+                &mut session,
+                query_timeout,
+                &sql,
+                db.as_deref(),
+                Some(deadline),
+            ),
+            Err(error) => (
+                false,
+                None,
+                format!("FAIL (runner publication hold): open query session: {error:#}"),
+            ),
+        }
     });
 
     if let Err(error) = fault_guard.wait_until_downstream_successful_hold(deadline) {
@@ -2343,7 +2459,13 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 if role == "reference" && !ctx.reference_required {
                     continue;
                 }
-                if let Err(error) = drop_case_database(connection, ctx.query_timeout, db, role) {
+                if let Err(error) = session::drop_case_database_until(
+                    connection,
+                    ctx.query_timeout,
+                    db,
+                    role,
+                    ctx.controls.as_ref().map(|controls| controls.deadline),
+                ) {
                     let _ = writeln!(
                         log,
                         "    case cleanup failure {role} database={db}: {error:#}"
@@ -2354,11 +2476,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
     };
 
     for db_name in &case_dbs {
-        if let Err(exc) = reset_case_database(
+        if let Err(exc) = session::reset_case_database_until(
             &target_case_db_admin_conn,
             ctx.query_timeout,
             db_name,
             "target",
+            ctx.controls.as_ref().map(|controls| controls.deadline),
         ) {
             preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
             drop_all_case_dbs(ctx, &case_dbs, &mut log);
@@ -2379,11 +2502,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             };
         }
         if ctx.reference_required
-            && let Err(exc) = reset_case_database(
+            && let Err(exc) = session::reset_case_database_until(
                 &reference_case_db_admin_conn,
                 ctx.query_timeout,
                 db_name,
                 "reference",
+                ctx.controls.as_ref().map(|controls| controls.deadline),
             )
         {
             preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
@@ -2420,7 +2544,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         ..ctx.reference_conn_base.clone()
     };
 
-    let mut target_session = match MysqlSession::new(&case_target_conn) {
+    let mut target_session = match MysqlSession::new_with_deadline(
+        &case_target_conn,
+        ctx.controls.as_ref().map(|controls| controls.deadline),
+    ) {
         Ok(s) => s,
         Err(exc) => {
             preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
@@ -2444,7 +2571,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
     };
 
     let mut reference_session = if ctx.reference_required {
-        match MysqlSession::new(&case_reference_conn) {
+        match MysqlSession::new_with_deadline(
+            &case_reference_conn,
+            ctx.controls.as_ref().map(|controls| controls.deadline),
+        ) {
             Ok(s) => Some(s),
             Err(exc) => {
                 preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
@@ -2500,6 +2630,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
     // the next case that attaches a catalog onto the same warehouse, so a case
     // that skipped its own cleanup fails the ones after it.
     let mut cleanup_only = false;
+    let fault_cleanup_errors = fault_injection::FaultStepCleanupErrors::default();
 
     for step in &case.steps {
         if cleanup_only && !step.meta.cleanup {
@@ -2550,29 +2681,37 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         } else {
             None
         };
-        let mut structured_lifecycle_observation = match arm_lifecycle_statement_observation(
+        let selected_control = ctx
+            .controls
+            .as_ref()
+            .and_then(|controls| controls.step(&ctx.suite_name, &case.case_id, step.query_number));
+        let mut structured_lifecycle_observation: Option<LifecycleStatementObservationGuard> = None;
+        let query_lifecycle_fault_guard = fault_injection::query_lifecycle_fault_step_guard(
             &step.meta,
-            &ctx.server_handle,
-            target_session.connection_id(),
-            &step.sql,
-        ) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                case_failed = true;
-                let _ = writeln!(
-                    log,
-                    "    ❌ failed to arm exact statement lifecycle assertion: {error:#}"
-                );
-                break;
-            }
-        };
+            Arc::clone(&ctx.server_handle),
+            step.query_number,
+            fault_cleanup_errors.clone(),
+        );
+        let cleanup_fault_guard = fault_injection::cleanup_fault_step_guard(
+            &step.meta,
+            Arc::clone(&ctx.server_handle),
+            step.query_number,
+            fault_cleanup_errors.clone(),
+        );
         if fault_injection::has_fault(&step.meta) {
             let fault_result = ctx
                 .server_handle
                 .lock()
                 .map_err(|_| anyhow::anyhow!("server handle mutex is poisoned"))
                 .and_then(|mut server_handle| {
-                    fault_injection::apply_pre_query(&step.meta, server_handle.as_mut())
+                    fault_injection::apply_pre_query_with_token(
+                        &step.meta,
+                        server_handle.as_mut(),
+                        selected_control
+                            .and_then(|control| control.submissions.first())
+                            .map(|target| target.run_token.as_str()),
+                        ctx.controls.as_ref().map(|controls| controls.deadline),
+                    )
                 });
             if let Err(exc) = fault_result {
                 case_failed = true;
@@ -2584,12 +2723,6 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 break;
             }
         }
-        let _query_lifecycle_fault_guard = fault_injection::query_lifecycle_fault_step_guard(
-            &step.meta,
-            Arc::clone(&ctx.server_handle),
-        );
-        let _cleanup_fault_guard =
-            fault_injection::cleanup_fault_step_guard(&step.meta, Arc::clone(&ctx.server_handle));
         let orphan_fixture = match step.meta.iceberg_orphan_fixture.as_deref() {
             Some(table) => match iceberg_orphan_fixture::install(table) {
                 Ok(fixture) => {
@@ -2699,7 +2832,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
 
                 for attempt in 0..retry_count {
                     let (ok, execution, err_msg) = if shell::is_shell_step(&step.sql) {
-                        shell::execute_shell_step(&step.sql)
+                        shell::execute_shell_step_until(
+                            &step.sql,
+                            ctx.controls.as_ref().map(|controls| controls.deadline),
+                        )
                     } else if let Some(hold) = publication_service_hold.as_mut() {
                         let Some(concurrent_shell) =
                             step.meta.publication_catalog_concurrent_shell.as_deref()
@@ -2710,6 +2846,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             meta: &step.meta,
                             server_handle: &ctx.server_handle,
                             session_config: case_target_conn.clone(),
+                            original_deadline: ctx
+                                .controls
+                                .as_ref()
+                                .map(|controls| controls.deadline),
                             query_timeout: ctx.query_timeout,
                             sql: step.sql.clone(),
                             db: step.meta.db.clone(),
@@ -2745,6 +2885,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                 meta: &step.meta,
                                 server_handle: &ctx.server_handle,
                                 session_config: case_target_conn.clone(),
+                                original_deadline: ctx
+                                    .controls
+                                    .as_ref()
+                                    .map(|controls| controls.deadline),
                                 query_timeout: ctx.query_timeout,
                                 sql: step.sql.clone(),
                                 db: step.meta.db.clone(),
@@ -2769,6 +2913,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                 meta: &step.meta,
                                 server_handle: &ctx.server_handle,
                                 session_config: case_target_conn.clone(),
+                                original_deadline: ctx
+                                    .controls
+                                    .as_ref()
+                                    .map(|controls| controls.deadline),
                                 session_to_reconnect: &mut target_session,
                                 query_timeout: ctx.query_timeout,
                                 sql: step.sql.clone(),
@@ -2779,7 +2927,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             },
                         )
                     } else {
-                        execute_target_query_with_fault(
+                        execute_target_query_with_selected_control(
                             &step.meta,
                             &ctx.server_handle,
                             &mut target_session,
@@ -2787,6 +2935,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             &step.sql,
                             step.meta.db.as_deref(),
                             be_log_snapshot.evidence_deadline(),
+                            selected_control.map(|control| {
+                                (control, attempt, ctx.controls.as_ref().unwrap().deadline)
+                            }),
+                            &mut structured_lifecycle_observation,
                         )
                     };
                     let elapsed = execution
@@ -3197,9 +3349,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 for attempt in 0..retry_count {
                     let (ok, execution, err_msg) = if ctx.record_from == RecordFrom::Target {
                         if shell::is_shell_step(&step.sql) {
-                            shell::execute_shell_step(&step.sql)
+                            shell::execute_shell_step_until(
+                                &step.sql,
+                                ctx.controls.as_ref().map(|controls| controls.deadline),
+                            )
                         } else {
-                            execute_target_query_with_fault(
+                            execute_target_query_with_selected_control(
                                 &step.meta,
                                 &ctx.server_handle,
                                 &mut target_session,
@@ -3207,10 +3362,17 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                 &step.sql,
                                 step.meta.db.as_deref(),
                                 be_log_snapshot.evidence_deadline(),
+                                selected_control.map(|control| {
+                                    (control, attempt, ctx.controls.as_ref().unwrap().deadline)
+                                }),
+                                &mut structured_lifecycle_observation,
                             )
                         }
                     } else if shell::is_shell_step(&step.sql) {
-                        shell::execute_shell_step(&step.sql)
+                        shell::execute_shell_step_until(
+                            &step.sql,
+                            ctx.controls.as_ref().map(|controls| controls.deadline),
+                        )
                     } else {
                         reference_session
                             .as_mut()
@@ -3408,9 +3570,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             Mode::Diff => {
                 if let Some(expected_code) = step.meta.expect_error_code.as_deref() {
                     let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
-                        shell::execute_shell_step(&step.sql)
+                        shell::execute_shell_step_until(
+                            &step.sql,
+                            ctx.controls.as_ref().map(|controls| controls.deadline),
+                        )
                     } else {
-                        execute_target_query_with_fault(
+                        execute_target_query_with_selected_control(
                             &step.meta,
                             &ctx.server_handle,
                             &mut target_session,
@@ -3418,10 +3583,17 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             &step.sql,
                             step.meta.db.as_deref(),
                             be_log_snapshot.evidence_deadline(),
+                            selected_control.map(|control| {
+                                (control, 0, ctx.controls.as_ref().unwrap().deadline)
+                            }),
+                            &mut structured_lifecycle_observation,
                         )
                     };
                     let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
-                        shell::execute_shell_step(&step.sql)
+                        shell::execute_shell_step_until(
+                            &step.sql,
+                            ctx.controls.as_ref().map(|controls| controls.deadline),
+                        )
                     } else {
                         reference_session
                             .as_mut()
@@ -3459,9 +3631,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     // required to emit NovaRocks-owned descriptors, so Diff
                     // validates this branch against the target only.
                     let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
-                        shell::execute_shell_step(&step.sql)
+                        shell::execute_shell_step_until(
+                            &step.sql,
+                            ctx.controls.as_ref().map(|controls| controls.deadline),
+                        )
                     } else {
-                        execute_target_query_with_fault(
+                        execute_target_query_with_selected_control(
                             &step.meta,
                             &ctx.server_handle,
                             &mut target_session,
@@ -3469,6 +3644,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             &step.sql,
                             step.meta.db.as_deref(),
                             be_log_snapshot.evidence_deadline(),
+                            selected_control.map(|control| {
+                                (control, 0, ctx.controls.as_ref().unwrap().deadline)
+                            }),
+                            &mut structured_lifecycle_observation,
                         )
                     };
                     case_elapsed += execution_t
@@ -3492,9 +3671,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 } else if let Some(expected_error) = step.meta.expect_error.as_deref() {
                     let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
-                        shell::execute_shell_step(&step.sql)
+                        shell::execute_shell_step_until(
+                            &step.sql,
+                            ctx.controls.as_ref().map(|controls| controls.deadline),
+                        )
                     } else {
-                        execute_target_query_with_fault(
+                        execute_target_query_with_selected_control(
                             &step.meta,
                             &ctx.server_handle,
                             &mut target_session,
@@ -3502,10 +3684,17 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             &step.sql,
                             step.meta.db.as_deref(),
                             be_log_snapshot.evidence_deadline(),
+                            selected_control.map(|control| {
+                                (control, 0, ctx.controls.as_ref().unwrap().deadline)
+                            }),
+                            &mut structured_lifecycle_observation,
                         )
                     };
                     let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
-                        shell::execute_shell_step(&step.sql)
+                        shell::execute_shell_step_until(
+                            &step.sql,
+                            ctx.controls.as_ref().map(|controls| controls.deadline),
+                        )
                     } else {
                         reference_session
                             .as_mut()
@@ -3534,9 +3723,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 } else {
                     let (ok_t, execution_t, err_t) = if shell::is_shell_step(&step.sql) {
-                        shell::execute_shell_step(&step.sql)
+                        shell::execute_shell_step_until(
+                            &step.sql,
+                            ctx.controls.as_ref().map(|controls| controls.deadline),
+                        )
                     } else {
-                        execute_target_query_with_fault(
+                        execute_target_query_with_selected_control(
                             &step.meta,
                             &ctx.server_handle,
                             &mut target_session,
@@ -3544,6 +3736,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             &step.sql,
                             step.meta.db.as_deref(),
                             be_log_snapshot.evidence_deadline(),
+                            selected_control.map(|control| {
+                                (control, 0, ctx.controls.as_ref().unwrap().deadline)
+                            }),
+                            &mut structured_lifecycle_observation,
                         )
                     };
                     if !ok_t || execution_t.is_none() {
@@ -3558,7 +3754,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             unreachable!("checked above");
                         };
                         let (ok_r, execution_r, err_r) = if shell::is_shell_step(&step.sql) {
-                            shell::execute_shell_step(&step.sql)
+                            shell::execute_shell_step_until(
+                                &step.sql,
+                                ctx.controls.as_ref().map(|controls| controls.deadline),
+                            )
                         } else {
                             reference_session
                                 .as_mut()
@@ -3648,8 +3847,31 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             }
         }
 
+        for (action, result) in [
+            ("query lifecycle", query_lifecycle_fault_guard.finish()),
+            ("connector cleanup", cleanup_fault_guard.finish()),
+        ] {
+            if let Err(error) = result {
+                case_failed = true;
+                let _ = writeln!(log, "    ❌ {action} fault cleanup: {error:#}");
+                preserve_case_failure_snapshot(
+                    ctx,
+                    &case.case_id,
+                    Some(step.query_number),
+                    &mut log,
+                );
+            }
+        }
+
         if let Some(baseline) = resource_baseline {
-            let convergence_deadline = Instant::now() + Duration::from_secs(30);
+            let convergence_deadline = ctx.controls.as_ref().map_or(
+                Instant::now() + Duration::from_secs(30),
+                |controls| {
+                    controls
+                        .deadline
+                        .min(Instant::now() + Duration::from_secs(30))
+                },
+            );
             let resource_result = ctx
                 .server_handle
                 .lock()
@@ -3740,16 +3962,34 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
         preserve_case_failure_snapshot(ctx, &case.case_id, None, &mut log);
     }
 
+    for (query_number, error) in fault_cleanup_errors.take() {
+        case_failed = true;
+        let _ = writeln!(
+            log,
+            "    ❌ step {query_number} early-exit fault cleanup: {error}"
+        );
+        preserve_case_failure_snapshot(ctx, &case.case_id, Some(query_number), &mut log);
+    }
+
     // --- cleanup ---
-    drop(target_session);
-    drop(reference_session);
+    for (role, closed) in std::iter::once(("target", target_session.finish())).chain(
+        reference_session
+            .take()
+            .map(|session| ("reference", session.finish())),
+    ) {
+        if let Err(error) = closed {
+            case_failed = true;
+            let _ = writeln!(log, "    ❌ {role} MySQL socket owner cleanup: {error:#}");
+        }
+    }
 
     for db_name in &case_dbs {
-        if let Err(exc) = drop_case_database(
+        if let Err(exc) = session::drop_case_database_until(
             &target_case_db_admin_conn,
             ctx.query_timeout,
             db_name,
             "target",
+            ctx.controls.as_ref().map(|controls| controls.deadline),
         ) {
             case_failed = true;
             let _ = writeln!(
@@ -3759,11 +3999,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             );
         }
         if ctx.reference_required
-            && let Err(exc) = drop_case_database(
+            && let Err(exc) = session::drop_case_database_until(
                 &reference_case_db_admin_conn,
                 ctx.query_timeout,
                 db_name,
                 "reference",
+                ctx.controls.as_ref().map(|controls| controls.deadline),
             )
         {
             case_failed = true;
@@ -3855,7 +4096,15 @@ fn load_failure_outcomes(suite_name: &str, failures: &[CaseLoadFailure]) -> Vec<
 }
 
 fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) -> SuiteOutcome {
-    run_suite_with_hooks(ps, abort, stdout_lock, execute_suite_hook)
+    run_suite_with_hooks(ps, abort, stdout_lock, |conn, timeout, hook, label| {
+        session::execute_suite_hook_until(
+            conn,
+            timeout,
+            hook,
+            label,
+            ps.ctx.controls.as_ref().map(|controls| controls.deadline),
+        )
+    })
 }
 
 fn run_suite_with_hooks(
@@ -4031,16 +4280,28 @@ fn run_suite_with_hooks(
         }
 
         // Run parallel cases first.
-        outcomes.extend(
-            parallel_cases
-                .par_iter()
-                .map(|case| {
-                    let outcome = run_case(ctx, case, abort);
-                    report_outcome(&outcome);
-                    outcome
-                })
-                .collect::<Vec<CaseOutcome>>(),
-        );
+        if ctx
+            .controls
+            .as_ref()
+            .is_some_and(|controls| controls.has_restarts)
+        {
+            for case in &parallel_cases {
+                let outcome = run_case(ctx, case, abort);
+                report_outcome(&outcome);
+                outcomes.push(outcome);
+            }
+        } else {
+            outcomes.extend(
+                parallel_cases
+                    .par_iter()
+                    .map(|case| {
+                        let outcome = run_case(ctx, case, abort);
+                        report_outcome(&outcome);
+                        outcome
+                    })
+                    .collect::<Vec<CaseOutcome>>(),
+            );
+        }
 
         // Then run sequential cases one by one.
         for case in &sequential_cases {
@@ -4120,10 +4381,11 @@ fn format_case_timings(timings: &[CaseTiming]) -> String {
 }
 
 fn cases_have_fault_directives(cases: &[SqlCase]) -> bool {
-    cases
-        .iter()
-        .flat_map(|case| case.steps.iter())
-        .any(|step| fault_injection::has_fault(&step.meta) || step.meta.restart_fe_after_step)
+    cases.iter().flat_map(|case| case.steps.iter()).any(|step| {
+        fault_injection::has_fault(&step.meta)
+            || step.meta.restart_fe_after_step
+            || step.meta.imv_accelerator_wipe_restart.is_some()
+    })
 }
 
 fn validate_fault_injection_jobs(cases: &[SqlCase], jobs: usize) -> Result<()> {
@@ -4332,6 +4594,7 @@ fn restart_frontend_after_step(
     Ok(())
 }
 
+#[cfg(test)]
 fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
     const DIRECTIVES: &[&str] = &[
         "kill_fe_after_mv_known_committed_before_projector_cas",
@@ -4369,12 +4632,6 @@ fn sql_text_has_query_lifecycle_fault_directive(sql: &str) -> bool {
                     .iter()
                     .any(|marker| line.contains(marker)))
     })
-}
-
-fn sql_text_has_cleanup_fault_directive(sql: &str) -> bool {
-    sql.lines()
-        .map(str::trim_start)
-        .any(|line| line.starts_with("-- @cleanup_fault="))
 }
 
 fn validate_selected_suite_cluster(
@@ -4543,92 +4800,40 @@ fn validate_publication_catalog_directives(
     Ok(())
 }
 
-fn selected_cases_require_query_lifecycle_faults(
-    cli: &Cli,
-    suite_names: &[String],
-    suite_configs: &BTreeMap<String, SuiteConfig>,
-    base_dir: &std::path::Path,
-) -> Result<bool> {
-    for suite_name in suite_names {
-        let suite = suite_configs
-            .get(suite_name)
-            .with_context(|| format!("selected suite {suite_name} is missing"))?;
-        let sql_dir =
-            resolve_path(cli.sql_dir.as_deref(), base_dir).unwrap_or_else(|| suite.sql_dir.clone());
-        let sql_glob = cli
-            .sql_glob
-            .clone()
-            .unwrap_or_else(|| suite.sql_glob.clone());
-        let mut files = list_sql_files(&sql_dir, &sql_glob)?;
-        let available = files
+fn selected_meta_requires_lifecycle(meta: &QueryMeta) -> bool {
+    let lifecycle_marker = |marker: &str| {
+        [
+            "NOVAROCKS_QUERY_INIT_",
+            "NOVAROCKS_QUERY_CONTROL_",
+            "NOVAROCKS_QUERY_FRAGMENT_",
+            "NOVAROCKS_QUERY_LIFECYCLE_",
+            "NOVAROCKS_QUERY_TERMINAL_",
+        ]
+        .iter()
+        .any(|prefix| marker.contains(prefix))
+    };
+    meta.kill_fe_after_mv_known_committed_before_projector_cas
+        || meta.restart_be_after_establish_context_index.is_some()
+        || meta.kill_query_after_be_log_contains.is_some()
+        || meta.kill_fe_after_be_log_contains.is_some()
+        || meta.kill_be_after_be_log_contains.is_some()
+        || meta.terminal_snapshot_conflict_be_index.is_some()
+        || meta.query_lifecycle_fault.is_some()
+        || !meta.query_lifecycle_faults.is_empty()
+        || meta.query_lifecycle_structured_assertion.is_some()
+        || meta.kill_query_at_lifecycle_phase.is_some()
+        || meta.kill_be_at_lifecycle_phase.is_some()
+        || meta.query_control_fragment_backend_limit.is_some()
+        || meta
+            .be_log_contains
             .iter()
-            .filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()))
-            .map(ToOwned::to_owned)
-            .collect::<HashSet<_>>();
-        let only = parse_selector_list(cli.only.as_deref(), &available, "--only")?;
-        let skip = parse_selector_list(cli.skip.as_deref(), &available, "--skip")?;
-        files.retain(|path| {
-            let Some(case_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                return false;
-            };
-            (only.is_empty() || only.contains(case_id)) && !skip.contains(case_id)
-        });
-        if let Some(limit) = cli.limit {
-            files.truncate(limit.min(files.len()));
-        }
-        for path in files {
-            let sql = fs::read_to_string(&path)
-                .with_context(|| format!("read lifecycle fault preflight {}", path.display()))?;
-            if sql_text_has_query_lifecycle_fault_directive(&sql) {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
-}
-
-fn selected_cases_require_cleanup_faults(
-    cli: &Cli,
-    suite_names: &[String],
-    suite_configs: &BTreeMap<String, SuiteConfig>,
-    base_dir: &std::path::Path,
-) -> Result<bool> {
-    for suite_name in suite_names {
-        let suite = suite_configs
-            .get(suite_name)
-            .with_context(|| format!("selected suite {suite_name} is missing"))?;
-        let sql_dir =
-            resolve_path(cli.sql_dir.as_deref(), base_dir).unwrap_or_else(|| suite.sql_dir.clone());
-        let sql_glob = cli
-            .sql_glob
-            .clone()
-            .unwrap_or_else(|| suite.sql_glob.clone());
-        let mut files = list_sql_files(&sql_dir, &sql_glob)?;
-        let available = files
+            .chain(&meta.be_log_not_contains)
+            .any(|marker| lifecycle_marker(marker))
+        || meta
+            .be_log_count_at_least
             .iter()
-            .filter_map(|path| path.file_stem().and_then(|stem| stem.to_str()))
-            .map(ToOwned::to_owned)
-            .collect::<HashSet<_>>();
-        let only = parse_selector_list(cli.only.as_deref(), &available, "--only")?;
-        let skip = parse_selector_list(cli.skip.as_deref(), &available, "--skip")?;
-        files.retain(|path| {
-            let Some(case_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                return false;
-            };
-            (only.is_empty() || only.contains(case_id)) && !skip.contains(case_id)
-        });
-        if let Some(limit) = cli.limit {
-            files.truncate(limit.min(files.len()));
-        }
-        for path in files {
-            let sql = fs::read_to_string(&path)
-                .with_context(|| format!("read cleanup fault preflight {}", path.display()))?;
-            if sql_text_has_cleanup_fault_directive(&sql) {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
+            .chain(&meta.be_log_be_count_at_least)
+            .any(|(marker, _)| lifecycle_marker(marker))
 }
 
 // ---------------------------------------------------------------------------
@@ -4636,6 +4841,13 @@ fn selected_cases_require_cleanup_faults(
 // ---------------------------------------------------------------------------
 
 pub fn run_correctness() -> Result<()> {
+    if std::env::args().skip(1).eq(["--build-info"]) {
+        println!(
+            "{}",
+            build_information::value(cfg!(debug_assertions), cfg!(panic = "unwind"))
+        );
+        return Ok(());
+    }
     let exit_code = run_cli(Cli::parse())?;
     if exit_code != 0 {
         std::process::exit(exit_code);
@@ -4873,170 +5085,78 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
     // an isolated one has to exist first.
     let (mut isolated_rest_catalog, publication_control_uri) =
         start_isolated_rest_catalog(&suite_names)?;
-    let fixture_endpoints = if let Some(fixture) = isolated_rest_catalog.as_ref() {
-        FixtureEndpoints::from_isolated(
-            fixture.endpoints(),
-            &fixture.static_s3_identity(),
-            fixture.runtime_env_file()?,
-        )?
-    } else {
-        FixtureEndpoints::from_runner_config(&runner_config)?
-    };
-    let subprocess_environment = fixture_endpoints.project(&mut runner_config);
-    let mut dataset_bindings = BTreeMap::new();
-    for suite_name in &suite_names {
-        if let Some(requirement) = &suite_configs[suite_name].manifest.prepared_dataset {
-            let binding =
-                dataset_fixture::bind_prepared_dataset(requirement, &runner_config, &base_dir)?;
-            failure_artifacts.record_provenance(
-                format!("dataset/{suite_name}"),
-                serde_json::to_value(&binding)?,
+    let mut publication_catalog_fixture: Option<publication_catalog::FixtureHandle> = None;
+    let fixture_primary = (|| -> Result<i32> {
+        let fixture_endpoints = if let Some(fixture) = isolated_rest_catalog.as_ref() {
+            FixtureEndpoints::from_isolated(
+                fixture.endpoints(),
+                &fixture.static_s3_identity(),
+                fixture.runtime_env_file()?,
+            )?
+        } else {
+            FixtureEndpoints::from_runner_config(&runner_config)?
+        };
+        let subprocess_environment = fixture_endpoints.project(&mut runner_config);
+        let mut dataset_bindings = BTreeMap::new();
+        for suite_name in &suite_names {
+            if let Some(requirement) = &suite_configs[suite_name].manifest.prepared_dataset {
+                let binding =
+                    dataset_fixture::bind_prepared_dataset(requirement, &runner_config, &base_dir)?;
+                failure_artifacts.record_provenance(
+                    format!("dataset/{suite_name}"),
+                    serde_json::to_value(&binding)?,
+                );
+                dataset_bindings.insert(suite_name.clone(), binding);
+            }
+        }
+        // SAFETY: no runner-owned server, proxy or case worker exists yet.
+        // Publish the physical fixture projection once before starting those threads.
+        unsafe {
+            for (key, value) in &subprocess_environment {
+                std::env::set_var(key, value);
+            }
+        }
+        let publication_service_control = if let Some(control_uri) = publication_control_uri {
+            let fixture = isolated_rest_catalog
+                .as_ref()
+                .context("MV V11 requires a private REST Catalog")?;
+            let identity = fixture.runtime_identity()?;
+            let image = identity
+                .images
+                .get("rest")
+                .context("publication hook image identity is absent")?;
+            println!(
+                "  V11 post-requirements REST hook image={} id={}",
+                image.image_reference, image.image_id
             );
-            dataset_bindings.insert(suite_name.clone(), binding);
-        }
-    }
-    // SAFETY: no runner-owned server, proxy or case worker exists yet.
-    // Publish the physical fixture projection once before starting those threads.
-    unsafe {
-        for (key, value) in &subprocess_environment {
-            std::env::set_var(key, value);
-        }
-    }
-    let publication_service_control = if let Some(control_uri) = publication_control_uri {
-        let fixture = isolated_rest_catalog
+            Some(publication_service::Control::new(control_uri)?)
+        } else {
+            None
+        };
+        publication_catalog_fixture =
+            start_publication_catalog_fixture(&mut runner_config, &suite_names)?;
+        let publication_catalog_control = publication_catalog_fixture
             .as_ref()
-            .context("MV V11 requires a private REST Catalog")?;
-        let identity = fixture.runtime_identity()?;
-        let image = identity
-            .images
-            .get("rest")
-            .context("publication hook image identity is absent")?;
-        println!(
-            "  V11 post-requirements REST hook image={} id={}",
-            image.image_reference, image.image_id
-        );
-        Some(publication_service::Control::new(control_uri)?)
-    } else {
-        None
-    };
-    let publication_catalog_fixture =
-        start_publication_catalog_fixture(&mut runner_config, &suite_names)?;
-    let publication_catalog_control = publication_catalog_fixture
-        .as_ref()
-        .map(publication_catalog::FixtureHandle::control)
-        .transpose()?;
+            .map(publication_catalog::FixtureHandle::control)
+            .transpose()?;
 
-    // Validate: per-suite path overrides conflict with multi-suite
-    let multi_suite = suite_names.len() > 1;
-    if multi_suite && (cli.sql_dir.is_some() || cli.result_dir.is_some() || cli.sql_glob.is_some())
-    {
-        println!(
-            "❌ ERROR: --sql-dir, --result-dir, --sql-glob cannot be used with multiple suites"
-        );
-        return Ok(1);
-    }
+        // Validate: per-suite path overrides conflict with multi-suite
+        let multi_suite = suite_names.len() > 1;
+        if multi_suite
+            && (cli.sql_dir.is_some() || cli.result_dir.is_some() || cli.sql_glob.is_some())
+        {
+            println!(
+                "❌ ERROR: --sql-dir, --result-dir, --sql-glob cannot be used with multiple suites"
+            );
+            return Ok(1);
+        }
 
-    if let Some(eps) = cli.float_epsilon
-        && eps <= 0.0
-    {
-        println!("❌ ERROR: --float-epsilon must be > 0");
-        return Ok(1);
-    }
-
-    let query_lifecycle_faults_enabled = !cli.dry_run
-        && selected_cases_require_query_lifecycle_faults(
-            &cli,
-            &suite_names,
-            &suite_configs,
-            &base_dir,
-        )?;
-    let cleanup_faults_enabled = !cli.dry_run
-        && selected_cases_require_cleanup_faults(&cli, &suite_names, &suite_configs, &base_dir)?;
-    let launch_profile = select_cluster_launch_profile(
-        cli.cluster_launch_profile,
-        query_lifecycle_faults_enabled,
-        cleanup_faults_enabled,
-    )?;
-
-    validate_dataset_launch_profile(&suite_names, &suite_configs, launch_profile)?;
-    failure_artifacts.record_build_provenance(
-        &base_dir,
-        launch_profile,
-        selected_cluster_mode,
-        selected_cluster_size,
-    )?;
-
-    let launch_cluster_mode = if cli.dry_run {
-        ClusterMode::AllInOne
-    } else {
-        selected_cluster_mode
-    };
-    let launch_cluster_size = if cli.dry_run {
-        1
-    } else {
-        selected_cluster_size
-    };
-    let server_handle = launch_server(
-        launch_cluster_mode,
-        launch_cluster_size,
-        &base_dir,
-        &runner_config,
-        launch_profile,
-    )?;
-    let launched_target_port = server_handle.target_port();
-    let launched_target_host = server_handle.target_host().map(ToOwned::to_owned);
-    let server_handle = Arc::new(Mutex::new(server_handle));
-    let primary_result = (|| -> Result<i32> {
-        // Resolve global connection params
-        let reference_required = cli.mode == Mode::Diff
-            || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference);
-        let target_port = resolve_effective_target_port(
-            launched_target_port,
-            cli.port.as_deref(),
-            &runner_config,
-        )?;
-        let reference_port =
-            resolve_reference_port(cli.ref_port.as_deref(), &target_port, reference_required)?;
-
-        let target_host = launched_target_host
-            .or_else(|| cli.host.clone())
-            .or_else(|| env_optional("NOVAROCKS_SQL_TEST_HOST"))
-            .or_else(|| runner_config.cluster.get("host").cloned())
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-        let target_user = cli
-            .user
-            .clone()
-            .or_else(|| env_optional("NOVAROCKS_SQL_TEST_USER"))
-            .or_else(|| runner_config.cluster.get("user").cloned())
-            .unwrap_or_else(|| "root".to_string());
-        let target_password = cli
-            .password
-            .clone()
-            .or_else(|| env_optional("NOVAROCKS_SQL_TEST_PASSWORD"))
-            .or_else(|| runner_config.cluster.get("password").cloned());
-        let target_mysql_bin = cli
-            .mysql
-            .clone()
-            .unwrap_or_else(|| env_or_default("NOVAROCKS_SQL_TEST_MYSQL", "mysql"));
-
-        let ref_host = cli
-            .ref_host
-            .clone()
-            .or_else(|| env_optional("NOVAROCKS_SQL_TEST_REF_HOST"))
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-        let ref_user = cli
-            .ref_user
-            .clone()
-            .or_else(|| env_optional("NOVAROCKS_SQL_TEST_REF_USER"))
-            .unwrap_or_else(|| "root".to_string());
-        let ref_password = cli
-            .ref_password
-            .clone()
-            .or_else(|| env_optional("NOVAROCKS_SQL_TEST_REF_PASSWORD"));
-        let ref_mysql_bin = cli
-            .ref_mysql
-            .clone()
-            .unwrap_or_else(|| env_or_default("NOVAROCKS_SQL_TEST_REF_MYSQL", "mysql"));
+        if let Some(eps) = cli.float_epsilon
+            && eps <= 0.0
+        {
+            println!("❌ ERROR: --float-epsilon must be > 0");
+            return Ok(1);
+        }
 
         let verify_enabled_override = verify_override(&cli);
         let actual_artifact_dir = resolve_path(cli.write_actual_dir.as_deref(), &base_dir);
@@ -5052,14 +5172,7 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
             cli.jobs
         };
 
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(jobs)
-            .build()
-            .context("failed to build rayon thread pool")?;
-
-        // Prepare all suites
-        let mut prepared_suites: Vec<PreparedSuite> = Vec::new();
-
+        let mut prepared_inputs: Vec<PreparedSqlInputs> = Vec::new();
         for suite_name in &suite_names {
             let suite = suite_configs
                 .get(suite_name)
@@ -5110,9 +5223,12 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                         format!("failed to load suite cleanup hook for {}", suite.name)
                     })?;
 
-            let suite_catalog_override = suite_init_hook
-                .as_ref()
-                .and_then(|hook| hook.catalog.clone());
+            let suite_catalog_override = Some(
+                suite_init_hook
+                    .as_ref()
+                    .and_then(|hook| hook.catalog.clone())
+                    .unwrap_or_else(|| suite.default_catalog.clone()),
+            );
             let suite_db_override = suite_init_hook.as_ref().and_then(|hook| hook.db.clone());
 
             let target_db_default = suite_db_override
@@ -5128,52 +5244,6 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                     .and_then(|raw| raw.parse().ok())
                     .unwrap_or_else(|| suite_default_query_timeout(&suite.name))
             });
-
-            let target_catalog_name = suite_catalog_override
-                .clone()
-                .unwrap_or_else(|| suite.default_catalog.clone());
-            let reference_catalog_name = suite_catalog_override
-                .clone()
-                .unwrap_or_else(|| suite.default_catalog.clone());
-
-            let target_conn_base = ConnectionConfig {
-                mysql: target_mysql_bin.clone(),
-                host: target_host.clone(),
-                port: target_port.clone(),
-                user: target_user.clone(),
-                password: target_password.clone(),
-                catalog: Some(target_catalog_name.clone()),
-                db: if target_db_default.is_empty() {
-                    None
-                } else {
-                    Some(target_db_default)
-                },
-            };
-
-            let reference_conn_base = ConnectionConfig {
-                mysql: ref_mysql_bin.clone(),
-                host: ref_host.clone(),
-                port: reference_port.clone(),
-                user: ref_user.clone(),
-                password: ref_password.clone(),
-                catalog: Some(reference_catalog_name),
-                db: if ref_db_default.is_empty() {
-                    None
-                } else {
-                    Some(ref_db_default)
-                },
-            };
-
-            let target_admin_conn = ConnectionConfig {
-                catalog: None,
-                db: None,
-                ..target_conn_base.clone()
-            };
-            let reference_admin_conn = ConnectionConfig {
-                catalog: None,
-                db: None,
-                ..reference_conn_base.clone()
-            };
 
             // Load and filter cases
             if !sql_dir.exists() {
@@ -5265,6 +5335,18 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
 
             for case in &cases {
                 for step in &case.steps {
+                    parser::validate_test_capability_tags(&step.meta.tags)?;
+                    if step.meta.cleanup_fault.is_some()
+                        || step.meta.kill_query_at_lifecycle_phase.is_some()
+                        || step.meta.kill_be_at_lifecycle_phase.is_some()
+                    {
+                        bail!(
+                            "suite {} case {} step {} requests an internal cleanup/FE-phase control with no current product owner",
+                            suite.name,
+                            case.case_id,
+                            step.query_number
+                        );
+                    }
                     if let Err(error) = be_log_directive::validate_record_source(
                         &step.meta,
                         cli.mode,
@@ -5358,298 +5440,558 @@ pub(crate) fn run_cli(cli: Cli) -> Result<i32> {
                     .with_context(|| format!("create result_dir failed: {}", dir.display()))?;
             }
 
-            // Print suite header
-            println!("{}", "=".repeat(72));
-            println!(
-                "📋 {} correctness runner (jobs={})",
-                suite.name.to_uppercase(),
-                jobs
-            );
-            println!("{}", "=".repeat(72));
-            println!("mode={}", mode_name(cli.mode));
-            println!(
-                "cluster_mode={}",
-                match selected_cluster_mode {
-                    ClusterMode::AllInOne => "all-in-one",
-                    ClusterMode::CrossProcess => "cross-process",
-                }
-            );
-            println!("sql_dir={}", sql_dir.display());
-            println!("sql_glob={}", sql_glob);
-            if let Some(path) = runner_config.path.as_deref() {
-                println!("config={}", path.display());
-            }
-            if let Some(dir) = &result_dir {
-                println!("result_dir={}", dir.display());
-            }
-            println!("query_timeout={}s", query_timeout);
-            println!("{}", summarize_connection("target", &target_conn_base));
-            if cli.mode == Mode::Diff
-                || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference)
-            {
-                println!(
-                    "{}",
-                    summarize_connection("reference", &reference_conn_base)
-                );
-            }
-            if cli.mode == Mode::Verify {
-                println!("verify_enabled={}", verify_enabled);
-            }
-            if let Some(hook) = suite_init_hook.as_ref() {
-                println!("suite_init={}", hook.path.display());
-                if let Some(catalog) = hook.catalog.as_deref() {
-                    println!("suite_env.catalog={}", catalog);
-                }
-                if let Some(db) = hook.db.as_deref() {
-                    println!("suite_env.db={}", db);
-                }
-            }
-            if let Some(hook) = suite_cleanup_hook.as_ref() {
-                println!("suite_cleanup={}", hook.path.display());
-            }
-            let seq_count = cases.iter().filter(|c| c.sequential).count();
-            if seq_count > 0 {
-                println!(
-                    "cases={} (parallel={}, sequential={})",
-                    cases.len(),
-                    cases.len() - seq_count,
-                    seq_count
-                );
-            } else {
-                println!("cases={}", cases.len());
-            }
-            println!("{}", "=".repeat(72));
-
-            if cli.dry_run {
-                println!("selected cases for suite {}:", suite.name);
-                for case in &cases {
-                    let file_name = case
-                        .source_file
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or_default();
-                    let seq_tag = if case.sequential { " [sequential]" } else { "" };
-                    println!(
-                        "  {} ({}, steps={}{})",
-                        case.case_id,
-                        file_name,
-                        case.steps.len(),
-                        seq_tag,
-                    );
-                }
-                continue;
-            }
-
-            let ctx = SuiteRunContext {
+            prepared_inputs.push(PreparedSqlInputs {
                 suite_name: suite.name.clone(),
-                mode: cli.mode,
-                record_from: cli.record_from,
-                target_conn_base,
-                reference_conn_base,
-                target_admin_conn,
-                reference_admin_conn,
+                sql_dir,
                 result_dir,
-                actual_artifact_dir: actual_artifact_dir.clone(),
+                sql_glob,
+                suite_catalog_override,
+                target_db_default,
+                ref_db_default,
                 verify_enabled,
                 query_timeout,
-                reference_required,
-                auto_case_db: suite.auto_case_db,
-                order_sensitive_default: cli.order_sensitive_default,
-                float_epsilon: cli.float_epsilon,
-                preview_lines: cli.preview_lines,
-                update_expected: cli.update_expected,
-                target_session_sql: cli.target_session_sql.clone(),
-                rewrite_explain_contains_as_not_contains: cli
-                    .rewrite_explain_contains_as_not_contains
-                    .clone(),
-                marker_re: marker_re.clone(),
-                fail_fast: cli.fail_fast,
-                server_handle: Arc::clone(&server_handle),
-                failure_artifacts: Arc::clone(&failure_artifacts),
-                publication_catalog_control: publication_catalog_control.clone(),
-                publication_service_control: publication_service_control.clone(),
-            };
-
-            prepared_suites.push(PreparedSuite {
-                ctx,
                 cases,
                 load_failures,
-                init_hook: suite_init_hook,
-                cleanup_hook: suite_cleanup_hook,
+                suite_init_hook,
+                suite_cleanup_hook,
             });
         }
 
-        if cli.dry_run {
-            // --dry-run is the case-validation path: unloadable case files must
-            // fail it rather than being reported and then exiting zero.
-            let unloadable: usize = prepared_suites
+        let query_lifecycle_faults_enabled = !cli.dry_run
+            && prepared_inputs
                 .iter()
-                .map(|ps| ps.load_failures.len())
-                .sum();
-            if unloadable > 0 {
-                println!("❌ ERROR: {unloadable} case file(s) failed to load");
-                return Ok(1);
-            }
-            return Ok(0);
-        }
+                .flat_map(|input| &input.cases)
+                .flat_map(|case| &case.steps)
+                .any(|step| selected_meta_requires_lifecycle(&step.meta));
+        let cleanup_faults_enabled = !cli.dry_run
+            && prepared_inputs
+                .iter()
+                .flat_map(|input| &input.cases)
+                .flat_map(|case| &case.steps)
+                .any(|step| step.meta.cleanup_fault.is_some());
+        let selected_load_failure_count: usize = prepared_inputs
+            .iter()
+            .map(|input| input.load_failures.len())
+            .sum();
+        let launch_profile = select_cluster_launch_profile(
+            cli.cluster_launch_profile,
+            query_lifecycle_faults_enabled,
+            cleanup_faults_enabled,
+        )?;
 
-        if prepared_suites.is_empty() {
-            println!("❌ ERROR: no suites to run");
-            return Ok(1);
-        }
+        validate_dataset_launch_profile(&suite_names, &suite_configs, launch_profile)?;
+        failure_artifacts.record_build_provenance(
+            &base_dir,
+            launch_profile,
+            selected_cluster_mode,
+            selected_cluster_size,
+        )?;
 
-        // Global abort flag for fail-fast
-        let abort = AtomicBool::new(false);
-        let stdout_lock = Mutex::new(());
-
-        // Run suites (parallel via rayon thread pool)
-        let suite_outcomes: Vec<SuiteOutcome> = pool.install(|| {
-            prepared_suites
-                .par_iter()
-                .map(|ps| run_suite(ps, &abort, &stdout_lock))
-                .collect()
-        });
-
-        // Aggregate results
-        let mut grand_total = 0usize;
-        let mut grand_passed = 0usize;
-        let mut grand_failed = 0usize;
-        let mut grand_skipped = 0usize;
-        let mut all_case_timings: Vec<CaseTiming> = Vec::new();
-        let mut all_failed_cases: Vec<(String, String)> = Vec::new();
-        let mut all_cleanup_errors: Vec<String> = Vec::new();
-
-        for so in &suite_outcomes {
-            grand_total += so.total;
-            for co in &so.outcomes {
-                match co.status {
-                    CaseStatus::Pass => grand_passed += 1,
-                    CaseStatus::Fail => {
-                        grand_failed += 1;
-                        all_failed_cases.push((so.suite_name.clone(), co.case_id.clone()));
-                    }
-                    CaseStatus::Skipped => grand_skipped += 1,
+        let launch_cluster_mode = if cli.dry_run {
+            ClusterMode::AllInOne
+        } else {
+            selected_cluster_mode
+        };
+        let launch_cluster_size = if cli.dry_run {
+            1
+        } else {
+            selected_cluster_size
+        };
+        let (test_sessions, controls) = if !cli.dry_run && control_plan::required(&prepared_inputs)
+        {
+            ensure!(
+                launch_cluster_mode == ClusterMode::CrossProcess,
+                "internal SQL controls require a runner-owned native cross-process launch"
+            );
+            let ordinary = cluster::discover_novarocks_binary(&base_dir)?;
+            let controlled = cluster::discover_controlled_novarocks_binary(&base_dir)?;
+            let auto_case_db = suite_configs
+                .iter()
+                .map(|(name, suite)| (name.clone(), suite.auto_case_db))
+                .collect();
+            match control_plan::build(
+                &prepared_inputs,
+                launch_cluster_size,
+                cluster::startup_timeout(),
+                &ordinary,
+                &controlled,
+                &auto_case_db,
+                &cli.target_session_sql,
+            )? {
+                Some((plan, execution)) => {
+                    failure_artifacts.record_provenance("selected-control-intents".into(),serde_json::json!({
+                        "role_launches":plan.planned_launch_summaries(),
+                        "remaining_original_budget_millis":execution.deadline.saturating_duration_since(Instant::now()).as_millis(),
+                        "serial_role_order":execution.has_restarts,
+                        "status":"frozen-intents-not-action-evidence",
+                        "mysql_cumulative_slow_progress_handshake":"excluded-by-explicit-user-decision"}));
+                    (Some(plan), Some(Arc::new(execution)))
                 }
-                all_case_timings.push(CaseTiming {
-                    suite_name: so.suite_name.clone(),
-                    case_id: co.case_id.clone(),
-                    status: co.status,
-                    elapsed: co.elapsed,
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
+        ensure!(
+            controls
+                .as_ref()
+                .is_none_or(|controls| !controls.has_restarts || jobs == 1),
+            "selected role restart/wipe controls require -j 1"
+        );
+        let server_handle = launch_server(
+            launch_cluster_mode,
+            launch_cluster_size,
+            &base_dir,
+            &runner_config,
+            launch_profile,
+            test_sessions,
+        )?;
+        if let Some(evidence) = server_handle.actual_build_information_evidence()? {
+            failure_artifacts.record_provenance("actual-role-build-information".into(), evidence);
+        }
+        let launched_target_port = server_handle.target_port();
+        let launched_target_host = server_handle.target_host().map(ToOwned::to_owned);
+        let server_handle = Arc::new(Mutex::new(server_handle));
+        let primary_result = (|| -> Result<i32> {
+            // Resolve global connection params
+            let reference_required = cli.mode == Mode::Diff
+                || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference);
+            let target_port = resolve_effective_target_port(
+                launched_target_port,
+                cli.port.as_deref(),
+                &runner_config,
+            )?;
+            let reference_port =
+                resolve_reference_port(cli.ref_port.as_deref(), &target_port, reference_required)?;
+
+            let target_host = launched_target_host
+                .or_else(|| cli.host.clone())
+                .or_else(|| env_optional("NOVAROCKS_SQL_TEST_HOST"))
+                .or_else(|| runner_config.cluster.get("host").cloned())
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            let target_user = cli
+                .user
+                .clone()
+                .or_else(|| env_optional("NOVAROCKS_SQL_TEST_USER"))
+                .or_else(|| runner_config.cluster.get("user").cloned())
+                .unwrap_or_else(|| "root".to_string());
+            let target_password = cli
+                .password
+                .clone()
+                .or_else(|| env_optional("NOVAROCKS_SQL_TEST_PASSWORD"))
+                .or_else(|| runner_config.cluster.get("password").cloned());
+            let target_mysql_bin = cli
+                .mysql
+                .clone()
+                .unwrap_or_else(|| env_or_default("NOVAROCKS_SQL_TEST_MYSQL", "mysql"));
+
+            let ref_host = cli
+                .ref_host
+                .clone()
+                .or_else(|| env_optional("NOVAROCKS_SQL_TEST_REF_HOST"))
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            let ref_user = cli
+                .ref_user
+                .clone()
+                .or_else(|| env_optional("NOVAROCKS_SQL_TEST_REF_USER"))
+                .unwrap_or_else(|| "root".to_string());
+            let ref_password = cli
+                .ref_password
+                .clone()
+                .or_else(|| env_optional("NOVAROCKS_SQL_TEST_REF_PASSWORD"));
+            let ref_mysql_bin = cli
+                .ref_mysql
+                .clone()
+                .unwrap_or_else(|| env_or_default("NOVAROCKS_SQL_TEST_REF_MYSQL", "mysql"));
+
+            // The execution pool consumes the frozen selection.
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(jobs)
+                .build()
+                .context("failed to build rayon thread pool")?;
+
+            // Prepare all suites
+            let mut prepared_suites: Vec<PreparedSuite> = Vec::new();
+
+            for input in prepared_inputs {
+                let PreparedSqlInputs {
+                    suite_name,
+                    sql_dir,
+                    result_dir,
+                    sql_glob,
+                    suite_catalog_override,
+                    target_db_default,
+                    ref_db_default,
+                    verify_enabled,
+                    query_timeout,
+                    cases,
+                    load_failures,
+                    suite_init_hook,
+                    suite_cleanup_hook,
+                } = input;
+                let suite = suite_configs
+                    .get(&suite_name)
+                    .expect("selected suite already validated");
+                let target_catalog_name = suite_catalog_override
+                    .clone()
+                    .unwrap_or_else(|| suite.default_catalog.clone());
+                let reference_catalog_name = suite_catalog_override
+                    .clone()
+                    .unwrap_or_else(|| suite.default_catalog.clone());
+
+                let target_conn_base = ConnectionConfig {
+                    mysql: target_mysql_bin.clone(),
+                    host: target_host.clone(),
+                    port: target_port.clone(),
+                    user: target_user.clone(),
+                    password: target_password.clone(),
+                    catalog: Some(target_catalog_name.clone()),
+                    db: if target_db_default.is_empty() {
+                        None
+                    } else {
+                        Some(target_db_default)
+                    },
+                };
+
+                let reference_conn_base = ConnectionConfig {
+                    mysql: ref_mysql_bin.clone(),
+                    host: ref_host.clone(),
+                    port: reference_port.clone(),
+                    user: ref_user.clone(),
+                    password: ref_password.clone(),
+                    catalog: Some(reference_catalog_name),
+                    db: if ref_db_default.is_empty() {
+                        None
+                    } else {
+                        Some(ref_db_default)
+                    },
+                };
+
+                let target_admin_conn = ConnectionConfig {
+                    catalog: None,
+                    db: None,
+                    ..target_conn_base.clone()
+                };
+                let reference_admin_conn = ConnectionConfig {
+                    catalog: None,
+                    db: None,
+                    ..reference_conn_base.clone()
+                };
+
+                // Print suite header
+                println!("{}", "=".repeat(72));
+                println!(
+                    "📋 {} correctness runner (jobs={})",
+                    suite.name.to_uppercase(),
+                    jobs
+                );
+                println!("{}", "=".repeat(72));
+                println!("mode={}", mode_name(cli.mode));
+                println!(
+                    "cluster_mode={}",
+                    match selected_cluster_mode {
+                        ClusterMode::AllInOne => "all-in-one",
+                        ClusterMode::CrossProcess => "cross-process",
+                    }
+                );
+                println!("sql_dir={}", sql_dir.display());
+                println!("sql_glob={}", sql_glob);
+                if let Some(path) = runner_config.path.as_deref() {
+                    println!("config={}", path.display());
+                }
+                if let Some(dir) = &result_dir {
+                    println!("result_dir={}", dir.display());
+                }
+                println!("query_timeout={}s", query_timeout);
+                println!("{}", summarize_connection("target", &target_conn_base));
+                if cli.mode == Mode::Diff
+                    || (cli.mode == Mode::Record && cli.record_from == RecordFrom::Reference)
+                {
+                    println!(
+                        "{}",
+                        summarize_connection("reference", &reference_conn_base)
+                    );
+                }
+                if cli.mode == Mode::Verify {
+                    println!("verify_enabled={}", verify_enabled);
+                }
+                if let Some(hook) = suite_init_hook.as_ref() {
+                    println!("suite_init={}", hook.path.display());
+                    if let Some(catalog) = hook.catalog.as_deref() {
+                        println!("suite_env.catalog={}", catalog);
+                    }
+                    if let Some(db) = hook.db.as_deref() {
+                        println!("suite_env.db={}", db);
+                    }
+                }
+                if let Some(hook) = suite_cleanup_hook.as_ref() {
+                    println!("suite_cleanup={}", hook.path.display());
+                }
+                let seq_count = cases.iter().filter(|c| c.sequential).count();
+                if seq_count > 0 {
+                    println!(
+                        "cases={} (parallel={}, sequential={})",
+                        cases.len(),
+                        cases.len() - seq_count,
+                        seq_count
+                    );
+                } else {
+                    println!("cases={}", cases.len());
+                }
+                println!("{}", "=".repeat(72));
+
+                if cli.dry_run {
+                    println!("selected cases for suite {}:", suite.name);
+                    for case in &cases {
+                        let file_name = case
+                            .source_file
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or_default();
+                        let seq_tag = if case.sequential { " [sequential]" } else { "" };
+                        println!(
+                            "  {} ({}, steps={}{})",
+                            case.case_id,
+                            file_name,
+                            case.steps.len(),
+                            seq_tag,
+                        );
+                    }
+                    continue;
+                }
+
+                let ctx = SuiteRunContext {
+                    controls: controls.clone(),
+                    suite_name: suite.name.clone(),
+                    mode: cli.mode,
+                    record_from: cli.record_from,
+                    target_conn_base,
+                    reference_conn_base,
+                    target_admin_conn,
+                    reference_admin_conn,
+                    result_dir,
+                    actual_artifact_dir: actual_artifact_dir.clone(),
+                    verify_enabled,
+                    query_timeout,
+                    reference_required,
+                    auto_case_db: suite.auto_case_db,
+                    order_sensitive_default: cli.order_sensitive_default,
+                    float_epsilon: cli.float_epsilon,
+                    preview_lines: cli.preview_lines,
+                    update_expected: cli.update_expected,
+                    target_session_sql: cli.target_session_sql.clone(),
+                    rewrite_explain_contains_as_not_contains: cli
+                        .rewrite_explain_contains_as_not_contains
+                        .clone(),
+                    marker_re: marker_re.clone(),
+                    fail_fast: cli.fail_fast,
+                    server_handle: Arc::clone(&server_handle),
+                    failure_artifacts: Arc::clone(&failure_artifacts),
+                    publication_catalog_control: publication_catalog_control.clone(),
+                    publication_service_control: publication_service_control.clone(),
+                };
+
+                prepared_suites.push(PreparedSuite {
+                    ctx,
+                    cases,
+                    load_failures,
+                    init_hook: suite_init_hook,
+                    cleanup_hook: suite_cleanup_hook,
                 });
             }
-            if !so.cleanup_errors.is_empty() {
-                failure_artifacts.record_provenance(
-                    format!("suite-cleanup/{}", so.suite_name),
-                    serde_json::json!(so.cleanup_errors),
+
+            if cli.dry_run {
+                // --dry-run is the case-validation path: unloadable case files must
+                // fail it rather than being reported and then exiting zero.
+                let unloadable = selected_load_failure_count;
+                if unloadable > 0 {
+                    println!("❌ ERROR: {unloadable} case file(s) failed to load");
+                    return Ok(1);
+                }
+                return Ok(0);
+            }
+
+            if prepared_suites.is_empty() {
+                println!("❌ ERROR: no suites to run");
+                return Ok(1);
+            }
+
+            // Global abort flag for fail-fast
+            let abort = AtomicBool::new(false);
+            let stdout_lock = Mutex::new(());
+
+            // Run suites (parallel via rayon thread pool)
+            let suite_outcomes: Vec<SuiteOutcome> = pool.install(|| {
+                if controls.is_some() && jobs == 1 {
+                    // Frozen role generations follow the selected serial suite order.
+                    prepared_suites
+                        .iter()
+                        .map(|ps| run_suite(ps, &abort, &stdout_lock))
+                        .collect()
+                } else {
+                    prepared_suites
+                        .par_iter()
+                        .map(|ps| run_suite(ps, &abort, &stdout_lock))
+                        .collect()
+                }
+            });
+
+            // Aggregate results
+            let mut grand_total = 0usize;
+            let mut grand_passed = 0usize;
+            let mut grand_failed = 0usize;
+            let mut grand_skipped = 0usize;
+            let mut all_case_timings: Vec<CaseTiming> = Vec::new();
+            let mut all_failed_cases: Vec<(String, String)> = Vec::new();
+            let mut all_cleanup_errors: Vec<String> = Vec::new();
+
+            for so in &suite_outcomes {
+                grand_total += so.total;
+                for co in &so.outcomes {
+                    match co.status {
+                        CaseStatus::Pass => grand_passed += 1,
+                        CaseStatus::Fail => {
+                            grand_failed += 1;
+                            all_failed_cases.push((so.suite_name.clone(), co.case_id.clone()));
+                        }
+                        CaseStatus::Skipped => grand_skipped += 1,
+                    }
+                    all_case_timings.push(CaseTiming {
+                        suite_name: so.suite_name.clone(),
+                        case_id: co.case_id.clone(),
+                        status: co.status,
+                        elapsed: co.elapsed,
+                    });
+                }
+                if !so.cleanup_errors.is_empty() {
+                    failure_artifacts.record_provenance(
+                        format!("suite-cleanup/{}", so.suite_name),
+                        serde_json::json!(so.cleanup_errors),
+                    );
+                }
+                all_cleanup_errors.extend(so.cleanup_errors.iter().cloned());
+            }
+
+            let total_cpu_time: Duration =
+                all_case_timings.iter().map(|timing| timing.elapsed).sum();
+
+            // Print summary
+            println!("\n{}", "=".repeat(72));
+            if suite_outcomes.len() == 1 {
+                println!(
+                    "summary ({}, mode={})",
+                    suite_outcomes[0].suite_name,
+                    mode_name(cli.mode)
+                );
+            } else {
+                let names: Vec<&str> = suite_outcomes
+                    .iter()
+                    .map(|s| s.suite_name.as_str())
+                    .collect();
+                println!(
+                    "summary ({} suites: {}, mode={})",
+                    names.len(),
+                    names.join(", "),
+                    mode_name(cli.mode)
                 );
             }
-            all_cleanup_errors.extend(so.cleanup_errors.iter().cloned());
-        }
-
-        let total_cpu_time: Duration = all_case_timings.iter().map(|timing| timing.elapsed).sum();
-
-        // Print summary
-        println!("\n{}", "=".repeat(72));
-        if suite_outcomes.len() == 1 {
-            println!(
-                "summary ({}, mode={})",
-                suite_outcomes[0].suite_name,
-                mode_name(cli.mode)
-            );
-        } else {
-            let names: Vec<&str> = suite_outcomes
-                .iter()
-                .map(|s| s.suite_name.as_str())
-                .collect();
-            println!(
-                "summary ({} suites: {}, mode={})",
-                names.len(),
-                names.join(", "),
-                mode_name(cli.mode)
-            );
-        }
-        println!("{}", "=".repeat(72));
-        println!("total={}", grand_total);
-        println!("pass={}", grand_passed);
-        println!("fail={}", grand_failed);
-        if grand_skipped > 0 {
-            println!("skipped={}", grand_skipped);
-        }
-        println!("cpu_time={:.2}s", total_cpu_time.as_secs_f64());
-        for so in &suite_outcomes {
-            println!(
-                "  suite {} wall_time={:.2}s",
-                so.suite_name,
-                so.wall_time.as_secs_f64()
-            );
-        }
-
-        let mut slowest_case_timings = all_case_timings.clone();
-        slowest_case_timings.sort_by(|a, b| b.elapsed.cmp(&a.elapsed));
-        println!("\nslowest cases (top 5):");
-        for timing in slowest_case_timings.iter().take(5) {
-            println!(
-                "  [{}] {}: {:.2}s",
-                timing.suite_name,
-                timing.case_id,
-                timing.elapsed.as_secs_f64()
-            );
-        }
-
-        all_case_timings.sort_by(|a, b| {
-            a.suite_name
-                .cmp(&b.suite_name)
-                .then_with(|| b.elapsed.cmp(&a.elapsed))
-                .then_with(|| a.case_id.cmp(&b.case_id))
-        });
-        print!("{}", format_case_timings(&all_case_timings));
-
-        if !all_failed_cases.is_empty() {
-            println!("\nfailed cases:");
-            for (suite, case_id) in &all_failed_cases {
-                println!("  [{}] {}", suite, case_id);
+            println!("{}", "=".repeat(72));
+            println!("total={}", grand_total);
+            println!("pass={}", grand_passed);
+            println!("fail={}", grand_failed);
+            if grand_skipped > 0 {
+                println!("skipped={}", grand_skipped);
             }
-        }
-        if !all_cleanup_errors.is_empty() {
-            println!("\ncleanup errors:");
-            for err in &all_cleanup_errors {
-                println!("  {}", err);
+            println!("cpu_time={:.2}s", total_cpu_time.as_secs_f64());
+            for so in &suite_outcomes {
+                println!(
+                    "  suite {} wall_time={:.2}s",
+                    so.suite_name,
+                    so.wall_time.as_secs_f64()
+                );
             }
-        }
-        println!("{}", "=".repeat(72));
 
-        if grand_failed > 0 || !all_cleanup_errors.is_empty() {
-            return Ok(1);
-        }
+            let mut slowest_case_timings = all_case_timings.clone();
+            slowest_case_timings.sort_by(|a, b| b.elapsed.cmp(&a.elapsed));
+            println!("\nslowest cases (top 5):");
+            for timing in slowest_case_timings.iter().take(5) {
+                println!(
+                    "  [{}] {}: {:.2}s",
+                    timing.suite_name,
+                    timing.case_id,
+                    timing.elapsed.as_secs_f64()
+                );
+            }
 
-        Ok(0)
+            all_case_timings.sort_by(|a, b| {
+                a.suite_name
+                    .cmp(&b.suite_name)
+                    .then_with(|| b.elapsed.cmp(&a.elapsed))
+                    .then_with(|| a.case_id.cmp(&b.case_id))
+            });
+            print!("{}", format_case_timings(&all_case_timings));
+
+            if !all_failed_cases.is_empty() {
+                println!("\nfailed cases:");
+                for (suite, case_id) in &all_failed_cases {
+                    println!("  [{}] {}", suite, case_id);
+                }
+            }
+            if !all_cleanup_errors.is_empty() {
+                println!("\ncleanup errors:");
+                for err in &all_cleanup_errors {
+                    println!("  {}", err);
+                }
+            }
+            println!("{}", "=".repeat(72));
+
+            if grand_failed > 0 || !all_cleanup_errors.is_empty() {
+                return Ok(1);
+            }
+
+            Ok(0)
+        })();
+        finish_run_with_server_cleanup(server_handle, primary_result, failure_artifacts.as_ref())
     })();
-    let outcome =
-        finish_run_with_server_cleanup(server_handle, primary_result, failure_artifacts.as_ref());
-    // After the servers are down, so nothing is still talking to the catalog
-    // while its containers go away.
+    let mut fixture_failures = Vec::new();
+    if let Some(fixture) = publication_catalog_fixture.as_mut() {
+        if let Err(error) = fixture.shutdown() {
+            fixture_failures.push(format!("join publication fixture: {error:#}"));
+        }
+    }
+    // Consumers and proxy actors have actually exited before the physical fixture is reclaimed.
     if let Some(fixture) = isolated_rest_catalog.as_mut() {
         let workspace = fixture.workspace_root().to_path_buf();
         match fixture.shutdown() {
-            // Only once the containers are gone: the generated file names this
-            // fixture's object-store identity, and nothing should outlive the
-            // MinIO it belonged to.
             Ok(()) => {
-                if let Err(error) = std::fs::remove_dir_all(&workspace)
-                    && error.kind() != std::io::ErrorKind::NotFound
-                {
-                    eprintln!(
-                        "could not remove the isolated REST catalog workspace {}: {error}",
-                        workspace.display()
-                    );
+                if let Err(error) = fs::remove_dir_all(&workspace) {
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        fixture_failures.push(format!(
+                            "remove isolated fixture workspace {}: {error}",
+                            workspace.display()
+                        ));
+                    }
                 }
             }
-            Err(error) => {
-                eprintln!("could not stop the isolated Iceberg REST catalog: {error:#}");
-            }
+            Err(error) => fixture_failures.push(format!("stop isolated fixture: {error:#}")),
         }
     }
-    outcome
+    if fixture_failures.is_empty() {
+        return fixture_primary;
+    }
+    failure_artifacts.record_provenance(
+        "fixture-cleanup".into(),
+        serde_json::json!(&fixture_failures),
+    );
+    let cleanup = fixture_failures.join("; ");
+    match fixture_primary {
+        Ok(code) => Err(anyhow::anyhow!(
+            "run exited with code {code}; fixture cleanup failed: {cleanup}"
+        )),
+        Err(primary) => Err(anyhow::anyhow!(
+            "{primary:#}; fixture cleanup failed: {cleanup}"
+        )),
+    }
 }
 
 /// The suites that must not share the ordinary `docker/iceberg-rest`
@@ -6897,6 +7239,7 @@ mod tests {
             },
         ));
         let ctx = super::SuiteRunContext {
+            controls: None,
             suite_name: "test".into(),
             mode: Mode::Verify,
             record_from: RecordFrom::Target,
@@ -7202,7 +7545,7 @@ access_key_secret = "admin123"
     }
 
     #[test]
-    fn cross_process_command_sets_required_test_env() {
+    fn cross_process_command_keeps_network_fixture_and_scrubs_ambient_test_authority() {
         let command = build_novarocks_command(
             PathBuf::from("ignored-binary").as_path(),
             "fe",
@@ -7220,7 +7563,17 @@ access_key_secret = "admin123"
             .find(|(key, _)| key.to_str() == Some("NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD"))
             .and_then(|(_, value)| value)
             .and_then(|value| value.to_str());
-        assert_eq!(imv_stateless_rebuild, Some("1"));
+        assert_eq!(imv_stateless_rebuild, None);
+        let removed = command
+            .get_envs()
+            .find(|(key, _)| key.to_str() == Some("NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD"))
+            .expect("legacy authority is explicitly scrubbed");
+        assert!(removed.1.is_none());
+        assert!(
+            !command
+                .get_args()
+                .any(|argument| argument == "--test-session")
+        );
     }
 
     #[test]

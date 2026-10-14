@@ -19,6 +19,8 @@
 
 use std::future::Future;
 use std::sync::Arc;
+#[cfg(feature = "mem-1-m07-hms-listing-observe")]
+use std::sync::Mutex;
 
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorOperationControl, ConnectorRequestContext,
@@ -31,7 +33,7 @@ pub(crate) const LISTING_CONCURRENCY: usize = 8;
 pub(crate) struct ListingAdmission {
     positions: Arc<Semaphore>,
     #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    observer: Arc<super::hms_listing_observer::Observer>,
+    observer: Mutex<Option<HmsObservation>>,
 }
 
 impl Default for ListingAdmission {
@@ -39,17 +41,83 @@ impl Default for ListingAdmission {
         Self {
             positions: Arc::new(Semaphore::new(LISTING_CONCURRENCY)),
             #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            observer: Default::default(),
+            observer: Mutex::new(None),
         }
     }
 }
 
+#[cfg(feature = "mem-1-m07-hms-listing-observe")]
+#[derive(Debug)]
+struct HmsObservation {
+    observer: Arc<super::hms_listing_observer::Observer>,
+    cancellation: Option<novarocks_failpoint::scope::ControlCancellation>,
+}
+
 impl ListingAdmission {
+    #[cfg(all(test, feature = "mem-1-m07-hms-listing-observe"))]
+    fn observed_test_fixture() -> Self {
+        Self {
+            positions: Arc::new(Semaphore::new(LISTING_CONCURRENCY)),
+            observer: Mutex::new(Some(HmsObservation {
+                observer: Default::default(),
+                cancellation: None,
+            })),
+        }
+    }
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub(crate) fn install_hms_observation(
+        &self,
+        cancellation: novarocks_failpoint::scope::ControlCancellation,
+    ) -> Result<(), &'static str> {
+        if !cancellation.is_active() {
+            return Err("HMS observation session is closed");
+        }
+        let mut state = self
+            .observer
+            .lock()
+            .map_err(|_| "HMS observer lock failed")?;
+        if state.is_some() {
+            return Err("HMS observer is already installed");
+        }
+        *state = Some(HmsObservation {
+            observer: Default::default(),
+            cancellation: Some(cancellation),
+        });
+        Ok(())
+    }
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub(crate) fn close_hms_observation(&self) {
+        if let Ok(mut state) = self.observer.lock() {
+            *state = None;
+        }
+    }
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub(super) fn active_observer(&self) -> Option<Arc<super::hms_listing_observer::Observer>> {
+        let mut state = self.observer.lock().ok()?;
+        if state
+            .as_ref()?
+            .cancellation
+            .as_ref()
+            .is_some_and(|scope| !scope.is_active())
+        {
+            *state = None;
+            return None;
+        }
+        Some(Arc::clone(&state.as_ref()?.observer))
+    }
+    #[cfg(all(test, feature = "mem-1-m07-hms-listing-observe"))]
+    fn hms_observation_active(&self) -> bool {
+        self.active_observer().is_some()
+    }
+
     #[cfg(feature = "mem-1-m07-hms-listing-observe")]
     pub(crate) fn hms_snapshot(
         &self,
     ) -> Result<super::hms_listing_observer::Snapshot, &'static str> {
-        let mut snapshot = self.observer.snapshot()?;
+        let mut snapshot = self
+            .active_observer()
+            .ok_or("HMS observation is not active")?
+            .snapshot()?;
         snapshot.available_positions_sample = Some(self.positions.available_permits());
         Ok(snapshot)
     }
@@ -61,21 +129,22 @@ impl ListingAdmission {
         phase: u64,
         sequence: u64,
     ) -> Result<u64, &'static str> {
-        self.observer.reset_idle(domain, phase, sequence)
+        self.active_observer()
+            .ok_or("HMS observation is not active")?
+            .reset_idle(domain, phase, sequence)
     }
 
     #[cfg(feature = "mem-1-m07-hms-listing-observe")]
     pub(super) async fn run_hms<T, F: Future<Output = Result<T, ConnectorError>>>(
         &self,
         context: &ConnectorRequestContext,
+        observer: Arc<super::hms_listing_observer::Observer>,
         operation: super::hms_listing_observer::HmsListingOperation,
         target_sha256: Option<[u8; 32]>,
         make_call: impl FnOnce(super::hms_listing_observer::Invocation) -> F,
     ) -> Result<T, ConnectorError> {
         use super::hms_listing_observer::{ExitSelection, PermitOwner, WrapperExit};
-        let invocation = self
-            .observer
-            .begin(operation, target_sha256, context.deadline());
+        let invocation = observer.begin(operation, target_sha256, context.deadline());
         // PermitOwner is declared before both wrapper witness and the future.
         // Cancelling/dropping this outer future cannot return the permit first.
         let mut owner = PermitOwner {
@@ -238,7 +307,10 @@ mod tests {
         let gate = ListingAdmission {
             positions: Arc::new(Semaphore::new(1)),
             #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            observer: Default::default(),
+            observer: Mutex::new(Some(HmsObservation {
+                observer: Default::default(),
+                cancellation: None,
+            })),
         };
         let stop = ConnectorStopOwner::new();
         let ctx = context(&stop, Instant::now() + Duration::from_secs(5));
@@ -282,7 +354,10 @@ mod tests {
         let gate = ListingAdmission {
             positions: Arc::new(Semaphore::new(1)),
             #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            observer: Default::default(),
+            observer: Mutex::new(Some(HmsObservation {
+                observer: Default::default(),
+                cancellation: None,
+            })),
         };
         let stop = ConnectorStopOwner::new();
         let dropped = Arc::new(AtomicBool::new(false));
@@ -307,7 +382,10 @@ mod tests {
         let gate = ListingAdmission {
             positions: Arc::new(Semaphore::new(1)),
             #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            observer: Default::default(),
+            observer: Mutex::new(Some(HmsObservation {
+                observer: Default::default(),
+                cancellation: None,
+            })),
         };
         let stop = ConnectorStopOwner::new();
         let ctx = context(&stop, Instant::now() + Duration::from_secs(5));

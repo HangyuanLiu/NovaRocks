@@ -3264,6 +3264,8 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
         source.storage_observation(),
         &iceberg_target,
         connector_context,
+        #[cfg(feature = "test-controls")]
+        source.readiness().test_controls(),
     )
     .map_err(refresh_connector_preparation_error)?;
     if let Err(snapshot_error) =

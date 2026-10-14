@@ -65,6 +65,10 @@ pub struct NativePlanDecodeContext {
     /// finds it absent fails closed rather than inventing a registry.
     typed_scan_runtime: Option<TypedScanRuntime>,
     function_catalog: Option<Arc<EngineFunctionCatalog>>,
+    #[cfg(feature = "test-controls")]
+    test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
+    #[cfg(feature = "test-controls")]
+    observation_controls: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
 }
 
 impl Default for NativePlanDecodeContext {
@@ -82,6 +86,10 @@ impl Default for NativePlanDecodeContext {
             exchange_wait: Duration::from_millis(120_000),
             typed_scan_runtime: None,
             function_catalog: None,
+            #[cfg(feature = "test-controls")]
+            test_controls: None,
+            #[cfg(feature = "test-controls")]
+            observation_controls: None,
         }
     }
 }
@@ -114,7 +122,39 @@ impl NativePlanDecodeContext {
             exchange_wait,
             typed_scan_runtime: None,
             function_catalog: None,
+            #[cfg(feature = "test-controls")]
+            test_controls: None,
+            #[cfg(feature = "test-controls")]
+            observation_controls: None,
         }
+    }
+
+    #[cfg(feature = "test-controls")]
+    pub fn with_test_controls(
+        mut self,
+        controls: Option<Arc<crate::test_controls::NativeTestControls>>,
+    ) -> Self {
+        self.test_controls = controls;
+        self
+    }
+    #[cfg(feature = "test-controls")]
+    pub fn test_controls(&self) -> Option<Arc<crate::test_controls::NativeTestControls>> {
+        self.test_controls.clone()
+    }
+
+    #[cfg(feature = "test-controls")]
+    pub fn with_observation_controls(
+        mut self,
+        controls: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
+    ) -> Self {
+        self.observation_controls = controls;
+        self
+    }
+    #[cfg(feature = "test-controls")]
+    pub fn observation_controls(
+        &self,
+    ) -> Option<Arc<crate::test_observation_controls::NativeObservationControls>> {
+        self.observation_controls.clone()
     }
 
     pub fn with_backend_process_id(mut self, process_id: BackendProcessId) -> Self {

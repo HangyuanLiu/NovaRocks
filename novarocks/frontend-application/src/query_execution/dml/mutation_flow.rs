@@ -6306,8 +6306,10 @@ mod tests {
                 if let Err(failure) = result {
                     cause_preserved = failure
                         .source()
-                        .and_then(|source| source.source())
-                        .and_then(|source| source.source())
+                        .and_then(|source| source.downcast_ref::<spi::ConnectorCowBeginFailure>())
+                        .and_then(|failure| failure.source())
+                        .and_then(|source| source.downcast_ref::<spi::ConnectorCowBeginCause>())
+                        .and_then(|cause| cause.source())
                         .and_then(|source| source.downcast_ref::<ConnectorError>())
                         .is_some_and(|actual| {
                             actual.message().as_ptr() == original_pointer && actual == &expected
@@ -6317,8 +6319,10 @@ mod tests {
                     dml_preserved = dml
                         .source()
                         .and_then(|source| source.source())
-                        .and_then(|source| source.source())
-                        .and_then(|source| source.source())
+                        .and_then(|source| source.downcast_ref::<spi::ConnectorCowBeginFailure>())
+                        .and_then(|failure| failure.source())
+                        .and_then(|source| source.downcast_ref::<spi::ConnectorCowBeginCause>())
+                        .and_then(|cause| cause.source())
                         .and_then(|source| source.downcast_ref::<ConnectorError>())
                         .is_some_and(|actual| {
                             actual.message().as_ptr() == original_pointer && actual == &expected
@@ -6364,6 +6368,15 @@ mod tests {
 
         #[test]
         fn real_cow_consumer_retains_internal_window_through_session_ast_and_last_buffer() {
+            fn original_failure_chain(error: &dyn std::error::Error) -> String {
+                let mut chain = Vec::new();
+                let mut current: Option<&dyn std::error::Error> = Some(error);
+                while let Some(original) = current {
+                    chain.push(format!("{original:?}: {original}"));
+                    current = original.source();
+                }
+                chain.join(" -> ")
+            }
             let fixture = cow_rewrite_query_fixture(
                 vec![7, 9],
                 vec![2, 4],
@@ -6395,36 +6408,66 @@ mod tests {
             else {
                 panic!("fixture must carry signed lineage input");
             };
-            let session = Arc::new(
-                ConnectorWriteSession::begin(
-                    write_lease,
-                    properties,
-                    ws::ConnectorWriteBeginRequest {
-                        table: Arc::from("db.t"),
-                        target_ref: fixture.preparation.target_ref().clone(),
-                        intent: spi::ConnectorWriteIntent::RowDelta,
-                        purpose: spi::ConnectorWriteAdmissionPurpose::OrdinaryDml,
-                        input: spi::ConnectorWriteInputRequest::RowLineage {
-                            data_fields: request_fields(data_fields),
-                            row_identity_fields: request_fields(row_identity_fields),
-                        },
-                        base: Some(fixture.preparation.base_version().clone()),
-                        flavor: ws::ConnectorWriteSessionFlavor::CopyOnWrite {
-                            selection,
-                            match_contract: fixture.preparation.match_contract().clone(),
-                        },
-                        context,
-                    },
+            let request_receipt = cow_fe_begin_receipt::before_request(
+                &fixture.preparation,
+                &selection,
+                "db",
+                "t",
+                &binding,
+                &context,
+            )
+            .unwrap();
+            let caller_peak = request_receipt.through_request_peak_upper().unwrap();
+            let (original, caller_upper) =
+                crate::query_execution::original_cow_result_scope::from_original_binding(
+                    &binding,
+                    &context,
+                    caller_peak,
                 )
-                .unwrap(),
-            );
+                .unwrap();
+            let original_write_lease = planning.derive_write_lease().unwrap();
+            let session = crate::query_execution::write_session::begin_cow_connector_write_session(
+                write_lease,
+                &original_write_lease,
+                ws::ConnectorWriteBeginRequest {
+                    table: Arc::from("db.t"),
+                    target_ref: fixture.preparation.target_ref().clone(),
+                    intent: spi::ConnectorWriteIntent::RowDelta,
+                    purpose: spi::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                    input: spi::ConnectorWriteInputRequest::RowLineage {
+                        data_fields: request_fields(data_fields),
+                        row_identity_fields: request_fields(row_identity_fields),
+                    },
+                    base: Some(fixture.preparation.base_version().clone()),
+                    flavor: ws::ConnectorWriteSessionFlavor::CopyOnWrite {
+                        selection,
+                        match_contract: fixture.preparation.match_contract().clone(),
+                    },
+                    context,
+                },
+                original,
+                caller_upper,
+            )
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "original checked COW begin failed: {}",
+                    original_failure_chain(&failure)
+                )
+            });
+            drop(original_write_lease);
+            drop(properties);
             let write = build_cow_update_distributed_write(
                 &iceberg_target(),
                 planning,
                 &fixture.preparation,
                 session.clone(),
             )
-            .unwrap();
+            .unwrap_or_else(|failure| {
+                panic!(
+                    "original COW construction failed: {}",
+                    original_failure_chain(&failure)
+                )
+            });
             let exact_session = Arc::ptr_eq(&write.write_session, &session);
             let target_ordinal = write.targets[0].ordinal.get();
             let actual_sql = novarocks_parser::printer::print_query(&write.targets[0].query);

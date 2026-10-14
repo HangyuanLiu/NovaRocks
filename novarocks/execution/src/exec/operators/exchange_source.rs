@@ -293,6 +293,7 @@ impl OperatorFactory for ExchangeSourceFactory {
             finished: false,
             logged_first_pull: false,
             logged_first_none: false,
+            #[cfg(feature = "test-controls")]
             last_partial_eos_marker_count: 0,
             arena: Arc::clone(&self.arena),
             native_runtime_filter_consumers: Some(self.runtime_filter_execution.consumers.clone()),
@@ -323,6 +324,7 @@ struct ExchangeSourceOperator {
     finished: bool,
     logged_first_pull: bool,
     logged_first_none: bool,
+    #[cfg(feature = "test-controls")]
     last_partial_eos_marker_count: usize,
     arena: Arc<ExprArena>,
     native_runtime_filter_consumers: Option<RuntimeFilterConsumerSet>,
@@ -527,12 +529,16 @@ impl ProcessorOperator for ExchangeSourceOperator {
                 }
                 Some(exchange::ExchangePopResult::Finished(stats)) => {
                     self.idle_deadline.cancel();
-                    if exchange::exchange_snapshot_markers_enabled() {
+                    #[cfg(feature = "test-controls")]
+                    if let Some(observer) = state
+                        .exchange_test_observer()
+                        .filter(|observer| observer.is_active())
+                    {
                         let snapshot = self
                             .binding
                             .receiver_port
                             .snapshot(receiver_key(self.binding.key));
-                        exchange::emit_exchange_snapshot_marker(|| {
+                        exchange::emit_exchange_snapshot_marker(Some(observer.as_ref()), || {
                             format!(
                                 "event=source_finished finst={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
                                 self.binding.key.finst_uuid(),
@@ -583,41 +589,51 @@ impl ProcessorOperator for ExchangeSourceOperator {
                     if first_none {
                         self.logged_first_none = true;
                     }
-                    if exchange::exchange_snapshot_markers_enabled() {
+                    #[cfg(feature = "test-controls")]
+                    if let Some(observer) = state
+                        .exchange_test_observer()
+                        .filter(|observer| observer.is_active())
+                    {
                         let snapshot = self
                             .binding
                             .receiver_port
                             .snapshot(receiver_key(self.binding.key));
                         if first_none {
                             let first_snapshot = snapshot.clone();
-                            exchange::emit_exchange_snapshot_marker(|| {
-                                format!(
-                                    "event=source_first_block finst={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
-                                    self.binding.key.finst_uuid(),
-                                    self.node.node_id,
-                                    self.driver_id,
-                                    self.binding.expected_senders,
-                                    first_snapshot,
-                                    self.source_observable.generation(),
-                                )
-                            });
+                            exchange::emit_exchange_snapshot_marker(
+                                Some(observer.as_ref()),
+                                || {
+                                    format!(
+                                        "event=source_first_block finst={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
+                                        self.binding.key.finst_uuid(),
+                                        self.node.node_id,
+                                        self.driver_id,
+                                        self.binding.expected_senders,
+                                        first_snapshot,
+                                        self.source_observable.generation(),
+                                    )
+                                },
+                            );
                         }
                         if let Some(snapshot) = snapshot
                             && snapshot.finished_senders > self.last_partial_eos_marker_count
                             && snapshot.finished_senders < self.binding.expected_senders
                         {
                             self.last_partial_eos_marker_count = snapshot.finished_senders;
-                            exchange::emit_exchange_snapshot_marker(|| {
-                                format!(
-                                    "event=source_partial_eos_block finst={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
-                                    self.binding.key.finst_uuid(),
-                                    self.node.node_id,
-                                    self.driver_id,
-                                    self.binding.expected_senders,
-                                    snapshot,
-                                    self.source_observable.generation(),
-                                )
-                            });
+                            exchange::emit_exchange_snapshot_marker(
+                                Some(observer.as_ref()),
+                                || {
+                                    format!(
+                                        "event=source_partial_eos_block finst={} node_id={} driver_id={} expected_senders={} snapshot={:?} source_generation={}",
+                                        self.binding.key.finst_uuid(),
+                                        self.node.node_id,
+                                        self.driver_id,
+                                        self.binding.expected_senders,
+                                        snapshot,
+                                        self.source_observable.generation(),
+                                    )
+                                },
+                            );
                         }
                     }
                     if first_none {

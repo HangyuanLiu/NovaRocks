@@ -148,7 +148,6 @@ impl Drop for SupervisedSplitSource {
                     if let Err(error) = source.close() {
                         tracing::warn!(plan_node_id, error = %error, "closing an abandoned split source failed");
                     }
-                    super::round::emit_split_source_close_marker(plan_node_id);
                     drop(source);
                 });
             }

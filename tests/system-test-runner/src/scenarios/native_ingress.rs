@@ -32,12 +32,11 @@ use serde_json::Value;
 use std::time::Duration;
 use std::{
     fs,
-    io::{Read, Write},
     os::unix::net::{UnixListener, UnixStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc,
     thread,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::Instant,
 };
 
 use crate::{
@@ -46,9 +45,14 @@ use crate::{
 };
 use novarocks_cluster_harness::LaunchProfile;
 
+use super::native_direct_controls::{
+    DirectIntent, DirectIntentOwner, close_hold, read_marker, release_hold,
+};
+
 use super::native_compatibility::{
     RawUnaryConnection, RawUnaryResponse, authorization_header, raw_acquire_admission_ticket,
     raw_establish, raw_operation_envelope, raw_query_context, raw_unary_response,
+    raw_unary_response_until,
 };
 
 const REQUIRED_BACKENDS: usize = 3;
@@ -63,21 +67,30 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(OuterPreflightRejection),
         Box::new(QueryMessageBounds),
-        Box::new(CurrentGateObservation),
-        Box::new(BlockingSaturationControl),
+        Box::new(CurrentGateObservation::default()),
+        Box::new(BlockingSaturationControl::default()),
         Box::new(AsyncSchedulingPressure),
         Box::new(PartialBodyDeadline),
-        Box::new(RegistryContentionControl),
+        Box::new(RegistryContentionControl::default()),
     ]
 }
 
 struct OuterPreflightRejection;
 struct QueryMessageBounds;
-struct CurrentGateObservation;
-struct BlockingSaturationControl;
+#[derive(Default)]
+struct CurrentGateObservation {
+    intent: DirectIntentOwner,
+}
+#[derive(Default)]
+struct BlockingSaturationControl {
+    intent: DirectIntentOwner,
+}
 struct AsyncSchedulingPressure;
 struct PartialBodyDeadline;
-struct RegistryContentionControl;
+#[derive(Default)]
+struct RegistryContentionControl {
+    intent: DirectIntentOwner,
+}
 
 #[derive(Clone, PartialEq, Message)]
 struct PaddedOperations {
@@ -160,6 +173,7 @@ impl Scenario for OuterPreflightRejection {
             proto::ApplyTaskOperationsRequest {
                 operations: vec![proto::TaskOperation::default(); 33],
             },
+            context.deadline(),
         )?;
         ensure!(
             response.grpc_status == tonic::Code::ResourceExhausted as u16
@@ -217,6 +231,7 @@ impl Scenario for QueryMessageBounds {
                     value: backend.to_bytes().to_vec(),
                 }),
             },
+            context.deadline(),
         )?;
         ensure!(
             heartbeat.grpc_status == 0,
@@ -232,7 +247,13 @@ impl Scenario for QueryMessageBounds {
         for (size, accepted) in [(ORDINARY_BATCH_MAX, true), (ORDINARY_BATCH_MAX + 1, false)] {
             let request = pad_ordinary(ordinary.clone(), size)?;
             let response: RawUnaryResponse<proto::ApplyTaskOperationsResponse> =
-                raw_unary_response(&connector, ORDINARY_PATH, &authorization, request)?;
+                raw_unary_response(
+                    &connector,
+                    ORDINARY_PATH,
+                    &authorization,
+                    request,
+                    context.deadline(),
+                )?;
             if accepted {
                 ensure!(
                     response.grpc_status == 0
@@ -277,7 +298,13 @@ impl Scenario for QueryMessageBounds {
         for (size, accepted) in [(CONTROL_FRAME_MAX, true), (CONTROL_FRAME_MAX + 1, false)] {
             let request = pad_control(control.clone(), size)?;
             let response: RawUnaryResponse<proto::ApplyTaskOperationsResponse> =
-                raw_unary_response(&control_connector, CONTROL_PATH, &authorization, request)?;
+                raw_unary_response(
+                    &control_connector,
+                    CONTROL_PATH,
+                    &authorization,
+                    request,
+                    context.deadline(),
+                )?;
             if accepted {
                 ensure!(
                     response.grpc_status == 0
@@ -346,6 +373,29 @@ impl Scenario for CurrentGateObservation {
             "dynamic gate observation requires --launch-profile fault-scenario"
         );
         Ok(())
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let targets = (0..1).map(|query| (0, query, None)).collect::<Vec<_>>();
+        Ok(Some(self.intent.freeze(
+            "ingress-hold",
+            1,
+            &targets,
+            false,
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -419,20 +469,38 @@ impl Scenario for CurrentGateObservation {
         }
         let (connector, control_connector, authorization, backend, compatibility_id) =
             probe(context)?;
-        let operation = ticket_operation(
+        let intent = self.intent.get()?;
+        intent.verify_backend(0, backend)?;
+        ensure!(
+            context.deadline() == intent.deadline,
+            "Native ingress deadline changed after freeze"
+        );
+        let operations = held_operations(
+            &intent,
             &control_connector,
             &authorization,
             backend,
             compatibility_id,
         )?;
-        let mut held = HeldOrdinary::start(&connector, &authorization, operation, backend, 1)?;
-        held.await_entered(context.deadline())?;
-        wait_ingress_slot(context, "ordinary", "running", 1.0)?;
-        context.action("BE[0] ordinary running slot rose to one during a real held Worker closure");
-        held.release_and_join()?;
-        wait_ingress_slot(context, "ordinary", "running", 0.0)?;
-        context.action("BE[0] ordinary running slot returned to zero after closure release");
-        Ok(())
+        let mut held = HeldOrdinary::start(
+            &connector,
+            &authorization,
+            operations,
+            backend,
+            intent.deadline,
+        )?;
+        let primary = (|| -> Result<()> {
+            held.await_entered(context.deadline())?;
+            wait_ingress_slot(context, "ordinary", "running", 1.0)?;
+            context.action(
+                "BE[0] ordinary running slot rose to one during a real held Worker closure",
+            );
+            held.release_and_join()?;
+            wait_ingress_slot(context, "ordinary", "running", 0.0)?;
+            context.action("BE[0] ordinary running slot returned to zero after closure release");
+            Ok(())
+        })();
+        held.finish_after(primary)
     }
 }
 
@@ -462,11 +530,48 @@ impl Scenario for BlockingSaturationControl {
         Ok(launch)
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let targets = (0..8).map(|query| (0, query, None)).collect::<Vec<_>>();
+        Ok(Some(self.intent.freeze(
+            "ingress-hold",
+            8,
+            &targets,
+            false,
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         let (connector, control_connector, authorization, backend, compatibility_id) =
             probe(context)?;
         let releasable = establish_releasable_context(
             &connector,
+            &control_connector,
+            &authorization,
+            backend,
+            compatibility_id,
+            context.deadline(),
+        )?;
+        let intent = self.intent.get()?;
+        intent.verify_backend(0, backend)?;
+        ensure!(
+            context.deadline() == intent.deadline,
+            "Native ingress deadline changed after freeze"
+        );
+        let operations = held_operations(
+            &intent,
             &control_connector,
             &authorization,
             backend,
@@ -477,6 +582,7 @@ impl Scenario for BlockingSaturationControl {
             &authorization,
             backend,
             compatibility_id,
+            context.deadline(),
         )?;
         let running_limit = metric(
             &read_backend_metrics(context, 0)?,
@@ -491,124 +597,136 @@ impl Scenario for BlockingSaturationControl {
             running_limit == 8.0,
             "expected eight ordinary slots, got {running_limit}"
         );
-        let mut held =
-            HeldOrdinary::start(&connector, &authorization, operation.clone(), backend, 8)?;
-        held.await_entered(context.deadline())?;
-        wait_ingress_slot(context, "ordinary", "running", 8.0)?;
-        context.action("BE[0] eight real ordinary Worker closures held; ordinary blocking pool and running gate full");
-
-        held.start_waiter(&authorization, operation.clone())?;
-        wait_ingress_slot(context, "ordinary", "waiting", 1.0)?;
-        context.action("ninth ordinary request visibly waited at Native gate");
-
-        // No task was created in this context. A typed Worker refusal proves
-        // control-lane progress without claiming that a real task was canceled.
-        let cancel_request = control_cancel(backend);
-        let cancel_id = cancel_request.operations[0]
-            .envelope
-            .as_ref()
-            .and_then(|envelope| envelope.operation_id.clone())
-            .context("Cancel probe omitted operation id")?;
-        let control = raw_unary_response(
-            &control_connector,
-            CONTROL_PATH,
+        let mut held = HeldOrdinary::start(
+            &connector,
             &authorization,
-            cancel_request,
+            operations,
+            backend,
+            intent.deadline,
         )?;
-        let receipt = exact_probe_receipt(
-            control,
-            &cancel_id,
-            proto::TaskOperationOutcome::InvalidStateOrRequest,
-            "Cancel",
-        )?;
-        ensure!(
-            receipt.ack.is_none()
-                && receipt.safe_field_path.is_none()
-                && receipt.safe_detail == "cancel names a task this backend does not own",
-            "task-free Cancel did not return its Worker-owned refusal: {receipt:?}"
-        );
-        context.action(
+        let primary = (|| -> Result<()> {
+            held.await_entered(context.deadline())?;
+            wait_ingress_slot(context, "ordinary", "running", 8.0)?;
+            context.action("BE[0] eight real ordinary Worker closures held; ordinary blocking pool and running gate full");
+
+            held.start_waiter(&authorization, operation.clone())?;
+            wait_ingress_slot(context, "ordinary", "waiting", 1.0)?;
+            context.action("ninth ordinary request visibly waited at Native gate");
+
+            // No task was created in this context. A typed Worker refusal proves
+            // control-lane progress without claiming that a real task was canceled.
+            let cancel_request = control_cancel(backend);
+            let cancel_id = cancel_request.operations[0]
+                .envelope
+                .as_ref()
+                .and_then(|envelope| envelope.operation_id.clone())
+                .context("Cancel probe omitted operation id")?;
+            let control = raw_unary_response_until(
+                &control_connector,
+                CONTROL_PATH,
+                &authorization,
+                cancel_request,
+                intent.deadline,
+            )?;
+            let receipt = exact_probe_receipt(
+                control,
+                &cancel_id,
+                proto::TaskOperationOutcome::InvalidStateOrRequest,
+                "Cancel",
+            )?;
+            ensure!(
+                receipt.ack.is_none()
+                    && receipt.safe_field_path.is_none()
+                    && receipt.safe_detail == "cancel names a task this backend does not own",
+                "task-free Cancel did not return its Worker-owned refusal: {receipt:?}"
+            );
+            context.action(
             "task-free Cancel returned the exact Worker refusal while eight ordinary closures and one waiter were present",
         );
 
-        let quiesce_request = control_quiesce(releasable.clone());
-        let quiesce_id = quiesce_request.operations[0]
-            .envelope
-            .as_ref()
-            .and_then(|envelope| envelope.operation_id.clone())
-            .context("Quiesce probe omitted operation id")?;
-        let quiesce = raw_unary_response(
-            &control_connector,
-            CONTROL_PATH,
-            &authorization,
-            quiesce_request,
-        )?;
-        let receipt = exact_probe_receipt(
-            quiesce,
-            &quiesce_id,
-            proto::TaskOperationOutcome::Accepted,
-            "Quiesce",
-        )?;
-        let Some(proto::task_operation_receipt::Ack::QuiesceQueryContext(ack)) = &receipt.ack
-        else {
-            anyhow::bail!("Quiesce control omitted its typed acknowledgement: {receipt:?}");
-        };
-        ensure!(
-            ack.query_context.as_ref() == Some(&releasable)
-                && ack.fence_version == 1
-                && ack.accepted_tasks.is_empty()
-                && proto::QueryContextState::try_from(ack.state)
-                    == Ok(proto::QueryContextState::Quiescing),
-            "task-free Quiesce did not freeze the exact empty accepted-task set: {ack:?}"
-        );
-        context.action("Quiesce installed fence version one with an empty accepted-task set under ordinary saturation");
+            let quiesce_request = control_quiesce(releasable.clone());
+            let quiesce_id = quiesce_request.operations[0]
+                .envelope
+                .as_ref()
+                .and_then(|envelope| envelope.operation_id.clone())
+                .context("Quiesce probe omitted operation id")?;
+            let quiesce = raw_unary_response_until(
+                &control_connector,
+                CONTROL_PATH,
+                &authorization,
+                quiesce_request,
+                intent.deadline,
+            )?;
+            let receipt = exact_probe_receipt(
+                quiesce,
+                &quiesce_id,
+                proto::TaskOperationOutcome::Accepted,
+                "Quiesce",
+            )?;
+            let Some(proto::task_operation_receipt::Ack::QuiesceQueryContext(ack)) = &receipt.ack
+            else {
+                anyhow::bail!("Quiesce control omitted its typed acknowledgement: {receipt:?}");
+            };
+            ensure!(
+                ack.query_context.as_ref() == Some(&releasable)
+                    && ack.fence_version == 1
+                    && ack.accepted_tasks.is_empty()
+                    && proto::QueryContextState::try_from(ack.state)
+                        == Ok(proto::QueryContextState::Quiescing),
+                "task-free Quiesce did not freeze the exact empty accepted-task set: {ack:?}"
+            );
+            context.action("Quiesce installed fence version one with an empty accepted-task set under ordinary saturation");
 
-        let release_request = control_release(releasable.clone());
-        let release_id = release_request.operations[0]
-            .envelope
-            .as_ref()
-            .and_then(|envelope| envelope.operation_id.clone())
-            .context("Release probe omitted operation id")?;
-        let release = raw_unary_response(
-            &control_connector,
-            CONTROL_PATH,
-            &authorization,
-            release_request,
-        )?;
-        let receipt = exact_probe_receipt(
-            release,
-            &release_id,
-            proto::TaskOperationOutcome::Accepted,
-            "Release",
-        )?;
-        let Some(proto::task_operation_receipt::Ack::ReleaseQueryContext(ack)) = &receipt.ack
-        else {
-            anyhow::bail!("Release control omitted its typed acknowledgement: {receipt:?}");
-        };
-        ensure!(
-            ack.query_context.as_ref() == Some(&releasable)
-                && proto::ReleaseQueryContextOutcome::try_from(ack.outcome)
-                    == Ok(proto::ReleaseQueryContextOutcome::Released)
-                && proto::QueryContextState::try_from(ack.state)
-                    == Ok(proto::QueryContextState::TerminalRetained)
-                && ack.termination_cause.is_none(),
-            "task-free context did not release normally under ordinary saturation: {ack:?}"
-        );
-        context.action(
+            let release_request = control_release(releasable.clone());
+            let release_id = release_request.operations[0]
+                .envelope
+                .as_ref()
+                .and_then(|envelope| envelope.operation_id.clone())
+                .context("Release probe omitted operation id")?;
+            let release = raw_unary_response_until(
+                &control_connector,
+                CONTROL_PATH,
+                &authorization,
+                release_request,
+                intent.deadline,
+            )?;
+            let receipt = exact_probe_receipt(
+                release,
+                &release_id,
+                proto::TaskOperationOutcome::Accepted,
+                "Release",
+            )?;
+            let Some(proto::task_operation_receipt::Ack::ReleaseQueryContext(ack)) = &receipt.ack
+            else {
+                anyhow::bail!("Release control omitted its typed acknowledgement: {receipt:?}");
+            };
+            ensure!(
+                ack.query_context.as_ref() == Some(&releasable)
+                    && proto::ReleaseQueryContextOutcome::try_from(ack.outcome)
+                        == Ok(proto::ReleaseQueryContextOutcome::Released)
+                    && proto::QueryContextState::try_from(ack.state)
+                        == Ok(proto::QueryContextState::TerminalRetained)
+                    && ack.termination_cause.is_none(),
+                "task-free context did not release normally under ordinary saturation: {ack:?}"
+            );
+            context.action(
             "Release of the exact quiesced, task-free context returned Released and TerminalRetained under ordinary saturation",
         );
 
-        held.release_and_join()?;
-        let queued = held.join_waiter()?;
-        ensure!(
-            queued.grpc_status == 0,
-            "queued ordinary probe failed after release: {:?}",
-            queued.grpc_message
-        );
-        wait_ingress_slot(context, "ordinary", "running", 0.0)?;
-        wait_ingress_slot(context, "ordinary", "waiting", 0.0)?;
-        context.action("ordinary running/waiting returned to zero after release and queue drain");
-        Ok(())
+            held.release_and_join()?;
+            let queued = held.join_waiter()?;
+            ensure!(
+                queued.grpc_status == 0,
+                "queued ordinary probe failed after release: {:?}",
+                queued.grpc_message
+            );
+            wait_ingress_slot(context, "ordinary", "running", 0.0)?;
+            wait_ingress_slot(context, "ordinary", "waiting", 0.0)?;
+            context
+                .action("ordinary running/waiting returned to zero after release and queue drain");
+            Ok(())
+        })();
+        held.finish_after(primary)
     }
 }
 
@@ -705,6 +823,7 @@ impl Scenario for AsyncSchedulingPressure {
             CONTROL_PATH,
             &authorization,
             control_cancel(backend),
+            context.deadline(),
         )?;
         ensure!(
             control.grpc_status == 0
@@ -778,6 +897,7 @@ impl Scenario for PartialBodyDeadline {
             CONTROL_PATH,
             &authorization,
             control_cancel(backend),
+            context.deadline(),
         )?;
         ensure!(
             control.grpc_status == 0
@@ -803,41 +923,52 @@ impl Scenario for RegistryContentionControl {
     }
 
     fn validate_runner_inputs(&self, launch_profile: LaunchProfile) -> Result<()> {
-        BlockingSaturationControl.validate_runner_inputs(launch_profile)
+        BlockingSaturationControl::default().validate_runner_inputs(launch_profile)
     }
 
-    fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        fs::create_dir_all(scenario_root)?;
-        let token = format!(
-            "{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        );
-        fs::write(scenario_root.join("registry-hold-token"), &token)?;
-        let mut launch = ScenarioLaunchConfig::default();
-        launch
-            .child_environment
-            .be_by_index
-            .entry(0)
-            .or_default()
-            .insert(
-                "NOVAROCKS_SQL_TEST_NATIVE_REGISTRY_HOLD_TOKEN".to_owned(),
-                token,
-            );
-        Ok(launch)
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let targets = (0..1).map(|query| (0, query, None)).collect::<Vec<_>>();
+        Ok(Some(self.intent.freeze(
+            "registry-hold",
+            1,
+            &targets,
+            false,
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        let token = fs::read_to_string(context.scenario_root().join("registry-hold-token"))?;
-        let mut rendezvous = RegistryRendezvous::bind(&token)?;
+        let intent = self.intent.get()?;
+        ensure!(
+            context.deadline() == intent.deadline,
+            "Native registry deadline changed after freeze"
+        );
+        let mut rendezvous = RegistryRendezvous::bind(intent.token(0)?)?;
         let (connector, control_connector, authorization, backend, compatibility_id) =
             probe(context)?;
-        let operation = ticket_operation(
+        intent.verify_backend(0, backend)?;
+        let operation = held_operations(
+            &intent,
             &control_connector,
             &authorization,
             backend,
             compatibility_id,
-        )?;
+        )?
+        .remove(0)
+        .0;
+        let original_deadline = intent.deadline;
         let before = read_backend_metrics(context, 0)?;
         let control_started_before = metric_or_zero(
             &before,
@@ -851,14 +982,15 @@ impl Scenario for RegistryContentionControl {
         )?;
         let acquire_connector = connector.clone();
         let acquire_authorization = authorization.clone();
-        let acquire = thread::spawn(move || {
-            raw_unary_response::<_, proto::ApplyTaskOperationsResponse>(
+        let acquire = JoinedActor::spawn(move || {
+            raw_unary_response_until::<_, proto::ApplyTaskOperationsResponse>(
                 &acquire_connector,
                 ORDINARY_PATH,
                 &acquire_authorization,
                 proto::ApplyTaskOperationsRequest {
                     operations: vec![operation],
                 },
+                original_deadline,
             )
         });
         rendezvous.await_entered(backend, context.deadline())?;
@@ -867,12 +999,13 @@ impl Scenario for RegistryContentionControl {
         let control_connector = control_connector.clone();
         let control_authorization = authorization.clone();
         let (done_tx, done_rx) = mpsc::sync_channel(1);
-        let control_thread = thread::spawn(move || {
-            let result = raw_unary_response::<_, proto::ApplyTaskOperationsResponse>(
+        let control_thread = JoinedActor::spawn(move || {
+            let result = raw_unary_response_until::<_, proto::ApplyTaskOperationsResponse>(
                 &control_connector,
                 CONTROL_PATH,
                 &control_authorization,
                 control_cancel(backend),
+                original_deadline,
             );
             let _ = done_tx.send(result);
         });
@@ -910,18 +1043,18 @@ impl Scenario for RegistryContentionControl {
         );
         context.action("control executor started and held one control-running slot, but its receipt waited for the Worker mutex");
         rendezvous.release()?;
-        let acquisition = acquire
-            .join()
-            .map_err(|_| anyhow::anyhow!("registry Acquire actor panicked"))??;
+        let acquisition = acquire.join()??;
         ensure!(
             acquisition.grpc_status == 0,
             "registry Acquire failed after release: {:?}",
             acquisition.grpc_message
         );
-        let control = done_rx.recv_timeout(Duration::from_secs(10))??;
-        control_thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("registry control actor panicked"))?;
+        let control = done_rx.recv_timeout(
+            context
+                .remaining("join registry control actor")?
+                .min(Duration::from_secs(10)),
+        )??;
+        control_thread.join()?;
         ensure!(
             control.grpc_status == 0
                 && control
@@ -947,6 +1080,27 @@ impl Scenario for RegistryContentionControl {
     }
 }
 
+struct JoinedActor<T>(Option<thread::JoinHandle<T>>);
+impl<T: Send + 'static> JoinedActor<T> {
+    fn spawn(action: impl FnOnce() -> T + Send + 'static) -> Self {
+        Self(Some(thread::spawn(action)))
+    }
+    fn join(mut self) -> Result<T> {
+        self.0
+            .take()
+            .context("Native actor already joined")?
+            .join()
+            .map_err(|_| anyhow::anyhow!("Native registry actor panicked"))
+    }
+}
+impl<T> Drop for JoinedActor<T> {
+    fn drop(&mut self) {
+        if let Some(actor) = self.0.take() {
+            let _ = actor.join();
+        }
+    }
+}
+
 fn metric_or_zero(rows: &[Value], name: &str, labels: &[(&str, &str)]) -> Result<f64> {
     if rows.iter().any(|row| {
         row["tags"]["metric"] == name
@@ -961,6 +1115,7 @@ fn metric_or_zero(rows: &[Value], name: &str, labels: &[(&str, &str)]) -> Result
 }
 
 struct RegistryRendezvous {
+    deadline: Option<Instant>,
     path: PathBuf,
     listener: UnixListener,
     stream: Option<UnixStream>,
@@ -974,6 +1129,7 @@ impl RegistryRendezvous {
         let listener = UnixListener::bind(&path)?;
         listener.set_nonblocking(true)?;
         Ok(Self {
+            deadline: None,
             path,
             listener,
             stream: None,
@@ -1000,10 +1156,8 @@ impl RegistryRendezvous {
                 Err(error) => return Err(error.into()),
             }
         };
-        stream.set_nonblocking(false)?;
-        stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-        let mut marker = String::new();
-        stream.read_to_string(&mut marker)?;
+        let marker = read_marker(&mut stream, deadline)?;
+        self.deadline = Some(scenario_deadline);
         ensure!(
             marker == format!("NIR1 0 {backend} {}\n", self.token),
             "unexpected Worker registry marker: {marker:?}"
@@ -1013,10 +1167,13 @@ impl RegistryRendezvous {
     }
 
     fn release(&mut self) -> Result<()> {
-        self.stream
-            .as_mut()
-            .context("registry hold has not entered")?
-            .write_all(b"R")?;
+        release_hold(
+            self.stream
+                .as_mut()
+                .context("registry hold has not entered")?,
+            self.deadline
+                .context("registry hold lacks original deadline")?,
+        )?;
         self.stream = None;
         Ok(())
     }
@@ -1025,7 +1182,7 @@ impl RegistryRendezvous {
 impl Drop for RegistryRendezvous {
     fn drop(&mut self) {
         if let Some(stream) = &mut self.stream {
-            let _ = stream.write_all(b"R");
+            close_hold(stream);
         }
         let _ = fs::remove_file(&self.path);
     }
@@ -1127,7 +1284,13 @@ fn read_backend_metrics(context: &mut ScenarioContext, index: usize) -> Result<V
         .context("BE metrics target index out of range")?
         .http;
     let url = format!("http://127.0.0.1:{port}/metrics?type=json");
-    let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
+    let client = Client::builder()
+        .timeout(
+            context
+                .remaining("read Native ingress metrics")?
+                .min(Duration::from_secs(5)),
+        )
+        .build()?;
     let rows: Value = client.get(&url).send()?.error_for_status()?.json()?;
     rows.as_array()
         .cloned()
@@ -1161,13 +1324,65 @@ fn wait_ingress_slot(
     }
 }
 
+fn held_operations(
+    intent: &DirectIntent,
+    connector: &NativeEndpointConnector,
+    authorization: &str,
+    backend: BackendProcessId,
+    compatibility_id: [u8; 32],
+) -> Result<Vec<(proto::TaskOperation, String)>> {
+    let heartbeat: RawUnaryResponse<proto::HeartbeatResponse> = raw_unary_response_until(
+        connector,
+        HEARTBEAT_PATH,
+        authorization,
+        proto::HeartbeatRequest {
+            expected_process_id: Some(proto::BackendProcessId {
+                value: backend.to_bytes().to_vec(),
+            }),
+        },
+        intent.deadline,
+    )?;
+    ensure!(
+        heartbeat.grpc_status == 0,
+        "Native held query heartbeat failed"
+    );
+    let epoch = heartbeat
+        .message
+        .context("heartbeat omitted response")?
+        .admission_epoch_capability
+        .context("heartbeat omitted epoch")?;
+    intent
+        .holds
+        .iter()
+        .map(|hold| {
+            ensure!(
+                hold.backend_index == 0 && hold.task_id.is_none(),
+                "invalid ingress hold target"
+            );
+            let query = intent
+                .queries
+                .get(hold.query_index)
+                .context("hold query outside frozen set")?;
+            Ok((
+                raw_acquire_admission_ticket(
+                    query.context(backend),
+                    compatibility_id,
+                    epoch.clone(),
+                ),
+                hold.token.clone(),
+            ))
+        })
+        .collect()
+}
+
 fn ticket_operation(
     control_connector: &NativeEndpointConnector,
     authorization: &str,
     backend: BackendProcessId,
     compatibility_id: [u8; 32],
+    deadline: Instant,
 ) -> Result<proto::TaskOperation> {
-    let heartbeat: RawUnaryResponse<proto::HeartbeatResponse> = raw_unary_response(
+    let heartbeat: RawUnaryResponse<proto::HeartbeatResponse> = raw_unary_response_until(
         control_connector,
         HEARTBEAT_PATH,
         authorization,
@@ -1176,6 +1391,7 @@ fn ticket_operation(
                 value: backend.to_bytes().to_vec(),
             }),
         },
+        deadline,
     )?;
     ensure!(
         heartbeat.grpc_status == 0,
@@ -1199,9 +1415,15 @@ fn establish_releasable_context(
     authorization: &str,
     backend: BackendProcessId,
     compatibility_id: [u8; 32],
+    deadline: Instant,
 ) -> Result<proto::QueryContextRef> {
-    let acquisition =
-        ticket_operation(control_connector, authorization, backend, compatibility_id)?;
+    let acquisition = ticket_operation(
+        control_connector,
+        authorization,
+        backend,
+        compatibility_id,
+        deadline,
+    )?;
     let context = match acquisition.operation.as_ref() {
         Some(proto::task_operation::Operation::AcquireQueryContextAdmissionTicket(request)) => {
             request
@@ -1216,13 +1438,14 @@ fn establish_releasable_context(
         .as_ref()
         .and_then(|envelope| envelope.operation_id.clone())
         .context("ticket acquisition omitted operation id")?;
-    let response = raw_unary_response(
+    let response = raw_unary_response_until(
         connector,
         ORDINARY_PATH,
         authorization,
         proto::ApplyTaskOperationsRequest {
             operations: vec![acquisition],
         },
+        deadline,
     )?;
     let receipt = exact_probe_receipt(
         response,
@@ -1247,13 +1470,14 @@ fn establish_releasable_context(
         .as_ref()
         .and_then(|envelope| envelope.operation_id.clone())
         .context("Establish probe omitted operation id")?;
-    let establish = raw_unary_response(
+    let establish = raw_unary_response_until(
         connector,
         ORDINARY_PATH,
         authorization,
         proto::ApplyTaskOperationsRequest {
             operations: vec![operation],
         },
+        deadline,
     )?;
     let receipt = exact_probe_receipt(
         establish,
@@ -1371,6 +1595,7 @@ struct HeldCall {
 struct HeldOrdinary {
     calls: Vec<HeldCall>,
     backend: BackendProcessId,
+    deadline: Instant,
     connection: RawUnaryConnection,
     waiter:
         Option<thread::JoinHandle<Result<RawUnaryResponse<proto::ApplyTaskOperationsResponse>>>>,
@@ -1380,40 +1605,18 @@ impl HeldOrdinary {
     fn start(
         connector: &NativeEndpointConnector,
         authorization: &str,
-        operation: proto::TaskOperation,
+        operations: Vec<(proto::TaskOperation, String)>,
         backend: BackendProcessId,
-        count: usize,
+        deadline: Instant,
     ) -> Result<Self> {
-        Self::start_inner(connector, authorization, operation, backend, count, false)
-    }
-
-    fn start_with_near_limit(
-        connector: &NativeEndpointConnector,
-        authorization: &str,
-        operation: proto::TaskOperation,
-        backend: BackendProcessId,
-        count: usize,
-    ) -> Result<Self> {
-        Self::start_inner(connector, authorization, operation, backend, count, true)
-    }
-
-    fn start_inner(
-        connector: &NativeEndpointConnector,
-        authorization: &str,
-        operation: proto::TaskOperation,
-        backend: BackendProcessId,
-        count: usize,
-        near_limit_first: bool,
-    ) -> Result<Self> {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let mut held = Self {
-            calls: Vec::with_capacity(count),
+            calls: Vec::with_capacity(operations.len()),
             backend,
-            connection: RawUnaryConnection::connect(connector)?,
+            connection: RawUnaryConnection::connect_until(connector, deadline)?,
             waiter: None,
+            deadline,
         };
-        for index in 0..count {
-            let token = format!("{}-{nonce}-{index}", std::process::id());
+        for (operation, token) in operations {
             let path = novarocks_failpoint::native_ingress_hold_socket_path(&token)
                 .map_err(anyhow::Error::msg)?;
             let listener = UnixListener::bind(&path)
@@ -1421,31 +1624,17 @@ impl HeldOrdinary {
             listener.set_nonblocking(true)?;
             let client = held.connection.client();
             let authorization = authorization.to_owned();
-            let request = if near_limit_first && index == 0 {
-                Some(pad_ordinary(operation.clone(), ORDINARY_BATCH_MAX)?)
-            } else {
-                None
-            };
-            let small_request = proto::ApplyTaskOperationsRequest {
-                operations: vec![operation.clone()],
-            };
             let token_for_request = token.clone();
             let response = thread::spawn(move || {
-                if let Some(request) = request {
-                    client.response_with_hold::<_, proto::ApplyTaskOperationsResponse>(
-                        ORDINARY_PATH,
-                        &authorization,
-                        request,
-                        Some(&token_for_request),
-                    )
-                } else {
-                    client.response_with_hold::<_, proto::ApplyTaskOperationsResponse>(
-                        ORDINARY_PATH,
-                        &authorization,
-                        small_request,
-                        Some(&token_for_request),
-                    )
-                }
+                client.response_with_hold_until::<_, proto::ApplyTaskOperationsResponse>(
+                    ORDINARY_PATH,
+                    &authorization,
+                    proto::ApplyTaskOperationsRequest {
+                        operations: vec![operation],
+                    },
+                    Some(&token_for_request),
+                    deadline,
+                )
             });
             held.calls.push(HeldCall {
                 token,
@@ -1462,14 +1651,16 @@ impl HeldOrdinary {
         ensure!(self.waiter.is_none(), "ordinary waiter already started");
         let client = self.connection.client();
         let authorization = authorization.to_owned();
+        let deadline = self.deadline;
         self.waiter = Some(thread::spawn(move || {
-            client.response_with_hold(
+            client.response_with_hold_until(
                 ORDINARY_PATH,
                 &authorization,
                 proto::ApplyTaskOperationsRequest {
                     operations: vec![operation],
                 },
                 None,
+                deadline,
             )
         }));
         Ok(())
@@ -1500,10 +1691,7 @@ impl HeldOrdinary {
                     Err(error) => return Err(error.into()),
                 }
             };
-            stream.set_nonblocking(false)?;
-            stream.set_read_timeout(Some(Duration::from_secs(5)))?;
-            let mut marker = String::new();
-            stream.read_to_string(&mut marker)?;
+            let marker = read_marker(&mut stream, deadline)?;
             ensure!(
                 marker == format!("NIH1 0 {} {}\n", self.backend, call.token),
                 "unexpected Native hold marker: {marker:?}"
@@ -1514,56 +1702,87 @@ impl HeldOrdinary {
     }
 
     fn release_and_join(&mut self) -> Result<()> {
+        let mut result = Ok(());
         for call in &mut self.calls {
             if let Some(stream) = &mut call.stream {
-                stream.write_all(b"R")?;
+                result = super::native_compatibility::combine_raw_cleanup(
+                    result,
+                    release_hold(stream, self.deadline),
+                );
             }
         }
         for call in &mut self.calls {
-            let response = call
-                .response
-                .take()
-                .context("held ordinary response already joined")?
-                .join()
-                .map_err(|_| anyhow::anyhow!("held ordinary probe panicked"))??;
-            ensure!(
-                response.grpc_status == 0
-                    && response
-                        .message
-                        .as_ref()
-                        .is_some_and(|body| body.receipts.len() == 1),
-                "held ordinary probe failed: status={} detail={:?}",
-                response.grpc_status,
-                response.grpc_message
-            );
+            if let Some(response) = call.response.take() {
+                let joined = response
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("held ordinary probe panicked"))
+                    .and_then(|response| response)
+                    .and_then(|response| {
+                        ensure!(
+                            response.grpc_status == 0
+                                && response
+                                    .message
+                                    .as_ref()
+                                    .is_some_and(|body| body.receipts.len() == 1),
+                            "held ordinary probe failed: status={} detail={:?}",
+                            response.grpc_status,
+                            response.grpc_message
+                        );
+                        Ok(())
+                    });
+                result = super::native_compatibility::combine_raw_cleanup(result, joined);
+            }
         }
-        Ok(())
+        result
+    }
+
+    fn finish_after<T>(&mut self, primary: Result<T>) -> Result<T> {
+        let mut cleanup = Ok(());
+        for call in &mut self.calls {
+            if let Some(stream) = &mut call.stream {
+                close_hold(stream);
+            }
+            while let Ok((mut stream, _)) = call.listener.accept() {
+                close_hold(&mut stream);
+            }
+            let removed = fs::remove_file(&call.path);
+            let removed = match removed {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => {
+                    Err(anyhow::Error::from(error).context("remove owned Native hold socket"))
+                }
+            };
+            cleanup = super::native_compatibility::combine_raw_cleanup(cleanup, removed);
+        }
+        cleanup =
+            super::native_compatibility::combine_raw_cleanup(cleanup, self.connection.close());
+        for call in &mut self.calls {
+            if let Some(response) = call.response.take() {
+                let joined = response
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("held ordinary probe panicked during cleanup"))
+                    .and_then(|response| response)
+                    .map(|_| ());
+                cleanup = super::native_compatibility::combine_raw_cleanup(cleanup, joined);
+            }
+        }
+        if let Some(waiter) = self.waiter.take() {
+            let joined = waiter
+                .join()
+                .map_err(|_| anyhow::anyhow!("ordinary waiter panicked during cleanup"))
+                .and_then(|response| response)
+                .map(|_| ());
+            cleanup = super::native_compatibility::combine_raw_cleanup(cleanup, joined);
+        }
+        super::native_compatibility::combine_raw_cleanup(primary, cleanup)
     }
 }
 
 impl Drop for HeldOrdinary {
     fn drop(&mut self) {
-        for call in &mut self.calls {
-            if let Some(stream) = &mut call.stream {
-                let _ = stream.write_all(b"R");
-            }
-            // Failure may leave a rendezvous accepted by BE but not yet
-            // accepted by the runner. Release its pending socket as well.
-            while let Ok((mut stream, _)) = call.listener.accept() {
-                let _ = stream.write_all(b"R");
-            }
-            let _ = fs::remove_file(&call.path);
-        }
-        // On an early assertion failure, cancellation wakes every pending H2
-        // response before joining its actor. No fixture thread is detached.
-        self.connection.close();
-        for call in &mut self.calls {
-            if let Some(response) = call.response.take() {
-                let _ = response.join();
-            }
-        }
-        if let Some(waiter) = self.waiter.take() {
-            let _ = waiter.join();
+        if let Err(error) = self.finish_after(Ok(())) {
+            eprintln!("Native held ordinary cleanup failed: {error:#}");
         }
     }
 }

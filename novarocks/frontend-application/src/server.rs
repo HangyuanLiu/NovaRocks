@@ -113,7 +113,7 @@ pub struct FrontendApplicationOpenConfig {
 
 #[cfg(feature = "mem-1-m07-hms-listing-observe")]
 #[path = "server/hms_admission_observation.rs"]
-mod hms_admission_observation;
+pub(crate) mod hms_admission_observation;
 #[cfg(feature = "mem-1-m07-hms-listing-observe")]
 pub use hms_admission_observation::HmsListingObservationSetup;
 
@@ -323,8 +323,30 @@ async fn build_frontend_role_products(
     // Constructor-supplied, exactly once: query preparation receives the
     // registry here and never resolves it from the host at request time.
     let typed_connector_control = host.typed_connector_control();
+    #[cfg(not(feature = "test-controls"))]
     let query_control =
         novarocks_query_application::query_control::QueryApplicationControl::service();
+    #[cfg(feature = "test-controls")]
+    let query_application_control =
+        Arc::new(novarocks_query_application::query_control::QueryApplicationControl::default());
+    #[cfg(feature = "test-controls")]
+    let query_control = novarocks_query_application::session_control::QueryControlService::new(
+        query_application_control.clone(),
+    );
+    #[cfg(feature = "test-controls")]
+    if let Some(owner) = host
+        .test_session
+        .as_ref()
+        .and_then(|session| session.statement.as_ref())
+    {
+        // Retain the same actual session owner used by QueryControlService.
+        // Each arm snapshots its token once; replacement never refreshes it.
+        owner
+            .install_session_resolver(Arc::new(move |connection_id| {
+                query_application_control.current_session_for_test_controls(connection_id)
+            }))
+            .map_err(FrontendApplicationError::server)?;
+    }
     let query_execution = host.build_query_execution_service()?;
     let logical_read_launcher = host.build_logical_read_launcher();
     let topology = host.backend_topology_port();
@@ -333,22 +355,27 @@ async fn build_frontend_role_products(
     let view_service: Arc<dyn novarocks_query_application::view::ViewService> =
         Arc::new(novarocks_query_application::view::QueryViewService::new());
     let dml_service = Arc::new(crate::dml::DmlService::new());
+    let maintenance_service = crate::table_maintenance::FrontendTableMaintenanceService::open(
+        host.durable(),
+        Handle::current(),
+        host.workload_root_admission(),
+    )
+    .await
+    .map_err(|error| {
+        FrontendApplicationError::new(
+            crate::application::FrontendApplicationErrorKind::TableMaintenanceServiceOpen,
+            error,
+        )
+    })?
+    .with_lake_publication_runtime_policy(host.lake_publication_runtime_policy());
+    #[cfg(feature = "test-controls")]
+    let maintenance_service = maintenance_service.with_test_controls(
+        host.test_session
+            .as_ref()
+            .and_then(|session| session.maintenance.clone()),
+    );
     let maintenance_service: Arc<dyn crate::query_execution::maintenance::TableMaintenanceService> =
-        Arc::new(
-            crate::table_maintenance::FrontendTableMaintenanceService::open(
-                host.durable(),
-                Handle::current(),
-                host.workload_root_admission(),
-            )
-            .await
-            .map_err(|error| {
-                FrontendApplicationError::new(
-                    crate::application::FrontendApplicationErrorKind::TableMaintenanceServiceOpen,
-                    error,
-                )
-            })?
-            .with_lake_publication_runtime_policy(host.lake_publication_runtime_policy()),
-        );
+        Arc::new(maintenance_service);
 
     core_capabilities::bind_catalog_runtime_projection(
         catalog_projection.as_ref(),
@@ -378,12 +405,21 @@ async fn build_frontend_role_products(
         mv_management_entrance,
         host.mv_remote_effect_policy(),
     ));
-    let mv_readiness = Arc::new(crate::mv::domain::readiness::MvReadinessPort::from_product(
+    let mv_readiness = crate::mv::domain::readiness::MvReadinessPort::from_product(
         mv_product_service
             .readiness_service()
             .expect("serving MV product must own readiness state"),
         tokio::runtime::Handle::current(),
-    ));
+    );
+    #[cfg(feature = "test-controls")]
+    let mv_readiness = match &host.test_session {
+        Some(session) => match &session.mv {
+            Some(mv) => mv_readiness.with_test_controls(mv.clone()),
+            None => mv_readiness,
+        },
+        None => mv_readiness,
+    };
+    let mv_readiness = Arc::new(mv_readiness);
     let mv_candidate_reader = mv_readiness.candidate_reader();
     let mv_activation = core_capabilities::mv_refresh_provider_activation(
         core_capabilities::MvRefreshProviderActivationPorts::new(
@@ -676,7 +712,7 @@ fn build_frontend_query_session_factory_from_role_products(
         host.constant_policy(),
         host.static_plan_carrier(),
     ));
-    let query_service = Arc::new(crate::query::FrontendQueryService::new(
+    let query_service = crate::query::FrontendQueryService::new(
         session_catalog_resolver,
         query_compiler,
         product_command_router,
@@ -703,7 +739,14 @@ fn build_frontend_query_session_factory_from_role_products(
         host.optimizer_query_mem_limit_bytes(),
         host.lake_publication_runtime_policy(),
         host.serving_lifecycle().admission(),
-    ));
+    );
+    #[cfg(feature = "test-controls")]
+    let query_service = query_service.with_statement_observation(
+        host.test_session
+            .as_ref()
+            .and_then(|session| session.statement.clone()),
+    );
+    let query_service = Arc::new(query_service);
     host.mark_ready()?;
     Ok(query_service)
 }
@@ -818,6 +861,7 @@ pub struct FrontendManagementServer {
 
 pub fn start_frontend_management_server(
     config: &FrontendManagementConfig,
+    host: &FrontendApplicationHost,
 ) -> Result<FrontendManagementServer, FrontendApplicationError> {
     let metrics_registry =
         crate::metrics::FrontendMetricsRegistry::with_process_memory(config.process_memory.clone())
@@ -835,10 +879,17 @@ pub fn start_frontend_management_server(
         dyn crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceReader,
     > = convergence_reader.clone();
     #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    let hms_admission_observation = config
-        .hms_listing_observation
+    let hms_admission_observation = host
+        .test_session
         .as_ref()
-        .map(hms_admission_observation::HmsAdmissionObservation::new);
+        .and_then(|session| session.hms_admission_owner.clone());
+    #[cfg(feature = "test-controls")]
+    let statement_observation = host
+        .test_session
+        .as_ref()
+        .and_then(|session| session.statement.clone());
+    #[cfg(not(feature = "test-controls"))]
+    let _ = host;
     let metrics_http_server = crate::metrics::MetricsHttpServer::start(
         &config.bind_host,
         config.http_port,
@@ -847,6 +898,8 @@ pub fn start_frontend_management_server(
         management_island_reader,
         Some(management_convergence_reader),
         Arc::clone(&config.memory_authority),
+        #[cfg(feature = "test-controls")]
+        statement_observation,
         #[cfg(feature = "mem-1-m07-hms-listing-observe")]
         hms_admission_observation
             .as_ref()
@@ -870,7 +923,7 @@ impl FrontendManagementServer {
         #[cfg(feature = "mem-1-m07-hms-listing-observe")]
         if let Some(owner) = self.hms_admission_observation.as_ref() {
             owner
-                .install(&host.catalog_runtime_projection())
+                .require_installed(&host.catalog_runtime_projection())
                 .map_err(FrontendApplicationError::server)?;
         }
         self.serving_reader
@@ -1046,30 +1099,52 @@ where
     F: Future<Output = ()> + Send,
 {
     #[cfg(feature = "mem-1-m07-root-observation")]
-    root_observation_identity::emit(&native_trust)?;
-    #[cfg(feature = "mem-1-m07-closing-pressure")]
-    let pressure = closing_pressure_fixture::bind_from_environment(
+    let _root_observation_claim = root_observation_identity::emit(
         &native_trust,
-        host.workload_observation(),
+        host.test_session.as_ref().map_or_else(Vec::new, |session| {
+            session
+                .scope()
+                .grants_for(root_observation_identity::DOMAIN)
+        }),
     )?;
+    #[cfg(any(
+        feature = "mem-1-m07-closing-pressure",
+        feature = "mem-1-m07-exact-mysql-write"
+    ))]
+    let authorization = host
+        .test_session
+        .as_ref()
+        .map(|session| session.take_mysql_fixture())
+        .transpose()
+        .map_err(FrontendApplicationError::server)?
+        .flatten();
     #[cfg(feature = "mem-1-m07-closing-pressure")]
-    if let Some(fixture) = pressure {
-        return closing_pressure_fixture::serve(
-            fixture,
-            mysql_listener,
-            session_factory,
-            client_connections,
-            shutdown,
-            report_server,
-            management_server,
-            host,
-            drain_timeout,
-            cleanup_timeout,
-        )
-        .await;
-    }
+    let authorization = match authorization {
+        Some(authorization) if authorization.is_closing_pressure() => {
+            let fixture = closing_pressure_fixture::bind_authorized(
+                &native_trust,
+                authorization,
+                host.workload_observation(),
+            )?;
+            return closing_pressure_fixture::serve(
+                fixture,
+                mysql_listener,
+                session_factory,
+                client_connections,
+                shutdown,
+                report_server,
+                management_server,
+                host,
+                drain_timeout,
+                cleanup_timeout,
+            )
+            .await;
+        }
+        other => other,
+    };
     #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-    if let Some(fixture) = exact_mysql_write_fixture::bind_from_environment(&native_trust)? {
+    if let Some(authorization) = authorization {
+        let fixture = exact_mysql_write_fixture::bind_authorized(&native_trust, authorization)?;
         return exact_mysql_write_fixture::serve(
             fixture,
             mysql_listener,
@@ -2110,5 +2185,636 @@ mod tests {
             .clone()
             .expect("state store input");
         assert_eq!(captured, input);
+    }
+
+    #[cfg(all(unix, feature = "test-controls"))]
+    mod real_statement_entry_tests {
+        use super::*;
+        use anyhow::{Result, anyhow, ensure};
+        use novarocks_failpoint::liveness::{PreparedRoleSession, RunnerSession};
+        use novarocks_failpoint::session::{DomainGrant, SessionDeclaration, SessionRole};
+        use novarocks_query_application::session::QuerySession;
+        use novarocks_query_application::session_control::GovernedStatementFinishOutcome;
+        use novarocks_query_application::session_error::QueryServiceError;
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+
+        fn arm_real_entry(
+            owner: &crate::preparation_diagnostics::StatementObservationOwner,
+            token: &str,
+            connection_id: u32,
+            sql: &str,
+        ) -> Result<()> {
+            owner
+                .arm(
+                    crate::preparation_diagnostics::StatementObservationArmRequest {
+                        run_token: token.to_owned(),
+                        connection_id,
+                        sql_sha256: hex::encode(Sha256::digest(sql.as_bytes())),
+                    },
+                )
+                .map_err(anyhow::Error::msg)
+        }
+
+        async fn actual_entry_error(
+            session: &dyn QuerySession,
+            sql: &str,
+        ) -> Result<QueryServiceError> {
+            match session.execute_batch(sql).await {
+                Err(error) => Ok(error),
+                Ok(statement) => {
+                    let (output, terminal) = statement.into_parts();
+                    match output {
+                        StatementResult::GovernedError(result) => {
+                            let (error, mut protocol) = result.into_parts();
+                            let finish = protocol.fail();
+                            terminal.complete();
+                            if matches!(finish, GovernedStatementFinishOutcome::Stale) {
+                                return Err(anyhow::Error::new(error).context(
+                                    "real error protocol failed to finish its statement",
+                                ));
+                            }
+                            Ok(error)
+                        }
+                        output => {
+                            drop(output);
+                            terminal.complete();
+                            Err(anyhow!(
+                                "selected entry unexpectedly returned a successful result"
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+
+        async fn configure_real_entry(session: &dyn QuerySession) -> Result<()> {
+            let statement = session.execute_batch("SET query_timeout = 1").await?;
+            let (output, terminal) = statement.into_parts();
+            let StatementResult::GovernedCompletion(result) = output else {
+                drop(output);
+                terminal.complete();
+                return Err(anyhow!(
+                    "query timeout SET did not return its governed completion"
+                ));
+            };
+            let mut protocol = result.into_protocol();
+            let seal = protocol.seal_success_visibility();
+            let finish = protocol.complete();
+            terminal.complete();
+            ensure!(matches!(seal,
+                novarocks_query_application::session_control::GovernedStatementVisibilitySealOutcome::Sealed),
+                "query timeout SET visibility did not seal: {seal:?}");
+            ensure!(
+                matches!(finish, GovernedStatementFinishOutcome::Completed),
+                "query timeout SET did not actually finish: {finish:?}"
+            );
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn real_unbound_arm_cannot_move_to_replacement_connection() -> Result<()> {
+            run_unbound_entry_case(false).await
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn real_unbound_native_permission_cannot_retarget_sql_through_drain_and_rearm()
+        -> Result<()> {
+            run_unbound_entry_case(true).await
+        }
+
+        async fn run_unbound_entry_case(rearm: bool) -> Result<()> {
+            let directory = tempfile::Builder::new()
+                .prefix("g2-real-entry-")
+                .tempdir_in("/tmp")?;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+            let mut grants = vec![DomainGrant {
+                domain: "statement-observation".into(),
+                grant_id: "observe-real-entry".into(),
+                parameters: serde_json::json!({"action":"observe", "bearer_secret":"0123456789abcdef0123456789abcdef"}),
+            }];
+            // These bind grants freeze statement ownership without inventing a BE
+            // receipt or a QueryExecutionId. This test fails before placement.
+            for token in ["first-entry"] {
+                grants.push(DomainGrant {
+                    domain: "native".into(),
+                    grant_id: format!("bind-{token}"),
+                    parameters: serde_json::json!({
+                        "action":"bind-create-task-ack-drop", "root":directory.path(),
+                        "backend_index":0, "statement_run_token":token,
+                        "target_session_id":"unpublished-backend-entry",
+                        "target_process_receipt":directory.path().join("unpublished-be.receipt.json"),
+                    }),
+                });
+            }
+            let declaration = SessionDeclaration {
+                schema_version: 1,
+                session_id: "real-entry-fe".into(),
+                launch_id: "real-entry-launch".into(),
+                role: SessionRole::Fe,
+                lifetime_millis: 30_000,
+                liveness_socket: directory.path().join("live.sock"),
+                handshake_secret: "0123456789abcdef0123456789abcdef".into(),
+                domain_grants: grants,
+            };
+            let path = directory.path().join("declaration.json");
+            declaration.write_private(&path)?;
+            let prepared = PreparedRoleSession::read_and_claim(&path, SessionRole::Fe)?;
+            let mut runner = RunnerSession::start(declaration)?;
+            let registry = test_state_store_registry();
+            let opened =
+                FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+                    Some(test_state_store_input("g2-real-entry")),
+                    &registry,
+                    FrontendExecutionConfig::new_for_test(
+                        NonZeroUsize::new(1).unwrap(),
+                        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                        builtin_function_catalog(),
+                        crate::application::test_constant_policy(),
+                    )
+                    .with_test_session(
+                        crate::test_session::FrontendTestSessionConfig::new(prepared),
+                    ),
+                    frontend_backend_open_config(),
+                    Vec::new(),
+                    tokio::runtime::Handle::current(),
+                    test_native_trust(),
+                    FrontendNativeTransport::plaintext(),
+                )
+                .await;
+            let mut host = match opened {
+                Ok(host) => host,
+                Err(primary) => {
+                    let cleanup = runner.end_and_join();
+                    return Err(anyhow!("{primary}; runner cleanup: {cleanup:?}"));
+                }
+            };
+            let built = build_frontend_query_session_factory(
+                &mut host,
+                Arc::new(
+                    novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
+                ),
+                0,
+                Arc::new(UnavailableMvStorageObservationPort),
+                Arc::new(MysqlClientConnectionRegistry::new()),
+            )
+            .await;
+            let (session_factory, mut products) = match built {
+                Ok(products) => products,
+                Err(primary) => {
+                    let host_cleanup = host.shutdown().await;
+                    let runner_cleanup = runner.end_and_join();
+                    return Err(anyhow!(
+                        "{primary}; host cleanup: {host_cleanup:?}; runner cleanup: {runner_cleanup:?}"
+                    ));
+                }
+            };
+            let mut sessions = Vec::<Arc<dyn QuerySession>>::new();
+            let primary: Result<()> = async {
+                ensure!(host.backend_topology_port().snapshot()?.targets().is_empty(),
+                    "the preallocation check must use the actual empty topology");
+                let controls = host.test_session.as_ref().ok_or_else(|| anyhow!("missing actual role session"))?;
+                let owner = controls.statement.as_ref().ok_or_else(|| anyhow!("missing actual observation owner"))?;
+                let scope = controls.scope().clone();
+                let original = session_factory.open_session(QuerySessionOpenRequest::new(
+                    ClientConnectionToken::new(41, 1).unwrap(), "unbound-original"))?;
+                sessions.push(original.clone());
+                configure_real_entry(original.as_ref()).await?;
+                let selected_sql = if rearm { "SELECT" } else { "SELECT 1" };
+                arm_real_entry(owner, "first-entry", 41, selected_sql)?;
+                ensure!(owner.peek("first-entry").map_err(anyhow::Error::msg)?.work_id.is_none(),
+                    "the selected arm must still be unbound before its first matching statement");
+                let replacement = if rearm {
+                    // Parser failure occurs before QueryControl allocates any
+                    // statement for this selected request. Keep the exact same
+                    // live client while testing a forbidden SQL retarget.
+                    let parse = actual_entry_error(original.as_ref(), selected_sql).await?;
+                    ensure!(parse.kind() == QueryServiceErrorKind::Parse, "{parse}");
+                    ensure!(owner.peek("first-entry").map_err(anyhow::Error::msg)?.work_id.is_none(),
+                        "the parser failure unexpectedly allocated a statement");
+                    original.clone()
+                } else {
+                    original.close();
+                    let replacement = session_factory.open_session(QuerySessionOpenRequest::new(
+                        ClientConnectionToken::new(41, 2).unwrap(), "unbound-replacement"))?;
+                    sessions.push(replacement.clone());
+                    configure_real_entry(replacement.as_ref()).await?;
+                    replacement
+                };
+                let rearmed = if rearm {
+                    owner.drain("first-entry").map_err(anyhow::Error::msg)?;
+                    Some(arm_real_entry(owner, "first-entry", 41, "SELECT 1"))
+                } else {
+                    None
+                };
+
+                // Poll the actual entry to its returned error before checking the
+                // nomination predicate. No direct bind or invented execution is
+                // used, and failure assertions cannot abandon a query future.
+                let error = actual_entry_error(replacement.as_ref(), "SELECT 1").await?;
+                ensure!(error.kind() == QueryServiceErrorKind::Timeout, "{error}");
+                ensure!(products.query_control.list_processes().iter().all(|process| process.statement.is_none()),
+                    "the returned query error retained an active statement");
+                if let Some(rearmed) = rearmed {
+                    ensure!(rearmed.is_err(),
+                        "the same predeclared Native permission retargeted SQL through drain/rearm after parser failure");
+                } else {
+                    let old = owner.peek("first-entry").map_err(anyhow::Error::msg)?;
+                    ensure!(old.work_id.is_none(),
+                        "the original unbound arm moved to the replacement client: work_id={:?}", old.work_id);
+                    ensure!(old.execution_id.is_none() && old.logical_execution_id.is_none()
+                        && old.attempt_id.is_none() && old.snapshot.is_none(),
+                        "an abandoned arm acquired replacement execution evidence");
+                }
+                ensure!(scope.observations().iter().all(|event| event.domain != "native"),
+                    "replacement observation caused a Native authority claim/hit");
+                ensure!(!directory.path().join("unpublished-be.receipt.json").exists(),
+                    "the entry test fabricated a backend receipt");
+                Ok(())
+            }.await;
+            for session in &sessions {
+                session.close();
+            }
+            drop(sessions);
+            drop(session_factory);
+            let products_cleanup = shutdown_frontend_role_products_to_convergence(
+                &mut products,
+                Duration::from_secs(1),
+            )
+            .await;
+            let host_cleanup = host.shutdown().await;
+            let runner_cleanup = runner.end_and_join();
+            let failures = [
+                products_cleanup.map_err(|error| error.to_string()),
+                host_cleanup.map_err(|error| error.to_string()),
+                runner_cleanup.map_err(|error| error.to_string()),
+            ]
+            .into_iter()
+            .filter_map(Result::err)
+            .collect::<Vec<_>>();
+            match (primary, failures.is_empty()) {
+                (Ok(()), true) => Ok(()),
+                (Err(primary), true) => Err(primary),
+                (Ok(()), false) => Err(anyhow!(
+                    "real entry cleanup failed: {}",
+                    failures.join("; ")
+                )),
+                (Err(primary), false) => {
+                    Err(primary.context(format!("real entry cleanup: {}", failures.join("; "))))
+                }
+            }
+        }
+
+        fn actual_statement_identity(work_id: Option<&str>) -> Result<(u32, u64, u64)> {
+            let fields = work_id
+                .ok_or_else(|| anyhow!("real statement entry did not bind"))?
+                .split(':')
+                .collect::<Vec<_>>();
+            ensure!(
+                fields.len() == 4 && fields[0] == "statement",
+                "invalid statement work identity"
+            );
+            let connection = fields[1].parse()?;
+            let epoch = fields[2].parse()?;
+            let generation = fields[3].parse()?;
+            ensure!(
+                epoch > 0 && generation > 0,
+                "statement identity must be owner allocated"
+            );
+            Ok((connection, epoch, generation))
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn real_entry_finite_input_survives_unbound_drain_and_bound_successors() -> Result<()>
+        {
+            let directory = tempfile::Builder::new()
+                .prefix("g2-real-entry-")
+                .tempdir_in("/tmp")?;
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+            let mut grants = vec![DomainGrant {
+                domain: "statement-observation".into(),
+                grant_id: "observe-real-entry".into(),
+                parameters: serde_json::json!({"action":"observe", "bearer_secret":"0123456789abcdef0123456789abcdef"}),
+            }];
+            // These bind grants freeze statement ownership without inventing a BE
+            // receipt or a QueryExecutionId. This test fails before placement.
+            for token in ["first-entry", "independent-entry"] {
+                grants.push(DomainGrant {
+                    domain: "native".into(),
+                    grant_id: format!("bind-{token}"),
+                    parameters: serde_json::json!({
+                        "action":"bind-create-task-ack-drop", "root":directory.path(),
+                        "backend_index":0, "statement_run_token":token,
+                        "target_session_id":"unpublished-backend-entry",
+                        "target_process_receipt":directory.path().join("unpublished-be.receipt.json"),
+                    }),
+                });
+            }
+            let declaration = SessionDeclaration {
+                schema_version: 1,
+                session_id: "real-entry-fe".into(),
+                launch_id: "real-entry-launch".into(),
+                role: SessionRole::Fe,
+                lifetime_millis: 30_000,
+                liveness_socket: directory.path().join("live.sock"),
+                handshake_secret: "0123456789abcdef0123456789abcdef".into(),
+                domain_grants: grants,
+            };
+            let path = directory.path().join("declaration.json");
+            declaration.write_private(&path)?;
+            let prepared = PreparedRoleSession::read_and_claim(&path, SessionRole::Fe)?;
+            let mut runner = RunnerSession::start(declaration)?;
+            let registry = test_state_store_registry();
+            let opened =
+                FrontendApplicationHost::open_with_role_factories_and_state_store_registry(
+                    Some(test_state_store_input("g2-real-entry")),
+                    &registry,
+                    FrontendExecutionConfig::new_for_test(
+                        NonZeroUsize::new(1).unwrap(),
+                        novarocks_types::NativeCompatibilityId::new([0x71; 32]),
+                        builtin_function_catalog(),
+                        crate::application::test_constant_policy(),
+                    )
+                    .with_test_session(
+                        crate::test_session::FrontendTestSessionConfig::new(prepared),
+                    ),
+                    frontend_backend_open_config(),
+                    Vec::new(),
+                    tokio::runtime::Handle::current(),
+                    test_native_trust(),
+                    FrontendNativeTransport::plaintext(),
+                )
+                .await;
+            let mut host = match opened {
+                Ok(host) => host,
+                Err(primary) => {
+                    let cleanup = runner.end_and_join();
+                    return Err(
+                        anyhow::Error::new(primary).context(format!("runner cleanup: {cleanup:?}"))
+                    );
+                }
+            };
+            let built = build_frontend_query_session_factory(
+                &mut host,
+                Arc::new(
+                    novarocks_query_application::system_catalog::SystemCatalogService::with_defaults(),
+                ),
+                0,
+                Arc::new(UnavailableMvStorageObservationPort),
+                Arc::new(MysqlClientConnectionRegistry::new()),
+            )
+            .await;
+            let (session_factory, mut products) = match built {
+                Ok(products) => products,
+                Err(primary) => {
+                    let host_cleanup = host.shutdown().await;
+                    let runner_cleanup = runner.end_and_join();
+                    return Err(anyhow::Error::new(primary).context(format!(
+                        "host cleanup: {host_cleanup:?}; runner cleanup: {runner_cleanup:?}"
+                    )));
+                }
+            };
+            let mut sessions = Vec::<Arc<dyn QuerySession>>::new();
+            let primary: Result<()> = async {
+                ensure!(
+                    host.backend_topology_port()
+                        .snapshot()?
+                        .targets()
+                        .is_empty(),
+                    "the preallocation check must use the actual empty topology"
+                );
+                let controls = host
+                    .test_session
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("missing actual role session"))?;
+                let owner = controls
+                    .statement
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("missing actual observation owner"))?;
+                let scope = controls.scope().clone();
+                let original = session_factory.open_session(QuerySessionOpenRequest::new(
+                    ClientConnectionToken::new(41, 1).unwrap(),
+                    "complement-original",
+                ))?;
+                sessions.push(original.clone());
+                let unrelated = session_factory.open_session(QuerySessionOpenRequest::new(
+                    ClientConnectionToken::new(42, 1).unwrap(),
+                    "complement-unrelated",
+                ))?;
+                sessions.push(unrelated.clone());
+                configure_real_entry(original.as_ref()).await?;
+                configure_real_entry(unrelated.as_ref()).await?;
+                arm_real_entry(owner, "first-entry", 41, "SELECT 1")?;
+
+                // Neither an unrelated client nor another SQL on the selected client
+                // can acquire the unbound first permission. Await both real entries.
+                let foreign = actual_entry_error(unrelated.as_ref(), "SELECT 1").await?;
+                ensure!(
+                    foreign.kind() == QueryServiceErrorKind::Timeout,
+                    "{foreign}"
+                );
+                ensure!(
+                    owner
+                        .peek("first-entry")
+                        .map_err(anyhow::Error::msg)?
+                        .work_id
+                        .is_none(),
+                    "unrelated connection stole the finite nomination"
+                );
+                let different_sql = actual_entry_error(original.as_ref(), "SELECT 2").await?;
+                ensure!(
+                    different_sql.kind() == QueryServiceErrorKind::Timeout,
+                    "{different_sql}"
+                );
+                let unbound = owner.peek("first-entry").map_err(anyhow::Error::msg)?;
+                ensure!(
+                    unbound.work_id.is_none()
+                        && unbound.execution_id.is_none()
+                        && unbound.logical_execution_id.is_none()
+                        && unbound.attempt_id.is_none()
+                        && unbound.snapshot.is_none(),
+                    "an unmatched statement acquired selected evidence"
+                );
+                let drained = owner.drain("first-entry").map_err(anyhow::Error::msg)?;
+                ensure!(
+                    drained.work_id.is_none(),
+                    "the first arm unexpectedly bound before drain"
+                );
+                original.close();
+                let replacement = session_factory.open_session(QuerySessionOpenRequest::new(
+                    ClientConnectionToken::new(41, 2).unwrap(),
+                    "complement-replacement",
+                ))?;
+                sessions.push(replacement.clone());
+                configure_real_entry(replacement.as_ref()).await?;
+                let old_rearm = arm_real_entry(owner, "first-entry", 41, "SELECT 1");
+                // Even a faulty rearm must not abandon its actual query future.
+                let replacement_error = actual_entry_error(replacement.as_ref(), "SELECT 1").await?;
+                ensure!(
+                    replacement_error.kind() == QueryServiceErrorKind::Timeout,
+                    "{replacement_error}"
+                );
+                let refusal = old_rearm.err().ok_or_else(|| {
+                    anyhow!(
+                        "unbound original permission followed the replacement client through drain/rearm"
+                    )
+                })?;
+                ensure!(
+                    refusal
+                        .to_string()
+                        .contains("Native original statement input replacement refused"),
+                    "unexpected unbound input refusal: {refusal}"
+                );
+                ensure!(
+                    owner.peek("first-entry").is_err(),
+                    "failed finite input rearm retained a replacement journal"
+                );
+
+                // The separately declared permission remains usable after that refusal.
+                arm_real_entry(owner, "independent-entry", 41, "SELECT 1")?;
+                let first = actual_entry_error(replacement.as_ref(), "SELECT 1").await?;
+                ensure!(first.kind() == QueryServiceErrorKind::Timeout, "{first}");
+                let bound = owner
+                    .peek("independent-entry")
+                    .map_err(anyhow::Error::msg)?;
+                let first_id = actual_statement_identity(bound.work_id.as_deref())?;
+                ensure!(
+                    first_id.0 == 41,
+                    "nomination differs from the actual replacement connection"
+                );
+                ensure!(
+                    bound.execution_id.is_none()
+                        && bound.logical_execution_id.is_none()
+                        && bound.attempt_id.is_none()
+                        && bound.snapshot.is_none(),
+                    "preallocation failure invented an execution or completion"
+                );
+
+                // With its journal retained, a later real generation cannot move the
+                // existing binding. Drain may retire only that observer journal.
+                let later = actual_entry_error(replacement.as_ref(), "SELECT 1").await?;
+                ensure!(later.kind() == QueryServiceErrorKind::Timeout, "{later}");
+                ensure!(
+                    owner
+                        .peek("independent-entry")
+                        .map_err(anyhow::Error::msg)?
+                        .work_id
+                        == bound.work_id,
+                    "a bound journal rolled forward to a later generation"
+                );
+                owner
+                    .drain("independent-entry")
+                    .map_err(anyhow::Error::msg)?;
+                arm_real_entry(owner, "independent-entry", 41, "SELECT 1")?;
+                let next = actual_entry_error(replacement.as_ref(), "SELECT 1").await?;
+                ensure!(
+                    next.kind() == QueryServiceErrorKind::Internal
+                        && next
+                            .message()
+                            .contains("Native first statement nomination replacement refused"),
+                    "drain/rearm rolled an existing permission into the next generation: {next}"
+                );
+                let next_bound = owner
+                    .peek("independent-entry")
+                    .map_err(anyhow::Error::msg)?;
+                let next_id = actual_statement_identity(next_bound.work_id.as_deref())?;
+                ensure!(
+                    next_id.0 == first_id.0 && next_id.1 == first_id.1 && next_id.2 > first_id.2,
+                    "real QueryControl did not advance the same client generation"
+                );
+                ensure!(
+                    next_bound.execution_id.is_none()
+                        && next_bound.logical_execution_id.is_none()
+                        && next_bound.attempt_id.is_none()
+                        && next_bound.snapshot.is_none(),
+                    "refused generation acquired execution evidence"
+                );
+                owner
+                    .drain("independent-entry")
+                    .map_err(anyhow::Error::msg)?;
+                replacement.close();
+
+                let successor = session_factory.open_session(QuerySessionOpenRequest::new(
+                    ClientConnectionToken::new(41, 3).unwrap(),
+                    "complement-successor",
+                ))?;
+                sessions.push(successor.clone());
+                configure_real_entry(successor.as_ref()).await?;
+                let bound_rearm = arm_real_entry(owner, "independent-entry", 41, "SELECT 1");
+                let successor_error = actual_entry_error(successor.as_ref(), "SELECT 1").await?;
+                ensure!(
+                    successor_error.kind() == QueryServiceErrorKind::Timeout,
+                    "{successor_error}"
+                );
+                let refusal = bound_rearm
+                    .err()
+                    .ok_or_else(|| anyhow!("bound original permission followed a replacement client"))?;
+                ensure!(
+                    refusal
+                        .to_string()
+                        .contains("Native original statement input replacement refused"),
+                    "unexpected bound input refusal: {refusal}"
+                );
+                ensure!(
+                    owner.peek("independent-entry").is_err(),
+                    "failed bound-input rearm retained a replacement journal"
+                );
+                ensure!(
+                    products
+                        .query_control
+                        .list_processes()
+                        .iter()
+                        .all(|process| process.statement.is_none()),
+                    "returned real queries retained an active statement"
+                );
+                ensure!(
+                    scope
+                        .observations()
+                        .iter()
+                        .all(|event| event.domain != "native"),
+                    "nomination or observation consumed Native authority"
+                );
+                ensure!(
+                    !directory
+                        .path()
+                        .join("unpublished-be.receipt.json")
+                        .exists(),
+                    "the entry test fabricated a backend receipt"
+                );
+                Ok(())
+            }
+            .await;
+            for session in &sessions {
+                session.close();
+            }
+            drop(sessions);
+            drop(session_factory);
+            let products_cleanup = shutdown_frontend_role_products_to_convergence(
+                &mut products,
+                Duration::from_secs(1),
+            )
+            .await;
+            let host_cleanup = host.shutdown().await;
+            let runner_cleanup = runner.end_and_join();
+            let failures = [
+                products_cleanup.map_err(|error| error.to_string()),
+                host_cleanup.map_err(|error| error.to_string()),
+                runner_cleanup.map_err(|error| error.to_string()),
+            ]
+            .into_iter()
+            .filter_map(Result::err)
+            .collect::<Vec<_>>();
+            match (primary, failures.is_empty()) {
+                (Ok(()), true) => Ok(()),
+                (Err(primary), true) => Err(primary),
+                (Ok(()), false) => Err(anyhow!(
+                    "real entry cleanup failed: {}",
+                    failures.join("; ")
+                )),
+                (Err(primary), false) => {
+                    Err(primary.context(format!("real entry cleanup: {}", failures.join("; "))))
+                }
+            }
+        }
     }
 }

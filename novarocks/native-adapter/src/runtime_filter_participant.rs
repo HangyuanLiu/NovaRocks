@@ -23,7 +23,7 @@
 //! by this participant.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 use std::sync::Condvar;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -137,7 +137,7 @@ pub struct RuntimeFilterParticipant {
     state: Arc<WorkerRuntimeFilterParticipant>,
     outbound: Arc<BackendParticipantOutbound>,
     close_hook: RuntimeFilterParticipantCloseHook,
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     accepted_contribution_retry_rendezvous: AcceptedContributionRetryRendezvous,
 }
 
@@ -145,15 +145,16 @@ pub struct RuntimeFilterParticipant {
 ///
 /// The receiver must remain installed until the sender's exact retry reaches
 /// its ordinary dedupe owner.  This lives on the participant rather than in a
-/// registry or a transport fallback, so release builds and all non-faulted
+/// registry or a transport fallback, so ordinary builds and all non-faulted
 /// attempts retain their normal release/no-op behavior.
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 struct AcceptedContributionRetryRendezvous {
     state: Mutex<AcceptedContributionRetryRendezvousState>,
     changed: Condvar,
+    claim: Mutex<Option<crate::test_controls::NativeFaultClaim>>,
 }
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum AcceptedContributionRetryRendezvousState {
     Idle,
@@ -164,12 +165,13 @@ enum AcceptedContributionRetryRendezvousState {
     DuplicateObserved,
 }
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 impl AcceptedContributionRetryRendezvous {
     fn new() -> Self {
         Self {
             state: Mutex::new(AcceptedContributionRetryRendezvousState::Idle),
             changed: Condvar::new(),
+            claim: Mutex::new(None),
         }
     }
 
@@ -177,8 +179,10 @@ impl AcceptedContributionRetryRendezvous {
         &self,
         channel_id: RuntimeFilterChannelId,
         route: BackendNativeContributionRouteIdentity,
+        claim: crate::test_controls::NativeFaultClaim,
     ) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        *self.claim.lock().unwrap_or_else(|error| error.into_inner()) = Some(claim);
         *state = AcceptedContributionRetryRendezvousState::Armed { channel_id, route };
     }
 
@@ -211,10 +215,20 @@ impl AcceptedContributionRetryRendezvous {
             *state,
             AcceptedContributionRetryRendezvousState::Armed { .. }
         ) {
+            if self
+                .claim
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+                .is_some_and(|claim| !claim.cancellation().is_active())
+            {
+                break;
+            }
             state = self
                 .changed
-                .wait(state)
-                .unwrap_or_else(|error| error.into_inner());
+                .wait_timeout(state, std::time::Duration::from_millis(20))
+                .unwrap_or_else(|error| error.into_inner())
+                .0;
         }
     }
 }
@@ -250,7 +264,7 @@ impl RuntimeFilterParticipant {
             state,
             outbound,
             close_hook: Arc::new(|_, _| Ok(())),
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "test-controls")]
             accepted_contribution_retry_rendezvous: AcceptedContributionRetryRendezvous::new(),
         }))
     }
@@ -363,7 +377,7 @@ impl RuntimeFilterParticipant {
             | BackendEnvelopeKind::CompletedWithoutArtifact
             | BackendEnvelopeKind::DegradedLogical => self.dispatch_delivery_envelope(envelope),
         };
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "test-controls")]
         if result.status()
             == novarocks_worker::runtime_filter::domain::BackendAcceptStatus::Duplicate
         {
@@ -375,19 +389,20 @@ impl RuntimeFilterParticipant {
 
     /// Arms the system-test-only receiver rendezvous after this participant
     /// has accepted the contribution whose unary response is being dropped.
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     pub fn arm_accepted_contribution_retry_rendezvous(
         &self,
         channel_id: RuntimeFilterChannelId,
         route: BackendNativeContributionRouteIdentity,
+        claim: crate::test_controls::NativeFaultClaim,
     ) {
         self.accepted_contribution_retry_rendezvous
-            .arm(channel_id, route);
+            .arm(channel_id, route, claim);
     }
 
     /// Blocks only a debug-faulted participant's release until its exact
     /// duplicate retry arrives.  The ordinary participant never waits here.
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     pub fn wait_for_accepted_contribution_retry_rendezvous(&self) {
         self.accepted_contribution_retry_rendezvous
             .wait_for_duplicate();
@@ -508,6 +523,7 @@ impl RuntimeFilterParticipant {
         self.state.record_row_effect(fragment_instance_id, effect);
     }
 
+    #[cfg(any(test, feature = "test-controls"))]
     #[doc(hidden)]
     pub fn with_close_hook_for_test(
         &self,
@@ -518,7 +534,7 @@ impl RuntimeFilterParticipant {
             state: Arc::clone(&self.state),
             outbound: Arc::clone(&self.outbound),
             close_hook,
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "test-controls")]
             accepted_contribution_retry_rendezvous: AcceptedContributionRetryRendezvous::new(),
         })
     }
@@ -2159,5 +2175,48 @@ mod tests {
                 novarocks_execution::runtime_filter::UnavailableReason::MaterializationFailed
             ))
         ));
+    }
+}
+
+#[cfg(all(test, feature = "test-controls"))]
+mod session_rendezvous_tests {
+    use super::*;
+    use crate::test_controls::tests::controlled;
+    #[test]
+    fn accepted_contribution_hold_releases_on_session_end_and_waiter_really_exits() {
+        let mut fixture = controlled("runtime-filter-contribution-ack-drop-rendezvous");
+        let kind=novarocks_failpoint::QueryLifecycleFaultKind::RuntimeFilterContributionAckDropRendezvous;
+        novarocks_failpoint::target_binding::StatementExecutionBinding::new(
+            "native-tests".into(),
+            fixture.token.clone(),
+            0,
+            fixture.process,
+            fixture.execution,
+        )
+        .unwrap()
+        .write_private(&crate::test_controls::fault_binding_path(
+            fixture.directory.path(),
+            kind,
+            0,
+            &fixture.token,
+        ))
+        .unwrap();
+        let claim = fixture
+            .controls
+            .claim_receiver(kind, fixture.execution)
+            .unwrap()
+            .unwrap();
+        let rendezvous = Arc::new(AcceptedContributionRetryRendezvous::new());
+        let route = BackendNativeContributionRouteIdentity::new(
+            novarocks_execution::runtime_filter::RuntimeFilterBindingId::new(1),
+            UniqueId::new(3, 5),
+            novarocks_execution::runtime_filter::PartitionId::new(0),
+            novarocks_worker::runtime_filter::domain::BackendTransportSequence::new(1),
+        );
+        rendezvous.arm(RuntimeFilterChannelId::new(1), route, claim);
+        let worker = Arc::clone(&rendezvous);
+        let waiter = std::thread::spawn(move || worker.wait_for_duplicate());
+        fixture.runner.end_and_join().unwrap();
+        waiter.join().unwrap();
     }
 }

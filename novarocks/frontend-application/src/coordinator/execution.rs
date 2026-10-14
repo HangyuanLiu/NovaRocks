@@ -286,6 +286,14 @@ fn production_backend_services(
 }
 
 pub struct FrontendDistributedQueryCoordinator {
+    #[cfg(feature = "test-controls")]
+    test_native: Option<Arc<novarocks_native_adapter::test_controls::NativeTestControls>>,
+    #[cfg(feature = "test-controls")]
+    test_observations:
+        Option<Arc<novarocks_native_adapter::test_observation_controls::NativeObservationControls>>,
+    #[cfg(feature = "test-controls")]
+    statement_observation: Option<Arc<crate::preparation_diagnostics::StatementObservationOwner>>,
+
     backend_topology: novarocks_query_application::api::BackendTopologyService,
     #[cfg(test)]
     backend_services: Option<BackendServicesSource>,
@@ -313,6 +321,21 @@ pub struct FrontendDistributedQueryCoordinator {
 }
 
 impl FrontendDistributedQueryCoordinator {
+    #[cfg(feature = "test-controls")]
+    pub(crate) fn with_test_controls(
+        mut self,
+        native: Arc<novarocks_native_adapter::test_controls::NativeTestControls>,
+        observations: Option<
+            Arc<novarocks_native_adapter::test_observation_controls::NativeObservationControls>,
+        >,
+        statement: Option<Arc<crate::preparation_diagnostics::StatementObservationOwner>>,
+    ) -> Self {
+        self.test_native = Some(native);
+        self.test_observations = observations;
+        self.statement_observation = statement;
+        self
+    }
+
     pub(crate) fn new(
         runtime_filter_worker_count: NonZeroUsize,
         native_compatibility_id: NativeCompatibilityId,
@@ -332,6 +355,12 @@ impl FrontendDistributedQueryCoordinator {
             "frontend query process namespace initialized"
         );
         Ok(Self {
+            #[cfg(feature = "test-controls")]
+            test_native: None,
+            #[cfg(feature = "test-controls")]
+            test_observations: None,
+            #[cfg(feature = "test-controls")]
+            statement_observation: None,
             backend_topology,
             #[cfg(test)]
             backend_services: None,
@@ -402,6 +431,12 @@ impl FrontendDistributedQueryCoordinator {
                 query_id.high() as u64,
             ))),
             lifecycle_diagnostics: Arc::new(FrontendLifecycleDiagnostics::default()),
+            #[cfg(feature = "test-controls")]
+            test_native: None,
+            #[cfg(feature = "test-controls")]
+            test_observations: None,
+            #[cfg(feature = "test-controls")]
+            statement_observation: None,
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             internal_result_cpu: None,
             task_update_retry_policy:
@@ -465,6 +500,12 @@ impl FrontendDistributedQueryCoordinator {
                 query_id.high() as u64,
             ))),
             lifecycle_diagnostics: Arc::new(FrontendLifecycleDiagnostics::default()),
+            #[cfg(feature = "test-controls")]
+            test_native: None,
+            #[cfg(feature = "test-controls")]
+            test_observations: None,
+            #[cfg(feature = "test-controls")]
+            statement_observation: None,
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
             internal_result_cpu: None,
             task_update_retry_policy:
@@ -646,9 +687,65 @@ impl FrontendDistributedQueryCoordinator {
         #[cfg(not(test))]
         let backend_services = production_backend_services(parts.topology.targets())?;
         let _query = self.registry.register(query_id, intent)?;
-        let schedule = backend_services
-            .scheduler
-            .schedule(&parts.artifacts.scheduling_facts(), execution_id)?;
+        let scheduler = &backend_services.scheduler;
+        #[cfg(feature = "test-controls")]
+        let scheduler = if let (Some(native), Some(nomination)) =
+            (&self.test_native, &parts.test_statement_nomination)
+        {
+            scheduler
+                .clone()
+                .with_test_nomination(native.clone(), nomination.clone())
+        } else {
+            scheduler.clone()
+        };
+        #[cfg(feature = "test-controls")]
+        if let Some(nomination) = &parts.test_statement_nomination {
+            if let Some(owner) = &self.statement_observation {
+                owner
+                    .bind_nominated_attempt(
+                        nomination,
+                        novarocks_types::QueryExecutionId::new(
+                            execution_id.query_id(),
+                            novarocks_types::AttemptId::new(execution_id.attempt_id().get())
+                                .map_err(|error| failed(error.to_string()))?,
+                        )
+                        .map_err(|error| failed(error.to_string()))?,
+                    )
+                    .map_err(failed)?;
+            }
+            if let Some(observations) = &self.test_observations {
+                let execution = novarocks_types::QueryExecutionId::new(
+                    execution_id.query_id(),
+                    novarocks_types::AttemptId::new(execution_id.attempt_id().get())
+                        .map_err(|error| failed(error.to_string()))?,
+                )
+                .map_err(|error| failed(error.to_string()))?;
+                for target in parts.topology.targets() {
+                    for action in [
+                        "grpc-fragment",
+                        "reader-marker",
+                        "writer-marker",
+                        "catalog-materialization",
+                        "catalog-lifecycle",
+                        "exchange-snapshot",
+                        "catalog-hold",
+                        "catalog-failure",
+                    ] {
+                        observations
+                            .publish_nominated_binding(
+                                action,
+                                nomination,
+                                target
+                                    .process_id()
+                                    .map_err(|error| failed(error.to_string()))?,
+                                execution,
+                            )
+                            .map_err(failed)?;
+                    }
+                }
+            }
+        }
+        let schedule = scheduler.schedule(&parts.artifacts.scheduling_facts(), execution_id)?;
         let scheduled_backend_ownership = backend_services
             .scheduler
             .scheduled_backend_ownership(&schedule.backend_ids())?;
@@ -670,8 +767,9 @@ impl FrontendDistributedQueryCoordinator {
             parts.cancellation.clone(),
         )
         .map_err(failed)?;
-        let connector_context =
-            credential_lease_source.connector_request_context(connector_context);
+        let connector_context = credential_lease_source
+            .connector_request_context(connector_context)
+            .map_err(failed)?;
         let binding = parts.result_capacity.as_ref().ok_or_else(|| {
             failed("attempt initialization requires its admitted result capacity")
         })?;
@@ -839,7 +937,6 @@ impl FrontendDistributedQueryCoordinator {
         &self,
         handoff: RoundHandoff<'_>,
     ) -> Result<DistributedQueryOutcome, DistributedQueryError> {
-        let execution_started = Instant::now();
         let RoundHandoff {
             delivery,
             internal_capacity,
@@ -1467,13 +1564,6 @@ impl FrontendDistributedQueryCoordinator {
                     self.data_runtime.clone(),
                 ) {
                     Ok(polls) => {
-                        emit_distributed_write_phase_marker(
-                            intent,
-                            execution_id,
-                            "root_poll_enter",
-                            execution_started,
-                            None,
-                        );
                         root_result_polls = Some(polls);
                     }
                     Err(error) => {
@@ -1659,13 +1749,6 @@ impl FrontendDistributedQueryCoordinator {
                                     .require_terminal_evidence(required_terminals)
                             });
                         if let Err(error) = consumed {
-                            emit_distributed_write_phase_marker(
-                                intent,
-                                execution_id,
-                                "root_failure",
-                                execution_started,
-                                Some((root_batch_count, root_row_count)),
-                            );
                             break Err(self.fail_task_round_with_root_reader(
                                 &mut relayed_reader,
                                 &mut root_result_polls,
@@ -1678,13 +1761,6 @@ impl FrontendDistributedQueryCoordinator {
                                 format!("root result end of stream was refused: {error}"),
                             ));
                         }
-                        emit_distributed_write_phase_marker(
-                            intent,
-                            execution_id,
-                            "root_eof",
-                            execution_started,
-                            Some((root_batch_count, root_row_count)),
-                        );
                         observed_result_eof = true;
                         last_root_poll = RootResultPoll::EndOfStream(packet_sequence);
                         moved = true;
@@ -1928,37 +2004,16 @@ impl FrontendDistributedQueryCoordinator {
                 let mut barrier = crate::query_execution::write_barrier::WriteCommitBarrier::new();
                 observe_write_statuses(&round, tracker);
                 let execution_verdict = tracker.execution_verdict(round.failure_cause().is_some());
-                emit_distributed_write_phase_marker(
-                    intent,
-                    execution_id,
-                    "write_decoder_finish_enter",
-                    execution_started,
-                    None,
-                );
                 let prepared = internal_domain
                     .take()
                     .ok_or_else(|| "distributed write lost its admitted Internal domain".to_owned())
                     .and_then(|domain| domain.hand_off(|domain, _| domain.into_write()))
                     .map_err(|error| {
-                        emit_distributed_write_phase_marker(
-                            intent,
-                            execution_id,
-                            "root_failure",
-                            execution_started,
-                            Some((root_batch_count, root_row_count)),
-                        );
                         DistributedQueryError::new(
                             DistributedQueryErrorKind::ContractViolation,
                             error,
                         )
                     })?;
-                emit_distributed_write_phase_marker(
-                    intent,
-                    execution_id,
-                    "write_decoder_finish_exit",
-                    execution_started,
-                    Some((root_batch_count, root_row_count)),
-                );
                 barrier.observe_prepared_write_set(prepared);
                 barrier.observe_task_execution(execution_verdict);
                 if cancellation.is_cancelled() {
@@ -2002,13 +2057,6 @@ impl FrontendDistributedQueryCoordinator {
         // must never be able to take that completion back, so a drain that
         // does not finish inside the statement's own budget is reported rather
         // than turned into a query failure.
-        emit_distributed_write_phase_marker(
-            intent,
-            execution_id,
-            "drain_enter",
-            execution_started,
-            None,
-        );
         drain_task_round(
             &mut round,
             &split_delivery,
@@ -2019,13 +2067,6 @@ impl FrontendDistributedQueryCoordinator {
             execution_id,
             &mut final_task_info,
             profile_waits_for_terminals,
-        );
-        emit_distributed_write_phase_marker(
-            intent,
-            execution_id,
-            "drain_exit",
-            execution_started,
-            None,
         );
 
         // Read once the drain has ended: a release acknowledgement is the only
@@ -2043,28 +2084,12 @@ impl FrontendDistributedQueryCoordinator {
         // then keeps it from resending.
         let split_assignment_profile = match split_assignment.take() {
             Some(assignment) => {
-                emit_distributed_write_phase_marker(
-                    intent,
-                    execution_id,
-                    "split_finish_enter",
-                    execution_started,
-                    None,
-                );
                 let abandoned = !assignment.is_finished();
                 if abandoned {
                     split_delivery.abandon("split assignment round ended with the attempt");
                 }
                 match assignment.finish_after_attempt(abandoned) {
-                    Ok(profile) => {
-                        emit_distributed_write_phase_marker(
-                            intent,
-                            execution_id,
-                            "split_finish_exit",
-                            execution_started,
-                            None,
-                        );
-                        profile
-                    }
+                    Ok(profile) => profile,
                     Err(error) => {
                         return Err(self.fail_and_cancel(
                             query_id,
@@ -2205,6 +2230,9 @@ impl FrontendDistributedQueryCoordinator {
         execution_id: QueryExecutionId,
         contributions: &ReleasedRuntimeFilterContributions,
     ) {
+        if !self.lifecycle_diagnostics.is_enabled() {
+            return;
+        }
         // A context whose release never answered may still have observed
         // runtime-filter activity this frontend has not seen, so the rollup is
         // refused rather than summed over the backends that did answer.
@@ -2539,50 +2567,6 @@ fn statement_deadline_for_request(
         })
 }
 
-fn emit_distributed_write_phase_marker(
-    intent: DistributedQueryIntent,
-    execution_id: QueryExecutionId,
-    phase: &str,
-    started: Instant,
-    root_counts: Option<(u64, u64)>,
-) {
-    if intent != DistributedQueryIntent::Write
-        || !cfg!(debug_assertions)
-        || std::env::var_os("NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER").is_none()
-    {
-        return;
-    }
-    println!(
-        "{}",
-        distributed_write_phase_marker(
-            execution_id,
-            phase,
-            started.elapsed().as_millis(),
-            root_counts,
-        )
-    );
-}
-
-fn distributed_write_phase_marker(
-    execution_id: QueryExecutionId,
-    phase: &str,
-    elapsed_ms: u128,
-    root_counts: Option<(u64, u64)>,
-) -> String {
-    let query_id = execution_id.query_id();
-    let marker = format!(
-        "NOVAROCKS_DISTRIBUTED_WRITE_PHASE query_hi={} query_lo={} attempt={} phase={} elapsed_ms={}",
-        query_id.high(),
-        query_id.low(),
-        execution_id.attempt_id().get(),
-        phase,
-        elapsed_ms,
-    );
-    root_counts.map_or(marker.clone(), |(batches, rows)| {
-        format!("{marker} root_batches={batches} root_rows={rows}")
-    })
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct StatisticsTaskCompletionFact {
     identity: TaskIdentity,
@@ -2841,8 +2825,8 @@ mod tests {
     use super::{
         FrontendBackendSnapshot, FrontendDistributedQueryCoordinator, FrontendFragmentScheduler,
         QueryIdSource, StatisticsTaskCompletionFact, UniqueQueryIdSource,
-        distributed_write_phase_marker, fail_closed_one_shot_topology_retry,
-        pre_ready_topology_validation_error, statistics_all_success_failure_message,
+        fail_closed_one_shot_topology_retry, pre_ready_topology_validation_error,
+        statistics_all_success_failure_message,
     };
     use crate::connector::{
         FixtureConnectorRegistry, FixtureControlResolver, test_request_context,
@@ -2875,19 +2859,6 @@ mod tests {
     use novarocks_types::{AttemptId, QueryExecutionId};
     use novarocks_types::{BackendProcessId, ClusterRole, QueryId, QueryProcessNamespace};
     use novarocks_version::native_build_identity;
-
-    #[test]
-    fn write_phase_marker_identifies_attempt_phase_and_bounded_root_counts() {
-        let execution_id = QueryExecutionId::new(
-            QueryId::new(7, 11),
-            AttemptId::new(2).expect("nonzero attempt"),
-        )
-        .expect("nonzero execution identity");
-        assert_eq!(
-            distributed_write_phase_marker(execution_id, "root_eof", 37, Some((3, 19))),
-            "NOVAROCKS_DISTRIBUTED_WRITE_PHASE query_hi=7 query_lo=11 attempt=2 phase=root_eof elapsed_ms=37 root_batches=3 root_rows=19"
-        );
-    }
 
     #[test]
     fn statistics_failure_preserves_every_incompatible_task_and_round_cause() {

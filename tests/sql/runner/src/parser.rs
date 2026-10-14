@@ -30,6 +30,17 @@ use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
+pub(crate) const MV_DOCUMENT_OBSERVATION_TAG: &str = "test-capability:mv-document-observation";
+
+pub(crate) fn validate_test_capability_tags(tags: &[String]) -> Result<()> {
+    for tag in tags {
+        if tag.starts_with("test-capability:") && tag != MV_DOCUMENT_OBSERVATION_TAG {
+            bail!("unknown reserved test capability tag: {tag}");
+        }
+    }
+    Ok(())
+}
+
 /// Scan raw SQL content (before placeholder substitution) for `${case_db}` and
 /// `${case_db_N}` references.  Returns the resolved database names in order.
 /// Index 0 is the primary `${case_db}`, index 1 is `${case_db_2}`, etc.
@@ -460,6 +471,7 @@ fn parse_meta_with_sql_error_descriptors(
                     .filter(|s| !s.is_empty())
                     .map(ToString::to_string)
                     .collect();
+                validate_test_capability_tags(&meta.tags)?;
             }
             "skip_result_check" => {
                 meta.skip_result_check = parse_bool(&raw_value)?;
@@ -2643,5 +2655,34 @@ mod opt5_directive_tests {
                 .unwrap_err();
             assert!(format!("{failure:#}").contains(expected), "{failure:#}");
         }
+    }
+    #[test]
+    fn reserved_test_capability_tags_are_explicit_and_ordinary_tags_keep_their_meaning() {
+        let regex = Regex::new(r"^--\s*@([a-zA-Z0-9_]+)\s*=\s*(.+?)\s*$").unwrap();
+        let parsed = parse_meta(
+            &["-- @tags=regression,test-capability:mv-document-observation,package".into()],
+            &regex,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.tags,
+            vec![
+                "regression",
+                "test-capability:mv-document-observation",
+                "package"
+            ]
+        );
+        assert!(parsed.imv_accelerator_wipe_restart.is_none());
+        assert!(parse_meta(&["-- @tags=test-capability:wipe-everything".into()], &regex).is_err());
+        assert!(
+            parse_meta(
+                &["-- @tags=regression,test-capability:future-observer".into()],
+                &regex
+            )
+            .is_err()
+        );
+        let merged = merge_meta(&parsed, &QueryMeta::default());
+        assert_eq!(merged.tags, parsed.tags);
+        assert!(merged.imv_accelerator_wipe_restart.is_none());
     }
 }

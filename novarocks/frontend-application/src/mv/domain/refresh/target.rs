@@ -117,16 +117,27 @@ pub(crate) fn load_iceberg_mv_target_binding_typed(
     storage_observation: &dyn MvStorageObservationPort,
     target: &IcebergMvTarget,
     connector_context: &ConnectorRequestContext,
+    #[cfg(feature = "test-controls")] controls: Option<&crate::mv::test_controls::MvTestControls>,
 ) -> Result<MvTargetBinding, ConnectorError> {
-    #[cfg(debug_assertions)]
-    if consume_scheduler_transient_preparation_fault(target) {
-        return Err(ConnectorError::new(
-            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
-            format!(
-                "test-injected temporary connector unavailability while preparing {}.{}.{}",
-                target.catalog, target.namespace, target.table
-            ),
-        ));
+    #[cfg(feature = "test-controls")]
+    if let Some(controls) = controls {
+        if controls
+            .transient_preparation(&target.catalog, &target.namespace, &target.table)
+            .map_err(|error| {
+                ConnectorError::new(
+                    novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+                    error,
+                )
+            })?
+        {
+            return Err(ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unavailable,
+                format!(
+                    "test-injected temporary connector unavailability while preparing {}.{}.{}",
+                    target.catalog, target.namespace, target.table
+                ),
+            ));
+        }
     }
     load_mv_target_binding_with_ports_typed(
         connector_control,
@@ -138,22 +149,6 @@ pub(crate) fn load_iceberg_mv_target_binding_typed(
         },
         connector_context,
     )
-}
-
-/// Debug-only, one-shot cross-process seam for the scheduler recovery test.
-/// The injected provider-style error enters at the typed binding boundary, so
-/// the test proves its category survives planning and background scheduling.
-#[cfg(debug_assertions)]
-fn consume_scheduler_transient_preparation_fault(target: &IcebergMvTarget) -> bool {
-    let Some(directory) = std::env::var_os("NOVAROCKS_MVX4_SCHEDULER_TEST_DIR") else {
-        return false;
-    };
-    let trigger = std::path::PathBuf::from(directory).join(format!(
-        "mvx4-scheduler-transient-preparation-{}.trigger",
-        target.table
-    ));
-    let consumed = trigger.with_extension("consumed");
-    std::fs::rename(trigger, consumed).is_ok()
 }
 
 /// Validates that the persisted MV definition still names the target snapshot

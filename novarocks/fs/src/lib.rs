@@ -21,6 +21,20 @@
 //! correctness. Connector implementations bind authorized storage access and
 //! ask this crate to read physical Parquet or ORC columns.
 
+#[cfg(all(feature = "normal-build", feature = "test-controls"))]
+compile_error!("normal-build cannot include test-controls");
+
+/// Capabilities compiled by this owner; activation still requires a role session.
+pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
+    (
+        env!("CARGO_PKG_NAME"),
+        &[
+            #[cfg(feature = "test-controls")]
+            "test-controls",
+        ],
+    )
+}
+
 mod access;
 mod cache;
 mod catalog_properties;
@@ -107,3 +121,6 @@ pub use storage_authority::{
 };
 
 // Design: ADR-0014 (docs/adr/ADR-0014-connector-neutral-file-foundation.md)
+
+#[cfg(feature = "test-controls")]
+pub use storage_authority::StorageAuthorityCloseControls;

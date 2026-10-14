@@ -24,14 +24,20 @@
 
 use super::connector::{
     await_resource_convergence, connector_launch_config, create_catalog, create_warehouse,
-    mysql_endpoint, require_three_backends, resource_baseline,
+    require_three_backends, resource_baseline,
+};
+use super::query_lifecycle::native_sql_controls::{
+    SelectedStatement, SqlIntentOwner, StatementSpec,
 };
 use super::task_evidence::assert_query_completed_across_boundary;
+#[path = "scan_statement_actor.rs"]
+pub(super) mod scan_statement_actor;
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::ServerHandle;
+use scan_statement_actor::ScanActor;
 use serde_json::Value;
 use std::env;
 use std::fs;
@@ -59,16 +65,44 @@ const FIXTURE_PROCESS_POLL: Duration = Duration::from_millis(20);
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
-        Box::new(PaimonReadData),
+        Box::new(PaimonReadData::default()),
         Box::new(PaimonSnapshotAndSchema::default()),
         Box::new(PaimonMergeFilterCorrectness),
-        Box::new(PaimonCancelAndBudget),
+        Box::new(PaimonCancelAndBudget::default()),
         Box::new(PaimonUnsupportedAndBinding),
-        Box::new(IcebergPaimonRead),
+        Box::new(IcebergPaimonRead::default()),
     ]
 }
 
-struct PaimonReadData;
+#[derive(Default)]
+struct PaimonReadData {
+    intent: SqlIntentOwner,
+}
+
+fn reader_spec(sql: String, cluster_size: usize) -> StatementSpec {
+    StatementSpec {
+        sql,
+        faults: vec![],
+        observations: (0..cluster_size)
+            .map(|index| (index, "reader-marker", None))
+            .collect(),
+    }
+}
+fn read_data_sqls() -> Vec<String> {
+    let catalog = "paimon_read_data";
+    vec![
+        format!(
+            "SELECT id, value FROM {catalog}.fixture.append_none UNION ALL SELECT id, value FROM {catalog}.fixture.append_snappy UNION ALL SELECT id, value FROM {catalog}.fixture.append_zstd UNION ALL SELECT id, value FROM {catalog}.fixture.append_lz4 ORDER BY id"
+        ),
+        format!(
+            "SELECT part, id, value FROM {catalog}.fixture.append_partitioned ORDER BY part, id"
+        ),
+        format!("SELECT count(*) FROM {catalog}.fixture.empty_append"),
+        format!(
+            "SELECT id, CAST(c_decimal AS STRING), HEX(c_binary), CAST(c_timestamp AS STRING) FROM {catalog}.fixture.type_matrix ORDER BY id"
+        ),
+    ]
+}
 
 impl Scenario for PaimonReadData {
     fn name(&self) -> &'static str {
@@ -83,6 +117,31 @@ impl Scenario for PaimonReadData {
         paimon_launch_config(&load_shared_fixture("schema")?)
     }
 
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        _: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(
+            self.intent.freeze(
+                read_data_sqls()
+                    .into_iter()
+                    .map(|sql| reader_spec(sql, cluster_size))
+                    .collect(),
+                &[],
+                cluster_size,
+                ordinary,
+                controlled,
+                deadline,
+            )?,
+        ))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let fixture = load_shared_fixture("schema")?;
@@ -93,14 +152,10 @@ impl Scenario for PaimonReadData {
         const CATALOG: &str = "paimon_read_data";
         create_paimon_catalog(&mut control, CATALOG, &fixture)?;
 
+        let selected = self.intent.take(0)?;
+        selected.arm(context, control.connection_id(), &selected.sql)?;
         let codec_rows: Vec<(i64, String)> = control
-            .query(format!(
-                "SELECT id, value FROM {CATALOG}.fixture.append_none \
-                 UNION ALL SELECT id, value FROM {CATALOG}.fixture.append_snappy \
-                 UNION ALL SELECT id, value FROM {CATALOG}.fixture.append_zstd \
-                 UNION ALL SELECT id, value FROM {CATALOG}.fixture.append_lz4 \
-                 ORDER BY id"
-            ))
+            .query(&selected.sql)
             .context("read Paimon append tables across supported codecs")?;
         ensure!(
             codec_rows
@@ -115,11 +170,10 @@ impl Scenario for PaimonReadData {
             "Paimon append/codec rows differ from the external oracle: {codec_rows:?}"
         );
 
+        let selected = self.intent.take(1)?;
+        selected.arm(context, control.connection_id(), &selected.sql)?;
         let partitioned: Vec<(String, i64, String)> = control
-            .query(format!(
-                "SELECT part, id, value FROM {CATALOG}.fixture.append_partitioned \
-                 ORDER BY part, id"
-            ))
+            .query(&selected.sql)
             .context("read partitioned Paimon append table")?;
         ensure!(
             partitioned
@@ -133,18 +187,17 @@ impl Scenario for PaimonReadData {
             "partitioned Paimon rows differ from the external oracle: {partitioned:?}"
         );
 
+        let selected = self.intent.take(2)?;
+        selected.arm(context, control.connection_id(), &selected.sql)?;
         let empty: Vec<i64> = control
-            .query(format!(
-                "SELECT count(*) FROM {CATALOG}.fixture.empty_append"
-            ))
+            .query(&selected.sql)
             .context("read empty Paimon append table")?;
         ensure!(empty == [0], "empty Paimon table returned {empty:?}");
 
+        let selected = self.intent.take(3)?;
+        selected.arm(context, control.connection_id(), &selected.sql)?;
         let typed: Vec<(i64, Option<String>, Option<String>, Option<String>)> = control
-            .query(format!(
-                "SELECT id, CAST(c_decimal AS STRING), HEX(c_binary), \
-                 CAST(c_timestamp AS STRING) FROM {CATALOG}.fixture.type_matrix ORDER BY id"
-            ))
+            .query(&selected.sql)
             .context("read Paimon scalar type matrix")?;
         ensure!(
             typed
@@ -170,6 +223,7 @@ impl Scenario for PaimonReadData {
 #[derive(Default)]
 struct PaimonSnapshotAndSchema {
     fixture: Mutex<Option<OwnedFixture>>,
+    intent: SqlIntentOwner,
 }
 
 impl Scenario for PaimonSnapshotAndSchema {
@@ -189,6 +243,29 @@ impl Scenario for PaimonSnapshotAndSchema {
         Ok(launch)
     }
 
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        _: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(self.intent.freeze(
+            vec![reader_spec(
+                "SELECT count(*) FROM paimon_snapshot.fixture.append_none WHERE sleep(90)".into(),
+                cluster_size,
+            )],
+            &[],
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let owned = self
@@ -200,103 +277,89 @@ impl Scenario for PaimonSnapshotAndSchema {
         let fixture = load_fixture(&owned.root.join("manifest.json"), "s1")?;
         let baseline = resource_baseline(context)?;
         let before = backend_logs(context)?;
-        let (user, port) = mysql_endpoint(context);
         let mut control = connect(context, "connect Paimon snapshot control session")?;
         const CATALOG: &str = "paimon_snapshot";
         create_paimon_catalog(&mut control, CATALOG, &fixture)?;
 
-        let held = start_query(
-            &user,
-            port,
-            context.remaining("connect S1 Paimon query actor")?,
-            format!("SELECT count(*) FROM {CATALOG}.fixture.append_none WHERE sleep(90)"),
-        )?;
-        wait_for_new_marker(context, &before, PAGE_SOURCE_OPEN, &held.done)?;
-        context.action("observed the S1 Paimon page source before external S2 publication");
+        let selected = self.intent.take(0)?;
+        let held = start_query(context, selected)?;
+        let operation = (|| -> Result<()> {
+            wait_for_new_marker(context, &before, PAGE_SOURCE_OPEN, &held.done)?;
+            context.action("observed the S1 Paimon page source before external S2 publication");
 
-        let (advance_tx, advance_done) = mpsc::sync_channel(1);
-        let advance_fixture = owned.clone();
-        let fixture_deadline = context.deadline();
-        let advance_thread = thread::spawn(move || -> Result<()> {
-            advance_tx
-                .send(advance_owned_fixture(
-                    &advance_fixture,
-                    "s2",
-                    fixture_deadline,
+            let (advance_tx, advance_done) = mpsc::sync_channel(1);
+            let advance_fixture = owned.clone();
+            let fixture_deadline = context.deadline();
+            let advance_thread = thread::spawn(move || -> Result<()> {
+                advance_tx
+                    .send(advance_owned_fixture(
+                        &advance_fixture,
+                        "s2",
+                        fixture_deadline,
+                    ))
+                    .context("publish S2 fixture advance result")?;
+                Ok(())
+            });
+            let advancement = (|| -> Result<()> {
+                wait_for_owned_fixture_stage(context, &owned.root, "s2", &advance_done)
+                    .context("external Paimon S2 fixture publication")?;
+                match held.done.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Ok(outcome) => {
+                        let rows = outcome
+                            .context("S1 query failed before the S2 snapshot was published")?;
+                        bail!("S1 query completed before the S2 snapshot was published: {rows:?}");
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        bail!("S1 Paimon query actor disconnected before S2 publication");
+                    }
+                }
+                advance_done
+                    .recv_timeout(context.remaining("finish S2 fixture verification")?)
+                    .context(
+                        "external Paimon S2 fixture verification exceeded the scenario deadline",
+                    )?
+            })();
+            scan_statement_actor::combine(advancement, scan_statement_actor::join(advance_thread))?;
+            let s1 = held
+                .done
+                .recv_timeout(context.remaining("await frozen S1 query")?)
+                .context("frozen S1 query did not complete before the scenario deadline")?
+                .context("frozen S1 query failed")?;
+            ensure!(
+                s1 == [2],
+                "in-flight S1 query observed another snapshot: {s1:?}"
+            );
+
+            let s2: Vec<i64> = control
+                .query(format!(
+                    "SELECT id FROM {CATALOG}.fixture.append_none ORDER BY id"
                 ))
-                .context("publish S2 fixture advance result")?;
+                .context("read newly published Paimon S2")?;
+            ensure!(s2 == [1, 2, 3], "fresh query did not observe S2: {s2:?}");
+
+            advance_owned_fixture(&owned, "schema", context.deadline())?;
+            context.remaining("read Paimon schema after external fixture advance")?;
+            let evolved: Vec<(i64, String, Option<String>)> = control
+                .query(format!(
+                    "SELECT id, name, added FROM {CATALOG}.fixture.schema_evolution ORDER BY id"
+                ))
+                .context("read current Paimon schema over historical files")?;
+            ensure!(
+                evolved
+                    == [
+                        (1, "after-a".to_string(), Some("added-a".to_string())),
+                        (2, "before-b".to_string(), None),
+                        (3, "after-c".to_string(), Some("added-c".to_string())),
+                    ],
+                "Paimon field-ID schema evolution differs from the oracle: {evolved:?}"
+            );
+
+            await_resource_convergence(context, &baseline, "Paimon snapshot/schema reads")?;
+            drop_catalog(&mut control, CATALOG)?;
             Ok(())
-        });
-        if let Err(error) = wait_for_owned_fixture_stage(context, &owned.root, "s2", &advance_done)
-        {
-            // The exact deadline also belongs to the subprocess owner. Join
-            // its bounded cleanup before fixture teardown can remove inputs.
-            let _ = advance_thread.join();
-            return Err(error.context("external Paimon S2 fixture publication"));
-        }
-        match held.done.try_recv() {
-            Err(mpsc::TryRecvError::Empty) => {}
-            Ok(outcome) => {
-                held.thread
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("S1 Paimon query actor panicked"))??;
-                let rows =
-                    outcome.context("S1 query failed before the S2 snapshot was published")?;
-                bail!("S1 query completed before the S2 snapshot was published: {rows:?}");
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {
-                bail!("S1 Paimon query actor disconnected before S2 publication");
-            }
-        }
-        let advanced: Result<()> = (|| {
-            advance_done
-                .recv_timeout(context.remaining("finish S2 fixture verification")?)
-                .context("external Paimon S2 fixture verification exceeded the scenario deadline")?
         })();
-        advance_thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("S2 fixture advance actor panicked"))??;
-        advanced?;
-        let s1 = held
-            .done
-            .recv_timeout(context.remaining("await frozen S1 query")?)
-            .context("frozen S1 query did not complete before the scenario deadline")?
-            .context("frozen S1 query failed")?;
-        held.thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("S1 Paimon query actor panicked"))??;
-        ensure!(
-            s1 == [2],
-            "in-flight S1 query observed another snapshot: {s1:?}"
-        );
-
-        let s2: Vec<i64> = control
-            .query(format!(
-                "SELECT id FROM {CATALOG}.fixture.append_none ORDER BY id"
-            ))
-            .context("read newly published Paimon S2")?;
-        ensure!(s2 == [1, 2, 3], "fresh query did not observe S2: {s2:?}");
-
-        advance_owned_fixture(&owned, "schema", context.deadline())?;
-        context.remaining("read Paimon schema after external fixture advance")?;
-        let evolved: Vec<(i64, String, Option<String>)> = control
-            .query(format!(
-                "SELECT id, name, added FROM {CATALOG}.fixture.schema_evolution ORDER BY id"
-            ))
-            .context("read current Paimon schema over historical files")?;
-        ensure!(
-            evolved
-                == [
-                    (1, "after-a".to_string(), Some("added-a".to_string())),
-                    (2, "before-b".to_string(), None),
-                    (3, "after-c".to_string(), Some("added-c".to_string())),
-                ],
-            "Paimon field-ID schema evolution differs from the oracle: {evolved:?}"
-        );
-
-        await_resource_convergence(context, &baseline, "Paimon snapshot/schema reads")?;
-        drop_catalog(&mut control, CATALOG)?;
-        Ok(())
+        held.settle(context, operation)
     }
 
     fn teardown(&self) -> Result<()> {
@@ -408,7 +471,10 @@ impl Scenario for PaimonMergeFilterCorrectness {
     }
 }
 
-struct PaimonCancelAndBudget;
+#[derive(Default)]
+struct PaimonCancelAndBudget {
+    intent: SqlIntentOwner,
+}
 
 impl Scenario for PaimonCancelAndBudget {
     fn name(&self) -> &'static str {
@@ -423,62 +489,79 @@ impl Scenario for PaimonCancelAndBudget {
         paimon_launch_config(&load_shared_fixture("schema")?)
     }
 
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        _: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(self.intent.freeze(
+            vec![reader_spec(
+                "SELECT count(*) FROM paimon_cancel.fixture.pk_dynamic WHERE sleep(60)".into(),
+                cluster_size,
+            )],
+            &[],
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let fixture = load_shared_fixture("schema")?;
         let baseline = resource_baseline(context)?;
         let before = backend_logs(context)?;
-        let (user, port) = mysql_endpoint(context);
         let mut control = connect(context, "connect Paimon cancellation control session")?;
         const CATALOG: &str = "paimon_cancel";
         create_paimon_catalog(&mut control, CATALOG, &fixture)?;
 
-        let target = start_query(
-            &user,
-            port,
-            context.remaining("connect cancellable Paimon query actor")?,
-            format!("SELECT count(*) FROM {CATALOG}.fixture.pk_dynamic WHERE sleep(60)"),
-        )?;
-        let connection_id = target
-            .ready
-            .recv_timeout(context.remaining("receive cancellable Paimon connection id")?)
-            .context("cancellable Paimon query did not publish its connection ID")?;
-        wait_for_new_marker(context, &before, PAGE_SOURCE_OPEN, &target.done)?;
-        control
-            .query_drop(format!("KILL QUERY {connection_id}"))
-            .context("cancel active Paimon query through public MySQL")?;
-        let error = target
-            .done
-            .recv_timeout(context.remaining("await Paimon query cancellation")?)
-            .context("cancelled Paimon query did not terminate")?
-            .expect_err("cancelled Paimon query unexpectedly succeeded");
-        ensure!(
-            matches!(error, mysql::Error::MySqlError(ref error) if error.code == 1317),
-            "expected MySQL cancellation error 1317, received {error}"
-        );
-        target
-            .thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("Paimon cancellation query actor panicked"))??;
+        let target = start_query(context, self.intent.take(0)?)?;
+        let operation = (|| -> Result<()> {
+            let connection_id = target.connection_id;
+            wait_for_new_marker(context, &before, PAGE_SOURCE_OPEN, &target.done)?;
+            control
+                .query_drop(format!("KILL QUERY {connection_id}"))
+                .context("cancel active Paimon query through public MySQL")?;
+            let error = target
+                .done
+                .recv_timeout(context.remaining("await Paimon query cancellation")?)
+                .context("cancelled Paimon query did not terminate")?
+                .expect_err("cancelled Paimon query unexpectedly succeeded");
+            ensure!(
+                matches!(error, mysql::Error::MySqlError(ref error) if error.code == 1317),
+                "expected MySQL cancellation error 1317, received {error}"
+            );
 
-        let budget_error = control
-            .query::<mysql::Row, _>(format!(
-                "SELECT /*+ SET_VAR(query_mem_limit=1) */ * \
+            let budget_error = control
+                .query::<mysql::Row, _>(format!(
+                    "SELECT /*+ SET_VAR(query_mem_limit=1) */ * \
                  FROM {CATALOG}.fixture.type_matrix"
-            ))
-            .expect_err("one-byte query memory budget must reject the Paimon read");
-        ensure!(
-            budget_error
-                .to_string()
-                .to_ascii_lowercase()
-                .contains("memory"),
-            "low-budget Paimon read failed for another reason: {budget_error}"
-        );
+                ))
+                .expect_err("one-byte query memory budget must reject the Paimon read");
+            ensure!(
+                budget_error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("memory"),
+                "low-budget Paimon read failed for another reason: {budget_error}"
+            );
 
-        wait_for_balanced_page_sources(context, &before)?;
-        await_resource_convergence(context, &baseline, "Paimon cancellation and budget refusal")?;
-        drop_catalog(&mut control, CATALOG)?;
-        Ok(())
+            wait_for_balanced_page_sources(context, &before)?;
+            await_resource_convergence(
+                context,
+                &baseline,
+                "Paimon cancellation and budget refusal",
+            )?;
+            drop_catalog(&mut control, CATALOG)?;
+            Ok(())
+        })();
+        target.settle(context, operation)
     }
 }
 
@@ -591,7 +674,14 @@ impl Scenario for PaimonUnsupportedAndBinding {
     }
 }
 
-struct IcebergPaimonRead;
+#[derive(Default)]
+struct IcebergPaimonRead {
+    intent: SqlIntentOwner,
+}
+
+fn cross_provider_sql() -> String {
+    "SELECT p.id, p.note, i.label FROM paimon_cross.fixture.pk_default p JOIN iceberg_cross.fixture.dim i ON p.id = i.id ORDER BY p.id".into()
+}
 
 impl Scenario for IcebergPaimonRead {
     fn name(&self) -> &'static str {
@@ -604,6 +694,32 @@ impl Scenario for IcebergPaimonRead {
 
     fn launch_config(&self, _scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
         paimon_launch_config(&load_shared_fixture("schema")?)
+    }
+
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        _: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(self.intent.freeze(
+            vec![StatementSpec {
+                    sql: cross_provider_sql(),
+                    faults: vec![],
+                    observations: (0..cluster_size)
+                        .map(|index| (index, "grpc-fragment", None))
+                        .collect(),
+                }],
+            &[],
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -630,12 +746,10 @@ impl Scenario for IcebergPaimonRead {
             ))
             .context("write Iceberg cross-provider rows")?;
 
+        let selected = self.intent.take(0)?;
+        let observation = selected.arm(context, control.connection_id(), &selected.sql)?;
         let joined: Vec<(i64, String, String)> = control
-            .query(format!(
-                "SELECT p.id, p.note, i.label \
-                 FROM {PAIMON}.fixture.pk_default p \
-                 JOIN {ICEBERG}.fixture.dim i ON p.id = i.id ORDER BY p.id"
-            ))
+            .query(&selected.sql)
             .context("join Paimon and Iceberg through one native query")?;
         ensure!(
             joined
@@ -646,10 +760,10 @@ impl Scenario for IcebergPaimonRead {
             "cross-provider join returned {joined:?}"
         );
 
+        let deadline = context.deadline();
         let snapshot = context
             .handle()
-            .query_lifecycle_structured_snapshot()?
-            .context("cross-provider query published no lifecycle snapshot")?;
+            .await_query_lifecycle_statement_observation(&observation, true, deadline)?;
         assert_query_completed_across_boundary(context, &snapshot, "Iceberg/Paimon join")?;
         await_resource_convergence(context, &baseline, "Iceberg/Paimon join")?;
         control
@@ -692,11 +806,7 @@ struct OwnedFixture {
     env_file: PathBuf,
 }
 
-struct QueryActor {
-    ready: mpsc::Receiver<u32>,
-    done: mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
-    thread: thread::JoinHandle<Result<()>>,
-}
+type QueryActor = ScanActor<Vec<i64>>;
 
 fn paimon_launch_config(fixture: &Fixture) -> Result<ScenarioLaunchConfig> {
     let access = env::var(ACCESS_KEY_ENV).with_context(|| {
@@ -752,11 +862,12 @@ access_key_secret = "${{ENV:{SECRET_KEY_ENV}}}"
     Ok(launch)
 }
 
-fn connect(context: &ScenarioContext, operation: &str) -> Result<mysql::Conn> {
-    mysql_actor::connect(
+fn connect(context: &ScenarioContext, operation: &str) -> Result<mysql_actor::DeadlineConnection> {
+    context.remaining(operation)?;
+    mysql_actor::connect_until(
         context.mysql_user(),
         context.mysql_port(),
-        context.remaining(operation)?,
+        context.deadline(),
     )
 }
 
@@ -1206,31 +1317,13 @@ fn wait_for_balanced_page_sources(context: &mut ScenarioContext, before: &[Strin
     }
 }
 
-fn start_query(
-    user: &str,
-    port: u16,
-    connect_timeout: Duration,
-    query: String,
-) -> Result<QueryActor> {
-    let (ready_tx, ready) = mpsc::sync_channel(1);
-    let (done_tx, done) = mpsc::sync_channel(1);
-    let user = user.to_string();
-    let thread = thread::spawn(move || -> Result<()> {
-        let mut connection = mysql_actor::connect_for_cancellation(&user, port, connect_timeout)
-            .context("connect Paimon query actor")?;
-        ready_tx
-            .send(connection.connection_id())
-            .context("publish Paimon query connection ID")?;
-        done_tx
-            .send(connection.query::<i64, _>(query))
-            .context("publish Paimon query result")?;
-        Ok(())
-    });
-    Ok(QueryActor {
-        ready,
-        done,
-        thread,
-    })
+fn start_query(context: &mut ScenarioContext, selected: SelectedStatement) -> Result<QueryActor> {
+    ScanActor::start(
+        context,
+        selected.sql.clone(),
+        Some(selected),
+        |connection, sql| connection.query::<i64, _>(sql),
+    )
 }
 
 fn expect_error_any<T>(
@@ -1254,11 +1347,54 @@ fn expect_error_any<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::{Fixture, paimon_launch_config_with_credentials, run_external_fixture_until};
+    use super::{
+        Fixture, SqlIntentOwner, paimon_launch_config_with_credentials, read_data_sqls,
+        reader_spec, run_external_fixture_until,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::process::Command;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn paimon_read_data_freezes_only_its_four_actual_reader_submissions() {
+        let binary = std::env::current_exe().unwrap();
+        let owner = SqlIntentOwner::default();
+        let sqls = read_data_sqls();
+        let plan = owner
+            .freeze(
+                sqls.iter()
+                    .cloned()
+                    .map(|sql| reader_spec(sql, 3))
+                    .collect(),
+                &[],
+                3,
+                &binary,
+                Some(&binary),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        for launch in plan.planned_launch_summaries().as_array().unwrap() {
+            let grants = launch["grants"].as_array().unwrap();
+            if launch["role"] == "fe" {
+                assert_eq!(grants.len(), 13);
+            } else {
+                assert_eq!(grants.len(), 4);
+                assert!(
+                    grants
+                        .iter()
+                        .all(|grant| grant["domain"] == "native-observation"
+                            && grant["action"] == "reader-marker")
+                );
+            }
+            assert!(!grants.iter().any(|grant| grant["domain"] == "native"));
+        }
+        for (index, sql) in sqls.iter().enumerate() {
+            assert_eq!(owner.take(index).unwrap().sql, *sql);
+            assert!(owner.take(index).is_err());
+        }
+        assert!(owner.take(sqls.len()).is_err());
+    }
 
     fn command_capture_root(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

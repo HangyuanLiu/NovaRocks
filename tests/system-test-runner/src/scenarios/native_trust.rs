@@ -24,7 +24,11 @@
 
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
+use crate::scenarios::query_lifecycle::native_sql_controls::SqlIntentOwner;
 use crate::scenarios::task_evidence;
+
+#[path = "native_trust_controls.rs"]
+mod native_trust_controls;
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use h2::client;
@@ -44,8 +48,10 @@ use novarocks_secret::SecretValue;
 use novarocks_types::NativeEndpoint;
 use prost::Message;
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
+use std::time::Instant;
 
 const REQUIRED_BACKENDS: usize = 3;
 const GRPC_UNAUTHENTICATED: u16 = 16;
@@ -68,14 +74,17 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(NativeTrustPositive {
             name: "native-trust/plaintext-ip",
             fixture: NativeTrustFixture::plaintext_ip(),
+            intent: SqlIntentOwner::default(),
         }),
         Box::new(NativeTrustPositive {
             name: "native-trust/automatic-dns",
             fixture: NativeTrustFixture::automatic_dns(),
+            intent: SqlIntentOwner::default(),
         }),
         Box::new(NativeTrustPositive {
             name: "native-trust/pem-ip",
             fixture: NativeTrustFixture::pem_ip(),
+            intent: SqlIntentOwner::default(),
         }),
         Box::new(NativeTrustNegative::domain_mismatch()),
         Box::new(NativeTrustNegative::plaintext_tls_mismatch()),
@@ -89,6 +98,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
 struct NativeTrustPositive {
     name: &'static str,
     fixture: NativeTrustFixture,
+    intent: SqlIntentOwner,
 }
 
 impl Scenario for NativeTrustPositive {
@@ -101,6 +111,28 @@ impl Scenario for NativeTrustPositive {
             native_trust_fixture: self.fixture.clone(),
             ..Default::default()
         })
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        self.intent
+            .freeze(
+                native_trust_controls::baseline_statements(),
+                &[],
+                cluster_size,
+                ordinary_binary,
+                controlled_binary,
+                original_deadline,
+            )
+            .map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -123,38 +155,27 @@ impl Scenario for NativeTrustPositive {
             "proved missing/invalid/valid JWT ordering on both real Native BE Data and Control listeners",
         );
 
-        let mut connection = mysql_actor::connect(
+        let mut connection = mysql_actor::connect_until(
             context.mysql_user(),
             context.mysql_port(),
-            context.remaining("connect Native trust acceptance MySQL client")?,
+            context.deadline(),
         )?;
-        let mut previous_execution = context
-            .handle()
-            .query_lifecycle_structured_snapshot()?
-            .and_then(|snapshot| snapshot.execution_id);
         let mut snapshots = Vec::new();
         let mut participating = BTreeSet::new();
-        let deadline = context.deadline();
-        for ordinal in 1..=3 {
-            let rows: Vec<i64> = connection
-                .query("SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v")
-                .with_context(|| {
-                    format!("run distributed Native trust acceptance query {ordinal}")
-                })?;
+        for index in 0..3 {
+            let ordinal = index + 1;
+            let selected = self.intent.take(index)?;
+            let (rows, snapshot) = native_trust_controls::observed_query(
+                context,
+                &selected,
+                &mut connection,
+                native_trust_controls::BASELINE_SQL,
+                &format!("distributed Native trust acceptance query {ordinal}"),
+            )?;
             ensure!(
                 rows == vec![1, 2],
                 "Native trust acceptance query {ordinal} returned unexpected rows: {rows:?}"
             );
-            let snapshot = context
-                .handle()
-                .await_query_lifecycle_structured_snapshot_after(
-                    previous_execution.as_deref(),
-                    deadline,
-                )
-                .with_context(|| {
-                    format!("read FE lifecycle snapshot for Native trust query {ordinal}")
-                })?;
-            previous_execution = snapshot.execution_id.clone();
             let backends =
                 assert_query_crossed_trust_boundary(context, &snapshot, "Native trust query")?;
             participating.extend(backends);
@@ -186,6 +207,7 @@ impl Scenario for NativeTrustPositive {
             self.fixture.mode()
             , snapshots.len()
         ));
+        connection.finish()?;
         Ok(())
     }
 }
@@ -283,6 +305,7 @@ struct VendedCredentialTransportParity {
     name: &'static str,
     fixture: NativeTrustFixture,
     rest: Mutex<Option<VendedCredentialParityFixture>>,
+    intent: SqlIntentOwner,
 }
 
 struct VendedCredentialParityFixture {
@@ -317,6 +340,7 @@ impl VendedCredentialTransportParity {
             name,
             fixture,
             rest: Mutex::new(None),
+            intent: SqlIntentOwner::default(),
         }
     }
 
@@ -459,6 +483,30 @@ token = "${{ENV:{environment_name}}}"
         })
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        self.intent
+            .freeze(
+                vec![native_trust_controls::grpc_statement(
+                    native_trust_controls::PARITY_SQL,
+                )],
+                &[],
+                cluster_size,
+                ordinary_binary,
+                controlled_binary,
+                original_deadline,
+            )
+            .map(Some)
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         ensure!(
@@ -468,10 +516,10 @@ token = "${{ENV:{environment_name}}}"
         assert_credential_domain_task_ingress(context, self.fixture.mode())?;
 
         let (proxy_uri, warehouse, minio_endpoint) = self.fixture_endpoints()?;
-        let mut connection = mysql_actor::connect(
+        let mut connection = mysql_actor::connect_until(
             context.mysql_user(),
             context.mysql_port(),
-            context.remaining("connect vended transport parity MySQL client")?,
+            context.deadline(),
         )?;
         const CATALOG: &str = "vended_parity";
         connection
@@ -480,7 +528,7 @@ token = "${{ENV:{environment_name}}}"
             ))
             .context("create real REST-vended catalog for Native transport parity")?;
 
-        let query = format!("SELECT count(*) FROM {CATALOG}.vended_parity_db.vended_parity_data");
+        let query = native_trust_controls::PARITY_SQL;
         let establish_before = (0..REQUIRED_BACKENDS)
             .map(|index| {
                 context
@@ -488,12 +536,18 @@ token = "${{ENV:{environment_name}}}"
                     .be_log_count(index, task_evidence::CONTEXT_ESTABLISH_APPLIED)
             })
             .collect::<Result<Vec<_>>>()?;
-        let rows: Vec<i64> = connection.query(&query).with_context(|| {
-            format!(
-                "run real REST-vended query over {:?} Native transport",
+        let selected = self.intent.take(0)?;
+        let (rows, snapshot) = native_trust_controls::observed_query(
+            context,
+            &selected,
+            &mut connection,
+            query,
+            &format!(
+                "real REST-vended query over {:?} Native transport",
                 self.fixture.mode()
-            )
-        })?;
+            ),
+        )?;
+        assert_query_crossed_trust_boundary(context, &snapshot, "vended transport parity query")?;
         ensure!(
             rows == vec![0],
             "vended catalog query returned unexpected rows on {:?}: {rows:?}",
@@ -527,6 +581,7 @@ token = "${{ENV:{environment_name}}}"
             self.table_loads()? > 0,
             "vended transport parity did not observe a REST table response carrying a lease"
         );
+        connection.finish()?;
         Ok(())
     }
 
@@ -812,7 +867,8 @@ fn raw_grpc_probe_with_deadline(
     tokio::runtime::Runtime::new()
         .context("create Native raw probe runtime")?
         .block_on(async move {
-            let probe = async move {
+            let mut driver = None;
+            let probe = async {
                 let stream = connector
                     .connect()
                     .await
@@ -821,7 +877,7 @@ fn raw_grpc_probe_with_deadline(
                 let (mut sender, connection) = client::handshake(stream)
                     .await
                     .context("perform Native raw probe HTTP/2 handshake")?;
-                let driver = tokio::spawn(async move { connection.await });
+                driver = Some(tokio::spawn(async move { connection.await }));
                 let mut request = Request::builder()
                     .method("POST")
                     .uri(path)
@@ -870,23 +926,24 @@ fn raw_grpc_probe_with_deadline(
                     header_status.or_else(|| trailer_status.as_ref().and_then(grpc_status));
                 let grpc_message =
                     header_message.or_else(|| trailer_status.as_ref().and_then(grpc_message));
-                // Native listeners are long-lived. The probe has received the
-                // complete response, so waiting for the peer to close would turn
-                // a successful keep-alive into a scenario timeout.
-                driver.abort();
-                let _ = driver.await;
                 Ok(GrpcProbe {
                     http_status,
                     grpc_status,
                     grpc_message,
                 })
             };
-            match deadline {
-                Some(deadline) => tokio::time::timeout(deadline, probe)
-                    .await
-                    .context("absolute Native probe deadline exceeded")?,
+            let result = match deadline {
+                Some(deadline) => match tokio::time::timeout(deadline, probe).await {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow::Error::from(error)
+                        .context("absolute Native probe deadline exceeded")),
+                },
                 None => probe.await,
-            }
+            };
+            // Response failure or timeout must also abort and actually join
+            // the owned HTTP/2 driver. Peer keep-alive is not its exit signal.
+            let joined = native_trust_controls::join_probe_driver(driver).await;
+            native_trust_controls::with_cleanup(result, joined)
         })
 }
 
@@ -928,5 +985,30 @@ mod tests {
                 "native-trust/vended-credential-transport-parity-pem",
             ]
         );
+    }
+
+    #[test]
+    fn negative_transport_scenarios_have_no_test_session_authority() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for scenario in [
+            NativeTrustNegative::domain_mismatch(),
+            NativeTrustNegative::plaintext_tls_mismatch(),
+            NativeTrustNegative::automatic_pem_mismatch(),
+        ] {
+            assert!(
+                scenario
+                    .test_session_plan(
+                        &ScenarioLaunchConfig::default(),
+                        Path::new("/unused"),
+                        REQUIRED_BACKENDS,
+                        Path::new("/unused/primary"),
+                        Path::new("/unused/ordinary"),
+                        None,
+                        deadline,
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
     }
 }

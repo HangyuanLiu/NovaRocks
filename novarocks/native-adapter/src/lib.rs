@@ -17,6 +17,20 @@
 
 //! Server-resolved Native transport capabilities and protocol adapters.
 
+#[cfg(all(feature = "normal-build", feature = "test-controls"))]
+compile_error!("normal-build cannot include test-controls");
+
+/// Capabilities compiled by this owner; activation still requires a role session.
+pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
+    (
+        env!("CARGO_PKG_NAME"),
+        &[
+            #[cfg(feature = "test-controls")]
+            "test-controls",
+        ],
+    )
+}
+
 extern crate self as novarocks_native_adapter;
 
 pub mod backend_announce;
@@ -35,7 +49,6 @@ pub mod compiled_writer_binding;
 pub mod connector_write_data_plane;
 #[cfg(any(test, feature = "test-support"))]
 pub mod connector_write_test_support;
-pub mod debug_environment;
 pub mod descriptor_snapshot;
 pub mod exchange_data_plane;
 pub mod exchange_transmitter;
@@ -110,6 +123,7 @@ pub mod runtime_filter_typed_scan;
 pub mod static_package_admission;
 pub mod task_execution_observation;
 pub mod task_protocol;
+#[cfg(feature = "test-controls")]
 pub mod task_protocol_fault;
 pub mod task_protocol_ingress;
 pub mod task_query_context_options;
@@ -414,3 +428,12 @@ mod tests {
         assert!(generated.contains("::novarocks_proto_models::novarocks::HeartbeatRequest"));
     }
 }
+
+#[cfg(feature = "test-controls")]
+pub mod test_controls;
+
+#[cfg(feature = "test-controls")]
+pub mod test_observation_controls;
+
+#[cfg(feature = "test-controls")]
+pub mod backend_test_session;

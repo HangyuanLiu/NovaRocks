@@ -35,6 +35,8 @@ pub(crate) struct RuntimeStateInputs {
     pub(crate) execution_runtime: Option<Arc<ExecutionRuntime>>,
     pub(crate) query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     pub(crate) task_identity: Option<novarocks_execution_contract::TaskIdentity>,
+    #[cfg(feature = "test-controls")]
+    pub(crate) exchange_test_observer: Option<Arc<dyn crate::runtime::exchange::TestEventObserver>>,
 }
 
 pub(crate) fn apply_query_option_overrides(
@@ -78,17 +80,18 @@ pub(crate) fn build_runtime_state(inputs: RuntimeStateInputs) -> Result<Arc<Runt
     let cache_options = crate::runtime::cache::ExecutionCacheOptions::from_query_options(
         inputs.query_options.as_ref(),
     )?;
-    Ok(Arc::new(
-        RuntimeState::new(
-            inputs.query_options,
-            Some(cache_options),
-            inputs.query_id,
-            inputs.fragment_instance_id,
-            inputs.backend_num,
-            inputs.mem_tracker,
-            inputs.execution_runtime,
-        )
-        .with_runtime_filter_session(inputs.runtime_filter_session)
-        .with_query_memory(inputs.query_memory),
-    ))
+    let state = RuntimeState::new(
+        inputs.query_options,
+        Some(cache_options),
+        inputs.query_id,
+        inputs.fragment_instance_id,
+        inputs.backend_num,
+        inputs.mem_tracker,
+        inputs.execution_runtime,
+    )
+    .with_runtime_filter_session(inputs.runtime_filter_session)
+    .with_query_memory(inputs.query_memory);
+    #[cfg(feature = "test-controls")]
+    let state = state.with_exchange_test_observer(inputs.exchange_test_observer);
+    Ok(Arc::new(state))
 }

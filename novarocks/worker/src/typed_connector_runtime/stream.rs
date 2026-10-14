@@ -52,9 +52,13 @@ use novarocks_spi::connector::read_stack::{
     PageSourceFileMetrics, SourcePage,
 };
 
-use super::{TypedConnectorScanShared, TypedSystemTableScanShared, emit_page_source_marker};
+#[cfg(feature = "test-controls")]
+use super::emit_page_source_marker;
+use super::{TypedConnectorScanShared, TypedSystemTableScanShared};
 use crate::read_attempt::ReceivedReadSplit;
-use crate::typed_page_source::{TypedConnectorReaderMarker, flush_page_source_file_metrics};
+#[cfg(feature = "test-controls")]
+use crate::typed_page_source::TypedConnectorReaderMarker;
+use crate::typed_page_source::flush_page_source_file_metrics;
 use crate::typed_preparation_flow::StreamPreparationFlow;
 
 /// Hands a typed scan's one stream to the driver that runs it.
@@ -155,6 +159,7 @@ enum SplitStep {
 
 struct OpenSplit {
     stream: OwnedConnectorPageStream,
+    #[cfg(feature = "test-controls")]
     reader_marker: Option<TypedConnectorReaderMarker>,
     successor_control_id: Option<u64>,
     file_metrics: PageSourceFileMetrics,
@@ -162,6 +167,7 @@ struct OpenSplit {
 
 struct ClosingSplit {
     exit: BoxFuture<'static, Result<(), ConnectorError>>,
+    #[cfg(feature = "test-controls")]
     reader_marker: Option<TypedConnectorReaderMarker>,
 }
 
@@ -174,6 +180,7 @@ impl ClosingSplit {
         }
         Self {
             exit: split.stream.close(),
+            #[cfg(feature = "test-controls")]
             reader_marker: split.reader_marker,
         }
     }
@@ -284,16 +291,19 @@ impl TypedConnectorScanStream {
     }
 
     fn install(&mut self, split: &ReceivedReadSplit, stream: OwnedConnectorPageStream) {
+        #[cfg(feature = "test-controls")]
         let reader_marker =
-            TypedConnectorReaderMarker::for_split(split, self.shared.emit_reader_markers);
+            TypedConnectorReaderMarker::for_split(split, self.shared.test_observation.clone());
+        #[cfg(feature = "test-controls")]
         if let Some(marker) = reader_marker.as_ref() {
             marker.emit("OPEN");
         }
         // Acceptance evidence: a distributed run proves a page stream was
         // opened on this backend for this exact scheduled split, which a
         // result-only assertion cannot show.
+        #[cfg(feature = "test-controls")]
         emit_page_source_marker(
-            self.shared.emit_reader_markers,
+            self.shared.test_observation.as_deref(),
             "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN",
             self.shared.plan_node_id,
             Some(split.sequence_id()),
@@ -303,6 +313,7 @@ impl TypedConnectorScanStream {
         }
         self.step = SplitStep::Reading(Box::new(OpenSplit {
             stream,
+            #[cfg(feature = "test-controls")]
             reader_marker,
             successor_control_id: None,
             file_metrics: PageSourceFileMetrics::default(),
@@ -424,9 +435,10 @@ impl Stream for TypedConnectorScanStream {
                         return Poll::Pending;
                     }
                     Poll::Ready(result) => {
+                        #[cfg(feature = "test-controls")]
                         emit_split_close_markers(
                             closing.reader_marker.as_ref(),
-                            this.shared.emit_reader_markers,
+                            this.shared.test_observation.as_deref(),
                             this.shared.plan_node_id,
                         );
                         if let Err(error) = result {
@@ -519,14 +531,23 @@ impl ScanChunkStream for TypedConnectorScanStream {
         drop(this.claims);
         let task_exit = seal_task_source(&this.shared.request);
         let drained = this.flow.drained();
-        let markers = (this.shared.emit_reader_markers, this.shared.plan_node_id);
+        #[cfg(feature = "test-controls")]
+        let markers = (
+            this.shared.test_observation.clone(),
+            this.shared.plan_node_id,
+        );
         Box::pin(InScanRuntime {
             runtime,
             inner: Box::pin(async move {
                 let mut first_error = None;
                 if let Some(split) = split {
                     let result = split.exit.await;
-                    emit_split_close_markers(split.reader_marker.as_ref(), markers.0, markers.1);
+                    #[cfg(feature = "test-controls")]
+                    emit_split_close_markers(
+                        split.reader_marker.as_ref(),
+                        markers.0.as_deref(),
+                        markers.1,
+                    );
                     if let Err(error) = result {
                         first_error
                             .get_or_insert(format!("close typed connector page stream: {error}"));
@@ -544,16 +565,18 @@ impl ScanChunkStream for TypedConnectorScanStream {
     }
 }
 
+#[cfg(feature = "test-controls")]
 fn emit_split_close_markers(
     reader_marker: Option<&TypedConnectorReaderMarker>,
-    enabled: bool,
+    observation: Option<&dyn novarocks_execution::runtime::exchange::TestEventObserver>,
     plan_node_id: i32,
 ) {
     if let Some(marker) = reader_marker {
         marker.emit("CLOSE");
     }
+    #[cfg(feature = "test-controls")]
     emit_page_source_marker(
-        enabled,
+        observation,
         "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE",
         plan_node_id,
         None,
@@ -669,8 +692,9 @@ impl TypedSystemTableStream {
         // No sequence: a system relation read has no split, and printing one
         // would be the first step toward asserting scheduling identity it does
         // not have.
+        #[cfg(feature = "test-controls")]
         emit_page_source_marker(
-            self.shared.emit_reader_markers,
+            self.shared.test_observation.as_deref(),
             "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN",
             self.shared.plan_node_id,
             None,
@@ -760,8 +784,9 @@ impl Stream for TypedSystemTableStream {
                         return Poll::Pending;
                     }
                     Poll::Ready(result) => {
+                        #[cfg(feature = "test-controls")]
                         emit_page_source_marker(
-                            this.shared.emit_reader_markers,
+                            this.shared.test_observation.as_deref(),
                             "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE",
                             this.shared.plan_node_id,
                             None,
@@ -789,15 +814,20 @@ impl ScanChunkStream for TypedSystemTableStream {
             SystemStep::Unopened | SystemStep::Ended => None,
         };
         let task_exit = seal_task_source(&this.shared.request);
-        let markers = (this.shared.emit_reader_markers, this.shared.plan_node_id);
+        #[cfg(feature = "test-controls")]
+        let markers = (
+            this.shared.test_observation.clone(),
+            this.shared.plan_node_id,
+        );
         Box::pin(InScanRuntime {
             runtime,
             inner: Box::pin(async move {
                 let mut first_error = None;
                 if let Some(exit) = exit {
                     let result = exit.await;
+                    #[cfg(feature = "test-controls")]
                     emit_page_source_marker(
-                        markers.0,
+                        markers.0.as_deref(),
                         "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE",
                         markers.1,
                         None,

@@ -71,7 +71,7 @@ const MAX_WRITE_UNPIVOT_MAPPINGS: usize = 4_096;
 const MAX_WRITE_UNPIVOT_CONSTANTS: usize = 16_384;
 
 use super::DecodedNode;
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 use crate::connector_write_data_plane::QueryScopedTableWriteAggregateGuard;
 use crate::connector_write_data_plane::{
     NativeConnectorWriteObservationPort, RoleBoundCommitFragmentEncoder,
@@ -878,17 +878,35 @@ pub(super) fn lower_table_writer_node(
         binding.execution(),
         execution_id,
         node_id,
-        Arc::new(NativeConnectorWriteObservationPort::new(
-            ctx.backend_process_id()
-                .map_err(|error| error.into_native(path.clone()))?,
-        )),
-        crate::debug_environment::debug_emit_connector_writer_marker(),
+        Arc::new({
+            let observer = NativeConnectorWriteObservationPort::new(
+                ctx.backend_process_id()
+                    .map_err(|error| error.into_native(path.clone()))?,
+            );
+            #[cfg(feature = "test-controls")]
+            let observer = if let Some(controls) = ctx.test_controls() {
+                observer.with_test_controls(controls)
+            } else {
+                observer
+            };
+            observer
+        }),
+        #[cfg(feature = "test-controls")]
+        ctx.observation_controls()
+            .map(|controls| controls.observation_for("writer-marker", execution_id))
+            .transpose()
+            .map_err(|error| NativeFragmentDecodeError::invalid_value(path.clone(), error))?
+            .flatten(),
     ));
-    let fragment_encoder = Arc::new(RoleBoundCommitFragmentEncoder::new(
-        binding.fragment_encoder(),
-        execution_id,
-        node_id,
-    ));
+    let fragment_encoder =
+        RoleBoundCommitFragmentEncoder::new(binding.fragment_encoder(), execution_id, node_id);
+    #[cfg(feature = "test-controls")]
+    let fragment_encoder = if let Some(controls) = ctx.test_controls() {
+        fragment_encoder.with_test_controls(controls)
+    } else {
+        fragment_encoder
+    };
+    let fragment_encoder = Arc::new(fragment_encoder);
 
     let lowered = TableWriterNode::try_new_with_relation(
         Box::new(child.node),
@@ -910,11 +928,16 @@ pub(super) fn lower_table_writer_node(
             format!("native node_id={node_id} table writer: {error}"),
         )
     })?;
-    #[cfg(debug_assertions)]
-    let lowered = lowered.with_aggregate_guard(Arc::new(QueryScopedTableWriteAggregateGuard::new(
-        execution_id,
-        node_id,
-    )));
+    #[cfg(feature = "test-controls")]
+    let lowered = if let Some(controls) = ctx.test_controls() {
+        lowered.with_aggregate_guard(Arc::new(QueryScopedTableWriteAggregateGuard::new(
+            execution_id,
+            node_id,
+            controls,
+        )))
+    } else {
+        lowered
+    };
 
     let output_schema = Arc::clone(lowered.writer_multiplex_schema().chunk_schema());
     let layout = Layout::for_slots(output_schema.slot_ids().iter().copied());
@@ -1022,10 +1045,14 @@ pub(super) fn lower_table_finish_node(
                 ),
             )
         })?;
-    let validator = Arc::new(RootCommitFragmentCarrierValidator::new(
-        execution_id,
-        node_id,
-    ));
+    let validator = RootCommitFragmentCarrierValidator::new(execution_id, node_id);
+    #[cfg(feature = "test-controls")]
+    let validator = if let Some(controls) = ctx.test_controls() {
+        validator.with_test_controls(controls)
+    } else {
+        validator
+    };
+    let validator = Arc::new(validator);
 
     let inputs = children.into_iter().map(|child| child.node).collect();
     let lowered = TableFinishNode::try_new_with_relations(
@@ -1043,11 +1070,16 @@ pub(super) fn lower_table_finish_node(
             format!("native node_id={node_id} table finish: {error}"),
         )
     })?;
-    #[cfg(debug_assertions)]
-    let lowered = lowered.with_aggregate_guard(Arc::new(QueryScopedTableWriteAggregateGuard::new(
-        execution_id,
-        node_id,
-    )));
+    #[cfg(feature = "test-controls")]
+    let lowered = if let Some(controls) = ctx.test_controls() {
+        lowered.with_aggregate_guard(Arc::new(QueryScopedTableWriteAggregateGuard::new(
+            execution_id,
+            node_id,
+            controls,
+        )))
+    } else {
+        lowered
+    };
 
     let output_schema = Arc::clone(lowered.root_result_schema().chunk_schema());
     let layout = Layout::for_slots(output_schema.slot_ids().iter().copied());

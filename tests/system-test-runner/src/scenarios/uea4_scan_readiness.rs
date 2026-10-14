@@ -51,7 +51,11 @@ use super::connector::{
     await_resource_convergence, connector_reader_environment, require_three_backends,
     resource_baseline,
 };
+use super::paimon::scan_statement_actor::{ScanActor, combine};
 use super::paimon::{Fixture as PaimonFixture, create_paimon_catalog, load_shared_fixture};
+use super::query_lifecycle::native_sql_controls::{
+    SelectedStatement, SqlIntentOwner, StatementSpec,
+};
 use super::uea4_catalog_planning::await_frontend_local_exit;
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
@@ -68,7 +72,7 @@ use std::env;
 use std::fs;
 use std::path::Path;
 use std::sync::mpsc;
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 const DATABASE: &str = "uea4a3_scan";
@@ -104,8 +108,8 @@ const NO_CACHE_OVERLAY: &str = "[runtime.cache]\npage_cache_enable = false\nparq
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
-        Box::new(ScanProducerReadiness),
-        Box::new(ScanProducerCancel),
+        Box::new(ScanProducerReadiness::default()),
+        Box::new(ScanProducerCancel::default()),
     ]
 }
 
@@ -134,7 +138,7 @@ fn launch_config(driver_workers: usize) -> Result<ScenarioLaunchConfig> {
 fn validate_environment(launch_profile: LaunchProfile) -> Result<()> {
     ensure!(
         launch_profile == LaunchProfile::FaultScenario,
-        "UEA-4A-3 scan scenarios read backend markers, which only the fault-scenario profile emits"
+        "UEA-4A-3 scan scenarios require fault-scenario composition and finite reader grants"
     );
     Environment::load().map(|_| ())
 }
@@ -308,11 +312,12 @@ fn path_tail(location: &str) -> Result<String> {
         .with_context(|| format!("object location {location} has no file name"))
 }
 
-fn connect(context: &ScenarioContext, operation: &str) -> Result<mysql::Conn> {
-    mysql_actor::connect(
+fn connect(context: &ScenarioContext, operation: &str) -> Result<mysql_actor::DeadlineConnection> {
+    context.remaining(operation)?;
+    mysql_actor::connect_until(
         context.mysql_user(),
         context.mysql_port(),
-        context.remaining(operation)?,
+        context.deadline(),
     )
 }
 
@@ -449,70 +454,38 @@ fn await_single_split(
 
 /// A query running on its own connection while one of its object reads is
 /// held.
-struct RunningQuery {
-    connection_id: u32,
-    done: mpsc::Receiver<mysql::Result<Rows>>,
-    actor: JoinHandle<Result<()>>,
-}
+type RunningQuery = ScanActor<Rows>;
 
-impl RunningQuery {
-    fn start(context: &ScenarioContext, sql: String) -> Result<Self> {
-        let (id_tx, id_rx) = mpsc::sync_channel(1);
-        let (done_tx, done_rx) = mpsc::sync_channel(1);
-        let user = context.mysql_user().to_owned();
-        let port = context.mysql_port();
-        let timeout = context.remaining("connect held scan query")?;
-        let actor = thread::spawn(move || -> Result<()> {
-            // No read timeout: the query legitimately waits as long as its
-            // read is held.
-            let mut connection = mysql_actor::connect_for_cancellation(&user, port, timeout)?;
-            id_tx.send(connection.connection_id())?;
-            done_tx.send(query_rows(&mut connection, &sql))?;
-            Ok(())
-        });
-        let connection_id = id_rx
-            .recv_timeout(context.remaining("receive held query connection ID")?)
-            .context("held query did not publish its connection ID")?;
-        Ok(Self {
-            connection_id,
-            done: done_rx,
-            actor,
-        })
-    }
-
-    fn still_running(&self) -> Result<bool> {
-        match self.done.try_recv() {
-            Err(mpsc::TryRecvError::Empty) => Ok(true),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                bail!("held query actor exited without a result")
-            }
-            Ok(result) => bail!("held query ended while its read was held: {result:?}"),
+fn still_running(held: &RunningQuery) -> Result<bool> {
+    match held.done.try_recv() {
+        Err(mpsc::TryRecvError::Empty) => Ok(true),
+        Err(mpsc::TryRecvError::Disconnected) => {
+            bail!("held query actor exited without a result")
         }
-    }
-
-    fn finish(self, timeout: Duration) -> Result<mysql::Result<Rows>> {
-        let result = self
-            .done
-            .recv_timeout(timeout)
-            .context("held query did not end after its read was released")?;
-        self.actor
-            .join()
-            .map_err(|_| anyhow::anyhow!("held query actor panicked"))??;
-        Ok(result)
+        Ok(result) => bail!("held query ended while its read was held: {result:?}"),
     }
 }
 
 /// Runs `sql` on a fresh connection whose every read is bounded, so a query
 /// that cannot make progress fails instead of hanging the scenario.
-fn run_independent(context: &ScenarioContext, sql: &str) -> Result<(Rows, Duration)> {
+fn run_independent(
+    context: &mut ScenarioContext,
+    sql: &str,
+    selected: Option<SelectedStatement>,
+) -> Result<(Rows, Duration)> {
     let started = Instant::now();
-    let mut connection = mysql_actor::connect(
-        context.mysql_user(),
-        context.mysql_port(),
-        INDEPENDENT_QUERY_TIMEOUT,
-    )?;
+    let deadline = started
+        .checked_add(INDEPENDENT_QUERY_TIMEOUT)
+        .context("independent query deadline overflow")?
+        .min(context.deadline());
+    let mut connection =
+        mysql_actor::connect_until(context.mysql_user(), context.mysql_port(), deadline)?;
+    if let Some(selected) = selected {
+        selected.arm(context, connection.connection_id(), sql)?;
+    }
     let rows = query_rows(&mut connection, sql)
         .with_context(|| format!("independent query `{sql}` did not complete"))?;
+    connection.finish()?;
     Ok((rows, started.elapsed()))
 }
 
@@ -550,7 +523,52 @@ fn write_report(context: &ScenarioContext, file: &str, report: &impl Serialize) 
 
 // ------------------------------------------------------------- readiness
 
-struct ScanProducerReadiness;
+#[derive(Default)]
+struct ScanProducerReadiness {
+    intent: SqlIntentOwner,
+}
+
+const HELD_ICE_STATEMENT: usize = PAIMON_CANDIDATES.len();
+const HELD_PAIMON_STATEMENTS: usize = HELD_ICE_STATEMENT + 1;
+const INDEPENDENT_ICE_STATEMENT: usize = HELD_PAIMON_STATEMENTS + PAIMON_CANDIDATES.len();
+const INDEPENDENT_PAIMON_STATEMENT: usize = INDEPENDENT_ICE_STATEMENT + 1;
+const BUDGET_YIELD_STATEMENT: usize = INDEPENDENT_PAIMON_STATEMENT + 1;
+
+fn candidate_sqls() -> Vec<String> {
+    PAIMON_CANDIDATES
+        .into_iter()
+        .map(|name| PaimonTable::sql(name, DIRECT_PAIMON))
+        .collect()
+}
+fn readiness_sqls() -> Vec<String> {
+    let mut sqls = candidate_sqls();
+    sqls.push(format!(
+        "SELECT COUNT(*), SUM(v) FROM {HELD_ICEBERG}.{DATABASE}.t_open"
+    ));
+    sqls.extend(
+        PAIMON_CANDIDATES
+            .into_iter()
+            .map(|name| PaimonTable::sql(name, HELD_PAIMON)),
+    );
+    let independent = format!("SELECT COUNT(*), SUM(v) FROM {DIRECT_ICEBERG}.{DATABASE}.t_peer");
+    // The same source is executed in two distinct readiness phases.
+    sqls.extend([independent.clone(), independent]);
+    sqls.push(format!(
+        "SELECT COUNT(*) FROM {DIRECT_ICEBERG}.{DATABASE}.t_long WHERE v * 3 = 1"
+    ));
+    sqls
+}
+fn scan_specs(sqls: Vec<String>, cluster_size: usize) -> Vec<StatementSpec> {
+    sqls.into_iter()
+        .map(|sql| StatementSpec {
+            sql,
+            faults: vec![],
+            observations: (0..cluster_size)
+                .map(|index| (index, "reader-marker", None))
+                .collect(),
+        })
+        .collect()
+}
 
 #[derive(Serialize)]
 struct ReadinessPhase {
@@ -601,6 +619,8 @@ struct ReadinessCase<'a> {
     held_expected: Rows,
     independent_sql: String,
     independent_expected: Rows,
+    held_statement: SelectedStatement,
+    independent_statement: SelectedStatement,
 }
 
 fn run_readiness_case(
@@ -614,17 +634,26 @@ fn run_readiness_case(
     ));
     let offsets = log_offsets(context)?;
     let hold = case.hold.arm(proxy)?;
-    let held = RunningQuery::start(context, case.held_sql)?;
+    let held = RunningQuery::start(
+        context,
+        case.held_sql,
+        Some(case.held_statement),
+        query_rows,
+    )?;
     let operation = (|| -> Result<ReadinessPhase> {
         hold.wait_until_entered(HOLD_ENTRY_TIMEOUT)
             .with_context(|| format!("{phase}: the held query's object read never arrived"))?;
         let held_split = await_single_split(context, &offsets, phase)?;
         ensure!(
-            held.still_running()?,
+            still_running(&held)?,
             "{phase}: the held query is not running"
         );
         let independent_offsets = log_offsets(context)?;
-        let (observed, elapsed) = run_independent(context, &case.independent_sql)?;
+        let (observed, elapsed) = run_independent(
+            context,
+            &case.independent_sql,
+            Some(case.independent_statement),
+        )?;
         ensure!(
             observed == case.independent_expected,
             "{phase}: independent query returned {observed:?}, expected {:?}",
@@ -638,7 +667,7 @@ fn run_readiness_case(
             held_split.backend
         );
         ensure!(
-            held.still_running()?,
+            still_running(&held)?,
             "{phase}: the held query finished before its read was released"
         );
         context.action(format!(
@@ -654,24 +683,36 @@ fn run_readiness_case(
         })
     })();
     hold.release();
-    let result = held.finish(HELD_QUERY_EXIT_TIMEOUT)?;
-    let report = operation?;
-    let observed = result.with_context(|| format!("{phase}: held query failed after release"))?;
-    ensure!(
-        observed == case.held_expected,
-        "{phase}: held query returned {observed:?}, expected {:?}",
-        case.held_expected
-    );
-    Ok(report)
+    let completion = (|| -> Result<()> {
+        let observed = held
+            .done
+            .recv_timeout(HELD_QUERY_EXIT_TIMEOUT)
+            .context("held query did not end after its read was released")?
+            .with_context(|| format!("{phase}: held query failed after release"))?;
+        ensure!(
+            observed == case.held_expected,
+            "{phase}: held query returned {observed:?}, expected {:?}",
+            case.held_expected
+        );
+        Ok(())
+    })();
+    held.settle(context, combine(operation, completion))
 }
 
 /// Picks a Paimon fixture table whose read is one split, reading it through
 /// the direct catalog.
-fn one_split_paimon_table(context: &mut ScenarioContext) -> Result<PaimonTable> {
+fn one_split_paimon_table(
+    context: &mut ScenarioContext,
+    intent: &SqlIntentOwner,
+) -> Result<PaimonTable> {
     let mut control = connect(context, "connect Paimon probe session")?;
-    for name in PAIMON_CANDIDATES {
+    for (index, name) in PAIMON_CANDIDATES.into_iter().enumerate() {
         let offsets = log_offsets(context)?;
-        let expected = query_rows(&mut control, &PaimonTable::sql(name, DIRECT_PAIMON))
+        let sql = PaimonTable::sql(name, DIRECT_PAIMON);
+        intent
+            .take(index)?
+            .arm(context, control.connection_id(), &sql)?;
+        let expected = query_rows(&mut control, &sql)
             .with_context(|| format!("probe Paimon fixture table {name}"))?;
         // Only the probe runs, so every placement seen belongs to it.
         thread::sleep(Duration::from_millis(200));
@@ -708,6 +749,26 @@ impl Scenario for ScanProducerReadiness {
         launch_config(1)
     }
 
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        _: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(self.intent.freeze(
+            scan_specs(readiness_sqls(), cluster_size),
+            &[],
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let catalogs = Catalogs::create(context, true)?;
@@ -717,7 +778,11 @@ impl Scenario for ScanProducerReadiness {
         let peer = IcebergTable::create(&mut control, "t_peer", 2_000)?;
         let long = IcebergTable::create(&mut control, "t_long", LONG_TABLE_ROWS)?;
         drop(control);
-        let paimon = one_split_paimon_table(context)?;
+        let paimon = one_split_paimon_table(context, &self.intent)?;
+        let paimon_index = PAIMON_CANDIDATES
+            .iter()
+            .position(|name| *name == paimon.name)
+            .context("selected Paimon table is outside the finite candidate list")?;
         let independent_sql = peer.count_and_sum_sql(DIRECT_ICEBERG);
         let independent_expected = peer.expected_count_and_sum();
 
@@ -732,6 +797,8 @@ impl Scenario for ScanProducerReadiness {
                     held_expected: open.expected_count_and_sum(),
                     independent_sql: independent_sql.clone(),
                     independent_expected: independent_expected.clone(),
+                    held_statement: self.intent.take(HELD_ICE_STATEMENT)?,
+                    independent_statement: self.intent.take(INDEPENDENT_ICE_STATEMENT)?,
                 },
             )?,
             run_readiness_case(
@@ -744,6 +811,8 @@ impl Scenario for ScanProducerReadiness {
                     held_expected: paimon.expected.clone(),
                     independent_sql,
                     independent_expected,
+                    held_statement: self.intent.take(HELD_PAIMON_STATEMENTS + paimon_index)?,
+                    independent_statement: self.intent.take(INDEPENDENT_PAIMON_STATEMENT)?,
                 },
             )?,
         ];
@@ -765,11 +834,15 @@ impl Scenario for ScanProducerReadiness {
         let mut control = connect(context, "connect budget-yield session")?;
         // `v * 3 = 1` holds for no integer and no statistic can prune it, so
         // every page is decoded and filtered to nothing.
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE v * 3 = 1",
+            long.qualified(DIRECT_ICEBERG)
+        );
+        self.intent
+            .take(BUDGET_YIELD_STATEMENT)?
+            .arm(context, control.connection_id(), &sql)?;
         let matched: Option<i64> = control
-            .query_first(format!(
-                "SELECT COUNT(*) FROM {} WHERE v * 3 = 1",
-                long.qualified(DIRECT_ICEBERG)
-            ))
+            .query_first(&sql)
             .context("run the all-filtered long scan")?;
         ensure!(
             matched == Some(0),
@@ -817,7 +890,10 @@ impl Scenario for ScanProducerReadiness {
 
 // ------------------------------------------------------------------ cancel
 
-struct ScanProducerCancel;
+#[derive(Default)]
+struct ScanProducerCancel {
+    intent: SqlIntentOwner,
+}
 
 #[derive(Serialize)]
 struct CancelPhase {
@@ -844,13 +920,13 @@ fn run_cancel_case(
     ));
     let baseline = resource_baseline(context)?;
     let hold = hold.arm(proxy)?;
-    let held = RunningQuery::start(context, held_sql)?;
+    let held = RunningQuery::start(context, held_sql, None, query_rows)?;
     let operation = (|| -> Result<CancelPhase> {
         hold.wait_until_entered(HOLD_ENTRY_TIMEOUT)
             .with_context(|| format!("{phase}: the held query's object read never arrived"))?;
         let held_connection = held_request_connection(proxy);
         ensure!(
-            held.still_running()?,
+            still_running(&held)?,
             "{phase}: the held query is not running"
         );
         let killed = Instant::now();
@@ -878,7 +954,7 @@ fn run_cancel_case(
             .with_context(|| {
                 format!("{phase}: query resources did not converge while the read was held")
             })?;
-        let (observed, elapsed) = run_independent(context, independent_sql)?;
+        let (observed, elapsed) = run_independent(context, independent_sql, None)?;
         ensure!(
             &observed == independent_expected,
             "{phase}: independent query returned {observed:?}, expected {independent_expected:?}"
@@ -897,10 +973,7 @@ fn run_cancel_case(
         })
     })();
     hold.release();
-    held.actor
-        .join()
-        .map_err(|_| anyhow::anyhow!("{phase}: held query actor panicked"))??;
-    let report = operation?;
+    let report = held.settle(context, operation)?;
     await_resource_convergence(context, &baseline, &format!("{phase} after release"))?;
     Ok(report)
 }
@@ -922,6 +995,26 @@ impl Scenario for ScanProducerCancel {
         launch_config(1)
     }
 
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        _: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(self.intent.freeze(
+            scan_specs(candidate_sqls(), cluster_size),
+            &[],
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let catalogs = Catalogs::create(context, true)?;
@@ -930,7 +1023,7 @@ impl Scenario for ScanProducerCancel {
         let cancel = IcebergTable::create(&mut control, "t_cancel", 1_000)?;
         let peer = IcebergTable::create(&mut control, "t_peer", 2_000)?;
         drop(control);
-        let paimon = one_split_paimon_table(context)?;
+        let paimon = one_split_paimon_table(context, &self.intent)?;
         let independent_sql = peer.count_and_sum_sql(DIRECT_ICEBERG);
         let independent_expected = peer.expected_count_and_sum();
 
@@ -963,6 +1056,67 @@ impl Scenario for ScanProducerCancel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_grants_fit_one_role_and_distinguish_repeated_peer_queries() {
+        let binary = std::env::current_exe().unwrap();
+        let owner = SqlIntentOwner::default();
+        let sqls = readiness_sqls();
+        assert_eq!(sqls.len(), 14);
+        let plan = owner
+            .freeze(
+                scan_specs(sqls, 3),
+                &[],
+                3,
+                &binary,
+                Some(&binary),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        for launch in plan.planned_launch_summaries().as_array().unwrap() {
+            let grants = launch["grants"].as_array().unwrap();
+            assert!(grants.len() <= novarocks_failpoint::session::MAX_GRANTS);
+            if launch["role"] == "fe" {
+                assert_eq!(grants.len(), 43);
+            } else {
+                assert_eq!(grants.len(), 14);
+                assert!(
+                    grants
+                        .iter()
+                        .all(|grant| grant["action"] == "reader-marker")
+                );
+            }
+        }
+        let first = owner.take(INDEPENDENT_ICE_STATEMENT).unwrap();
+        let second = owner.take(INDEPENDENT_PAIMON_STATEMENT).unwrap();
+        assert_eq!(first.sql, second.sql);
+        assert_ne!(first.token, second.token);
+    }
+
+    #[test]
+    fn cancel_scene_observes_only_five_bounded_candidate_probes() {
+        let binary = std::env::current_exe().unwrap();
+        let owner = SqlIntentOwner::default();
+        let plan = owner
+            .freeze(
+                scan_specs(candidate_sqls(), 3),
+                &[],
+                3,
+                &binary,
+                Some(&binary),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+        for launch in plan.planned_launch_summaries().as_array().unwrap() {
+            let grants = launch["grants"].as_array().unwrap();
+            if launch["role"] == "fe" {
+                assert_eq!(grants.len(), 16);
+            } else {
+                assert_eq!(grants.len(), 5);
+            }
+        }
+        assert!(owner.take(HELD_ICE_STATEMENT).is_err());
+    }
 
     fn line(backend: usize, text: &str) -> (usize, String) {
         (backend, format!("2026-09-25 12:00:00 {text}"))

@@ -15,6 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#[cfg(unix)]
+#[path = "captured_command.rs"]
+mod captured_command;
+#[cfg(unix)]
+pub use captured_command::{CapturedCommandOutcome, capture_command_until};
+
 use anyhow::{Context, Result, bail};
 #[cfg(all(
     any(target_os = "macos", target_os = "ios"),

@@ -75,247 +75,176 @@
     reason = "The tonic service boundary must preserve Status without changing its generated signature."
 )]
 
-#[cfg(debug_assertions)]
 use std::{
-    collections::BTreeMap,
     io::{Read, Write},
     net::Shutdown,
     os::unix::net::UnixStream,
-    sync::{
-        Mutex, OnceLock,
-        atomic::{AtomicBool, Ordering},
-    },
 };
 
+use crate::test_controls::{NativeFaultClaim, NativeTestControls};
 use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
 use novarocks_execution_contract::task_execution::operation::OperationOutcome;
 use novarocks_failpoint::QueryLifecycleFaultKind;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId};
 
-/// A runner-armed token for a debug-only hold in the ordinary task handler.
-/// Absence of the existing fault root disables this hook completely.
-#[cfg(debug_assertions)]
-pub fn native_ingress_ordinary_hold_token<T>(
-    request: &tonic::Request<T>,
-) -> Result<Option<String>, tonic::Status> {
-    if novarocks_failpoint::configured_root().is_none() {
-        return Ok(None);
-    }
-    let Some(value) = request.metadata().get("x-novarocks-ingress-hold-token") else {
+/// Selects a finite direct hold only for the exact nominated admission context.
+pub fn claim_native_ingress_hold(
+    controls: &NativeTestControls,
+    request: &tonic::Request<proto::ApplyTaskOperationsRequest>,
+) -> Result<Option<crate::test_controls::NativeHoldClaim>, tonic::Status> {
+    let Some(token) = request.metadata().get("x-novarocks-ingress-hold-token") else {
         return Ok(None);
     };
-    let token = value
+    let token = token
         .to_str()
         .map_err(|_| tonic::Status::invalid_argument("native ingress hold token is not ASCII"))?;
-    novarocks_failpoint::native_ingress_hold_socket_path(token)
-        .map_err(tonic::Status::invalid_argument)?;
-    Ok(Some(token.to_owned()))
+    claim_batch_hold(controls, request.get_ref(), "ingress-hold", Some(token))
 }
-
-/// Arms one registry-mutex rendezvous on an actual admission-ticket request.
-/// A runner-owned fault root and process environment are both required.
-#[cfg(debug_assertions)]
-pub fn native_registry_hold_token_for_batch(
+pub fn claim_native_registry_hold(
+    controls: &NativeTestControls,
     request: &proto::ApplyTaskOperationsRequest,
-) -> Result<Option<String>, tonic::Status> {
-    let contains_acquire = request.operations.iter().any(|item| {
-        matches!(
-            item.operation.as_ref(),
-            Some(proto::task_operation::Operation::AcquireQueryContextAdmissionTicket(_))
-        )
-    });
-    if !contains_acquire {
-        return Ok(None);
-    }
-    static TOKEN: OnceLock<Result<Option<String>, String>> = OnceLock::new();
-    static CLAIMED: AtomicBool = AtomicBool::new(false);
-    let token = TOKEN.get_or_init(|| {
-        let Some(root) = novarocks_failpoint::configured_root() else {
-            return Ok(None);
-        };
-        if !root.is_dir() {
-            return Err("native registry hold fault root is not a directory".to_owned());
+) -> Result<Option<crate::test_controls::NativeHoldClaim>, tonic::Status> {
+    claim_batch_hold(controls, request, "registry-hold", None)
+}
+fn claim_batch_hold(
+    controls: &NativeTestControls,
+    request: &proto::ApplyTaskOperationsRequest,
+    action: &str,
+    token: Option<&str>,
+) -> Result<Option<crate::test_controls::NativeHoldClaim>, tonic::Status> {
+    let operations = novarocks_task_codec::operation::decode_ordinary_operation_batch(
+        request,
+        novarocks_task_codec::TransportBudget::DEFAULT,
+        novarocks_proto_codec::FieldPath::root("hold_target"),
+    )
+    .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+    for operation in operations {
+        if let novarocks_task_codec::operation::DecodedOperation::AcquireQueryContextAdmissionTicket(request)=operation {
+            if let Some(claim)=controls.claim_context_hold(action,request.context(),token).map_err(tonic::Status::failed_precondition)? {return Ok(Some(claim));}
         }
-        let Ok(token) = std::env::var("NOVAROCKS_SQL_TEST_NATIVE_REGISTRY_HOLD_TOKEN") else {
-            return Ok(None);
-        };
-        novarocks_failpoint::native_registry_hold_socket_path(&token)?;
-        Ok(Some(token))
-    });
-    let token = token.as_ref().map_err(|error| {
-        tonic::Status::failed_precondition(format!("native registry hold is invalid: {error}"))
-    })?;
-    Ok(token
-        .as_ref()
-        .filter(|_| {
-            CLAIMED
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        })
-        .cloned())
-}
-
-#[cfg(debug_assertions)]
-pub fn hold_native_registry_lock(
-    token: &str,
-    process_id: BackendProcessId,
-    request_deadline: std::time::Instant,
-) -> Result<(), tonic::Status> {
-    let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")
-        .map_err(|_| tonic::Status::failed_precondition("native registry backend index is unset"))?
-        .parse::<usize>()
-        .map_err(|_| {
-            tonic::Status::failed_precondition("native registry backend index is invalid")
-        })?;
-    let hold_until =
-        request_deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(30));
-    let remaining = hold_until.saturating_duration_since(std::time::Instant::now());
-    if remaining.is_zero() {
-        return Err(tonic::Status::deadline_exceeded(
-            "native registry hold deadline elapsed",
-        ));
     }
-    let path = novarocks_failpoint::native_registry_hold_socket_path(token)
-        .map_err(tonic::Status::invalid_argument)?;
-    let mut stream = UnixStream::connect(&path).map_err(|error| {
-        tonic::Status::failed_precondition(format!(
-            "native registry hold runner is unavailable at {}: {error}",
-            path.display()
-        ))
-    })?;
-    stream.set_write_timeout(Some(remaining)).map_err(|error| {
-        tonic::Status::internal(format!("set native registry hold write timeout: {error}"))
-    })?;
-    let marker = format!("NIR1 {backend_index} {process_id} {token}\n");
-    stream.write_all(marker.as_bytes()).map_err(|error| {
-        tonic::Status::internal(format!("write native registry hold marker: {error}"))
-    })?;
-    stream.shutdown(Shutdown::Write).map_err(|error| {
-        tonic::Status::internal(format!("finish native registry hold marker: {error}"))
-    })?;
-    let remaining = hold_until.saturating_duration_since(std::time::Instant::now());
-    if remaining.is_zero() {
-        return Err(tonic::Status::deadline_exceeded(
-            "native registry hold deadline elapsed",
-        ));
-    }
-    stream.set_read_timeout(Some(remaining)).map_err(|error| {
-        tonic::Status::internal(format!("set native registry hold read timeout: {error}"))
-    })?;
-    let mut release = [0_u8; 1];
-    stream.read_exact(&mut release).map_err(|error| {
-        tonic::Status::failed_precondition(format!(
-            "native registry hold runner disconnected or timed out: {error}"
-        ))
-    })?;
-    if release != *b"R" {
-        return Err(tonic::Status::failed_precondition(
-            "native registry hold runner sent an invalid release byte",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(debug_assertions))]
-pub fn native_ingress_ordinary_hold_token<T>(
-    _request: &tonic::Request<T>,
-) -> Result<Option<String>, tonic::Status> {
     Ok(None)
 }
-
-/// Called only inside the real ordinary spawn_blocking closure, after the
-/// Tower permit has been granted and before Worker entry. The runner's socket
-/// accept is the entered marker; only its `R` byte releases this closure.
-#[cfg(debug_assertions)]
-pub fn hold_native_ingress_ordinary_closure(
-    token: &str,
-    process_id: BackendProcessId,
+pub fn hold_native_registry_lock(
+    mut claim: crate::test_controls::NativeHoldClaim,
     request_deadline: std::time::Instant,
 ) -> Result<(), tonic::Status> {
-    let root = novarocks_failpoint::configured_root()
-        .ok_or_else(|| tonic::Status::failed_precondition("native ingress fault root is unset"))?;
-    if !root.is_dir() {
-        return Err(tonic::Status::failed_precondition(
-            "native ingress fault root is not a directory",
-        ));
-    }
-    let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")
-        .map_err(|_| tonic::Status::failed_precondition("native ingress backend index is unset"))?
-        .parse::<usize>()
-        .map_err(|_| {
-            tonic::Status::failed_precondition("native ingress backend index is invalid")
-        })?;
-    wait_for_native_ingress_runner(token, backend_index, process_id, request_deadline)
-}
-
-#[cfg(debug_assertions)]
-fn wait_for_native_ingress_runner(
-    token: &str,
-    backend_index: usize,
-    process_id: BackendProcessId,
-    request_deadline: std::time::Instant,
-) -> Result<(), tonic::Status> {
-    let hold_until =
-        request_deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(30));
-    let remaining = hold_until.saturating_duration_since(std::time::Instant::now());
-    if remaining.is_zero() {
-        return Err(tonic::Status::deadline_exceeded(
-            "native ingress hold deadline elapsed",
-        ));
-    }
-    let path = novarocks_failpoint::native_ingress_hold_socket_path(token)
+    let path = novarocks_failpoint::native_registry_hold_socket_path(&claim.token)
         .map_err(tonic::Status::invalid_argument)?;
-    let mut stream = UnixStream::connect(&path).map_err(|error| {
-        tonic::Status::failed_precondition(format!(
-            "native ingress hold runner is unavailable at {}: {error}",
-            path.display()
-        ))
-    })?;
-    stream.set_write_timeout(Some(remaining)).map_err(|error| {
-        tonic::Status::internal(format!("set native ingress hold write timeout: {error}"))
-    })?;
-    let marker = format!("NIH1 {backend_index} {process_id} {token}\n");
-    stream.write_all(marker.as_bytes()).map_err(|error| {
-        tonic::Status::internal(format!("write native ingress hold marker: {error}"))
-    })?;
-    stream.shutdown(Shutdown::Write).map_err(|error| {
-        tonic::Status::internal(format!("finish native ingress hold marker: {error}"))
-    })?;
-    let remaining = hold_until.saturating_duration_since(std::time::Instant::now());
-    if remaining.is_zero() {
-        return Err(tonic::Status::deadline_exceeded(
-            "native ingress hold deadline elapsed",
-        ));
-    }
-    stream.set_read_timeout(Some(remaining)).map_err(|error| {
-        tonic::Status::internal(format!("set native ingress hold read timeout: {error}"))
-    })?;
-    let mut release = [0_u8; 1];
-    stream.read_exact(&mut release).map_err(|error| {
-        tonic::Status::failed_precondition(format!(
-            "native ingress hold runner disconnected or timed out: {error}"
-        ))
-    })?;
-    if release != *b"R" {
-        return Err(tonic::Status::failed_precondition(
-            "native ingress hold runner sent an invalid release byte",
-        ));
-    }
-    Ok(())
+    let marker = format!(
+        "NIR1 {} {} {}\n",
+        claim.backend_index, claim.process_id, claim.token
+    );
+    hold_socket(&path, marker.as_bytes(), &mut claim, request_deadline)
+        .map_err(tonic::Status::failed_precondition)
 }
-
-#[cfg(not(debug_assertions))]
 pub fn hold_native_ingress_ordinary_closure(
-    _token: &str,
-    _process_id: BackendProcessId,
-    _request_deadline: std::time::Instant,
+    mut claim: crate::test_controls::NativeHoldClaim,
+    request_deadline: std::time::Instant,
 ) -> Result<(), tonic::Status> {
-    Ok(())
+    let path = novarocks_failpoint::native_ingress_hold_socket_path(&claim.token)
+        .map_err(tonic::Status::invalid_argument)?;
+    let marker = format!(
+        "NIH1 {} {} {}\n",
+        claim.backend_index, claim.process_id, claim.token
+    );
+    hold_socket(&path, marker.as_bytes(), &mut claim, request_deadline)
+        .map_err(tonic::Status::failed_precondition)
+}
+fn hold_socket(
+    path: &std::path::Path,
+    marker: &[u8],
+    claim: &mut crate::test_controls::NativeHoldClaim,
+    request_deadline: std::time::Instant,
+) -> Result<(), String> {
+    let cancellation = claim.cancellation();
+    let deadline = request_deadline
+        .min(cancellation.deadline())
+        .min(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    if !cancellation.is_active() || std::time::Instant::now() >= deadline {
+        return Ok(());
+    }
+    let mut stream = match novarocks_failpoint::liveness::connect_until(path, deadline, || {
+        !cancellation.is_active()
+    }) {
+        Ok(stream) => stream,
+        Err(_) if !cancellation.is_active() || std::time::Instant::now() >= deadline => {
+            return Ok(());
+        }
+        Err(error) => return Err(format!("connect Native hold runner: {error}")),
+    };
+    if !cancellation.is_active() || std::time::Instant::now() >= deadline {
+        return Ok(());
+    }
+    stream
+        .set_write_timeout(Some(
+            deadline.saturating_duration_since(std::time::Instant::now()),
+        ))
+        .map_err(|error| error.to_string())?;
+    stream
+        .write_all(marker)
+        .map_err(|error| format!("write Native hold identity: {error}"))?;
+    stream
+        .shutdown(Shutdown::Write)
+        .map_err(|error| error.to_string())?;
+    claim.record_hit()?;
+    read_release(&mut stream, &cancellation, deadline, false)
+}
+fn read_release(
+    stream: &mut UnixStream,
+    cancellation: &novarocks_failpoint::scope::ControlCancellation,
+    deadline: std::time::Instant,
+    allow_eof: bool,
+) -> Result<(), String> {
+    read_release_with_end(stream, cancellation, deadline, allow_eof, || Ok(false))
+}
+fn read_release_with_end(
+    stream: &mut UnixStream,
+    cancellation: &novarocks_failpoint::scope::ControlCancellation,
+    deadline: std::time::Instant,
+    allow_eof: bool,
+    ended: impl Fn() -> Result<bool, String>,
+) -> Result<(), String> {
+    let mut release = [0_u8; 1];
+    while cancellation.is_active() && std::time::Instant::now() < deadline {
+        if ended()? {
+            return Ok(());
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        stream
+            .set_read_timeout(Some(remaining.min(std::time::Duration::from_millis(20))))
+            .map_err(|error| error.to_string())?;
+        let read = stream.read(&mut release);
+        if ended()? {
+            return Ok(());
+        }
+        match read {
+            Ok(0) if allow_eof => return Ok(()),
+            Ok(1) if release == *b"R" && !allow_eof => return Ok(()),
+            Ok(_) => {
+                return Err("Native hold runner disconnected or sent an invalid release".into());
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(format!("Native hold runner read failed: {error}")),
+        }
+    }
+    if ended()? {
+        return Ok(());
+    }
+    Err("Native hold session closed or original deadline elapsed".into())
 }
 
 /// Drops the acknowledgement of one applied `EstablishQueryContext`.
 pub fn establish_context_ack_dropped(
+    controls: &NativeTestControls,
     context: QueryContextRef,
     outcome: OperationOutcome,
 ) -> Result<(), tonic::Status> {
@@ -323,6 +252,7 @@ pub fn establish_context_ack_dropped(
         return Ok(());
     }
     drop_context_ack(
+        controls,
         QueryLifecycleFaultKind::EstablishContextAckDrop,
         "NOVAROCKS_TASK_ESTABLISH_CONTEXT_ACK_DROPPED",
         "runner-owned EstablishQueryContext acknowledgement dropped after the context was installed",
@@ -351,16 +281,23 @@ pub const TASK_EXECUTION_FAILURE_DETAIL: &str =
 /// It fires once per arming, so a second task of the same attempt runs
 /// untouched and its termination is caused by the first one's failure rather
 /// than by another injection.
-pub fn task_execution_failure_injected(identity: TaskIdentity) -> Result<bool, String> {
-    let execution = identity.query_execution_id();
-    let Some(scope) = claim_by_detail(
+pub fn task_execution_failure_injected(
+    controls: &NativeTestControls,
+    identity: TaskIdentity,
+) -> Result<Option<NativeFaultClaim>, String> {
+    claim_by_detail(
+        controls,
         QueryLifecycleFaultKind::TaskExecutionFailure,
-        execution,
+        identity.query_execution_id(),
         identity.backend_process_id(),
-    )?
-    else {
-        return Ok(false);
-    };
+    )
+}
+pub fn record_task_execution_failure(
+    identity: TaskIdentity,
+    scope: &NativeFaultClaim,
+) -> Result<(), String> {
+    scope.record_hit()?;
+    let execution = identity.query_execution_id();
     eprintln!(
         "NOVAROCKS_TASK_EXECUTION_FAILURE_INJECTED execution_id={}:{}:{} stage={} task={} backend_index={} token={}",
         execution.query_id().high(),
@@ -371,7 +308,7 @@ pub fn task_execution_failure_injected(identity: TaskIdentity) -> Result<bool, S
         scope.backend_index,
         scope.token,
     );
-    Ok(true)
+    Ok(())
 }
 
 /// Holds one applied `EstablishQueryContext` open until this process is gone.
@@ -417,9 +354,13 @@ pub fn task_execution_failure_injected(identity: TaskIdentity) -> Result<bool, S
 /// recording the hold only after the establish returns would let that waiter
 /// reserve a task in the narrow gate-open interval before this handler publishes
 /// its marker.
-pub fn arm_restart_after_establish_context(context: QueryContextRef) -> Result<(), tonic::Status> {
+pub fn arm_restart_after_establish_context(
+    controls: &NativeTestControls,
+    context: QueryContextRef,
+) -> Result<(), tonic::Status> {
     let execution = context.query_execution_id();
     let Some(scope) = match_persistent(
+        controls,
         QueryLifecycleFaultKind::RestartAfterEstablishContext,
         execution,
         context.backend_process_id(),
@@ -427,11 +368,12 @@ pub fn arm_restart_after_establish_context(context: QueryContextRef) -> Result<(
     else {
         return Ok(());
     };
-    restart_after_establish_rendezvous_arm(context, scope);
+    controls.arm_restart(context, scope);
     Ok(())
 }
 
 pub fn restart_after_establish_context(
+    controls: &NativeTestControls,
     context: QueryContextRef,
     outcome: OperationOutcome,
 ) -> Result<(), tonic::Status> {
@@ -439,11 +381,11 @@ pub fn restart_after_establish_context(
         outcome,
         OperationOutcome::Accepted | OperationOutcome::Idempotent
     ) {
-        restart_after_establish_rendezvous_disarm(context);
+        controls.disarm_restart(context);
         return Ok(());
     }
     let execution = context.query_execution_id();
-    let Some(scope) = restart_after_establish_rendezvous_scope(context) else {
+    let Some(scope) = controls.restart_claim(context) else {
         return Ok(());
     };
     if outcome == OperationOutcome::Accepted {
@@ -460,7 +402,7 @@ pub fn restart_after_establish_context(
     notify_runner_of_restart_after_establish(&scope)?;
     wait_for_runner_owned_restart(&scope);
     if outcome == OperationOutcome::Accepted {
-        restart_after_establish_rendezvous_disarm(context);
+        controls.disarm_restart(context);
     }
     Ok(())
 }
@@ -476,103 +418,37 @@ pub fn restart_after_establish_context(
 /// scoped to the exact context and exists only while the accepted establish is
 /// parked, so it neither changes normal admission nor broadens the fault to
 /// other attempts.
-pub fn restart_after_establish_context_holds_task_creation(context: QueryContextRef) -> bool {
-    restart_after_establish_rendezvous_is_held(context)
+pub fn restart_after_establish_context_holds_task_creation(
+    controls: &NativeTestControls,
+    context: QueryContextRef,
+) -> bool {
+    controls.restart_claim(context).is_some()
 }
 
 /// Waits for the exact runner-owned restart that holds this context's task
 /// creation. The scope was validated when the accepted establish armed the
 /// hold, so the registry can call this at its linearization point without
 /// re-reading fault configuration while it owns its lock.
-pub fn wait_for_restart_after_establish_context(context: QueryContextRef) {
-    if let Some(scope) = restart_after_establish_rendezvous_scope(context) {
+pub fn wait_for_restart_after_establish_context(
+    controls: &NativeTestControls,
+    context: QueryContextRef,
+) {
+    if let Some(scope) = controls.restart_claim(context) {
         wait_for_runner_owned_restart(&scope);
     }
 }
 
 /// Native fault adapter for the Worker task-creation gate.
-pub struct RestartAfterEstablishTaskCreationGate;
+pub struct RestartAfterEstablishTaskCreationGate(pub std::sync::Arc<NativeTestControls>);
 
 impl novarocks_worker::TaskCreationGate for RestartAfterEstablishTaskCreationGate {
     fn holds_task_creation(&self, context: QueryContextRef) -> bool {
-        restart_after_establish_context_holds_task_creation(context)
+        restart_after_establish_context_holds_task_creation(&self.0, context)
     }
 
     fn wait_for_task_creation_release(&self, context: QueryContextRef) {
-        wait_for_restart_after_establish_context(context);
+        wait_for_restart_after_establish_context(&self.0, context);
     }
-}
-
-/// A process-local guard for the narrow interval after a successful establish
-/// publishes the runner rendezvous marker. It is compiled only in debug
-/// builds, the only builds that accept runner fault arming.
-#[cfg(debug_assertions)]
-fn restart_after_establish_rendezvous_arm(
-    context: QueryContextRef,
-    scope: novarocks_failpoint::QueryLifecycleFaultScope,
-) {
-    restart_after_establish_rendezvous()
-        .lock()
-        .expect("restart-after-establish rendezvous lock poisoned")
-        .insert(context, scope);
-}
-
-#[cfg(not(debug_assertions))]
-fn restart_after_establish_rendezvous_arm(
-    _context: QueryContextRef,
-    _scope: novarocks_failpoint::QueryLifecycleFaultScope,
-) {
-}
-
-#[cfg(debug_assertions)]
-fn restart_after_establish_rendezvous_disarm(context: QueryContextRef) {
-    restart_after_establish_rendezvous()
-        .lock()
-        .expect("restart-after-establish rendezvous lock poisoned")
-        .remove(&context);
-}
-
-#[cfg(not(debug_assertions))]
-fn restart_after_establish_rendezvous_disarm(_context: QueryContextRef) {}
-
-#[cfg(debug_assertions)]
-fn restart_after_establish_rendezvous_is_held(context: QueryContextRef) -> bool {
-    restart_after_establish_rendezvous()
-        .lock()
-        .expect("restart-after-establish rendezvous lock poisoned")
-        .contains_key(&context)
-}
-
-#[cfg(not(debug_assertions))]
-fn restart_after_establish_rendezvous_is_held(_context: QueryContextRef) -> bool {
-    false
-}
-
-#[cfg(debug_assertions)]
-fn restart_after_establish_rendezvous_scope(
-    context: QueryContextRef,
-) -> Option<novarocks_failpoint::QueryLifecycleFaultScope> {
-    restart_after_establish_rendezvous()
-        .lock()
-        .expect("restart-after-establish rendezvous lock poisoned")
-        .get(&context)
-        .cloned()
-}
-
-#[cfg(not(debug_assertions))]
-fn restart_after_establish_rendezvous_scope(
-    _context: QueryContextRef,
-) -> Option<novarocks_failpoint::QueryLifecycleFaultScope> {
-    None
-}
-
-#[cfg(debug_assertions)]
-fn restart_after_establish_rendezvous()
--> &'static Mutex<BTreeMap<QueryContextRef, novarocks_failpoint::QueryLifecycleFaultScope>> {
-    static HELD_CONTEXTS: OnceLock<
-        Mutex<BTreeMap<QueryContextRef, novarocks_failpoint::QueryLifecycleFaultScope>>,
-    > = OnceLock::new();
-    HELD_CONTEXTS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
 /// Blocks until this process is replaced, this exact arming is released, or
@@ -582,21 +458,18 @@ fn restart_after_establish_rendezvous()
 /// this thread is parked, so the wait usually ends with the process rather
 /// than with a release. The release path exists so a harness that only wants
 /// the rendezvous, without a replacement, can let the establish answer.
-#[cfg(debug_assertions)]
-fn wait_for_runner_owned_restart(scope: &novarocks_failpoint::QueryLifecycleFaultScope) {
+fn wait_for_runner_owned_restart(scope: &NativeFaultClaim) {
     const RESTART_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
     const RESTART_POLL: std::time::Duration = std::time::Duration::from_millis(1);
-    let Some(root) = novarocks_failpoint::configured_root() else {
-        return;
-    };
+    let root = scope.root();
     let release = novarocks_failpoint::trigger_path(
-        &root,
+        root,
         scope.backend_index,
         QueryLifecycleFaultKind::RestartAfterEstablishContext,
     )
     .with_extension("release");
     let deadline = std::time::Instant::now() + RESTART_WAIT;
-    while std::time::Instant::now() < deadline {
+    while scope.cancellation().is_active() && std::time::Instant::now() < deadline {
         match std::fs::read_to_string(&release) {
             Ok(token) if token.trim() == scope.token => {
                 let _ = std::fs::remove_file(&release);
@@ -610,9 +483,6 @@ fn wait_for_runner_owned_restart(scope: &novarocks_failpoint::QueryLifecycleFaul
     }
 }
 
-#[cfg(not(debug_assertions))]
-fn wait_for_runner_owned_restart(_scope: &novarocks_failpoint::QueryLifecycleFaultScope) {}
-
 /// Hands the accepted establish directly to the runner-owned process-loss
 /// action before leaving the RPC handler.
 ///
@@ -623,18 +493,34 @@ fn wait_for_runner_owned_restart(_scope: &novarocks_failpoint::QueryLifecycleFau
 /// until it has completed the restart action, whose first operation kills this
 /// process. EOF is therefore the runner's acknowledgement, without admitting
 /// another establish while the action is still pending.
-#[cfg(debug_assertions)]
-fn notify_runner_of_restart_after_establish(
-    scope: &novarocks_failpoint::QueryLifecycleFaultScope,
-) -> Result<(), tonic::Status> {
+fn notify_runner_of_restart_after_establish(scope: &NativeFaultClaim) -> Result<(), tonic::Status> {
     let path = novarocks_failpoint::restart_after_establish_rendezvous_socket_path(&scope.token)
         .map_err(|error| tonic::Status::failed_precondition(error.to_string()))?;
-    let mut stream = UnixStream::connect(&path).map_err(|error| {
-        tonic::Status::failed_precondition(format!(
-            "restart-after-establish runner rendezvous is unavailable at {}: {error}",
-            path.display()
+    let deadline = (std::time::Instant::now() + std::time::Duration::from_secs(30))
+        .min(scope.cancellation().deadline());
+    let mut stream = match novarocks_failpoint::liveness::connect_until(&path, deadline, || {
+        !scope.cancellation().is_active()
+    }) {
+        Ok(stream) => stream,
+        Err(_) if !scope.cancellation().is_active() => return Ok(()),
+        Err(error) => {
+            return Err(tonic::Status::failed_precondition(format!(
+                "restart-after-establish runner rendezvous is unavailable: {error}"
+            )));
+        }
+    };
+    if !scope.cancellation().is_active() || std::time::Instant::now() >= deadline {
+        return Ok(());
+    }
+    stream
+        .set_write_timeout(Some(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .max(std::time::Duration::from_nanos(1)),
         ))
-    })?;
+        .map_err(|error| {
+            tonic::Status::internal(format!("set restart rendezvous write deadline: {error}"))
+        })?;
     stream.write_all(scope.token.as_bytes()).map_err(|error| {
         tonic::Status::internal(format!(
             "write restart-after-establish rendezvous token: {error}"
@@ -645,27 +531,16 @@ fn notify_runner_of_restart_after_establish(
             "close restart-after-establish rendezvous write side: {error}"
         ))
     })?;
-    let mut acknowledgement = [0_u8; 1];
-    match stream.read(&mut acknowledgement) {
-        Ok(0) => Ok(()),
-        Ok(_) => Err(tonic::Status::internal(
-            "restart-after-establish runner returned an unexpected acknowledgement",
-        )),
-        Err(error) => Err(tonic::Status::internal(format!(
-            "wait for restart-after-establish runner action: {error}"
-        ))),
-    }
-}
-
-#[cfg(not(debug_assertions))]
-fn notify_runner_of_restart_after_establish(
-    _scope: &novarocks_failpoint::QueryLifecycleFaultScope,
-) -> Result<(), tonic::Status> {
-    Ok(())
+    scope
+        .record_hit()
+        .map_err(tonic::Status::failed_precondition)?;
+    read_release(&mut stream, &scope.cancellation(), deadline, true)
+        .map_err(tonic::Status::failed_precondition)
 }
 
 /// Drops the acknowledgement of one applied lease renewal.
 pub fn lease_renewal_ack_dropped(
+    controls: &NativeTestControls,
     context: QueryContextRef,
     outcome: OperationOutcome,
 ) -> Result<(), tonic::Status> {
@@ -673,6 +548,7 @@ pub fn lease_renewal_ack_dropped(
         return Ok(());
     }
     drop_context_ack(
+        controls,
         QueryLifecycleFaultKind::LeaseRenewalAckDrop,
         "NOVAROCKS_TASK_LEASE_RENEWAL_ACK_DROPPED",
         "runner-owned lease renewal acknowledgement dropped after the lease was extended",
@@ -689,8 +565,12 @@ pub fn lease_renewal_ack_dropped(
 /// what makes the backend stand its tasks down, and the arming is therefore
 /// matched without being consumed -- consuming it would let the second renewal
 /// through and keep the lease alive.
-pub fn lease_renewal_stopped(context: QueryContextRef) -> Result<bool, tonic::Status> {
+pub fn lease_renewal_stopped(
+    controls: &NativeTestControls,
+    context: QueryContextRef,
+) -> Result<bool, tonic::Status> {
     let Some(scope) = match_persistent(
+        controls,
         QueryLifecycleFaultKind::LeaseRenewalStop,
         context.query_execution_id(),
         context.backend_process_id(),
@@ -699,6 +579,9 @@ pub fn lease_renewal_stopped(context: QueryContextRef) -> Result<bool, tonic::St
         return Ok(false);
     };
     let execution = context.query_execution_id();
+    scope
+        .record_hit()
+        .map_err(tonic::Status::failed_precondition)?;
     eprintln!(
         "NOVAROCKS_TASK_LEASE_RENEWAL_STOPPED execution_id={}:{}:{} backend_index={} token={}",
         execution.query_id().high(),
@@ -728,6 +611,7 @@ pub fn lease_renewal_stopped(context: QueryContextRef) -> Result<bool, tonic::St
 /// non-terminal one must leave the token for the real terminal
 /// acknowledgement, which is the case's actual subject.
 pub fn task_update_terminal_ack_dropped(
+    controls: &NativeTestControls,
     identity: TaskIdentity,
     outcome: OperationOutcome,
     terminal_nonempty: bool,
@@ -737,6 +621,7 @@ pub fn task_update_terminal_ack_dropped(
     }
     let execution = identity.query_execution_id();
     let Some(scope) = claim(
+        controls,
         QueryLifecycleFaultKind::TaskUpdateTerminalAckDrop,
         execution,
         identity.backend_process_id(),
@@ -744,6 +629,9 @@ pub fn task_update_terminal_ack_dropped(
     else {
         return Ok(());
     };
+    scope
+        .record_hit()
+        .map_err(tonic::Status::failed_precondition)?;
     eprintln!(
         "NOVAROCKS_TASK_UPDATE_TERMINAL_ACK_DROPPED execution_id={}:{}:{} backend_index={} token={}",
         execution.query_id().high(),
@@ -760,13 +648,14 @@ pub fn task_update_terminal_ack_dropped(
 /// Holds only a runner-armed exact Create before the Worker accepts it.
 /// Establishment and status subscription remain ordinary independent paths.
 pub fn create_task_before_worker_hold(
+    controls: &NativeTestControls,
     identity: TaskIdentity,
     outbound_edges: usize,
 ) -> Result<(), tonic::Status> {
-    #[cfg(debug_assertions)]
     {
         let execution = identity.query_execution_id();
         let Some(scope) = match_persistent(
+            controls,
             QueryLifecycleFaultKind::CreateTaskBeforeWorkerHold,
             execution,
             identity.backend_process_id(),
@@ -786,44 +675,72 @@ pub fn create_task_before_worker_hold(
             identity.backend_process_id(),
             outbound_edges,
         );
+        let path = novarocks_failpoint::create_before_worker_rendezvous_socket_path(&scope.token)
+            .map_err(tonic::Status::failed_precondition)?;
+        let deadline = (std::time::Instant::now() + std::time::Duration::from_secs(30))
+            .min(scope.cancellation().deadline());
+        let mut stream = match novarocks_failpoint::liveness::connect_until(&path, deadline, || {
+            !scope.cancellation().is_active() || scope.action_ended().unwrap_or(true)
+        }) {
+            Ok(stream) => stream,
+            Err(error) => {
+                if scope
+                    .action_ended()
+                    .map_err(tonic::Status::failed_precondition)?
+                    || !scope.cancellation().is_active()
+                {
+                    return Ok(());
+                }
+                return Err(tonic::Status::failed_precondition(format!(
+                    "connect pre-Worker Create rendezvous: {error}"
+                )));
+            }
+        };
+        if scope
+            .action_ended()
+            .map_err(tonic::Status::failed_precondition)?
+            || !scope.cancellation().is_active()
+            || std::time::Instant::now() >= deadline
+        {
+            return Ok(());
+        }
+        stream
+            .set_write_timeout(Some(
+                deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .max(std::time::Duration::from_nanos(1)),
+            ))
+            .map_err(|error| {
+                tonic::Status::internal(format!("set pre-Worker Create write deadline: {error}"))
+            })?;
+        let delivered = stream
+            .write_all(payload.as_bytes())
+            .and_then(|()| stream.shutdown(Shutdown::Write));
+        if scope
+            .action_ended()
+            .map_err(tonic::Status::failed_precondition)?
+        {
+            return Ok(());
+        }
+        delivered.map_err(|error| {
+            tonic::Status::internal(format!("deliver pre-Worker Create identity: {error}"))
+        })?;
+        scope
+            .record_hit()
+            .map_err(tonic::Status::failed_precondition)?;
         eprintln!(
             "NOVAROCKS_TASK_CREATE_BEFORE_WORKER_HELD {}",
             payload.trim_end()
         );
-        let path = novarocks_failpoint::create_before_worker_rendezvous_socket_path(&scope.token)
-            .map_err(tonic::Status::failed_precondition)?;
-        let mut stream = UnixStream::connect(&path).map_err(|error| {
-            tonic::Status::failed_precondition(format!(
-                "connect pre-Worker Create rendezvous: {error}"
-            ))
-        })?;
-        stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
-            .map_err(|error| {
-                tonic::Status::internal(format!("set pre-Worker Create hold deadline: {error}"))
-            })?;
-        stream.write_all(payload.as_bytes()).map_err(|error| {
-            tonic::Status::internal(format!("write pre-Worker Create identity: {error}"))
-        })?;
-        stream.shutdown(Shutdown::Write).map_err(|error| {
-            tonic::Status::internal(format!("close pre-Worker Create identity write: {error}"))
-        })?;
-        let mut release = [0_u8; 1];
-        match stream.read(&mut release) {
-            Ok(1) if release == [b'R'] => Ok(()),
-            _ => Err(tonic::Status::deadline_exceeded(
-                "runner pre-Worker Create hold ended without release",
-            )),
-        }
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = (identity, outbound_edges);
-        Ok(())
+        read_release_with_end(&mut stream, &scope.cancellation(), deadline, false, || {
+            scope.action_ended()
+        })
+        .map_err(tonic::Status::failed_precondition)
     }
 }
 
 pub fn create_task_ack_dropped(
+    controls: &NativeTestControls,
     identity: TaskIdentity,
     outcome: OperationOutcome,
 ) -> Result<(), tonic::Status> {
@@ -832,6 +749,7 @@ pub fn create_task_ack_dropped(
     }
     let execution = identity.query_execution_id();
     let Some(scope) = claim(
+        controls,
         QueryLifecycleFaultKind::CreateTaskAckDrop,
         execution,
         identity.backend_process_id(),
@@ -839,6 +757,9 @@ pub fn create_task_ack_dropped(
     else {
         return Ok(());
     };
+    scope
+        .record_hit()
+        .map_err(tonic::Status::failed_precondition)?;
     eprintln!(
         "NOVAROCKS_TASK_CREATE_ACK_DROPPED execution_id={}:{}:{} stage={} task={} backend_index={} token={}",
         execution.query_id().high(),
@@ -889,6 +810,7 @@ const CREATE_REJECTED_AFTER_APPLY_DETAIL: &str =
 /// attached would be a wire value no owner can produce, and the frontend would
 /// refuse it for its shape instead of for its verdict.
 pub fn create_task_rejected_after_apply(
+    controls: &NativeTestControls,
     identity: TaskIdentity,
     outcome: OperationOutcome,
     encoded: &mut proto::TaskOperationReceipt,
@@ -898,6 +820,7 @@ pub fn create_task_rejected_after_apply(
     }
     let execution = identity.query_execution_id();
     let Some(scope) = claim(
+        controls,
         QueryLifecycleFaultKind::CreateTaskRejectedAfterApply,
         execution,
         identity.backend_process_id(),
@@ -905,6 +828,9 @@ pub fn create_task_rejected_after_apply(
     else {
         return Ok(());
     };
+    scope
+        .record_hit()
+        .map_err(tonic::Status::failed_precondition)?;
     eprintln!(
         "NOVAROCKS_TASK_CREATE_REJECTED_AFTER_APPLY execution_id={}:{}:{} stage={} task={} backend_index={} token={}",
         execution.query_id().high(),
@@ -943,6 +869,7 @@ pub fn create_task_rejected_after_apply(
 /// Claimed only once the applied acknowledgement is present, so a malformed or
 /// refused create leaves the arming for the create that really admitted a task.
 pub fn create_task_receipt_foreign_task(
+    controls: &NativeTestControls,
     identity: TaskIdentity,
     outcome: OperationOutcome,
     encoded: &mut proto::TaskOperationReceipt,
@@ -958,6 +885,7 @@ pub fn create_task_receipt_foreign_task(
     };
     let execution = identity.query_execution_id();
     let Some(scope) = claim(
+        controls,
         QueryLifecycleFaultKind::CreateTaskReceiptForeignTask,
         execution,
         identity.backend_process_id(),
@@ -969,6 +897,9 @@ pub fn create_task_receipt_foreign_task(
     // identity: a zero would be refused as a malformed field and the case would
     // be asserting the decoder's range check instead of its identity fence.
     let foreign_task_id = wire_identity.task_id.checked_add(1).unwrap_or(1);
+    scope
+        .record_hit()
+        .map_err(tonic::Status::failed_precondition)?;
     eprintln!(
         "NOVAROCKS_TASK_CREATE_RECEIPT_FOREIGN_TASK execution_id={}:{}:{} stage={} task={} foreign_task={foreign_task_id} backend_index={} token={}",
         execution.query_id().high(),
@@ -1005,6 +936,7 @@ pub fn create_task_receipt_foreign_task(
 /// `task_status_subscription_dropped` already owns. A fault that cannot be
 /// claimed must not silently become that other fault.
 pub fn task_status_foreign_process(
+    controls: &NativeTestControls,
     identity: TaskIdentity,
     encoded: &mut proto::TaskStatusStreamEvent,
 ) {
@@ -1016,6 +948,7 @@ pub fn task_status_foreign_process(
     }
     let execution = identity.query_execution_id();
     let scope = match claim_by_detail(
+        controls,
         QueryLifecycleFaultKind::TaskStatusForeignProcess,
         execution,
         identity.backend_process_id(),
@@ -1032,6 +965,10 @@ pub fn task_status_foreign_process(
         }
     };
     let foreign = BackendProcessId::new_v7();
+    if let Err(error) = scope.record_hit() {
+        tracing::warn!(%error,"record Native fault hit failed");
+        return;
+    }
     eprintln!(
         "NOVAROCKS_TASK_STATUS_FOREIGN_PROCESS execution_id={}:{}:{} stage={} task={} backend={} foreign_backend={foreign} backend_index={} token={}",
         execution.query_id().high(),
@@ -1086,8 +1023,12 @@ fn wire_status_identity(
 /// The digest is the frontend's fence: `admit_terminal` refuses a publication
 /// whose digest is not the contract it declared. Corrupting it therefore has
 /// to fail the query closed rather than prune on a domain nobody declared.
-pub fn corrupt_feedback_contract_digest(carrier: TaskIdentity) -> bool {
+pub fn corrupt_feedback_contract_digest(
+    controls: &NativeTestControls,
+    carrier: TaskIdentity,
+) -> bool {
     claim_feedback_perturbation(
+        controls,
         QueryLifecycleFaultKind::RuntimeFilterFeedbackContractDigestCorrupt,
         "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_CONTRACT_DIGEST_CORRUPT",
         carrier,
@@ -1100,8 +1041,9 @@ pub fn corrupt_feedback_contract_digest(carrier: TaskIdentity) -> bool {
 /// one is the fail-*open* half of the pair: an unavailable channel is a
 /// statement the frontend admits, and the split source then enumerates
 /// unpruned. Correctness may not move; only the pruning optimization may.
-pub fn force_feedback_unavailable(carrier: TaskIdentity) -> bool {
+pub fn force_feedback_unavailable(controls: &NativeTestControls, carrier: TaskIdentity) -> bool {
     claim_feedback_perturbation(
+        controls,
         QueryLifecycleFaultKind::RuntimeFilterFeedbackUnavailable,
         "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_UNAVAILABLE",
         carrier,
@@ -1126,8 +1068,12 @@ pub fn force_feedback_unavailable(carrier: TaskIdentity) -> bool {
 /// belongs to, and the deployment epoch is exactly that fact. The fence it
 /// meets is the first check in `admit_terminal`, ahead of the pruning winner,
 /// so the query must fail closed with the winner untouched.
-pub fn forge_feedback_foreign_attempt(carrier: TaskIdentity) -> bool {
+pub fn forge_feedback_foreign_attempt(
+    controls: &NativeTestControls,
+    carrier: TaskIdentity,
+) -> bool {
     claim_feedback_perturbation(
+        controls,
         QueryLifecycleFaultKind::RuntimeFilterFeedbackForeignAttempt,
         "NOVAROCKS_TASK_RUNTIME_FILTER_FEEDBACK_FOREIGN_ATTEMPT",
         carrier,
@@ -1143,12 +1089,13 @@ pub fn forge_feedback_foreign_attempt(carrier: TaskIdentity) -> bool {
 /// fail because a test file was wrong, but a fault that never fires must not
 /// look like one that did not reproduce.
 fn claim_feedback_perturbation(
+    controls: &NativeTestControls,
     kind: QueryLifecycleFaultKind,
     marker: &str,
     carrier: TaskIdentity,
 ) -> bool {
     let execution = carrier.query_execution_id();
-    let scope = match claim_by_detail(kind, execution, carrier.backend_process_id()) {
+    let scope = match claim_by_detail(controls, kind, execution, carrier.backend_process_id()) {
         Ok(Some(scope)) => scope,
         Ok(None) => return false,
         Err(detail) => {
@@ -1161,6 +1108,10 @@ fn claim_feedback_perturbation(
             return false;
         }
     };
+    if let Err(error) = scope.record_hit() {
+        tracing::warn!(%error,"record Native fault hit failed");
+        return false;
+    }
     eprintln!(
         "{marker} execution_id={}:{}:{} stage={} task={} backend_index={} token={}",
         execution.query_id().high(),
@@ -1181,9 +1132,13 @@ fn claim_feedback_perturbation(
 /// that opened it. Nothing was consumed — the per-task cursors are read-only —
 /// so the frontend's resubscription sees exactly what this stream would have
 /// carried.
-pub fn task_status_subscription_dropped(context: QueryContextRef) -> Result<bool, tonic::Status> {
+pub fn task_status_subscription_dropped(
+    controls: &NativeTestControls,
+    context: QueryContextRef,
+) -> Result<bool, tonic::Status> {
     let execution = context.query_execution_id();
     let Some(scope) = claim(
+        controls,
         QueryLifecycleFaultKind::TaskStatusSubscriptionDrop,
         execution,
         context.backend_process_id(),
@@ -1191,6 +1146,9 @@ pub fn task_status_subscription_dropped(context: QueryContextRef) -> Result<bool
     else {
         return Ok(false);
     };
+    scope
+        .record_hit()
+        .map_err(tonic::Status::failed_precondition)?;
     eprintln!(
         "NOVAROCKS_TASK_STATUS_SUBSCRIPTION_DROPPED execution_id={}:{}:{} backend_index={} token={}",
         execution.query_id().high(),
@@ -1203,15 +1161,19 @@ pub fn task_status_subscription_dropped(context: QueryContextRef) -> Result<bool
 }
 
 fn drop_context_ack(
+    controls: &NativeTestControls,
     kind: QueryLifecycleFaultKind,
     marker: &str,
     detail: &'static str,
     context: QueryContextRef,
 ) -> Result<(), tonic::Status> {
     let execution = context.query_execution_id();
-    let Some(scope) = claim(kind, execution, context.backend_process_id())? else {
+    let Some(scope) = claim(controls, kind, execution, context.backend_process_id())? else {
         return Ok(());
     };
+    scope
+        .record_hit()
+        .map_err(tonic::Status::failed_precondition)?;
     eprintln!(
         "{marker} execution_id={}:{}:{} backend_index={} token={}",
         execution.query_id().high(),
@@ -1223,240 +1185,239 @@ fn drop_context_ack(
     Err(tonic::Status::deadline_exceeded(detail))
 }
 
-#[cfg(debug_assertions)]
 fn match_persistent(
+    controls: &NativeTestControls,
     kind: QueryLifecycleFaultKind,
     execution_id: QueryExecutionId,
     process_id: BackendProcessId,
-) -> Result<Option<novarocks_failpoint::QueryLifecycleFaultScope>, tonic::Status> {
-    let Some(root) = novarocks_failpoint::configured_root() else {
-        return Ok(None);
-    };
-    let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")
-        .map_err(|_| tonic::Status::failed_precondition("lifecycle fault backend index is unset"))?
-        .parse::<usize>()
-        .map_err(|error| {
-            tonic::Status::failed_precondition(format!(
-                "invalid lifecycle fault backend index: {error}"
-            ))
-        })?;
-    novarocks_failpoint::match_persistent_fault(
-        &root,
-        kind,
-        execution_id,
-        backend_index,
-        process_id,
-    )
-    .map_err(tonic::Status::failed_precondition)
-}
-
-#[cfg(not(debug_assertions))]
-fn match_persistent(
-    _kind: QueryLifecycleFaultKind,
-    _execution_id: QueryExecutionId,
-    _process_id: BackendProcessId,
-) -> Result<Option<novarocks_failpoint::QueryLifecycleFaultScope>, tonic::Status> {
-    Ok(None)
-}
-
-#[cfg(debug_assertions)]
-fn claim(
-    kind: QueryLifecycleFaultKind,
-    execution_id: QueryExecutionId,
-    process_id: BackendProcessId,
-) -> Result<Option<novarocks_failpoint::QueryLifecycleFaultScope>, tonic::Status> {
-    let Some(root) = novarocks_failpoint::configured_root() else {
-        return Ok(None);
-    };
-    let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")
-        .map_err(|_| tonic::Status::failed_precondition("lifecycle fault backend index is unset"))?
-        .parse::<usize>()
-        .map_err(|error| {
-            tonic::Status::failed_precondition(format!(
-                "invalid lifecycle fault backend index: {error}"
-            ))
-        })?;
-    novarocks_failpoint::claim_matching_fault(&root, kind, execution_id, backend_index, process_id)
+) -> Result<Option<NativeFaultClaim>, tonic::Status> {
+    controls
+        .claim(kind, execution_id, process_id, true)
         .map_err(tonic::Status::failed_precondition)
 }
-
-#[cfg(not(debug_assertions))]
 fn claim(
-    _kind: QueryLifecycleFaultKind,
-    _execution_id: QueryExecutionId,
-    _process_id: BackendProcessId,
-) -> Result<Option<novarocks_failpoint::QueryLifecycleFaultScope>, tonic::Status> {
-    Ok(None)
-}
-
-/// The same claim, for a caller that is not on the tonic boundary.
-///
-/// The execution-side host reports a rejection as a typed `HostRejection`, so
-/// it cannot receive a `tonic::Status`. The detail text is handed back
-/// unchanged and the caller decides which category it belongs to; nothing here
-/// invents an outcome.
-#[cfg(debug_assertions)]
-fn claim_by_detail(
+    controls: &NativeTestControls,
     kind: QueryLifecycleFaultKind,
     execution_id: QueryExecutionId,
     process_id: BackendProcessId,
-) -> Result<Option<novarocks_failpoint::QueryLifecycleFaultScope>, String> {
-    let Some(root) = novarocks_failpoint::configured_root() else {
-        return Ok(None);
-    };
-    let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")
-        .map_err(|_| "lifecycle fault backend index is unset".to_owned())?
-        .parse::<usize>()
-        .map_err(|error| format!("invalid lifecycle fault backend index: {error}"))?;
-    novarocks_failpoint::claim_matching_fault(&root, kind, execution_id, backend_index, process_id)
+) -> Result<Option<NativeFaultClaim>, tonic::Status> {
+    controls
+        .claim(kind, execution_id, process_id, false)
+        .map_err(tonic::Status::failed_precondition)
 }
-
-#[cfg(not(debug_assertions))]
 fn claim_by_detail(
-    _kind: QueryLifecycleFaultKind,
-    _execution_id: QueryExecutionId,
-    _process_id: BackendProcessId,
-) -> Result<Option<novarocks_failpoint::QueryLifecycleFaultScope>, String> {
-    Ok(None)
-}
-
-#[cfg(all(test, debug_assertions))]
-mod tests {
-    use super::*;
-    use novarocks_types::identity::{AttemptId, FrontendProcessId, QueryId};
-    use std::os::unix::net::UnixListener;
-
-    #[test]
-    fn native_ordinary_hold_reports_exact_process_and_waits_for_release_byte() {
-        let process_id = BackendProcessId::new_v7();
-        let token = format!("test-{}", process_id);
-        let path = novarocks_failpoint::native_ingress_hold_socket_path(&token).unwrap();
-        let listener = UnixListener::bind(&path).unwrap();
-        let token_for_worker = token.clone();
-        let worker = std::thread::spawn(move || {
-            wait_for_native_ingress_runner(
-                &token_for_worker,
-                2,
-                process_id,
-                std::time::Instant::now() + std::time::Duration::from_secs(5),
-            )
-        });
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut marker = String::new();
-        stream.read_to_string(&mut marker).unwrap();
-        assert_eq!(marker, format!("NIH1 2 {process_id} {token}\n"));
-        stream.write_all(b"R").unwrap();
-        assert!(worker.join().unwrap().is_ok());
-        drop(listener);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn native_ordinary_hold_unblocks_when_runner_disconnects() {
-        let process_id = BackendProcessId::new_v7();
-        let token = format!("test-{}", process_id);
-        let path = novarocks_failpoint::native_ingress_hold_socket_path(&token).unwrap();
-        let listener = UnixListener::bind(&path).unwrap();
-        let worker = std::thread::spawn(move || {
-            wait_for_native_ingress_runner(
-                &token,
-                2,
-                process_id,
-                std::time::Instant::now() + std::time::Duration::from_secs(5),
-            )
-        });
-        let (mut stream, _) = listener.accept().unwrap();
-        let mut marker = String::new();
-        stream.read_to_string(&mut marker).unwrap();
-        drop(stream);
-        assert!(
-            matches!(worker.join().unwrap(), Err(status) if status.code() == tonic::Code::FailedPrecondition)
-        );
-        drop(listener);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    fn context(query: i64) -> QueryContextRef {
-        QueryContextRef::new(
-            QueryExecutionId::new(
-                QueryId::new(query, query + 1),
-                AttemptId::new(1).expect("nonzero attempt"),
-            )
-            .expect("nonzero query"),
-            FrontendProcessId::new_v7(),
-            BackendProcessId::new_v7(),
-        )
-    }
-
-    #[test]
-    fn restart_after_establish_hold_is_exact_and_released_with_its_establish() {
-        let held = context(41);
-        let other = context(43);
-
-        assert!(!restart_after_establish_rendezvous_is_held(held));
-        let scope = novarocks_failpoint::QueryLifecycleFaultScope {
-            token: "test-token".to_owned(),
-            execution_id: held.query_execution_id(),
-            backend_index: 1,
-            process_id: held.backend_process_id(),
-        };
-        restart_after_establish_rendezvous_arm(held, scope.clone());
-        assert!(restart_after_establish_rendezvous_is_held(held));
-        assert!(!restart_after_establish_rendezvous_is_held(other));
-        assert_eq!(restart_after_establish_rendezvous_scope(held), Some(scope));
-
-        restart_after_establish_rendezvous_disarm(held);
-        assert!(!restart_after_establish_rendezvous_is_held(held));
-    }
+    controls: &NativeTestControls,
+    kind: QueryLifecycleFaultKind,
+    execution_id: QueryExecutionId,
+    process_id: BackendProcessId,
+) -> Result<Option<NativeFaultClaim>, String> {
+    controls.claim(kind, execution_id, process_id, false)
 }
 
 /// Parks one exact accepted preparation at its Native host boundary. The
 /// Worker already owns the queued/running position and backing charge; no
 /// registry lock or RPC ingress permit is held by this rendezvous.
-#[cfg(debug_assertions)]
-pub fn hold_native_task_preparation(identity: TaskIdentity) -> Result<(), String> {
-    let Ok(token) = std::env::var("NOVAROCKS_SQL_TEST_TASK_PREPARATION_HOLD_TOKEN") else {
+pub fn hold_native_task_preparation(
+    controls: &NativeTestControls,
+    identity: TaskIdentity,
+) -> Result<(), String> {
+    let Some(mut claim) = controls.claim_preparation_hold(identity)? else {
         return Ok(());
     };
-    let path = novarocks_failpoint::native_registry_hold_socket_path(&token)?;
-    let mut stream = UnixStream::connect(&path)
-        .map_err(|error| format!("preparation hold runner is unavailable: {error}"))?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    stream
-        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
-        .map_err(|error| format!("set preparation hold write timeout: {error}"))?;
+    let path = novarocks_failpoint::native_registry_hold_socket_path(&claim.token)?;
     let execution = identity.query_execution_id();
     let marker = format!(
-        "NTP1 {} {} {} {} {} {} {token}\n",
+        "NTP1 {} {} {} {} {} {} {}\n",
         identity.backend_process_id(),
         execution.query_id().high(),
         execution.query_id().low(),
         execution.attempt_id().get(),
         identity.stage_id().get(),
-        identity.task_id().get()
+        identity.task_id().get(),
+        claim.token
     );
-    stream
-        .write_all(marker.as_bytes())
-        .map_err(|error| format!("write preparation hold marker: {error}"))?;
-    stream
-        .shutdown(Shutdown::Write)
-        .map_err(|error| format!("finish preparation hold marker: {error}"))?;
-    stream
-        .set_read_timeout(Some(
-            deadline.saturating_duration_since(std::time::Instant::now()),
-        ))
-        .map_err(|error| format!("set preparation hold read timeout: {error}"))?;
-    let mut release = [0_u8; 1];
-    stream
-        .read_exact(&mut release)
-        .map_err(|error| format!("preparation hold runner disconnected or timed out: {error}"))?;
-    if release != *b"R" {
-        return Err("preparation hold runner sent an invalid release byte".to_owned());
-    }
-    Ok(())
+    let deadline = claim.cancellation().deadline();
+    hold_socket(&path, marker.as_bytes(), &mut claim, deadline)
 }
 
-#[cfg(not(debug_assertions))]
-pub fn hold_native_task_preparation(_identity: TaskIdentity) -> Result<(), String> {
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_controls::tests::{bind_fixture, context, controlled, end_fixture, task};
+    use std::os::unix::net::UnixListener;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn accept_marker(listener: &UnixListener) -> UnixStream {
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    return stream;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(2))
+                }
+                Err(error) => panic!("Native hold did not enter: {error}"),
+            }
+        }
+    }
+    #[test]
+    fn late_create_bypasses_only_exact_ended_injection_with_role_still_active() {
+        let kind = QueryLifecycleFaultKind::CreateTaskBeforeWorkerHold;
+        let fixture = controlled(kind.as_str());
+        let binding = bind_fixture(&fixture, kind);
+        // No listener: an ordinary, unended controlled hold must fail.
+        assert!(create_task_before_worker_hold(&fixture.controls, task(&fixture, 1), 1).is_err());
+        end_fixture(&fixture, kind, &binding);
+        assert!(create_task_before_worker_hold(&fixture.controls, task(&fixture, 2), 1).is_ok());
+        assert!(fixture.role.scope().is_active());
+        assert!(
+            fixture
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .all(|event| event.event != "hit")
+        );
+    }
+    #[test]
+    fn exact_end_unparks_read_but_eof_alone_preserves_failure() {
+        let kind = QueryLifecycleFaultKind::CreateTaskBeforeWorkerHold;
+        let fixture = controlled(kind.as_str());
+        let binding = bind_fixture(&fixture, kind);
+        let claim = fixture
+            .controls
+            .claim(kind, fixture.execution, fixture.process, true)
+            .unwrap()
+            .unwrap();
+        let (mut client, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        assert!(
+            read_release_with_end(
+                &mut client,
+                &claim.cancellation(),
+                claim.cancellation().deadline(),
+                false,
+                || claim.action_ended()
+            )
+            .is_err()
+        );
+        let (mut client, _peer) = UnixStream::pair().unwrap();
+        let worker = std::thread::spawn(move || {
+            read_release_with_end(
+                &mut client,
+                &claim.cancellation(),
+                claim.cancellation().deadline(),
+                false,
+                || claim.action_ended(),
+            )
+        });
+        end_fixture(&fixture, kind, &binding);
+        worker.join().unwrap().unwrap();
+        assert!(fixture.role.scope().is_active());
+    }
+    #[test]
+    fn native_ordinary_hold_unblocks_when_runner_disconnects() {
+        let mut fixture = controlled("ingress-hold");
+        // Keep the declared finite target token: socket namespace is private
+        // to the attempted action rather than a process-global registry.
+        let claim = fixture
+            .controls
+            .claim_context_hold("ingress-hold", context(&fixture), Some(&fixture.token))
+            .unwrap()
+            .unwrap();
+        let path = novarocks_failpoint::native_ingress_hold_socket_path(&claim.token).unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
+        let worker = std::thread::spawn(move || {
+            hold_native_ingress_ordinary_closure(claim, Instant::now() + Duration::from_secs(5))
+        });
+        let mut stream = accept_marker(&listener);
+        let mut marker = String::new();
+        stream.read_to_string(&mut marker).unwrap();
+        assert!(marker.contains(&fixture.process.to_string()));
+        fixture.runner.end_and_join().unwrap();
+        assert!(
+            worker.join().unwrap().is_err(),
+            "domain hold really returned after liveness EOF"
+        );
+        assert_eq!(
+            fixture
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .filter(|event| event.event == "hit")
+                .count(),
+            1
+        );
+        drop(stream);
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn preparation_hold_unblocks_on_session_end_and_the_actual_worker_is_joined() {
+        let mut fixture = controlled("preparation-hold");
+        let path = novarocks_failpoint::native_registry_hold_socket_path(&fixture.token).unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
+        let identity = task(&fixture, 2);
+        let controls = Arc::clone(&fixture.controls);
+        let worker = std::thread::spawn(move || hold_native_task_preparation(&controls, identity));
+        let mut stream = accept_marker(&listener);
+        let mut marker = String::new();
+        stream.read_to_string(&mut marker).unwrap();
+        assert!(marker.starts_with("NTP1 "));
+        fixture.runner.end_and_join().unwrap();
+        assert!(worker.join().unwrap().is_err());
+        drop(stream);
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn restart_after_establish_hold_is_exact_and_released_with_its_establish() {
+        let fixture = controlled("restart-after-establish-context");
+        let kind = QueryLifecycleFaultKind::RestartAfterEstablishContext;
+        novarocks_failpoint::target_binding::StatementExecutionBinding::new(
+            "native-tests".into(),
+            fixture.token.clone(),
+            0,
+            fixture.process,
+            fixture.execution,
+        )
+        .unwrap()
+        .write_private(&crate::test_controls::fault_binding_path(
+            fixture.directory.path(),
+            kind,
+            0,
+            &fixture.token,
+        ))
+        .unwrap();
+        let exact = context(&fixture);
+        let other = QueryContextRef::new(
+            fixture.execution,
+            fixture.frontend,
+            BackendProcessId::new_v7(),
+        );
+        arm_restart_after_establish_context(&fixture.controls, exact).unwrap();
+        assert!(restart_after_establish_context_holds_task_creation(
+            &fixture.controls,
+            exact
+        ));
+        assert!(!restart_after_establish_context_holds_task_creation(
+            &fixture.controls,
+            other
+        ));
+        fixture.controls.disarm_restart(exact);
+        assert!(!restart_after_establish_context_holds_task_creation(
+            &fixture.controls,
+            exact
+        ));
+    }
 }

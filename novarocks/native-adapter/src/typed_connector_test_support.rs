@@ -1021,7 +1021,8 @@ mod tests {
             ),
             no_runtime_filter(),
             live_dynamic_filter_factory(),
-            false,
+            #[cfg(feature = "test-controls")]
+            None,
             novarocks_worker::ScanStreamHost::new(
                 novarocks_worker::ScanPreparationConfig::default(),
                 crate::backend_test_support::test_scan_stream_runtime(),
@@ -1467,7 +1468,8 @@ mod tests {
                 ])
                 .expect("frozen test output schema"),
             ),
-            false,
+            #[cfg(feature = "test-controls")]
+            None,
             crate::backend_test_support::test_scan_stream_runtime(),
         );
         let op = source

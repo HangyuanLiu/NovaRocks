@@ -8,10 +8,13 @@ license.workspace = true
 workspace = true
 
 [features]
+normal-build = ["novarocks-failpoint?/normal-build"]
+test-controls = ["dep:novarocks-failpoint", "novarocks-failpoint/test-controls"]
 test-support = []
 mem-1-m07-exact-mysql-write = []
 
 [dependencies]
+novarocks-failpoint = { workspace = true, optional = true }
 novarocks-type-contract.workspace = true
 arrow.workspace = true
 async-trait.workspace = true

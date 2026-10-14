@@ -32,3 +32,6 @@ pub mod startup_isolation_file;
 pub(crate) mod startup_restore;
 
 pub use service::FrontendMvProductAdapter;
+
+#[cfg(feature = "test-controls")]
+pub mod test_controls;

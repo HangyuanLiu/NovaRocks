@@ -498,6 +498,7 @@ fn fetch_rows(
                 acknowledged_packet_sequence,
                 max_result_bytes: 1024 * 1024,
             },
+            context.deadline(),
         )?;
         ensure!(
             response.status != proto::fetch_result_response::Status::Error as i32,

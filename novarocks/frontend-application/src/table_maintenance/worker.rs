@@ -421,6 +421,8 @@ fn cleanup_candidate_locations(
 pub(crate) struct FrontendOptimizeTargetCapturePort<'a> {
     engine: &'a dyn TableMaintenanceEngine,
     statement: bool,
+    #[cfg(feature = "test-controls")]
+    receipt: Option<&'a super::test_controls::SubmissionReceipt>,
 }
 
 impl<'a> FrontendOptimizeTargetCapturePort<'a> {
@@ -428,6 +430,8 @@ impl<'a> FrontendOptimizeTargetCapturePort<'a> {
         Self {
             engine,
             statement: false,
+            #[cfg(feature = "test-controls")]
+            receipt: None,
         }
     }
 
@@ -435,7 +439,20 @@ impl<'a> FrontendOptimizeTargetCapturePort<'a> {
         Self {
             engine,
             statement: true,
+            #[cfg(feature = "test-controls")]
+            receipt: None,
         }
+    }
+}
+
+#[cfg(feature = "test-controls")]
+impl<'a> FrontendOptimizeTargetCapturePort<'a> {
+    pub(crate) fn with_test_receipt(
+        mut self,
+        receipt: Option<&'a super::test_controls::SubmissionReceipt>,
+    ) -> Self {
+        self.receipt = receipt;
+        self
     }
 }
 
@@ -453,6 +470,10 @@ impl OptimizeTargetCapturePort for FrontendOptimizeTargetCapturePort<'_> {
                 return Err(
                     "OPTIMIZE requires the admitted statement cancellation scope".to_string(),
                 );
+            }
+            #[cfg(feature = "test-controls")]
+            if let Some(receipt) = self.receipt {
+                receipt.capture(&captured.object_id)?;
             }
             return Ok(captured);
         }
@@ -603,14 +624,24 @@ impl Drop for FrontendOptimizeJobScope {
 pub(crate) struct FrontendOptimizeJobExecutionPort {
     engine: Weak<dyn TableMaintenanceEngine>,
     product: Weak<TableMaintenanceProduct>,
+    #[cfg(feature = "test-controls")]
+    controls: Option<Arc<super::test_controls::MaintenanceTestControls>>,
 }
 
 impl FrontendOptimizeJobExecutionPort {
     pub(crate) fn new(
         engine: Weak<dyn TableMaintenanceEngine>,
         product: Weak<TableMaintenanceProduct>,
+        #[cfg(feature = "test-controls")] controls: Option<
+            Arc<super::test_controls::MaintenanceTestControls>,
+        >,
     ) -> Self {
-        Self { engine, product }
+        Self {
+            engine,
+            product,
+            #[cfg(feature = "test-controls")]
+            controls,
+        }
     }
 }
 
@@ -630,6 +661,15 @@ impl OptimizeJobExecutionPort for FrontendOptimizeJobExecutionPort {
         Ok(Some(Box::new(FrontendOptimizeJobExecution {
             engine,
             product,
+            #[cfg(feature = "test-controls")]
+            test: self
+                .controls
+                .as_ref()
+                .map(|owner| MaintenanceExecutionControls {
+                    owner: owner.clone(),
+                    capacity: capacity.clone(),
+                    observation: Mutex::new(None),
+                }),
         })))
     }
 }
@@ -637,11 +677,46 @@ impl OptimizeJobExecutionPort for FrontendOptimizeJobExecutionPort {
 struct FrontendOptimizeJobExecution {
     engine: Arc<dyn TableMaintenanceEngine>,
     product: Arc<TableMaintenanceProduct>,
+    #[cfg(feature = "test-controls")]
+    test: Option<MaintenanceExecutionControls>,
+}
+
+#[cfg(feature = "test-controls")]
+struct MaintenanceExecutionControls {
+    owner: Arc<super::test_controls::MaintenanceTestControls>,
+    capacity: novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    observation: Mutex<Option<super::test_controls::AuthorizedJob>>,
+}
+#[cfg(feature = "test-controls")]
+impl FrontendOptimizeJobExecution {
+    fn record_test_dispatch(
+        &self,
+        job: &OptimizeJob,
+        capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
+    ) -> Result<(), String> {
+        if let Some(test) = &self.test {
+            let mut observation = test
+                .observation
+                .lock()
+                .map_err(|_| "maintenance dispatch observation lock failed")?;
+            if let Some(observation) = observation.as_mut() {
+                observation.record_dispatch(job, capacity)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl OptimizeJobExecution for FrontendOptimizeJobExecution {
     fn rebind_target(&self, job: &OptimizeJob) -> Result<MaintenanceTargetRebind, String> {
-        stat2f_before_rebind_barrier(job.job_id)?;
+        #[cfg(feature = "test-controls")]
+        if let Some(test) = &self.test {
+            let observation = test.owner.before_rebind(job, &test.capacity)?;
+            *test
+                .observation
+                .lock()
+                .map_err(|_| "maintenance rebind observation lock failed")? = observation;
+        }
         let expected_object_id = ConnectorTableObjectId::try_new(Bytes::copy_from_slice(
             &job.object_id,
         ))
@@ -664,7 +739,9 @@ impl OptimizeJobExecution for FrontendOptimizeJobExecution {
             .engine
             .for_admitted_execution(capacity)
             .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
-        stat2f_record_provider_dispatch(job.job_id).map_err(OptimizeTerminalError::failed)?;
+        #[cfg(feature = "test-controls")]
+        self.record_test_dispatch(job, capacity)
+            .map_err(OptimizeTerminalError::failed)?;
         self.product.execute_rewrite_terminal(
             &FrontendMaintenanceEffectPort::new(engine.as_ref()),
             &job.target,
@@ -682,193 +759,13 @@ impl OptimizeJobExecution for FrontendOptimizeJobExecution {
             .engine
             .for_admitted_execution(capacity)
             .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
-        stat2f_record_provider_dispatch(job.job_id)
+        #[cfg(feature = "test-controls")]
+        self.record_test_dispatch(job, capacity)
             .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
         self.product.execute_automatic_rewrite_terminal(
             &FrontendMaintenanceEffectPort::new(engine.as_ref()),
             &job.target,
             effect_id,
         )
-    }
-}
-
-/// Runner-owned test root for the STAT-2F cross-process maintenance race.
-#[cfg(debug_assertions)]
-const STAT2F_TEST_ROOT_ENV: &str = "NOVAROCKS_STAT2F_MAINTENANCE_TEST_DIR";
-#[cfg(debug_assertions)]
-const STAT2F_TEST_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-#[cfg(debug_assertions)]
-fn stat2f_before_rebind_barrier(job_id: i64) -> Result<(), String> {
-    use std::time::Instant;
-
-    let Some(root) = std::env::var_os(STAT2F_TEST_ROOT_ENV) else {
-        return Ok(());
-    };
-    let paths = stat2f_test_paths(std::path::Path::new(&root), job_id);
-    if paths.resume.exists() {
-        return Err(format!(
-            "STAT-2F maintenance test resume trigger already exists: {}",
-            paths.resume.display()
-        ));
-    }
-    std::fs::write(&paths.dispatch_count, "0\n").map_err(|error| {
-        format!(
-            "write STAT-2F maintenance dispatch counter {}: {error}",
-            paths.dispatch_count.display()
-        )
-    })?;
-    std::fs::write(
-        &paths.ready,
-        format!("job_id={job_id}\nphase=after-claim-before-rebind\n"),
-    )
-    .map_err(|error| {
-        format!(
-            "write STAT-2F maintenance ready marker {}: {error}",
-            paths.ready.display()
-        )
-    })?;
-
-    let deadline = Instant::now() + STAT2F_TEST_BARRIER_TIMEOUT;
-    while !paths.resume.exists() && Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    if paths.resume.exists() {
-        Ok(())
-    } else {
-        Err(format!(
-            "timed out waiting for STAT-2F maintenance resume trigger {}",
-            paths.resume.display()
-        ))
-    }
-}
-
-#[cfg(not(debug_assertions))]
-fn stat2f_before_rebind_barrier(_job_id: i64) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(debug_assertions)]
-fn stat2f_record_provider_dispatch(job_id: i64) -> Result<(), String> {
-    let Some(root) = std::env::var_os(STAT2F_TEST_ROOT_ENV) else {
-        return Ok(());
-    };
-    let paths = stat2f_test_paths(std::path::Path::new(&root), job_id);
-    let previous = std::fs::read_to_string(&paths.dispatch_count).map_err(|error| {
-        format!(
-            "read STAT-2F maintenance dispatch counter {}: {error}",
-            paths.dispatch_count.display()
-        )
-    })?;
-    let previous = previous.trim().parse::<u64>().map_err(|error| {
-        format!(
-            "parse STAT-2F maintenance dispatch counter {}: {error}",
-            paths.dispatch_count.display()
-        )
-    })?;
-    std::fs::write(&paths.dispatch_count, format!("{}\n", previous + 1)).map_err(|error| {
-        format!(
-            "write STAT-2F maintenance dispatch counter {}: {error}",
-            paths.dispatch_count.display()
-        )
-    })
-}
-
-#[cfg(not(debug_assertions))]
-fn stat2f_record_provider_dispatch(_job_id: i64) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(debug_assertions)]
-struct Stat2fTestPaths {
-    ready: std::path::PathBuf,
-    resume: std::path::PathBuf,
-    dispatch_count: std::path::PathBuf,
-}
-
-#[cfg(debug_assertions)]
-fn stat2f_test_paths(root: &std::path::Path, job_id: i64) -> Stat2fTestPaths {
-    let stem = format!("stat2f-maintenance-optimize-{job_id}");
-    Stat2fTestPaths {
-        ready: root.join(format!("{stem}.before-rebind.ready")),
-        resume: root.join(format!("{stem}.before-rebind.resume")),
-        dispatch_count: root.join(format!("{stem}.dispatch-count")),
-    }
-}
-
-#[cfg(all(test, debug_assertions))]
-mod stat2f_test_hook_tests {
-    use std::ffi::OsString;
-    use std::sync::{Mutex, OnceLock};
-    use std::time::{Duration, Instant};
-
-    use tempfile::TempDir;
-
-    use super::{
-        STAT2F_TEST_ROOT_ENV, stat2f_before_rebind_barrier, stat2f_record_provider_dispatch,
-        stat2f_test_paths,
-    };
-
-    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    struct ScopedTestEnv {
-        prior: Option<OsString>,
-    }
-
-    impl ScopedTestEnv {
-        fn set(root: &std::path::Path) -> Self {
-            let prior = std::env::var_os(STAT2F_TEST_ROOT_ENV);
-            // The process-global environment is serialized by TEST_ENV_LOCK.
-            unsafe { std::env::set_var(STAT2F_TEST_ROOT_ENV, root) };
-            Self { prior }
-        }
-    }
-
-    impl Drop for ScopedTestEnv {
-        fn drop(&mut self) {
-            // The process-global environment is serialized by TEST_ENV_LOCK.
-            unsafe {
-                if let Some(prior) = self.prior.take() {
-                    std::env::set_var(STAT2F_TEST_ROOT_ENV, prior);
-                } else {
-                    std::env::remove_var(STAT2F_TEST_ROOT_ENV);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn barrier_reports_zero_then_one_dispatch_and_resumes_only_on_trigger() {
-        let _environment = TEST_ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("lock STAT-2F test environment");
-        let temporary = TempDir::new().expect("create test root");
-        let root = temporary.path().join("stat2f-hook");
-        std::fs::create_dir(&root).expect("create hook directory");
-        let _scope = ScopedTestEnv::set(&root);
-        let job_id = 19;
-        let paths = stat2f_test_paths(&root, job_id);
-
-        let waiter = std::thread::spawn(move || stat2f_before_rebind_barrier(job_id));
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !paths.ready.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(paths.ready.exists(), "the barrier exposes its ready marker");
-        assert_eq!(
-            std::fs::read_to_string(&paths.dispatch_count).unwrap(),
-            "0\n"
-        );
-        std::fs::write(&paths.resume, "resume\n").expect("release barrier");
-        waiter
-            .join()
-            .expect("barrier joins")
-            .expect("barrier resumes");
-        stat2f_record_provider_dispatch(job_id).expect("record first provider dispatch");
-        assert_eq!(
-            std::fs::read_to_string(&paths.dispatch_count).unwrap(),
-            "1\n"
-        );
     }
 }

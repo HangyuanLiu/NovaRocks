@@ -57,6 +57,8 @@ const ROW_SHA: &str = "e5a05e54f4636fe6e87eb8094fceda8e002bff799f3de76413a2a77c5
 const SAMPLES: usize = 51;
 const WHOLE: Duration = Duration::from_secs(20);
 const PROTOCOL: Duration = Duration::from_secs(5);
+const TARGET_RUN_TOKEN: &str = "m07-held-late-ack-target";
+const HEALTH_RUN_TOKEN: &str = "m07-held-late-ack-health";
 const ROOT_FIELDS: [&str; 14] = [
     "channels",
     "terminal_task_records",
@@ -130,6 +132,41 @@ impl Scenario for HeldLateAck {
         // Neutral source feature is build-admitted, not enabled by an environment knob.
         // No exact Hub, socket, nonce or controller is created for this unarmed scene.
         Ok(ScenarioLaunchConfig::default())
+    }
+    fn test_session_plan(
+        &self,
+        launch: &ScenarioLaunchConfig,
+        _scenario_root: &Path,
+        cluster_size: usize,
+        primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        self.run.validate_shape()?;
+        ensure!(
+            original_deadline <= self.clock()?,
+            "held declaration renewed original clock"
+        );
+        ensure!(
+            launch.child_environment == Default::default(),
+            "held root observation cannot adopt exact fixture or ambient control inputs"
+        );
+        Ok(Some(super::variant_sessions::fixture_plan(
+            primary_binary,
+            ordinary_binary,
+            controlled_binary,
+            cluster_size,
+            original_deadline,
+            vec![super::variant_sessions::grant(
+                "root-observation",
+                "original-neutral-root",
+                json!({"action":"observe"}),
+            )],
+            "mem-1-m07-root-observation",
+            &["novarocks-server", "novarocks-frontend-application"],
+            &[TARGET_RUN_TOKEN, HEALTH_RUN_TOKEN],
+        )?))
     }
     fn root_observation_deadline(&self) -> Result<Option<Instant>> {
         Ok(Some(self.clock()?))
@@ -523,6 +560,13 @@ fn run_owned(
             "actual original socket receive bound unavailable"
         );
         cid = Some(client.connection_id()?);
+        super::variant_sessions::arm_statement_until(
+            context,
+            TARGET_RUN_TOKEN,
+            cid.unwrap(),
+            SQL,
+            deadline,
+        )?;
         let (ready_tx, ready_rx) = oneshot::channel();
         let (resume_tx, resume_rx) = oneshot::channel();
         resume = Some(resume_tx);
@@ -744,6 +788,13 @@ fn run_owned(
             let client = stream
                 .as_mut()
                 .context("original client disappeared before health")?;
+            super::variant_sessions::arm_statement_until(
+                context,
+                HEALTH_RUN_TOKEN,
+                client.connection_id()?,
+                HEALTH_SQL,
+                deadline,
+            )?;
             let mut value = runtime.block_on(client.observe_text_query_owned_until(
                 HEALTH_SQL,
                 Duration::ZERO,

@@ -162,14 +162,7 @@ impl MvRepository for HeldMvRepository {
         self.held.other_calls.fetch_add(1, Ordering::AcqRel);
         self.inner.delete_projection(id, value).await
     }
-    async fn wipe_projection_by_target(
-        &self,
-        id: uuid::Uuid,
-        target: &MvTarget,
-    ) -> Result<bool, MvRepositoryError> {
-        self.held.other_calls.fetch_add(1, Ordering::AcqRel);
-        self.inner.wipe_projection_by_target(id, target).await
-    }
+    #[cfg(feature = "test-controls")]
     async fn wipe_accelerator(&self, id: uuid::Uuid) -> Result<(), MvRepositoryError> {
         self.held.other_calls.fetch_add(1, Ordering::AcqRel);
         self.inner.wipe_accelerator(id).await

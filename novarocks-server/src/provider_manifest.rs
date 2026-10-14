@@ -96,8 +96,6 @@ const PROVIDER_BUILDERS: &[ProviderBuilderDefinition] = &[
 /// execution resources and BE never constructs FE credentials or control
 /// resources.
 pub struct ServerProviderManifest {
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    hms_listing_probe: Option<Arc<novarocks_connector_iceberg::hms_listing_probe::HmsListingProbe>>,
     contracts: SealedProviderRegistry,
     builders: Arc<[SealedProviderBuilder]>,
 }
@@ -148,27 +146,9 @@ impl ServerProviderManifest {
             );
         }
         Ok(Self {
-            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            hms_listing_probe: None,
             contracts,
             builders: Arc::from(builders),
         })
-    }
-
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub fn with_hms_listing_probe(
-        mut self,
-        probe: Arc<novarocks_connector_iceberg::hms_listing_probe::HmsListingProbe>,
-    ) -> Self {
-        self.hms_listing_probe = Some(probe);
-        self
-    }
-
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub fn hms_listing_probe(
-        &self,
-    ) -> Option<Arc<novarocks_connector_iceberg::hms_listing_probe::HmsListingProbe>> {
-        self.hms_listing_probe.clone()
     }
 
     pub const fn contracts(&self) -> &SealedProviderRegistry {
@@ -179,33 +159,42 @@ impl ServerProviderManifest {
         &self,
         config: &NovaRocksConfig,
         runtime: tokio::runtime::Handle,
+        #[cfg(feature = "test-controls")]
+        test_slots: &crate::provider_test_slots::ProviderTestSlots,
     ) -> anyhow::Result<Vec<Arc<dyn ConnectorControlRoleBindingFactory>>> {
         self.builders
             .iter()
             .map(|builder| {
-                #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-                let observed = builder.provider_id.as_str()
+                #[cfg(feature = "test-controls")]
+                let factory = if builder.provider_id.as_str()
                     == novarocks_connector_iceberg::PROVIDER_ID
-                    && self.hms_listing_probe.is_some();
-                #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
-                let observed = false;
-                let factory = if observed {
+                {
+                    let metadata_binding =
+                        crate::composition::compose_iceberg_metadata_access_template(
+                            config,
+                            runtime.clone(),
+                        )?;
+                    let resources =
+                        IcebergMetadataResources::new(metadata_binding, runtime.clone())
+                            .with_test_observation(test_slots.iceberg.clone());
+                    let max_inflight =
+                        NonZeroUsize::new(config.runtime.catalog_materialization_max_inflight)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "catalog materialization max inflight must be nonzero"
+                                )
+                            })?;
+                    let factory = IcebergControlRoleBindingFactory::new(resources, max_inflight);
                     #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-                    {
-                        Arc::new(
-                            compose_iceberg_control_factory(config, runtime.clone())?
-                                .with_hms_listing_probe(Arc::clone(
-                                    self.hms_listing_probe.as_ref().expect("selected probe"),
-                                )),
-                        ) as Arc<dyn ConnectorControlRoleBindingFactory>
-                    }
-                    #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
-                    unreachable!("observation is feature-only")
+                    let factory = factory.with_hms_listing_observation_slot(test_slots.hms.clone());
+                    Arc::new(factory) as Arc<dyn ConnectorControlRoleBindingFactory>
                 } else {
-                    (builder.control)(config, runtime.clone()).with_context(|| {
-                        format!("compose `{}` FE factory", builder.provider_id.as_str())
-                    })?
+                    (builder.control)(config, runtime.clone())?
                 };
+                #[cfg(not(feature = "test-controls"))]
+                let factory = (builder.control)(config, runtime.clone()).with_context(|| {
+                    format!("compose `{}` FE factory", builder.provider_id.as_str())
+                })?;
                 validate_factory_identity(
                     "FE control",
                     &builder.provider_id,
@@ -253,10 +242,52 @@ impl ServerProviderManifest {
         config: &NovaRocksConfig,
         runtime: tokio::runtime::Handle,
         scan_io: &ScanIoServices,
+        #[cfg(feature = "test-controls")]
+        test_slots: &crate::provider_test_slots::ProviderTestSlots,
     ) -> anyhow::Result<Vec<Arc<dyn ConnectorExecutionRoleBindingFactory>>> {
         self.builders
             .iter()
             .map(|builder| {
+                #[cfg(feature = "test-controls")]
+                let factory: Arc<dyn ConnectorExecutionRoleBindingFactory> = if builder
+                    .provider_id
+                    .as_str()
+                    == novarocks_connector_iceberg::PROVIDER_ID
+                {
+                    let resources = crate::composition::compose_iceberg_execution_resources(
+                        config,
+                        runtime.clone(),
+                        scan_io,
+                    )?;
+                    test_slots
+                        .register_storage(resources.test_storage_authority_registry())
+                        .map_err(anyhow::Error::msg)?;
+                    Arc::new(IcebergExecutionRoleBindingFactory::new(
+                        resources.with_test_observation(test_slots.iceberg.clone()),
+                        iceberg_execution_reader_options(config),
+                    ))
+                } else if builder.provider_id.as_str() == novarocks_connector_paimon::PROVIDER_ID {
+                    let resources = crate::composition::compose_connector_file_planning_resources(
+                        config,
+                        runtime.clone(),
+                    )?
+                    .with_file_io(scan_io.file_runtime(), scan_io.file_task_spawner());
+                    test_slots
+                        .register_storage(resources.storage_authority_registry().clone())
+                        .map_err(anyhow::Error::msg)?;
+                    let access = Arc::new(
+                        crate::composition::compose_paimon_access_factory_with_resources(
+                            config,
+                            novarocks_types::ClusterRole::Be,
+                            resources,
+                        )?
+                        .with_range_service(scan_io.range_service()),
+                    );
+                    Arc::new(PaimonExecutionRoleBindingFactory::new(access))
+                } else {
+                    (builder.execution)(config, runtime.clone(), scan_io)?
+                };
+                #[cfg(not(feature = "test-controls"))]
                 let factory =
                     (builder.execution)(config, runtime.clone(), scan_io).with_context(|| {
                         format!("compose `{}` BE factory", builder.provider_id.as_str())

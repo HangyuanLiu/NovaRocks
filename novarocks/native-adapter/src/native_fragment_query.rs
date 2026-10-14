@@ -46,6 +46,10 @@ use novarocks_worker::sink_commit::WorkerSinkCommitPort;
 #[derive(Clone)]
 pub struct NativeFragmentQueryRuntime {
     manager: Arc<QueryContextManager>,
+    #[cfg(feature = "test-controls")]
+    test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
+    #[cfg(feature = "test-controls")]
+    observation_controls: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
     /// Clones must publish one current manager snapshot in a single order.
     resource_metrics_publish: Arc<Mutex<()>>,
     #[cfg(test)]
@@ -66,6 +70,33 @@ pub struct NativeFragmentQueryRuntime {
 }
 
 impl NativeFragmentQueryRuntime {
+    #[cfg(feature = "test-controls")]
+    pub fn with_test_controls(
+        mut self,
+        controls: Option<Arc<crate::test_controls::NativeTestControls>>,
+    ) -> Self {
+        self.test_controls = controls;
+        self
+    }
+    #[cfg(feature = "test-controls")]
+    pub fn test_controls(&self) -> Option<Arc<crate::test_controls::NativeTestControls>> {
+        self.test_controls.clone()
+    }
+    #[cfg(feature = "test-controls")]
+    pub fn with_observation_controls(
+        mut self,
+        controls: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
+    ) -> Self {
+        self.observation_controls = controls;
+        self
+    }
+    #[cfg(feature = "test-controls")]
+    pub fn observation_controls(
+        &self,
+    ) -> Option<Arc<crate::test_observation_controls::NativeObservationControls>> {
+        self.observation_controls.clone()
+    }
+
     pub fn publish_resource_snapshot(&self) {
         let _publication = self
             .resource_metrics_publish
@@ -95,6 +126,10 @@ impl NativeFragmentQueryRuntime {
     pub fn global(memory_authority: Arc<MemoryAuthority>) -> Self {
         Self {
             manager: query_context_manager(),
+            #[cfg(feature = "test-controls")]
+            test_controls: None,
+            #[cfg(feature = "test-controls")]
+            observation_controls: None,
             resource_metrics_publish: Arc::new(Mutex::new(())),
             #[cfg(test)]
             resource_snapshot_observer: None,
@@ -109,6 +144,10 @@ impl NativeFragmentQueryRuntime {
     ) -> Self {
         Self {
             manager,
+            #[cfg(feature = "test-controls")]
+            test_controls: None,
+            #[cfg(feature = "test-controls")]
+            observation_controls: None,
             resource_metrics_publish: Arc::new(Mutex::new(())),
             #[cfg(test)]
             resource_snapshot_observer: None,
@@ -362,7 +401,6 @@ impl NativeFragmentAdmissionResources {
         )
         .with_query_memory(self.query_memory)
         .with_fragment_commit_port(Arc::new(WorkerSinkCommitPort))
-        .with_debug_exec_node_output(crate::debug_environment::debug_exec_node_output())
     }
 }
 

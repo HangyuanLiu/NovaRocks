@@ -24,8 +24,15 @@
 // Design: ADR-0069 (docs/adr/ADR-0069-shared-test-mechanics-owner.md)
 mod managed_process;
 mod reserved_tcp_port;
+#[cfg(unix)]
+mod socket_deadline;
+#[cfg(unix)]
+pub use socket_deadline::SocketDeadlineOwner;
 
 pub use managed_process::{
     ManagedProcess, ManagedProcessLogSource, ManagedProcessLogTail, ReadyMarker,
 };
 pub use reserved_tcp_port::ReservedTcpPort;
+
+#[cfg(unix)]
+pub use managed_process::{CapturedCommandOutcome, capture_command_until};

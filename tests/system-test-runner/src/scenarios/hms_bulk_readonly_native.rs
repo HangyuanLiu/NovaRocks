@@ -1403,6 +1403,52 @@ impl Scenario for HmsBulkReadonlyNative {
         }
         Ok(launch)
     }
+    fn test_session_plan(
+        &self,
+        launch: &ScenarioLaunchConfig,
+        _scenario_root: &Path,
+        cluster_size: usize,
+        primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        self.recheck_admission()?;
+        ensure!(
+            original_deadline <= self.deadline,
+            "HMS declaration renewed original clock"
+        );
+        ensure!(
+            launch
+                .child_environment
+                .fe
+                .get(PROBE_ENV)
+                .map(String::as_str)
+                == Some(CATALOG),
+            "original HMS catalog nomination changed before declaration"
+        );
+        Ok(Some(
+            super::exact_mysql_native_driver::variant_sessions::fixture_plan(
+                primary_binary,
+                ordinary_binary,
+                controlled_binary,
+                cluster_size,
+                original_deadline,
+                vec![super::exact_mysql_native_driver::variant_sessions::grant(
+                    "hms-listing-observation",
+                    "original-hms-catalog",
+                    json!({"action":"observe", "catalog_name":CATALOG}),
+                )],
+                "mem-1-m07-hms-listing-observe",
+                &[
+                    "novarocks-server",
+                    "novarocks-frontend-application",
+                    "novarocks-connector-iceberg",
+                ],
+                &[],
+            )?,
+        ))
+    }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let original = context.recheck_live_process_launch_identities()?;

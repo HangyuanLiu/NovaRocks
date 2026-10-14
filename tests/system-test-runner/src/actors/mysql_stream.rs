@@ -44,6 +44,7 @@ pub use control_response::{
 
 pub struct MysqlStream {
     stream: TcpStream,
+    connection_id: u32,
 }
 
 /// An async form of [`MysqlStream`] for scenarios whose logical client count
@@ -331,6 +332,14 @@ impl MysqlPacket {
 }
 
 impl MysqlStream {
+    pub fn connection_id(&self) -> Result<u32> {
+        ensure!(
+            self.connection_id != 0,
+            "raw MySQL connection identity is zero"
+        );
+        Ok(self.connection_id)
+    }
+
     pub fn connect(user: &str, port: u16, timeout: Duration) -> Result<Self> {
         Self::connect_with_capabilities(user, port, timeout, false)
     }
@@ -369,6 +378,7 @@ impl MysqlStream {
             handshake.first().copied() == Some(10),
             "expected MySQL protocol v10 handshake, got payload={handshake:?}"
         );
+        let connection_id = handshake_connection_id(&handshake)?;
 
         let mut client_flags = CLIENT_LONG_PASSWORD
             | CLIENT_LONG_FLAG
@@ -403,7 +413,10 @@ impl MysqlStream {
             auth_result.first().copied() == Some(0),
             "unexpected raw MySQL authentication response: {auth_result:?}"
         );
-        Ok(Self { stream })
+        Ok(Self {
+            stream,
+            connection_id,
+        })
     }
 
     pub fn query(user: &str, port: u16, sql: &str, timeout: Duration) -> Result<Self> {

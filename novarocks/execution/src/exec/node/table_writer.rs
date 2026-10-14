@@ -41,7 +41,7 @@ use crate::exec::fragment::error::{ExecPlanBuildError, ExecPlanInvariant};
 use crate::exec::node::ExecNode;
 use crate::exec::node::table_write_aggregate::WriterPartialAggregatePlan;
 use crate::exec::node::table_write_relation::ConnectorCommitFragmentEncoder;
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 use crate::exec::node::table_write_relation::{
     AllowTableWriteAggregates, TableWriteAggregateGuard,
 };
@@ -269,7 +269,7 @@ pub struct TableWriterNode {
     fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
     writer_multiplex_schema: crate::exec::node::table_write_relation::WriterMultiplexRelationSchema,
     partial_aggregate_plan: WriterPartialAggregatePlan,
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
 }
 
@@ -281,7 +281,7 @@ pub struct TableWriterRuntimeBinding {
     pub(crate) physical_template: TableWriterPhysicalContextTemplate,
     pub(crate) request_context: ConnectorRequestContext,
     pub(crate) fragment_encoder: Arc<dyn ConnectorCommitFragmentEncoder>,
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     pub(crate) aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
 }
 
@@ -309,13 +309,13 @@ impl TableWriterRuntimeBinding {
             physical_template,
             request_context,
             fragment_encoder,
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "test-controls")]
             aggregate_guard: Arc::new(AllowTableWriteAggregates),
         })
     }
 
     /// Bind the application-owned, query-scoped aggregate rejection guard.
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     pub fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateGuard>) -> Self {
         self.aggregate_guard = guard;
         self
@@ -406,13 +406,13 @@ impl TableWriterNode {
             fragment_encoder,
             writer_multiplex_schema,
             partial_aggregate_plan,
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "test-controls")]
             aggregate_guard: Arc::new(AllowTableWriteAggregates),
         })
     }
 
     /// Bind the application-owned, query-scoped aggregate rejection guard.
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     pub fn with_aggregate_guard(mut self, guard: Arc<dyn TableWriteAggregateGuard>) -> Self {
         self.aggregate_guard = guard;
         self
@@ -485,7 +485,7 @@ impl TableWriterNode {
                 physical_template: self.physical_template,
                 request_context: self.request_context,
                 fragment_encoder: self.fragment_encoder,
-                #[cfg(debug_assertions)]
+                #[cfg(feature = "test-controls")]
                 aggregate_guard: self.aggregate_guard,
             },
             (
@@ -499,7 +499,7 @@ impl TableWriterNode {
         )
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     pub const fn aggregate_guard(&self) -> &Arc<dyn TableWriteAggregateGuard> {
         &self.aggregate_guard
     }

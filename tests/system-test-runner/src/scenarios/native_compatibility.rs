@@ -18,11 +18,14 @@
 //! Real process-boundary compatibility-island admission scenarios.
 
 use crate::actors::mysql as mysql_actor;
+#[path = "compatibility_sql_intent.rs"]
+mod compatibility_sql_intent;
 use crate::scenario::{
     Scenario, ScenarioBinary, ScenarioBinaryLayout, ScenarioContext, ScenarioLaunchConfig,
 };
 use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
+use compatibility_sql_intent::{CompatibilityIntent, CompatibilitySql};
 use h2::client;
 use http::{Request, header};
 use mysql::prelude::Queryable;
@@ -32,7 +35,7 @@ use novarocks_proto_models::{common, novarocks as proto, plan};
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
 use prost::Message;
 use std::collections::BTreeSet;
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -42,15 +45,18 @@ pub(super) const HEARTBEAT_PATH: &str = "/novarocks.NovaRocksGrpc/Heartbeat";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
-        Box::new(MixedBuildSameIsland),
-        Box::new(OtherIslandHardCut),
-        Box::new(RawEstablishCompatibilityAdmission),
-        Box::new(IslandDrainAndReplacement),
-        Box::new(TargetIslandCutover),
+        Box::new(MixedBuildSameIsland::default()),
+        Box::new(OtherIslandHardCut::default()),
+        Box::new(RawEstablishCompatibilityAdmission::default()),
+        Box::new(IslandDrainAndReplacement::default()),
+        Box::new(TargetIslandCutover::default()),
     ]
 }
 
-struct MixedBuildSameIsland;
+#[derive(Default)]
+struct MixedBuildSameIsland {
+    intent: CompatibilityIntent,
+}
 
 impl Scenario for MixedBuildSameIsland {
     fn name(&self) -> &'static str {
@@ -70,6 +76,41 @@ impl Scenario for MixedBuildSameIsland {
             expected_eligible_backend_count: Some(REQUIRED_BACKENDS),
             ..Default::default()
         })
+    }
+
+    fn test_session_plan(
+        &self,
+        launch: &ScenarioLaunchConfig,
+        _: &std::path::Path,
+        cluster_size: usize,
+        _: &std::path::Path,
+        _: &std::path::Path,
+        _: Option<&std::path::Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        ensure!(
+            cluster_size == 3,
+            "compatibility observations require native 1FE+3BE"
+        );
+        let artifacts = launch
+            .resolved_artifacts
+            .as_ref()
+            .context("compatibility role artifacts were not resolved before freezing")?;
+        Ok(Some(
+            self.intent.freeze(
+                &artifacts.frontend,
+                &artifacts.backends,
+                None,
+                (0..3)
+                    .map(|_| CompatibilitySql {
+                        sql: BASELINE_QUERY.into(),
+                        backends: vec![0, 1, 2],
+                    })
+                    .collect(),
+                &[],
+                deadline,
+            )?,
+        ))
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -100,20 +141,63 @@ impl Scenario for MixedBuildSameIsland {
             "same island must retain one compatibility ID, got {compatibility_ids:?}"
         );
         assert_island_ready(context, 200)?;
-        run_distributed_queries(context, &[0, 1, 2])?;
+        compatibility_sql_intent::run_baselines(context, &self.intent, BASELINE_QUERY, &[0, 1, 2])?;
         context.action(format!("admitted 3 BEs with builds={build_ids:?} inside compatibility_ids={compatibility_ids:?}"));
         Ok(())
     }
 }
 
-struct OtherIslandHardCut;
-struct RawEstablishCompatibilityAdmission;
-struct IslandDrainAndReplacement;
-struct TargetIslandCutover;
+#[derive(Default)]
+struct OtherIslandHardCut {
+    intent: CompatibilityIntent,
+}
+#[derive(Default)]
+struct RawEstablishCompatibilityAdmission {
+    intent: CompatibilityIntent,
+}
+#[derive(Default)]
+struct IslandDrainAndReplacement {
+    intent: CompatibilityIntent,
+}
+#[derive(Default)]
+struct TargetIslandCutover {
+    source: CompatibilityIntent,
+    target: CompatibilityIntent,
+    peer:
+        std::sync::Mutex<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>>,
+}
 
 impl Scenario for RawEstablishCompatibilityAdmission {
     fn name(&self) -> &'static str {
         "native-compatibility/raw-establish-compatibility-admission"
+    }
+
+    fn test_session_plan(
+        &self,
+        launch: &ScenarioLaunchConfig,
+        _: &std::path::Path,
+        cluster_size: usize,
+        _: &std::path::Path,
+        _: &std::path::Path,
+        _: Option<&std::path::Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        ensure!(
+            cluster_size == 3,
+            "raw compatibility observation requires native 1FE+3BE"
+        );
+        let artifacts = launch
+            .resolved_artifacts
+            .as_ref()
+            .context("raw compatibility artifacts were not resolved before freezing")?;
+        Ok(Some(self.intent.freeze(
+            &artifacts.frontend,
+            &artifacts.backends,
+            None,
+            vec![],
+            &[0],
+            deadline,
+        )?))
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -152,6 +236,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
                     value: backend.to_bytes().to_vec(),
                 }),
             },
+            context.deadline(),
         )?;
         let admission_epoch_capability = heartbeat
             .admission_epoch_capability
@@ -164,6 +249,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
                 native_compatibility_id,
                 admission_epoch_capability.clone(),
             )],
+            context.deadline(),
         )?;
         let acquisition_receipt =
             only_successful_receipt(acquisition, "admission ticket acquisition")?;
@@ -210,6 +296,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
                     admission_ticket_id.clone(),
                     compatibility_id,
                 )],
+                context.deadline(),
             )?;
             ensure!(
                 response.grpc_status == tonic::Code::InvalidArgument as u16,
@@ -236,6 +323,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
                 admission_ticket_id.clone(),
                 Some(foreign.to_vec()),
             )],
+            context.deadline(),
         )?;
         let foreign_receipt = only_successful_receipt(foreign_response, "foreign Establish")?;
         ensure!(
@@ -259,6 +347,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
             &connector,
             &authorization,
             vec![raw_create_task(query_context.clone())],
+            context.deadline(),
         )?;
         let create_receipt =
             only_successful_receipt(create_response, "CreateTask after foreign Establish")?;
@@ -297,6 +386,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
                 native_compatibility_id,
                 admission_epoch_capability,
             )],
+            context.deadline(),
         )?;
         let renewed_receipt =
             only_successful_receipt(renewed_acquisition, "renewed admission ticket acquisition")?;
@@ -322,6 +412,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
                 renewed_ticket_id,
                 Some(native_compatibility_id.to_vec()),
             )],
+            context.deadline(),
         )?;
         let matching_receipt = only_successful_receipt(matching_response, "matching Establish")?;
         ensure!(
@@ -413,6 +504,41 @@ impl Scenario for OtherIslandHardCut {
         })
     }
 
+    fn test_session_plan(
+        &self,
+        launch: &ScenarioLaunchConfig,
+        _: &std::path::Path,
+        cluster_size: usize,
+        _: &std::path::Path,
+        _: &std::path::Path,
+        _: Option<&std::path::Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        ensure!(
+            cluster_size == 3,
+            "compatibility observations require native 1FE+3BE"
+        );
+        let artifacts = launch
+            .resolved_artifacts
+            .as_ref()
+            .context("compatibility role artifacts were not resolved before freezing")?;
+        Ok(Some(
+            self.intent.freeze(
+                &artifacts.frontend,
+                &artifacts.backends,
+                None,
+                (0..3)
+                    .map(|_| CompatibilitySql {
+                        sql: BASELINE_QUERY.into(),
+                        backends: vec![0, 1],
+                    })
+                    .collect(),
+                &[2],
+                deadline,
+            )?,
+        ))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let rows = context.handle().frontend_backend_topology()?;
@@ -444,7 +570,7 @@ impl Scenario for OtherIslandHardCut {
         let excluded_build = other[0].build_identity.clone();
         let primary_compatibility_id = decode_hex_32(&live[0].native_compatibility_id)?;
         assert_island_ready(context, 200)?;
-        run_distributed_queries(context, &[0, 1])?;
+        compatibility_sql_intent::run_baselines(context, &self.intent, BASELINE_QUERY, &[0, 1])?;
         context
             .handle()
             .assert_be_log(2, super::task_evidence::CONTEXT_ESTABLISH_APPLIED)
@@ -482,10 +608,66 @@ impl Scenario for TargetIslandCutover {
         })
     }
 
+    fn test_session_plan(
+        &self,
+        launch: &ScenarioLaunchConfig,
+        _: &std::path::Path,
+        cluster_size: usize,
+        _: &std::path::Path,
+        _: &std::path::Path,
+        _: Option<&std::path::Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        ensure!(
+            cluster_size == 3,
+            "compatibility cutover requires native 1FE+3BE"
+        );
+        let artifacts = launch
+            .resolved_artifacts
+            .as_ref()
+            .context("cutover artifacts were not resolved before freezing")?;
+        let other = artifacts
+            .other_island
+            .as_deref()
+            .context("cutover requires --other-island-binary")?;
+        let peer = self.target.freeze(
+            other,
+            &vec![other.to_owned(); 3],
+            None,
+            vec![CompatibilitySql {
+                sql: BASELINE_QUERY.into(),
+                backends: vec![],
+            }],
+            &[],
+            deadline,
+        )?;
+        *self
+            .peer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cutover peer intent poisoned"))? = Some(peer);
+        Ok(Some(self.source.freeze(
+            &artifacts.frontend,
+            &artifacts.backends,
+            None,
+            vec![CompatibilitySql {
+                sql: "SELECT sleep(2)".into(),
+                backends: vec![],
+            }],
+            &[],
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         assert_island_ready(context, 200)?;
-        let mut target = context.launch_peer_cluster(
+        let peer = self
+            .peer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("cutover peer intent poisoned"))?
+            .take()
+            .context("target cutover plan was not frozen before source launch")?;
+        let mut target = context.launch_peer_cluster_with_test_session(
             "target-island",
             ScenarioLaunchConfig {
                 binary_layout: ScenarioBinaryLayout {
@@ -495,66 +677,51 @@ impl Scenario for TargetIslandCutover {
                 expected_eligible_backend_count: Some(REQUIRED_BACKENDS),
                 ..Default::default()
             },
+            peer,
         )?;
-        let result = (|| -> Result<()> {
-            let target_island =
-                target.frontend_management_get("/island-readyz", Duration::from_secs(5))?;
+        let mut source = None;
+        let primary = (|| -> Result<()> {
+            let target_island = target.frontend_management_get(
+                "/island-readyz",
+                context
+                    .remaining("observe target island readiness")?
+                    .min(Duration::from_secs(5)),
+            )?;
             ensure!(
                 target_island.status == 200,
                 "target island is not ready: {target_island:?}"
             );
-            let source_user = context.mysql_user().to_string();
-            let source_port = context.mysql_port();
-            let (sender, receiver) = mpsc::sync_channel(1);
-            thread::spawn(move || {
-                let result = (|| -> Result<Vec<i64>> {
-                    let mut connection =
-                        mysql_actor::connect(&source_user, source_port, Duration::from_secs(30))?;
-                    connection
-                        .query("SELECT sleep(2)")
-                        .context("run source pre-cutover query")
-                })();
-                let _ = sender.send(result);
-            });
-            thread::sleep(Duration::from_millis(200));
+            source = Some(compatibility_sql_intent::SourceQuery::start(
+                context,
+                self.source.take(0)?,
+            )?);
+            thread::sleep(
+                Duration::from_millis(200)
+                    .min(context.remaining("source cutover admission interval")?),
+            );
             context
                 .handle()
                 .begin_fe_drain()
                 .context("begin source FE drain after target island readiness")?;
-            let target_rows: Vec<i64> = mysql_actor::connect(
-                target.mysql_user(),
-                target.runtime().fe_mysql_port,
-                context.remaining("connect target post-cutover client")?,
-            )?
-            .query(BASELINE_QUERY)
-            .context("run new query on target island")?;
-            ensure!(
-                target_rows == vec![1, 2],
-                "target island query returned {target_rows:?}"
-            );
-            let source_rows = receiver
-                .recv_timeout(context.remaining("wait for source pre-cutover query")?)
-                .map_err(|error| {
-                    anyhow::anyhow!("source pre-cutover query did not finish: {error}")
-                })??;
-            ensure!(
-                source_rows.len() == 1,
-                "source pre-cutover query returned {source_rows:?}"
-            );
+            compatibility_sql_intent::run_peer_baseline(
+                &mut target,
+                self.target.take(0)?,
+                BASELINE_QUERY,
+                context.deadline(),
+            )?;
+            Ok(())
+        })();
+        // Even a target failure joins the original source before cleanup. FE
+        // session/process close invalidates its source observation on drain.
+        let source_exit = source.map_or(Ok(()), compatibility_sql_intent::SourceQuery::join);
+        let result = compatibility_sql_intent::combine(primary, source_exit).and_then(|()| {
             let deadline = context.deadline();
             context.handle().wait_fe_exit_until(deadline)?;
             context.action("target island became ready before source drain; new query went to target while source attempt completed locally");
             Ok(())
-        })();
+        });
         let cleanup = ServerHandle::shutdown(&mut target);
-        match (result, cleanup) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(error), Ok(())) => Err(error),
-            (Ok(()), Err(error)) => Err(error),
-            (Err(error), Err(cleanup)) => {
-                Err(error.context(format!("target cleanup also failed: {cleanup:#}")))
-            }
-        }
+        compatibility_sql_intent::combine(result, cleanup)
     }
 }
 
@@ -576,6 +743,47 @@ impl Scenario for IslandDrainAndReplacement {
             expected_eligible_backend_count: Some(2),
             ..Default::default()
         })
+    }
+
+    fn test_session_plan(
+        &self,
+        launch: &ScenarioLaunchConfig,
+        _: &std::path::Path,
+        cluster_size: usize,
+        _: &std::path::Path,
+        _: &std::path::Path,
+        _: Option<&std::path::Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        ensure!(
+            cluster_size == 3,
+            "compatibility observations require native 1FE+3BE"
+        );
+        let artifacts = launch
+            .resolved_artifacts
+            .as_ref()
+            .context("compatibility role artifacts were not resolved before freezing")?;
+        Ok(Some(
+            self.intent.freeze(
+                &artifacts.frontend,
+                &artifacts.backends,
+                Some((
+                    2,
+                    artifacts
+                        .compatible
+                        .as_deref()
+                        .context("compatibility replacement requires --compatible-binary")?,
+                )),
+                (0..3)
+                    .map(|_| CompatibilitySql {
+                        sql: BASELINE_QUERY.into(),
+                        backends: vec![2],
+                    })
+                    .collect(),
+                &[],
+                deadline,
+            )?,
+        ))
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -601,7 +809,7 @@ impl Scenario for IslandDrainAndReplacement {
             .context("replace OtherIsland BE with compatible binary")?;
         wait_for_eligible_count(context, 1)?;
         assert_base_and_island_readiness(context, 200, 200)?;
-        run_distributed_queries(context, &[2])?;
+        compatibility_sql_intent::run_baselines(context, &self.intent, BASELINE_QUERY, &[2])?;
         context.action("replaced the OtherIsland BE with a same-island binary and recovered distributed query admission");
         Ok(())
     }
@@ -641,6 +849,7 @@ fn assert_other_island_admission_cut(
                 value: backend.to_bytes().to_vec(),
             }),
         },
+        context.deadline(),
     )?;
     let admission_epoch_capability = heartbeat
         .admission_epoch_capability
@@ -658,6 +867,7 @@ fn assert_other_island_admission_cut(
             primary_compatibility_id,
             admission_epoch_capability,
         )],
+        context.deadline(),
     )?;
     let receipt = only_successful_receipt(response, "OtherIsland admission acquisition")?;
     ensure!(
@@ -706,6 +916,7 @@ fn assert_raw_ingress_hard_cuts(context: &mut ScenarioContext) -> Result<()> {
         "/novarocks.NovaRocksGrpc/ExchangeUnary",
         &authorization,
         exchange,
+        context.deadline(),
     )?;
     let status = exchange_response
         .status
@@ -910,12 +1121,23 @@ pub(super) fn raw_apply_task_operations(
     connector: &NativeEndpointConnector,
     authorization: &str,
     operations: Vec<proto::TaskOperation>,
+    deadline: std::time::Instant,
 ) -> Result<RawUnaryResponse<proto::ApplyTaskOperationsResponse>> {
-    raw_unary_response(
+    raw_apply_task_operations_until(connector, authorization, operations, deadline)
+}
+
+pub(super) fn raw_apply_task_operations_until(
+    connector: &NativeEndpointConnector,
+    authorization: &str,
+    operations: Vec<proto::TaskOperation>,
+    deadline: std::time::Instant,
+) -> Result<RawUnaryResponse<proto::ApplyTaskOperationsResponse>> {
+    raw_unary_response_until(
         connector,
         "/novarocks.NovaRocksGrpc/ApplyTaskOperations",
         authorization,
         proto::ApplyTaskOperationsRequest { operations },
+        deadline,
     )
 }
 
@@ -938,8 +1160,19 @@ pub(super) fn raw_unary<M: Message, R: Message + Default>(
     path: &str,
     authorization: &str,
     message: M,
+    deadline: std::time::Instant,
 ) -> Result<R> {
-    let response = raw_unary_response(&connector, path, authorization, message)?;
+    raw_unary_until(connector, path, authorization, message, deadline)
+}
+
+pub(super) fn raw_unary_until<M: Message, R: Message + Default>(
+    connector: NativeEndpointConnector,
+    path: &str,
+    authorization: &str,
+    message: M,
+    deadline: std::time::Instant,
+) -> Result<R> {
+    let response = raw_unary_response_until(&connector, path, authorization, message, deadline)?;
     ensure!(
         response.grpc_status == tonic::Code::Ok as u16,
         "raw RPC returned non-OK grpc-status={} message={:?}",
@@ -962,8 +1195,9 @@ pub(super) fn raw_unary_response<M: Message, R: Message + Default>(
     path: &str,
     authorization: &str,
     message: M,
+    deadline: std::time::Instant,
 ) -> Result<RawUnaryResponse<R>> {
-    raw_unary_response_with_hold(connector, path, authorization, message, None)
+    raw_unary_response_until(connector, path, authorization, message, deadline)
 }
 
 /// One explicit fixture-owned physical connection. Cloned clients multiplex
@@ -972,62 +1206,147 @@ pub(super) struct RawUnaryConnection {
     runtime: Arc<tokio::runtime::Runtime>,
     sender: Option<client::SendRequest<Bytes>>,
     driver: Option<tokio::task::JoinHandle<Result<(), h2::Error>>>,
+    close_failure: Option<String>,
+    original_deadline: Option<std::time::Instant>,
 }
 
 #[derive(Clone)]
 pub(super) struct RawUnaryClient {
     runtime: Arc<tokio::runtime::Runtime>,
     sender: client::SendRequest<Bytes>,
+    original_deadline: Option<std::time::Instant>,
 }
 
 impl RawUnaryConnection {
-    pub(super) fn connect(connector: &NativeEndpointConnector) -> Result<Self> {
+    pub(super) fn connect_until(
+        connector: &NativeEndpointConnector,
+        deadline: std::time::Instant,
+    ) -> Result<Self> {
+        Self::connect_with_deadline(connector, Some(deadline))
+    }
+    fn connect_with_deadline(
+        connector: &NativeEndpointConnector,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Self> {
+        if let Some(deadline) = deadline {
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "raw Native original connect deadline expired"
+            );
+        }
         let runtime = Arc::new(tokio::runtime::Runtime::new()?);
-        let (sender, driver) = runtime.block_on(async {
+        let connect = async {
             let stream = connector.connect().await.map_err(anyhow::Error::msg)?;
             let (sender, connection) = client::handshake(stream).await?;
             let driver = tokio::spawn(connection);
             Ok::<_, anyhow::Error>((sender, driver))
+        };
+        let (sender, driver) = runtime.block_on(async {
+            match deadline {
+                Some(deadline) => {
+                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), connect)
+                        .await
+                        .context("raw Native original TCP/TLS/H2 deadline expired")?
+                }
+                None => connect.await,
+            }
         })?;
-        Ok(Self {
+        let mut connection = Self {
             runtime,
             sender: Some(sender),
             driver: Some(driver),
-        })
+            close_failure: None,
+            original_deadline: deadline,
+        };
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            return combine_raw_cleanup(
+                Err(anyhow::anyhow!(
+                    "raw Native connection completed after its original deadline"
+                )),
+                connection.close(),
+            );
+        }
+        Ok(connection)
     }
 
     pub(super) fn client(&self) -> RawUnaryClient {
         RawUnaryClient {
             runtime: Arc::clone(&self.runtime),
             sender: self.sender.as_ref().expect("live raw H2 fixture").clone(),
+            original_deadline: self.original_deadline,
         }
     }
 
     /// Cancellation is explicit and joined: dropping a task handle alone would
     /// detach the IO driver and leave a physical closing generation alive.
-    pub(super) fn close(&mut self) {
+    pub(super) fn close(&mut self) -> Result<()> {
         drop(self.sender.take());
         if let Some(driver) = self.driver.take() {
             driver.abort();
-            let _ = self.runtime.block_on(driver);
+            let failure = match self.runtime.block_on(driver) {
+                Ok(Ok(())) => None,
+                Err(error) if error.is_cancelled() => None,
+                Ok(Err(error)) => Some(format!(
+                    "original raw Native H2 driver failed during actual join: {error}"
+                )),
+                Err(error) => Some(format!(
+                    "original raw Native H2 driver panicked during actual join: {error}"
+                )),
+            };
+            if failure.is_some() {
+                self.close_failure = failure;
+            }
+        }
+        match &self.close_failure {
+            Some(failure) => Err(anyhow::anyhow!(failure.clone())),
+            None => Ok(()),
         }
     }
 }
 
 impl Drop for RawUnaryConnection {
     fn drop(&mut self) {
-        self.close();
+        if let Err(error) = self.close() {
+            eprintln!("Raw Native actual exit failed: {error:#}");
+        }
     }
 }
 
 impl RawUnaryClient {
-    pub(super) fn response_with_hold<M: Message, R: Message + Default>(
+    pub(super) fn response_with_hold_until<M: Message, R: Message + Default>(
         &self,
         path: &str,
         authorization: &str,
         message: M,
         hold_token: Option<&str>,
+        original_deadline: std::time::Instant,
     ) -> Result<RawUnaryResponse<R>> {
+        self.response_with_deadline(
+            path,
+            authorization,
+            message,
+            hold_token,
+            Some(original_deadline),
+        )
+    }
+    fn response_with_deadline<M: Message, R: Message + Default>(
+        &self,
+        path: &str,
+        authorization: &str,
+        message: M,
+        hold_token: Option<&str>,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<RawUnaryResponse<R>> {
+        let deadline = match (self.original_deadline, deadline) {
+            (Some(original), Some(request)) => Some(original.min(request)),
+            (original, request) => original.or(request),
+        };
+        if let Some(deadline) = deadline {
+            ensure!(
+                std::time::Instant::now() < deadline,
+                "raw Native original request deadline expired"
+            );
+        }
         let mut payload = Vec::new();
         message.encode(&mut payload)?;
         let mut frame = Vec::with_capacity(payload.len() + 5);
@@ -1035,7 +1354,7 @@ impl RawUnaryClient {
         frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
         frame.extend_from_slice(&payload);
         let mut sender = self.sender.clone();
-        self.runtime.block_on(async move {
+        let response = async move {
             let mut request = Request::builder()
                 .method("POST")
                 .uri(path)
@@ -1091,23 +1410,70 @@ impl RawUnaryClient {
                 grpc_message: message,
                 message: decoded,
             })
-        })
+        };
+        let result = self.runtime.block_on(async move {
+            match deadline {
+                Some(deadline) => {
+                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), response)
+                        .await
+                        .context(
+                            "raw Native original ready/response/body/trailers deadline expired",
+                        )?
+                }
+                None => response.await,
+            }
+        })?;
+        ensure!(
+            deadline.is_none_or(|deadline| std::time::Instant::now() < deadline),
+            "raw Native response completed after its original deadline"
+        );
+        Ok(result)
     }
 }
 
-pub(super) fn raw_unary_response_with_hold<M: Message, R: Message + Default>(
+pub(super) fn raw_unary_response_until<M: Message, R: Message + Default>(
+    connector: &NativeEndpointConnector,
+    path: &str,
+    authorization: &str,
+    message: M,
+    original_deadline: std::time::Instant,
+) -> Result<RawUnaryResponse<R>> {
+    raw_unary_response_with_hold_until(
+        connector,
+        path,
+        authorization,
+        message,
+        None,
+        original_deadline,
+    )
+}
+pub(super) fn raw_unary_response_with_hold_until<M: Message, R: Message + Default>(
     connector: &NativeEndpointConnector,
     path: &str,
     authorization: &str,
     message: M,
     hold_token: Option<&str>,
+    original_deadline: std::time::Instant,
 ) -> Result<RawUnaryResponse<R>> {
-    // Preserve the single-request helper's default: one fresh connection, the
-    // same wire/status decode, and a joined driver before returning to caller.
-    let connection = RawUnaryConnection::connect(connector)?;
-    connection
-        .client()
-        .response_with_hold(path, authorization, message, hold_token)
+    let mut connection = RawUnaryConnection::connect_until(connector, original_deadline)?;
+    let primary = connection.client().response_with_hold_until(
+        path,
+        authorization,
+        message,
+        hold_token,
+        original_deadline,
+    );
+    combine_raw_cleanup(primary, connection.close())
+}
+
+pub(super) fn combine_raw_cleanup<T>(primary: Result<T>, cleanup: Result<()>) -> Result<T> {
+    match (primary, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(primary), Err(cleanup)) => {
+            anyhow::bail!("{primary:#}; raw Native actual exit: {cleanup:#}")
+        }
+        (Err(error), _) | (_, Err(error)) => Err(error),
+    }
 }
 
 fn grpc_status(headers: &http::HeaderMap) -> Option<u16> {
@@ -1210,6 +1576,61 @@ fn run_distributed_queries(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raw_driver_actual_exit_retains_failure_and_panic_across_repeated_close() {
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        for panic in [false, true] {
+            let driver = runtime.spawn(async move {
+                if panic {
+                    panic!("intentional raw driver regression panic");
+                }
+                Err(h2::Error::from(h2::Reason::INTERNAL_ERROR))
+            });
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while !driver.is_finished() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            });
+            let mut connection = RawUnaryConnection {
+                runtime: Arc::clone(&runtime),
+                sender: None,
+                driver: Some(driver),
+                close_failure: None,
+                original_deadline: Some(Instant::now() + Duration::from_secs(2)),
+            };
+            let original = connection.close().unwrap_err().to_string();
+            assert!(original.contains(if panic { "panicked" } else { "failed" }));
+            assert!(connection.driver.is_none());
+            assert_eq!(connection.close().unwrap_err().to_string(), original);
+            let combined = combine_raw_cleanup::<()>(
+                Err(anyhow::anyhow!("original RPC failed")),
+                connection.close(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(combined.contains("original RPC failed") && combined.contains(&original));
+        }
+    }
+    #[test]
+    fn raw_driver_cancellation_is_actually_joined_and_has_no_failure_verdict() {
+        let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+        let driver = runtime.spawn(std::future::pending::<Result<(), h2::Error>>());
+        let mut connection = RawUnaryConnection {
+            runtime,
+            sender: None,
+            driver: Some(driver),
+            close_failure: None,
+            original_deadline: Some(Instant::now() + Duration::from_secs(2)),
+        };
+        connection.close().unwrap();
+        assert!(connection.driver.is_none());
+        connection.close().unwrap();
+    }
+
     use super::*;
 
     #[test]

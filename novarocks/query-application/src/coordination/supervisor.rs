@@ -622,6 +622,10 @@ async fn run_logical_execution(
         frontend_process_id,
         &prepared.eligible_backends,
         &prepared.scheduling,
+        #[cfg(feature = "test-controls")]
+        prepared
+            .owner
+            .test_preferred_backend_process(initial_execution),
     ) {
         Ok(schedule) => schedule,
         Err(error) => {
@@ -1710,6 +1714,8 @@ async fn prepare_native_attempt(
         frontend_process_id,
         &prepared.eligible_backends,
         &prepared.scheduling,
+        #[cfg(feature = "test-controls")]
+        prepared.owner.test_preferred_backend_process(execution),
     )
     .map_err(|error| {
         QueryExecutionError::new(QueryExecutionErrorKind::Failed, error.to_string())
