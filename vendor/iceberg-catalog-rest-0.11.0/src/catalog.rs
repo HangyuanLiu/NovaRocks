@@ -27,8 +27,8 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 pub use extension::{
     DeferredRestTableMaterialization, DeferredRestTableWithAccessDelegation,
-    DeferredStagedTableCreateWithAccessDelegation, RestAccessDelegation, StagedCommitError,
-    StagedCreateError, StagedTableCreate, StorageCredentialDelegation,
+    DeferredStagedTableCreateWithAccessDelegation, RestAccessDelegation,
+    StorageCredentialDelegation,
 };
 use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};

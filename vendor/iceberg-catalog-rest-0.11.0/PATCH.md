@@ -107,35 +107,6 @@ source control; package content and dependency resolution remain reproducible.
 - Coverage: migrated `credential_refresh_uses_catalog_authentication_and_redacts_values`.
 - Validation: standalone REST crate tests after the shared Cargo window is free.
 
-### R2: authoritative staged-create result
-
-- Files: `src/catalog/extension.rs`, `src/catalog.rs`.
-- Purpose: retain StagedTableCreate and its table/initialization-update accessors
-  as the typed stage result; the unused untyped stage API is not restored.
-- Upstream status: no equivalent authoritative staged result at the baseline.
-- Production dependency: NovaRocks REST staged-create owner.
-- Exit: IRU-13a replaces the vendored staged-create protocol surface.
-- Coverage: authoritative staged-create component tests migrate with R3.
-- Validation: standalone REST crate tests after the shared Cargo window is free.
-
-### R3: typed staged-create and single publication dispatch
-
-- Files: `src/catalog/extension.rs`, `src/catalog.rs`.
-- Purpose: retain StagedCreateError/StagedCommitError and four typed public
-  stage/commit entrypoints, implemented on RestSessionCatalog and forwarded
-  from RestCatalog. Static stage still sends the access-delegation header;
-  caller-FileIO commit does not select a catalog-global storage capability.
-- Dispatch classification: client/request construction failure is undispatched;
-  query_catalog failure is possibly dispatched, including buffered body-read
-  failure (the deliberately accepted 0.11 difference); statuses preserve 0.9.
-- Upstream status: no equivalent typed dispatch-certainty surface at baseline.
-- Production dependency: NovaRocks REST CTAS staging and publication owner.
-- Exit: IRU-13a replaces typed protocol/evidence and single-dispatch surfaces.
-- Coverage: all retained typed stage/commit tests and authoritative staged
-  snapshot request test migrated; P8 V2/V3 format, snapshot-state refusal and
-  partition watermark tests preserved. Unused eager/extension helpers omitted.
-- Validation: standalone REST crate check/tests after the shared window is free.
-
 ### R10: response and credential diagnostics stay redacted
 
 - Files: `src/client.rs`, `src/auth/oauth2.rs`, `src/types.rs`.
