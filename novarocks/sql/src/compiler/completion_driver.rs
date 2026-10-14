@@ -2983,6 +2983,23 @@ mod tests {
         mode: super::super::SqlPhysicalEmissionMode,
         disable_preagg: bool,
     ) -> Result<SqlCompileProgress, super::super::SqlCompileProgressError> {
+        grouped_state_topn_sequence_fixture_with_options(sql, mode, disable_preagg, &[])
+    }
+
+    fn grouped_state_topn_sequence_fixture_with_observed_metrics(
+        sql: &str,
+        mode: super::super::SqlPhysicalEmissionMode,
+        additional_metrics: &[(&str, u64, f64, f64)],
+    ) -> Result<SqlCompileProgress, super::super::SqlCompileProgressError> {
+        grouped_state_topn_sequence_fixture_with_options(sql, mode, false, additional_metrics)
+    }
+
+    fn grouped_state_topn_sequence_fixture_with_options(
+        sql: &str,
+        mode: super::super::SqlPhysicalEmissionMode,
+        disable_preagg: bool,
+        additional_metrics: &[(&str, u64, f64, f64)],
+    ) -> Result<SqlCompileProgress, super::super::SqlCompileProgressError> {
         use arrow::datatypes::TimeUnit;
         use novarocks_types::schema::{ColumnDef, SqlType};
 
@@ -3095,7 +3112,10 @@ mod tests {
             ("c1", 10_801, 0.7430171321911873, 129.0),
             ("c2", 1, 1.230151323245117, 201.0),
             ("c3", 1, 1.230151323245117, 201.0),
-        ] {
+        ]
+        .into_iter()
+        .chain(additional_metrics.iter().copied())
+        {
             for (metric, value, source, nature) in [
                 (
                     StatisticsMetric::NullCount {
@@ -3171,33 +3191,46 @@ mod tests {
             .strip_prefix("USE ${case_db};")
             .expect("original query 140 selects its case namespace")
             .trim();
-        for mode in [
-            super::super::SqlPhysicalEmissionMode::OriginalNativeV1,
-            super::super::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
-        ] {
-            for (label, sql) in [
-                (
-                    "inner-140",
-                    "SELECT c9, COUNT(*) AS cnt FROM all_t0 GROUP BY c9 ORDER BY c9 LIMIT 100",
-                ),
-                ("original-140", original),
+        // A temporary SQL-owner diagnosis with no external resource. The
+        // historical lane replays the actual SHOW TABLE STATS observation
+        // from source 10a52a704; it does not assert the native query's winner.
+        // Keep the original Missing lane and independent legacy expectations.
+        let observed_c9 = [("c9", 2, 10.140857276181588, 30_002.0)];
+        let lanes: [(&str, &[(&str, u64, f64, f64)]); 2] =
+            [("Missing", &[]), ("HistoricalC9", &observed_c9)];
+        for (statistics, metrics) in lanes {
+            for mode in [
+                super::super::SqlPhysicalEmissionMode::OriginalNativeV1,
+                super::super::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
             ] {
-                println!("C28_DIAGNOSTIC_INPUT {mode:?} {label}: {sql}");
-                match grouped_state_topn_sequence_fixture(sql, mode) {
-                    Ok(SqlCompileProgress::Complete(completed)) => {
-                        println!(
-                            "C28_DIAGNOSTIC_COMPLETE {mode:?} {label}: {:#?}",
-                            completed.into_plan().plan()
-                        );
-                    }
-                    Ok(SqlCompileProgress::Incomplete(progress)) => {
-                        panic!(
-                            "original fixture left unresolved completion needs for {mode:?} {label}: {:?}",
-                            progress.needs()
-                        );
-                    }
-                    Err(error) => {
-                        println!("C28_DIAGNOSTIC_REFUSAL {mode:?} {label}: {error:#?}");
+                for (label, sql) in [
+                    (
+                        "inner-140",
+                        "SELECT c9, COUNT(*) AS cnt FROM all_t0 GROUP BY c9 ORDER BY c9 LIMIT 100",
+                    ),
+                    ("original-140", original),
+                ] {
+                    println!("C28_DIAGNOSTIC_INPUT {statistics} {mode:?} {label}: {sql}");
+                    match grouped_state_topn_sequence_fixture_with_observed_metrics(
+                        sql, mode, metrics,
+                    ) {
+                        Ok(SqlCompileProgress::Complete(completed)) => {
+                            println!(
+                                "C28_DIAGNOSTIC_COMPLETE {statistics} {mode:?} {label}: {:#?}",
+                                completed.into_plan().plan()
+                            );
+                        }
+                        Ok(SqlCompileProgress::Incomplete(progress)) => {
+                            panic!(
+                                "original fixture left unresolved completion needs for {statistics} {mode:?} {label}: {:?}",
+                                progress.needs()
+                            );
+                        }
+                        Err(error) => {
+                            println!(
+                                "C28_DIAGNOSTIC_REFUSAL {statistics} {mode:?} {label}: {error:#?}"
+                            );
+                        }
                     }
                 }
             }
