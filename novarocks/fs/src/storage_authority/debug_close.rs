@@ -107,8 +107,8 @@ impl TargetIntent {
     fn matches(&self, id: &StorageAuthorityId) -> bool {
         id.catalog().catalog_name() == &self.catalog
             && id.scope() == &self.scope
-            && matches!(id.capability(), AuthorityCapabilityPath::CredentialsEndpoint { principal, endpoint }
-                if principal == &self.principal && endpoint.as_ref() == self.endpoint.as_str())
+            && matches!(id.capability(), AuthorityCapabilityPath::CredentialsEndpoint { principal, routing }
+                if principal == &self.principal && routing.url() == self.endpoint.as_str())
     }
 }
 struct Inner {
