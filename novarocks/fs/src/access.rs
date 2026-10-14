@@ -4486,7 +4486,11 @@ mod tests {
                     .unwrap(),
                 AuthorityCapabilityPath::CredentialsEndpoint {
                     principal: StaticCredentialReference::try_new("executor", "v1").unwrap(),
-                    endpoint: Arc::from("http://127.0.0.1:1/v1/credentials"),
+                    routing: novarocks_spi::connector::CredentialRoutingContext::try_new(
+                        "http://127.0.0.1:1/v1/credentials",
+                        [],
+                    )
+                    .unwrap(),
                 },
             ),
             Arc::new(CatalogUnreachableSource),

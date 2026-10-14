@@ -131,17 +131,27 @@ fn principal(generation: &str) -> StaticCredentialReference {
     StaticCredentialReference::try_new("vending", generation).expect("credential reference")
 }
 
+fn routing(url: &str, headers: &[(&str, &str)]) -> CredentialRoutingContext {
+    CredentialRoutingContext::try_new(
+        url,
+        headers
+            .iter()
+            .map(|(name, value)| (Arc::from(*name), Arc::from(*value))),
+    )
+    .expect("routing context")
+}
+
 fn endpoint_capability(url: &str) -> AuthorityCapabilityPath {
     AuthorityCapabilityPath::CredentialsEndpoint {
         principal: principal("g1"),
-        endpoint: Arc::from(url),
+        routing: routing(url, &[]),
     }
 }
 
 fn endpoint_capability_as(generation: &str, url: &str) -> AuthorityCapabilityPath {
     AuthorityCapabilityPath::CredentialsEndpoint {
         principal: principal(generation),
-        endpoint: Arc::from(url),
+        routing: routing(url, &[]),
     }
 }
 
@@ -267,7 +277,7 @@ fn a_coordinator_and_an_execution_node_never_share_one_authority() {
         scope,
         AuthorityCapabilityPath::CredentialsEndpoint {
             principal: StaticCredentialReference::try_new("executor", "v1").unwrap(),
-            endpoint: Arc::from("https://catalog/credentials"),
+            routing: routing("https://catalog/credentials", &[]),
         },
     );
 
@@ -1029,6 +1039,91 @@ fn a_different_scope_is_a_different_authority() {
 
     assert!(!Arc::ptr_eq(&a, &b));
     assert_eq!(registry.metrics().resident, 2);
+}
+
+#[test]
+fn a_different_route_over_the_same_scope_is_a_different_authority() {
+    // IRU-13a L15: the routing context decides which service and catalog an
+    // acquisition reaches, so two routes are two capabilities even when the
+    // scope, catalog and principal agree.
+    let now = Instant::now();
+    let (registry, _executor) = registry();
+    let url = "https://catalog/v1/p1/namespaces/sales/tables/orders";
+    let load_table = |routing: CredentialRoutingContext| {
+        StorageAuthorityId::new(
+            catalog("lake"),
+            prefix("s3://warehouse/sales/orders/"),
+            AuthorityCapabilityPath::LoadTableDelegation {
+                principal: principal("g1"),
+                routing,
+                namespace: Arc::from("sales"),
+                table: Arc::from("orders"),
+                table_uuid: Arc::from("8f1d0c6e-0000-4000-8000-000000000001"),
+            },
+        )
+    };
+    let endpoint = |routing: CredentialRoutingContext| {
+        StorageAuthorityId::new(
+            catalog("lake"),
+            prefix("s3://warehouse/sales/orders/"),
+            AuthorityCapabilityPath::CredentialsEndpoint {
+                principal: principal("g1"),
+                routing,
+            },
+        )
+    };
+    let base = routing(url, &[("x-project-id", "p1"), ("polaris-realm", "r1")]);
+    for (make, label) in [
+        (
+            &load_table as &dyn Fn(CredentialRoutingContext) -> StorageAuthorityId,
+            "load-table",
+        ),
+        (&endpoint, "credentials-endpoint"),
+    ] {
+        let id = make(base.clone());
+        // The same route assembled in another header order is the same key.
+        assert_eq!(
+            id,
+            make(routing(
+                url,
+                &[("polaris-realm", "r1"), ("x-project-id", "p1")]
+            )),
+            "{label}: an equal route must key the same authority"
+        );
+        for other in [
+            routing(
+                "https://catalog/v1/p2/namespaces/sales/tables/orders",
+                &[("x-project-id", "p1"), ("polaris-realm", "r1")],
+            ),
+            routing(url, &[("x-project-id", "p2"), ("polaris-realm", "r1")]),
+            routing(
+                url,
+                &[
+                    ("x-project-id", "p1"),
+                    ("polaris-realm", "r1"),
+                    ("x-region", "eu"),
+                ],
+            ),
+            routing(url, &[]),
+        ] {
+            let other = make(other);
+            assert_ne!(id, other, "{label}: a different route must not share a key");
+            let first = registry.authority(&id, now, empty_source);
+            let second = registry.authority(&other, now, empty_source);
+            assert!(
+                !Arc::ptr_eq(&first, &second),
+                "{label}: a different route must not share an authority"
+            );
+        }
+    }
+
+    // The key renders route header names only, never their values.
+    let rendered = format!(
+        "{:?}",
+        load_table(routing(url, &[("x-project-id", "value-canary")]))
+    );
+    assert!(rendered.contains("x-project-id"), "{rendered}");
+    assert!(!rendered.contains("value-canary"), "{rendered}");
 }
 
 #[test]

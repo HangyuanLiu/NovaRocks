@@ -286,7 +286,11 @@ mod tests {
             AuthorityCapabilityPath::CredentialsEndpoint {
                 principal: StaticCredentialReference::try_new("vending", "g1")
                     .expect("vending principal"),
-                endpoint: Arc::from("https://catalog.example/credentials"),
+                routing: novarocks_spi::connector::CredentialRoutingContext::try_new(
+                    "https://catalog.example/credentials",
+                    [],
+                )
+                .expect("routing context"),
             },
         );
         let source = Arc::new(CountingSource {

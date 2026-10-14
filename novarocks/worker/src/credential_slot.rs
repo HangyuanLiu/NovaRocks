@@ -177,8 +177,9 @@ mod tests {
     use super::QueryContextCredentialSlot;
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorInstanceId, CredentialLeaseDescriptor,
-        CredentialLeaseId, CredentialLeaseProvider, CredentialRenewalPath, StorageAccessDomainId,
-        StorageAccessRequest, StorageCredentialScopePrefix,
+        CredentialLeaseId, CredentialLeaseProvider, CredentialRenewalPath,
+        CredentialRoutingContext, StorageAccessDomainId, StorageAccessRequest,
+        StorageCredentialScopePrefix,
     };
 
     fn owner() -> CatalogHandle {
@@ -200,6 +201,11 @@ mod tests {
         announcing_lease(seed, epoch, prefixes, None)
     }
 
+    fn routing(url: &str) -> CredentialRoutingContext {
+        CredentialRoutingContext::try_new(url, [(Arc::from("x-project-id"), Arc::from("p1"))])
+            .expect("legal routing context")
+    }
+
     fn announcing_lease(
         seed: u8,
         epoch: u64,
@@ -216,8 +222,7 @@ mod tests {
             // execution node acquires its own material and never reads it.
             1,
             true,
-            endpoint
-                .map(|endpoint| CredentialRenewalPath::CredentialsEndpoint(Arc::from(endpoint))),
+            endpoint.map(|endpoint| CredentialRenewalPath::CredentialsEndpoint(routing(endpoint))),
             StorageAccessDomainId::from_bytes([8; 32]),
         )
         .expect("legal descriptor")
@@ -247,11 +252,14 @@ mod tests {
         let announcing = slot
             .resolve_vended_s3(&request("s3://bucket/a/x"))
             .expect("selection");
-        assert!(matches!(
+        // The whole routing context travels, headers included: the consumer
+        // must reach the catalog the coordinator observed (IRU-13a L15).
+        assert_eq!(
             announcing.renewal_path(),
-            Some(CredentialRenewalPath::CredentialsEndpoint(endpoint))
-                if endpoint.as_ref() == "https://rest/v1/a/credentials"
-        ));
+            Some(&CredentialRenewalPath::CredentialsEndpoint(routing(
+                "https://rest/v1/a/credentials"
+            )))
+        );
 
         // Absence is the seeded-without-renewal shape, and it must stay
         // distinguishable from the announcing lease installed beside it.

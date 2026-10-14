@@ -72,6 +72,18 @@ impl NovaRocksCatalogFactory {
     }
 
     #[cfg(test)]
+    pub(crate) fn adopt_vended_rest_for_test(
+        endpoints: Arc<crate::rest_protocol::endpoints::RestEndpoints>,
+        warehouse: &str,
+    ) -> Arc<dyn NovaRocksCatalog> {
+        Arc::new(super::rest::NovaRocksRestCatalog::new(
+            endpoints,
+            Some(Arc::from(warehouse)),
+            crate::catalog_runtime::RestAccessDelegationMode::Vended,
+        ))
+    }
+
+    #[cfg(test)]
     pub(crate) fn adopt_recording_hadoop_for_test(
         client: Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>,
         vendored_client: Arc<dyn crate::iceberg::Catalog>,

@@ -800,9 +800,10 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         // A replacement must name the incarnation it was produced from.
         let uuid = requirements
             .iter()
-            .find_map(|requirement| match requirement {
-                crate::iceberg::ViewRequirement::UuidMatch { uuid } => Some(*uuid),
-            });
+            .map(|requirement| match requirement {
+                crate::iceberg::ViewRequirement::UuidMatch { uuid } => *uuid,
+            })
+            .next();
         let commit = crate::iceberg::ViewCommit::builder()
             .ident(ident)
             .requirements(requirements)

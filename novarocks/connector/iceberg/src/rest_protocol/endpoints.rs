@@ -72,6 +72,9 @@ pub(crate) struct RestEndpoints {
     /// which never materializes with a catalog-global FileIO.
     storage_factory: Option<Arc<dyn StorageFactory>>,
     declared_routing_headers: BTreeSet<String>,
+    /// Whether the catalog definition declares the execution nodes'
+    /// `DataCredentialVending` identity (L25).
+    vending_declared: bool,
 }
 
 impl fmt::Debug for RestEndpoints {
@@ -101,6 +104,7 @@ impl RestEndpoints {
         runtime: Runtime,
         storage_factory: Option<Arc<dyn StorageFactory>>,
         declared_routing_headers: BTreeSet<String>,
+        vending_declared: bool,
     ) -> Self {
         Self {
             upstream,
@@ -109,7 +113,30 @@ impl RestEndpoints {
             runtime,
             storage_factory,
             declared_routing_headers,
+            vending_declared,
         }
+    }
+
+    /// The binding of an already established session, without establishing
+    /// one. A vended lease is formed only after a NovaRocks read on this
+    /// session, so its binding always exists by then.
+    pub(crate) fn established_binding(&self) -> Option<Arc<SessionBinding>> {
+        self.gate.ready()
+    }
+
+    /// The admission facts every routing context of this generation is
+    /// checked against (L25).
+    pub(crate) fn route_admission(&self) -> crate::rest_protocol::routing::RouteAdmission<'_> {
+        crate::rest_protocol::routing::RouteAdmission {
+            vending_declared: self.vending_declared,
+            declared_headers: &self.declared_routing_headers,
+        }
+    }
+
+    /// Whether this generation vends storage credentials (it has no
+    /// catalog-global storage factory).
+    pub(crate) fn is_vended(&self) -> bool {
+        self.storage_factory.is_none()
     }
 
     /// A FileIO from the static generation's storage factory, or `None` in
@@ -428,6 +455,84 @@ impl RestEndpoints {
                 "Iceberg REST {operation} failed without a response ({cause:?})"
             ))),
         }
+    }
+}
+
+/// An execution node's acquisition along a frozen routing context (spec 5.4).
+///
+/// It never opens a session: no `/v1/config`, no address of its own. The
+/// request carries the protocol headers, the routing headers, the delegation
+/// header on the load-table path, and the node's own `Authorization`. Only the
+/// table UUID (load-table path) and `storage-credentials` are decoded. Every
+/// request-layer failure is retryable before progress (L17).
+pub(crate) async fn acquire_routed(
+    owner: &RestAuthOwner,
+    routing: &novarocks_spi::connector::CredentialRoutingContext,
+    load_table: bool,
+) -> Result<(Option<String>, RestDelegation), ConnectorError> {
+    const OPERATION: &str = "execution-node credential acquisition";
+    let mut headers = crate::rest_protocol::binding::protocol_headers();
+    for header in routing.headers() {
+        let name = reqwest::header::HeaderName::from_bytes(header.name().as_bytes());
+        let value = HeaderValue::from_str(header.value());
+        let (Ok(name), Ok(value)) = (name, value) else {
+            return Err(unavailable(format!(
+                "Iceberg REST {OPERATION} has an unusable routing header"
+            )));
+        };
+        headers.insert(name, value);
+    }
+    if load_table {
+        headers.insert(
+            crate::rest_protocol::binding::X_ICEBERG_ACCESS_DELEGATION,
+            VENDED_CREDENTIALS,
+        );
+    }
+    owner.authorize(&mut headers).await.map_err(|failure| {
+        retryable(unavailable(format!(
+            "Iceberg REST {OPERATION} failed: no catalog token ({:?})",
+            failure.step
+        )))
+    })?;
+    let (stage, body) = owner
+        .http()
+        .send_once(
+            Ok(RestRequest::new(
+                Method::GET,
+                routing.url().to_string(),
+                headers,
+            )),
+            &[200],
+            &RequestContext::default(),
+        )
+        .await;
+    let body = match (stage, body) {
+        (DispatchStage::Status { .. }, Some(body)) => body,
+        (DispatchStage::Status { code, .. }, None) => {
+            return Err(retryable(status_error(OPERATION, code)));
+        }
+        (DispatchStage::NotWritten(cause), _) => {
+            return Err(retryable(unavailable(format!(
+                "Iceberg REST {OPERATION} failed before the request was written ({cause:?})"
+            ))));
+        }
+        (DispatchStage::WrittenNoStatus(cause), _) => {
+            return Err(retryable(unavailable(format!(
+                "Iceberg REST {OPERATION} failed without a response ({cause:?})"
+            ))));
+        }
+    };
+    if load_table {
+        let view = scan_body(OPERATION, body, BackendAcquisitionSink::new())
+            .await
+            .map_err(retryable)?;
+        let (uuid, credentials) = view.into_parts();
+        Ok((uuid, RestDelegation::new(credentials)))
+    } else {
+        let view = scan_body(OPERATION, body, CredentialsSink::new())
+            .await
+            .map_err(retryable)?;
+        Ok((None, RestDelegation::new(view.into_credentials())))
     }
 }
 

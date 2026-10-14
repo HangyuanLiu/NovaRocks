@@ -914,8 +914,8 @@ mod tests {
     use novarocks_proto_codec::lifecycle::encode_credential_lease_descriptor;
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorInstanceId, CredentialLeaseDescriptor,
-        CredentialLeaseId, CredentialLeaseProvider, StorageAccessDomainId,
-        StorageCredentialScopePrefix,
+        CredentialLeaseId, CredentialLeaseProvider, CredentialRenewalPath,
+        CredentialRoutingContext, StorageAccessDomainId, StorageCredentialScopePrefix,
     };
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
@@ -969,6 +969,68 @@ mod tests {
             )
             .expect("descriptor"),
         )
+    }
+
+    /// One announcement whose endpoint path carries `headers` in the order given.
+    fn routed_credential(url: &str, headers: &[(&str, &str)]) -> WireCredential {
+        let routing = CredentialRoutingContext::try_new(
+            url,
+            headers
+                .iter()
+                .map(|(name, value)| (std::sync::Arc::from(*name), std::sync::Arc::from(*value))),
+        )
+        .expect("routing context");
+        let descriptor = encode_credential_lease_descriptor(
+            &CredentialLeaseDescriptor::try_new(
+                CredentialLeaseId::try_from_bytes([1; 16]).expect("lease"),
+                3,
+                CatalogHandle::new(
+                    ConnectorInstanceId::parse("warehouse").expect("instance"),
+                    CatalogVersion::from_bytes([7; 32]),
+                ),
+                CredentialLeaseProvider::S3,
+                vec![
+                    StorageCredentialScopePrefix::try_from_normalized("s3://bucket/orders")
+                        .expect("prefix"),
+                ],
+                99,
+                true,
+                Some(CredentialRenewalPath::CredentialsEndpoint(routing)),
+                StorageAccessDomainId::from_bytes([8; 32]),
+            )
+            .expect("descriptor"),
+        );
+        WireCredential::decode(&[descriptor], FieldPath::root("credential"))
+            .expect("legal rotation")
+    }
+
+    #[test]
+    fn the_routing_context_takes_part_in_the_replay_comparison() {
+        // The coordinator may assemble the same headers in any order; the
+        // canonical encoding makes that one announcement, so a replay is
+        // idempotent rather than a conflict.
+        let url = "https://rest/v1/p1/credentials";
+        let installed = routed_credential(url, &[("x-project-id", "p1"), ("polaris-realm", "r1")]);
+        assert!(installed.matches(&routed_credential(
+            url,
+            &[("polaris-realm", "r1"), ("x-project-id", "p1")],
+        )));
+
+        // A different routing fact at the same epoch is a different
+        // acquisition, which the protocol must call a conflict. Each variant
+        // keeps the encoded length so size cannot decide.
+        for different in [
+            routed_credential(url, &[("x-project-id", "p2"), ("polaris-realm", "r1")]),
+            routed_credential(url, &[("x-project-ix", "p1"), ("polaris-realm", "r1")]),
+            routed_credential(
+                "https://rest/v1/p2/credentials",
+                &[("x-project-id", "p1"), ("polaris-realm", "r1")],
+            ),
+        ] {
+            assert_eq!(installed.encoded_len(), different.encoded_len());
+            assert!(!installed.matches(&different));
+        }
+        assert!(!installed.matches(&routed_credential(url, &[("x-project-id", "p1")])));
     }
 
     /// Two announcements differing only in scope, at equal encoded length.

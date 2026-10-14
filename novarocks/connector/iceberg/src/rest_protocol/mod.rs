@@ -28,6 +28,8 @@
 //! `http` depends only on the observation types in `evidence`; endpoint and
 //! mutation modules compose the rest. The upstream REST crate appears only in
 //! the auth owner, the upstream boundary and the transitional adapter.
+//!
+//! Design: ADR-0175 (docs/adr/ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md)
 
 pub(crate) mod adapter;
 pub(crate) mod attempt;

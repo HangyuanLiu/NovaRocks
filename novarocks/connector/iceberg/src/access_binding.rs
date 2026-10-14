@@ -162,6 +162,11 @@ pub struct IcebergReadBinding {
     /// always absent on an execution node: the backend projection of a
     /// catalog definition never carries this binding.
     catalog_control_reference: Option<StaticCredentialReference>,
+    /// Whether the catalog definition declares a `DataCredentialVending`
+    /// identity for its execution nodes. A fact of the definition, not of this
+    /// binding's purpose: the coordinator binds for metadata access yet must
+    /// still know whether execution nodes can acquire (L25).
+    data_credential_vending_declared: bool,
     request_context: Option<ConnectorRequestContext>,
     /// The bridge this role drives its own catalog calls on.
     ///
@@ -214,6 +219,7 @@ impl IcebergReadBinding {
             credential_purpose: CatalogCredentialPurpose::ObjectStoreData,
             storage_access: None,
             catalog_control_reference: None,
+            data_credential_vending_declared: false,
             request_context: None,
             catalog_runtime: None,
         }
@@ -232,6 +238,7 @@ impl IcebergReadBinding {
             credential_purpose: CatalogCredentialPurpose::ObjectStoreData,
             storage_access: None,
             catalog_control_reference: None,
+            data_credential_vending_declared: false,
             request_context: None,
             catalog_runtime: None,
         }
@@ -250,6 +257,7 @@ impl IcebergReadBinding {
             credential_purpose: CatalogCredentialPurpose::ObjectStoreMetadata,
             storage_access: None,
             catalog_control_reference: None,
+            data_credential_vending_declared: false,
             request_context: None,
             catalog_runtime: None,
         }
@@ -364,6 +372,7 @@ impl IcebergReadBinding {
             credential_purpose,
             storage_access: Some(storage_access),
             catalog_control_reference: catalog_control_reference(properties),
+            data_credential_vending_declared: vending_reference(properties).is_some(),
             request_context: None,
             catalog_runtime: None,
         })
@@ -387,6 +396,12 @@ impl IcebergReadBinding {
             range_service: self.range_service.clone(),
             ..bound
         })
+    }
+
+    /// Whether the catalog this binding was bound for declares a
+    /// `DataCredentialVending` identity for its execution nodes.
+    pub(crate) fn declares_data_credential_vending(&self) -> bool {
+        self.data_credential_vending_declared
     }
 
     /// Resolve the coordinator identity that authenticates this catalog's
@@ -480,6 +495,7 @@ impl IcebergReadBinding {
             credential_purpose: CatalogCredentialPurpose::ObjectStoreData,
             storage_access: Some(storage_access),
             catalog_control_reference: None,
+            data_credential_vending_declared: false,
             request_context: None,
             catalog_runtime: None,
         }
@@ -499,6 +515,7 @@ impl IcebergReadBinding {
             credential_purpose: self.credential_purpose,
             storage_access: self.storage_access.clone(),
             catalog_control_reference: self.catalog_control_reference.clone(),
+            data_credential_vending_declared: self.data_credential_vending_declared,
             request_context: Some(request_context),
             catalog_runtime: self.catalog_runtime.clone(),
         }
@@ -1064,17 +1081,19 @@ impl VendedRenewalIdentity {
     /// clients and must not share a provider-pool entry (CAD-1 D0, D7).
     fn capability_path(&self) -> AuthorityCapabilityPath {
         match &self.path {
-            crate::execution_authority::ExecutionNodeAcquisitionPath::CredentialsEndpoint(
-                endpoint,
-            ) => AuthorityCapabilityPath::CredentialsEndpoint {
+            crate::execution_authority::ExecutionNodeAcquisitionPath::CredentialsEndpoint {
+                routing,
+            } => AuthorityCapabilityPath::CredentialsEndpoint {
                 principal: self.reference.clone(),
-                endpoint: Arc::clone(endpoint),
+                routing: routing.clone(),
             },
             crate::execution_authority::ExecutionNodeAcquisitionPath::LoadTableDelegation {
+                routing,
                 table,
                 expected_table_uuid,
             } => AuthorityCapabilityPath::LoadTableDelegation {
                 principal: self.reference.clone(),
+                routing: routing.clone(),
                 namespace: Arc::from(table.namespace().to_url_string().as_str()),
                 table: Arc::from(table.name()),
                 table_uuid: Arc::from(expected_table_uuid.to_string().as_str()),
@@ -1316,8 +1335,16 @@ mod tests {
         .expect("catalog properties")
     }
 
+    fn routing(url: &str) -> novarocks_spi::connector::CredentialRoutingContext {
+        novarocks_spi::connector::CredentialRoutingContext::try_new(
+            url,
+            [(Arc::from("x-tenant"), Arc::from("t1"))],
+        )
+        .expect("routing context")
+    }
+
     fn endpoint_path() -> CredentialRenewalPath {
-        CredentialRenewalPath::CredentialsEndpoint(Arc::from("https://rest/v1/credentials"))
+        CredentialRenewalPath::CredentialsEndpoint(routing("https://rest/v1/credentials"))
     }
 
     /// A resolver that answers the vending question the way one exact role
@@ -1435,8 +1462,8 @@ mod tests {
         assert_eq!(renewal.reference, reference);
         assert!(matches!(
             renewal.capability_path(),
-            AuthorityCapabilityPath::CredentialsEndpoint { endpoint, .. }
-                if endpoint.as_ref() == "https://rest/v1/credentials"
+            AuthorityCapabilityPath::CredentialsEndpoint { routing: route, .. }
+                if route == routing("https://rest/v1/credentials")
         ));
     }
 
@@ -1477,14 +1504,15 @@ mod tests {
             true,
         );
         let reference = StaticCredentialReference::try_new("executor", "v1").expect("reference");
-        let announced = CredentialRenewalPath::LoadTableDelegation(
-            novarocks_spi::connector::CredentialLoadTableDelegation::try_new(
+        let announced = CredentialRenewalPath::LoadTableDelegation {
+            routing: routing("https://rest/v1/namespaces/sales%1Feu/tables/orders"),
+            table: novarocks_spi::connector::CredentialLoadTableDelegation::try_new(
                 vec![Arc::from("sales"), Arc::from("eu")],
                 Arc::from("orders"),
                 Arc::from("8f1d0c6e-0000-4000-8000-000000000001"),
             )
             .expect("delegation"),
-        );
+        };
 
         let renewal = binding
             .vended_renewal_identity(Some(&reference), Some(&announced))
@@ -1493,11 +1521,16 @@ mod tests {
         match renewal.capability_path() {
             AuthorityCapabilityPath::LoadTableDelegation {
                 principal,
+                routing: route,
                 namespace,
                 table,
                 table_uuid,
             } => {
                 assert_eq!(principal, reference);
+                assert_eq!(
+                    route,
+                    routing("https://rest/v1/namespaces/sales%1Feu/tables/orders")
+                );
                 // The canonical Iceberg multi-level separator, not a dot: a
                 // level may contain a dot, and a key that joined on one would
                 // make two different namespaces the same authority.
@@ -1522,14 +1555,15 @@ mod tests {
             }),
             true,
         );
-        let announced = CredentialRenewalPath::LoadTableDelegation(
-            novarocks_spi::connector::CredentialLoadTableDelegation::try_new(
+        let announced = CredentialRenewalPath::LoadTableDelegation {
+            routing: routing("https://rest/v1/namespaces/sales/tables/orders"),
+            table: novarocks_spi::connector::CredentialLoadTableDelegation::try_new(
                 vec![Arc::from("sales")],
                 Arc::from("orders"),
                 Arc::from("not-a-uuid"),
             )
             .expect("delegation"),
-        );
+        };
 
         let error = binding
             .vended_renewal_identity(
@@ -1563,7 +1597,7 @@ mod tests {
             scope,
             AuthorityCapabilityPath::CredentialsEndpoint {
                 principal: StaticCredentialReference::try_new("executor", "v1").expect("reference"),
-                endpoint: Arc::from("https://rest/v1/credentials"),
+                routing: routing("https://rest/v1/credentials"),
             },
         );
         assert_ne!(seeded, acquiring);
@@ -1852,6 +1886,23 @@ mod catalog_control_tests {
             }
             other => panic!("unexpected control identity: {other:?}"),
         }
+    }
+
+    /// The coordinator binds for metadata access, yet still learns that its
+    /// execution nodes hold a vending identity: route admission (L25) reads
+    /// the definition, not the purpose this role bound for.
+    #[test]
+    fn the_coordinator_metadata_binding_reports_the_declared_vending_identity() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let template = IcebergReadBinding::with_static_metadata_credential_resolver(
+            resources(&runtime),
+            Arc::new(DefaultResolver),
+        );
+        assert!(!template.declares_data_credential_vending());
+        let bound = template
+            .bind_catalog(&rest_catalog_properties(false))
+            .expect("bound coordinator binding");
+        assert!(bound.declares_data_credential_vending());
     }
 
     #[test]

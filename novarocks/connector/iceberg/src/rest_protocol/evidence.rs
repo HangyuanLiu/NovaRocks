@@ -572,6 +572,7 @@ pub(crate) enum RestEvidence {
 ///
 /// `read` is consulted only when the status is the endpoint's success status
 /// and the endpoint has a response body.
+// Design: ADR-0175 (docs/adr/ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md)
 pub(crate) fn classify(
     stage: &DispatchStage,
     read: BodyRead<MutationView>,

@@ -57,6 +57,11 @@ const VENDED_METADATA_CREDENTIAL_NAME: &str = "native-trust-vended-metadata";
 const VENDED_METADATA_CREDENTIAL_GENERATION: &str = "v1";
 const VENDED_METADATA_ACCESS_KEY_ENV: &str = "NOVAROCKS_NATIVE_TRUST_METADATA_ACCESS_KEY_ID";
 const VENDED_METADATA_SECRET_KEY_ENV: &str = "NOVAROCKS_NATIVE_TRUST_METADATA_SECRET_ACCESS_KEY";
+/// Each execution node's own catalog identity: a vended read is admitted only
+/// when execution nodes can acquire storage credentials themselves (L25).
+const VENDED_EXECUTION_CREDENTIAL_NAME: &str = "native-trust-vended-execution";
+const VENDED_EXECUTION_CREDENTIAL_GENERATION: &str = "v1";
+const VENDED_EXECUTION_BEARER_ENV_PREFIX: &str = "NOVAROCKS_NATIVE_TRUST_EXECUTION_BEARER_BE_";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -418,13 +423,38 @@ access_key_id = "${{ENV:{VENDED_METADATA_ACCESS_KEY_ENV}}}"
 access_key_secret = "${{ENV:{VENDED_METADATA_SECRET_KEY_ENV}}}"
 "#
         );
+        let mut config_overlay = CrossProcessConfigOverlay {
+            fe: Some(metadata_registry),
+            ..Default::default()
+        };
+        for backend_index in 0..REQUIRED_BACKENDS {
+            let environment_name = format!("{VENDED_EXECUTION_BEARER_ENV_PREFIX}{backend_index}");
+            child_environment
+                .be_by_index
+                .entry(backend_index)
+                .or_default()
+                .insert(
+                    environment_name.clone(),
+                    format!("native-trust-execution-node-be-{backend_index}"),
+                );
+            config_overlay.be_by_index.insert(
+                backend_index,
+                format!(
+                    r#"
+[[connector.credentials]]
+purpose = "data-credential-vending"
+name = "{VENDED_EXECUTION_CREDENTIAL_NAME}"
+generation = "{VENDED_EXECUTION_CREDENTIAL_GENERATION}"
+kind = "iceberg-rest-bearer"
+token = "${{ENV:{environment_name}}}"
+"#
+                ),
+            );
+        }
         Ok(ScenarioLaunchConfig {
             native_trust_fixture: self.fixture.clone(),
             child_environment,
-            config_overlay: CrossProcessConfigOverlay {
-                fe: Some(metadata_registry),
-                ..Default::default()
-            },
+            config_overlay,
             ..Default::default()
         })
     }
@@ -446,7 +476,7 @@ access_key_secret = "${{ENV:{VENDED_METADATA_SECRET_KEY_ENV}}}"
         const CATALOG: &str = "vended_parity";
         connection
             .query_drop(format!(
-                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\")"
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")"
             ))
             .context("create real REST-vended catalog for Native transport parity")?;
 

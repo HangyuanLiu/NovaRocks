@@ -161,15 +161,18 @@ async fn build_rest_catalog_with_access_delegation(
     let identity = binding
         .resolve_catalog_control_identity()
         .map_err(|error| format!("resolve REST catalog-control identity: {error}"))?;
+    let binding_declares_vending = binding.declares_data_credential_vending();
     let storage_factory = match rest_access_delegation {
         RestAccessDelegationMode::Static => {
             Some(storage_factory(&configuration.warehouse_uri, binding))
         }
         RestAccessDelegationMode::Vended => None,
     };
+    let vending_declared = binding_declares_vending;
     assemble_rest_generation(
         properties,
         definition.server_routing_headers().clone(),
+        vending_declared,
         identity,
         storage_factory,
         runtime,
@@ -180,9 +183,11 @@ async fn build_rest_catalog_with_access_delegation(
 /// Assemble one REST generation from its already-validated persistent
 /// properties: the FE auth owner and the HTTP client are injected into the
 /// upstream client, and the NovaRocks endpoints share its session.
+// Design: ADR-0175 (docs/adr/ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md)
 async fn assemble_rest_generation(
     properties: HashMap<String, String>,
     declared_routing_headers: std::collections::BTreeSet<String>,
+    vending_declared: bool,
     identity: Option<crate::access_binding::IcebergRestAuthMaterial>,
     storage_factory: Option<Arc<dyn crate::iceberg::io::StorageFactory>>,
     runtime: crate::iceberg::Runtime,
@@ -218,6 +223,7 @@ async fn assemble_rest_generation(
         runtime,
         storage_factory,
         declared_routing_headers,
+        vending_declared,
     ));
     Ok(RestGeneration {
         upstream,
@@ -239,43 +245,16 @@ pub(crate) async fn build_vended_rest_generation_for_test(
     ),
     String,
 > {
-    let generation =
-        assemble_rest_generation(properties, Default::default(), identity, None, runtime).await?;
+    let generation = assemble_rest_generation(
+        properties,
+        Default::default(),
+        true,
+        identity,
+        None,
+        runtime,
+    )
+    .await?;
     Ok((generation.upstream, generation.endpoints))
-}
-
-/// Build a REST client from an already-assembled property map.
-///
-/// The execution node's credential acquisition owns its own property
-/// assembly: it joins the frozen non-secret catalog definition with a
-/// principal that only the role-local registry holds, and that join must not
-/// pass back through catalog configuration state (CAD-1 D1, D9).
-///
-/// `Vended` installs no warehouse storage factory, which is why this needs no
-/// access binding: the client speaks to the control plane only.
-pub(crate) async fn build_rest_catalog_from_properties(
-    properties: std::collections::HashMap<String, String>,
-    rest_access_delegation: RestAccessDelegationMode,
-    runtime: crate::iceberg::Runtime,
-) -> Result<crate::iceberg_catalog_rest::RestCatalog, String> {
-    use crate::iceberg::CatalogBuilder;
-    use crate::iceberg_catalog_rest::RestCatalogBuilder;
-
-    if rest_access_delegation != RestAccessDelegationMode::Vended {
-        return Err(
-            "REST client built from properties supports only vended access delegation".to_string(),
-        );
-    }
-    RestCatalogBuilder::default()
-        .with_runtime(runtime)
-        .with_client(
-            crate::rest_protocol::http::RestHttpClient::new()?
-                .reqwest_client()
-                .clone(),
-        )
-        .load("rest".to_string(), properties)
-        .await
-        .map_err(|error| format!("build REST iceberg catalog: {error}"))
 }
 
 pub async fn build_hms_catalog(

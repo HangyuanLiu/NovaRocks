@@ -197,6 +197,7 @@ pub(crate) type SessionGate = AttemptCell<Arc<SessionBinding>, AttemptFailure>;
 /// The establishment entry every NovaRocks request and every read through
 /// upstream passes first: returns the session binding, joining or starting
 /// one establishment attempt.
+// Design: ADR-0175 (docs/adr/ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md)
 pub(crate) async fn ensure_session(
     owner: &Arc<RestAuthOwner>,
     gate: &SessionGate,

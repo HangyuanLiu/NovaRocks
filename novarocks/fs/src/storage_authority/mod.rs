@@ -40,7 +40,8 @@ use std::time::{Duration, Instant};
 
 use novarocks_secret::SecretValue;
 use novarocks_spi::connector::{
-    CatalogHandle, StaticCredentialReference, StorageCredentialScopePrefix,
+    CatalogHandle, CredentialRoutingContext, StaticCredentialReference,
+    StorageCredentialScopePrefix,
 };
 use tokio::sync::watch;
 
@@ -69,19 +70,25 @@ pub use registry::{
 /// The refreshing identity lives inside the renewing variants rather than
 /// beside them: it carries no meaning without a path to refresh along, and a
 /// type that demanded one could not express a seeded authority at all.
+///
+/// Both renewing variants hold the coordinator's routing context by value:
+/// two routes are two acquisition capabilities, so they key two authorities.
+/// `Debug` stays derived because the routing context renders header names
+/// only; no routing header value reaches a diagnostic through this type.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum AuthorityCapabilityPath {
     /// Renew through the credentials endpoint the server advertised. The URL is
     /// never constructed by the client from a canonical spec path.
     CredentialsEndpoint {
         principal: StaticCredentialReference,
-        endpoint: Arc<str>,
+        routing: CredentialRoutingContext,
     },
     /// Renew through load-table delegation. The table identity is part of the
     /// capability: this path has to know which table to load, which is why it
     /// also belongs in the process-lived cache key (CAD-1 D10).
     LoadTableDelegation {
         principal: StaticCredentialReference,
+        routing: CredentialRoutingContext,
         namespace: Arc<str>,
         table: Arc<str>,
         table_uuid: Arc<str>,
@@ -104,6 +111,16 @@ impl AuthorityCapabilityPath {
     /// Whether this path can produce new material at all.
     pub const fn can_renew(&self) -> bool {
         !matches!(self, Self::SeededWithoutRenewal)
+    }
+
+    /// Where and with which public headers a refresh along this path is sent,
+    /// when there is one.
+    pub const fn routing(&self) -> Option<&CredentialRoutingContext> {
+        match self {
+            Self::CredentialsEndpoint { routing, .. }
+            | Self::LoadTableDelegation { routing, .. } => Some(routing),
+            Self::InProcessProvider | Self::SeededWithoutRenewal => None,
+        }
     }
 
     /// The identity a refresh along this path authenticates as, when there is
