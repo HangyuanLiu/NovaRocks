@@ -58,7 +58,7 @@ pub(crate) enum AggregateTopNBoundarySnapshot {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum AggregateTopNBoundaryError {
+pub enum AggregateTopNBoundaryError {
     UnsupportedKeyArity {
         actual: usize,
     },

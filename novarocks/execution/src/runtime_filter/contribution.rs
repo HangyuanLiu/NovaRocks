@@ -684,6 +684,13 @@ pub enum OrderedTupleError {
     ArityMismatch,
     TypeMismatch,
 }
+impl fmt::Display for OrderedTupleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The existing boundary shell already presents this original Debug.
+        fmt::Debug::fmt(self, f)
+    }
+}
+impl Error for OrderedTupleError {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TopKSummaryError {
     TooManyCandidates,

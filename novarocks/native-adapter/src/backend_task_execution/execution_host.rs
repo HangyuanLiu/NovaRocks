@@ -2366,7 +2366,8 @@ fn failure_cause_category(
         | ExecutionFailureCause::RequiredRow(_)
         | ExecutionFailureCause::InvocationData(_)
         | ExecutionFailureCause::ScalarInvocationData(_)
-        | ExecutionFailureCause::WindowInvocationData(_) => TaskFailureCategory::Execution,
+        | ExecutionFailureCause::WindowInvocationData(_)
+        | ExecutionFailureCause::RuntimeFilter(_) => TaskFailureCategory::Execution,
         ExecutionFailureCause::PreparationMetadata(cause) => match cause {
             novarocks_execution::runtime::preparation_metadata::PreparationMetadataFailure::Request(error) => metadata_request_category(error),
             novarocks_execution::runtime::preparation_metadata::PreparationMetadataFailure::Host(error) => preparation_memory_refusal_category(error),
@@ -5599,6 +5600,69 @@ pub(super) mod tests {
                 assert_eq!(failure.category(), expected);
                 assert_eq!(failure.phase(), TaskFailurePhase::Execution);
             }
+        }
+    }
+
+    /// Component-only nominal RF classification through the original reporter.
+    /// Misleading message words must not become a Kernel resource category.
+    #[test]
+    fn typed_failure_native_runtime_filter_reports_the_original_nominal_payload() {
+        use novarocks_execution::runtime::fragment::{ExecutionFailure, ExecutionFailureCause};
+        use novarocks_execution::runtime_filter::contribution::{
+            ContributionCodecError, OrderedTupleError,
+        };
+        use novarocks_execution::runtime_filter::{
+            AggregateTopNBoundaryError, RuntimeFilterContractViolation,
+            RuntimeFilterContractViolationKind, RuntimeFilterFailure,
+        };
+        use novarocks_execution_contract::task_execution::status::{
+            TaskFailurePhase, TerminationDetail,
+        };
+        let cases = [
+            RuntimeFilterFailure::Contract(RuntimeFilterContractViolation::new(
+                RuntimeFilterContractViolationKind::ContractMismatch,
+                "ResourceExhausted: kernel evaluation was cancelled",
+            )),
+            RuntimeFilterFailure::Boundary(AggregateTopNBoundaryError::BoundLoosened),
+            RuntimeFilterFailure::Tuple(OrderedTupleError::TypeMismatch),
+            RuntimeFilterFailure::Codec(ContributionCodecError::ResourceLimit),
+        ];
+        for (index, original) in cases.into_iter().enumerate() {
+            let failure: ExecutionFailure = original.clone().into();
+            assert_eq!(
+                failure.cause(),
+                &ExecutionFailureCause::RuntimeFilter(original.clone())
+            );
+            assert_eq!(
+                super::failure_cause_category(
+                    failure.cause(),
+                    TaskFailureCategory::ResourceExhausted
+                ),
+                TaskFailureCategory::Execution
+            );
+            let expected_detail = format!("fragment execution error (pipeline): {failure}");
+            let (owner, reporter) = reporter_for(identity(80_060 + index as i64, 1, 1));
+            reporter.running();
+            report_terminal(
+                &reporter,
+                FragmentSinkKind::Noop,
+                &terminal_fact(FragmentOutcome::Failed(
+                    FragmentExecutionError::from_failure(
+                        FragmentExecutionErrorKind::Pipeline,
+                        failure,
+                    ),
+                )),
+                None,
+            );
+            assert_eq!(owner.state(), TaskState::Failed);
+            assert!(owner.output_released());
+            let status = owner.current();
+            let Some(TerminationDetail::Failed(failure)) = status.termination() else {
+                panic!("original nominal failure must be terminal")
+            };
+            assert_eq!(failure.category(), TaskFailureCategory::Execution);
+            assert_eq!(failure.phase(), TaskFailurePhase::Execution);
+            assert_eq!(failure.detail().as_str(), expected_detail);
         }
     }
 

@@ -29,9 +29,12 @@ pub use novarocks_functions::FunctionValueType;
 
 pub mod contribution;
 pub mod evaluator;
+mod failure;
 pub mod feedback_domain;
 mod owned;
 pub mod row_group_domain;
+pub use crate::exec::operators::AggregateTopNBoundaryError;
+pub use failure::RuntimeFilterFailure;
 pub use owned::CanonicalContributionBytes;
 pub(crate) use owned::{OrderedTopNAllocationHost, OwnedUtf8OrderKey};
 
