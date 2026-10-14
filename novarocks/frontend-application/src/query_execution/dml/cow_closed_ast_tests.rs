@@ -242,3 +242,109 @@ fn every_generated_nonempty_slot_is_exact_and_empty_values_are_rejected() {
     assert!(measured > std::mem::size_of::<Query>() as u64);
     assert!(values(Vec::new(), "x", Vec::new()).is_err());
 }
+
+#[test]
+fn authored_variant_fields_keep_exact_cast_identity_and_prospective_heap() {
+    use super::super::cow_compile_receipt::type_footprint;
+    use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+    let physical = arrow::datatypes::Field::new("value", DataType::LargeBinary, true);
+    let variant = FunctionValueType::try_with_logical_type(
+        DataType::LargeBinary,
+        true,
+        ValueLogicalType::Variant,
+    )
+    .unwrap()
+    .try_to_field("value")
+    .unwrap();
+    for (field, expected) in [(physical, "VARBINARY"), (variant, "VARIANT")] {
+        let column: ArrayRef = Arc::new(LargeBinaryArray::from(vec![
+            Some(&b"\x00\xFF\x27"[..]),
+            None,
+        ]));
+        for row in 0..column.len() {
+            let literal = novarocks_sql::literal::literal_from_batch(&column, row).unwrap();
+            let literal_sql =
+                crate::query_execution::dml::iceberg_writer::literal_to_sql_for_arrow_type(
+                    &literal,
+                    column.data_type(),
+                )
+                .unwrap();
+            let old = crate::query_execution::dml::iceberg_writer::target_cast_expr_sql(
+                &literal_sql,
+                &novarocks_types::schema::ColumnDef::from_value_type(
+                    field.name().clone(),
+                    FunctionValueType::try_from_field(&field).unwrap(),
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let value = checked_value(column.as_ref(), row, &preflight, &|| Ok(())).unwrap();
+            let new = cast_field(value, &field).unwrap();
+            assert_eq!(novarocks_parser::printer::print_expr(&new), old);
+            assert!(old.ends_with(&format!(" AS {expected})")));
+        }
+        let name = field_type_name(&field).unwrap();
+        assert_eq!(
+            type_footprint::exact_field_type_heap(&field).unwrap(),
+            name.name.parts.capacity() as u64 * std::mem::size_of::<Ident>() as u64
+                + name.name.parts[0].value.capacity() as u64,
+        );
+    }
+    let invalid = arrow::datatypes::Field::new("value", DataType::Int64, true)
+        .with_metadata([("nr_logical_type".into(), "variant".into())].into());
+    assert!(field_type_name(&invalid).is_err());
+    assert!(type_footprint::exact_field_type_heap(&invalid).is_err());
+}
+
+#[test]
+fn declared_cow_field_types_preserve_original_caster_supported_intersection() {
+    use super::super::cow_compile_receipt::type_footprint;
+    use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+    let typed = |carrier, logical| {
+        FunctionValueType::try_with_logical_type(carrier, true, logical)
+            .unwrap()
+            .try_to_field("value")
+            .unwrap()
+    };
+    let fields = [
+        typed(DataType::FixedSizeBinary(16), ValueLogicalType::Physical),
+        typed(DataType::FixedSizeBinary(16), ValueLogicalType::LargeInt),
+        typed(DataType::Utf8, ValueLogicalType::Json),
+        typed(DataType::Binary, ValueLogicalType::Hll),
+        typed(DataType::Binary, ValueLogicalType::Bitmap),
+        typed(DataType::FixedSizeBinary(16), ValueLogicalType::Uuid),
+        typed(DataType::LargeBinary, ValueLogicalType::Object),
+        typed(DataType::Binary, ValueLogicalType::Percentile),
+        arrow::datatypes::Field::new(
+            "value",
+            DataType::List(Arc::new(typed(
+                DataType::LargeBinary,
+                ValueLogicalType::Variant,
+            ))),
+            true,
+        ),
+    ];
+    for field in fields {
+        let old = novarocks_types::schema::ColumnDef::from_value_type(
+            field.name().clone(),
+            FunctionValueType::try_from_field(&field).unwrap(),
+            None,
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|column| {
+            crate::query_execution::dml::iceberg_writer::target_cast_expr_sql("NULL", &column)
+        });
+        let new = cast_field(null(), &field);
+        match (old, new) {
+            (Ok(old), Ok(new)) => {
+                assert_eq!(novarocks_parser::printer::print_expr(&new), old);
+                assert!(type_footprint::exact_field_type_heap(&field).is_ok());
+            }
+            (Err(_), Err(_)) => assert!(type_footprint::exact_field_type_heap(&field).is_err()),
+            (old, new) => {
+                panic!("original/new COW cast support differs for {field:?}: {old:?}, {new:?}")
+            }
+        }
+    }
+}

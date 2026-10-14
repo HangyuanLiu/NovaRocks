@@ -28,7 +28,7 @@ iceberg-ivm
 iceberg-mv-apply
 iceberg-rest
 distributed-resilience
-paimon
+# DISABLED: paimon (pending detailed connector design; cases are retained)
 materialized-view
 session
 

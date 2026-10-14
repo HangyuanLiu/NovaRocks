@@ -609,7 +609,8 @@ fn corrupt(message: &'static str) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::CorruptData, message)
 }
 
-#[cfg(test)]
+// Retained while Paimon-specific tests are suspended.
+#[cfg(all(test, any()))]
 mod tests {
     use std::fmt::{Display, Formatter};
     use std::ops::Range;

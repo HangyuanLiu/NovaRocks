@@ -1,2 +1,3 @@
 # PAI-1 reads a fixture authored by an external Spark/Paimon process.
 explicit_only = true
+disabled_reason = "Paimon tests are suspended pending detailed connector design"

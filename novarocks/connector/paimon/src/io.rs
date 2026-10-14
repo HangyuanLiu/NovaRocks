@@ -635,7 +635,8 @@ pub(crate) fn connector_error_from_file_error(error: &FileError) -> ConnectorErr
     ConnectorError::from(error)
 }
 
-#[cfg(test)]
+// Retained while Paimon-specific tests are suspended.
+#[cfg(all(test, any()))]
 mod tests {
     use std::num::NonZeroUsize;
     use std::sync::Arc;

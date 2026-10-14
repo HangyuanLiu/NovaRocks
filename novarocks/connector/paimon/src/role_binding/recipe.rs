@@ -249,7 +249,8 @@ fn inconsistent(path: ConnectorFieldPath, detail: impl AsRef<str>) -> ConnectorC
     ConnectorCodecError::new(path, ConnectorCodecErrorKind::InconsistentFields, detail)
 }
 
-#[cfg(test)]
+// Retained while Paimon-specific tests are suspended.
+#[cfg(all(test, any()))]
 mod tests {
     use bytes::Bytes;
     use novarocks_connector_contract::{

@@ -94,7 +94,7 @@ fn selection_value_ast(
                 "COW selection field ordinal is out of bounds",
             ))?;
     let value = closed::checked_value(array.as_ref(), view.row_index(), &preflight, &check)?;
-    closed::cast(value, field.data_type())
+    closed::cast_field(value, field)
 }
 
 pub(super) fn build_cow_append_query_closed(
@@ -148,10 +148,7 @@ pub(super) fn build_cow_append_query_closed(
         let alias = closed::value_alias(ordinal)?;
         aliases.push(closed::ident(&alias, true)?);
         projection.push(closed::item(
-            closed::cast(
-                closed::column("__nr_values", &alias)?,
-                binding.field().data_type(),
-            )?,
+            closed::cast_field(closed::column("__nr_values", &alias)?, binding.field())?,
             binding.field().name(),
         )?);
     }
@@ -337,7 +334,7 @@ pub(super) fn build_cow_rewrite_query_closed(
             } => scan,
         };
         projection.push(closed::item(
-            closed::cast(expression, binding.field().data_type())?,
+            closed::cast_field(expression, binding.field())?,
             binding.field().name(),
         )?);
     }
@@ -689,7 +686,7 @@ fn preflight_signed_cell(
     target
         .selection_cast(
             value,
-            type_footprint::exact_type_heap(field.data_type()).map_err(map_footprint)?,
+            type_footprint::exact_field_type_heap(field).map_err(map_footprint)?,
         )
         .map_err(map_footprint)
 }

@@ -131,6 +131,12 @@ impl ScalarSchema {
     pub fn field(&self) -> &ScalarField {
         &self.field
     }
+    /// Refine the root nullability after lowering while preserving its semantic
+    /// type, native slot, and retained schema bounds.
+    pub fn with_nullability(mut self, nullable: bool) -> Self {
+        self.field.nullable = nullable;
+        self
+    }
     pub fn source_slot(&self) -> Option<u32> {
         self.source_slot
     }

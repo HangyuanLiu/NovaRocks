@@ -1981,7 +1981,8 @@ fn begin_cow_write_session(
         let mut data_fields = Vec::with_capacity(after_fields.len());
         for signed in after_fields {
             let source = signed.field();
-            data_fields.push(field(source.name(), source.data_type().clone(), source.is_nullable()));
+            // Preserve the provider-authored field identity, including logical metadata.
+            data_fields.push(ConnectorWriteFieldRequest::new(source.clone()));
         }
         let request = novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
             table: table_name,
@@ -2366,6 +2367,19 @@ fn ordered_route_inputs(
         .collect()
 }
 
+// The archived string builders remain an independent literal/caster/parser oracle.
+// Project the actual authored Field into that caster; recreating it from only
+// its Arrow carrier would erase logical metadata before the comparison.
+#[cfg(test)]
+fn cow_oracle_column(
+    field: &arrow::datatypes::Field,
+) -> Result<novarocks_types::schema::ColumnDef, String> {
+    let value_type = novarocks_type_contract::FunctionValueType::try_from_field(field)
+        .map_err(|error| error.to_string())?;
+    novarocks_types::schema::ColumnDef::from_value_type(field.name().clone(), value_type, None)
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 fn selection_value_sql(
     selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
@@ -2382,13 +2396,7 @@ fn selection_value_sql(
         .get(field_ordinal as usize)
         .ok_or_else(|| "COW selection field ordinal is out of bounds".to_string())?;
     let literal = literal_from_batch(array, view.row_index())?;
-    let column = novarocks_types::schema::ColumnDef {
-        name: field.name().to_string(),
-        data_type: field.data_type().clone(),
-        nullable: field.is_nullable(),
-        write_default: None,
-        logical_type: None,
-    };
+    let column = cow_oracle_column(field)?;
     let literal = crate::query_execution::dml::iceberg_writer::literal_to_sql_for_arrow_type(
         &literal,
         field.data_type(),
@@ -2449,13 +2457,7 @@ fn build_cow_append_query(
         .enumerate()
         .map(|(ordinal, binding)| {
             let field = binding.field();
-            let column = novarocks_types::schema::ColumnDef {
-                name: field.name().to_string(),
-                data_type: field.data_type().clone(),
-                nullable: field.is_nullable(),
-                write_default: None,
-                logical_type: None,
-            };
+            let column = cow_oracle_column(field)?;
             Ok(format!(
                 "{} AS {}",
                 crate::query_execution::dml::iceberg_writer::target_cast_expr_sql(
@@ -2645,13 +2647,7 @@ fn build_cow_rewrite_query(
                 ..
             } => scan_value,
         };
-        let column = novarocks_types::schema::ColumnDef {
-            name: field.name().to_string(),
-            data_type: field.data_type().clone(),
-            nullable: field.is_nullable(),
-            write_default: None,
-            logical_type: None,
-        };
+        let column = cow_oracle_column(field)?;
         select_items.push(format!(
             "{} AS {}",
             crate::query_execution::dml::iceberg_writer::target_cast_expr_sql(
@@ -5096,6 +5092,20 @@ mod tests {
         after_values: ArrayRef,
         value_type: DataType,
     ) -> CowRewriteQueryFixture {
+        cow_rewrite_query_fixture_with_value_field(
+            row_ids,
+            after_ids,
+            after_values,
+            arrow::datatypes::Field::new("after_value", value_type, true),
+        )
+    }
+
+    fn cow_rewrite_query_fixture_with_value_field(
+        row_ids: Vec<i64>,
+        after_ids: Vec<i64>,
+        after_values: ArrayRef,
+        value_field: arrow::datatypes::Field,
+    ) -> CowRewriteQueryFixture {
         use novarocks_spi::connector::{
             ConnectorInstanceId, ConnectorMutationEffectField, ConnectorMutationMatchContract,
             ConnectorMutationRouteInput, ConnectorMutationSourceField,
@@ -5154,7 +5164,7 @@ mod tests {
                 ),
                 ConnectorMutationTargetField::new(
                     value_token,
-                    arrow::datatypes::Field::new("after_value", value_type.clone(), true),
+                    value_field.clone().with_nullable(true),
                     3,
                 ),
             ],
@@ -5176,7 +5186,7 @@ mod tests {
                 arrow::datatypes::Field::new("match_key", DataType::Int64, false),
                 arrow::datatypes::Field::new("match_version", DataType::Int64, false),
                 arrow::datatypes::Field::new("after_id", DataType::Int64, false),
-                arrow::datatypes::Field::new("after_value", value_type.clone(), false),
+                value_field.clone().with_nullable(false),
             ])),
             ConnectorWriteTargetRef::main(),
             ConnectorRowMutationIntent::Update,
@@ -5191,7 +5201,7 @@ mod tests {
             arrow::datatypes::Field::new("match_key", DataType::Int64, false),
             arrow::datatypes::Field::new("match_version", DataType::Int64, false),
             arrow::datatypes::Field::new("after_id", DataType::Int64, true),
-            arrow::datatypes::Field::new("after_value", value_type.clone(), true),
+            value_field.clone().with_nullable(true),
             arrow::datatypes::Field::new("effect", DataType::Int8, false),
         ]));
         let selection_batch = RecordBatch::try_new(
@@ -5226,7 +5236,7 @@ mod tests {
                 ),
                 ConnectorWriteFieldBinding::new(
                     value_token,
-                    arrow::datatypes::Field::new("after_value", value_type.clone(), true),
+                    value_field.clone().with_nullable(true),
                 ),
             ],
             row_identity_fields: vec![
@@ -5269,7 +5279,7 @@ mod tests {
         .expect("rewrite route");
         let scan_schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("source_id", DataType::Int64, true),
-            arrow::datatypes::Field::new("source_value", value_type, true),
+            value_field.with_name("source_value").with_nullable(true),
             arrow::datatypes::Field::new("source_key", DataType::Int64, false),
             arrow::datatypes::Field::new("source_version", DataType::Int64, false),
         ]));
@@ -5640,13 +5650,20 @@ mod tests {
     #[test]
     fn cow_rewrite_query_casts_variant_values_payloads() {
         let payload = [0x0c_u8, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03];
-        let fixture = cow_rewrite_query_fixture(
+        let fixture = cow_rewrite_query_fixture_with_value_field(
             vec![7],
             vec![10],
             Arc::new(arrow::array::LargeBinaryArray::from_iter_values([
                 payload.as_slice()
             ])) as ArrayRef,
-            DataType::LargeBinary,
+            novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                true,
+                novarocks_type_contract::ValueLogicalType::Variant,
+            )
+            .unwrap()
+            .try_to_field("after_value")
+            .unwrap(),
         );
         let query = build_cow_rewrite_query(
             &fixture.selection,
@@ -5660,6 +5677,19 @@ mod tests {
         .expect("query");
         let sql = novarocks_parser::printer::print_query(&query);
 
+        let closed_query = super::super::cow_closed_route::build_cow_rewrite_query_closed(
+            &fixture.selection,
+            &fixture.rows,
+            &fixture.input,
+            &fixture.route_facts,
+            &fixture.rewrite_source,
+            fixture.preparation.match_contract(),
+            &fixture.identity,
+            &|_, _| Ok(()),
+            &|| Ok(()),
+        )
+        .expect("closed variant query");
+        assert_eq!(novarocks_parser::printer::print_query(&closed_query), sql);
         assert!(sql.contains("CAST(X'0C000000010203' AS VARIANT)"), "{sql}");
         assert!(sql.contains("CASE WHEN"), "{sql}");
     }
@@ -5852,13 +5882,15 @@ mod tests {
         assert!(sql.contains("(s.id > 0)"), "{sql}");
     }
 
-    // Insert this whole test-only module inside mutation_flow.rs::tests.
-    // This is an uncompiled candidate, not stock Iceberg or Native evidence.
+    // Scripted COW component fixtures. They exercise the retained consumer graph,
+    // not stock Iceberg reads, external effects, or native transport.
     mod admitted_cow_consumer_tests {
         use super::*;
         use novarocks_spi::connector as spi;
         use novarocks_spi::connector::write_stack as ws;
         use std::sync::{Arc, Mutex};
+
+        include!("cow_read_source_fixture.rs");
 
         struct CowLegacyWrite(spi::ConnectorProviderBindingKey);
         impl spi::ConnectorWriteControl for CowLegacyWrite {
@@ -5987,7 +6019,19 @@ mod tests {
                 )
                 .with_route(self.route.clone())
                 .with_routing_proof(proof)
-                .with_rewrite_source(self.source.clone());
+                .with_rewrite_source(
+                    self.source
+                        .clone()
+                        .with_frozen_read_source(spi::read_stack::adapter::ReadRuntimeAdapter::<
+                        FakeRowMutationProvider,
+                    >::freeze_source(
+                        self.key.clone(),
+                        CowProviderFrozenSource {
+                            owner: self.key.clone(),
+                            source: self.source.clone(),
+                        },
+                    )),
+                );
                 // This is the actual accepted request -> retained result alias cut.
                 // No binding, window alias, or test guard is retained by this port.
                 ws::ConnectorWriteSessionPlan::try_copy_on_write(
@@ -6181,7 +6225,7 @@ mod tests {
                 )
                 .with_cleanup_context("original binding cleanup"),
             ];
-            for error in cases {
+            for (index, error) in cases.into_iter().enumerate() {
                 // Pointer/equality oracles are captured before giving the provider its
                 // one original error; only the test's equality oracle makes a clone.
                 let original_pointer = error.message().as_ptr();
@@ -6190,12 +6234,31 @@ mod tests {
                     "begin connector write session: {error}"
                 ))
                 .to_string();
-                let fixture = cow_rewrite_query_fixture(
-                    vec![7],
-                    vec![2],
-                    Arc::new(arrow::array::StringArray::from(vec!["bb"])) as ArrayRef,
-                    DataType::Utf8,
-                );
+                let fixture = if index == 0 {
+                    let payload = [0x0c_u8, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03];
+                    cow_rewrite_query_fixture_with_value_field(
+                        vec![7],
+                        vec![2],
+                        Arc::new(arrow::array::LargeBinaryArray::from_iter_values([
+                            payload.as_slice()
+                        ])) as ArrayRef,
+                        novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                            DataType::LargeBinary,
+                            true,
+                            novarocks_type_contract::ValueLogicalType::Variant,
+                        )
+                        .unwrap()
+                        .try_to_field("after_value")
+                        .unwrap(),
+                    )
+                } else {
+                    cow_rewrite_query_fixture(
+                        vec![7],
+                        vec![2],
+                        Arc::new(arrow::array::StringArray::from(vec!["bb"])) as ArrayRef,
+                        DataType::Utf8,
+                    )
+                };
                 let (control, root, binding, capacity) =
                     crate::query_execution::internal_result_cpu::admitted_internal_fixture();
                 let context = connector_context_for_test();
@@ -6292,13 +6355,26 @@ mod tests {
                                     && actual.field().is_nullable()),
                         _ => false,
                     };
+                    let authored_value_domain = match &request.input {
+                        spi::ConnectorWriteInputRequest::RowLineage { data_fields, .. } => {
+                            data_fields.get(1).is_some_and(|field| {
+                                novarocks_type_contract::FunctionValueType::try_from_field(field.field())
+                                    .is_ok_and(|value| value.logical_type == if index == 0 {
+                                        novarocks_type_contract::ValueLogicalType::Variant
+                                    } else {
+                                        novarocks_type_contract::ValueLogicalType::Physical
+                                    })
+                            })
+                        }
+                        _ => false,
+                    };
                     request.table.as_ref() == "db1.t"
                         && &request.target_ref == fixture.preparation.target_ref()
                         && request.base.as_ref() == Some(fixture.preparation.base_version())
                         && request.context.deadline() == original_deadline
                         && request.intent == spi::ConnectorWriteIntent::RowDelta
                         && request.purpose == spi::ConnectorWriteAdmissionPurpose::OrdinaryDml
-                        && flavor_same && input_same
+                        && flavor_same && input_same && authored_value_domain
                 });
                 let mut cause_preserved = false;
                 let mut dml_preserved = false;
@@ -6468,6 +6544,16 @@ mod tests {
                     original_failure_chain(&failure)
                 )
             });
+            let frozen_source = write.targets[0]
+                .frozen_read
+                .as_ref()
+                .unwrap()
+                .read
+                .frozen_source
+                .as_ref()
+                .unwrap();
+            let original_source_owner = frozen_source.owner() == fixture.preparation.owner()
+                && &frozen_source.owner().instance_id == fixture.rewrite_source.source().owner();
             let exact_session = Arc::ptr_eq(&write.write_session, &session);
             let target_ordinal = write.targets[0].ordinal.get();
             let actual_sql = novarocks_parser::printer::print_query(&write.targets[0].query);
@@ -6517,6 +6603,7 @@ mod tests {
             assert!(owned_source);
             assert_eq!(domain_digest, business_digest);
             assert!(same_runtime && exact_session);
+            assert!(original_source_owner);
             assert_eq!(target_ordinal, 0);
             assert_eq!(actual_sql, expected_sql);
             assert!(actual_sql.contains("LEFT JOIN") && actual_sql.contains("VALUES"));

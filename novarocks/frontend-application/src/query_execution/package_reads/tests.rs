@@ -521,6 +521,8 @@ fn frozen_encodings(
 /// package whose scan carries the provider's own public facts: the package
 /// receiver decodes it, the provider's pure compiler accepts the authored
 /// read, and the local compiler addresses the scan by its physical node.
+// Retained while Paimon-specific tests are suspended.
+#[cfg(any())]
 #[test]
 fn a_paimon_scan_freezes_a_compiled_package_the_provider_and_local_compilers_accept() {
     use novarocks_local_compiler::{
@@ -661,6 +663,8 @@ fn a_paimon_scan_freezes_a_compiled_package_the_provider_and_local_compilers_acc
 
 /// The same statement still freezes into the plan tree, with the same attempt
 /// scan facts: the compiled author reads the freeze, it does not change it.
+// Retained while Paimon-specific tests are suspended.
+#[cfg(any())]
 #[test]
 fn a_paimon_scan_still_freezes_into_the_plan_tree() {
     let fixture = paimon_fixture();

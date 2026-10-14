@@ -448,17 +448,12 @@ pub(super) fn type_name(data_type: &DataType) -> Result<TypeName> {
         DataType::Float32 => ("FLOAT", 0),
         DataType::Float64 => ("DOUBLE", 0),
         DataType::Utf8 | DataType::LargeUtf8 => ("STRING", 0),
-        DataType::Binary => ("VARBINARY", 0),
-        DataType::LargeBinary => ("VARIANT", 0),
+        DataType::Binary | DataType::LargeBinary => ("VARBINARY", 0),
         DataType::Date32 => ("DATE", 0),
         DataType::Timestamp(TimeUnit::Microsecond, _) => ("DATETIME", 0),
         DataType::Timestamp(TimeUnit::Nanosecond, _) => ("DATETIME_NS", 0),
         DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond) => ("TIME", 0),
-        DataType::FixedSizeBinary(width)
-            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
-        {
-            ("LARGEINT", 0)
-        }
+        DataType::FixedSizeBinary(_) => ("VARBINARY", 0),
         DataType::Decimal128(_, scale) if *scale >= 0 => ("DECIMAL", 2),
         DataType::Decimal128(_, _) => {
             return Err(BuildError::OriginalSemantic(
@@ -491,9 +486,7 @@ pub(super) fn type_name(data_type: &DataType) -> Result<TypeName> {
                 span: S,
             }));
         }
-        DataType::List(field) => {
-            arguments.push(TypeNameArgument::Type(type_name(field.data_type())?))
-        }
+        DataType::List(field) => arguments.push(TypeNameArgument::Type(field_type_name(field)?)),
         DataType::Map(field, _) => {
             let DataType::Struct(fields) = field.data_type() else {
                 return Err(BuildError::OriginalSemantic(
@@ -506,14 +499,14 @@ pub(super) fn type_name(data_type: &DataType) -> Result<TypeName> {
                 ));
             }
             for child in fields {
-                arguments.push(TypeNameArgument::Type(type_name(child.data_type())?));
+                arguments.push(TypeNameArgument::Type(field_type_name(child)?));
             }
         }
         DataType::Struct(fields) => {
             for field in fields {
                 arguments.push(TypeNameArgument::Field(StructField {
                     name: ident(field.name(), true)?,
-                    data_type: type_name(field.data_type())?,
+                    data_type: field_type_name(field)?,
                     span: S,
                 }));
             }
@@ -531,6 +524,31 @@ pub(super) fn type_name(data_type: &DataType) -> Result<TypeName> {
         span: S,
     })
 }
+pub(super) fn field_type_name(field: &arrow::datatypes::Field) -> Result<TypeName> {
+    use super::cow_compile_receipt::{borrowed_value_footprint::Failure, type_footprint};
+    match type_footprint::logical_type_name(field).map_err(|failure| match failure {
+        Failure::OriginalSemantic(message) => BuildError::OriginalSemantic(message.into()),
+        _ => BuildError::InvalidSource("invalid COW field logical type"),
+    })? {
+        Some(logical) => Ok(TypeName {
+            name: name(logical)?,
+            arguments: exact_vec(0)?,
+            argument_separator_spaces: exact_vec(0)?,
+            span: S,
+        }),
+        None => type_name(field.data_type()),
+    }
+}
+pub(super) fn cast_field(expr: Expr, field: &arrow::datatypes::Field) -> Result<Expr> {
+    Ok(Expr::Cast(CastExpr {
+        expr: Box::new(expr),
+        data_type: field_type_name(field)?,
+        kind: CastKind::Cast,
+        format: None,
+        span: S,
+    }))
+}
+#[cfg(test)]
 pub(super) fn cast(expr: Expr, data_type: &DataType) -> Result<Expr> {
     Ok(Expr::Cast(CastExpr {
         expr: Box::new(expr),

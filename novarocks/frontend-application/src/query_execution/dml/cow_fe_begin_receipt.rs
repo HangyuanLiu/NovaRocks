@@ -168,6 +168,8 @@ pub(super) fn borrowed_fe_begin_receipt(
         )?;
     }
     fresh = add(fresh, mul(width, size_of::<ConnectorWriteFieldRequest>())?)?;
+    // Request after-fields clone the signed Field whole, including authored
+    // logical metadata. The borrowed footprint covers those exact clone backings.
     fresh = add(
         fresh,
         ConnectorRowConversionFootprint::for_fields(

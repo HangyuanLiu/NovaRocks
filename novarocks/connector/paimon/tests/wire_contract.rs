@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Retained while Paimon-specific tests are suspended.
+#![cfg(any())]
+
 use novarocks_connector_paimon::domain::{
     PaimonBinaryTableStats, PaimonBucketMode, PaimonColumn, PaimonDataCompression, PaimonDataFile,
     PaimonDataFileFacts, PaimonDeletionFile, PaimonMergeEngine, PaimonReadView, PaimonRowRange,

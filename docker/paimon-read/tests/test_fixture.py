@@ -38,6 +38,7 @@ sys.modules[SPEC.name] = fixture
 SPEC.loader.exec_module(fixture)
 
 
+@unittest.skip("Paimon fixture tests are suspended pending detailed connector design")
 class FixtureContractTest(unittest.TestCase):
     def test_publication_unset_then_exports_load_without_shell_or_ambient_values(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

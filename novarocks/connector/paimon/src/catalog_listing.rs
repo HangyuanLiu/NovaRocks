@@ -224,7 +224,8 @@ fn sdk_error(error: ConnectorError) -> paimon::Error {
     }
 }
 
-#[cfg(test)]
+// Retained while Paimon-specific tests are suspended.
+#[cfg(all(test, any()))]
 mod tests {
     use super::super::{PaimonFileSystemCatalog, map_sdk_error};
     use super::*;

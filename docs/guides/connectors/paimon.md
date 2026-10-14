@@ -73,10 +73,12 @@ postpone bucket、多个 sequence field、嵌套类型、`TIMESTAMP_LTZ`、data 
 system table、change-window、procedure、named reference 和 pinned-file-set 读取。
 未知且可能影响读语义的 Paimon 表属性也会失败关闭。
 
-## 本地验证
+## 保留的手工 fixture 配方
+
+Paimon 产品测试已暂停，等待详细 connector 设计；生产 provider 仍保留。Paimon SQL suite、组件测试以及 13 个依赖 Paimon 的 native system 场景均关闭，包含六个 connector 场景、五个 mixed catalog-planning 场景和两个 scan-readiness 场景。runner 明确拒绝选择这些场景，暂停状态不表示验收通过。
 
 仓库中的 `docker/paimon-read` 使用固定版本的 Spark/Paimon 创建外部 fixture，并用
-Spark 直接读取产生 oracle。运行 SQL 验收：
+Spark 直接读取产生 oracle。以下保留历史配方；prepare/verify 是可手工调用的输入工具，SQL 验收命令当前被拒绝，CI 不准备 Paimon fixture。cleanup 继续可调用，用于清理匹配 run-id 的既有私有 fixture：
 
 ```bash
 docker/iceberg-rest/up.sh
@@ -96,4 +98,4 @@ docker/paimon-read/cleanup.sh \
   --output-dir "$PAI_REPORT_ROOT/fixture"
 ```
 
-正式产品验收使用 native `1FE+3BE` system scenarios；all-in-one 只适合作为本地 smoke。
+保留的产品验收场景使用 native `1FE+3BE`；恢复运行需后续详细设计明确测试范围，当前无重新启用开关。

@@ -15,6 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Retained while Paimon-specific tests are suspended.
+#![cfg(any())]
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

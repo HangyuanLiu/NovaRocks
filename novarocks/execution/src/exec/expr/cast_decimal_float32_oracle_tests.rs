@@ -71,28 +71,18 @@ fn value(
     policy: DecimalOverflowPolicy,
     allow: bool,
 ) {
-    let old = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        actual(&a.slice(row, 1), policy, allow).unwrap()
-    }));
-    let pure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        r.evaluate_row(EvaluatedArgument::Column(a), ordinal, row, &Control)
-            .unwrap()
-    }));
-    assert_eq!(
-        old.is_err(),
-        pure.is_err(),
-        "retain original panic on exactly demanded rows"
-    );
-    if let (Ok(old), Ok(pure)) = (old, pure) {
-        let old = old.as_any().downcast_ref::<Float32Array>().unwrap();
-        if old.is_null(0) {
-            assert_eq!(pure, CastRowResult::Null);
-        } else {
-            let CastRowResult::Float32(got) = pure else {
-                panic!("exact Float32 output")
-            };
-            assert_eq!(got.to_bits(), old.value(0).to_bits());
-        }
+    let old = actual(&a.slice(row, 1), policy, allow).unwrap();
+    let pure = r
+        .evaluate_row(EvaluatedArgument::Column(a), ordinal, row, &Control)
+        .unwrap();
+    let old = old.as_any().downcast_ref::<Float32Array>().unwrap();
+    if old.is_null(0) {
+        assert_eq!(pure, CastRowResult::Null);
+    } else {
+        let CastRowResult::Float32(got) = pure else {
+            panic!("exact Float32 output")
+        };
+        assert_eq!(got.to_bits(), old.value(0).to_bits());
     }
 }
 fn complete(wide: bool) {
@@ -117,13 +107,6 @@ fn complete(wide: bool) {
                 ] {
                     for allow in [false, true] {
                         let recipe = r(&a, nullable, policy, allow);
-                        if wide && scale == i8::MIN {
-                            // All metadata/policies remain admitted, with original non-NULL failure pinned for boundary precisions below.
-                            if nullable {
-                                value(&recipe, &a, 7, 2, policy, allow);
-                            }
-                            continue;
-                        }
                         for row in 0..a.len() {
                             value(&recipe, &a, row, row, policy, allow);
                         }

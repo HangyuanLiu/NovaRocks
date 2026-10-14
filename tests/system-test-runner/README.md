@@ -30,7 +30,11 @@ NOVAROCKS_BUILD_PROFILE=dev-opt cargo run -p novarocks-system-test-runner \
 
 The default list uses the same registry classification as a run without
 `--only`. Explicit functional stages with external fixtures or higher cost remain
-discoverable through `--list` and selectable by exact `--only`. 当前阶段不维护
+discoverable through `--list` and selectable by exact `--only`, except disabled
+scenarios: Paimon connector scenes and all mixed UEA4 catalog-planning/scan-readiness
+scenes retain their assets, appear with `DISABLED` in `--list`, and refuse explicit
+selection before fixture preparation or role launch. They are suspended pending
+detailed Paimon design; the production provider remains registered. 当前阶段不维护
 测量基线；`performance` launch profile只选择clean harness配置，不表示性能实验。
 
 Run one scenario against the native 1FE+3BE default:

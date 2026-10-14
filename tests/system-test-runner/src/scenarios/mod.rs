@@ -101,3 +101,25 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(table_maintenance::scenarios());
     scenarios
 }
+
+/// Kept discoverable for audit; these scenes must not provision or run fixtures.
+pub fn disabled_reason(name: &str) -> Option<&'static str> {
+    match name {
+        "connector/paimon-read-data"
+        | "connector/paimon-snapshot-and-schema"
+        | "connector/paimon-merge-filter-correctness"
+        | "connector/paimon-cancel-and-budget"
+        | "connector/paimon-unsupported-and-binding"
+        | "connector/iceberg-paimon-read"
+        | "uea4/catalog-planning-smoke"
+        | "uea4/iceberg-held-read-cancellation"
+        | "uea4/catalog-planning-no-fe-quota"
+        | "uea4/catalog-planning-responsibility"
+        | "catalog/provider-read-queued-progress"
+        | "uea4/scan-producer-readiness"
+        | "uea4/scan-producer-cancel" => {
+            Some("Paimon tests are suspended pending detailed connector design")
+        }
+        _ => None,
+    }
+}

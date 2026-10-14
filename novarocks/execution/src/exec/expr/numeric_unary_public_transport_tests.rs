@@ -150,13 +150,6 @@ fn numeric_unary_public_transport_same_original_source_and_all_consumers() {
             dt.clone(),
             SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
         );
-        let render = novarocks_sql::compiler::client_render_schema(source.plan(), 0).unwrap();
-        let source = source
-            .with_root_output(novarocks_result_contract::RootOutputContract::new(
-                novarocks_result_contract::RootProfileId::V1,
-                novarocks_result_contract::FrozenRootOutput::ClientRows(render),
-            ))
-            .unwrap();
         assert_eq!(
             source.emission_mode(),
             SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration
@@ -241,13 +234,6 @@ fn numeric_unary_public_transport_original_and_unchanged_nested_types_use_actual
             SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
         ] {
             let source = table_free_sql(sql, mode);
-            let render = novarocks_sql::compiler::client_render_schema(source.plan(), 0).unwrap();
-            let source = source
-                .with_root_output(novarocks_result_contract::RootOutputContract::new(
-                    novarocks_result_contract::RootProfileId::V1,
-                    novarocks_result_contract::FrozenRootOutput::ClientRows(render),
-                ))
-                .unwrap();
             let port = source.plan().result_port().unwrap();
             let original = source.original_public_result_declaration().unwrap();
             assert_eq!(original.fields(), port.fields.as_ref());

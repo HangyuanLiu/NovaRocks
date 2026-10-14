@@ -140,7 +140,7 @@ fn decimal_float_complete_metadata_policy_nullability_and_effect_contract() {
                                         .for_use(context)
                                         .unwrap()
                                         .may_raise_row_error,
-                                    wide && scale == i8::MIN
+                                    false
                                 );
                                 assert!(!carrier_cast_can_produce_null(
                                     &source.data_type,
@@ -307,7 +307,7 @@ fn decimal_float_original_hidden_payload_and_scale_min_failure_contract() {
         DecimalOverflowPolicy::ReportError,
     ] {
         for allow in [false, true] {
-            let a = input(true, 76, i8::MIN, vec![Some(0), None]);
+            let a = input(true, 76, i8::MIN, vec![Some(0), None, Some(1), Some(-1)]);
             let r = PreparedCastRecipe::try_new(
                 CastOperation::Carrier,
                 &FunctionValueType::new(a.data_type().clone(), true),
@@ -322,14 +322,20 @@ fn decimal_float_original_hidden_payload_and_scale_min_failure_contract() {
                     .unwrap(),
                 CastRowResult::Null
             );
-            // Test-only panic evidence; runtime does not catch or translate it.
-            let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_eq!(
                 r.evaluate_row(EvaluatedArgument::Column(&a), 0, 0, &Control::default())
+                    .unwrap(),
+                CastRowResult::Float64(0.0),
+            );
+            for (row, expected) in [(2, 1e128), (3, -1e128)] {
+                let CastRowResult::Float64(got) = r
+                    .evaluate_row(EvaluatedArgument::Column(&a), row, row, &Control::default())
                     .unwrap()
-            }));
-            assert_eq!(got.is_err(), cfg!(debug_assertions));
-            if let Ok(got) = got {
-                assert_eq!(got, CastRowResult::Float64(0.0));
+                else {
+                    panic!("exact Float64 minimum-scale result")
+                };
+                assert!(got.is_finite());
+                assert!((got - expected).abs() <= expected.abs() * f64::EPSILON * 4.0);
             }
         }
     }

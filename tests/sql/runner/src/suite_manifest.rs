@@ -28,6 +28,7 @@ use std::path::Path;
 #[serde(default, deny_unknown_fields)]
 pub struct SuiteManifest {
     pub explicit_only: bool,
+    pub disabled_reason: Option<String>,
     pub prepared_dataset: Option<PreparedDatasetRequirement>,
 }
 
@@ -101,7 +102,9 @@ pub fn select_suite_names(
     let suite_names: Vec<String> = if requested.eq_ignore_ascii_case("all") {
         suites
             .iter()
-            .filter(|(_, suite)| !suite.manifest.explicit_only)
+            .filter(|(_, suite)| {
+                !suite.manifest.explicit_only && suite.manifest.disabled_reason.is_none()
+            })
             .map(|(name, _)| name.clone())
             .collect()
     } else {
@@ -119,13 +122,16 @@ pub fn select_suite_names(
 
     let all_available: Vec<String> = suites.keys().cloned().collect();
     for name in &suite_names {
-        suites.get(name).with_context(|| {
+        let suite = suites.get(name).with_context(|| {
             format!(
                 "unknown suite '{}'; available suites: {}",
                 name,
                 all_available.join(", ")
             )
         })?;
+        if let Some(reason) = &suite.manifest.disabled_reason {
+            bail!("SQL suite {name} is disabled: {reason}");
+        }
     }
 
     Ok(suite_names)
@@ -195,6 +201,16 @@ mod tests {
             select_suite_names("explicit", &suites).unwrap(),
             vec!["explicit"]
         );
+    }
+
+    #[test]
+    fn disabled_suites_are_not_selected_and_explicit_selection_is_refused() {
+        let mut suites = fixture_suites([("filter", false), ("suspended", false)]);
+        suites.get_mut("suspended").unwrap().manifest =
+            SuiteManifest::parse("disabled_reason = \"pending design\"\n").unwrap();
+        assert_eq!(select_suite_names("all", &suites).unwrap(), vec!["filter"]);
+        let error = select_suite_names("suspended", &suites).unwrap_err();
+        assert!(error.to_string().contains("is disabled: pending design"));
     }
 
     #[test]
