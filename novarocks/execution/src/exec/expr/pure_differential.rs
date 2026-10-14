@@ -1721,6 +1721,11 @@ mod nullif_tests;
 #[path = "pure_differential/by_tests.rs"]
 mod by_tests;
 
+#[path = "pure_differential/n_largeint_tests.rs"]
+mod n_largeint_tests;
+
+#[path = "pure_differential/n_largeint_declaration_tests.rs"]
+mod n_largeint_declaration_tests;
 #[cfg(test)]
 #[path = "pure_differential/n_tests.rs"]
 mod n_tests;
@@ -1822,6 +1827,9 @@ mod numeric_binary_shared_tests;
 
 mod round_disagreement_tests;
 mod round_expanded_tests;
+
+#[path = "pure_differential/round_unary_shared_core_tests.rs"]
+mod round_unary_shared_core_tests;
 
 #[cfg(test)]
 #[path = "pure_differential_array_append_multi_tests.rs"]
@@ -1966,3 +1974,22 @@ mod approx_top_k_full_any_error_tests;
 #[cfg(test)]
 #[path = "pure_differential_parse_json_tests.rs"]
 mod parse_json_tests;
+
+#[path = "pure_differential/truncate_shared_core_tests.rs"]
+mod truncate_shared_core_tests;
+
+#[path = "pure_differential/trim_shared_core_tests.rs"]
+mod trim_shared_core_tests;
+
+#[cfg(test)]
+mod concat_shared_core_tests;
+
+#[cfg(test)]
+mod substring_index_shared_core_tests;
+
+mod json_object_legacy_native_oracle_tests;
+
+mod json_object_shared_owner_tests;
+
+#[path = "pure_differential/mann_whitney_tests.rs"]
+mod mann_whitney_tests;

@@ -81,10 +81,13 @@ pub enum ExecutionFailureCause {
     /// infer a resource, deadline, transport or invariant category from text.
     Pipeline(String),
     Kernel(KernelFailure),
+    RuntimeScalarSource(novarocks_functions::ScalarResourceError),
+    RuntimeScalarMemory(crate::runtime::scalar_memory::RuntimeScalarMemoryRefusal),
     InvocationData(novarocks_functions::InvocationData),
     ScalarInvocationData(novarocks_functions::ScalarInvocationData),
     WindowInvocationData(novarocks_functions::WindowInvocationData),
     RequiredRow(RequiredExpressionRowError),
+    PreparationMetadata(crate::runtime::preparation_metadata::PreparationMetadataFailure),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,6 +125,16 @@ impl ExecutionFailure {
             ExecutionFailureCause::InvocationData(error) => error.message(),
             ExecutionFailureCause::ScalarInvocationData(error) => error.message(),
             ExecutionFailureCause::WindowInvocationData(error) => error.message(),
+            ExecutionFailureCause::PreparationMetadata(error) => match error {
+                crate::runtime::preparation_metadata::PreparationMetadataFailure::Request(_) => {
+                    "metadata preparation request failed"
+                }
+                crate::runtime::preparation_metadata::PreparationMetadataFailure::Host(_) => {
+                    "metadata preparation host refused"
+                }
+            },
+            ExecutionFailureCause::RuntimeScalarSource(_) => "scalar runtime source request failed",
+            ExecutionFailureCause::RuntimeScalarMemory(_) => "scalar runtime memory refused",
             ExecutionFailureCause::Kernel(error) => match error {
                 KernelFailure::Cancelled => "kernel evaluation was cancelled",
                 KernelFailure::DeadlineExceeded => "kernel evaluation deadline was exceeded",
@@ -144,6 +157,24 @@ impl ExecutionFailure {
             });
         }
         self
+    }
+
+    /// The original Direct graph returns only its original owned diagnostics.
+    /// A nominal host cause here would violate the explicit Direct mode.
+    pub(crate) fn into_pipeline_message(self) -> String {
+        match self.cause {
+            ExecutionFailureCause::Pipeline(message) => message,
+            _ => unreachable!("a Direct graph cannot produce a nominal metadata host failure"),
+        }
+    }
+}
+
+impl From<crate::runtime::preparation_metadata::PreparationMetadataFailure> for ExecutionFailure {
+    fn from(error: crate::runtime::preparation_metadata::PreparationMetadataFailure) -> Self {
+        Self {
+            cause: ExecutionFailureCause::PreparationMetadata(error),
+            context: None,
+        }
     }
 }
 
@@ -190,6 +221,27 @@ impl From<novarocks_functions::ScalarInvocationFailure> for ExecutionFailure {
         }
     }
 }
+impl From<crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure> for ExecutionFailure {
+    fn from(error: crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure) -> Self {
+        use crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure;
+        let cause = match error {
+            RuntimeScalarEvaluationFailure::Kernel(cause) => return cause.into(),
+            RuntimeScalarEvaluationFailure::Data(cause) => {
+                ExecutionFailureCause::ScalarInvocationData(cause)
+            }
+            RuntimeScalarEvaluationFailure::Source(cause) => {
+                ExecutionFailureCause::RuntimeScalarSource(cause)
+            }
+            RuntimeScalarEvaluationFailure::Host(cause) => {
+                ExecutionFailureCause::RuntimeScalarMemory(cause)
+            }
+        };
+        Self {
+            cause,
+            context: None,
+        }
+    }
+}
 impl From<novarocks_functions::WindowEvaluationFailure> for ExecutionFailure {
     fn from(error: novarocks_functions::WindowEvaluationFailure) -> Self {
         match error {
@@ -221,10 +273,13 @@ impl fmt::Display for ExecutionFailure {
         match &self.cause {
             ExecutionFailureCause::Pipeline(message) => f.write_str(message),
             ExecutionFailureCause::Kernel(error) => error.fmt(f),
+            ExecutionFailureCause::RuntimeScalarSource(error) => error.fmt(f),
+            ExecutionFailureCause::RuntimeScalarMemory(error) => error.fmt(f),
             ExecutionFailureCause::RequiredRow(error) => error.fmt(f),
             ExecutionFailureCause::InvocationData(error) => error.fmt(f),
             ExecutionFailureCause::ScalarInvocationData(error) => error.fmt(f),
             ExecutionFailureCause::WindowInvocationData(error) => error.fmt(f),
+            ExecutionFailureCause::PreparationMetadata(error) => error.fmt(f),
         }
     }
 }
@@ -233,10 +288,13 @@ impl Error for ExecutionFailure {
         match &self.cause {
             ExecutionFailureCause::Pipeline(_) => None,
             ExecutionFailureCause::Kernel(error) => Some(error),
+            ExecutionFailureCause::RuntimeScalarSource(error) => Some(error),
+            ExecutionFailureCause::RuntimeScalarMemory(error) => Some(error),
             ExecutionFailureCause::RequiredRow(error) => Some(error),
             ExecutionFailureCause::InvocationData(error) => Some(error),
             ExecutionFailureCause::ScalarInvocationData(error) => Some(error),
             ExecutionFailureCause::WindowInvocationData(error) => Some(error),
+            ExecutionFailureCause::PreparationMetadata(error) => Some(error),
         }
     }
 }

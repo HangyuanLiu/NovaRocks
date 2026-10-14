@@ -1632,7 +1632,17 @@ impl SqlCompiler {
                 },
             )));
         }
-        let settings = request.session.optimizer_settings.clone();
+        let mut settings = request.session.optimizer_settings.clone();
+        // The original carrier retains Rows only after complete aggregation.
+        // Both optimizer entrypoints consume this single effective setting.
+        if request.emission_mode == SqlPhysicalEmissionMode::OriginalNativeV1
+            && !settings
+                .disabled_rules
+                .iter()
+                .any(|rule| rule == "PushDownTopNToPreAgg")
+        {
+            settings.disabled_rules.push("PushDownTopNToPreAgg".into());
+        }
         if !matches!(request.intent, SqlCompileIntent::LogicalOnly)
             && (!logical_input
                 || !matches!(request.environment, SqlPlanningEnvironment::NotApplicable))
@@ -2574,6 +2584,69 @@ mod tests {
             bool,
             &dyn novarocks_type_contract::PureCompileControl,
         ) -> Result<Vec<String>, SqlCompileError> = SqlCompileOutput::into_explain_lines;
+    }
+
+    #[test]
+    fn grouped_topn_mode_and_user_disable_reach_the_public_optimize_entry() {
+        use crate::optimizer::operator::{AggMode, Operator};
+        fn inspect(node: &crate::optimizer::OptimizedOperatorNode, forbid_preagg: bool) -> usize {
+            let own = usize::from(matches!(node.op, Operator::PhysicalTopN(_)));
+            if own > 0 && forbid_preagg {
+                assert!(!node.children.iter().any(|child| matches!(
+                    &child.op, Operator::PhysicalHashAggregate(aggregate) if aggregate.mode == AggMode::Local
+                )), "a row TopN must not consume partial groups");
+            }
+            own + node
+                .children
+                .iter()
+                .map(|child| inspect(child, forbid_preagg))
+                .sum::<usize>()
+        }
+        for mode in [
+            SqlPhysicalEmissionMode::OriginalNativeV1,
+            SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
+        ] {
+            for user_disabled in [false, true] {
+                let catalog = CountingTableCatalog::new();
+                let cancellation = Arc::new(Cancellation::default());
+                let functions = crate::functions::build_builtin_engine_function_catalog().unwrap();
+                let mut input = table_request(&catalog, control(None, &cancellation));
+                input.functions = Some(&functions);
+                input.statement = SqlStatementInput::sql(
+                    "SELECT order_id, COUNT(*) FROM orders GROUP BY order_id ORDER BY order_id LIMIT 10",
+                );
+                input.emission_mode = mode;
+                if user_disabled {
+                    input
+                        .session
+                        .optimizer_settings
+                        .disabled_rules
+                        .push("PushDownTopNToPreAgg".into());
+                }
+                let analyzed = SqlCompiler::analyze(input).unwrap().into_pending().unwrap();
+                let must_disable =
+                    user_disabled || mode == SqlPhysicalEmissionMode::OriginalNativeV1;
+                assert_eq!(
+                    analyzed
+                        .settings
+                        .disabled_rules
+                        .iter()
+                        .filter(|name| name.eq_ignore_ascii_case("PushDownTopNToPreAgg"))
+                        .count(),
+                    usize::from(must_disable)
+                );
+                let output = SqlCompiler::optimize(SqlOptimizeRequest::new(
+                    analyzed,
+                    &missing_table_statistics(),
+                    SqlCompileControl::unbounded(),
+                ))
+                .unwrap()
+                .into_optimized_output()
+                .unwrap();
+                assert!(inspect(&output.optimized_tree, must_disable) > 0);
+                assert_eq!(catalog.resolution_count(), 1);
+            }
+        }
     }
 
     #[test]
@@ -3531,7 +3604,9 @@ pub(crate) mod root_output;
 mod root_render_type;
 mod root_scalar_type;
 pub use completion::*;
-pub use root_render_type::{client_render_schema, client_render_schema_from_port};
+pub use root_render_type::{
+    client_render_schema, client_render_schema_from_port, validate_public_result_logical_identities,
+};
 pub(crate) mod mv_rewrite;
 
 impl From<&str> for SqlCompileError {
@@ -3557,3 +3632,6 @@ pub use crate::planner::distributed::build::state_source_fixture::ordinary_extre
 
 #[cfg(feature = "test-support")]
 pub use crate::planner::distributed::build::state_source_fixture::ordered_array_state_source_for_test;
+
+#[cfg(test)]
+mod c16_p1_json_object_error_effect_tests;

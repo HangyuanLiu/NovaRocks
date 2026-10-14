@@ -354,6 +354,37 @@ mod tests {
     }
 
     #[test]
+    fn complete_uuid_without_a_legacy_declaration_never_captures_largeint_proof() {
+        use novarocks_type_contract::ValueLogicalType;
+        for logical in [
+            ValueLogicalType::Uuid,
+            ValueLogicalType::LargeInt,
+            ValueLogicalType::Physical,
+        ] {
+            let mut factory = ColumnRefFactory::new();
+            let mut ty = ValueType::new(D::FixedSizeBinary(16), true);
+            ty.logical_type = logical;
+            let id = factory.create(None, "value".into(), ty.clone());
+            assert!(factory.borrowed_logical_type(id).is_none());
+            let column = OutputColumn {
+                column_id: id,
+                name: "value".into(),
+                value_type: ty,
+                is_internal: false,
+            };
+            let captured = RootOutputSemantics::capture(&[column], &factory).unwrap();
+            if logical == ValueLogicalType::Uuid {
+                assert!(captured.scalar_field.is_none());
+            } else {
+                assert!(matches!(
+                    captured.scalar_field.unwrap().value_type,
+                    novarocks_result_contract::ScalarValueType::LargeInt
+                ));
+            }
+        }
+    }
+
+    #[test]
     fn m07_scalar_complete_nested_declaration_is_not_lost_as_plain_storage() {
         for marked in [false, true] {
             let (factory, column) = declared_map(marked);

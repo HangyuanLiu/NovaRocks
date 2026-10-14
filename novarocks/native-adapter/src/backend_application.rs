@@ -366,6 +366,7 @@ impl TaskExecutionHost for UnroutedTaskExecutionHost {
         &self,
         _descriptor: &TaskDescriptor,
         _input: TaskCreationInput,
+        _preparation: &novarocks_worker::PreparationControlLoan<'_>,
     ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
         Err(HostRejection::new(
             TaskFailureCategory::Internal,

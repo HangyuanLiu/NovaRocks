@@ -1719,6 +1719,57 @@ mod tests {
     }
 
     #[test]
+    fn static_and_compiled_layouts_keep_complete_raw_domains_and_legacy_projection() {
+        use novarocks_local_program::{StaticFieldSchema, StaticLayout};
+        use novarocks_type_contract::{NR_LOGICAL_TYPE_KEY, ValueLogicalType};
+        for (logical, carrier) in [
+            (ValueLogicalType::Physical, DataType::FixedSizeBinary(16)),
+            (ValueLogicalType::LargeInt, DataType::FixedSizeBinary(16)),
+            (ValueLogicalType::Uuid, DataType::FixedSizeBinary(16)),
+            (ValueLogicalType::Variant, DataType::LargeBinary),
+            (ValueLogicalType::Json, DataType::Utf8),
+            (ValueLogicalType::Hll, DataType::Binary),
+            (ValueLogicalType::Bitmap, DataType::Binary),
+            (ValueLogicalType::Object, DataType::Binary),
+            (ValueLogicalType::Percentile, DataType::Binary),
+        ] {
+            let mut field = Field::new("value", carrier, true);
+            if let Some(marker) = logical.metadata_value() {
+                field = field.with_metadata([(NR_LOGICAL_TYPE_KEY.into(), marker.into())].into());
+            }
+            let source = ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(1),
+                field.clone(),
+                None,
+                None,
+            )])
+            .unwrap();
+            let projection = source.slots()[0].field_schema().logical_type();
+            let layout = StaticLayout::try_new_exact(
+                source.arrow_schema_ref(),
+                Arc::from([SlotId::new(1)]),
+                vec![(StaticFieldSchema::new(projection, vec![]), None)],
+            )
+            .unwrap();
+            for restored in [
+                ChunkSchema::from_static_layout(&layout).unwrap(),
+                ChunkSchema::from_compiled_layout(&layout).unwrap(),
+            ] {
+                assert_eq!(restored.slots()[0].field(), &field);
+                assert_eq!(
+                    restored.slots()[0].field_schema().logical_type(),
+                    projection
+                );
+                assert_eq!(
+                    novarocks_type_contract::field_logical_type(restored.slots()[0].field())
+                        .unwrap(),
+                    logical
+                );
+            }
+        }
+    }
+
+    #[test]
     fn static_layout_thaw_narrows_each_slot_and_keeps_actual_schema_owner() {
         use novarocks_local_program::{StaticFieldSchema, StaticLayout};
         // A whole-layout index on every slot would produce 66,049 entries and

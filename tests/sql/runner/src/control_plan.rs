@@ -393,6 +393,63 @@ pub(crate) fn required(inputs: &[PreparedSqlInputs]) -> bool {
         })
 }
 
+/// Select the existing inert variant without authorizing a domain or a restart.
+/// The harness still checks each real artifact before its one reserved spawn.
+pub(crate) fn build_physical_wire_candidate(
+    inputs: &[PreparedSqlInputs],
+    cluster_size: usize,
+    startup: Duration,
+    binary: &Path,
+    session_sql: &[String],
+) -> Result<ClusterTestSessionPlan> {
+    ensure!(
+        cluster_size > 0,
+        "physical-wire candidate requires at least one BE"
+    );
+    ensure!(
+        inputs.iter().all(|input| input.verify_enabled),
+        "physical-wire candidate requires verification for every selected suite"
+    );
+    ensure!(
+        !required(inputs)
+            && inputs
+                .iter()
+                .all(|input| !crate::cases_have_fault_directives(&input.cases))
+            && inputs
+                .iter()
+                .flat_map(|input| &input.cases)
+                .flat_map(|case| &case.steps)
+                .all(|step| {
+                    !crate::selected_meta_requires_lifecycle(&step.meta)
+                        && step.meta.publication_catalog_fault.is_none()
+                        && step.meta.publication_service_hold.is_none()
+                        && step.meta.publication_catalog_concurrent_shell.is_none()
+                }),
+        "physical-wire candidate cannot be combined with selected domain controls or fault directives"
+    );
+    let deadline = Instant::now()
+        .checked_add(budget(inputs, startup, cluster_size, session_sql.len())?)
+        .context("physical-wire candidate absolute deadline exceeds the monotonic clock")?;
+    let mut plan = ClusterTestSessionPlan::new(deadline)?;
+    for role in std::iter::once(RoleSlot::Frontend).chain((0..cluster_size).map(RoleSlot::Backend))
+    {
+        let reference = plan.reserve_launch(role)?;
+        plan.authorize_inert_controlled_launch(
+            &reference,
+            binary.to_path_buf(),
+            vec![
+                ("novarocks-server".into(), "test-controls".into()),
+                (
+                    "novarocks-server".into(),
+                    "physical-wire-v2-candidate".into(),
+                ),
+            ],
+        )?;
+    }
+    plan.validate_selected_intents(cluster_size)?;
+    Ok(plan)
+}
+
 pub(crate) fn build(
     inputs: &[PreparedSqlInputs],
     cluster_size: usize,
@@ -755,6 +812,77 @@ mod tests {
         .context("expected selected controls")
     }
     use std::path::PathBuf;
+    #[test]
+    fn physical_wire_candidate_reserves_only_inert_roles_with_a_finite_deadline() {
+        let input = inputs(vec![step(1, "SELECT 1", Default::default())]);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let binary = file.path();
+        let before = Instant::now();
+        let plan =
+            build_physical_wire_candidate(&input, 2, Duration::from_secs(5), binary, &[]).unwrap();
+        assert!(plan.deadline() > before);
+        assert!(plan.deadline() <= before + Duration::from_secs(1000));
+        let summaries = plan.planned_launch_summaries();
+        let roles = summaries.as_array().unwrap();
+        assert_eq!(roles.len(), 3);
+        assert_eq!(roles.iter().filter(|role| role["role"] == "fe").count(), 1);
+        for role in roles {
+            assert_eq!(role["inert_controlled"], true);
+            assert!(role["grants"].as_array().unwrap().is_empty());
+            assert_eq!(role["binary"], binary.to_string_lossy().as_ref());
+        }
+    }
+
+    #[test]
+    fn physical_wire_candidate_refuses_unverified_unbounded_and_controlled_inputs() {
+        let build = |inputs: &[PreparedSqlInputs]| {
+            build_physical_wire_candidate(
+                inputs,
+                3,
+                Duration::from_secs(5),
+                Path::new("/candidate"),
+                &[],
+            )
+        };
+        let mut unverified = inputs(vec![step(1, "SELECT 1", Default::default())]);
+        unverified[0].verify_enabled = false;
+        assert!(
+            build(&unverified)
+                .unwrap_err()
+                .to_string()
+                .contains("verification")
+        );
+        let mut unbounded = inputs(vec![step(1, "SELECT 1", Default::default())]);
+        unbounded[0].query_timeout = 0;
+        assert!(
+            build(&unbounded)
+                .unwrap_err()
+                .to_string()
+                .contains("unbounded")
+        );
+        for meta in [
+            QueryMeta {
+                kill_be_index: Some(0),
+                ..Default::default()
+            },
+            QueryMeta {
+                restart_fe_after_step: true,
+                ..Default::default()
+            },
+            QueryMeta {
+                be_log_contains: vec!["NOVAROCKS_GRPC_FETCH_TYPED".into()],
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                build(&inputs(vec![step(1, "SELECT 1", meta)]))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("domain controls or fault")
+            );
+        }
+    }
+
     #[test]
     fn document_tag_never_grants_wipe_and_reserves_distinct_retry_observations() {
         let file = tempfile::NamedTempFile::new().unwrap();

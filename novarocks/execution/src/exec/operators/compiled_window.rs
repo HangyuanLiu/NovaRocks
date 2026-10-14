@@ -68,6 +68,8 @@ use novarocks_local_program::{
 mod invocation_input;
 use invocation_input::InvocationInputBuffer;
 
+use crate::runtime::preparation_metadata::{CompiledSchemaMetadataScope, CompiledSchemaSite};
+
 use super::analytic_shared::{
     AnalyticOutputValidationFailure, validate_analytic_output_columns_typed,
 };
@@ -115,12 +117,55 @@ pub struct CompiledWindowProcessorFactory {
     original_function_major: bool,
 }
 
+/// The original Hosted constructor, exported only to isolated allocator tests.
+#[cfg(feature = "test-support")]
+pub fn prepare_window_factory_for_test<H: CompiledSchemaMetadataScope>(
+    program: Arc<LocalProgram>,
+    node: ProgramNodeId,
+    error: Arc<RuntimeErrorState>,
+    host: &mut H,
+) -> ExecutionResult<CompiledWindowProcessorFactory> {
+    CompiledWindowProcessorFactory::try_new_with_metadata_host(program, node, error, host)
+}
+
 impl CompiledWindowProcessorFactory {
     pub(crate) fn try_new(
         program: Arc<LocalProgram>,
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
     ) -> Result<Self, String> {
+        Self::try_new_in(program, node, error, |_, _, layout| {
+            ChunkSchema::from_compiled_layout(layout)
+        })
+    }
+
+    pub(crate) fn try_new_with_metadata_host<H: CompiledSchemaMetadataScope>(
+        program: Arc<LocalProgram>,
+        node: ProgramNodeId,
+        error: Arc<RuntimeErrorState>,
+        host: &mut H,
+    ) -> ExecutionResult<Self> {
+        Self::try_new_in(program, node, error, |program, site, layout| {
+            host.materialize(program, site, layout, || {
+                ChunkSchema::from_compiled_layout(layout)
+            })
+        })
+    }
+
+    fn try_new_in<E, F>(
+        program: Arc<LocalProgram>,
+        node: ProgramNodeId,
+        error: Arc<RuntimeErrorState>,
+        mut materialize: F,
+    ) -> Result<Self, E>
+    where
+        E: From<String>,
+        F: FnMut(
+            &Arc<LocalProgram>,
+            CompiledSchemaSite,
+            &novarocks_local_program::StaticLayout,
+        ) -> Result<ChunkSchemaRef, E>,
+    {
         let at = node.index();
         let nodes = program.graph().nodes();
         let graph_node = nodes
@@ -134,7 +179,7 @@ impl CompiledWindowProcessorFactory {
             output_columns,
         } = graph_node.kind()
         else {
-            return Err(format!("compiled local node {at} is not an Analytic"));
+            return Err(format!("compiled local node {at} is not an Analytic").into());
         };
         let key = |count: usize, role: fn(u32) -> ProgramNodeExpressionRole| {
             (0..count)
@@ -163,7 +208,8 @@ impl CompiledWindowProcessorFactory {
             if !matches!(function.kind, WindowFunctionKind::Prepared) {
                 return Err(format!(
                     "compiled Analytic call {call} at local node {at} is not a prepared window call"
-                ));
+                )
+                .into());
             }
             let frame = function.frame.ok_or_else(|| {
                 format!("compiled Analytic call {call} at local node {at} has no explicit frame")
@@ -176,21 +222,22 @@ impl CompiledWindowProcessorFactory {
             else {
                 return Err(format!(
                     "compiled Analytic call {call} at local node {at} has no prepared window kernel"
-                ));
+                )
+                .into());
             };
             let kernel = Arc::clone(kernel);
             let contract = kernel.contract();
             if contract.order_argument_types().len() != 0 {
                 return Err(format!(
                     "compiled Analytic call {call} at local node {at} with function ORDER BY is not executable"
-                ));
+                ).into());
             }
             let roots = contract.logical_argument_types().len();
             if function.args.len() != roots {
                 return Err(format!(
                     "compiled Analytic call {call} at local node {at} has {} roots for {roots} channels",
                     function.args.len()
-                ));
+                ).into());
             }
             let first_root = sites.len();
             for argument in 0..roots {
@@ -234,15 +281,20 @@ impl CompiledWindowProcessorFactory {
                 AnalyticOutputColumn::Window(call) => {
                     return Err(format!(
                         "compiled Analytic at local node {at} outputs absent call {call}"
-                    ));
+                    ).into());
                 }
             });
         }
-        let output = ChunkSchema::from_compiled_layout(graph_node.output_layout())?;
+        let output = materialize(
+            &program,
+            CompiledSchemaSite::AnalyticOutput(node),
+            graph_node.output_layout(),
+        )?;
         if output.arrow_schema_ref().fields().len() != columns.len() {
             return Err(format!(
                 "compiled Analytic at local node {at} output width differs from its columns"
-            ));
+            )
+            .into());
         }
         let (partition_keys, order_keys) = (partition_exprs.len(), order_by_exprs.len());
         // Positive immutable owner capability, never a function-name decision.

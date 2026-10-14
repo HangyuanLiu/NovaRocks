@@ -97,8 +97,7 @@ use novarocks_worker::{TaskCompletionSignal, TaskCompletionSupervisor, TaskInbou
 use tracing::debug;
 
 use super::compiled_package::{
-    CompiledPackageCompiler, CompiledPackageError, CompiledTaskOptions, CompiledTaskProgram,
-    TaskPreparationControl,
+    CompiledPackageCompiler, CompiledPackageError, CompiledTaskOptions, TaskPreparationControl,
 };
 use crate::compiled_runtime_filter::program_runtime_filter_bindings;
 use crate::compiled_scan_binding::{CompiledScanTask, bind_compiled_scans};
@@ -549,12 +548,14 @@ impl NativeTaskExecutionHost {
     /// The compiled-package half of `install_receiver`: the task's package is
     /// received, provider-validated and compiled into a LocalProgram, then
     /// prepared into the same dormant handle and task runtime as a plan-tree
-    /// task. Every refusal here precedes registration and rolls back.
+    /// task. The original registration lease protects early query funding and
+    /// rolls back on every refusal before installation.
     fn install_compiled_receiver(
         &self,
         descriptor: &TaskDescriptor,
         input: TaskCreationInput,
         compiler: &dyn CompiledPackageCompiler,
+        preparation: &novarocks_worker::PreparationControlLoan<'_>,
     ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
         let identity = descriptor.identity();
         let execution = identity.query_execution_id();
@@ -572,6 +573,37 @@ impl NativeTaskExecutionHost {
                 "task {identity} creation assignment is not a codec-produced assignment"
             ))
         })?;
+
+        let context_options = self.context_facts.query_options(execution)?;
+        let (delivery_expire, query_expire) =
+            novarocks_execution::runtime::query_options::query_expire_durations(Some(
+                context_options.runtime().as_ref(),
+            ));
+        // The original fragment lease protects the early SAME query account.
+        // A refused decoder drops only this fragment's registration.
+        let registration = self
+            .queries
+            .register_fragment_execution(execution, kernel_key, delivery_expire, query_expire)
+            .map_err(|error| {
+                resource_exhausted(format!("task {identity} could not be registered: {error}"))
+            })?;
+        let memory = self
+            .queries
+            .prepare_query_memory_typed(
+                execution,
+                delivery_expire,
+                query_expire,
+                context_options.runtime().exec_mem_limit(),
+            )
+            .map_err(|error| memory_admission_failure_to_host(identity, &error))?;
+        memory
+            .binding()
+            .validate_task(identity, self.execution_runtime.memory_authority())
+            .map_err(|error| {
+                resource_exhausted(format!(
+                    "task {identity} query memory does not bind: {error}"
+                ))
+            })?;
 
         let attempt = TaskAttemptKey::new(execution, kernel_key);
         let splits = self.split_queues.open_attempt(
@@ -593,22 +625,34 @@ impl NativeTaskExecutionHost {
             Arc::clone(&splits),
         )?;
 
-        let control = TaskPreparationControl::new(task_stop.view());
-        let CompiledTaskProgram {
-            program,
-            runtime_filters,
-        } = compiler
-            .compile(
-                carrier.package(),
-                CompiledTaskOptions {
-                    pipeline_dop: descriptor.pipeline_dop(),
-                    exchange_wait: Duration::from_millis(
-                        self.execution_runtime.config().exchange_wait_ms,
-                    ),
-                },
-                &control,
-            )
-            .map_err(|error| compiled_package_rejection(identity, error))?;
+        let control = TaskPreparationControl::new(task_stop.view(), preparation);
+        let mut metadata_journal = super::TypeMaterializationJournal::default();
+        let mut type_host = super::TypeMaterializationHost::new(
+            memory.binding(),
+            preparation,
+            &mut metadata_journal,
+        );
+        let mut project_journal = super::ProjectMetadataJournal::default();
+        let mut project_host =
+            super::ProjectMetadataHost::new(memory.binding(), preparation, &mut project_journal);
+        let compiled = compiler.compile(
+            carrier.package(),
+            CompiledTaskOptions {
+                pipeline_dop: descriptor.pipeline_dop(),
+                exchange_wait: Duration::from_millis(
+                    self.execution_runtime.config().exchange_wait_ms,
+                ),
+            },
+            &control,
+            &mut type_host,
+            &mut project_host,
+        );
+        // Fixed local facts only: no metadata text or query-id metric labels.
+        tracing::debug!(resource_scope = "be-type-materialization", receipt = ?metadata_journal, "type materialization resource receipt");
+        tracing::debug!(resource_scope = "project-compile-metadata", receipt = ?project_journal, "Project compilation resource receipt");
+        let compiled = compiled.map_err(|error| compiled_package_rejection(identity, error))?;
+        let program = compiled.program();
+        let runtime_filters = &compiled.runtime_filters;
         // The bindings this program's runtime-filter sites bind. They decide
         // whether the task needs the query context's filter session, exactly
         // as a plan-tree program's bindings do, and the session must host
@@ -628,7 +672,6 @@ impl NativeTaskExecutionHost {
         let sink_kind = compiled_sink_kind(Some(sink))
             .map_err(|error| internal(format!("task {identity} compiled sink: {error}")))?;
 
-        let context_options = self.context_facts.query_options(execution)?;
         let instance_input = project_task_instance(
             descriptor,
             assignment
@@ -645,7 +688,7 @@ impl NativeTaskExecutionHost {
         let scan_assignments =
             compiled_scan_assignments(identity, descriptor, &program, &instance_input)?;
         // Every compiled scan binds its typed source here, before anything is
-        // registered: a refusal leaves only this attempt's local state behind.
+        // published: a refusal rolls back this attempt's lease and local state.
         let scans = bind_compiled_scans(
             &program,
             &CompiledScanTask {
@@ -660,7 +703,7 @@ impl NativeTaskExecutionHost {
         )
         .map_err(|error| protocol(format!("task {identity} scan does not bind: {error}")))?;
         // Every compiled writer binds its write capability and every finish
-        // its carrier validator here, before anything is registered; a write
+        // its carrier validator here, before anything is published; a write
         // execution is opened only when a driver activates.
         let writers = bind_compiled_writers(
             &program,
@@ -715,8 +758,11 @@ impl NativeTaskExecutionHost {
             .map(|session| Arc::clone(session.channel()));
         let root_display_id = i32::try_from(program.graph().root().index())
             .map_err(|_| internal(format!("task {identity} compiled root index exceeds i32")))?;
+        // This is the original Arc birth. Submission and the private loan
+        // borrow this same immutable backing, with no recreated program.
+        let compiled = compiled.into_preparation();
         let submission = CompiledFragmentSubmission::try_new_with_writers(
-            Arc::new(program),
+            Arc::clone(compiled.program()),
             scans,
             writers,
             instance,
@@ -727,11 +773,6 @@ impl NativeTaskExecutionHost {
             ))
         })?;
 
-        let (delivery_expire, query_expire) =
-            novarocks_execution::runtime::query_options::query_expire_durations(Some(
-                context_options.runtime().as_ref(),
-            ));
-        let exec_mem_limit = context_options.runtime().exec_mem_limit();
         let profiler = context_options
             .runtime()
             .enable_profile()
@@ -752,7 +793,7 @@ impl NativeTaskExecutionHost {
                     .runtime_filter_event_sink(execution, kernel_key),
                 Arc::clone(&operator_statistics) as Arc<dyn FragmentEventSink>,
             ]));
-        // Resolved before registration, so a task whose bindings differ from
+        // Resolved before installation, so a task whose bindings differ from
         // what its query context installed for it is refused with nothing to
         // roll back but this attempt's local state.
         let runtime_filter = self.context_facts.runtime_filter_session_for_bindings(
@@ -760,23 +801,9 @@ impl NativeTaskExecutionHost {
             kernel_key,
             &runtime_filter_bindings,
         )?;
-        let registration = self
-            .queries
-            .register_fragment_execution(execution, kernel_key, delivery_expire, query_expire)
-            .map_err(|error| {
-                resource_exhausted(format!("task {identity} could not be registered: {error}"))
-            })?;
-        let admission = self
-            .queries
-            .prepare_admission_execution_typed(
-                execution,
-                kernel_key,
-                delivery_expire,
-                query_expire,
-                exec_mem_limit,
-                runtime_filter,
-            )
-            .map_err(|error| memory_admission_failure_to_host(identity, &error))?;
+        let admission =
+            self.queries
+                .prepare_admission_with_memory(kernel_key, memory, runtime_filter);
         // Scan sources open their providers only when preparation binds them,
         // which needs the admitted fragment tracker installed first.
         typed_runtime
@@ -786,6 +813,12 @@ impl NativeTaskExecutionHost {
                     "task {identity} could not install connector resource accounting: {error}"
                 ))
             })?;
+        // A binding clone borrows the same authority/account as the original
+        // context transport; it creates no new query registration or domain.
+        let project_binding = admission
+            .query_memory()
+            .cloned()
+            .expect("validated preparation memory reaches admission");
         let mut context = admission
             .into_prepare_context(
                 profiler,
@@ -813,8 +846,25 @@ impl NativeTaskExecutionHost {
         if let Some(session) = root_session {
             context = context.with_root_result_session(session);
         }
-        let dormant = prepare_compiled_fragment(submission, context)
-            .map_err(|error| preparation_failure_to_host(identity, &error))?;
+        let prepared = match compiled.native_metadata_loan() {
+            Some(source) => {
+                let mut host = super::project_materialization::CompiledProjectMetadataHost::new(
+                    source,
+                    &project_binding,
+                    preparation,
+                    &control,
+                    &mut project_journal,
+                );
+                novarocks_execution::runtime::fragment::prepare_compiled_fragment_with_metadata_host(
+                    submission, context, &mut host,
+                )
+            }
+            // Independently assembled products use their original route before
+            // any bounded-native author or preparation metadata admission.
+            None => prepare_compiled_fragment(submission, context),
+        };
+        tracing::debug!(resource_scope = "project-prepare-metadata", receipt = ?project_journal, "Project preparation resource receipt");
+        let dormant = prepared.map_err(|error| preparation_failure_to_host(identity, &error))?;
 
         #[cfg(feature = "test-controls")]
         crate::task_execution_observation::emit_prepared_task_dop(
@@ -1125,6 +1175,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         &self,
         descriptor: &TaskDescriptor,
         input: TaskCreationInput,
+        preparation: &novarocks_worker::PreparationControlLoan<'_>,
     ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
         let identity = descriptor.identity();
         let execution = identity.query_execution_id();
@@ -1141,7 +1192,12 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                 .map_err(internal)?;
         }
         if let Some(compiler) = self.compiled.clone() {
-            return self.install_compiled_receiver(descriptor, input, compiler.as_ref());
+            return self.install_compiled_receiver(
+                descriptor,
+                input,
+                compiler.as_ref(),
+                preparation,
+            );
         }
         let (static_fragment, assignment) = input.into_parts();
         let fragment = decode_static_fragment(&static_fragment, FieldPath::root("frozen_fragment"))
@@ -2167,7 +2223,49 @@ fn failure_cause_category(
         | ExecutionFailureCause::InvocationData(_)
         | ExecutionFailureCause::ScalarInvocationData(_)
         | ExecutionFailureCause::WindowInvocationData(_) => TaskFailureCategory::Execution,
+        ExecutionFailureCause::PreparationMetadata(cause) => match cause {
+            novarocks_execution::runtime::preparation_metadata::PreparationMetadataFailure::Request(error) => metadata_request_category(error),
+            novarocks_execution::runtime::preparation_metadata::PreparationMetadataFailure::Host(error) => preparation_memory_refusal_category(error),
+        },
+        ExecutionFailureCause::RuntimeScalarSource(novarocks_functions::ScalarResourceError::Arithmetic)
+        | ExecutionFailureCause::RuntimeScalarMemory(_) => TaskFailureCategory::ResourceExhausted,
+        ExecutionFailureCause::RuntimeScalarSource(novarocks_functions::ScalarResourceError::SourceModel(_)
+            | novarocks_functions::ScalarResourceError::Invariant(_)) => TaskFailureCategory::Internal,
         ExecutionFailureCause::Pipeline(_) => opaque_category,
+    }
+}
+
+fn preparation_memory_refusal_category(
+    error: &novarocks_execution::runtime::preparation_memory::PreparationMemoryRefusal,
+) -> TaskFailureCategory {
+    use novarocks_execution::runtime::preparation_memory::PreparationMemoryRefusal;
+    match error {
+        PreparationMemoryRefusal::Stopped(_) => TaskFailureCategory::Execution,
+        PreparationMemoryRefusal::MissingQueryMemory
+        | PreparationMemoryRefusal::SharedShortage(_)
+        | PreparationMemoryRefusal::Capacity(_) => TaskFailureCategory::ResourceExhausted,
+    }
+}
+fn metadata_request_category(
+    error: &novarocks_type_contract::MetadataRequestError,
+) -> TaskFailureCategory {
+    use novarocks_type_contract::owned_resources::{
+        hashmap::HashMapResourceError, metadata_materialization::MetadataMaterializationError,
+    };
+    use novarocks_type_contract::{CompileControlError, MetadataRequestError};
+    match error {
+        MetadataRequestError::Control(
+            CompileControlError::Cancelled | CompileControlError::DeadlineExceeded,
+        ) => TaskFailureCategory::Execution,
+        MetadataRequestError::Control(CompileControlError::ResourceExhausted)
+        | MetadataRequestError::Arithmetic
+        | MetadataRequestError::Metadata(
+            MetadataMaterializationError::Arithmetic
+            | MetadataMaterializationError::Model(HashMapResourceError::Arithmetic(_)),
+        ) => TaskFailureCategory::ResourceExhausted,
+        MetadataRequestError::SourceModel(_)
+        | MetadataRequestError::ValueType(_)
+        | MetadataRequestError::Metadata(_) => TaskFailureCategory::Internal,
     }
 }
 
@@ -2274,6 +2372,12 @@ fn compiled_package_rejection(
             CompileControlError::Cancelled | CompileControlError::DeadlineExceeded,
         ) => TaskFailureCategory::Execution,
         CompiledPackageError::Refused(_) => TaskFailureCategory::Protocol,
+        CompiledPackageError::ProjectMetadata(error) => preparation_memory_refusal_category(error),
+        CompiledPackageError::ProjectMetadataRequest(error) => metadata_request_category(error),
+        CompiledPackageError::TypeMaterialization(super::TypeMaterializationRefusal::Stopped(
+            _,
+        )) => TaskFailureCategory::Execution,
+        CompiledPackageError::TypeMaterialization(_) => TaskFailureCategory::ResourceExhausted,
     };
     HostRejection::new(
         category,
@@ -2307,7 +2411,7 @@ fn resource_exhausted(detail: impl AsRef<str>) -> HostRejection {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::{
         CompositeFragmentEventSink, FragmentStandDown, NativeRunnableTask, NativeTaskExecutionHost,
         PreparationStopGuard, QueryContextOptions, RootProducerPool, StandDown,
@@ -2392,6 +2496,226 @@ mod tests {
         TaskExecutionHost, TaskExecutionRegistry, TaskExecutionRegistryConfig, TaskStatusOwner,
         TaskStatusReporter, TaskStatusSource, WorkerMonotonicClock,
     };
+
+    #[test]
+    fn runtime_scalar_memory_nominal_categories_preserve_original_transport() {
+        use novarocks_execution::runtime::{
+            fragment::{ExecutionFailure, ExecutionFailureCause},
+            scalar_memory::{RuntimeScalarEvaluationFailure, RuntimeScalarMemoryRefusal},
+        };
+        use novarocks_functions::{KernelFailure, ScalarResourceError};
+        for (failure, expected) in [
+            (
+                RuntimeScalarEvaluationFailure::Source(ScalarResourceError::Arithmetic),
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                RuntimeScalarEvaluationFailure::Source(ScalarResourceError::SourceModel(
+                    "cancelled ResourceExhausted",
+                )),
+                TaskFailureCategory::Internal,
+            ),
+            (
+                RuntimeScalarEvaluationFailure::Source(ScalarResourceError::Invariant(
+                    "ResourceExhausted",
+                )),
+                TaskFailureCategory::Internal,
+            ),
+            (
+                RuntimeScalarEvaluationFailure::Host(
+                    RuntimeScalarMemoryRefusal::MissingQueryMemory,
+                ),
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                RuntimeScalarEvaluationFailure::Host(RuntimeScalarMemoryRefusal::Capacity(
+                    novarocks_memory::CapacityError::Invalid {
+                        detail: "cancelled Internal",
+                    },
+                )),
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                RuntimeScalarEvaluationFailure::Kernel(KernelFailure::Cancelled),
+                TaskFailureCategory::Execution,
+            ),
+            (
+                RuntimeScalarEvaluationFailure::Kernel(KernelFailure::ResourceExhausted),
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                RuntimeScalarEvaluationFailure::Kernel(KernelFailure::InstanceFailed),
+                TaskFailureCategory::Internal,
+            ),
+        ] {
+            let error = ExecutionFailure::from(failure.clone());
+            assert_eq!(
+                super::failure_cause_category(error.cause(), TaskFailureCategory::Protocol),
+                expected
+            );
+            match (failure, error.cause()) {
+                (
+                    RuntimeScalarEvaluationFailure::Source(original),
+                    ExecutionFailureCause::RuntimeScalarSource(actual),
+                ) => assert_eq!(&original, actual),
+                (
+                    RuntimeScalarEvaluationFailure::Host(original),
+                    ExecutionFailureCause::RuntimeScalarMemory(actual),
+                ) => assert_eq!(&original, actual),
+                (
+                    RuntimeScalarEvaluationFailure::Kernel(original),
+                    ExecutionFailureCause::Kernel(actual),
+                ) => assert_eq!(&original, actual),
+                _ => {
+                    panic!("nominal source or host cause must survive without text classification")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn project_metadata_nominal_categories_match_compile_and_prepare_without_parsing_text() {
+        use super::{
+            CompiledPackageError, ExecutionFailureCause, compiled_package_rejection,
+            failure_cause_category,
+        };
+        use novarocks_execution::runtime::{
+            preparation_memory::{PreparationMemoryRefusal, PreparationMemoryStop},
+            preparation_metadata::PreparationMetadataFailure,
+        };
+        use novarocks_type_contract::{
+            CompileControlError, MetadataRequestError, ValueTypeError,
+            owned_resources::{
+                hashmap::HashMapResourceError,
+                metadata_materialization::MetadataMaterializationError,
+            },
+        };
+        let task = identity(371, 1, 1);
+        let requests = [
+            (
+                MetadataRequestError::Control(CompileControlError::Cancelled),
+                TaskFailureCategory::Execution,
+            ),
+            (
+                MetadataRequestError::Control(CompileControlError::DeadlineExceeded),
+                TaskFailureCategory::Execution,
+            ),
+            (
+                MetadataRequestError::Control(CompileControlError::ResourceExhausted),
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                MetadataRequestError::Arithmetic,
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                MetadataRequestError::SourceModel("ResourceExhausted: cancelled"),
+                TaskFailureCategory::Internal,
+            ),
+            (
+                MetadataRequestError::ValueType(ValueTypeError::UnknownLogicalMetadata),
+                TaskFailureCategory::Internal,
+            ),
+            (
+                MetadataRequestError::Metadata(MetadataMaterializationError::Arithmetic),
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                MetadataRequestError::Metadata(MetadataMaterializationError::Model(
+                    HashMapResourceError::Arithmetic("original arithmetic"),
+                )),
+                TaskFailureCategory::ResourceExhausted,
+            ),
+            (
+                MetadataRequestError::Metadata(MetadataMaterializationError::Model(
+                    HashMapResourceError::SourceModel("cancelled"),
+                )),
+                TaskFailureCategory::Internal,
+            ),
+            (
+                MetadataRequestError::Metadata(MetadataMaterializationError::ValueType(
+                    ValueTypeError::TooDeep,
+                )),
+                TaskFailureCategory::Internal,
+            ),
+            (
+                MetadataRequestError::Metadata(
+                    MetadataMaterializationError::InsertCountExceededOriginalReservation,
+                ),
+                TaskFailureCategory::Internal,
+            ),
+            (
+                MetadataRequestError::Metadata(
+                    MetadataMaterializationError::MissingOriginalFieldOrigin,
+                ),
+                TaskFailureCategory::Internal,
+            ),
+        ];
+        for (request, expected) in requests {
+            let cause = ExecutionFailureCause::PreparationMetadata(
+                PreparationMetadataFailure::Request(request),
+            );
+            assert_eq!(
+                failure_cause_category(&cause, TaskFailureCategory::Protocol),
+                expected
+            );
+            assert_eq!(
+                compiled_package_rejection(
+                    task,
+                    CompiledPackageError::ProjectMetadataRequest(request)
+                )
+                .category(),
+                expected
+            );
+        }
+        for stop in [
+            PreparationMemoryStop::Cancel(CancelReason::UpstreamNoLongerNeeded),
+            PreparationMemoryStop::Abort(AbortCause::QueryFailed),
+            PreparationMemoryStop::Abort(AbortCause::LeaseExpired),
+            PreparationMemoryStop::Abort(AbortCause::PeerTaskFailed),
+        ] {
+            let refusal = PreparationMemoryRefusal::Stopped(stop);
+            let cause = ExecutionFailureCause::PreparationMetadata(
+                PreparationMetadataFailure::Host(refusal.clone()),
+            );
+            assert_eq!(
+                failure_cause_category(&cause, TaskFailureCategory::Internal),
+                TaskFailureCategory::Execution
+            );
+            assert_eq!(
+                compiled_package_rejection(task, CompiledPackageError::ProjectMetadata(refusal))
+                    .category(),
+                TaskFailureCategory::Execution
+            );
+        }
+        for refusal in [
+            PreparationMemoryRefusal::MissingQueryMemory,
+            PreparationMemoryRefusal::Capacity(novarocks_memory::CapacityError::Invalid {
+                detail: "cancelled Internal: original capacity",
+            }),
+        ] {
+            let cause = ExecutionFailureCause::PreparationMetadata(
+                PreparationMetadataFailure::Host(refusal.clone()),
+            );
+            assert_eq!(
+                failure_cause_category(&cause, TaskFailureCategory::Internal),
+                TaskFailureCategory::ResourceExhausted
+            );
+            assert_eq!(
+                compiled_package_rejection(task, CompiledPackageError::ProjectMetadata(refusal))
+                    .category(),
+                TaskFailureCategory::ResourceExhausted
+            );
+        }
+        let original = ExecutionFailureCause::Pipeline("ResourceExhausted: cancelled".into());
+        for category in [
+            TaskFailureCategory::Internal,
+            TaskFailureCategory::Protocol,
+            TaskFailureCategory::ResourceExhausted,
+        ] {
+            assert_eq!(failure_cause_category(&original, category), category);
+        }
+    }
 
     // ------------------------------------------------------------- fixtures
 
@@ -2707,8 +3031,13 @@ mod tests {
         descriptor: &TaskDescriptor,
     ) -> Result<PreparedTaskFacts, HostRejection> {
         let dop = u32::try_from(descriptor.pipeline_dop().get()).expect("small dop");
-        host.install_receiver(descriptor, Body::values(dop).input(descriptor))
-            .map(|installed| installed.facts())
+        host.install_receiver(
+            descriptor,
+            Body::values(dop).input(descriptor),
+            &novarocks_worker::TestPreparationControl::new(std::time::Duration::from_millis(1))
+                .loan(),
+        )
+        .map(|installed| installed.facts())
     }
 
     fn inbound_topology(node: FragmentNodeId, sources: Vec<ExchangeSource>) -> ExchangeTopology {
@@ -3009,7 +3338,10 @@ mod tests {
             TaskCompletionSupervisor::start(data_runtime.handle().clone(), 64);
         let execution_runtime = test_execution_runtime();
         NativeTaskExecutionHost::new(
-            NativeFragmentQueryRuntime::global(Arc::clone(execution_runtime.memory_authority())),
+            NativeFragmentQueryRuntime::new_for_test(
+                novarocks_worker::query_context::QueryContextManager::new_for_test(),
+                Arc::clone(execution_runtime.memory_authority()),
+            ),
             facts,
             TaskInboundCapabilities::new(),
             novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
@@ -3564,6 +3896,8 @@ mod tests {
             .install_receiver(
                 &descriptor,
                 TaskCreationInput::new(Body::values(1).frozen_bytes(), Box::new(ForeignAssignment)),
+                &novarocks_worker::TestPreparationControl::new(std::time::Duration::from_millis(1))
+                    .loan(),
             )
             .expect_err("a foreign assignment has no decodable representation");
         assert_eq!(rejection.category(), TaskFailureCategory::Internal);
@@ -3591,6 +3925,8 @@ mod tests {
                     FrozenBytes::freeze(bytes::Bytes::from_static(&[0x0a, 0x80])),
                     assignment,
                 ),
+                &novarocks_worker::TestPreparationControl::new(std::time::Duration::from_millis(1))
+                    .loan(),
             )
             .expect_err("a creation winner must interpret its static fragment");
         assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
@@ -3620,7 +3956,12 @@ mod tests {
         );
 
         let rejection = host
-            .install_receiver(&descriptor, Body::values(1).input(&descriptor))
+            .install_receiver(
+                &descriptor,
+                Body::values(1).input(&descriptor),
+                &novarocks_worker::TestPreparationControl::new(std::time::Duration::from_millis(1))
+                    .loan(),
+            )
             .expect_err("a parallelism outside the frozen domain is not this fragment");
         assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
         assert!(
@@ -3642,7 +3983,12 @@ mod tests {
         }];
 
         let rejection = host
-            .install_receiver(&descriptor, body.input(&descriptor))
+            .install_receiver(
+                &descriptor,
+                body.input(&descriptor),
+                &novarocks_worker::TestPreparationControl::new(std::time::Duration::from_millis(1))
+                    .loan(),
+            )
             .expect_err("a scan assignment must name a scan node of the static plan");
         assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
         assert!(
@@ -3679,7 +4025,12 @@ mod tests {
         let body = Body::with_sink(1, stream_sink(plan::PartitionKind::Hash), vec![edge.get()]);
 
         let rejection = host
-            .install_receiver(&descriptor, body.input(&descriptor))
+            .install_receiver(
+                &descriptor,
+                body.input(&descriptor),
+                &novarocks_worker::TestPreparationControl::new(std::time::Duration::from_millis(1))
+                    .loan(),
+            )
             .expect_err("a static sink branch must agree with its assigned edge");
         assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
         assert!(
@@ -3796,7 +4147,14 @@ mod tests {
                 Vec::new(),
             );
             let refusal = host
-                .install_receiver(&descriptor, body.input(&descriptor))
+                .install_receiver(
+                    &descriptor,
+                    body.input(&descriptor),
+                    &novarocks_worker::TestPreparationControl::new(
+                        std::time::Duration::from_millis(1),
+                    )
+                    .loan(),
+                )
                 .unwrap_err();
             assert_eq!(writer.opens.load(Ordering::SeqCst), 1);
             assert_eq!(refusal.category(), TaskFailureCategory::ResourceExhausted);
@@ -3904,7 +4262,12 @@ mod tests {
         );
 
         let prepared = host
-            .install_receiver(&descriptor, body.input(&descriptor))
+            .install_receiver(
+                &descriptor,
+                body.input(&descriptor),
+                &novarocks_worker::TestPreparationControl::new(std::time::Duration::from_millis(1))
+                    .loan(),
+            )
             .expect("a consistent descriptor prepares");
         assert_eq!(
             prepared.facts().sink_kind(),
@@ -3959,8 +4322,13 @@ mod tests {
             stream_sink(plan::PartitionKind::Unpartitioned),
             vec![edge.get()],
         );
-        host.install_receiver(&descriptor, body.input(&descriptor))
-            .expect("prepares");
+        host.install_receiver(
+            &descriptor,
+            body.input(&descriptor),
+            &novarocks_worker::TestPreparationControl::new(std::time::Duration::from_millis(1))
+                .loan(),
+        )
+        .expect("prepares");
 
         let replacement_process = TaskIdentity::new(
             consumer.query_execution_id(),
@@ -5135,8 +5503,13 @@ mod tests {
                 ..Default::default()
             },
         ));
-        host.install_receiver(&descriptor, body.input(&descriptor))
-            .expect("prepares");
+        host.install_receiver(
+            &descriptor,
+            body.input(&descriptor),
+            &novarocks_worker::TestPreparationControl::new(std::time::Duration::from_millis(1))
+                .loan(),
+        )
+        .expect("prepares");
         let runnable = submit_committed(&host, &descriptor, reporter);
 
         // The owner publishes ABORTING and then asks the task to stand down,
@@ -5376,9 +5749,10 @@ mod tests {
             &self,
             descriptor: &TaskDescriptor,
             input: TaskCreationInput,
+            preparation: &novarocks_worker::PreparationControlLoan<'_>,
         ) -> Result<novarocks_worker::PreparedTaskInstallation, HostRejection> {
             self.installs.fetch_add(1, Ordering::SeqCst);
-            self.inner.install_receiver(descriptor, input)
+            self.inner.install_receiver(descriptor, input, preparation)
         }
 
         fn remove_receiver(&self, descriptor: &TaskDescriptor) {
@@ -6272,7 +6646,12 @@ mod tests {
             &[1],
         );
         let error = host
-            .install_receiver(&descriptor, body.input(&descriptor))
+            .install_receiver(
+                &descriptor,
+                body.input(&descriptor),
+                &novarocks_worker::TestPreparationControl::new(std::time::Duration::from_millis(1))
+                    .loan(),
+            )
             .unwrap_err();
         assert_eq!(error.category(), TaskFailureCategory::Protocol);
         assert!(host.task_runtime(root).is_none());
@@ -6307,7 +6686,12 @@ mod tests {
             drop(credit);
         };
         reserve_remaining("before installation");
-        let error = match host.install_receiver(&descriptor, body.input(&descriptor)) {
+        let error = match host.install_receiver(
+            &descriptor,
+            body.input(&descriptor),
+            &novarocks_worker::TestPreparationControl::new(std::time::Duration::from_millis(1))
+                .loan(),
+        ) {
             Err(error) => error,
             Ok(_) => panic!("generic Unpivot must not replace the protected Statistics source"),
         };
@@ -6331,7 +6715,12 @@ mod tests {
         let descriptor = consistent_descriptor(root, UniqueId::new(91_003, 1));
         let body = Body::bounded_root(novarocks_result_contract::FrozenRootOutput::CountOnly, &[1]);
         let installation = host
-            .install_receiver(&descriptor, body.input(&descriptor))
+            .install_receiver(
+                &descriptor,
+                body.input(&descriptor),
+                &novarocks_worker::TestPreparationControl::new(std::time::Duration::from_millis(1))
+                    .loan(),
+            )
             .unwrap();
         let (_, channel) = installation.into_parts();
         let channel = channel.expect("explicit bounded root installs its provisional channel");
@@ -6361,7 +6750,12 @@ mod tests {
             &[],
         );
         let rejected = host
-            .install_receiver(&descriptor, body.input(&descriptor))
+            .install_receiver(
+                &descriptor,
+                body.input(&descriptor),
+                &novarocks_worker::TestPreparationControl::new(std::time::Duration::from_millis(1))
+                    .loan(),
+            )
             .unwrap_err();
         assert_eq!(rejected.category(), TaskFailureCategory::Protocol);
         assert!(
@@ -6392,8 +6786,13 @@ mod tests {
             ),
             &[],
         );
-        host.install_receiver(&descriptor, body.input(&descriptor))
-            .expect("an installed scalar producer admits its typed root");
+        host.install_receiver(
+            &descriptor,
+            body.input(&descriptor),
+            &novarocks_worker::TestPreparationControl::new(std::time::Duration::from_millis(1))
+                .loan(),
+        )
+        .expect("an installed scalar producer admits its typed root");
         assert!(host.task_runtime(root).is_some());
         host.remove_receiver(&descriptor);
         host.root_producer_pool.shutdown().unwrap();
@@ -6473,7 +6872,7 @@ mod tests {
     /// Hosts composed with the compiled-package interpreter: the static
     /// carrier is a physical package, received, provider-validated and
     /// compiled during preparation.
-    mod compiled_package_host {
+    pub(crate) mod compiled_package_host {
         use super::*;
         use std::collections::BTreeMap;
 
@@ -6569,7 +6968,7 @@ mod tests {
                 .expect("sealed rand subset")
         }
 
-        fn interpreter() -> CompiledPackageInterpreter<std::io::Error> {
+        pub(crate) fn interpreter() -> CompiledPackageInterpreter<std::io::Error> {
             let providers =
                 PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &Unbounded)
                     .expect("empty provider catalog");
@@ -6577,6 +6976,49 @@ mod tests {
                 FragmentDecodeResourceModel::try_new(&Unbounded).expect("decode model"),
                 decode_limits(),
                 Arc::new(sealed_rand_subset()),
+                Arc::new(providers),
+                constants(),
+            )
+        }
+
+        pub(crate) fn window_interpreter() -> CompiledPackageInterpreter<std::io::Error> {
+            let actual =
+                novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog()
+                    .unwrap();
+            let definition = actual
+                .definition("row_number", FunctionKind::Window)
+                .unwrap();
+            let declaration = definition.binding_declaration().unwrap();
+            let installed = declaration
+                .overloads()
+                .iter()
+                .map(|overload| {
+                    let record = actual
+                        .pure_overload_declaration_observed(
+                            declaration.function_id(),
+                            declaration.kind(),
+                            &overload.identity,
+                            &Unbounded,
+                        )
+                        .unwrap();
+                    InstalledPureKernel {
+                        function: declaration.function_id().clone(),
+                        kind: declaration.kind(),
+                        implementation: record.implementation().clone(),
+                        aggregate_state_format: None,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let mut builder = EngineFunctionCatalogBuilder::new();
+            builder.register(definition.clone()).unwrap();
+            let functions = builder.seal_pure(installed).unwrap();
+            let providers =
+                PureProviderProgramCatalog::<std::io::Error>::try_new(&[], vec![], &Unbounded)
+                    .unwrap();
+            CompiledPackageInterpreter::new(
+                FragmentDecodeResourceModel::try_new(&Unbounded).unwrap(),
+                decode_limits(),
+                Arc::new(functions),
                 Arc::new(providers),
                 constants(),
             )
@@ -6600,8 +7042,12 @@ mod tests {
                 package: &[u8],
                 options: CompiledTaskOptions,
                 control: &dyn PureCompileControl,
+                type_host: &mut crate::backend_task_execution::TypeMaterializationHost<'_>,
+                project_host: &mut crate::backend_task_execution::ProjectMetadataHost<'_>,
             ) -> Result<CompiledTaskProgram, CompiledPackageError> {
-                let mut compiled = self.inner.compile(package, options, control)?;
+                let mut compiled =
+                    self.inner
+                        .compile(package, options, control, type_host, project_host)?;
                 compiled.runtime_filters = self.runtime_filters.clone();
                 Ok(compiled)
             }
@@ -6609,11 +7055,19 @@ mod tests {
 
         /// The producer fragment of a real `SELECT 1` in v2 bytes, and the
         /// consumer exchange node it streams to.
-        fn select_one_producer() -> (Vec<u8>, u32) {
+        pub(crate) fn select_one_producer() -> (Vec<u8>, u32) {
+            sql_producer("SELECT 1", false)
+        }
+
+        pub(crate) fn window_producer() -> Vec<u8> {
+            sql_producer("SELECT row_number() OVER () AS r", true).0
+        }
+
+        fn sql_producer(sql: &str, window: bool) -> (Vec<u8>, u32) {
             let control = SqlCompileControl::unbounded();
             let request = SqlFinalPlanCompileRequest::new(
                 PlanVersionId::try_new([9; 16]).expect("plan version"),
-                SqlStatementInput::sql("SELECT 1"),
+                SqlStatementInput::sql(sql),
                 SqlCompileIntent::Query,
                 SqlSessionContext {
                     sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings::default(),
@@ -6684,9 +7138,18 @@ mod tests {
             let producer = plan
                 .fragments()
                 .iter()
-                .find(|(_, fragment)| matches!(fragment.sink(), FragmentSink::Stream { .. }))
+                .find(|(_, fragment)| {
+                    if window {
+                        fragment
+                            .nodes()
+                            .values()
+                            .any(|node| matches!(node.kind, NodeKind::Window(_)))
+                    } else {
+                        matches!(fragment.sink(), FragmentSink::Stream { .. })
+                    }
+                })
                 .map(|(id, _)| *id)
-                .expect("a stream producer");
+                .expect("the requested actual SQL fragment");
             let receiver = plan
                 .fragments()
                 .values()
@@ -6792,6 +7255,10 @@ mod tests {
                 .install_receiver(
                     &descriptor,
                     producer_input(&descriptor, package_carrier(&package)),
+                    &novarocks_worker::TestPreparationControl::new(
+                        std::time::Duration::from_millis(1),
+                    )
+                    .loan(),
                 )
                 .expect("the compiled producer installs");
             assert_eq!(prepared.facts().sink_kind(), FragmentSinkKind::DataStream);
@@ -6843,6 +7310,10 @@ mod tests {
                 .install_receiver(
                     &descriptor,
                     producer_input(&descriptor, package_carrier(&package)),
+                    &novarocks_worker::TestPreparationControl::new(
+                        std::time::Duration::from_millis(1),
+                    )
+                    .loan(),
                 )
                 .expect_err("binding 3 has no site in the program");
             assert_eq!(refused.category(), TaskFailureCategory::Protocol);
@@ -6877,6 +7348,10 @@ mod tests {
                 .install_receiver(
                     &descriptor,
                     producer_input(&descriptor, Body::values(1).frozen_bytes()),
+                    &novarocks_worker::TestPreparationControl::new(
+                        std::time::Duration::from_millis(1),
+                    )
+                    .loan(),
                 )
                 .expect_err("a compiled host reads no plan tree");
             assert_eq!(plan_tree.category(), TaskFailureCategory::Protocol);
@@ -6893,6 +7368,10 @@ mod tests {
                 .install_receiver(
                     &descriptor,
                     producer_input(&descriptor, package_carrier(&package)),
+                    &novarocks_worker::TestPreparationControl::new(
+                        std::time::Duration::from_millis(1),
+                    )
+                    .loan(),
                 )
                 .expect_err("a plan-tree host reads no package");
             assert_eq!(refused.category(), TaskFailureCategory::Protocol);
@@ -6901,6 +7380,10 @@ mod tests {
                 .install_receiver(
                     &descriptor,
                     producer_input(&descriptor, package_carrier(b"not a package")),
+                    &novarocks_worker::TestPreparationControl::new(
+                        std::time::Duration::from_millis(1),
+                    )
+                    .loan(),
                 )
                 .expect_err("an unreceivable package");
             assert_eq!(garbage.category(), TaskFailureCategory::Protocol);
@@ -7036,9 +7519,10 @@ mod tests {
             .expect("finite test producer pool");
             let execution_runtime = test_execution_runtime();
             NativeTaskExecutionHost::new(
-                NativeFragmentQueryRuntime::global(Arc::clone(
-                    execution_runtime.memory_authority(),
-                )),
+                NativeFragmentQueryRuntime::new_for_test(
+                    novarocks_worker::query_context::QueryContextManager::new_for_test(),
+                    Arc::clone(execution_runtime.memory_authority()),
+                ),
                 facts,
                 TaskInboundCapabilities::new(),
                 novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
@@ -7101,6 +7585,10 @@ mod tests {
                         package_carrier(&package),
                         vec![empty_scan_ranges(SCAN_NODE)],
                     ),
+                    &novarocks_worker::TestPreparationControl::new(
+                        std::time::Duration::from_millis(1),
+                    )
+                    .loan(),
                 )
                 .expect("the compiled scan producer installs");
             assert_eq!(prepared.facts().sink_kind(), FragmentSinkKind::DataStream);
@@ -7168,6 +7656,10 @@ mod tests {
                     .install_receiver(
                         &descriptor,
                         scan_input(&descriptor, package_carrier(&package), initial),
+                        &novarocks_worker::TestPreparationControl::new(
+                            std::time::Duration::from_millis(1),
+                        )
+                        .loan(),
                     )
                     .expect_err("the compiled scan task must be refused");
                 assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
@@ -7326,9 +7818,10 @@ mod tests {
             .expect("finite test producer pool");
             let execution_runtime = test_execution_runtime();
             NativeTaskExecutionHost::new(
-                NativeFragmentQueryRuntime::global(Arc::clone(
-                    execution_runtime.memory_authority(),
-                )),
+                NativeFragmentQueryRuntime::new_for_test(
+                    novarocks_worker::query_context::QueryContextManager::new_for_test(),
+                    Arc::clone(execution_runtime.memory_authority()),
+                ),
                 facts,
                 TaskInboundCapabilities::new(),
                 novarocks_native_adapter::exchange_transmitter::grpc_exchange_transmitter(
@@ -7423,6 +7916,10 @@ mod tests {
                 .install_receiver(
                     &descriptor,
                     producer_input(&descriptor, package_carrier(&package)),
+                    &novarocks_worker::TestPreparationControl::new(
+                        std::time::Duration::from_millis(1),
+                    )
+                    .loan(),
                 )
                 .expect("the compiled writer producer installs");
             assert_eq!(prepared.facts().sink_kind(), FragmentSinkKind::DataStream);
@@ -7450,6 +7947,10 @@ mod tests {
                 .install_receiver(
                     &descriptor,
                     producer_input(&descriptor, package_carrier(&package)),
+                    &novarocks_worker::TestPreparationControl::new(
+                        std::time::Duration::from_millis(1),
+                    )
+                    .loan(),
                 )
                 .expect_err("an unleased writer must be refused");
             assert_eq!(rejection.category(), TaskFailureCategory::Protocol);

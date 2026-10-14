@@ -23,6 +23,7 @@ pub(crate) mod join_associativity;
 pub(crate) mod join_commutativity;
 pub(crate) mod multi_join_reorder;
 pub(crate) mod mv_rewrite;
+pub(crate) mod push_topn_to_preagg;
 pub(crate) mod push_topn_through_join;
 pub(crate) mod sort_limit_to_top_n;
 pub(crate) mod split_aggregate;
@@ -70,9 +71,9 @@ pub(crate) fn all_transformation_rules() -> Vec<Box<dyn Rule>> {
         Box::new(sort_limit_to_top_n::SortLimitToTopN),
         Box::new(split_aggregate::SplitAggregateRule),
         Box::new(split_top_n::SplitTopN),
-        // Rows budgets cannot prune Local aggregate states: a group may emit
-        // multiple contributions. Pre-aggregate key budgets require the
-        // GroupedStates execution owner; SplitTopN remains valid after Global.
+        // The compiler disables this rule for OriginalNativeV1. Only the exact
+        // compiled carrier owns GroupedStates before complete aggregation.
+        Box::new(push_topn_to_preagg::PushDownTopNToPreAgg),
         Box::new(topn_compactness::MergeConsecutiveTopN),
         Box::new(topn_compactness::RemoveRedundantSortUnderTopN),
         Box::new(topn_compactness::PushTopNIntoScan),

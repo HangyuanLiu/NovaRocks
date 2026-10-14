@@ -2577,6 +2577,39 @@ mod tests {
             );
             assert_eq!(ledger.raw_bytes(), 0);
         }
+        for revision in [3, 4] {
+            for category in [
+                ConnectorCodecCategory::WriteHandle,
+                ConnectorCodecCategory::CommitFragment,
+            ] {
+                let header = ConnectorEnvelopeHeader::new(
+                    ConnectorProviderId::parse(crate::PROVIDER_ID).unwrap(),
+                    CatalogHandle::new(
+                        ConnectorInstanceId::parse("catalog.iceberg").unwrap(),
+                        CatalogVersion::from_bytes([1; 32]),
+                    ),
+                    category,
+                    ConnectorCodecRevision::try_new(revision).unwrap(),
+                );
+                let mut ledger = ConnectorDecodeLedger::new(private_limits());
+                let mut context = ConnectorDecodeContext::new(&header, &mut ledger);
+                // An invalid private body must not hide the exact ABI rejection.
+                let error = match category {
+                    ConnectorCodecCategory::WriteHandle => facets
+                        .handle_decoder
+                        .decode_private(&[], &mut context)
+                        .unwrap_err(),
+                    ConnectorCodecCategory::CommitFragment => facets
+                        .fragment_decoder
+                        .decode_private(&[], &mut context)
+                        .unwrap_err(),
+                    _ => unreachable!(),
+                };
+                assert_eq!(error.kind(), ConnectorCodecErrorKind::VersionMismatch);
+                assert_eq!(error.path().to_string(), "header.codec_revision");
+                assert_eq!(ledger.raw_bytes(), 0);
+            }
+        }
     }
 
     #[test]

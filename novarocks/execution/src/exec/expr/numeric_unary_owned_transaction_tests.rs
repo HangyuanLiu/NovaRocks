@@ -159,7 +159,7 @@ fn frozen_reads_with_residual_mode(
 ) -> BTreeMap<ProviderReadOccurrenceId, FrozenConnectorRead> {
     frozen_reads_with_explicit_source_shape(source, admit_original_scan_residuals, false)
 }
-fn frozen_reads_with_explicit_source_shape(
+pub(super) fn frozen_reads_with_explicit_source_shape(
     source: &SqlAuthoredPhysicalPlan,
     admit_original_scan_residuals: bool,
     admit_required_inlist_shape: bool,

@@ -1673,3 +1673,12 @@ mod approx_top_k_actual_sql_source_tests;
 mod parse_json_actual_sql_source_tests;
 #[cfg(test)]
 mod parse_json_original_runtime_baseline_tests;
+
+#[cfg(test)]
+pub(crate) mod runtime_scalar_memory_actual_sql_tests;
+
+#[cfg(test)]
+mod runtime_scalar_memory_actual_sql_bitwise_tests;
+
+#[cfg(test)]
+mod signed_cast_nullability_sql_tests;

@@ -23,8 +23,9 @@
 //! kernel failures stay typed. There is no legacy ExprArena or name dispatch.
 //!
 //! The kernel control observes the fragment's runtime error state. A unified
-//! absolute evaluation deadline and memory admission are not yet loaned to
-//! this host; they remain open host obligations, not implied by this control.
+//! absolute evaluation deadline remains open. A bounded installed source
+//! explicitly borrows its original runtime account at its scalar invocation;
+//! uncovered sources retain their original accounting obligations.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,14 +40,23 @@ use novarocks_local_program::{
 };
 
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
-use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+use crate::exec::expr::compiled_program::{
+    CompiledExpressionInstance, input_source::CompiledInputLoan,
+};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult, RequiredExpressionRowError};
+use crate::runtime::preparation_metadata::{CompiledSchemaMetadataScope, CompiledSchemaSite};
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
-#[path = "runtime_kernel_memory.rs"]
-pub(super) mod runtime_kernel_memory;
+pub(super) use crate::runtime::kernel_memory as runtime_kernel_memory;
+#[cfg(test)]
+#[path = "runtime_kernel_memory_tests.rs"]
+mod runtime_kernel_memory_tests;
+
+#[cfg(feature = "test-support")]
+#[path = "runtime_scalar_memory_test_support.rs"]
+pub(crate) mod runtime_scalar_memory_test_support;
 
 /// Kernel control backed by the fragment's runtime error state: a recorded
 /// failure or cancellation refuses the next checkpoint, and waits are
@@ -54,7 +64,7 @@ pub(super) mod runtime_kernel_memory;
 pub(crate) struct RuntimeKernelControl {
     error: Arc<RuntimeErrorState>,
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
-    allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    allocator: Option<Arc<super::compiled_aggregate::TrackedStateAllocator>>,
 }
 impl RuntimeKernelControl {
     pub(crate) fn new(error: Arc<RuntimeErrorState>) -> Self {
@@ -89,20 +99,47 @@ impl RuntimeKernelControl {
     pub(crate) fn allocator(
         &self,
     ) -> Option<Arc<dyn novarocks_functions::AggregateStateAllocator>> {
-        self.allocator.clone()
+        self.allocator.as_ref().map(|host| {
+            let actual: Arc<dyn novarocks_functions::AggregateStateAllocator> = host.clone();
+            actual
+        })
+    }
+    /// Borrow the SAME concrete host whose original dyn Arc created this
+    /// instance. Equality checks existing owners; it grants no new authority.
+    pub(crate) fn invocation_host(
+        &self,
+        original: Option<&Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    ) -> Result<
+        &super::compiled_aggregate::TrackedStateAllocator,
+        novarocks_functions::ScalarResourceError,
+    > {
+        let Some(host) = &self.allocator else {
+            return Err(novarocks_functions::ScalarResourceError::Invariant(
+                "whole-invocation runtime has no concrete allocation host",
+            ));
+        };
+        let actual: Arc<dyn novarocks_functions::AggregateStateAllocator> = host.clone();
+        if !original.is_some_and(|original| Arc::ptr_eq(original, &actual)) {
+            return Err(novarocks_functions::ScalarResourceError::Invariant(
+                "whole-invocation instance allocation host differs from its runtime owner",
+            ));
+        }
+        Ok(host)
     }
 }
 impl KernelEvaluationControl for RuntimeKernelControl {
     fn checkpoint(&self, _work_units: u32) -> Result<(), KernelFailure> {
-        if self.error.error().is_some() {
+        if self.error.is_stopped() {
             return Err(KernelFailure::Cancelled);
         }
         Ok(())
     }
     fn wait(&self, duration: Duration) -> Result<(), KernelFailure> {
-        self.error
-            .wait_interruptibly(duration)
-            .map_err(|_| KernelFailure::Cancelled)
+        if self.error.wait_until_stopped(duration) {
+            Err(KernelFailure::Cancelled)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -116,14 +153,36 @@ pub(crate) fn evaluate_all(
     instance: &mut CompiledExpressionInstance,
     site: ProgramExpressionRootSite,
     input: &RecordBatch,
-    control: &dyn KernelEvaluationControl,
+    control: &RuntimeKernelControl,
 ) -> ExecutionResult<ArrayRef> {
     evaluate_selection(
         instance,
         site,
-        input,
+        CompiledInputLoan::RecordBatch(input),
         Selection::all(input.num_rows()),
         if input.num_rows() == 0 {
+            novarocks_functions::ScalarInvocationActivation::ValidateOnly
+        } else {
+            novarocks_functions::ScalarInvocationActivation::Activated
+        },
+        control,
+    )
+}
+
+/// The actual Chunk callers borrow its original attached authority. No
+/// authority is retained after this synchronous evaluation returns.
+pub(crate) fn evaluate_chunk_all(
+    instance: &mut CompiledExpressionInstance,
+    site: ProgramExpressionRootSite,
+    input: &Chunk,
+    control: &RuntimeKernelControl,
+) -> ExecutionResult<ArrayRef> {
+    evaluate_selection(
+        instance,
+        site,
+        CompiledInputLoan::from_chunk(input),
+        Selection::all(input.batch.num_rows()),
+        if input.batch.num_rows() == 0 {
             novarocks_functions::ScalarInvocationActivation::ValidateOnly
         } else {
             novarocks_functions::ScalarInvocationActivation::Activated
@@ -141,7 +200,7 @@ pub(crate) fn evaluate_selected(
     site: ProgramExpressionRootSite,
     input: &RecordBatch,
     rows: &[usize],
-    control: &dyn KernelEvaluationControl,
+    control: &RuntimeKernelControl,
 ) -> ExecutionResult<ArrayRef> {
     let selection = Selection::try_sparse(input.num_rows(), rows).map_err(|_| {
         ExecutionFailure::from(KernelFailure::Internal(KernelDiagnostic::new(
@@ -153,20 +212,31 @@ pub(crate) fn evaluate_selected(
     } else {
         novarocks_functions::ScalarInvocationActivation::Activated
     };
-    evaluate_selection(instance, site, input, selection, activation, control)
+    evaluate_selection(
+        instance,
+        site,
+        CompiledInputLoan::RecordBatch(input),
+        selection,
+        activation,
+        control,
+    )
 }
 
 fn evaluate_selection(
     instance: &mut CompiledExpressionInstance,
     site: ProgramExpressionRootSite,
-    input: &RecordBatch,
+    input: CompiledInputLoan<'_>,
     selection: Selection<'_>,
     activation: novarocks_functions::ScalarInvocationActivation,
-    control: &dyn KernelEvaluationControl,
+    control: &RuntimeKernelControl,
 ) -> ExecutionResult<ArrayRef> {
     // Required callers supply their actual row-demand policy. Direct Frame
     // callers may activate an empty invocation (e.g. the original IF else).
-    let result = instance.evaluate_evaluation(input, selection, activation, control)?;
+    let mut journal = crate::runtime::scalar_memory::RuntimeScalarMemoryJournal::default();
+    let mut scope =
+        crate::runtime::scalar_memory::RuntimeScalarMemoryScope::new(control, &mut journal);
+    let result =
+        instance.evaluate_input_runtime(input, selection, activation, control, &mut scope)?;
     let (selection, values, errors) = result.into_parts();
     if let Some(error) = errors.into_vec().into_iter().next() {
         return Err(RequiredExpressionRowError::try_new(site, selection, error)?.into());
@@ -238,6 +308,38 @@ impl CompiledProjectProcessorFactory {
         program: Arc<LocalProgram>,
         error: Arc<RuntimeErrorState>,
     ) -> Result<Self, String> {
+        Self::try_new_final_result_boundary_in(program, error, |_, _, layout| {
+            ChunkSchema::from_compiled_layout(layout)
+        })
+    }
+
+    pub(crate) fn try_new_final_result_boundary_with_metadata_host<
+        H: CompiledSchemaMetadataScope,
+    >(
+        program: Arc<LocalProgram>,
+        error: Arc<RuntimeErrorState>,
+        host: &mut H,
+    ) -> ExecutionResult<Self> {
+        Self::try_new_final_result_boundary_in(program, error, |program, site, layout| {
+            host.materialize(program, site, layout, || {
+                ChunkSchema::from_compiled_layout(layout)
+            })
+        })
+    }
+
+    fn try_new_final_result_boundary_in<E, F>(
+        program: Arc<LocalProgram>,
+        error: Arc<RuntimeErrorState>,
+        mut materialize: F,
+    ) -> Result<Self, E>
+    where
+        E: From<String> + From<&'static str>,
+        F: FnMut(
+            &Arc<LocalProgram>,
+            CompiledSchemaSite,
+            &novarocks_local_program::StaticLayout,
+        ) -> Result<ChunkSchemaRef, E>,
+    {
         if !matches!(
             program.graph().sink(),
             Some(novarocks_local_program::StaticSinkProgram::RootResult(_))
@@ -250,7 +352,11 @@ impl CompiledProjectProcessorFactory {
             .nodes()
             .get(root.index())
             .ok_or("compiled final result root is absent")?;
-        let output = ChunkSchema::from_compiled_layout(node.output_layout())?;
+        let output = materialize(
+            &program,
+            CompiledSchemaSite::FinalResult,
+            node.output_layout(),
+        )?;
         let pairs = output
             .slot_ids()
             .iter()
@@ -271,6 +377,38 @@ impl CompiledProjectProcessorFactory {
         node: ProgramNodeId,
         error: Arc<RuntimeErrorState>,
     ) -> Result<Self, String> {
+        Self::try_new_in(program, node, error, |_, _, layout| {
+            ChunkSchema::from_compiled_layout(layout)
+        })
+    }
+
+    pub(crate) fn try_new_with_metadata_host<H: CompiledSchemaMetadataScope>(
+        program: Arc<LocalProgram>,
+        node: ProgramNodeId,
+        error: Arc<RuntimeErrorState>,
+        host: &mut H,
+    ) -> ExecutionResult<Self> {
+        Self::try_new_in(program, node, error, |program, site, layout| {
+            host.materialize(program, site, layout, || {
+                ChunkSchema::from_compiled_layout(layout)
+            })
+        })
+    }
+
+    fn try_new_in<E, F>(
+        program: Arc<LocalProgram>,
+        node: ProgramNodeId,
+        error: Arc<RuntimeErrorState>,
+        mut materialize: F,
+    ) -> Result<Self, E>
+    where
+        E: From<String> + From<&'static str>,
+        F: FnMut(
+            &Arc<LocalProgram>,
+            CompiledSchemaSite,
+            &novarocks_local_program::StaticLayout,
+        ) -> Result<ChunkSchemaRef, E>,
+    {
         let graph_node = program
             .graph()
             .nodes()
@@ -284,7 +422,7 @@ impl CompiledProjectProcessorFactory {
             ..
         } = graph_node.kind()
         else {
-            return Err("compiled node is not a Project".to_string());
+            return Err("compiled node is not a Project".to_string().into());
         };
         let mut sites = Vec::with_capacity(exprs.len());
         for ordinal in 0..exprs.len() {
@@ -325,7 +463,11 @@ impl CompiledProjectProcessorFactory {
         } else {
             None
         };
-        let output = ChunkSchema::from_compiled_layout(graph_node.output_layout())?;
+        let output = materialize(
+            &program,
+            CompiledSchemaSite::Project(node),
+            graph_node.output_layout(),
+        )?;
         Ok(Self {
             name: format!("COMPILED_PROJECT (node={})", node.index()),
             program,
@@ -366,6 +508,46 @@ struct CompiledProjectProcessor {
     pending: Option<Chunk>,
     finishing: bool,
     finished: bool,
+}
+
+#[cfg(test)]
+pub(crate) fn project_chunk_with_source_observer(
+    program: Arc<LocalProgram>,
+    chunk: Chunk,
+    observer: Arc<crate::exec::expr::compiled_program::input_source::SlotSourceObserver>,
+) -> ExecutionResult<Chunk> {
+    let factory = CompiledProjectProcessorFactory::try_new(
+        program,
+        ProgramNodeId::new(3),
+        Arc::new(RuntimeErrorState::default()),
+    )?;
+    let mut processor = CompiledProjectProcessor {
+        name: factory.name,
+        program: factory.program,
+        sites: factory.sites,
+        final_identity_slots: factory.final_identity_slots,
+        output: factory.output,
+        control: RuntimeKernelControl::new(factory.error),
+        instances: None,
+        pending: None,
+        finishing: false,
+        finished: false,
+    };
+    assert!(processor.final_identity_slots.is_none());
+    instances(
+        &mut processor.instances,
+        &processor.program,
+        &processor.sites,
+        &processor.control,
+    )?;
+    for instance in processor.instances.as_mut().unwrap() {
+        instance.observe_slot_source(Arc::clone(&observer));
+    }
+    let state = RuntimeState::default();
+    processor.push_chunk(&state, chunk)?;
+    processor
+        .pull_chunk(&state)?
+        .ok_or_else(|| "source fixture Project has no output".into())
 }
 impl Operator for CompiledProjectProcessor {
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
@@ -452,7 +634,7 @@ impl ProcessorOperator for CompiledProjectProcessor {
         let instances = self.instances.as_mut().expect("instances were created");
         let mut columns = Vec::with_capacity(self.sites.len());
         for (instance, site) in instances.iter_mut().zip(&self.sites) {
-            columns.push(evaluate_all(instance, *site, &chunk.batch, &self.control)?);
+            columns.push(evaluate_chunk_all(instance, *site, &chunk, &self.control)?);
         }
         // A Project may publish no column (e.g. under COUNT(*)); its row count
         // is still its input's, which a zero-column batch cannot infer.
@@ -619,14 +801,20 @@ impl ProcessorOperator for CompiledFilterProcessor {
                 Arc::clone(&self.program), node, &self.control, self.control.allocator(),
             )?);
         }
+        let mut journal = crate::runtime::scalar_memory::RuntimeScalarMemoryJournal::default();
+        let mut scope = crate::runtime::scalar_memory::RuntimeScalarMemoryScope::new(
+            &self.control,
+            &mut journal,
+        );
         let truth = self
             .instance
             .as_mut()
             .expect("instance was created")
-            .evaluate_required(
+            .evaluate_required_runtime(
                 &chunk.batch,
                 Selection::all(chunk.batch.num_rows()),
                 &self.control,
+                &mut scope,
             )?;
         let truth = truth
             .as_any()
@@ -663,5 +851,27 @@ impl ProcessorOperator for CompiledFilterProcessor {
             self.finished = true;
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "test-support")]
+pub fn prepare_project_factory_for_test<H: CompiledSchemaMetadataScope>(
+    program: Arc<LocalProgram>,
+    site: CompiledSchemaSite,
+    error: Arc<RuntimeErrorState>,
+    host: &mut H,
+) -> ExecutionResult<CompiledProjectProcessorFactory> {
+    match site {
+        CompiledSchemaSite::Project(node) => {
+            CompiledProjectProcessorFactory::try_new_with_metadata_host(program, node, error, host)
+        }
+        CompiledSchemaSite::FinalResult => {
+            CompiledProjectProcessorFactory::try_new_final_result_boundary_with_metadata_host(
+                program, error, host,
+            )
+        }
+        CompiledSchemaSite::AnalyticOutput(_) => {
+            Err("the Project test factory cannot prepare an Analytic schema".into())
+        }
     }
 }

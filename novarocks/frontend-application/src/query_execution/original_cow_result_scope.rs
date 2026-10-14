@@ -180,6 +180,27 @@ mod tests {
         }
     }
     #[test]
+    fn original_scope_refuses_growth_without_releasing_its_last_window_alias() {
+        let (_control, root, binding, capacity) =
+            super::super::internal_result_cpu::admitted_internal_fixture();
+        let (scope, carrier_upper) = from_original_binding(&binding, &context(), 0).unwrap();
+        assert!(carrier_upper > 0);
+        scope.check_before_growth(carrier_upper).unwrap();
+        let error = scope
+            .check_before_growth(INTERNAL_PEAK_BYTES + 1)
+            .unwrap_err();
+        assert_eq!(error.class(), Class::Coverage);
+        let last = scope.retention_guard();
+        drop(scope);
+        drop(binding);
+        root.owner.complete();
+        root.business.release();
+        assert_eq!(capacity.snapshot().held_positions, [0, 0, 1, 0]);
+        drop(last);
+        assert_eq!(capacity.snapshot().held_positions, [0; 4]);
+    }
+
+    #[test]
     fn failure_and_last_neutral_alias_keep_actual_window_without_activity() {
         let (_control, root, binding, capacity) =
             super::super::internal_result_cpu::admitted_internal_fixture();

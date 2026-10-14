@@ -454,3 +454,6 @@ mod copy_operation_ports;
 
 #[path = "analytic_stage_metadata_escape_tests.rs"]
 mod metadata_escape_tests;
+
+#[path = "analytic_chunk_constructor_port_tests.rs"]
+mod chunk_constructor_ports;

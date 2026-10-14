@@ -101,9 +101,10 @@ pub(super) trait FrameFailure: From<KernelFailure> {
         selection: Selection<'a>,
         arguments: &'a [EvaluatedArgument<'a>],
         activation: ScalarInvocationActivation,
-        control: &dyn KernelEvaluationControl,
+        allocator: Option<&Arc<dyn AggregateStateAllocator>>,
+        work: &mut super::Work<'_, '_>,
     ) -> Result<SelectedValues<'a>, Self>;
-    fn finish<T>(work: &mut super::Work<'_>, result: Result<T, Self>) -> Result<T, Self>;
+    fn finish<T>(work: &mut super::Work<'_, '_>, result: Result<T, Self>) -> Result<T, Self>;
 }
 impl FrameFailure for KernelFailure {
     const ACTIVATE_EMPTY: bool = false;
@@ -112,16 +113,17 @@ impl FrameFailure for KernelFailure {
         selection: Selection<'a>,
         arguments: &'a [EvaluatedArgument<'a>],
         _activation: ScalarInvocationActivation,
-        control: &dyn KernelEvaluationControl,
+        _allocator: Option<&Arc<dyn AggregateStateAllocator>>,
+        work: &mut super::Work<'_, '_>,
     ) -> Result<SelectedValues<'a>, Self> {
         match instance {
-            CallInstance::Kernel(instance) => instance.evaluate(selection, arguments, control),
+            CallInstance::Kernel(instance) => instance.evaluate(selection, arguments, work.control),
             CallInstance::Invocation(_) => Err(super::invalid(
                 "whole-invocation scalar requires the lossless evaluation entry",
             )),
         }
     }
-    fn finish<T>(work: &mut super::Work<'_>, result: Result<T, Self>) -> Result<T, Self> {
+    fn finish<T>(work: &mut super::Work<'_, '_>, result: Result<T, Self>) -> Result<T, Self> {
         work.finish(result)
     }
 }
@@ -132,13 +134,57 @@ impl FrameFailure for ScalarInvocationFailure {
         selection: Selection<'a>,
         arguments: &'a [EvaluatedArgument<'a>],
         activation: ScalarInvocationActivation,
-        control: &dyn KernelEvaluationControl,
+        _allocator: Option<&Arc<dyn AggregateStateAllocator>>,
+        work: &mut super::Work<'_, '_>,
     ) -> Result<SelectedValues<'a>, Self> {
-        instance.evaluate(selection, arguments, activation, control)
+        instance.evaluate(selection, arguments, activation, work.control)
     }
-    fn finish<T>(work: &mut super::Work<'_>, result: Result<T, Self>) -> Result<T, Self> {
+    fn finish<T>(work: &mut super::Work<'_, '_>, result: Result<T, Self>) -> Result<T, Self> {
         match result {
             Err(Self::Data(data)) => Err(Self::Data(data)),
+            Err(Self::Kernel(cause)) => work.finish(Err(cause)).map_err(Self::Kernel),
+            Ok(value) => work.finish(Ok(value)).map_err(Self::Kernel),
+        }
+    }
+}
+
+impl FrameFailure for crate::runtime::scalar_memory::RuntimeScalarEvaluationFailure {
+    const ACTIVATE_EMPTY: bool = true;
+    fn invoke<'a>(
+        instance: &mut CallInstance,
+        selection: Selection<'a>,
+        arguments: &'a [EvaluatedArgument<'a>],
+        activation: ScalarInvocationActivation,
+        allocator: Option<&Arc<dyn AggregateStateAllocator>>,
+        work: &mut super::Work<'_, '_>,
+    ) -> Result<SelectedValues<'a>, Self> {
+        match instance {
+            CallInstance::Kernel(instance) => {
+                let scope = work.scalar_scope.as_mut().ok_or_else(|| {
+                    super::internal("runtime scalar Frame has no explicit operation scope")
+                })?;
+                scope.evaluate(instance, selection, arguments, work.control)
+            }
+            CallInstance::Invocation(instance) => {
+                let scope = work.scalar_scope.as_mut().ok_or_else(|| {
+                    super::internal("runtime scalar Frame has no explicit operation scope")
+                })?;
+                scope.evaluate_invocation(
+                    instance,
+                    selection,
+                    arguments,
+                    activation,
+                    allocator,
+                    work.control,
+                )
+            }
+        }
+    }
+    fn finish<T>(work: &mut super::Work<'_, '_>, result: Result<T, Self>) -> Result<T, Self> {
+        match result {
+            Err(Self::Data(data)) => Err(Self::Data(data)),
+            Err(Self::Source(error)) => Err(Self::Source(error)),
+            Err(Self::Host(cause)) => Err(Self::Host(cause)),
             Err(Self::Kernel(cause)) => work.finish(Err(cause)).map_err(Self::Kernel),
             Ok(value) => work.finish(Ok(value)).map_err(Self::Kernel),
         }

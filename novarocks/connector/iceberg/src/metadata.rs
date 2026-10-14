@@ -1581,10 +1581,10 @@ pub(crate) fn cow_projected_schema_upper(
     for f in schema.as_struct().fields() {
         n = add(n, field_upper(f, scope)?)?;
     }
-    // SQL carrier adaptation, scalar-domain projection, default annotation,
-    // hidden annotation and final projection retain old/new graphs. Six whole
-    // layouts conservatively cover these actual passes, including metadata fields.
-    n = mul(n, 6)?;
+    // SQL carrier adaptation, scalar/nominal-domain projection, default and
+    // hidden annotation and final projection retain old/new graphs. The added
+    // nominal pass owns another field-reference vector and schema/field graph.
+    n = mul(n, 7)?;
     for (key, value) in metadata.properties() {
         n = add(n, mul((key.len() + value.len()) as u64, 6)?)?;
     }
@@ -1596,6 +1596,28 @@ pub(crate) fn cow_projected_schema_upper(
         n,
         crate::commit::write_stack::control::cow_begin::tree_upper::<i32, (i64, i64)>(
             scalar_nodes,
+        )?,
+    )?;
+    let roots = schema.as_struct().fields().len() as u64;
+    // The shared nominal author inserts at most one declaration per exact root.
+    // Its ordinal tree coexists with scalar declarations and the Arrow output.
+    n = add(
+        n,
+        crate::commit::write_stack::control::cow_begin::tree_upper::<
+            usize,
+            novarocks_type_contract::ValueLogicalType,
+        >(roots)?,
+    )?;
+    // Price the new key/longest canonical label through each retained graph;
+    // existing property-string work also covers lowercase validation temporaries.
+    n = add(
+        n,
+        mul(
+            mul(
+                roots,
+                (novarocks_type_contract::NR_LOGICAL_TYPE_KEY.len() + "largeint".len()) as u64,
+            )?,
+            7,
         )?,
     )?;
     Ok(n)
@@ -1709,12 +1731,7 @@ pub(crate) fn projected_schema_with_metadata(
     } else {
         metadata.current_schema().clone()
     };
-    let declarations = crate::scalar_integer_domain::metadata_declarations(metadata)?;
-    let storage = crate::scalar_integer_domain::apply_schema(
-        crate::schema_mapping::sql_read_schema_from_iceberg(&storage_schema).map_err(corrupt)?,
-        &storage_schema,
-        &declarations,
-    )?;
+    let storage = crate::scalar_integer_domain::metadata_sql_schema(metadata, &storage_schema)?;
     // Field IDs survive the Arrow conversion but initial defaults do not, so the
     // frozen schema has to re-stamp them before the scan schema leaves the
     // provider. Readers backfill a missing column from that metadata.
