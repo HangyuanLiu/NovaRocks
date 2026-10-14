@@ -136,20 +136,6 @@ source control; package content and dependency resolution remain reproducible.
   partition watermark tests preserved. Unused eager/extension helpers omitted.
 - Validation: standalone REST crate check/tests after the shared window is free.
 
-### R1: REST view protocol
-
-- Files: `src/catalog.rs`, `src/catalog/extension.rs`, `src/types.rs`.
-- Purpose: restore the six Catalog view methods, view endpoint URL helpers and
-  four wire types over RestSessionCatalog using the bound facade context.
-  view_exists always uses HEAD without endpoint-advertisement fallback;
-  drop-view 404 text remains `Tried to drop a view that does not exist`.
-- Upstream status: no equivalent view endpoints at the pinned baseline.
-- Production dependency: NovaRocks view catalog-control and private delegate.
-- Exit: IRU-13a replaces the vendored REST view protocol surface.
-- Coverage: existing NovaRocks view connector/SQL tests; list-view protocol
-  component test migrates with U1r (0.9 has no other view-specific unit test).
-- Validation: standalone REST crate check/tests after the shared window is free.
-
 ### U1r: bounded single-page REST listings
 
 - Files: `src/catalog/extension.rs`.
