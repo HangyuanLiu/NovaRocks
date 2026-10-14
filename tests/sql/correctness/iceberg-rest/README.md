@@ -37,6 +37,7 @@ and read, exercising the REST commit protocol branches that the Hadoop-catalog
 | `iceberg_rest_branch_tag_ddl` | updateRefs commit: CREATE BRANCH/TAG, branch write, FOR VERSION AS OF '<branch>' |
 | `iceberg_rest_v3_default_columns` | format-v3 ADD COLUMN with DEFAULT + initial-default backfill + v2 rejection |
 | `iceberg_rest_time_travel` | `FOR VERSION AS OF '<branch>'` against REST loadTable + cross-ref join |
+| `iceberg_rest_view_replace` | view commit: CREATE OR REPLACE VIEW with unchanged columns, changed columns and an identical definition |
 
 `iceberg_rest_metadata_tables` (`$snapshots` / `$refs` / `$history` count
 assertions) was removed pending an analyzer fix for 3-part metadata-table

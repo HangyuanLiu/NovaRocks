@@ -105,11 +105,14 @@ text = Path(sys.argv[1]).read_text()
 expected = (
     'iru13b_java_rest_ctas_publishes_staged_metadata_for_every_format_version',
     'iru13b_java_rest_schema_changes_keep_the_column_high_water_mark',
+    'iru13b_java_rest_view_replacements_always_add_the_selected_version',
+    'iru13b_java_rest_view_replacement_survives_version_id_reuse',
+    'iru13b_java_rest_view_replacement_keeps_dialects_unless_allowed',
 )
 for name in expected:
     if not re.search(r'^test [^\n]*' + re.escape(name) + r' \.\.\. ok$', text, re.MULTILINE):
         raise SystemExit(f'FAIL: expected ignored interop test did not pass: {name}')
-if not re.search(r'test result: ok\. 2 passed; 0 failed; 0 ignored;', text):
-    raise SystemExit('FAIL: expected exactly two enabled interop tests')
+if not re.search(r'test result: ok\. 5 passed; 0 failed; 0 ignored;', text):
+    raise SystemExit('FAIL: expected exactly five enabled interop tests')
 PY
 printf 'IRU-13b Java REST interoperability artifacts: %s\n' "$NR_IRU13B_INTEROP_ARTIFACT_DIR"

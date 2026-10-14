@@ -410,43 +410,6 @@ mod application_document_publication_trace_tests {
                 )
                 .await
         }
-
-        async fn create_view(
-            &self,
-            namespace: &NamespaceIdent,
-            creation: crate::iceberg::ViewCreation,
-        ) -> crate::iceberg::Result<crate::iceberg::spec::ViewMetadata> {
-            self.inner.create_view(namespace, creation).await
-        }
-
-        async fn load_view(
-            &self,
-            view: &TableIdent,
-        ) -> crate::iceberg::Result<crate::iceberg::spec::ViewMetadata> {
-            self.inner.load_view(view).await
-        }
-
-        async fn update_view(
-            &self,
-            commit: crate::iceberg::ViewCommit,
-        ) -> crate::iceberg::Result<crate::iceberg::spec::ViewMetadata> {
-            self.inner.update_view(commit).await
-        }
-
-        async fn drop_view(&self, view: &TableIdent) -> crate::iceberg::Result<()> {
-            self.inner.drop_view(view).await
-        }
-
-        async fn view_exists(&self, view: &TableIdent) -> crate::iceberg::Result<bool> {
-            self.inner.view_exists(view).await
-        }
-
-        async fn list_views(
-            &self,
-            namespace: &NamespaceIdent,
-        ) -> crate::iceberg::Result<Vec<TableIdent>> {
-            self.inner.list_views(namespace).await
-        }
     }
 
     fn requirement_kind(requirement: &TableRequirement) -> &'static str {

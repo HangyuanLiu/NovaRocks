@@ -24,15 +24,13 @@ use novarocks_spi::connector::{
 use novarocks_types::naming::normalize_identifier;
 
 use crate::catalog::error::CatalogOutcome;
+pub(crate) use crate::catalog::view_request::VIEW_DIALECT_STARROCKS;
+use crate::catalog::view_request::{ValidatedViewReplace, ViewCreate, ViewDefinition};
 use crate::catalog::{CatalogNamespaceName, CatalogTableName};
-use crate::iceberg::spec::{
-    Schema, SqlViewRepresentation, ViewMetadata, ViewRepresentation, ViewRepresentations,
-    ViewVersion,
-};
-use crate::iceberg::{NamespaceIdent, TableIdent, ViewCommit, ViewCreation, ViewRequirement};
+use crate::iceberg::spec::{Schema, ViewMetadata, ViewRepresentation};
+use crate::iceberg::{NamespaceIdent, TableIdent};
 use crate::metadata_context::IcebergMetadataContext;
 
-pub(crate) const VIEW_DIALECT_STARROCKS: &str = "starrocks";
 const NOVAROCKS_ENGINE_NAME: &str = "novarocks";
 const NOVAROCKS_SOURCE_FORMAT_KEY: &str = "novarocks.source-format";
 const EFFECTIVE_USER_SOURCE_V1: &str = "effective-user-source-v1";
@@ -156,11 +154,6 @@ pub(crate) fn create_view(
     let (source_catalog, source_namespace, source_format) = novarocks_source_context(definition)?;
     let (namespace_ident, ident) = view_ident(namespace, view)?;
     let schema = build_view_schema(columns)?;
-    let representations =
-        ViewRepresentations::new(vec![ViewRepresentation::Sql(SqlViewRepresentation {
-            sql: definition.raw_sql.to_string(),
-            dialect: VIEW_DIALECT_STARROCKS.to_string(),
-        })]);
     let mut properties = extra_properties.iter().cloned().collect::<HashMap<_, _>>();
     if let Some(comment) = comment
         && properties
@@ -169,13 +162,24 @@ pub(crate) fn create_view(
     {
         return Err("duplicate Iceberg view comment property".to_string());
     }
-    let summary = HashMap::from([
-        ("engine-name".to_string(), NOVAROCKS_ENGINE_NAME.to_string()),
-        (
-            NOVAROCKS_SOURCE_FORMAT_KEY.to_string(),
-            source_format.to_string(),
-        ),
-    ]);
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("system clock before epoch: {error}"))?
+        .as_millis() as i64;
+    let definition = ViewDefinition {
+        schema,
+        sql: definition.raw_sql.to_string(),
+        summary: HashMap::from([
+            ("engine-name".to_string(), NOVAROCKS_ENGINE_NAME.to_string()),
+            (
+                NOVAROCKS_SOURCE_FORMAT_KEY.to_string(),
+                source_format.to_string(),
+            ),
+        ]),
+        default_catalog: Some(source_catalog),
+        default_namespace: source_namespace,
+        timestamp_ms,
+    };
     let owner = Arc::clone(runtime.novarocks_catalog());
 
     if replace {
@@ -191,30 +195,23 @@ pub(crate) fn create_view(
                 ConnectorErrorKind::NotFound => format!("unknown view: {ident}"),
                 _ => format!("load Iceberg view {ident}: {error}"),
             })?;
-        return replace_view(
-            runtime,
-            owner,
-            &ident,
-            current,
-            schema,
-            representations,
-            properties,
-            summary,
-            source_catalog,
-            source_namespace,
-        );
+        // Semantic validation precedes dispatch: a refusal here is certain,
+        // while the same refusal from the server would be an unknown outcome.
+        let replace = match ValidatedViewReplace::validate(ident, &current, definition, properties)
+        {
+            Ok(replace) => replace,
+            Err(message) => return Ok(locally_refused(message)),
+        };
+        return runtime
+            .resources()
+            .catalog_runtime()
+            .block_on(async move { owner.replace_view(replace).await });
     }
 
-    let creation = ViewCreation::builder()
-        .name(ident.name.clone())
-        .location(None)
-        .representations(representations)
-        .schema(schema)
-        .properties(properties)
-        .default_namespace(source_namespace)
-        .default_catalog(Some(source_catalog))
-        .summary(summary)
-        .build();
+    let creation = match ViewCreate::validate(ident.name.clone(), definition, properties) {
+        Ok(creation) => creation,
+        Err(message) => return Ok(locally_refused(message)),
+    };
     let namespace = CatalogNamespaceName::new(namespace_ident.to_url_string());
     runtime
         .resources()
@@ -222,75 +219,42 @@ pub(crate) fn create_view(
         .block_on(async move { owner.create_view(namespace, creation).await })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn replace_view(
-    runtime: &IcebergMetadataContext,
-    owner: Arc<dyn crate::catalog::NovaRocksCatalog>,
-    ident: &TableIdent,
-    current: ViewMetadata,
-    schema: Schema,
-    representations: ViewRepresentations,
-    properties: HashMap<String, String>,
-    summary: HashMap<String, String>,
-    source_catalog: String,
-    source_namespace: NamespaceIdent,
-) -> Result<CatalogOutcome<CatalogTableName>, String> {
-    let uuid = current.uuid();
-    let timestamp_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| format!("system clock before epoch: {error}"))?
-        .as_millis() as i64;
-    let new_version = ViewVersion::builder()
-        .with_version_id(1)
-        .with_schema_id(schema.schema_id())
-        .with_timestamp_ms(timestamp_ms)
-        .with_summary(summary)
-        .with_representations(representations)
-        .with_default_catalog(Some(source_catalog))
-        .with_default_namespace(source_namespace)
-        .build();
-    let mut builder = current.into_builder();
-    if !properties.is_empty() {
-        builder = builder
-            .set_properties(properties)
-            .map_err(|error| format!("set replaced view properties: {error}"))?;
-    }
-    let result = builder
-        .set_current_version(new_version, schema)
-        .map_err(|error| format!("stage replaced view version: {error}"))?
-        .build()
-        .map_err(|error| format!("build replaced view metadata: {error}"))?;
-    let commit = ViewCommit::builder()
-        .ident(ident.clone())
-        .requirements(vec![ViewRequirement::UuidMatch { uuid }])
-        .updates(result.changes)
-        .build();
-    runtime
-        .resources()
-        .catalog_runtime()
-        .block_on(async move { owner.replace_view(commit).await })
+/// A view mutation refused before dispatch is known not to have committed.
+fn locally_refused(message: String) -> CatalogOutcome<CatalogTableName> {
+    CatalogOutcome::uncommitted(
+        novarocks_spi::connector::ConnectorMutationFailureKind::InvalidRequest,
+        message,
+    )
 }
 
+/// Load a view. The owner's error reaches the caller with its kind intact:
+/// a catalog that cannot hold views answers `Unsupported`, which callers read
+/// as "no such view". Only failures this module produces itself are
+/// classified from their text.
 pub(crate) fn load_view(
     runtime: &IcebergMetadataContext,
     namespace: &str,
     view: &str,
-) -> Result<LoadedIcebergView, String> {
-    let (_, ident) = view_ident(namespace, view)?;
+) -> Result<LoadedIcebergView, ConnectorError> {
+    let (_, ident) = view_ident(namespace, view).map_err(unavailable)?;
     let owner = std::sync::Arc::clone(runtime.novarocks_catalog());
     let target =
         crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
     let metadata = runtime
         .resources()
         .catalog_runtime()
-        .block_on(async move { owner.load_view(target).await })?
-        // Absence is read from the error's kind. The owner classifies it, so
-        // there is nothing here to recognize by substring.
+        .block_on(async move { owner.load_view(target).await })
+        .map_err(unavailable)?
         .map_err(|error| match error.kind() {
-            ConnectorErrorKind::NotFound => format!("unknown view: {ident}"),
-            _ => format!("load Iceberg view {ident}: {error}"),
+            // Absence is read from the error's kind. The owner classifies it,
+            // so there is nothing here to recognize by substring.
+            ConnectorErrorKind::NotFound => ConnectorError::new(
+                ConnectorErrorKind::NotFound,
+                format!("unknown view: {ident}"),
+            ),
+            _ => error,
         })?;
-    loaded_view_from_metadata(&ident, &metadata)
+    loaded_view_from_metadata(&ident, &metadata).map_err(unavailable)
 }
 
 pub(crate) fn drop_view(
@@ -421,8 +385,7 @@ impl ConnectorViewMetadata for IcebergMetadata {
         request: ConnectorViewRequest,
     ) -> Result<ConnectorViewMetadataValue, ConnectorError> {
         ensure_request(self, &request.view.instance_id, &request.context)?;
-        let loaded = load_view(self.runtime(), &request.view.namespace, &request.view.view)
-            .map_err(unavailable)?;
+        let loaded = load_view(self.runtime(), &request.view.namespace, &request.view.view)?;
         if !loaded.dialect.eq_ignore_ascii_case(VIEW_DIALECT_STARROCKS) {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Unsupported,
@@ -579,14 +542,6 @@ mod tests {
     #[test]
     fn hadoop_reports_unsupported_rather_than_answering_view_questions() {
         let (_executor, _warehouse, runtime) = hadoop_runtime();
-        let assert_mutation_gate = |result: Result<(), String>| {
-            let error = result.expect_err("Hadoop must not expose a view mutation");
-            assert!(
-                error.to_lowercase().contains("unsupported"),
-                "expected an unsupported refusal, got: {error}"
-            );
-        };
-
         let assert_unsupported_outcome =
             |result: Result<CatalogOutcome<CatalogTableName>, String>| {
                 let outcome = result.expect("a view mutation reaches the owner");
@@ -606,7 +561,15 @@ mod tests {
             &[],
         ));
         assert_unsupported_outcome(drop_view(&runtime, "db", "v"));
-        assert_mutation_gate(load_view(&runtime, "db", "v").map(|_| ()));
+        let loaded = load_view(&runtime, "db", "v")
+            .expect_err("a catalog that cannot hold views must not load one");
+        assert_eq!(loaded.kind(), ConnectorErrorKind::Unsupported);
+        assert!(
+            loaded
+                .message()
+                .contains("load_view is not supported by this catalog"),
+            "{loaded}"
+        );
 
         let exists = view_exists(&runtime, "db", "v")
             .expect_err("a probe must not be answered by a catalog that cannot hold views");
@@ -700,5 +663,206 @@ mod tests {
             error.starts_with("unsupported NovaRocks Iceberg view"),
             "{error}"
         );
+    }
+
+    /// The SPI keeps the owner's `Unsupported`: callers read it as "no such
+    /// view" instead of failing on an `Unavailable` catalog.
+    #[test]
+    fn spi_load_view_on_hadoop_is_unsupported() {
+        let (_executor, _warehouse, runtime) = hadoop_runtime();
+        let provider = IcebergMetadata::new(
+            novarocks_spi::connector::ConnectorInstanceDescriptor {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .unwrap(),
+                instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("ice").unwrap(),
+            },
+            ProviderBindingEpoch::from_bytes([3; 16]),
+            Arc::new(runtime),
+        );
+        let error = ConnectorViewMetadata::load_view(
+            &provider,
+            ConnectorViewRequest {
+                view: ConnectorViewIdentity {
+                    instance_id: novarocks_spi::connector::ConnectorInstanceId::parse("ice")
+                        .unwrap(),
+                    namespace: Arc::from("db"),
+                    view: Arc::from("v"),
+                },
+                context: novarocks_spi::connector::ConnectorRequestContext::try_new(
+                    std::time::Instant::now() + std::time::Duration::from_secs(5),
+                    novarocks_spi::connector::ConnectorStopOwner::new().view(),
+                    1024,
+                    4096,
+                )
+                .unwrap(),
+            },
+        )
+        .expect_err("Hadoop holds no views");
+        assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        assert_eq!(
+            error.message(),
+            "load_view is not supported by this catalog"
+        );
+    }
+
+    mod local_refusal {
+        use super::*;
+        use crate::catalog::error::CatalogOutcome;
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+        use novarocks_spi::connector::{ConnectorDataType, ConnectorMutationFailureKind as Kind};
+
+        /// `db.v`, whose current version also carries a Spark definition.
+        fn load_view_reply() -> Reply {
+            Reply::json(
+                200,
+                &serde_json::json!({
+                    "metadata-location": "s3://warehouse/db/v/metadata/00001.json",
+                    "config": {},
+                    "metadata": {
+                        "view-uuid": "fa6506c3-7681-40c8-86dc-e36561f83385",
+                        "format-version": 1,
+                        "location": "s3://warehouse/db/v",
+                        "current-version-id": 1,
+                        "versions": [{
+                            "version-id": 1,
+                            "schema-id": 0,
+                            "timestamp-ms": 1_600_000_000_000i64,
+                            "summary": {"engine-name": "novarocks"},
+                            "representations": [
+                                {"type": "sql", "sql": "select 1 as a", "dialect": "starrocks"},
+                                {"type": "sql", "sql": "select 1 as a", "dialect": "spark"}
+                            ],
+                            "default-namespace": ["db"]
+                        }],
+                        "version-log": [{"version-id": 1, "timestamp-ms": 1_600_000_000_000i64}],
+                        "schemas": [{
+                            "type": "struct",
+                            "schema-id": 0,
+                            "fields": [{"id": 1, "name": "a", "required": false, "type": "int"}]
+                        }],
+                        "properties": {}
+                    }
+                }),
+            )
+        }
+
+        fn rest_runtime(server: &TestServer) -> (tokio::runtime::Runtime, IcebergMetadataContext) {
+            let executor = tokio::runtime::Runtime::new().expect("runtime");
+            let handle = executor.handle().clone();
+            let (_upstream, endpoints) = executor
+                .block_on(async {
+                    crate::catalog_runtime::build_vended_rest_generation_for_test(
+                        HashMap::from([("uri".to_string(), server.url())]),
+                        None,
+                        crate::iceberg::Runtime::try_current().expect("test runtime"),
+                    )
+                    .await
+                })
+                .expect("REST generation");
+            let configuration = crate::catalog_config::parse_catalog_configuration(
+                "ice",
+                &[
+                    ("iceberg.catalog.type".to_string(), "rest".to_string()),
+                    ("uri".to_string(), server.url()),
+                    ("warehouse".to_string(), "s3://warehouse".to_string()),
+                ],
+            )
+            .expect("configuration");
+            let binding = IcebergReadBinding::new(
+                None,
+                novarocks_fs::FsAccessResolver::new(),
+                Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+                Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle.clone())),
+            );
+            let runtime = IcebergMetadataContext::with_catalog_for_test(
+                IcebergCatalogControlState::new(configuration),
+                IcebergMetadataResources::new(binding, handle),
+                crate::catalog::factory::NovaRocksCatalogFactory::adopt_vended_rest_for_test(
+                    endpoints,
+                    "s3://warehouse",
+                ),
+            );
+            (executor, runtime)
+        }
+
+        fn column() -> ConnectorColumnDefinition {
+            ConnectorColumnDefinition {
+                name: "a".into(),
+                data_type: ConnectorDataType::Int,
+                nullable: true,
+                aggregation: None,
+                default: None,
+            }
+        }
+
+        fn refused_as_invalid(outcome: Result<CatalogOutcome<CatalogTableName>, String>) -> String {
+            match outcome.expect("the refusal is an outcome") {
+                CatalogOutcome::KnownUncommitted { failure } => {
+                    assert_eq!(failure.kind(), Kind::InvalidRequest);
+                    failure.to_string()
+                }
+                other => panic!("expected a local InvalidRequest refusal, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn dropping_a_dialect_is_refused_before_dispatch() {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on("GET", "/v1/namespaces/db/views/v", load_view_reply())
+                    .on("POST", "/v1/namespaces/db/views/v", Reply::status(200)),
+            );
+            let (_executor, runtime) = rest_runtime(&server);
+            let message = refused_as_invalid(create_view(
+                &runtime,
+                "db",
+                "v",
+                &[column()],
+                &novarocks_definition("select 2 as a"),
+                None,
+                true,
+                &[],
+            ));
+            assert!(message.contains("spark"), "{message}");
+            assert!(
+                message.contains("replace.drop-dialect.allowed"),
+                "{message}"
+            );
+            assert_eq!(server.count("GET", "/v1/namespaces/db/views/v"), 1);
+            assert_eq!(
+                server.count("POST", "/v1/namespaces/db/views/v"),
+                0,
+                "no commit request is dispatched"
+            );
+        }
+
+        #[test]
+        fn an_invalid_history_property_is_refused_before_dispatch() {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on("GET", "/v1/namespaces/db/views/v", load_view_reply())
+                    .on("POST", "/v1/namespaces/db/views", Reply::status(200))
+                    .on("POST", "/v1/namespaces/db/views/v", Reply::status(200)),
+            );
+            let (_executor, runtime) = rest_runtime(&server);
+            let invalid = [("version.history.num-entries".to_string(), "0".to_string())];
+            for replace in [false, true] {
+                let message = refused_as_invalid(create_view(
+                    &runtime,
+                    "db",
+                    "v",
+                    &[column()],
+                    &novarocks_definition("select 2 as a"),
+                    None,
+                    replace,
+                    &invalid,
+                ));
+                assert!(message.contains("version.history.num-entries"), "{message}");
+            }
+            assert_eq!(server.count("POST", "/v1/namespaces/db/views"), 0);
+            assert_eq!(server.count("POST", "/v1/namespaces/db/views/v"), 0);
+        }
     }
 }
