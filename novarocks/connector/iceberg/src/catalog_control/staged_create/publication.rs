@@ -136,7 +136,6 @@ struct CreatePublisher {
     prepared: PreparedOperation,
     operation_id: ConnectorStagedCreateOperationId,
     journal: PublicationJournal<ConnectorStagedCreateReceipt>,
-    file_io: Mutex<Option<crate::iceberg::io::FileIO>>,
 }
 
 #[async_trait]
@@ -146,11 +145,6 @@ impl Publisher for CreatePublisher {
         attempt: &IcebergCommitAttempt,
     ) -> crate::iceberg::Result<StagingBase> {
         attempt.check_active()?;
-        *self
-            .file_io
-            .lock()
-            .map_err(|_| iceberg_error("Create request FileIO lock poisoned"))? =
-            Some(attempt.file_io().clone());
         Ok(StagingBase::Create {
             staged: StagedCreateIdentity::new(
                 OperationToken::from_mutation(self.operation_id),
@@ -213,30 +207,18 @@ impl Publisher for CreatePublisher {
 
     async fn dispatch_once(&self, request: FrozenRequest) -> CatalogOutcome<CommitProof> {
         let expected_snapshot_id = request.ref_snapshot_after("main");
-        let file_io = match self.file_io.lock() {
-            Ok(io) => match io.as_ref() {
-                Some(io) => io.clone(),
-                None => {
-                    return CatalogOutcome::uncommitted(
-                        ConnectorMutationFailureKind::Internal,
-                        "Create dispatch has no admitted FileIO",
-                    );
-                }
-            },
-            Err(_) => {
-                return CatalogOutcome::uncommitted(
-                    ConnectorMutationFailureKind::Internal,
-                    "Create request FileIO lock poisoned",
-                );
-            }
-        };
         // This is the original catalog-owner boundary. No frozen update is
-        // appended here, and no SDK transaction predicts its metadata.
+        // appended here, and no SDK transaction predicts its metadata. The
+        // owner attributes the response against this operation's frozen UUID,
+        // snapshot and properties before it reports any evidence (L10, L11).
         let outcome = self
             .adapter
             .runtime
             .novarocks_catalog()
-            .commit_staged_table(request.into_table_commit(), file_io)
+            .commit_staged_table(
+                request.into_table_commit(),
+                publication_expectation(&self.prepared, expected_snapshot_id),
+            )
             .await;
         let evidence = || {
             CatalogCommitEvidence::for_target(format!(
@@ -252,26 +234,12 @@ impl Publisher for CreatePublisher {
         };
         use crate::catalog::StagedCommitResult;
         match outcome {
-            StagedCommitResult::Committed(table)
-                if publication_matches(
-                    &table,
-                    self.prepared.operation_id(),
-                    &self.prepared,
-                    expected_snapshot_id,
-                ) =>
-            {
-                CatalogOutcome::committed(
-                    CommitProof::applied(expected_snapshot_id)
-                        .with_table_uuid(table.metadata().uuid().to_string()),
-                    ExternalMutationEffect::Applied,
-                )
+            StagedCommitResult::Committed(proof) => {
+                CatalogOutcome::committed(proof, ExternalMutationEffect::Applied)
             }
-            StagedCommitResult::Committed(_) => CatalogOutcome::unknown(
-                "REST response did not prove the exact staged-create publication",
-                evidence(),
-            ),
-            StagedCommitResult::Conflict(message) => {
-                CatalogOutcome::uncommitted(ConnectorMutationFailureKind::Conflict, message)
+            StagedCommitResult::Conflict(failure)
+            | StagedCommitResult::KnownUncommitted(failure) => {
+                CatalogOutcome::KnownUncommitted { failure }
             }
             StagedCommitResult::CommitUnknown(message) => {
                 CatalogOutcome::unknown(message, evidence())
@@ -307,7 +275,6 @@ pub(super) fn publish(
         prepared: prepared.clone(),
         operation_id,
         journal: journal.clone(),
-        file_io: Mutex::new(None),
     }));
     let run_operation = operation.clone();
     let result = operation.runtime().block_on(async move {
@@ -590,7 +557,6 @@ mod tests {
                     prepared: fixture.prepared.clone(),
                     operation_id,
                     journal: journal.clone(),
-                    file_io: Mutex::new(None),
                 };
                 let attempt = operation.begin_attempt().unwrap();
                 let mut engine = StagingEngine::begin(
@@ -788,7 +754,6 @@ mod tests {
                 prepared: fixture.prepared.clone(),
                 operation_id,
                 journal: journal.clone(),
-                file_io: Mutex::new(None),
             };
             let attempt = operation.begin_attempt().unwrap();
             let mut engine = StagingEngine::begin(

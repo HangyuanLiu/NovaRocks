@@ -23,13 +23,13 @@ use novarocks_spi::connector::{
 };
 use novarocks_types::naming::normalize_identifier;
 
+use crate::catalog::error::CatalogOutcome;
+use crate::catalog::{CatalogNamespaceName, CatalogTableName};
 use crate::iceberg::spec::{
     Schema, SqlViewRepresentation, ViewMetadata, ViewRepresentation, ViewRepresentations,
     ViewVersion,
 };
-use crate::iceberg::{
-    Catalog, NamespaceIdent, TableIdent, ViewCommit, ViewCreation, ViewRequirement,
-};
+use crate::iceberg::{NamespaceIdent, TableIdent, ViewCommit, ViewCreation, ViewRequirement};
 use crate::metadata_context::IcebergMetadataContext;
 
 pub(crate) const VIEW_DIALECT_STARROCKS: &str = "starrocks";
@@ -152,7 +152,7 @@ pub(crate) fn create_view(
     comment: Option<&str>,
     replace: bool,
     extra_properties: &[(String, String)],
-) -> Result<(), String> {
+) -> Result<CatalogOutcome<CatalogTableName>, String> {
     let (source_catalog, source_namespace, source_format) = novarocks_source_context(definition)?;
     let (namespace_ident, ident) = view_ident(namespace, view)?;
     let schema = build_view_schema(columns)?;
@@ -176,21 +176,24 @@ pub(crate) fn create_view(
             source_format.to_string(),
         ),
     ]);
-    let catalog = runtime.novarocks_catalog().vendored_client();
+    let owner = Arc::clone(runtime.novarocks_catalog());
 
     if replace {
+        let target = CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
         let current = runtime
             .resources()
             .catalog_runtime()
             .block_on({
-                let catalog = catalog.clone();
-                let ident = ident.clone();
-                async move { catalog.load_view(&ident).await }
+                let owner = Arc::clone(&owner);
+                async move { owner.load_view(target).await }
             })?
-            .map_err(|error| format!("load Iceberg view {ident}: {error}"))?;
+            .map_err(|error| match error.kind() {
+                ConnectorErrorKind::NotFound => format!("unknown view: {ident}"),
+                _ => format!("load Iceberg view {ident}: {error}"),
+            })?;
         return replace_view(
             runtime,
-            catalog,
+            owner,
             &ident,
             current,
             schema,
@@ -212,18 +215,17 @@ pub(crate) fn create_view(
         .default_catalog(Some(source_catalog))
         .summary(summary)
         .build();
+    let namespace = CatalogNamespaceName::new(namespace_ident.to_url_string());
     runtime
         .resources()
         .catalog_runtime()
-        .block_on(async move { catalog.create_view(&namespace_ident, creation).await })?
-        .map_err(|error| format!("create Iceberg view {ident}: {error}"))?;
-    Ok(())
+        .block_on(async move { owner.create_view(namespace, creation).await })
 }
 
 #[allow(clippy::too_many_arguments)]
 fn replace_view(
     runtime: &IcebergMetadataContext,
-    catalog: std::sync::Arc<dyn Catalog>,
+    owner: Arc<dyn crate::catalog::NovaRocksCatalog>,
     ident: &TableIdent,
     current: ViewMetadata,
     schema: Schema,
@@ -232,7 +234,7 @@ fn replace_view(
     summary: HashMap<String, String>,
     source_catalog: String,
     source_namespace: NamespaceIdent,
-) -> Result<(), String> {
+) -> Result<CatalogOutcome<CatalogTableName>, String> {
     let uuid = current.uuid();
     let timestamp_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -266,9 +268,7 @@ fn replace_view(
     runtime
         .resources()
         .catalog_runtime()
-        .block_on(async move { catalog.update_view(commit).await })?
-        .map_err(|error| format!("replace Iceberg view {ident}: {error}"))?;
-    Ok(())
+        .block_on(async move { owner.replace_view(commit).await })
 }
 
 pub(crate) fn load_view(
@@ -297,17 +297,14 @@ pub(crate) fn drop_view(
     runtime: &IcebergMetadataContext,
     namespace: &str,
     view: &str,
-) -> Result<(), String> {
+) -> Result<CatalogOutcome<CatalogTableName>, String> {
     let (_, ident) = view_ident(namespace, view)?;
-    let catalog = runtime.novarocks_catalog().vendored_client();
+    let owner = Arc::clone(runtime.novarocks_catalog());
+    let target = CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
     runtime
         .resources()
         .catalog_runtime()
-        .block_on({
-            let ident = ident.clone();
-            async move { catalog.drop_view(&ident).await }
-        })?
-        .map_err(|error| map_view_error(&ident, "drop", error))
+        .block_on(async move { owner.drop_view(target).await })
 }
 
 /// Whether the view exists.
@@ -351,15 +348,6 @@ pub(crate) fn list_views(
     bridge(runtime, async move {
         catalog.list_views_for_request(name, context, bound).await
     })
-}
-
-fn map_view_error(ident: &TableIdent, action: &str, error: impl std::fmt::Display) -> String {
-    let message = error.to_string();
-    if message.contains("view that does not exist") {
-        format!("unknown view: {ident}")
-    } else {
-        format!("{action} REST Iceberg view {ident}: {message}")
-    }
 }
 
 fn loaded_view_from_metadata(
@@ -599,7 +587,15 @@ mod tests {
             );
         };
 
-        assert_mutation_gate(create_view(
+        let assert_unsupported_outcome =
+            |result: Result<CatalogOutcome<CatalogTableName>, String>| {
+                let outcome = result.expect("a view mutation reaches the owner");
+                assert!(
+                    matches!(outcome, CatalogOutcome::Unsupported(_)),
+                    "expected an unsupported refusal, got: {outcome:?}"
+                );
+            };
+        assert_unsupported_outcome(create_view(
             &runtime,
             "db",
             "v",
@@ -609,7 +605,7 @@ mod tests {
             false,
             &[],
         ));
-        assert_mutation_gate(drop_view(&runtime, "db", "v"));
+        assert_unsupported_outcome(drop_view(&runtime, "db", "v"));
         assert_mutation_gate(load_view(&runtime, "db", "v").map(|_| ()));
 
         let exists = view_exists(&runtime, "db", "v")

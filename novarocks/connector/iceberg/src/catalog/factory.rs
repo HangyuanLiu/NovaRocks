@@ -56,14 +56,10 @@ impl NovaRocksCatalogFactory {
                 Ok(Arc::new(super::hadoop::NovaRocksHadoopCatalog::new(hadoop)))
             }
             IcebergCatalogKind::Rest => {
-                let rest = client.rest().cloned().ok_or_else(|| {
-                    "REST Iceberg configuration produced no REST client".to_string()
-                })?;
                 let endpoints = client.rest_endpoints().cloned().ok_or_else(|| {
                     "REST Iceberg configuration produced no REST endpoints".to_string()
                 })?;
                 Ok(Arc::new(super::rest::NovaRocksRestCatalog::new(
-                    rest,
                     endpoints,
                     warehouse,
                     client.rest_access_delegation(),

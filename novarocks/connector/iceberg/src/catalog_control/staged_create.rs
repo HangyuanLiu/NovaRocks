@@ -104,7 +104,11 @@ pub(crate) enum RestStagedPrepareFailure {
     /// option and the only honest answers are the two below.
     Unsupported(String),
     Conflict(String),
+    /// A local check refused before any request.
     KnownUncommitted(String),
+    /// The stage itself was never dispatched or was rejected before
+    /// publication (D13); its failure keeps its kind.
+    StageUncommitted(ConnectorMutationFailure),
     CommitUnknown(String),
 }
 
@@ -329,10 +333,13 @@ pub(crate) fn prepare_rest_staged_table(
                 "prepare staged REST table: {error}"
             )));
         }
-        crate::catalog::StagedCreateStart::KnownUncommitted(error) => {
-            return Err(RestStagedPrepareFailure::KnownUncommitted(format!(
-                "prepare staged REST table: {error}"
-            )));
+        crate::catalog::StagedCreateStart::KnownUncommitted(failure) => {
+            return Err(RestStagedPrepareFailure::StageUncommitted(
+                ConnectorMutationFailure::new(
+                    failure.kind(),
+                    format!("prepare staged REST table: {}", failure.message()),
+                ),
+            ));
         }
         crate::catalog::StagedCreateStart::CommitUnknown(error) => {
             return Err(RestStagedPrepareFailure::CommitUnknown(format!(
@@ -1005,6 +1012,13 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     ),
                 })
             }
+            Err(RestStagedPrepareFailure::StageUncommitted(failure)) => {
+                self.operations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&request.operation_id);
+                Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted { failure })
+            }
             Err(RestStagedPrepareFailure::CommitUnknown(message)) => {
                 self.prepare_commit_unknown(request.operation_id, message)
             }
@@ -1441,6 +1455,32 @@ fn validate_publish_evidence(
         ));
     }
     Ok(())
+}
+
+/// What the final publication must show to belong to this operation: the
+/// staged UUID, this attempt's snapshot, the operation marker and the document
+/// properties, all named by NovaRocks (spec 5.7 items 4-6).
+fn publication_expectation(
+    prepared: &PreparedOperation,
+    expected_snapshot_id: Option<i64>,
+) -> crate::catalog::StagedPublicationExpectation {
+    let mut properties = vec![(
+        CTAS_OPERATION_MARKER.to_string(),
+        publication_marker(prepared.publication_id),
+    )];
+    if let Some(document) = &prepared.document_properties {
+        let mut document = document
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        document.sort();
+        properties.extend(document);
+    }
+    crate::catalog::StagedPublicationExpectation {
+        staged_table_uuid: prepared.staged.table.metadata().uuid(),
+        snapshot_id: expected_snapshot_id,
+        properties,
+    }
 }
 
 fn publication_matches(

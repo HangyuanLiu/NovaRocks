@@ -1540,15 +1540,18 @@ mod application_document_publication_trace_tests {
         async fn dispatch_once(
             &self,
             staged: Option<&crate::commit::model::FrozenRequest>,
-        ) -> crate::iceberg::Result<CommitProof> {
+        ) -> crate::catalog::transaction::CommitDispatchResult {
             let staged = staged.expect("eager publication must stage a commit");
             let expected_snapshot = staged.ref_snapshot_after("main");
-            let table = self
+            let result = self
                 .catalog
                 .update_table(staged.into_table_commit())
-                .await?;
-            Ok(CommitProof::applied(expected_snapshot)
-                .with_table_uuid(table.metadata().uuid().to_string()))
+                .await
+                .map(|table| {
+                    CommitProof::applied(expected_snapshot)
+                        .with_table_uuid(table.metadata().uuid().to_string())
+                });
+            crate::catalog::transaction::CommitDispatchResult::from_catalog_result(result)
         }
 
         async fn adjudicate(

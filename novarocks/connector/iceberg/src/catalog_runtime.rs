@@ -200,8 +200,8 @@ async fn assemble_rest_generation(
         .with_runtime(runtime.clone())
         .with_client(reqwest_client)
         .with_auth_manager(manager);
-    let builder = match storage_factory {
-        Some(factory) => builder.with_storage_factory(factory),
+    let builder = match &storage_factory {
+        Some(factory) => builder.with_storage_factory(Arc::clone(factory)),
         None => builder,
     };
     let upstream = Arc::new(builder.load("rest".to_string(), properties).await.map_err(
@@ -216,6 +216,7 @@ async fn assemble_rest_generation(
         Arc::clone(&upstream),
         owner,
         runtime,
+        storage_factory,
         declared_routing_headers,
     ));
     Ok(RestGeneration {

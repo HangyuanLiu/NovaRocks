@@ -307,7 +307,7 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
     async fn commit_staged_table(
         &self,
         _commit: crate::iceberg::TableCommit,
-        _request_file_io: crate::iceberg::io::FileIO,
+        _expectation: super::StagedPublicationExpectation,
     ) -> super::StagedCommitResult {
         super::StagedCommitResult::Unsupported(self.refuse_operation(
             CatalogOperation::CreateTable(CatalogCreateIntent::CreateTableAsSelect),

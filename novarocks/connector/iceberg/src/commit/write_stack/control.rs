@@ -3997,23 +3997,25 @@ mod eager_attempt_io_tests {
         async fn dispatch_once(
             &self,
             staged: Option<&crate::commit::model::FrozenRequest>,
-        ) -> Result<CommitProof, IcebergError> {
+        ) -> crate::catalog::transaction::CommitDispatchResult {
             assert!(
                 staged.is_some(),
                 "an eager attempt must dispatch its staged commit"
             );
             self.dispatches.fetch_add(1, Ordering::SeqCst);
-            match self.behavior {
-                DispatchBehavior::Conflict => Err(IcebergError::new(
-                    ErrorKind::CatalogCommitConflicts,
-                    "injected OCC conflict",
-                )),
-                DispatchBehavior::Commit => Ok(CommitProof::applied(Some(1))),
-                DispatchBehavior::LoseResponse => Err(IcebergError::new(
-                    ErrorKind::Unexpected,
-                    "injected lost response",
-                )),
-            }
+            crate::catalog::transaction::CommitDispatchResult::from_catalog_result(
+                match self.behavior {
+                    DispatchBehavior::Conflict => Err(IcebergError::new(
+                        ErrorKind::CatalogCommitConflicts,
+                        "injected OCC conflict",
+                    )),
+                    DispatchBehavior::Commit => Ok(CommitProof::applied(Some(1))),
+                    DispatchBehavior::LoseResponse => Err(IcebergError::new(
+                        ErrorKind::Unexpected,
+                        "injected lost response",
+                    )),
+                },
+            )
         }
 
         async fn adjudicate(&self) -> Result<Option<CommitProof>, ConnectorError> {

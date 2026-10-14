@@ -332,13 +332,13 @@ fn validate_context(
 /// return type cannot express; `execute_create_table` handles it before this is
 /// ever reached. Keeping a create path here is what let `IF NOT EXISTS` quietly
 /// diverge once, and one create path is the point of the owner.
-/// Translate a namespace mutation's three-state outcome into an effect.
+/// Translate a namespace or view mutation's three-state outcome into an effect.
 ///
 /// Nothing is lost by returning two states here: the caller reads dispatch
 /// certainty off the error's kind and turns an unknown into `CommitUnknown`,
 /// so `Unavailable` is the unknown rather than a flat failure.
-fn namespace_effect(
-    outcome: crate::catalog::error::CatalogOutcome<crate::catalog::CatalogNamespaceName>,
+fn catalog_effect<T>(
+    outcome: crate::catalog::error::CatalogOutcome<T>,
 ) -> Result<ExternalMutationEffect, ConnectorError> {
     match outcome {
         crate::catalog::error::CatalogOutcome::KnownCommitted { .. } => {
@@ -391,7 +391,7 @@ fn execute_operation(
                 .catalog_runtime()
                 .block_on(async move { owner.create_namespace(namespace).await })
                 .map_err(unavailable)?;
-            namespace_effect(outcome)
+            catalog_effect(outcome)
         }
         ConnectorCatalogMutationOperation::DropNamespace { namespace, policy } => {
             ensure_owner(provider, &namespace.instance_id)?;
@@ -416,7 +416,7 @@ fn execute_operation(
                 .catalog_runtime()
                 .block_on(async move { owner.drop_namespace(namespace).await })
                 .map_err(unavailable)?;
-            namespace_effect(outcome)
+            catalog_effect(outcome)
         }
         ConnectorCatalogMutationOperation::DropTable {
             table,
@@ -461,7 +461,7 @@ fn execute_operation(
                 }
                 _ => {}
             }
-            super::views::create_view(
+            let outcome = super::views::create_view(
                 provider.runtime(),
                 &view.namespace,
                 &view.view,
@@ -472,7 +472,7 @@ fn execute_operation(
                 &view_properties(properties)?,
             )
             .map_err(map_view_error)?;
-            Ok(ExternalMutationEffect::Applied)
+            catalog_effect(outcome)
         }
         ConnectorCatalogMutationOperation::DropView { view, policy } => {
             ensure_owner(provider, &view.instance_id)?;
@@ -485,9 +485,9 @@ fn execute_operation(
                     Err(not_found("Iceberg view does not exist"))
                 };
             }
-            super::views::drop_view(provider.runtime(), &view.namespace, &view.view)
+            let outcome = super::views::drop_view(provider.runtime(), &view.namespace, &view.view)
                 .map_err(map_view_error)?;
-            Ok(ExternalMutationEffect::Applied)
+            catalog_effect(outcome)
         }
         ConnectorCatalogMutationOperation::AlterSchema { table, changes } => {
             ensure_owner(provider, &table.instance_id)?;

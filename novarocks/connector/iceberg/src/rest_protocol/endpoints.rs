@@ -34,12 +34,13 @@ use reqwest::Method;
 use reqwest::header::HeaderValue;
 use serde::de::DeserializeOwned;
 
+use crate::iceberg::io::StorageFactory;
 use crate::iceberg::spec::ViewMetadata;
 use crate::iceberg::{NamespaceIdent, Runtime, TableIdent};
 use crate::iceberg_catalog_rest::{
     ListNamespaceResponse, ListTablesResponse, LoadTableResult, RestCatalog,
 };
-use crate::rest_protocol::attempt::{SessionGate, ensure_session};
+use crate::rest_protocol::attempt::{AttemptFailure, SessionGate, ensure_session};
 use crate::rest_protocol::auth::RestAuthOwner;
 use crate::rest_protocol::binding::SessionBinding;
 use crate::rest_protocol::deferred::{FrozenLoadTable, RestDelegation};
@@ -67,6 +68,9 @@ pub(crate) struct RestEndpoints {
     owner: Arc<RestAuthOwner>,
     gate: SessionGate,
     runtime: Runtime,
+    /// The static generation's storage factory; `None` in the vended mode,
+    /// which never materializes with a catalog-global FileIO.
+    storage_factory: Option<Arc<dyn StorageFactory>>,
     declared_routing_headers: BTreeSet<String>,
 }
 
@@ -95,6 +99,7 @@ impl RestEndpoints {
         upstream: Arc<RestCatalog>,
         owner: Arc<RestAuthOwner>,
         runtime: Runtime,
+        storage_factory: Option<Arc<dyn StorageFactory>>,
         declared_routing_headers: BTreeSet<String>,
     ) -> Self {
         Self {
@@ -102,24 +107,37 @@ impl RestEndpoints {
             owner,
             gate: SessionGate::default(),
             runtime,
+            storage_factory,
             declared_routing_headers,
         }
+    }
+
+    /// A FileIO from the static generation's storage factory, or `None` in
+    /// the vended mode.
+    pub(crate) fn static_file_io(&self) -> Option<crate::iceberg::io::FileIO> {
+        self.storage_factory
+            .as_ref()
+            .map(|factory| crate::iceberg::io::FileIOBuilder::new(Arc::clone(factory)).build())
+    }
+
+    /// The establishment attempt's own result, for callers that classify a
+    /// failed step (mutations: `NotWritten(Binding(step))`).
+    pub(crate) async fn session(&self) -> Result<Arc<SessionBinding>, AttemptFailure> {
+        ensure_session(&self.owner, &self.gate, &self.upstream).await
     }
 
     /// The generation's session binding, establishing the session when needed
     /// (L2). Concurrent callers share one establishment attempt.
     pub(crate) async fn binding(&self) -> Result<Arc<SessionBinding>, ConnectorError> {
-        ensure_session(&self.owner, &self.gate, &self.upstream)
-            .await
-            .map_err(|failure| {
-                ConnectorError::new(
-                    ConnectorErrorKind::Unavailable,
-                    format!(
-                        "Iceberg REST session could not be established: {:?}",
-                        failure.step
-                    ),
-                )
-            })
+        self.session().await.map_err(|failure| {
+            ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                format!(
+                    "Iceberg REST session could not be established: {:?}",
+                    failure.step
+                ),
+            )
+        })
     }
 
     /// The upstream client, only after the session has been established

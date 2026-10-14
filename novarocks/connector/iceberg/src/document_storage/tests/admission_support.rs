@@ -65,10 +65,6 @@ impl AdmissionCatalogSpy {
 
 #[async_trait]
 impl NovaRocksCatalog for AdmissionCatalogSpy {
-    fn admits_uncommitted_proof(&self, error: &crate::iceberg::Error) -> bool {
-        self.inner.admits_uncommitted_proof(error)
-    }
-
     fn listing_admission(&self) -> Arc<crate::catalog::listing_admission::ListingAdmission> {
         Arc::new(Default::default())
     }
@@ -201,7 +197,7 @@ impl NovaRocksCatalog for AdmissionCatalogSpy {
     async fn commit_staged_table(
         &self,
         _commit: crate::iceberg::TableCommit,
-        _request_file_io: crate::iceberg::io::FileIO,
+        _expectation: crate::catalog::StagedPublicationExpectation,
     ) -> StagedCommitResult {
         self.mutation()
     }
