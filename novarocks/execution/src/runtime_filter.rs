@@ -30,7 +30,10 @@ pub use novarocks_functions::FunctionValueType;
 pub mod contribution;
 pub mod evaluator;
 pub mod feedback_domain;
+mod owned;
 pub mod row_group_domain;
+pub use owned::CanonicalContributionBytes;
+pub(crate) use owned::{OrderedTopNAllocationHost, OwnedUtf8OrderKey};
 
 // These are the original Functions control/cause types used by the neutral
 // controlled artifact-query port, not a second Worker control vocabulary.
