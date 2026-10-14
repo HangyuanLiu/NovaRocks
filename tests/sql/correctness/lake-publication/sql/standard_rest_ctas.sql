@@ -34,11 +34,12 @@ INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows VALUES
 
 -- query 2
 -- The proxy answers the stage with HTTP 400 without forwarding it. A 400 is
--- not a pre-publication rejection (D13): a server may answer it after its
--- side effect, so the statement reports an unknown outcome and nothing is
--- cleaned up on its strength.
+-- not a pre-publication rejection (D13), so the connector keeps the staged
+-- operation unknown and cleans nothing up on its strength. A staged create
+-- publishes nothing visible, so the statement itself reports a definite
+-- non-commit: the target must remain absent.
 -- @publication_catalog_fault=stage-create,before-dispatch
--- @expect_error_code=CommitUnknown
+-- @expect_error_code=CommitKnownUncommitted
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.before_dispatch AS
   SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
 

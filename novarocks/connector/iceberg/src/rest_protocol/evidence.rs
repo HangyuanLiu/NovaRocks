@@ -140,13 +140,26 @@ impl MutationEndpoint {
         Self::DropView,
     ];
 
-    /// The one success status of this endpoint. Drops accept only the 204 the
-    /// REST specification defines (L24); everything else answers 200.
+    /// The primary success status of this endpoint: 204 for drops, 200
+    /// otherwise. A drop also succeeds with a 200 whose body is empty
+    /// ([`Self::is_drop`], L24 as revised 2026-10-14): Java REST servers before
+    /// 1.11 answer drops that way, while a 200 with any body -- a gateway page,
+    /// say -- stays unknown.
     pub(crate) fn success_status(self) -> u16 {
         match self {
             Self::DropTable | Self::DropNamespace | Self::DropView => 204,
             _ => 200,
         }
+    }
+
+    pub(crate) fn is_drop(self) -> bool {
+        matches!(self, Self::DropTable | Self::DropNamespace | Self::DropView)
+    }
+
+    /// The statuses whose body the dispatch hands to the classifier: the
+    /// primary success status, and a drop's empty-body 200.
+    pub(crate) fn success_statuses(self) -> &'static [u16] {
+        if self.is_drop() { &[204, 200] } else { &[200] }
     }
 
     /// Whether a 409 means "already exists" rather than a conflict.
@@ -398,6 +411,8 @@ pub(crate) enum BodyRead<V> {
     Failed(BodyReadFailure),
     /// The body was not read (drops, or a caller that never read it).
     NotRead,
+    /// The whole body was read and it was empty (a drop answered 200).
+    Empty,
 }
 
 /// Why a success body could not be read to the end as one valid document.
@@ -439,6 +454,8 @@ pub(crate) enum RefRelation {
 pub(crate) enum AnomalyCause {
     /// A body-bearing success status whose body was never read.
     BodyNotRead,
+    /// A drop answered 200 with a non-empty body (L24).
+    NonEmptyDropBody,
     Read(BodyReadFailure),
     /// The decoded view does not match the endpoint or the expectation it
     /// was scanned for.
@@ -578,6 +595,20 @@ pub(crate) fn classify(
             if code == endpoint.success_status() {
                 return attribute(expect, code, header_names, read);
             }
+            if code == 200 && endpoint.is_drop() {
+                return match read {
+                    BodyRead::Empty => RestEvidence::Applied {
+                        receipt: RestReceipt::bare(endpoint),
+                    },
+                    _ => unknown(
+                        expect,
+                        UnknownReason::ProtocolAnomaly(AnomalyCause::NonEmptyDropBody),
+                        Some(code),
+                        header_names,
+                        RefRelation::NotTracked,
+                    ),
+                };
+            }
             let rejected = |kind| RestEvidence::Rejected { status: code, kind };
             match code {
                 409 if endpoint.creates() => rejected(ConnectorMutationFailureKind::AlreadyExists),
@@ -671,7 +702,9 @@ fn attribute(
         BodyRead::Failed(failure) => {
             return anomaly(AnomalyCause::Read(failure), RefRelation::NotTracked);
         }
-        BodyRead::NotRead => return anomaly(AnomalyCause::BodyNotRead, RefRelation::NotTracked),
+        BodyRead::NotRead | BodyRead::Empty => {
+            return anomaly(AnomalyCause::BodyNotRead, RefRelation::NotTracked);
+        }
     };
     let checked = match (shape, &view) {
         (ResponseShape::Table, MutationView::Table(view)) => attribute_table(expect, view),
@@ -1313,12 +1346,27 @@ mod tests {
                 good_body(E::TableCommit).as_deref(),
             ] {
                 let evidence = classify_body(&expect, wrong_success, body);
-                assert_eq!(
-                    unknown_reason(&evidence),
-                    &UnknownReason::Status,
-                    "{endpoint:?}"
-                );
+                // A drop's 200 is judged by its body (L24 as revised): any
+                // body it was not shown as empty is a protocol anomaly.
+                let expected = if endpoint.is_drop() {
+                    UnknownReason::ProtocolAnomaly(AnomalyCause::NonEmptyDropBody)
+                } else {
+                    UnknownReason::Status
+                };
+                assert_eq!(unknown_reason(&evidence), &expected, "{endpoint:?}");
             }
+        }
+    }
+
+    #[test]
+    fn a_drop_answered_with_an_empty_200_is_applied() {
+        for endpoint in E::ALL.into_iter().filter(|endpoint| endpoint.is_drop()) {
+            let expect = expectation(endpoint);
+            let evidence = classify(&status(200), BodyRead::Empty, &expect);
+            assert!(
+                matches!(evidence, RestEvidence::Applied { .. }),
+                "{endpoint:?}: {evidence:?}"
+            );
         }
     }
 

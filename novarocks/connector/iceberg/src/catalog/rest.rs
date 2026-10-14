@@ -2250,16 +2250,21 @@ mod evidence_tests {
             }
             assert_eq!(outcome.permits_cleanup(), expected != "unknown");
         }
-        // A drop succeeds only with 204; a 200 is unknown (L24).
-        for (status, applied) in [(204, true), (200, false)] {
+        // A drop succeeds with 204 or an empty 200; a 200 with a body is
+        // unknown (L24 as revised).
+        for (label, reply, applied) in [
+            ("204", Reply::status(204), true),
+            ("empty 200", Reply::status(200), true),
+            (
+                "HTML 200",
+                Reply::bytes(200, b"<html>ok</html>".to_vec()),
+                false,
+            ),
+        ] {
             let server = TestServer::start(
                 Script::new()
                     .on("GET", "/v1/config", Reply::config(&[], &[], None))
-                    .on(
-                        "DELETE",
-                        "/v1/namespaces/db/tables/t",
-                        Reply::status(status),
-                    ),
+                    .on("DELETE", "/v1/namespaces/db/tables/t", reply),
             );
             let outcome = owner(&server)
                 .await
@@ -2268,7 +2273,7 @@ mod evidence_tests {
             assert_eq!(
                 matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
                 applied,
-                "HTTP {status}: {outcome:?}"
+                "{label}: {outcome:?}"
             );
             let deletes = server.requests_to("DELETE", "/v1/namespaces/db/tables/t");
             assert_eq!(deletes.len(), 1);

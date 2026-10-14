@@ -270,12 +270,15 @@ impl RestEndpoints {
             .http()
             .send_once(
                 request,
-                &[expect.endpoint().success_status()],
+                expect.endpoint().success_statuses(),
                 &RequestContext::default(),
             )
             .await;
         let (read, document) = match (expect.endpoint().response_shape(), body) {
             (Some(shape), Some(body)) => read_view(shape, expect, body, keep_document).await,
+            // A drop's success body must be empty (L24); its bytes are only
+            // counted, never kept.
+            (None, Some(body)) => (read_empty(body).await, None),
             _ => (BodyRead::NotRead, None),
         };
         let evidence = classify(&stage, read, expect);
@@ -357,6 +360,19 @@ async fn read_view(
     match view {
         Ok(view) => (BodyRead::Complete(view), None),
         Err(failure) => (BodyRead::Failed(failure), None),
+    }
+}
+
+/// Read a drop's success body: `Empty` only if it ends without a byte.
+async fn read_empty(mut body: ResponseBody) -> BodyRead<MutationView> {
+    loop {
+        match body.next_chunk().await {
+            Ok(None) => return BodyRead::Empty,
+            Ok(Some(chunk)) if chunk.is_empty() => {}
+            // Bytes in a drop's 200 are a different answer than "dropped".
+            Ok(Some(_)) => return BodyRead::NotRead,
+            Err(error) => return BodyRead::Failed(read_failure(error)),
+        }
     }
 }
 
@@ -515,6 +531,8 @@ mod tests {
         let success = if endpoint.is_drop() { 204 } else { 200 };
         match status {
             status if status == success => Expected::Applied,
+            // `status_reply` answers a drop's 200 with an error body: unknown.
+            200 if endpoint.is_drop() => Expected::Unknown,
             409 if endpoint.creates() => Expected::Rejected(Kind::AlreadyExists),
             409 => Expected::Rejected(Kind::Conflict),
             401 | 419 => Expected::Rejected(Kind::Unauthenticated),
@@ -738,9 +756,15 @@ mod tests {
     async fn success_bodies_must_be_complete_and_attributable() {
         for endpoint in ENDPOINTS {
             if endpoint.is_drop() {
-                // A drop's success is 204 only; any 200, HTML included, is
-                // unknown (L24).
-                for body in [b"".to_vec(), b"<html>ok</html>".to_vec()] {
+                // A drop succeeds with 204 or an empty 200; a 200 with any
+                // body, HTML included, is unknown (L24 as revised).
+                let (outcome, _server) = observe(endpoint, Reply::bytes(200, Vec::new())).await;
+                assert_eq!(
+                    observed(&outcome.evidence),
+                    Expected::Applied,
+                    "{endpoint:?}"
+                );
+                for body in [b"<html>ok</html>".to_vec(), b"{}".to_vec()] {
                     let (outcome, _server) = observe(endpoint, Reply::bytes(200, body)).await;
                     assert_eq!(
                         observed(&outcome.evidence),
@@ -915,5 +939,46 @@ mod tests {
             );
             assert_cleanup_follows_evidence(&outcome);
         }
+    }
+}
+#[cfg(test)]
+mod scratch_probe {
+    #[test]
+    fn scratch_probe_create_response() {
+        let Ok(path) = std::env::var("SCRATCH_RESPONSE") else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let expect = crate::rest_protocol::evidence::AttributionExpectation::create_table();
+        let view = crate::rest_protocol::json::scan_complete(
+            crate::rest_protocol::minimal_view::TableResponseSink::new(
+                expect.table_view_request().cloned().unwrap_or_default(),
+            ),
+            &bytes,
+        );
+        println!(
+            "view: {:?}",
+            view.as_ref().map(|_| "ok").map_err(|e| format!("{e:?}"))
+        );
+        let read = match view {
+            Ok(v) => crate::rest_protocol::evidence::BodyRead::Complete(
+                crate::rest_protocol::minimal_view::MutationView::Table(v),
+            ),
+            Err(e) => crate::rest_protocol::evidence::BodyRead::Failed(
+                crate::rest_protocol::evidence::BodyReadFailure::Scan(e),
+            ),
+        };
+        let evidence = crate::rest_protocol::evidence::classify(
+            &crate::rest_protocol::evidence::DispatchStage::Status {
+                code: 200,
+                header_names: vec![],
+            },
+            read,
+            &expect,
+        );
+        println!("evidence: {evidence:?}");
+        let decoded =
+            serde_json::from_slice::<crate::iceberg_catalog_rest::LoadTableResult>(&bytes);
+        println!("decode ok: {}", decoded.is_ok());
     }
 }

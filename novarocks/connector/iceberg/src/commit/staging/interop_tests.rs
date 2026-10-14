@@ -110,6 +110,32 @@ struct Java {
 
 impl Java {
     async fn new(case: &str) -> Self {
+        let namespace = NamespaceIdent::new(format!(
+            "{}_{}",
+            required("NR_IRU5_INTEROP_NAMESPACE"),
+            case
+        ));
+        let artifacts = PathBuf::from(required("NR_IRU5_INTEROP_ARTIFACT_DIR")).join(case);
+        let java = Self::attach(namespace, artifacts).await;
+        let result = java
+            .client
+            .post(java.endpoint(&["namespaces"]))
+            .json(&json!({"namespace": java.namespace.as_ref(), "properties": {}}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            result.status(),
+            StatusCode::OK,
+            "unique namespace must be created exactly once"
+        );
+        java.record("fixture", &json!({"publication": required("NOVA_ENV_REST_ENV_FILE"), "prefix": java.prefix, "namespace": java.namespace.as_ref()}));
+        java
+    }
+
+    /// Attach the independent raw-HTTP client to the pinned server without
+    /// creating `namespace`.
+    async fn attach(namespace: NamespaceIdent, artifacts: PathBuf) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
@@ -148,12 +174,6 @@ impl Java {
                     .collect()
             })
             .unwrap_or_default();
-        let namespace = NamespaceIdent::new(format!(
-            "{}_{}",
-            required("NR_IRU5_INTEROP_NAMESPACE"),
-            case
-        ));
-        let artifacts = PathBuf::from(required("NR_IRU5_INTEROP_ARTIFACT_DIR")).join(case);
         std::fs::create_dir(&artifacts).unwrap();
         let runtime = tokio::runtime::Handle::current();
         let binding = IcebergReadBinding::new(
@@ -176,28 +196,14 @@ impl Java {
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
             Arc::new(TokioFileTaskSpawner::new(runtime)),
         );
-        let java = Self {
+        Self {
             client,
             root,
             prefix,
             namespace,
             binding,
             artifacts,
-        };
-        let result = java
-            .client
-            .post(java.endpoint(&["namespaces"]))
-            .json(&json!({"namespace": java.namespace.as_ref(), "properties": {}}))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            result.status(),
-            StatusCode::OK,
-            "unique namespace must be created exactly once"
-        );
-        java.record("fixture", &json!({"publication": required("NOVA_ENV_REST_ENV_FILE"), "prefix": java.prefix, "namespace": java.namespace.as_ref()}));
-        java
+        }
     }
 
     fn independent(&self) -> Self {
@@ -1201,4 +1207,819 @@ async fn iru5_java_rest_attempt_runner_reloads_and_reprepares_after_real_cas() {
         );
     }
     java.record("retry-traces",&json!({"dispatches":traces,"metadata":semantic_facts(&actual.metadata),"cleanup":format!("{:?}",report.cleanup)}));
+}
+
+// ---------------------------------------------------------------------------
+// IRU-13a: every NovaRocks-issued REST request against the Java reference
+// server, judged by NovaRocks' own D13 evidence and cross-checked through the
+// independent raw-HTTP client above.
+// ---------------------------------------------------------------------------
+
+use crate::catalog_runtime::RestAccessDelegationMode;
+use crate::iceberg::{Catalog as _, TableCommit, ViewCommit, ViewCreation, ViewRequirement};
+use crate::rest_protocol::adapter::{RestTransitionalAdapter, rest_evidence};
+use crate::rest_protocol::endpoints::RestEndpoints;
+use crate::rest_protocol::evidence::{
+    AttributionExpectation, ExpectedSnapshot, MutationEndpoint, RefRelation, RestEvidence,
+    RestReceipt, UnknownReason,
+};
+use crate::rest_protocol::mutation::MutationOutcome;
+use novarocks_spi::connector::ConnectorErrorKind;
+
+/// One NovaRocks REST generation built exactly as production builds a static
+/// catalog, plus the independent Java oracle for the same namespace.
+struct NovaRocksRest {
+    java: Java,
+    endpoints: Arc<RestEndpoints>,
+}
+
+impl NovaRocksRest {
+    /// The namespace is created later, by a NovaRocks request.
+    async fn new(case: &str) -> Self {
+        let namespace = NamespaceIdent::new(format!(
+            "{}_{}",
+            required("NR_IRU13A_INTEROP_NAMESPACE"),
+            case
+        ));
+        let artifacts = PathBuf::from(required("NR_IRU13A_INTEROP_ARTIFACT_DIR")).join(case);
+        let java = Java::attach(namespace, artifacts).await;
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "iru13a",
+            &[
+                ("type".to_string(), "iceberg".to_string()),
+                ("iceberg.catalog.type".to_string(), "rest".to_string()),
+                ("uri".to_string(), required("NOVAROCKS_ICEBERG_REST_URI")),
+                (
+                    "warehouse".to_string(),
+                    required("NOVAROCKS_ICEBERG_REST_WAREHOUSE"),
+                ),
+            ],
+        )
+        .unwrap();
+        let client = crate::catalog_runtime::build_catalog_client(
+            &configuration,
+            java.binding.clone(),
+            crate::iceberg::Runtime::try_current().unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            client.rest_access_delegation(),
+            RestAccessDelegationMode::Static
+        );
+        let endpoints = Arc::clone(client.rest_endpoints().expect("REST generation endpoints"));
+        java.record("fixture", &json!({"publication": required("NOVA_ENV_REST_ENV_FILE"), "prefix": java.prefix, "namespace": java.namespace.as_ref()}));
+        Self { java, endpoints }
+    }
+
+    fn namespace(&self) -> &NamespaceIdent {
+        &self.java.namespace
+    }
+
+    /// Record the evidence of one request; its `Debug` carries no server text.
+    fn record(&self, label: &str, outcome: &MutationOutcome) {
+        self.java.record(
+            label,
+            &json!({"evidence": format!("{:?}", outcome.evidence)}),
+        );
+    }
+
+    async fn create_namespace(&self) {
+        let outcome = self
+            .endpoints
+            .create_namespace(self.namespace(), HashMap::new())
+            .await;
+        self.record("create-namespace", &outcome);
+        applied(&outcome, MutationEndpoint::CreateNamespace);
+    }
+
+    async fn drop_namespace(&self) {
+        let outcome = self.endpoints.drop_namespace(self.namespace()).await;
+        self.record("drop-namespace", &outcome);
+        applied(&outcome, MutationEndpoint::DropNamespace);
+    }
+
+    /// Create a table immediately (static access) and return the applied
+    /// response document.
+    async fn create_table(&self, label: &str, name: &str) -> LoadTableResult {
+        let outcome = self
+            .endpoints
+            .create_table(self.namespace(), create_request(name))
+            .await;
+        self.record(label, &outcome);
+        let receipt = applied(&outcome, MutationEndpoint::CreateTable);
+        let created: LoadTableResult =
+            serde_json::from_slice(outcome.document.as_deref().expect("applied document")).unwrap();
+        assert_eq!(receipt.uuid, Some(created.metadata.uuid()));
+        assert!(receipt.metadata_location.is_some());
+        assert_eq!(receipt.metadata_location, created.metadata_location);
+        assert_eq!(created.metadata.format_version(), FormatVersion::V3);
+        let oracle = self.java.load(&self.java.ident(name)).await.unwrap();
+        assert_eq!(oracle.metadata.uuid(), created.metadata.uuid());
+        assert_eq!(oracle.metadata_location, created.metadata_location);
+        created
+    }
+
+    async fn drop_table(&self, label: &str, name: &str) {
+        let outcome = self.endpoints.drop_table(&self.java.ident(name)).await;
+        self.record(label, &outcome);
+        applied(&outcome, MutationEndpoint::DropTable);
+    }
+
+    /// The raw status of an independent load.
+    async fn load_status(&self, ident: &TableIdent) -> StatusCode {
+        self.java
+            .client
+            .get(self.java.table_url(ident))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+}
+
+/// The receipt of an applied request; anything else fails with its evidence.
+fn applied(outcome: &MutationOutcome, endpoint: MutationEndpoint) -> RestReceipt {
+    match &outcome.evidence {
+        RestEvidence::Applied { receipt } if receipt.endpoint == endpoint => receipt.clone(),
+        other => panic!("Java REST must apply the NovaRocks {endpoint:?} request: {other:?}"),
+    }
+}
+
+fn create_request(name: &str) -> CreateTableRequest {
+    CreateTableRequest {
+        name: name.to_owned(),
+        location: None,
+        schema: schema(),
+        partition_spec: Some(PartitionSpec::unpartition_spec().into_unbound()),
+        write_order: Some(SortOrder::unsorted_order()),
+        stage_create: None,
+        properties: HashMap::from([
+            ("format-version".into(), "3".into()),
+            ("write.row-lineage".into(), "true".into()),
+        ]),
+    }
+}
+
+fn commit_of(request: &FrozenRequest, extra: Vec<TableUpdate>) -> TableCommit {
+    let mut updates = request.updates().to_vec();
+    updates.extend(extra);
+    TableCommit::builder()
+        .ident(request.identifier().clone())
+        .requirements(request.requirements().to_vec())
+        .updates(updates)
+        .build()
+}
+
+fn set_property(key: &str, value: &str) -> TableUpdate {
+    TableUpdate::SetProperties {
+        updates: HashMap::from([(key.to_owned(), value.to_owned())]),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires pinned Java REST and MinIO fixture publication"]
+async fn iru13a_java_rest_namespace_table_lifecycle_and_interleaved_reads() {
+    let rest = NovaRocksRest::new("lifecycle").await;
+    let java = &rest.java;
+    let endpoints = &rest.endpoints;
+    let namespace = rest.namespace();
+
+    // Upstream reads and NovaRocks requests share one session binding.
+    let upstream = endpoints.upstream().await.unwrap();
+    assert!(!upstream.namespace_exists(namespace).await.unwrap());
+    rest.create_namespace().await;
+    assert!(upstream.namespace_exists(namespace).await.unwrap());
+    let again = endpoints.create_namespace(namespace, HashMap::new()).await;
+    rest.record("create-namespace-again", &again);
+    assert_eq!(
+        again.evidence,
+        RestEvidence::Rejected {
+            status: 409,
+            kind: ConnectorMutationFailureKind::AlreadyExists
+        }
+    );
+
+    // Single-page namespace listing, following the server's tokens.
+    let mut seen = BTreeSet::new();
+    let mut found = false;
+    let mut token: Option<String> = None;
+    loop {
+        let page = endpoints
+            .list_namespaces_page(token.as_deref(), 50)
+            .await
+            .unwrap();
+        assert!(page.namespaces.len() <= 50);
+        found |= page.namespaces.contains(namespace);
+        match page.next_page_token {
+            Some(next) => {
+                assert!(seen.insert(next.clone()), "server repeated a page token");
+                token = Some(next);
+            }
+            None => break,
+        }
+    }
+    assert!(
+        found,
+        "paged namespace listing must contain the new namespace"
+    );
+
+    let names = ["t0", "t1", "t2"];
+    let mut created = BTreeMap::new();
+    for name in names {
+        assert!(!endpoints.table_exists(&java.ident(name)).await.unwrap());
+        let table = rest.create_table(&format!("create-{name}"), name).await;
+        assert!(endpoints.table_exists(&java.ident(name)).await.unwrap());
+        created.insert(name, table);
+    }
+    assert!(!endpoints.table_exists(&java.ident("absent")).await.unwrap());
+
+    // Paged table listing with a page smaller than the namespace.
+    let mut listed = Vec::new();
+    let mut pages = 0;
+    let mut seen = BTreeSet::new();
+    let mut token: Option<String> = None;
+    loop {
+        let page = endpoints
+            .list_tables_page(namespace, token.as_deref(), 2)
+            .await
+            .unwrap();
+        pages += 1;
+        assert!(page.identifiers.len() <= 2);
+        listed.extend(page.identifiers.into_iter().map(|ident| ident.name));
+        match page.next_page_token {
+            Some(next) => {
+                assert!(seen.insert(next.clone()), "server repeated a page token");
+                token = Some(next);
+            }
+            None => break,
+        }
+    }
+    assert!(pages >= 2, "a page size of two must page three tables");
+    listed.sort();
+    assert_eq!(listed, names);
+    let mut upstream_listed = upstream
+        .list_tables(namespace)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|ident| ident.name)
+        .collect::<Vec<_>>();
+    upstream_listed.sort();
+    assert_eq!(upstream_listed, listed);
+
+    // Drop never requests a purge: the dropped table's metadata file survives.
+    let dropped_location = created["t0"].metadata_location.clone().unwrap();
+    rest.drop_table("drop-t0", "t0").await;
+    assert!(!endpoints.table_exists(&java.ident("t0")).await.unwrap());
+    assert_eq!(
+        rest.load_status(&java.ident("t0")).await,
+        StatusCode::NOT_FOUND
+    );
+    let io = crate::fs_io::build_file_io_for_location(&dropped_location, java.binding.clone());
+    assert!(
+        io.exists(&dropped_location).await.unwrap(),
+        "drop without purgeRequested keeps the table files"
+    );
+    let mut remaining = upstream
+        .list_tables(namespace)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|ident| ident.name)
+        .collect::<Vec<_>>();
+    remaining.sort();
+    assert_eq!(remaining, ["t1", "t2"]);
+
+    rest.drop_table("drop-t1", "t1").await;
+    rest.drop_table("drop-t2", "t2").await;
+    let empty = endpoints
+        .list_tables_page(namespace, None, 2)
+        .await
+        .unwrap();
+    assert!(empty.identifiers.is_empty());
+    assert!(upstream.list_tables(namespace).await.unwrap().is_empty());
+    rest.drop_namespace().await;
+    assert!(!upstream.namespace_exists(namespace).await.unwrap());
+    // D13: a drop's 404 may follow a publication, so it is unknown.
+    let missing = endpoints.drop_namespace(namespace).await;
+    rest.record("drop-namespace-again", &missing);
+    assert!(matches!(
+        &missing.evidence,
+        RestEvidence::Unknown { diagnosis }
+            if diagnosis.reason == UnknownReason::PostPublishPossible
+                && diagnosis.status == Some(404)
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires pinned Java REST and MinIO fixture publication"]
+async fn iru13a_java_rest_table_commit_shapes() {
+    let rest = NovaRocksRest::new("commits").await;
+    let java = &rest.java;
+    let endpoints = &rest.endpoints;
+    rest.create_namespace().await;
+    let created = rest.create_table("create", "shapes").await;
+    let ident = java.ident("shapes");
+    let uuid = created.metadata.uuid();
+
+    // Snapshot-producing: an append adding S, attributed by S and the UUID.
+    let operation = java.operation(&created.metadata);
+    let file = java.data(&operation, &created.metadata, &[1, 2]).await;
+    let append = intent(
+        java,
+        "shapes",
+        &created.metadata,
+        &operation,
+        RequestShape::SnapshotProducing,
+        vec![
+            AddedContent::new_logical_data(file, created.metadata.default_partition_spec_id())
+                .unwrap(),
+        ],
+        vec![],
+        Dependency::NoReadDependency,
+    );
+    let attempt = operation.begin_attempt().unwrap();
+    let (expected, request) = freeze_append(&created, &append, &attempt).await;
+    assert!(
+        request
+            .requirements()
+            .contains(&TableRequirement::UuidMatch { uuid })
+    );
+    let snapshot = request.ref_snapshot_after("main").unwrap();
+    let expect = AttributionExpectation::table_commit(
+        uuid,
+        Some(ExpectedSnapshot::new(snapshot, Some("main".into()))),
+    )
+    .unwrap();
+    let outcome = endpoints
+        .commit_table(commit_of(&request, vec![]), &expect, false)
+        .await;
+    rest.record("append", &outcome);
+    let receipt = applied(&outcome, MutationEndpoint::TableCommit);
+    assert_eq!(receipt.snapshot_id, Some(snapshot));
+    assert_eq!(receipt.uuid, Some(uuid));
+    assert_eq!(receipt.ref_relation, RefRelation::AtExpectedSnapshot);
+    let appended = java.load(&ident).await.unwrap();
+    assert_eq!(
+        semantic_facts(&appended.metadata),
+        semantic_facts(&expected),
+        "Java is the independent metadata oracle"
+    );
+    assert_eq!(appended.metadata_location, receipt.metadata_location);
+
+    // Metadata-only: attributed by the frozen UUID alone.
+    let commit = crate::commit::existing_commit::existing_table_commit(
+        ident.clone(),
+        &appended.metadata,
+        vec![],
+        vec![set_property("iru13a.metadata-only", "applied")],
+    )
+    .unwrap();
+    let expect = AttributionExpectation::table_commit(uuid, None).unwrap();
+    let outcome = endpoints.commit_table(commit, &expect, false).await;
+    rest.record("metadata-only", &outcome);
+    let receipt = applied(&outcome, MutationEndpoint::TableCommit);
+    assert_eq!(receipt.snapshot_id, None);
+    assert_eq!(receipt.uuid, Some(uuid));
+    let updated = java.load(&ident).await.unwrap();
+    assert_eq!(
+        updated
+            .metadata
+            .properties()
+            .get("iru13a.metadata-only")
+            .map(String::as_str),
+        Some("applied")
+    );
+    assert_eq!(updated.metadata.current_snapshot_id(), Some(snapshot));
+    assert_eq!(updated.metadata_location, receipt.metadata_location);
+
+    // A failing requirement: produced before the append, when main was absent.
+    let commit = crate::commit::existing_commit::existing_table_commit(
+        ident.clone(),
+        &created.metadata,
+        vec![TableRequirement::RefSnapshotIdMatch {
+            r#ref: "main".into(),
+            snapshot_id: None,
+        }],
+        vec![set_property("iru13a.stale", "applied")],
+    )
+    .unwrap();
+    let outcome = endpoints.commit_table(commit, &expect, false).await;
+    rest.record("stale-requirement", &outcome);
+    assert_eq!(
+        outcome.evidence,
+        RestEvidence::Rejected {
+            status: 409,
+            kind: ConnectorMutationFailureKind::Conflict
+        }
+    );
+    let unchanged = java.load(&ident).await.unwrap();
+    assert_eq!(unchanged.metadata_location, updated.metadata_location);
+    assert!(!unchanged.metadata.properties().contains_key("iru13a.stale"));
+
+    rest.drop_table("drop", "shapes").await;
+    rest.drop_namespace().await;
+}
+
+#[tokio::test]
+#[ignore = "requires pinned Java REST and MinIO fixture publication"]
+async fn iru13a_java_rest_stage_create_and_ctas_final_commit() {
+    let rest = NovaRocksRest::new("ctas").await;
+    let java = &rest.java;
+    let endpoints = &rest.endpoints;
+    rest.create_namespace().await;
+    let ident = java.ident("ctas");
+
+    let outcome = endpoints
+        .stage_create(rest.namespace(), create_request("ctas"))
+        .await;
+    rest.record("stage", &outcome);
+    let receipt = applied(&outcome, MutationEndpoint::StageCreate);
+    assert_eq!(receipt.metadata_location, None);
+    let staged: LoadTableResult =
+        serde_json::from_slice(outcome.document.as_deref().expect("applied document")).unwrap();
+    assert!(staged.metadata_location.is_none());
+    let staged_uuid = staged.metadata.uuid();
+    assert_eq!(receipt.uuid, Some(staged_uuid));
+    // A stage publishes nothing.
+    assert!(!endpoints.table_exists(&ident).await.unwrap());
+
+    // Core patch P8 derives the initialization updates, as the stage flow does.
+    let initialization_updates = staged
+        .metadata
+        .staged_create_initialization_updates()
+        .unwrap();
+    let operation = java.operation(&staged.metadata);
+    let file = java.data(&operation, &staged.metadata, &[7, 8]).await;
+    let create = intent(
+        java,
+        "ctas",
+        &staged.metadata,
+        &operation,
+        RequestShape::Create,
+        vec![
+            AddedContent::new_logical_data(file, staged.metadata.default_partition_spec_id())
+                .unwrap(),
+        ],
+        vec![],
+        Dependency::NoReadDependency,
+    );
+    let attempt = operation.begin_attempt().unwrap();
+    let mut engine = StagingEngine::begin(
+        StagingBase::Create {
+            staged: StagedCreateIdentity::new(operation.token(), Arc::new(staged.metadata.clone())),
+            initialization_updates,
+        },
+        &create,
+        &attempt,
+    )
+    .unwrap();
+    engine.stage(&FastAppendPreparer).await.unwrap();
+    let request = engine.freeze(&added_references(&create)).unwrap();
+    assert_eq!(request.requirements(), &[TableRequirement::NotExist]);
+    let snapshot = request.ref_snapshot_after("main").unwrap();
+    let marker = (
+        "novarocks.ctas.operation-id".to_string(),
+        operation.token().path_component(),
+    );
+    let expect = AttributionExpectation::ctas_final_commit(
+        staged_uuid,
+        Some(ExpectedSnapshot::new(snapshot, Some("main".into()))),
+        vec![marker.clone()],
+    )
+    .unwrap();
+    let outcome = endpoints
+        .commit_table(
+            commit_of(&request, vec![set_property(&marker.0, &marker.1)]),
+            &expect,
+            false,
+        )
+        .await;
+    rest.record("ctas-final-commit", &outcome);
+    let receipt = applied(&outcome, MutationEndpoint::CtasFinalCommit);
+    assert_eq!(receipt.snapshot_id, Some(snapshot));
+    assert_eq!(receipt.uuid, Some(staged_uuid));
+    assert_eq!(receipt.ref_relation, RefRelation::AtExpectedSnapshot);
+    let published = java.load(&ident).await.unwrap();
+    assert_eq!(published.metadata.uuid(), staged_uuid);
+    assert_eq!(published.metadata.current_snapshot_id(), Some(snapshot));
+    assert_eq!(
+        published.metadata.properties().get(&marker.0),
+        Some(&marker.1)
+    );
+    assert_eq!(
+        published
+            .metadata
+            .current_snapshot()
+            .unwrap()
+            .added_rows_count(),
+        Some(2)
+    );
+    assert_eq!(published.metadata_location, receipt.metadata_location);
+
+    // The same final commit again: `assert-create` now fails on the server.
+    let outcome = endpoints
+        .commit_table(
+            commit_of(&request, vec![set_property(&marker.0, &marker.1)]),
+            &expect,
+            false,
+        )
+        .await;
+    rest.record("ctas-final-commit-again", &outcome);
+    assert_eq!(
+        outcome.evidence,
+        RestEvidence::Rejected {
+            status: 409,
+            kind: ConnectorMutationFailureKind::AlreadyExists
+        }
+    );
+    let unchanged = java.load(&ident).await.unwrap();
+    assert_eq!(unchanged.metadata_location, published.metadata_location);
+
+    rest.drop_table("drop", "ctas").await;
+    rest.drop_namespace().await;
+}
+
+fn sql_view(sql: &str) -> ViewRepresentations {
+    ViewRepresentations::new(vec![ViewRepresentation::Sql(SqlViewRepresentation {
+        sql: sql.to_owned(),
+        dialect: "starrocks".to_owned(),
+    })])
+}
+
+/// The replacement's columns differ from the original's: the vendored view
+/// builder records a reused schema as `add-schema` plus a version on schema
+/// `-1`, which the Java server refuses with 400 when nothing was added.
+fn replaced_view_schema() -> Schema {
+    Schema::builder()
+        .with_fields(vec![
+            Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                2,
+                "name",
+                Type::Primitive(PrimitiveType::String),
+            )),
+        ])
+        .build()
+        .unwrap()
+}
+
+fn current_sql(metadata: &ViewMetadata) -> String {
+    match metadata.current_version().representations().iter().next() {
+        Some(ViewRepresentation::Sql(sql)) => sql.sql.clone(),
+        None => panic!("view version has no representation"),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires pinned Java REST and MinIO fixture publication"]
+async fn iru13a_java_rest_view_create_replace_drop() {
+    let rest = NovaRocksRest::new("views").await;
+    let endpoints = &rest.endpoints;
+    rest.create_namespace().await;
+    let view = rest.java.ident("v");
+    let creation = || {
+        ViewCreation::builder()
+            .name("v".to_owned())
+            .location(None)
+            .representations(sql_view("select 1 as id"))
+            .schema(schema())
+            .properties(HashMap::new())
+            .default_namespace(rest.namespace().clone())
+            .default_catalog(Some("iru13a".to_owned()))
+            .summary(HashMap::from([(
+                "engine-name".to_owned(),
+                "novarocks".to_owned(),
+            )]))
+            .build()
+    };
+
+    assert!(!endpoints.view_exists(&view).await.unwrap());
+    let outcome = endpoints.create_view(rest.namespace(), creation()).await;
+    rest.record("create-view", &outcome);
+    let receipt = applied(&outcome, MutationEndpoint::CreateView);
+    let view_uuid = receipt.uuid.expect("view UUID");
+    assert!(receipt.metadata_location.is_some());
+    assert!(endpoints.view_exists(&view).await.unwrap());
+    let current = endpoints.load_view(&view).await.unwrap();
+    assert_eq!(current.uuid(), view_uuid);
+    assert_eq!(current_sql(&current), "select 1 as id");
+
+    let again = endpoints.create_view(rest.namespace(), creation()).await;
+    rest.record("create-view-again", &again);
+    assert_eq!(
+        again.evidence,
+        RestEvidence::Rejected {
+            status: 409,
+            kind: ConnectorMutationFailureKind::AlreadyExists
+        }
+    );
+
+    // Replace exactly as the view statement does: a new current version,
+    // with the frozen view UUID as requirement and attribution.
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let version = ViewVersion::builder()
+        .with_version_id(1)
+        .with_schema_id(replaced_view_schema().schema_id())
+        .with_timestamp_ms(timestamp_ms)
+        .with_summary(HashMap::from([(
+            "engine-name".to_owned(),
+            "novarocks".to_owned(),
+        )]))
+        .with_representations(sql_view("select 2 as id, 'x' as name"))
+        .with_default_catalog(Some("iru13a".to_owned()))
+        .with_default_namespace(rest.namespace().clone())
+        .build();
+    let changes = current
+        .clone()
+        .into_builder()
+        .set_current_version(version, replaced_view_schema())
+        .unwrap()
+        .build()
+        .unwrap()
+        .changes;
+    let replace = |uuid| {
+        ViewCommit::builder()
+            .ident(view.clone())
+            .requirements(vec![ViewRequirement::UuidMatch { uuid }])
+            .updates(changes.clone())
+            .build()
+    };
+    let outcome = endpoints
+        .replace_view(
+            replace(view_uuid),
+            &AttributionExpectation::replace_view(view_uuid),
+        )
+        .await;
+    rest.record("replace-view", &outcome);
+    let receipt = applied(&outcome, MutationEndpoint::ReplaceView);
+    assert_eq!(receipt.uuid, Some(view_uuid));
+    let replaced = endpoints.load_view(&view).await.unwrap();
+    assert_eq!(replaced.uuid(), view_uuid);
+    assert_eq!(current_sql(&replaced), "select 2 as id, 'x' as name");
+    assert_eq!(
+        replaced.current_version().schema_id(),
+        replaced
+            .schemas_iter()
+            .map(|schema| schema.schema_id())
+            .max()
+            .unwrap()
+    );
+
+    // A replacement produced from another view incarnation is refused.
+    let other = Uuid::now_v7();
+    let outcome = endpoints
+        .replace_view(replace(other), &AttributionExpectation::replace_view(other))
+        .await;
+    rest.record("replace-view-other-incarnation", &outcome);
+    assert_eq!(
+        outcome.evidence,
+        RestEvidence::Rejected {
+            status: 409,
+            kind: ConnectorMutationFailureKind::Conflict
+        }
+    );
+    let unchanged = endpoints.load_view(&view).await.unwrap();
+    assert_eq!(
+        unchanged.current_version_id(),
+        replaced.current_version_id()
+    );
+
+    let outcome = endpoints.drop_view(&view).await;
+    rest.record("drop-view", &outcome);
+    applied(&outcome, MutationEndpoint::DropView);
+    let missing = endpoints.load_view(&view).await.unwrap_err();
+    assert_eq!(missing.kind(), ConnectorErrorKind::NotFound);
+    assert!(!endpoints.view_exists(&view).await.unwrap());
+    // D13: a drop's 404 may follow a publication, so it is unknown.
+    let outcome = endpoints.drop_view(&view).await;
+    rest.record("drop-view-again", &outcome);
+    assert!(matches!(
+        &outcome.evidence,
+        RestEvidence::Unknown { diagnosis }
+            if diagnosis.reason == UnknownReason::PostPublishPossible
+                && diagnosis.status == Some(404)
+    ));
+    rest.drop_namespace().await;
+}
+
+/// The partition evolution the `ALTER TABLE ... ADD PARTITION COLUMN` path
+/// builds from `base`: identity on `id`, guarded by the base default spec.
+fn partition_evolution(ident: &TableIdent, base: &TableMetadata) -> TableCommit {
+    let base_spec_id = base.default_partition_spec_id();
+    let spec = UnboundPartitionSpecBuilder::new()
+        .add_partition_fields([UnboundPartitionField {
+            source_id: 1,
+            field_id: None,
+            name: "id_part".to_owned(),
+            transform: Transform::Identity,
+        }])
+        .unwrap()
+        .build();
+    let build = TableMetadataBuilder::new_from_metadata(base.clone(), None)
+        .add_default_partition_spec(spec)
+        .unwrap()
+        .build()
+        .unwrap();
+    let new_spec_id = build.metadata.default_partition_spec_id();
+    assert_ne!(new_spec_id, base_spec_id);
+    let mut updates = build.changes;
+    if let Some(TableUpdate::AddSpec { spec }) = updates.first_mut() {
+        *spec = build
+            .metadata
+            .partition_spec_by_id(new_spec_id)
+            .unwrap()
+            .as_ref()
+            .clone()
+            .into_unbound();
+    }
+    crate::commit::existing_commit::existing_table_commit(
+        ident.clone(),
+        base,
+        vec![TableRequirement::DefaultSpecIdMatch {
+            default_spec_id: base_spec_id,
+        }],
+        updates,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires pinned Java REST and MinIO fixture publication"]
+async fn iru13a_java_rest_recreated_table_rejects_stale_partition_evolution() {
+    let rest = NovaRocksRest::new("recreated").await;
+    let java = &rest.java;
+    rest.create_namespace().await;
+    let ident = java.ident("recreated");
+    rest.create_table("create-old", "recreated").await;
+    let old = java.load(&ident).await.unwrap();
+    rest.drop_table("drop-old", "recreated").await;
+    rest.create_table("create-new", "recreated").await;
+    let before = java.load(&ident).await.unwrap();
+    assert_ne!(before.metadata.uuid(), old.metadata.uuid());
+    assert_eq!(
+        before.metadata.current_schema(),
+        old.metadata.current_schema()
+    );
+    assert_eq!(
+        before.metadata.default_partition_spec_id(),
+        old.metadata.default_partition_spec_id()
+    );
+    assert_eq!(
+        before.metadata.default_partition_spec(),
+        old.metadata.default_partition_spec()
+    );
+
+    // Produced from the dropped incarnation: every requirement but the frozen
+    // UUID also holds on the recreated table.
+    let adapter = RestTransitionalAdapter::new(Arc::clone(&rest.endpoints));
+    let error = adapter
+        .update_table(partition_evolution(&ident, &old.metadata))
+        .await
+        .expect_err("a commit produced from the dropped table must not apply");
+    assert_eq!(error.kind(), ErrorKind::CatalogCommitConflicts);
+    assert_eq!(
+        rest_evidence(&error),
+        Some(&RestEvidence::Rejected {
+            status: 409,
+            kind: ConnectorMutationFailureKind::Conflict
+        })
+    );
+    java.record(
+        "stale-partition-evolution",
+        &json!({"evidence": format!("{:?}", rest_evidence(&error))}),
+    );
+    let after = java.load(&ident).await.unwrap();
+    assert_eq!(after.metadata_location, before.metadata_location);
+    assert_eq!(
+        semantic_facts(&after.metadata),
+        semantic_facts(&before.metadata)
+    );
+
+    // Control: the same evolution produced from the recreated table applies.
+    let table = adapter
+        .update_table(partition_evolution(&ident, &before.metadata))
+        .await
+        .expect("a commit produced from the current table applies");
+    assert_eq!(table.metadata().uuid(), before.metadata.uuid());
+    let evolved = java.load(&ident).await.unwrap();
+    assert_ne!(
+        evolved.metadata.default_partition_spec_id(),
+        before.metadata.default_partition_spec_id()
+    );
+    java.record(
+        "current-partition-evolution",
+        &json!({"default-spec-id": evolved.metadata.default_partition_spec_id()}),
+    );
+
+    rest.drop_table("drop-new", "recreated").await;
+    rest.drop_namespace().await;
 }
