@@ -390,7 +390,6 @@ struct Record {
 enum Operation {
     Namespaces,
     Tables,
-    Views,
 }
 #[derive(Deserialize, Serialize, Debug, PartialEq, Eq)]
 enum Selection {
@@ -553,38 +552,29 @@ fn normal_coverage(journal: &Journal, targets: &[String], clients: usize) -> Res
     );
     Ok(())
 }
-fn view_coverage(journal: &Journal) -> Result<()> {
-    let mut targets = std::collections::BTreeSet::new();
+// HMS answers view operations itself with an explicit Unsupported refusal: no
+// listing admission, no SDK future and therefore no observation record. The
+// 32 refusals are proven by the client replies; the journal must prove that
+// none of them reached the observed listing path.
+fn view_coverage(before: &Journal, journal: &Journal) -> Result<()> {
     ensure!(
-        journal.records.len() == 32,
-        "HMS view refusal operation count differs"
+        before.used == 0
+            && before.records.is_empty()
+            && before.peak_admitted_wrappers_live == 0
+            && before.peak_sdk_objects_live == 0,
+        "HMS view-refusal phase did not start from an exact reset journal"
     );
-    for record in &journal.records {
-        ensure!(
-            record.operation == Operation::Views
-                && record.selection == Selection::ReadyErr
-                && record.sdk_created > 0
-                && record.sdk_ready > record.sdk_first_poll
-                && record.sdk_dropped > record.sdk_ready
-                && !record.stop_at_selection
-                && !record.deadline_at_selection,
-            "HMS view refusal lacks original unsupported SDK-future exit facts"
-        );
-        ensure!(
-            targets.insert(
-                record
-                    .target_sha256
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("HMS view refusal target is absent"))?
-            ),
-            "HMS view refusal duplicated a namespace target"
-        );
-    }
     ensure!(
-        (0..32)
-            .all(|namespace| targets
-                .contains(sha(format!("cl_ns_{namespace:04}").as_bytes()).as_str())),
-        "HMS view refusal omitted or replaced a namespace target"
+        journal.used == 0 && journal.records.is_empty(),
+        "HMS view refusal reached the observed listing path"
+    );
+    ensure!(
+        journal.sequence == before.sequence,
+        "HMS view refusal advanced the observed listing sequence"
+    );
+    ensure!(
+        journal.peak_admitted_wrappers_live == 0 && journal.peak_sdk_objects_live == 0,
+        "HMS view refusal admitted a listing wrapper or created an SDK object"
     );
     Ok(())
 }
@@ -1620,7 +1610,7 @@ impl Scenario for HmsBulkReadonlyNative {
             journal = current.expect("actual journal captured");
             journal_idle(&journal, frontend)?;
             same_domain(&before, &journal)?;
-            view_coverage(&journal)?;
+            view_coverage(&before, &journal)?;
             remaining(self.deadline)?;
             ensure!(
                 context.recheck_live_process_launch_identities()? == original,
@@ -1916,21 +1906,34 @@ mod tests {
     }
 
     #[test]
-    fn view_refusal_count_cannot_replace_exact_namespace_coverage() {
-        let mut value = journal();
-        let prototype = serde_json::to_value(&value.records[0]).unwrap();
-        value.records = (0..32)
-            .map(|namespace| {
-                let mut record: Record = serde_json::from_value(prototype.clone()).unwrap();
-                record.operation = Operation::Views;
-                record.selection = Selection::ReadyErr;
-                record.target_sha256 = Some(sha(format!("cl_ns_{namespace:04}").as_bytes()));
-                record
-            })
-            .collect();
-        assert!(view_coverage(&value).is_ok());
-        value.records[1].target_sha256 = value.records[0].target_sha256.clone();
-        assert!(view_coverage(&value).is_err());
+    fn view_refusal_is_unobserved_and_leaves_the_reset_journal_untouched() {
+        let reset = || {
+            let mut value = journal();
+            value.records.clear();
+            value.used = 0;
+            value.peak_admitted_wrappers_live = 0;
+            value.peak_sdk_objects_live = 0;
+            value
+        };
+        let before = reset();
+        assert!(view_coverage(&before, &reset()).is_ok());
+        // Any observed record, even a refused one, means the refusal reached
+        // the listing path instead of the owner's direct Unsupported answer.
+        let mut after = reset();
+        after.records.push(journal().records.remove(0));
+        after.used = 1;
+        assert!(view_coverage(&before, &after).is_err());
+        let mut after = reset();
+        after.sequence += 1;
+        assert!(view_coverage(&before, &after).is_err());
+        let mut after = reset();
+        after.peak_admitted_wrappers_live = 1;
+        assert!(view_coverage(&before, &after).is_err());
+        let mut after = reset();
+        after.peak_sdk_objects_live = 1;
+        assert!(view_coverage(&before, &after).is_err());
+        // The phase must start from an exact reset journal.
+        assert!(view_coverage(&journal(), &reset()).is_err());
     }
 }
 

@@ -603,10 +603,7 @@ async fn iru5_java_rest_three_shapes_historic_spec_and_composition() {
     let mut engine = StagingEngine::begin(
         StagingBase::Create {
             staged: StagedCreateIdentity::new(operation.token(), Arc::new(staged.metadata.clone())),
-            initialization_updates: staged
-                .metadata
-                .staged_create_initialization_updates()
-                .unwrap(),
+            initialization_updates: super::staged_create_updates(&staged.metadata).unwrap(),
         },
         &create,
         &attempt,
@@ -1234,14 +1231,17 @@ struct NovaRocksRest {
 }
 
 impl NovaRocksRest {
-    /// The namespace is created later, by a NovaRocks request.
-    async fn new(case: &str) -> Self {
+    /// The namespace is created later, by a NovaRocks request. `driver` is
+    /// the environment prefix of the interop driver that owns this run, e.g.
+    /// `NR_IRU13A`.
+    async fn new(driver: &str, case: &str) -> Self {
         let namespace = NamespaceIdent::new(format!(
             "{}_{}",
-            required("NR_IRU13A_INTEROP_NAMESPACE"),
+            required(&format!("{driver}_INTEROP_NAMESPACE")),
             case
         ));
-        let artifacts = PathBuf::from(required("NR_IRU13A_INTEROP_ARTIFACT_DIR")).join(case);
+        let artifacts =
+            PathBuf::from(required(&format!("{driver}_INTEROP_ARTIFACT_DIR"))).join(case);
         let java = Java::attach(namespace, artifacts).await;
         let configuration = crate::catalog_config::parse_catalog_configuration(
             "iru13a",
@@ -1380,7 +1380,7 @@ fn set_property(key: &str, value: &str) -> TableUpdate {
 #[tokio::test]
 #[ignore = "requires pinned Java REST and MinIO fixture publication"]
 async fn iru13a_java_rest_namespace_table_lifecycle_and_interleaved_reads() {
-    let rest = NovaRocksRest::new("lifecycle").await;
+    let rest = NovaRocksRest::new("NR_IRU13A", "lifecycle").await;
     let java = &rest.java;
     let endpoints = &rest.endpoints;
     let namespace = rest.namespace();
@@ -1515,7 +1515,7 @@ async fn iru13a_java_rest_namespace_table_lifecycle_and_interleaved_reads() {
 #[tokio::test]
 #[ignore = "requires pinned Java REST and MinIO fixture publication"]
 async fn iru13a_java_rest_table_commit_shapes() {
-    let rest = NovaRocksRest::new("commits").await;
+    let rest = NovaRocksRest::new("NR_IRU13A", "commits").await;
     let java = &rest.java;
     let endpoints = &rest.endpoints;
     rest.create_namespace().await;
@@ -1625,7 +1625,7 @@ async fn iru13a_java_rest_table_commit_shapes() {
 #[tokio::test]
 #[ignore = "requires pinned Java REST and MinIO fixture publication"]
 async fn iru13a_java_rest_stage_create_and_ctas_final_commit() {
-    let rest = NovaRocksRest::new("ctas").await;
+    let rest = NovaRocksRest::new("NR_IRU13A", "ctas").await;
     let java = &rest.java;
     let endpoints = &rest.endpoints;
     rest.create_namespace().await;
@@ -1645,11 +1645,8 @@ async fn iru13a_java_rest_stage_create_and_ctas_final_commit() {
     // A stage publishes nothing.
     assert!(!endpoints.table_exists(&ident).await.unwrap());
 
-    // Core patch P8 derives the initialization updates, as the stage flow does.
-    let initialization_updates = staged
-        .metadata
-        .staged_create_initialization_updates()
-        .unwrap();
+    // The connector derives the initialization updates, as the stage flow does.
+    let initialization_updates = super::staged_create_updates(&staged.metadata).unwrap();
     let operation = java.operation(&staged.metadata);
     let file = java.data(&operation, &staged.metadata, &[7, 8]).await;
     let create = intent(
@@ -1779,7 +1776,7 @@ fn current_sql(metadata: &ViewMetadata) -> String {
 #[tokio::test]
 #[ignore = "requires pinned Java REST and MinIO fixture publication"]
 async fn iru13a_java_rest_view_create_replace_drop() {
-    let rest = NovaRocksRest::new("views").await;
+    let rest = NovaRocksRest::new("NR_IRU13A", "views").await;
     let endpoints = &rest.endpoints;
     rest.create_namespace().await;
     let view = rest.java.ident("v");
@@ -1955,7 +1952,7 @@ fn partition_evolution(ident: &TableIdent, base: &TableMetadata) -> TableCommit 
 #[tokio::test]
 #[ignore = "requires pinned Java REST and MinIO fixture publication"]
 async fn iru13a_java_rest_recreated_table_rejects_stale_partition_evolution() {
-    let rest = NovaRocksRest::new("recreated").await;
+    let rest = NovaRocksRest::new("NR_IRU13A", "recreated").await;
     let java = &rest.java;
     rest.create_namespace().await;
     let ident = java.ident("recreated");
@@ -2021,5 +2018,301 @@ async fn iru13a_java_rest_recreated_table_rejects_stale_partition_evolution() {
     );
 
     rest.drop_table("drop-new", "recreated").await;
+    rest.drop_namespace().await;
+}
+
+// IRU-13b: NovaRocks owns the REST request vocabulary that core patches used
+// to provide. Java fixture read-back is the independent oracle.
+
+const IRU13B: &str = "NR_IRU13B";
+
+/// `id` (1), `a` (2), `b` (3): the highest field is the last one.
+fn three_column_schema() -> Schema {
+    Schema::builder()
+        .with_fields(vec![
+            Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            )),
+            Arc::new(NestedField::optional(
+                2,
+                "a",
+                Type::Primitive(PrimitiveType::String),
+            )),
+            Arc::new(NestedField::optional(
+                3,
+                "b",
+                Type::Primitive(PrimitiveType::String),
+            )),
+        ])
+        .build()
+        .unwrap()
+}
+
+fn three_column_request(name: &str, format_version: u8) -> CreateTableRequest {
+    CreateTableRequest {
+        name: name.to_owned(),
+        location: None,
+        schema: three_column_schema(),
+        partition_spec: Some(PartitionSpec::unpartition_spec().into_unbound()),
+        write_order: Some(SortOrder::unsorted_order()),
+        stage_create: None,
+        properties: HashMap::from([("format-version".into(), format_version.to_string())]),
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires pinned Java REST and MinIO fixture publication"]
+async fn iru13b_java_rest_ctas_publishes_staged_metadata_for_every_format_version() {
+    let rest = NovaRocksRest::new(IRU13B, "ctas").await;
+    let java = &rest.java;
+    let endpoints = &rest.endpoints;
+    rest.create_namespace().await;
+
+    for (format_version, number) in [
+        (FormatVersion::V1, 1),
+        (FormatVersion::V2, 2),
+        (FormatVersion::V3, 3),
+    ] {
+        let name = format!("ctas_v{number}");
+        let ident = java.ident(&name);
+        let outcome = endpoints
+            .stage_create(rest.namespace(), three_column_request(&name, number))
+            .await;
+        rest.record(&format!("{name}-stage"), &outcome);
+        applied(&outcome, MutationEndpoint::StageCreate);
+        let staged: LoadTableResult =
+            serde_json::from_slice(outcome.document.as_deref().expect("applied document")).unwrap();
+        let staged = staged.metadata;
+        assert_eq!(staged.format_version(), format_version);
+
+        let initialization_updates = super::staged_create_updates(&staged).unwrap();
+        let operation = java.operation(&staged);
+        let file = java.data(&operation, &staged, &[7, 8]).await;
+        let create = intent(
+            java,
+            &name,
+            &staged,
+            &operation,
+            RequestShape::Create,
+            vec![AddedContent::new_logical_data(file, staged.default_partition_spec_id()).unwrap()],
+            vec![],
+            Dependency::NoReadDependency,
+        );
+        let attempt = operation.begin_attempt().unwrap();
+        let mut engine = StagingEngine::begin(
+            StagingBase::Create {
+                staged: StagedCreateIdentity::new(operation.token(), Arc::new(staged.clone())),
+                initialization_updates,
+            },
+            &create,
+            &attempt,
+        )
+        .unwrap();
+        engine.stage(&FastAppendPreparer).await.unwrap();
+        let request = engine.freeze(&added_references(&create)).unwrap();
+        let body = request.to_rest_json().unwrap();
+        java.record(&format!("{name}-request"), &body);
+        let add_schema = body["updates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|update| update["action"] == "add-schema")
+            .expect("initialization adds the staged schema");
+        assert!(add_schema.get("last-column-id").is_none(), "{add_schema}");
+        assert!(
+            body["updates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|update| update["action"] == "upgrade-format-version"
+                    && update["format-version"] == number),
+            "every format version is selected explicitly"
+        );
+
+        let snapshot = request.ref_snapshot_after("main").unwrap();
+        let marker = (
+            "novarocks.ctas.operation-id".to_string(),
+            operation.token().path_component(),
+        );
+        let expect = AttributionExpectation::ctas_final_commit(
+            staged.uuid(),
+            Some(ExpectedSnapshot::new(snapshot, Some("main".into()))),
+            vec![marker.clone()],
+        )
+        .unwrap();
+        let outcome = endpoints
+            .commit_table(
+                commit_of(&request, vec![set_property(&marker.0, &marker.1)]),
+                &expect,
+                false,
+            )
+            .await;
+        rest.record(&format!("{name}-final-commit"), &outcome);
+        let receipt = applied(&outcome, MutationEndpoint::CtasFinalCommit);
+        assert_eq!(receipt.snapshot_id, Some(snapshot));
+
+        let published = java.load(&ident).await.unwrap().metadata;
+        assert_eq!(published.format_version(), format_version);
+        assert_eq!(published.uuid(), staged.uuid());
+        assert_eq!(published.location(), staged.location());
+        assert_eq!(published.current_schema(), staged.current_schema());
+        assert_eq!(
+            published.default_partition_spec(),
+            staged.default_partition_spec()
+        );
+        assert_eq!(published.default_sort_order(), staged.default_sort_order());
+        let mut properties = published.properties().clone();
+        assert_eq!(properties.remove(&marker.0), Some(marker.1.clone()));
+        assert_eq!(&properties, staged.properties());
+        assert_eq!(
+            published.last_column_id(),
+            staged.current_schema().highest_field_id()
+        );
+        assert_eq!(published.last_column_id(), 3);
+        assert_eq!(published.current_snapshot_id(), Some(snapshot));
+        java.record(
+            &format!("{name}-published"),
+            &json!({"format-version": number, "last-column-id": published.last_column_id()}),
+        );
+        rest.drop_table(&format!("{name}-drop"), &name).await;
+    }
+    rest.drop_namespace().await;
+}
+
+fn root_column(name: &str) -> novarocks_spi::connector::ConnectorColumnPath {
+    novarocks_spi::connector::ConnectorColumnPath {
+        segments: vec![name.into()],
+    }
+}
+
+fn drop_column(name: &str) -> novarocks_spi::connector::ConnectorSchemaChange {
+    novarocks_spi::connector::ConnectorSchemaChange::DropColumn {
+        path: root_column(name),
+    }
+}
+
+impl NovaRocksRest {
+    /// Apply one schema change exactly as `ALTER TABLE` builds it, and return
+    /// the metadata Java holds afterwards.
+    async fn alter(
+        &self,
+        label: &str,
+        name: &str,
+        change: novarocks_spi::connector::ConnectorSchemaChange,
+    ) -> TableMetadata {
+        let ident = self.java.ident(name);
+        let base = self.java.load(&ident).await.unwrap().metadata;
+        let commit = crate::catalog_control::catalog_mutation::schema_change_commit(
+            ident.clone(),
+            &base,
+            &change,
+        )
+        .unwrap()
+        .expect("the change is not a no-op");
+        let expect = AttributionExpectation::table_commit(base.uuid(), None).unwrap();
+        let outcome = self.endpoints.commit_table(commit, &expect, false).await;
+        self.record(label, &outcome);
+        applied(&outcome, MutationEndpoint::TableCommit);
+        let altered = self.java.load(&ident).await.unwrap().metadata;
+        self.java.record(
+            &format!("{label}-result"),
+            &json!({
+                "last-column-id": altered.last_column_id(),
+                "schema": altered.current_schema().as_ref(),
+            }),
+        );
+        altered
+    }
+
+    async fn create_three_column_table(&self, name: &str) {
+        let outcome = self
+            .endpoints
+            .create_table(self.namespace(), three_column_request(name, 2))
+            .await;
+        self.record(&format!("{name}-create"), &outcome);
+        applied(&outcome, MutationEndpoint::CreateTable);
+    }
+}
+
+fn field_ids(metadata: &TableMetadata) -> Vec<(String, i32)> {
+    metadata
+        .current_schema()
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| (field.name.clone(), field.id))
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "requires pinned Java REST and MinIO fixture publication"]
+async fn iru13b_java_rest_schema_changes_keep_the_column_high_water_mark() {
+    let rest = NovaRocksRest::new(IRU13B, "schema").await;
+    rest.create_namespace().await;
+
+    // Dropping only the highest field: the high-water mark stays.
+    rest.create_three_column_table("drop_highest").await;
+    let dropped = rest
+        .alter("drop-highest", "drop_highest", drop_column("b"))
+        .await;
+    assert_eq!(field_ids(&dropped), vec![("id".into(), 1), ("a".into(), 2)]);
+    assert_eq!(dropped.last_column_id(), 3);
+
+    // Adding after the drop: the new field is numbered past the old mark.
+    rest.create_three_column_table("drop_then_add").await;
+    rest.alter("drop-then-add-drop", "drop_then_add", drop_column("b"))
+        .await;
+    let added = rest
+        .alter(
+            "drop-then-add-add",
+            "drop_then_add",
+            novarocks_spi::connector::ConnectorSchemaChange::AddColumn {
+                parent: novarocks_spi::connector::ConnectorColumnPath { segments: vec![] },
+                column: novarocks_spi::connector::ConnectorColumnDefinition {
+                    name: "c".into(),
+                    data_type: novarocks_spi::connector::ConnectorDataType::String,
+                    nullable: true,
+                    aggregation: None,
+                    default: None,
+                },
+                position: novarocks_spi::connector::ConnectorColumnPosition::Default,
+            },
+        )
+        .await;
+    assert_eq!(
+        field_ids(&added),
+        vec![("id".into(), 1), ("a".into(), 2), ("c".into(), 4)]
+    );
+    assert_eq!(added.last_column_id(), 4);
+
+    // Renaming after the drop adds no field; the mark is unchanged.
+    rest.create_three_column_table("drop_then_rename").await;
+    rest.alter(
+        "drop-then-rename-drop",
+        "drop_then_rename",
+        drop_column("b"),
+    )
+    .await;
+    let renamed = rest
+        .alter(
+            "drop-then-rename-rename",
+            "drop_then_rename",
+            novarocks_spi::connector::ConnectorSchemaChange::RenameColumn {
+                path: root_column("a"),
+                to: "a2".into(),
+            },
+        )
+        .await;
+    assert_eq!(
+        field_ids(&renamed),
+        vec![("id".into(), 1), ("a2".into(), 2)]
+    );
+    assert_eq!(renamed.last_column_id(), 3);
+
+    for name in ["drop_highest", "drop_then_add", "drop_then_rename"] {
+        rest.drop_table(&format!("{name}-drop"), name).await;
+    }
     rest.drop_namespace().await;
 }

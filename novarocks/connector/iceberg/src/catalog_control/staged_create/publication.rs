@@ -470,7 +470,8 @@ mod tests {
                 if with_data { 3 } else { 0 },
             )
             .unwrap();
-            let initialization_updates = metadata.staged_create_initialization_updates().unwrap();
+            let initialization_updates =
+                crate::commit::staging::staged_create_updates(&metadata).unwrap();
             let table = crate::iceberg::table::Table::builder()
                 .runtime(
                     runtime
@@ -775,85 +776,5 @@ mod tests {
             ));
             assert_eq!(operation.artifacts().unwrap().len(), 351);
         });
-    }
-
-    /// Core patch P8 derives a staged create's initialization updates from
-    /// the server's authoritative metadata. Its only caller is the REST
-    /// stage, so its coverage lives here until IRU-13b retires the patch.
-    mod staged_initialization {
-        use std::collections::HashMap;
-
-        use crate::iceberg::ErrorKind;
-        use crate::iceberg::TableUpdate;
-        use crate::iceberg::spec::{
-            FormatVersion, NestedField, PrimitiveType, Schema, SortOrder, TableMetadata,
-            TableMetadataBuilder, Type, UnboundPartitionSpec,
-        };
-
-        fn staged_metadata(format_version: FormatVersion) -> TableMetadata {
-            TableMetadataBuilder::new(
-                Schema::builder()
-                    .with_fields(vec![
-                        NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
-                    ])
-                    .build()
-                    .unwrap(),
-                UnboundPartitionSpec::default(),
-                SortOrder::unsorted_order(),
-                "s3://warehouse/database/versioned".to_string(),
-                format_version,
-                HashMap::new(),
-            )
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata
-        }
-
-        fn staged_metadata_json() -> serde_json::Value {
-            serde_json::to_value(staged_metadata(FormatVersion::V2)).unwrap()
-        }
-
-        #[test]
-        fn initialization_updates_preserve_v2_and_v3_format() {
-            for expected in [FormatVersion::V2, FormatVersion::V3] {
-                let updates = staged_metadata(expected)
-                    .staged_create_initialization_updates()
-                    .unwrap();
-                assert!(updates.contains(&TableUpdate::UpgradeFormatVersion {
-                    format_version: expected,
-                }));
-            }
-        }
-
-        #[test]
-        fn initialization_updates_reject_snapshot_state() {
-            let mut metadata_json = staged_metadata_json();
-            let snapshot_id = 3055729675574597000i64;
-            metadata_json["current-snapshot-id"] = serde_json::json!(snapshot_id);
-            metadata_json["snapshots"] = serde_json::json!([{
-                "snapshot-id": snapshot_id,
-                "timestamp-ms": 1657810968051i64,
-                "summary": {"operation": "append"},
-                "manifest-list": "s3://warehouse/database/table/metadata/snap-proof.avro"
-            }]);
-            metadata_json["refs"] = serde_json::json!({
-                "main": {"snapshot-id": snapshot_id, "type": "branch"}
-            });
-            let metadata: TableMetadata = serde_json::from_value(metadata_json).unwrap();
-            let error = metadata.staged_create_initialization_updates().unwrap_err();
-            assert_eq!(ErrorKind::DataInvalid, error.kind());
-            assert!(error.message().contains("cannot be represented"));
-        }
-
-        #[test]
-        fn initialization_updates_reject_an_unrepresented_partition_watermark() {
-            let mut metadata_json = staged_metadata_json();
-            metadata_json["last-partition-id"] = serde_json::json!(1000);
-            let metadata: TableMetadata = serde_json::from_value(metadata_json).unwrap();
-            let error = metadata.staged_create_initialization_updates().unwrap_err();
-            assert_eq!(ErrorKind::DataInvalid, error.kind());
-            assert!(error.message().contains("partition high-watermark"));
-        }
     }
 }

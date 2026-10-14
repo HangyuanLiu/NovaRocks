@@ -680,12 +680,14 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         }) else {
             return unknown("REST stage-create response could not be decoded");
         };
-        // Core patch P8 derives the initialization updates until IRU-13b.
-        let initialization_updates = match response.metadata.staged_create_initialization_updates()
-        {
-            Ok(updates) => updates,
-            Err(_) => return unknown("REST stage-create response has invalid initial metadata"),
-        };
+        // The first commit restates the server's staged metadata exactly.
+        let initialization_updates =
+            match crate::commit::staging::staged_create_updates(&response.metadata) {
+                Ok(updates) => updates,
+                Err(_) => {
+                    return unknown("REST stage-create response has invalid initial metadata");
+                }
+            };
         let (frozen, delegation) = crate::rest_protocol::deferred::FrozenLoadTable::from_response(
             table_ident,
             response,
