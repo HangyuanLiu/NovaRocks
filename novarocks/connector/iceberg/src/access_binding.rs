@@ -105,6 +105,23 @@ pub trait IcebergStaticCredentialResolver: Send + Sync {
             "role-local resolver provides no data-credential-vending identity",
         ))
     }
+
+    /// The coordinator's own catalog-control identity (L16).
+    ///
+    /// Only a coordinator holds one: it authenticates the control-plane
+    /// session of a catalog generation. The default refusal is the answer of
+    /// every role that does not. Unlike the vending identity, a catalog that
+    /// declares this binding cannot proceed without it, so a caller must not
+    /// read `Unsupported` as "no identity".
+    fn resolve_catalog_control(
+        &self,
+        _reference: &StaticCredentialReference,
+    ) -> Result<IcebergRestAuthMaterial, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "role-local resolver provides no catalog-control identity",
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -140,6 +157,11 @@ pub struct IcebergReadBinding {
     credential_resolver: Option<Arc<dyn IcebergStaticCredentialResolver>>,
     credential_purpose: CatalogCredentialPurpose,
     storage_access: Option<IcebergStorageAccess>,
+    /// The coordinator identity the catalog definition names for its
+    /// control-plane session. Absent when the definition declares none, and
+    /// always absent on an execution node: the backend projection of a
+    /// catalog definition never carries this binding.
+    catalog_control_reference: Option<StaticCredentialReference>,
     request_context: Option<ConnectorRequestContext>,
     /// The bridge this role drives its own catalog calls on.
     ///
@@ -191,6 +213,7 @@ impl IcebergReadBinding {
             credential_resolver: None,
             credential_purpose: CatalogCredentialPurpose::ObjectStoreData,
             storage_access: None,
+            catalog_control_reference: None,
             request_context: None,
             catalog_runtime: None,
         }
@@ -208,6 +231,7 @@ impl IcebergReadBinding {
             credential_resolver: Some(credential_resolver),
             credential_purpose: CatalogCredentialPurpose::ObjectStoreData,
             storage_access: None,
+            catalog_control_reference: None,
             request_context: None,
             catalog_runtime: None,
         }
@@ -225,6 +249,7 @@ impl IcebergReadBinding {
             credential_resolver: Some(credential_resolver),
             credential_purpose: CatalogCredentialPurpose::ObjectStoreMetadata,
             storage_access: None,
+            catalog_control_reference: None,
             request_context: None,
             catalog_runtime: None,
         }
@@ -338,6 +363,7 @@ impl IcebergReadBinding {
             credential_resolver: Some(credential_resolver),
             credential_purpose,
             storage_access: Some(storage_access),
+            catalog_control_reference: catalog_control_reference(properties),
             request_context: None,
             catalog_runtime: None,
         })
@@ -361,6 +387,26 @@ impl IcebergReadBinding {
             range_service: self.range_service.clone(),
             ..bound
         })
+    }
+
+    /// Resolve the coordinator identity that authenticates this catalog's
+    /// control-plane session (L16).
+    ///
+    /// `None` means the catalog definition declares no `CatalogControl`
+    /// binding, and the coordinator's REST requests then carry no
+    /// Authorization. A declared binding this role cannot resolve is an
+    /// error, never "no identity": silently dropping a declared identity
+    /// would send the session unauthenticated.
+    pub fn resolve_catalog_control_identity(
+        &self,
+    ) -> Result<Option<IcebergRestAuthMaterial>, ConnectorError> {
+        let Some(reference) = self.catalog_control_reference.as_ref() else {
+            return Ok(None);
+        };
+        let resolver = self.credential_resolver.as_ref().ok_or_else(|| {
+            invalid("Iceberg catalog-control binding has no role-local credential resolver")
+        })?;
+        resolver.resolve_catalog_control(reference).map(Some)
     }
 
     /// Install the bridge this role drives its own catalog calls on.
@@ -433,6 +479,7 @@ impl IcebergReadBinding {
             credential_resolver: Some(resolver),
             credential_purpose: CatalogCredentialPurpose::ObjectStoreData,
             storage_access: Some(storage_access),
+            catalog_control_reference: None,
             request_context: None,
             catalog_runtime: None,
         }
@@ -451,6 +498,7 @@ impl IcebergReadBinding {
             credential_resolver: self.credential_resolver.clone(),
             credential_purpose: self.credential_purpose,
             storage_access: self.storage_access.clone(),
+            catalog_control_reference: self.catalog_control_reference.clone(),
             request_context: Some(request_context),
             catalog_runtime: self.catalog_runtime.clone(),
         }
@@ -975,6 +1023,20 @@ fn vending_reference(properties: &CatalogProperties) -> Option<StaticCredentialR
             CatalogCredentialMode::Static(reference) => Some(reference.clone()),
             CatalogCredentialMode::Vended => None,
         })
+}
+
+/// The catalog-control binding this catalog declared, if any.
+///
+/// Its own purpose for the same reason as the vending binding: the
+/// coordinator's control identity and an execution node's acquisition
+/// identity are different principals (CAD-1 D9). The backend projection of a
+/// catalog definition drops this binding, so an execution node never sees it.
+fn catalog_control_reference(properties: &CatalogProperties) -> Option<StaticCredentialReference> {
+    properties
+        .credential_bindings()
+        .iter()
+        .find(|binding| binding.purpose() == CatalogCredentialPurpose::CatalogControl)
+        .and_then(|binding| binding.static_reference().cloned())
 }
 
 fn invalid(message: impl Into<String>) -> ConnectorError {
@@ -1640,5 +1702,223 @@ mod tests {
             .expect_err("resolver denial must not fall back to static credentials");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod catalog_control_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use novarocks_fs::{TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_spi::connector::{
+        CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
+        CatalogProperties, CatalogProperty, CatalogVersion, ConnectorInstanceId,
+        ConnectorProviderId, CredentialConsumerRole,
+    };
+
+    fn control_reference() -> StaticCredentialReference {
+        StaticCredentialReference::try_new("coordinator", "v1").expect("control reference")
+    }
+
+    fn rest_catalog_properties(with_control: bool) -> CatalogProperties {
+        let mut bindings = vec![
+            CatalogCredentialBinding::try_new(
+                CatalogCredentialPurpose::ObjectStoreData,
+                CredentialConsumerRole::Backend,
+                CatalogCredentialMode::Vended,
+            )
+            .expect("vended binding"),
+            CatalogCredentialBinding::try_new(
+                CatalogCredentialPurpose::DataCredentialVending,
+                CredentialConsumerRole::Backend,
+                CatalogCredentialMode::Static(
+                    StaticCredentialReference::try_new("executor", "v1").expect("reference"),
+                ),
+            )
+            .expect("vending binding"),
+            CatalogCredentialBinding::try_new(
+                CatalogCredentialPurpose::ObjectStoreMetadata,
+                CredentialConsumerRole::Frontend,
+                CatalogCredentialMode::Static(
+                    StaticCredentialReference::try_new("metadata", "v1").expect("reference"),
+                ),
+            )
+            .expect("metadata binding"),
+        ];
+        if with_control {
+            bindings.push(
+                CatalogCredentialBinding::try_new(
+                    CatalogCredentialPurpose::CatalogControl,
+                    CredentialConsumerRole::Frontend,
+                    CatalogCredentialMode::Static(control_reference()),
+                )
+                .expect("control binding"),
+            );
+        }
+        CatalogProperties::new(
+            CatalogHandle::new(
+                ConnectorInstanceId::parse("control-test").expect("catalog"),
+                CatalogVersion::from_bytes([0x43; 32]),
+            ),
+            ConnectorProviderId::parse("iceberg").expect("static provider ID"),
+            1,
+            vec![
+                CatalogProperty::new("aws.s3.endpoint", "http://minio:9000").expect("endpoint"),
+                CatalogProperty::new("iceberg.catalog.type", "rest").expect("type"),
+                CatalogProperty::new("uri", "http://rest:8181/catalog").expect("uri"),
+            ],
+            bindings,
+        )
+        .expect("catalog properties")
+    }
+
+    /// A resolver modelling one exact role: a coordinator holds the control
+    /// identity, an execution node structurally has none.
+    struct ControlResolver {
+        material: Option<IcebergRestAuthMaterial>,
+    }
+
+    impl IcebergStaticCredentialResolver for ControlResolver {
+        fn resolve_object_store_static(
+            &self,
+            _reference: &StaticCredentialReference,
+        ) -> Result<ObjectStoreSecretMaterial, ConnectorError> {
+            Err(invalid("this test resolver vends no object-store material"))
+        }
+
+        fn resolve_catalog_control(
+            &self,
+            reference: &StaticCredentialReference,
+        ) -> Result<IcebergRestAuthMaterial, ConnectorError> {
+            assert_eq!(reference, &control_reference());
+            self.material.clone().ok_or_else(|| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "role-local resolver provides no catalog-control identity",
+                )
+            })
+        }
+    }
+
+    struct DefaultResolver;
+
+    impl IcebergStaticCredentialResolver for DefaultResolver {
+        fn resolve_object_store_static(
+            &self,
+            _reference: &StaticCredentialReference,
+        ) -> Result<ObjectStoreSecretMaterial, ConnectorError> {
+            Err(invalid("this test resolver vends no object-store material"))
+        }
+    }
+
+    fn resources(runtime: &tokio::runtime::Runtime) -> FsAccessResources {
+        FsAccessResources::new(
+            Arc::new(
+                novarocks_fs::ObjectStoreProviderPool::new(
+                    novarocks_fs::ObjectStoreProviderPoolOptions::default(),
+                )
+                .expect("provider pool"),
+            ),
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        )
+    }
+
+    #[test]
+    fn the_coordinator_metadata_binding_resolves_its_declared_control_identity() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        // The coordinator's generation binds its metadata template to the
+        // admitted definition; the control identity travels with that bind.
+        let template = IcebergReadBinding::with_static_metadata_credential_resolver(
+            resources(&runtime),
+            Arc::new(ControlResolver {
+                material: Some(IcebergRestAuthMaterial::Bearer {
+                    token: novarocks_fs::SecretValue::new("control-token"),
+                }),
+            }),
+        );
+        let bound = template
+            .bind_catalog(&rest_catalog_properties(true))
+            .expect("bound coordinator binding");
+
+        match bound
+            .resolve_catalog_control_identity()
+            .expect("declared identity resolves")
+        {
+            Some(IcebergRestAuthMaterial::Bearer { token }) => {
+                assert_eq!(token.expose_secret(), "control-token");
+            }
+            other => panic!("unexpected control identity: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_definition_without_a_control_binding_has_no_coordinator_identity() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = IcebergReadBinding::from_catalog_properties(
+            resources(&runtime),
+            Arc::new(ControlResolver {
+                material: Some(IcebergRestAuthMaterial::Bearer {
+                    token: novarocks_fs::SecretValue::new("unused"),
+                }),
+            }),
+            &rest_catalog_properties(false),
+        )
+        .expect("binding");
+
+        assert!(
+            binding
+                .resolve_catalog_control_identity()
+                .expect("an absent binding is an answer")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_declared_control_identity_the_role_cannot_resolve_is_an_error() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        for resolver in [
+            Arc::new(ControlResolver { material: None })
+                as Arc<dyn IcebergStaticCredentialResolver>,
+            Arc::new(DefaultResolver),
+        ] {
+            let binding = IcebergReadBinding::from_catalog_properties(
+                resources(&runtime),
+                resolver,
+                &rest_catalog_properties(true),
+            )
+            .expect("binding");
+            let error = binding
+                .resolve_catalog_control_identity()
+                .expect_err("a declared identity is never silently dropped");
+            assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
+        }
+    }
+
+    #[test]
+    fn the_execution_projection_never_carries_the_control_identity() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let projected = rest_catalog_properties(true)
+            .backend_execution_projection()
+            .expect("backend projection");
+        let binding = IcebergReadBinding::from_catalog_properties(
+            resources(&runtime),
+            Arc::new(ControlResolver {
+                material: Some(IcebergRestAuthMaterial::Bearer {
+                    token: novarocks_fs::SecretValue::new("must-not-reach-backend"),
+                }),
+            }),
+            &projected,
+        )
+        .expect("backend binding");
+
+        assert!(
+            binding
+                .resolve_catalog_control_identity()
+                .expect("projection has no control binding")
+                .is_none()
+        );
     }
 }

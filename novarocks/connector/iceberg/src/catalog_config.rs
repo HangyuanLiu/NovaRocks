@@ -21,7 +21,7 @@
 //! caches, and control generations are added by the control runtime; SQL and
 //! application table projections never enter this module.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{Debug, Formatter};
 use std::path::{Path, PathBuf};
 
@@ -29,6 +29,25 @@ use novarocks_fs::{
     ObjectStoreConfig, ObjectStoreEndpointConfig, is_object_store_location_parse_only,
     normalize_aws_s3_catalog_properties, object_store_config_from_aws_s3_catalog_properties,
 };
+
+use crate::rest_protocol::binding::{is_authentication_header, is_protocol_header};
+
+/// Catalog property declaring which request headers a REST server may supply
+/// through `/v1/config` and still route an execution node's requests (L15).
+///
+/// A comma-separated list of case-insensitive header names. A server-supplied
+/// header that is not declared here never becomes a public routing header.
+pub const REST_SERVER_ROUTING_HEADERS_PROPERTY: &str = "iceberg.rest.server-routing-headers";
+
+/// Prefix of the persistent request headers a REST catalog definition carries.
+const REST_HEADER_PROPERTY_PREFIX: &str = "header.";
+
+/// The upstream property that selects an authentication scheme. NovaRocks
+/// injects its own auth owner, so upstream never reads it (L5).
+const REST_AUTH_TYPE_PROPERTY: &str = "rest.auth.type";
+
+const REST_AUTHENTICATION_SOURCE: &str = "REST catalog authentication is only possible through \
+the catalog's CatalogControl or DataCredentialVending credential binding";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IcebergCatalogKind {
@@ -56,6 +75,169 @@ impl IcebergCatalogConfiguration {
         self.object_store_config = None;
         self
     }
+}
+
+impl IcebergCatalogConfiguration {
+    /// The validated persistent REST definition: its public `header.*`
+    /// entries and the declared server-supplied routing headers.
+    ///
+    /// Parsing already rejects an invalid definition; generation construction
+    /// calls this again so a configuration assembled any other way cannot
+    /// reach the REST client unchecked (L5, L15, L26).
+    pub fn rest_persistent_definition(&self) -> Result<RestPersistentDefinition, String> {
+        if self.kind != IcebergCatalogKind::Rest {
+            return Err(format!(
+                "REST persistent definition requested for {:?} configuration",
+                self.kind
+            ));
+        }
+        rest_persistent_definition(
+            self.properties
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )
+    }
+}
+
+/// The public, non-secret request facts a REST catalog definition states.
+///
+/// Header values are public by construction (the definition crosses to every
+/// execution node), but they are still request data rather than diagnostics,
+/// so `Debug` prints names only.
+#[derive(Clone, Eq, PartialEq)]
+pub struct RestPersistentDefinition {
+    /// `header.<name>` entries, lowercase names in ascending order.
+    headers: Vec<(String, String)>,
+    /// Lowercase names from `iceberg.rest.server-routing-headers`.
+    server_routing_headers: BTreeSet<String>,
+}
+
+impl RestPersistentDefinition {
+    pub fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
+    pub fn server_routing_headers(&self) -> &BTreeSet<String> {
+        &self.server_routing_headers
+    }
+}
+
+impl Debug for RestPersistentDefinition {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RestPersistentDefinition")
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>(),
+            )
+            .field("server_routing_headers", &self.server_routing_headers)
+            .finish()
+    }
+}
+
+/// Validate the persistent REST definition and extract its header facts.
+///
+/// Authorization belongs to the role-local auth owner alone (L5): a
+/// `header.*` entry with an authentication-class name, or an explicit
+/// `rest.auth.type`, would configure authentication outside the role's
+/// identity, so either fails. Protocol headers are set per request by the
+/// client (L26) and cannot be configured either.
+fn rest_persistent_definition<'a>(
+    properties: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<RestPersistentDefinition, String> {
+    let mut headers = BTreeMap::new();
+    let mut server_routing_headers = BTreeSet::new();
+    for (key, value) in properties {
+        if key.eq_ignore_ascii_case(REST_AUTH_TYPE_PROPERTY) {
+            return Err(format!(
+                "REST Iceberg catalog property `{key}` is not supported: {REST_AUTHENTICATION_SOURCE}"
+            ));
+        }
+        if key.eq_ignore_ascii_case(REST_SERVER_ROUTING_HEADERS_PROPERTY) {
+            server_routing_headers = parse_server_routing_headers(value)?;
+            continue;
+        }
+        let Some(name) = strip_prefix_ignore_ascii_case(key, REST_HEADER_PROPERTY_PREFIX) else {
+            continue;
+        };
+        let name = name.to_ascii_lowercase();
+        validate_header_name(&name, || format!("REST Iceberg catalog property `{key}`"))?;
+        if is_authentication_header(&name) {
+            return Err(format!(
+                "REST Iceberg catalog property `{key}` sets the authentication header `{name}`: \
+                 {REST_AUTHENTICATION_SOURCE}"
+            ));
+        }
+        if is_protocol_header(&name) {
+            return Err(format!(
+                "REST Iceberg catalog property `{key}` sets `{name}`, a protocol header the REST \
+                 client sets on every request; a catalog definition may carry only routing \
+                 headers, and {REST_AUTHENTICATION_SOURCE}"
+            ));
+        }
+        reqwest::header::HeaderValue::from_str(value).map_err(|_| {
+            format!("REST Iceberg catalog property `{key}` has an invalid header value")
+        })?;
+        if headers.insert(name.clone(), value.to_string()).is_some() {
+            return Err(format!(
+                "REST Iceberg catalog definition sets header `{name}` more than once"
+            ));
+        }
+    }
+    Ok(RestPersistentDefinition {
+        headers: headers.into_iter().collect(),
+        server_routing_headers,
+    })
+}
+
+/// Parse the declared server-supplied routing header names: comma-separated,
+/// trimmed, case-insensitive; duplicates collapse, empty entries fail.
+fn parse_server_routing_headers(value: &str) -> Result<BTreeSet<String>, String> {
+    let subject =
+        || format!("REST Iceberg catalog property `{REST_SERVER_ROUTING_HEADERS_PROPERTY}`");
+    let mut names = BTreeSet::new();
+    for entry in value.split(',') {
+        let name = entry.trim().to_ascii_lowercase();
+        if name.is_empty() {
+            return Err(format!("{} contains an empty header name", subject()));
+        }
+        validate_header_name(&name, subject)?;
+        if is_authentication_header(&name) {
+            return Err(format!(
+                "{} declares the authentication header `{name}`; a server-supplied \
+                 authentication header is never accepted, and {REST_AUTHENTICATION_SOURCE}",
+                subject()
+            ));
+        }
+        if is_protocol_header(&name) {
+            return Err(format!(
+                "{} declares `{name}`, a protocol header the REST client sets on every \
+                 request; it never routes a request",
+                subject()
+            ));
+        }
+        names.insert(name);
+    }
+    Ok(names)
+}
+
+fn validate_header_name(name: &str, subject: impl Fn() -> String) -> Result<(), String> {
+    if name.is_empty() {
+        return Err(format!("{} names no header", subject()));
+    }
+    reqwest::header::HeaderName::from_bytes(name.as_bytes())
+        .map(|_| ())
+        .map_err(|_| format!("{} names an invalid header `{name}`", subject()))
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let head = value.get(..prefix.len())?;
+    head.eq_ignore_ascii_case(prefix)
+        .then(|| &value[prefix.len()..])
 }
 
 impl Debug for IcebergCatalogConfiguration {
@@ -192,6 +374,14 @@ fn parse_rest_configuration(
     mut properties: HashMap<String, String>,
     injected_object_store_config: Option<&ObjectStoreConfig>,
 ) -> Result<IcebergCatalogConfiguration, String> {
+    // Every REST configuration passes here, so a definition that would let a
+    // property override the role's authentication never yields a
+    // configuration a generation could be built from.
+    rest_persistent_definition(
+        properties
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    )?;
     let uri = properties
         .get("uri")
         .or_else(|| properties.get("iceberg.catalog.uri"))
@@ -602,6 +792,192 @@ mod tests {
         )
         .expect_err("a stated credential cannot be overridden");
         assert!(error.contains("do not match the server-composed binding"));
+    }
+
+    fn rest_properties(extra: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut properties = vec![
+            ("type".to_string(), "iceberg".to_string()),
+            ("iceberg.catalog.type".to_string(), "rest".to_string()),
+            ("uri".to_string(), "http://127.0.0.1:8181".to_string()),
+        ];
+        properties.extend(
+            extra
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+        );
+        properties
+    }
+
+    #[test]
+    fn rest_definition_refuses_authentication_outside_the_role_identity() {
+        for (key, value) in [
+            ("header.authorization", "Bearer canary-value"),
+            ("header.Authorization", "Bearer canary-value"),
+            ("header.proxy-authorization", "Basic canary-value"),
+            ("header.cookie", "session=canary-value"),
+            ("header.set-cookie", "session=canary-value"),
+            ("header.x-api-token", "canary-value"),
+            ("header.x-client-secret", "canary-value"),
+            ("rest.auth.type", "oauth2"),
+            ("REST.AUTH.TYPE", "none"),
+        ] {
+            let error = parse_catalog_configuration("ice", &rest_properties(&[(key, value)]))
+                .expect_err(key);
+            assert!(
+                error.contains("CatalogControl or DataCredentialVending"),
+                "{key}: {error}"
+            );
+            assert!(error.contains(&key.to_ascii_lowercase()), "{key}: {error}");
+            assert!(!error.contains("canary-value"), "{key}: {error}");
+        }
+    }
+
+    #[test]
+    fn rest_definition_refuses_protocol_headers() {
+        for name in [
+            "content-type",
+            "accept",
+            "user-agent",
+            "x-client-version",
+            "x-iceberg-access-delegation",
+        ] {
+            let key = format!("header.{name}");
+            let error =
+                parse_catalog_configuration("ice", &rest_properties(&[(key.as_str(), "value")]))
+                    .expect_err(&key);
+            assert!(error.contains("protocol header"), "{key}: {error}");
+            assert!(
+                error.contains("CatalogControl or DataCredentialVending"),
+                "{key}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rest_definition_keeps_public_routing_headers() {
+        let configuration = parse_catalog_configuration(
+            "ice",
+            &rest_properties(&[
+                ("header.x-tenant", "blue"),
+                ("header.polaris-realm", "prod"),
+                ("oauth2-server-uri", "http://127.0.0.1:8181/v1/oauth/tokens"),
+            ]),
+        )
+        .expect("public routing headers are legal");
+        let definition = configuration
+            .rest_persistent_definition()
+            .expect("validated definition");
+        assert_eq!(
+            definition.headers(),
+            &[
+                ("polaris-realm".to_string(), "prod".to_string()),
+                ("x-tenant".to_string(), "blue".to_string()),
+            ]
+        );
+        assert!(definition.server_routing_headers().is_empty());
+        let debug = format!("{definition:?}");
+        assert!(debug.contains("x-tenant"));
+        assert!(!debug.contains("blue"));
+    }
+
+    #[test]
+    fn rest_definition_rejects_malformed_header_entries() {
+        for (key, value) in [
+            ("header.", "value"),
+            ("header.x tenant", "value"),
+            ("header.x-tenant", "line\nbreak"),
+        ] {
+            assert!(
+                parse_catalog_configuration("ice", &rest_properties(&[(key, value)])).is_err(),
+                "{key}"
+            );
+        }
+        // Parsing normalizes key case before this check; a configuration
+        // assembled any other way still cannot state one header twice.
+        let error =
+            rest_persistent_definition([("header.x-tenant", "a"), ("HEADER.X-Tenant", "b")])
+                .expect_err("one header cannot be set twice");
+        assert!(error.contains("more than once"), "{error}");
+    }
+
+    #[test]
+    fn server_routing_headers_parse_case_insensitively_and_deduplicate() {
+        let configuration = parse_catalog_configuration(
+            "ice",
+            &rest_properties(&[(
+                REST_SERVER_ROUTING_HEADERS_PROPERTY,
+                " X-Region ,x-project-id,x-region",
+            )]),
+        )
+        .expect("declared routing headers");
+        let definition = configuration
+            .rest_persistent_definition()
+            .expect("validated definition");
+        assert_eq!(
+            definition
+                .server_routing_headers()
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["x-project-id", "x-region"]
+        );
+    }
+
+    #[test]
+    fn server_routing_headers_reject_illegal_names() {
+        for value in [
+            "",
+            "x-region,",
+            "x-region,,x-zone",
+            " , ",
+            "x region",
+            "authorization",
+            "x-region,Cookie",
+            "x-session-token",
+            "content-type",
+            "X-Iceberg-Access-Delegation",
+        ] {
+            let error = parse_catalog_configuration(
+                "ice",
+                &rest_properties(&[(REST_SERVER_ROUTING_HEADERS_PROPERTY, value)]),
+            )
+            .expect_err(value);
+            assert!(
+                error.contains(REST_SERVER_ROUTING_HEADERS_PROPERTY),
+                "{value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rest_definition_properties_are_admissible_catalog_properties() {
+        // The provider rule is the only gate for these names: the SPI admits
+        // every one of them as a non-secret durable property, including the
+        // authentication headers the provider must then refuse.
+        for key in [
+            REST_SERVER_ROUTING_HEADERS_PROPERTY,
+            "header.x-tenant",
+            "header.authorization",
+            "rest.auth.type",
+        ] {
+            novarocks_spi::connector::CatalogProperty::new(key, "x-region").expect(key);
+        }
+    }
+
+    #[test]
+    fn rest_definition_is_validated_only_for_rest_catalogs() {
+        let configuration = parse_catalog_configuration(
+            "ice",
+            &[
+                ("iceberg.catalog.type".to_string(), "hive".to_string()),
+                (
+                    "hive.metastore.uris".to_string(),
+                    "thrift://hms:9083".to_string(),
+                ),
+            ],
+        )
+        .expect("hive catalog");
+        assert!(configuration.rest_persistent_definition().is_err());
     }
 
     #[test]

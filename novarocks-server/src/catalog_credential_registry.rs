@@ -400,6 +400,50 @@ impl novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolve
         }
     }
 
+    fn resolve_catalog_control(
+        &self,
+        reference: &StaticCredentialReference,
+    ) -> Result<
+        novarocks_connector_iceberg::access_binding::IcebergRestAuthMaterial,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        use novarocks_connector_iceberg::access_binding::IcebergRestAuthMaterial;
+        // An execution node never holds a control identity: the registry
+        // refuses the purpose on that role, and the backend projection of a
+        // catalog definition never names one. Say so explicitly rather than
+        // reporting a missing entry.
+        if self.role != ClusterRole::Fe {
+            return Err(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "catalog-control identity is resolvable only on the frontend role",
+            ));
+        }
+        // On the coordinator a declared binding without its entry is a
+        // deployment error, not an absent identity: continuing would send the
+        // catalog session without the authentication the definition asks for.
+        match self.resolve(CatalogCredentialPurpose::CatalogControl, reference) {
+            Some(CatalogCredentialMaterial::IcebergRestOauth2(material)) => {
+                Ok(IcebergRestAuthMaterial::Oauth2 {
+                    client_id: material.client_id().to_string(),
+                    client_secret: material.client_secret().clone(),
+                })
+            }
+            Some(CatalogCredentialMaterial::IcebergRestBearer(material)) => {
+                Ok(IcebergRestAuthMaterial::Bearer {
+                    token: material.token().clone(),
+                })
+            }
+            _ => Err(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::InvalidRequest,
+                format!(
+                    "role-local registry has no catalog-control identity `{}` generation `{}`",
+                    reference.name(),
+                    reference.generation()
+                ),
+            )),
+        }
+    }
+
     fn resolve_object_store_metadata_static(
         &self,
         reference: &StaticCredentialReference,
@@ -516,6 +560,107 @@ mod tests {
                 .resolve_data_credential_vending(&reference("executor", "v2"))
                 .is_err()
         );
+    }
+
+    fn rest_oauth2(client_id: &str, secret: &str) -> CatalogCredentialMaterial {
+        CatalogCredentialMaterial::IcebergRestOauth2(
+            IcebergRestOauth2CredentialMaterial::new(
+                client_id.to_string(),
+                SecretValue::new(secret),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn control_entry(
+        name: &str,
+        material: CatalogCredentialMaterial,
+    ) -> CatalogCredentialRegistryEntry {
+        CatalogCredentialRegistryEntry::try_new(
+            CatalogCredentialPurpose::CatalogControl,
+            reference(name, "v1"),
+            material,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_coordinator_resolves_its_catalog_control_identity_exactly() {
+        use novarocks_connector_iceberg::access_binding::{
+            IcebergRestAuthMaterial, IcebergStaticCredentialResolver,
+        };
+
+        let coordinator = CatalogCredentialRegistry::try_new(
+            ClusterRole::Fe,
+            vec![
+                control_entry("oauth", rest_oauth2("coordinator-client", "client-secret")),
+                control_entry("bearer", rest_bearer("control-token")),
+            ],
+        )
+        .unwrap();
+
+        match coordinator
+            .resolve_catalog_control(&reference("oauth", "v1"))
+            .expect("exact OAuth2 identity")
+        {
+            IcebergRestAuthMaterial::Oauth2 {
+                client_id,
+                client_secret,
+            } => {
+                assert_eq!(client_id, "coordinator-client");
+                assert_eq!(client_secret.expose_secret(), "client-secret");
+            }
+            other => panic!("unexpected material: {other:?}"),
+        }
+        match coordinator
+            .resolve_catalog_control(&reference("bearer", "v1"))
+            .expect("exact bearer identity")
+        {
+            IcebergRestAuthMaterial::Bearer { token } => {
+                assert_eq!(token.expose_secret(), "control-token");
+            }
+            other => panic!("unexpected material: {other:?}"),
+        }
+
+        // A declared identity the coordinator does not hold is a deployment
+        // error, and a different generation is a different identity.
+        let missing = coordinator
+            .resolve_catalog_control(&reference("bearer", "v2"))
+            .expect_err("no fallback by name");
+        assert_eq!(
+            missing.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn an_execution_node_refuses_the_catalog_control_identity() {
+        use novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver;
+
+        // The execution node's own vending identity under the same reference
+        // must not answer a control lookup either.
+        let execution_node = CatalogCredentialRegistry::try_new(
+            ClusterRole::Be,
+            vec![
+                CatalogCredentialRegistryEntry::try_new(
+                    CatalogCredentialPurpose::DataCredentialVending,
+                    reference("executor", "v1"),
+                    rest_bearer("executor-token"),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        for name in ["executor", "coordinator"] {
+            let refused = execution_node
+                .resolve_catalog_control(&reference(name, "v1"))
+                .expect_err("an execution node has no control identity");
+            assert_eq!(
+                refused.kind(),
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported
+            );
+            assert!(!refused.to_string().contains("executor-token"));
+        }
     }
 
     #[test]

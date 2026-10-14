@@ -144,7 +144,10 @@ impl IcebergConnectorFactory {
         // Bind the FE metadata principal independently from the execution-data
         // declaration inspected above. A vended data binding chooses the
         // attempt acquisition strategy; all FE FileIO uses this static
-        // generation-owned metadata binding.
+        // generation-owned metadata binding. The same bind carries the
+        // definition's CatalogControl reference, so the generation resolves
+        // its coordinator control identity from this binding and from no
+        // other source (L16).
         let planning_binding = self
             .control_resources
             .planning_binding()
@@ -1008,6 +1011,130 @@ mod tests {
             creation.binding().staged_create().is_some(),
             "standard REST staged create must not depend on a private capability"
         );
+    }
+
+    /// A coordinator resolver holding exactly one catalog-control identity.
+    struct ControlIdentityResolver;
+
+    impl crate::access_binding::IcebergStaticCredentialResolver for ControlIdentityResolver {
+        fn resolve_object_store_static(
+            &self,
+            _reference: &StaticCredentialReference,
+        ) -> Result<novarocks_fs::ObjectStoreSecretMaterial, ConnectorError> {
+            Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "this test resolver vends no object-store material",
+            ))
+        }
+
+        fn resolve_catalog_control(
+            &self,
+            reference: &StaticCredentialReference,
+        ) -> Result<crate::access_binding::IcebergRestAuthMaterial, ConnectorError> {
+            assert_eq!(reference.name(), "coordinator");
+            Ok(crate::access_binding::IcebergRestAuthMaterial::Oauth2 {
+                client_id: "coordinator-client".to_string(),
+                client_secret: novarocks_fs::SecretValue::new("coordinator-secret"),
+            })
+        }
+    }
+
+    #[test]
+    fn rest_generation_binding_carries_the_declared_control_identity() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let resources = novarocks_fs::FsAccessResources::new(
+            Arc::new(
+                novarocks_fs::ObjectStoreProviderPool::new(
+                    novarocks_fs::ObjectStoreProviderPoolOptions::default(),
+                )
+                .expect("provider pool"),
+            ),
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let template =
+            crate::access_binding::IcebergReadBinding::with_static_metadata_credential_resolver(
+                resources,
+                Arc::new(ControlIdentityResolver),
+            );
+        let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
+            template,
+            runtime.handle().clone(),
+        ));
+        let properties = vec![
+            ("iceberg.catalog.type".to_string(), "rest".to_string()),
+            ("uri".to_string(), "http://127.0.0.1:1".to_string()),
+            ("header.x-tenant".to_string(), "blue".to_string()),
+        ];
+        let instance_id = ConnectorInstanceId::parse("ice").expect("instance ID");
+        let control = CatalogCredentialBinding::try_new(
+            CatalogCredentialPurpose::CatalogControl,
+            CredentialConsumerRole::Frontend,
+            CatalogCredentialMode::Static(
+                StaticCredentialReference::try_new("coordinator", "v1").expect("reference"),
+            ),
+        )
+        .expect("control binding");
+        let request = factory_request_with_catalog_properties(
+            &factory,
+            instance_id.clone(),
+            properties.clone(),
+            catalog_properties(instance_id, &properties, vec![control]),
+        );
+
+        let unpublished = factory
+            .prepare_unpublished(&request)
+            .expect("REST generation");
+        match unpublished
+            .runtime()
+            .resources()
+            .planning_binding()
+            .resolve_catalog_control_identity()
+            .expect("declared identity resolves")
+        {
+            Some(crate::access_binding::IcebergRestAuthMaterial::Oauth2 { client_id, .. }) => {
+                assert_eq!(client_id, "coordinator-client");
+            }
+            other => panic!("unexpected control identity: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rest_factory_refuses_authentication_properties_before_runtime_construction() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let factory = IcebergConnectorFactory::new(IcebergMetadataResources::new(
+            binding,
+            runtime.handle().clone(),
+        ));
+        for (key, value) in [
+            ("header.authorization", "Bearer canary-value"),
+            ("header.cookie", "session=canary-value"),
+            ("header.content-type", "text/plain"),
+            ("rest.auth.type", "oauth2"),
+        ] {
+            let request = rest_factory_request(
+                &factory,
+                "http://127.0.0.1:1".to_string(),
+                vec![(key.to_string(), value.to_string())],
+            );
+            let error = factory
+                .prepare_unpublished(&request)
+                .expect_err("authentication properties must not build a generation");
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest, "{key}");
+            let message = error.to_string();
+            assert!(
+                message.contains("CatalogControl or DataCredentialVending"),
+                "{key}: {message}"
+            );
+            assert!(!message.contains("canary-value"), "{key}: {message}");
+        }
     }
 
     #[test]
