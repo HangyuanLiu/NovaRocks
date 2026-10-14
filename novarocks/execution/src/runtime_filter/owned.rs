@@ -123,6 +123,20 @@ impl Eq for CanonicalContributionBytes {}
 /// A NULL key has no payload, and is distinct from an owned empty UTF8 key.
 #[derive(Clone)]
 pub(crate) struct OwnedUtf8OrderKey(Option<SourceBackingOwner<ByteBacking>>);
+impl fmt::Debug for OwnedUtf8OrderKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.borrowed().fmt(f)
+    }
+}
+impl PartialEq for OwnedUtf8OrderKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (self.borrowed(), other.borrowed()) {
+            (OrderedTupleRef::Single(a), OrderedTupleRef::Single(b)) => a == b,
+            _ => unreachable!("owned UTF8 keys always have exactly one borrowed scalar"),
+        }
+    }
+}
+impl Eq for OwnedUtf8OrderKey {}
 impl OwnedUtf8OrderKey {
     pub(crate) fn borrowed(&self) -> OrderedTupleRef<'_> {
         OrderedTupleRef::Single(self.0.as_ref().map(|owner| {
@@ -148,6 +162,10 @@ impl OrderedTopNAllocationHost {
             allocator: AggregateAllocator::new_nominal(Arc::clone(&tracker)),
             host: expression_allocation_host(tracker),
         }
+    }
+
+    pub(crate) fn vector_allocator(&self) -> AggregateAllocator {
+        self.allocator.clone()
     }
 
     fn reserve_prefix(&self) -> Result<OpaqueReservation, KernelFailure> {
