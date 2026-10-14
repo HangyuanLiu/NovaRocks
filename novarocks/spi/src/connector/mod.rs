@@ -44,6 +44,7 @@ mod payload_retention;
 mod predicate;
 pub mod provider;
 mod provider_binding;
+mod process_local;
 mod publication;
 mod read;
 mod read_session;
@@ -365,3 +366,5 @@ pub use write::{
     MAX_CONNECTOR_WRITE_RECEIPT_BYTES, WriteCommitEvidenceLedger, WriteCommitEvidenceLimits,
     WriteCommitEvidenceUsage,
 };
+
+pub use process_local::ConnectorProcessLocalPayload;
