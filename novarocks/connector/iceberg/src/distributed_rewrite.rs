@@ -17,14 +17,15 @@
 
 //! Exact-generation Iceberg distributed-rewrite control.
 //!
-//! Frozen file ownership, durable attempt artifacts, and write activation all
+//! Frozen file ownership, attempt-local frozen inputs, and write activation all
 //! live in the provider generation that owns the catalog client.  No Core
 //! registry, process-global runtime, or current-generation lookup participates
 //! in this capability.
 
+// Design: ADR-0176 (docs/adr/ADR-0176-attempt-local-maintenance-inputs-and-single-rewrite-plan.md)
 use crate::commit::model::EntryIdentity;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use bytes::Bytes;
@@ -57,12 +58,9 @@ use crate::scan_model::{
 };
 
 pub(crate) const ARTIFACT_VERSION: u16 = 3;
-pub(crate) const GROUP_PAYLOAD_VERSION: u16 = 2;
 pub(crate) const REWRITE_ARTIFACT_MAX_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const REWRITE_ARTIFACT_MAX_GROUPS: usize = 4096;
-pub(crate) const REWRITE_ARTIFACT_MAX_PARTS: usize = 64;
-pub(crate) const REWRITE_ARTIFACT_MAX_PART_BYTES: usize = 1024 * 1024;
-pub(crate) const REWRITE_ARTIFACT_MAX_ROOT_BYTES: usize = 64 * 1024;
+pub(crate) const REWRITE_GROUP_MAX_BYTES: usize = 1024 * 1024;
 
 const GROUP_DOMAIN: &[u8] = b"novarocks.iceberg.distributed-rewrite.group.v2\0";
 const STATE_DOMAIN: &[u8] = b"novarocks.iceberg.distributed-rewrite.state.v1\0";
@@ -72,7 +70,7 @@ const STATE_DOMAIN: &[u8] = b"novarocks.iceberg.distributed-rewrite.state.v1\0";
 struct IcebergRewritePlanPayloadV1 {
     version: u16,
     artifact_digest_hex: String,
-    artifact_location: String,
+    operation_id: String,
     target_ref: String,
 }
 
@@ -82,12 +80,6 @@ pub struct IcebergDistributedRewriteControl {
     descriptor: ConnectorInstanceDescriptor,
     runtime: Arc<IcebergMetadataContext>,
     provider: Arc<IcebergMetadata>,
-    plans: Mutex<
-        HashMap<
-            novarocks_spi::connector::ConnectorWriteOperationId,
-            ConnectorDistributedRewritePlan,
-        >,
-    >,
 }
 
 impl IcebergDistributedRewriteControl {
@@ -114,7 +106,6 @@ impl IcebergDistributedRewriteControl {
             descriptor,
             runtime,
             provider,
-            plans: Mutex::new(HashMap::new()),
         })
     }
 
@@ -176,7 +167,7 @@ impl IcebergDistributedRewriteControl {
                 groups
             }
         };
-        let artifact = IcebergFrozenRewriteArtifactV1 {
+        let mut artifact = IcebergFrozenRewriteArtifactV1 {
             version: ARTIFACT_VERSION,
             operation_kind: request.operation().kind().to_string(),
             namespace: target.namespace.clone(),
@@ -190,19 +181,24 @@ impl IcebergDistributedRewriteControl {
         };
         let artifact_bytes = artifact.canonical_bytes()?;
         let manifest_digest = artifact_digest(&artifact_bytes);
-        let artifact_location = format!(
-            "{}/_novarocks/maintenance/v2/distributed-rewrite/{}/{}",
-            metadata.location().trim_end_matches('/'),
-            hex::encode(request.operation_id().to_bytes()),
-            hex::encode(manifest_digest),
-        );
-        write_frozen_artifact(
-            &self.runtime,
-            table.file_io().clone(),
-            &artifact,
+        // The content digest uses the canonical group-digest order; execution uses cohort order.
+        artifact.groups.sort_by_key(|group| {
+            ConnectorWriteCohortId::derive(
+                request.operation_id(),
+                b"iceberg-distributed-rewrite-group",
+                decode_digest(&group.group_digest_hex).expect("validated group digest"),
+            )
+            .expect("valid cohort domain")
+        });
+        let artifact = Arc::new(FrozenRewritePlanContent {
+            operation_id: request.operation_id(),
             manifest_digest,
-            &artifact_location,
-        )?;
+            artifact,
+        });
+        let frozen = novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+            self.key.clone(),
+            artifact.clone(),
+        );
         let physical_schema = Arc::new(
             crate::iceberg::arrow::schema_to_arrow_schema(metadata.current_schema())
                 .map_err(|error| internal(format!("convert Iceberg rewrite schema: {error}")))?,
@@ -213,7 +209,7 @@ impl IcebergDistributedRewriteControl {
             &self.key,
             request,
             manifest_digest,
-            &artifact_location,
+            &frozen,
             &artifact,
             scan_schema,
             row_lineage,
@@ -257,7 +253,7 @@ impl IcebergDistributedRewriteControl {
         let payload = canonical_json(&IcebergRewritePlanPayloadV1 {
             version: 1,
             artifact_digest_hex: hex::encode(manifest_digest),
-            artifact_location: artifact_location.clone(),
+            operation_id: hex::encode(request.operation_id().to_bytes()),
             target_ref: "main".to_string(),
         })?;
         ConnectorDistributedRewritePlan::try_new(
@@ -267,6 +263,7 @@ impl IcebergDistributedRewriteControl {
             summary,
             payload,
             cohorts,
+            frozen,
         )
     }
 }
@@ -312,38 +309,7 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteControl {
                 request.context.initiation(),
             ))
             .map_err(connector_unsupported)?;
-        if let Some(existing) = self
-            .plans
-            .lock()
-            .map_err(|_| internal("Iceberg distributed rewrite plan cache lock poisoned"))?
-            .get(&request.operation_id())
-            .cloned()
-        {
-            return if existing.request_digest() == request.request_digest() {
-                Ok(existing)
-            } else {
-                Err(invalid(
-                    "Iceberg distributed rewrite operation conflicts with cached plan",
-                ))
-            };
-        }
-        let planned = self.build_plan(&request)?;
-        let mut plans = self
-            .plans
-            .lock()
-            .map_err(|_| internal("Iceberg distributed rewrite plan cache lock poisoned"))?;
-        match plans.get(&request.operation_id()) {
-            Some(existing) if existing.request_digest() == request.request_digest() => {
-                Ok(existing.clone())
-            }
-            Some(_) => Err(invalid(
-                "Iceberg distributed rewrite operation conflicts with cached plan",
-            )),
-            None => {
-                plans.insert(request.operation_id(), planned.clone());
-                Ok(planned)
-            }
-        }
+        self.build_plan(&request)
     }
 
     /// The write session seals a rewrite's branches from the same frozen
@@ -437,62 +403,57 @@ pub(crate) struct IcebergFrozenRewriteGroupV1 {
     pub owned_data_delete_files: Vec<EntryIdentity>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct IcebergRewriteGroupPayloadV1 {
-    pub version: u16,
-    pub group_digest_hex: String,
-    pub artifact_digest_hex: String,
-    pub artifact_location: String,
+/// Immutable attempt-owned input and the identity computed before cohort ordering.
+/// Content bytes stay in FE; wire contains only this identity.
+#[derive(Clone)]
+pub(crate) struct FrozenRewritePlanContent {
+    pub(crate) operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+    pub(crate) manifest_digest: [u8; 32],
+    pub(crate) artifact: IcebergFrozenRewriteArtifactV1,
+}
+impl std::ops::Deref for FrozenRewritePlanContent {
+    type Target = IcebergFrozenRewriteArtifactV1;
+    fn deref(&self) -> &Self::Target {
+        &self.artifact
+    }
+}
+impl FrozenRewritePlanContent {
+    pub(crate) fn validate_identity(
+        &self,
+        operation_id: novarocks_spi::connector::ConnectorWriteOperationId,
+        digest_hex: &str,
+    ) -> Result<(), ConnectorError> {
+        if self.operation_id != operation_id || hex::encode(self.manifest_digest) != digest_hex {
+            return Err(internal(
+                "Iceberg frozen rewrite content identity differs from its handle",
+            ));
+        }
+        Ok(())
+    }
 }
 
-/// One exact group together with the immutable artifact that authenticated it.
-///
-/// The group alone is insufficient at a typed TableExecute boundary: the root
-/// owns the table identity and base-generation fences that prove which table
-/// state the group was cut from. Keep those facts together until every caller
-/// has validated them against its pinned relation.
-#[derive(Clone, Debug)]
-pub(crate) struct IcebergLoadedFrozenRewriteGroupV1 {
-    pub artifact: IcebergFrozenRewriteArtifactV1,
-    pub group: IcebergFrozenRewriteGroupV1,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ArtifactRootV1 {
+// Encoded only to preserve the existing per-group size boundary.
+#[derive(Serialize)]
+struct GroupSizeInput<'a> {
     version: u16,
-    logical_artifact_digest_hex: String,
-    operation_kind: String,
-    namespace: String,
-    table: String,
-    table_uuid: String,
-    target_ref: String,
-    base_snapshot_id: Option<i64>,
-    schema_id: i32,
-    default_spec_id: i32,
-    parts: Vec<ArtifactPartRefV1>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ArtifactPartRefV1 {
-    index: u16,
-    digest_hex: String,
-    location: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ArtifactPartV1 {
-    version: u16,
-    groups: Vec<IcebergFrozenRewriteGroupV1>,
+    groups: [&'a IcebergFrozenRewriteGroupV1; 1],
 }
 
 impl IcebergFrozenRewriteArtifactV1 {
     fn canonical_bytes(&self) -> Result<Bytes, ConnectorError> {
         if self.version != ARTIFACT_VERSION || self.groups.len() > REWRITE_ARTIFACT_MAX_GROUPS {
             return Err(invalid("Iceberg rewrite artifact is invalid"));
+        }
+        for group in &self.groups {
+            if canonical_json(&GroupSizeInput {
+                version: ARTIFACT_VERSION,
+                groups: [group],
+            })?
+            .len()
+                > REWRITE_GROUP_MAX_BYTES
+            {
+                return Err(exhausted("Iceberg rewrite group exceeds 1 MiB"));
+            }
         }
         let bytes = canonical_json(self)?;
         if bytes.len() > REWRITE_ARTIFACT_MAX_BYTES {
@@ -502,163 +463,16 @@ impl IcebergFrozenRewriteArtifactV1 {
     }
 }
 
-pub(crate) fn load_frozen_rewrite_group(
-    runtime: &IcebergMetadataContext,
-    file_io: &crate::iceberg::io::FileIO,
-    payload: &IcebergRewriteGroupPayloadV1,
-) -> Result<IcebergLoadedFrozenRewriteGroupV1, ConnectorError> {
-    let root_location = format!("{}/manifest.json", payload.artifact_location);
-    let root_bytes = read_artifact_file(
-        runtime,
-        file_io,
-        &root_location,
-        REWRITE_ARTIFACT_MAX_ROOT_BYTES,
-    )?;
-    let root: ArtifactRootV1 = decode_canonical_json(&root_bytes, "Iceberg rewrite artifact root")?;
-    if root.version != ARTIFACT_VERSION
-        || root.parts.is_empty()
-        || root.parts.len() > REWRITE_ARTIFACT_MAX_PARTS
-        || root.logical_artifact_digest_hex != payload.artifact_digest_hex
-    {
-        return Err(invalid("Iceberg rewrite artifact root is invalid"));
+impl IcebergFrozenRewriteArtifactV1 {
+    pub(crate) fn group(
+        &self,
+        digest: &str,
+    ) -> Result<&IcebergFrozenRewriteGroupV1, ConnectorError> {
+        self.groups
+            .iter()
+            .find(|group| group.group_digest_hex == digest)
+            .ok_or_else(|| internal("Iceberg frozen rewrite plan has no requested group"))
     }
-    let expected = decode_digest(&payload.artifact_digest_hex)?;
-    let mut groups = Vec::new();
-    for (index, reference) in root.parts.iter().enumerate() {
-        let location = format!("{}/part-{index:04}.json", payload.artifact_location);
-        if reference.index as usize != index || reference.location != location {
-            return Err(invalid(
-                "Iceberg rewrite artifact part reference is invalid",
-            ));
-        }
-        let bytes =
-            read_artifact_file(runtime, file_io, &location, REWRITE_ARTIFACT_MAX_PART_BYTES)?;
-        if artifact_part_digest(&bytes) != decode_digest(&reference.digest_hex)? {
-            return Err(invalid("Iceberg rewrite artifact part digest is invalid"));
-        }
-        let part: ArtifactPartV1 = decode_canonical_json(&bytes, "Iceberg rewrite artifact part")?;
-        if part.version != ARTIFACT_VERSION || part.groups.is_empty() {
-            return Err(invalid("Iceberg rewrite artifact part is invalid"));
-        }
-        groups.extend(part.groups);
-    }
-    groups.sort_by(|left, right| left.group_digest_hex.cmp(&right.group_digest_hex));
-    if groups.len() > REWRITE_ARTIFACT_MAX_GROUPS
-        || groups
-            .windows(2)
-            .any(|pair| pair[0].group_digest_hex == pair[1].group_digest_hex)
-    {
-        return Err(invalid("Iceberg rewrite artifact groups are invalid"));
-    }
-    let logical = IcebergFrozenRewriteArtifactV1 {
-        version: root.version,
-        operation_kind: root.operation_kind,
-        namespace: root.namespace,
-        table: root.table,
-        table_uuid: root.table_uuid,
-        target_ref: root.target_ref,
-        base_snapshot_id: root.base_snapshot_id,
-        schema_id: root.schema_id,
-        default_spec_id: root.default_spec_id,
-        groups,
-    };
-    if artifact_digest(&logical.canonical_bytes()?) != expected {
-        return Err(invalid(
-            "Iceberg rewrite logical artifact digest is invalid",
-        ));
-    }
-    let group = logical
-        .groups
-        .iter()
-        .find(|group| group.group_digest_hex == payload.group_digest_hex)
-        .cloned()
-        .ok_or_else(|| invalid("Iceberg rewrite artifact has no requested group"))?;
-    Ok(IcebergLoadedFrozenRewriteGroupV1 {
-        artifact: logical,
-        group,
-    })
-}
-
-fn write_frozen_artifact(
-    runtime: &IcebergMetadataContext,
-    file_io: crate::iceberg::io::FileIO,
-    artifact: &IcebergFrozenRewriteArtifactV1,
-    logical_digest: [u8; 32],
-    root_location: &str,
-) -> Result<(), ConnectorError> {
-    let parts = split_artifact_parts(&artifact.groups)?;
-    let mut references = Vec::with_capacity(parts.len());
-    for (index, part) in parts.iter().enumerate() {
-        let bytes = canonical_json(part)?;
-        let digest = artifact_part_digest(&bytes);
-        let location = format!("{root_location}/part-{index:04}.json");
-        write_artifact_file(runtime, &file_io, &location, bytes)?;
-        references.push(ArtifactPartRefV1 {
-            index: index as u16,
-            digest_hex: hex::encode(digest),
-            location,
-        });
-    }
-    let root = ArtifactRootV1 {
-        version: ARTIFACT_VERSION,
-        logical_artifact_digest_hex: hex::encode(logical_digest),
-        operation_kind: artifact.operation_kind.clone(),
-        namespace: artifact.namespace.clone(),
-        table: artifact.table.clone(),
-        table_uuid: artifact.table_uuid.clone(),
-        target_ref: artifact.target_ref.clone(),
-        base_snapshot_id: artifact.base_snapshot_id,
-        schema_id: artifact.schema_id,
-        default_spec_id: artifact.default_spec_id,
-        parts: references,
-    };
-    let bytes = canonical_json(&root)?;
-    if bytes.len() > REWRITE_ARTIFACT_MAX_ROOT_BYTES {
-        return Err(exhausted("Iceberg rewrite artifact root exceeds 64 KiB"));
-    }
-    write_artifact_file(
-        runtime,
-        &file_io,
-        &format!("{root_location}/manifest.json"),
-        bytes,
-    )
-}
-
-fn split_artifact_parts(
-    groups: &[IcebergFrozenRewriteGroupV1],
-) -> Result<Vec<ArtifactPartV1>, ConnectorError> {
-    let mut parts = Vec::new();
-    let mut current = Vec::new();
-    for group in groups {
-        let mut candidate = current.clone();
-        candidate.push(group.clone());
-        let candidate_part = ArtifactPartV1 {
-            version: ARTIFACT_VERSION,
-            groups: candidate,
-        };
-        if canonical_json(&candidate_part)?.len() <= REWRITE_ARTIFACT_MAX_PART_BYTES {
-            current = candidate_part.groups;
-            continue;
-        }
-        if current.is_empty() {
-            return Err(exhausted("Iceberg rewrite group exceeds 1 MiB"));
-        }
-        parts.push(ArtifactPartV1 {
-            version: ARTIFACT_VERSION,
-            groups: std::mem::take(&mut current),
-        });
-        current.push(group.clone());
-    }
-    if !current.is_empty() {
-        parts.push(ArtifactPartV1 {
-            version: ARTIFACT_VERSION,
-            groups: current,
-        });
-    }
-    if parts.len() > REWRITE_ARTIFACT_MAX_PARTS {
-        return Err(exhausted("Iceberg rewrite artifact exceeds 64 parts"));
-    }
-    Ok(parts)
 }
 
 pub(crate) fn plan_data_file_groups(
@@ -692,9 +506,7 @@ pub(crate) fn plan_position_delete_groups(
 
 /// How many attached Puffin deletion vectors make a data file worth repacking.
 ///
-/// The default lives here and nowhere else: planning and the write session both
-/// cut the same groups, and a default resolved twice could drift and leave the
-/// two disagreeing about how many branches the rewrite has.
+/// The default is resolved once while planning; the write session consumes those frozen groups.
 fn position_delete_min_input_files(min_input_files: Option<u32>) -> usize {
     min_input_files.unwrap_or(DEFAULT_POSITION_DELETE_MIN_INPUT_FILES) as usize
 }
@@ -869,7 +681,7 @@ fn cohort_plans_from_artifact(
     owner: &ConnectorProviderBindingKey,
     request: &ConnectorDistributedRewritePlanningRequest,
     artifact_digest: [u8; 32],
-    artifact_location: &str,
+    frozen: &novarocks_spi::connector::ConnectorProcessLocalPayload,
     artifact: &IcebergFrozenRewriteArtifactV1,
     scan_schema: SchemaRef,
     row_lineage: bool,
@@ -924,8 +736,9 @@ fn cohort_plans_from_artifact(
                         ConnectorFrozenRewriteGroup::try_new(
                             &artifact.namespace,
                             &artifact.table,
-                            artifact_location,
+                            request.operation_id(),
                             artifact_digest,
+                            frozen.clone(),
                         )?,
                     )
                 }
@@ -1130,7 +943,7 @@ pub(crate) fn frozen_rewrite_scan_schema(
 ///
 /// The group is the authority on which artifacts this procedure instance
 /// rewrites, and the commit replaces exactly that set. Nothing here reselects:
-/// the artifact is read back by location and content digest, the named group is
+/// the attempt-owned content is validated by identity, the named group is
 /// looked up inside it, and the only judgement made is whether the pinned
 /// snapshot still holds every artifact the group named. It if does not, the
 /// cohort's commit could no longer replace what this read would consume, so the
@@ -1140,20 +953,21 @@ pub(crate) fn plan_rewrite_position_delete_splits(
     runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
     snapshot_id: i64,
-    group_payload: &IcebergRewriteGroupPayloadV1,
+    content: &IcebergFrozenRewriteArtifactV1,
+    group_digest: &str,
     context: &ConnectorRequestContext,
 ) -> Result<(IcebergDataFileInfo, Vec<IcebergDeleteFileInfo>), ConnectorError> {
     validate_context(context)?;
-    let loaded = load_frozen_rewrite_group(runtime, table.file_io(), group_payload)?;
+    let group = content.group(group_digest)?;
     validate_context(context)?;
     // The table can advance after the TableExecute relation was frozen. Its
     // later current snapshot must never become a substitute generation for the
     // immutable rewrite artifact, so fail before split dispatch if that fence
     // no longer holds.
-    validate_frozen_rewrite_table(&loaded.artifact, table.metadata())?;
+    validate_frozen_rewrite_table(content, table.metadata())?;
     let live = live_delete_file_paths_at_with_control(runtime, table, snapshot_id, Some(context))?;
     validate_context(context)?;
-    select_rewrite_position_delete_artifacts(&loaded.group, &live, snapshot_id)
+    select_rewrite_position_delete_artifacts(group, &live, snapshot_id)
 }
 
 /// Pick out exactly the delete artifacts one frozen group names.
@@ -1223,14 +1037,6 @@ fn live_delete_file_paths(
 }
 
 /// The delete files alive at one exact snapshot of a relation.
-pub(crate) fn live_delete_file_paths_at(
-    runtime: &IcebergMetadataContext,
-    table: &crate::iceberg::table::Table,
-    snapshot_id: i64,
-) -> Result<BTreeSet<EntryIdentity>, ConnectorError> {
-    live_delete_file_paths_at_with_control(runtime, table, snapshot_id, None)
-}
-
 fn live_delete_file_paths_at_with_control(
     runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
@@ -1322,56 +1128,9 @@ fn validate_frozen_rewrite_table(
     Ok(())
 }
 
-fn write_artifact_file(
-    runtime: &IcebergMetadataContext,
-    file_io: &crate::iceberg::io::FileIO,
-    location: &str,
-    bytes: Bytes,
-) -> Result<(), ConnectorError> {
-    let output = file_io
-        .new_output(location)
-        .map_err(|error| unavailable(format!("create Iceberg rewrite artifact: {error}")))?;
-    runtime
-        .resources()
-        .catalog_runtime()
-        .block_on(async move { output.write(bytes).await })
-        .map_err(unavailable)?
-        .map_err(|error| unavailable(format!("persist Iceberg rewrite artifact: {error}")))
-}
-
-fn read_artifact_file(
-    runtime: &IcebergMetadataContext,
-    file_io: &crate::iceberg::io::FileIO,
-    location: &str,
-    max_bytes: usize,
-) -> Result<Bytes, ConnectorError> {
-    let input = file_io
-        .new_input(location)
-        .map_err(|error| unavailable(format!("open Iceberg rewrite artifact: {error}")))?;
-    let bytes = runtime
-        .resources()
-        .catalog_runtime()
-        .block_on(async move { input.read().await })
-        .map_err(unavailable)?
-        .map_err(|error| unavailable(format!("read Iceberg rewrite artifact: {error}")))?;
-    if bytes.len() > max_bytes {
-        return Err(exhausted(format!(
-            "Iceberg rewrite artifact exceeds {max_bytes} bytes"
-        )));
-    }
-    Ok(bytes)
-}
-
 fn artifact_digest(bytes: &[u8]) -> [u8; 32] {
     let mut hash = Sha256::new();
     hash.update(b"novarocks.iceberg.distributed-rewrite.artifact.v1\0");
-    digest_bytes(&mut hash, bytes);
-    hash.finalize().into()
-}
-
-fn artifact_part_digest(bytes: &[u8]) -> [u8; 32] {
-    let mut hash = Sha256::new();
-    hash.update(b"novarocks.iceberg.distributed-rewrite.artifact-part.v1\0");
     digest_bytes(&mut hash, bytes);
     hash.finalize().into()
 }
@@ -1513,7 +1272,7 @@ fn digest_bytes(hash: &mut Sha256, value: &[u8]) {
     hash.update(value);
 }
 
-fn decode_digest(value: &str) -> Result<[u8; 32], ConnectorError> {
+pub(crate) fn decode_digest(value: &str) -> Result<[u8; 32], ConnectorError> {
     hex::decode(value)
         .map_err(|error| invalid(format!("decode Iceberg rewrite digest: {error}")))?
         .try_into()
@@ -1526,18 +1285,6 @@ fn canonical_json<T: Serialize>(value: &T) -> Result<Bytes, ConnectorError> {
     let mut output = Vec::new();
     write_canonical_json(&value, &mut output)?;
     Ok(Bytes::from(output))
-}
-
-fn decode_canonical_json<T>(payload: &[u8], label: &str) -> Result<T, ConnectorError>
-where
-    T: Serialize + for<'de> Deserialize<'de>,
-{
-    let decoded = serde_json::from_slice(payload)
-        .map_err(|error| invalid(format!("decode {label}: {error}")))?;
-    if canonical_json(&decoded)?.as_ref() != payload {
-        return Err(invalid(format!("{label} is not canonical JSON v1")));
-    }
-    Ok(decoded)
 }
 
 fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> Result<(), ConnectorError> {
@@ -1896,10 +1643,10 @@ mod tests {
 
     #[test]
     fn canonical_json_and_artifact_digest_are_deterministic() {
-        let mut first = HashMap::new();
+        let mut first = std::collections::HashMap::new();
         first.insert("z".to_string(), vec![1_u8]);
         first.insert("a".to_string(), vec![2_u8]);
-        let mut second = HashMap::new();
+        let mut second = std::collections::HashMap::new();
         second.insert("a".to_string(), vec![2_u8]);
         second.insert("z".to_string(), vec![1_u8]);
         assert_eq!(
@@ -2043,10 +1790,39 @@ mod tests {
                 } else {
                     "background"
                 }));
-                assert!(adapter.plans.lock().expect("plans").is_empty());
+                // Rejected requests retain no attempt content in the adapter.
                 assert_admission_left_no_io(&warehouse, &listener);
             }
         }
+    }
+    #[test]
+    fn frozen_rewrite_limits_keep_the_previous_single_group_size_boundary() {
+        let mut artifact = IcebergFrozenRewriteArtifactV1 {
+            version: ARTIFACT_VERSION,
+            operation_kind: REWRITE_POSITION_DELETES_KIND.to_string(),
+            namespace: "db".to_string(),
+            table: "t".to_string(),
+            table_uuid: "uuid".to_string(),
+            target_ref: "main".to_string(),
+            base_snapshot_id: Some(1),
+            schema_id: 0,
+            default_spec_id: 0,
+            groups: vec![IcebergFrozenRewriteGroupV1::default()],
+        };
+        artifact.groups[0]
+            .data_files
+            .push(IcebergDataFileInfo::for_test(
+                &"x".repeat(REWRITE_GROUP_MAX_BYTES),
+                1,
+                1,
+            ));
+        assert_eq!(
+            artifact.canonical_bytes().unwrap_err().kind(),
+            ConnectorErrorKind::ResourceExhausted
+        );
+        artifact.groups =
+            vec![IcebergFrozenRewriteGroupV1::default(); REWRITE_ARTIFACT_MAX_GROUPS + 1];
+        assert!(artifact.canonical_bytes().is_err());
     }
 }
 

@@ -655,11 +655,7 @@ fn open_relation(
                     session,
                     table,
                     novarocks_spi::connector::read_stack::ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(
-                        novarocks_spi::connector::read_stack::ConnectorReadFrozenRewriteGroup::new(
-                            read.group.artifact_location(),
-                            &hex::encode(read.group.artifact_digest()),
-                            &hex::encode(read.group_digest),
-                        ),
+                        novarocks_spi::connector::read_stack::ConnectorReadFrozenRewriteGroup::from_cohort(&read.group, read.group_digest),
                     ),
                 )
                 .map_err(|error| {

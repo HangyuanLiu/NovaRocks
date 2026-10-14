@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+// Design: ADR-0176 (docs/adr/ADR-0176-attempt-local-maintenance-inputs-and-single-rewrite-plan.md)
 use std::{any::Any, fmt, sync::Arc};
 
 use super::{ConnectorError, ConnectorErrorKind, ConnectorProviderBindingKey};

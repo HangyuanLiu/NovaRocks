@@ -274,13 +274,13 @@ impl ConnectorDistributedRewriteSession {
                 rewrite_begin_request(&plan, table, context).map_err(invalid)?,
             )
             .map_err(invalid)?;
-            let sealed = session.expected_targets().len();
-            if sealed != plan.cohorts().len() {
-                return Err(invalid(format!(
-                    "distributed rewrite sealed {sealed} write targets for {} frozen groups",
-                    plan.cohorts().len()
-                )));
-            }
+            validate_rewrite_target_groups(
+                &plan,
+                session
+                    .targets()
+                    .iter()
+                    .map(|target| (target.ordinal(), target.rewrite_group_digest())),
+            )?;
             Some(session)
         };
 
@@ -407,6 +407,39 @@ impl ConnectorDistributedRewriteSession {
 /// rewrite selected, so the plan's frozen shape travels in the flavor: it is
 /// what decides whether the session seals data branches or delete branches, and
 /// the provider refuses an input that disagrees with it.
+/// Validate correspondence before any cohort is dispatched to a writer.
+fn validate_rewrite_target_groups(
+    plan: &ConnectorDistributedRewritePlan,
+    mut targets: impl Iterator<
+        Item = (
+            novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+            Option<[u8; 32]>,
+        ),
+    >,
+) -> Result<(), ConnectorError> {
+    for (index, cohort) in plan.cohorts().iter().enumerate() {
+        let Some((ordinal, digest)) = targets.next() else {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "distributed rewrite sealed fewer writers than frozen cohorts",
+            ));
+        };
+        if ordinal.get() as usize != index || digest != Some(cohort.group_digest()) {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Internal,
+                "distributed rewrite writer group differs from its frozen cohort",
+            ));
+        }
+    }
+    if targets.next().is_some() {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::Internal,
+            "distributed rewrite sealed more writers than frozen cohorts",
+        ));
+    }
+    Ok(())
+}
+
 fn rewrite_begin_request(
     plan: &ConnectorDistributedRewritePlan,
     table: &novarocks_spi::connector::ConnectorTableMetadata,
@@ -440,9 +473,7 @@ fn rewrite_begin_request(
             ),
             base: None,
             flavor:
-                novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::DistributedRewrite(
-                    plan.shape(),
-                ),
+                novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::DistributedRewrite { shape: plan.shape(), frozen: plan.frozen().clone() },
             context,
         },
     )
@@ -768,8 +799,12 @@ mod tests {
                         novarocks_spi::connector::ConnectorFrozenRewriteGroup::try_new(
                             "db",
                             "orders",
-                            "s3://warehouse/db/orders/_rewrite/0199",
+                            operation_id,
                             digest,
+                            novarocks_spi::connector::ConnectorProcessLocalPayload::new(
+                                key.clone(),
+                                Arc::new(()),
+                            ),
                         )
                         .unwrap(),
                     ),
@@ -791,6 +826,7 @@ mod tests {
             },
             Bytes::from_static(b"plan"),
             cohort_plans,
+            novarocks_spi::connector::ConnectorProcessLocalPayload::new(key.clone(), Arc::new(())),
         )
         .unwrap();
         let rewrite = Arc::new(TestRewrite {
@@ -952,5 +988,62 @@ mod tests {
             panic!("two groups cannot sign different writer inputs");
         };
         assert!(error.contains("different writer inputs"), "{error}");
+    }
+    #[test]
+    fn writer_groups_must_match_each_cohort_before_dispatch() {
+        let (plan, _) = fixture(3);
+        let expected = plan
+            .cohorts()
+            .iter()
+            .enumerate()
+            .map(|(i, cohort)| {
+                (
+                    novarocks_spi::connector::write_stack::WriteTargetOrdinal::try_new(i as u32)
+                        .unwrap(),
+                    Some(cohort.group_digest()),
+                )
+            })
+            .collect::<Vec<_>>();
+        validate_rewrite_target_groups(&plan, expected.clone().into_iter()).unwrap();
+        let mut wrong = expected.clone();
+        wrong[0].1 = Some([255; 32]);
+        assert_eq!(
+            validate_rewrite_target_groups(&plan, wrong.into_iter())
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Internal
+        );
+        let mut wrong = expected.clone();
+        wrong[0].0 = wrong[1].0;
+        assert_eq!(
+            validate_rewrite_target_groups(&plan, wrong.into_iter())
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Internal
+        );
+        let mut wrong = expected.clone();
+        wrong.pop();
+        assert_eq!(
+            validate_rewrite_target_groups(&plan, wrong.into_iter())
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Internal
+        );
+        let mut wrong = expected.clone();
+        wrong.push(expected[0]);
+        assert_eq!(
+            validate_rewrite_target_groups(&plan, wrong.into_iter())
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Internal
+        );
+        let mut wrong = expected;
+        wrong[1].1 = None;
+        assert_eq!(
+            validate_rewrite_target_groups(&plan, wrong.into_iter())
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::Internal
+        );
     }
 }

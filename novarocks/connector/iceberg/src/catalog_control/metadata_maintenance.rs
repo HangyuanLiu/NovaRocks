@@ -69,7 +69,6 @@ struct IcebergMetadataMaintenancePlanPayloadV1 {
     operation_kind: String,
     older_than_ms: Option<i64>,
     retain_last: Option<u32>,
-    artifact_location: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -91,7 +90,6 @@ struct IcebergMetadataMaintenanceMarkerV1 {
 struct IcebergMetadataMaintenanceReceiptV1 {
     version: u16,
     snapshot_id: Option<i64>,
-    artifact_location: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -109,13 +107,6 @@ struct IcebergMetadataMaintenanceEvidenceV1 {
 }
 
 #[derive(Clone)]
-struct CachedPlan {
-    request_digest: [u8; 32],
-    plan: ConnectorMetadataMaintenancePlan,
-    payload: IcebergMetadataMaintenancePlanPayloadV1,
-}
-
-#[derive(Clone)]
 struct TerminalRecord {
     plan_digest: [u8; 32],
     outcome: ExternalMutationOutcome<ConnectorMetadataMaintenanceReceipt>,
@@ -127,7 +118,6 @@ pub(crate) struct IcebergMetadataMaintenanceAdapter {
     key: ConnectorProviderBindingKey,
     descriptor: ConnectorInstanceDescriptor,
     runtime: Arc<IcebergMetadataContext>,
-    plans: Mutex<HashMap<ConnectorMutationOperationId, CachedPlan>>,
     terminal: Mutex<HashMap<ConnectorMutationOperationId, TerminalRecord>>,
 }
 
@@ -144,7 +134,6 @@ impl IcebergMetadataMaintenanceAdapter {
             key,
             descriptor,
             runtime,
-            plans: Mutex::new(HashMap::new()),
             terminal: Mutex::new(HashMap::new()),
         })
     }
@@ -196,17 +185,6 @@ impl IcebergMetadataMaintenanceAdapter {
             metadata.current_schema_id(),
             metadata.default_partition_spec_id(),
         );
-        let payload_seed = format!(
-            "{}:{}:{}",
-            hex_encode(request.operation_id().to_bytes()),
-            request.operation().kind(),
-            hex_encode(state_digest)
-        );
-        let artifact_location = maintenance_artifact_location(
-            table.metadata_location(),
-            request.operation().kind(),
-            &payload_seed,
-        )?;
         let payload = IcebergMetadataMaintenancePlanPayloadV1 {
             version: PAYLOAD_VERSION,
             namespace,
@@ -223,24 +201,7 @@ impl IcebergMetadataMaintenanceAdapter {
             operation_kind: request.operation().kind().to_string(),
             older_than_ms,
             retain_last,
-            artifact_location,
         };
-        let artifact = canonical_json(&payload, "Iceberg metadata maintenance artifact")?;
-        if artifact.len() > 1024 * 1024 {
-            return Err(resource_exhausted(
-                "Iceberg maintenance artifact part exceeds 1 MiB",
-            ));
-        }
-        let output = table
-            .file_io()
-            .new_output(&payload.artifact_location)
-            .map_err(|error| unavailable(format!("create maintenance artifact: {error}")))?;
-        self.runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move { output.write(artifact).await })
-            .map_err(unavailable)?
-            .map_err(|error| unavailable(format!("write maintenance artifact: {error}")))?;
         let summary = ConnectorMetadataMaintenancePlanSummary::new(
             u64::from(payload.base_snapshot_id.is_some()),
             0,
@@ -255,20 +216,6 @@ impl IcebergMetadataMaintenanceAdapter {
         &self,
         plan: &ConnectorMetadataMaintenancePlan,
     ) -> Result<IcebergMetadataMaintenancePlanPayloadV1, ConnectorError> {
-        if let Some(cached) = self
-            .plans
-            .lock()
-            .map_err(|error| internal(format!("Iceberg maintenance plan lock: {error}")))?
-            .get(&plan.operation_id())
-            .cloned()
-        {
-            if cached.plan.plan_digest() == plan.plan_digest() {
-                return Ok(cached.payload);
-            }
-            return Err(invalid(
-                "Iceberg metadata maintenance plan digest conflicts",
-            ));
-        }
         let payload: IcebergMetadataMaintenancePlanPayloadV1 =
             decode_canonical_json(plan.provider_payload(), "Iceberg metadata maintenance plan")?;
         validate_payload_for_plan(plan, &payload)?;
@@ -487,7 +434,6 @@ impl IcebergMetadataMaintenanceAdapter {
                 &IcebergMetadataMaintenanceReceiptV1 {
                     version: PAYLOAD_VERSION,
                     snapshot_id,
-                    artifact_location: payload.artifact_location.clone(),
                 },
                 "Iceberg metadata maintenance receipt",
             )
@@ -529,18 +475,6 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
                 request.context.initiation(),
             ))
             .map_err(connector_unsupported)?;
-        let mut plans = self
-            .plans
-            .lock()
-            .map_err(|error| internal(format!("Iceberg maintenance plan lock: {error}")))?;
-        if let Some(existing) = plans.get(&request.operation_id()) {
-            if existing.request_digest == request.request_digest() {
-                return Ok(existing.plan.clone());
-            }
-            return Err(invalid(
-                "Iceberg metadata maintenance operation was replayed with a different request",
-            ));
-        }
         let (payload, state_digest, summary) = self.plan_payload(&request)?;
         let provider_payload = canonical_json(&payload, "Iceberg metadata maintenance plan")?;
         let plan = ConnectorMetadataMaintenancePlan::try_new(
@@ -549,14 +483,6 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
             summary,
             provider_payload,
         )?;
-        plans.insert(
-            request.operation_id(),
-            CachedPlan {
-                request_digest: request.request_digest(),
-                plan: plan.clone(),
-                payload,
-            },
-        );
         Ok(plan)
     }
 
@@ -585,7 +511,7 @@ impl ConnectorMetadataMaintenance for IcebergMetadataMaintenanceAdapter {
         let outcome = match self.lookup_marker(&payload, &marker, &request.context)? {
             MarkerLookup::Matching { snapshot_id } => ExternalMutationOutcome::KnownCommitted {
                 effect: ExternalMutationEffect::Applied,
-                receipt: self.receipt_from_marker(&request.plan, &payload, snapshot_id)?,
+                receipt: self.receipt_from_marker(&request.plan, snapshot_id)?,
                 finalization: ExternalMutationFinalization::Complete,
             },
             MarkerLookup::Conflicting => ExternalMutationOutcome::CommitUnknown {
@@ -683,7 +609,6 @@ impl IcebergMetadataMaintenanceAdapter {
     fn receipt_from_marker(
         &self,
         plan: &ConnectorMetadataMaintenancePlan,
-        payload: &IcebergMetadataMaintenancePlanPayloadV1,
         snapshot_id: Option<i64>,
     ) -> Result<ConnectorMetadataMaintenanceReceipt, ConnectorError> {
         ConnectorMetadataMaintenanceReceipt::try_new(
@@ -699,7 +624,6 @@ impl IcebergMetadataMaintenanceAdapter {
                 &IcebergMetadataMaintenanceReceiptV1 {
                     version: PAYLOAD_VERSION,
                     snapshot_id,
-                    artifact_location: payload.artifact_location.clone(),
                 },
                 "Iceberg metadata maintenance receipt",
             )?,
@@ -739,8 +663,6 @@ fn validate_payload_for_plan(
     if payload.version != PAYLOAD_VERSION
         || payload.operation_kind != plan.operation_kind()
         || payload.metadata_location_digest_hex.len() != 64
-        || payload.artifact_location.len()
-            > novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_PATH_BYTES
     {
         return Err(invalid(
             "Iceberg metadata maintenance plan payload does not match SPI plan",
@@ -819,29 +741,6 @@ fn identity_digest(
     hasher.update(plan.request_digest());
     hasher.update(plan.plan_digest());
     hasher.finalize().into()
-}
-
-fn maintenance_artifact_location(
-    metadata_location: Option<&str>,
-    operation_kind: &str,
-    seed: &str,
-) -> Result<String, ConnectorError> {
-    let location =
-        metadata_location.ok_or_else(|| invalid("Iceberg table has no metadata location"))?;
-    let (root, _) = location
-        .rsplit_once("/metadata/")
-        .ok_or_else(|| invalid("Iceberg metadata location has no table metadata directory"))?;
-    let digest = Sha256::digest(seed.as_bytes());
-    let path = format!(
-        "{root}/_novarocks/maintenance/v1/{operation_kind}/{}/plan.json",
-        hex_encode(digest)
-    );
-    if path.len() > novarocks_spi::connector::MAX_CONNECTOR_METADATA_MAINTENANCE_PATH_BYTES {
-        return Err(resource_exhausted(
-            "Iceberg maintenance artifact path exceeds hard limit",
-        ));
-    }
-    Ok(path)
 }
 
 fn classify_iceberg_error(error: crate::iceberg::Error) -> ExecFailure {
@@ -932,10 +831,6 @@ fn unavailable(message: impl Into<String>) -> ConnectorError {
 
 fn internal(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Internal, message.into())
-}
-
-fn resource_exhausted(message: impl Into<String>) -> ConnectorError {
-    ConnectorError::new(ConnectorErrorKind::ResourceExhausted, message.into())
 }
 
 #[cfg(test)]
@@ -1060,16 +955,249 @@ mod tests {
         assert!(hex_decode("xy").is_none());
     }
 
-    #[test]
-    fn maintenance_artifact_location_stays_under_table_root() {
-        let location = maintenance_artifact_location(
-            Some("s3://warehouse/db/table/metadata/v7.metadata.json"),
-            "expire-table-versions",
-            "operation",
+    fn create_local_table(
+        executor: &tokio::runtime::Runtime,
+        adapter: &IcebergMetadataMaintenanceAdapter,
+    ) -> crate::iceberg::table::Table {
+        use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
+        use crate::iceberg::{NamespaceIdent, TableCreation};
+
+        let catalog = adapter.runtime.novarocks_catalog().vendored_client();
+        executor.block_on(async {
+            let namespace = NamespaceIdent::new("maintenance_test".to_string());
+            catalog
+                .create_namespace(&namespace, HashMap::new())
+                .await
+                .expect("create namespace");
+            let schema = Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .expect("schema");
+            catalog
+                .create_table(
+                    &namespace,
+                    TableCreation::builder()
+                        .name("t".to_string())
+                        .schema(schema)
+                        .format_version(FormatVersion::V2)
+                        .build(),
+                )
+                .await
+                .expect("create table")
+        })
+    }
+
+    fn append_local_file(
+        executor: &tokio::runtime::Runtime,
+        adapter: &IcebergMetadataMaintenanceAdapter,
+        ident: &crate::iceberg::TableIdent,
+        name: &str,
+    ) {
+        use crate::iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
+        use crate::iceberg::transaction::{ApplyTransactionAction, Transaction};
+
+        let catalog = adapter.runtime.novarocks_catalog().vendored_client();
+        executor.block_on(async {
+            let table = catalog.load_table(ident).await.expect("load append table");
+            let location = format!("{}/data/{name}.parquet", table.metadata().location());
+            table
+                .file_io()
+                .new_output(&location)
+                .expect("data output")
+                .write(Bytes::from_static(b"test data"))
+                .await
+                .expect("write data file");
+            let file = DataFileBuilder::default()
+                .content(DataContentType::Data)
+                .file_path(location)
+                .file_format(DataFileFormat::Parquet)
+                .record_count(1)
+                .file_size_in_bytes(9)
+                .partition(Struct::empty())
+                .build()
+                .expect("synthetic data file");
+            let transaction = Transaction::new(&table);
+            transaction
+                .fast_append()
+                .add_data_files([file])
+                .apply(transaction)
+                .expect("stage append")
+                .commit(catalog.as_ref())
+                .await
+                .expect("commit append");
+        });
+    }
+
+    fn local_planning_request(
+        key: &ConnectorProviderBindingKey,
+        expire: bool,
+    ) -> ConnectorMetadataMaintenancePlanningRequest {
+        let table = ConnectorTableHandle::try_new(
+            key.instance_id.clone(),
+            Bytes::from_static(br#"{"namespace":"maintenance_test","table":"t","metadata_location":null,"table_info":null,"metadata_columns":[],"metadata_table_type":null,"prepared_files":[],"explicit_files":null}"#),
         )
-        .expect("artifact location");
-        assert!(location.starts_with("s3://warehouse/db/table/_novarocks/maintenance/v1/"));
-        assert!(location.ends_with("/plan.json"));
+        .expect("table handle");
+        let operation = if expire {
+            ConnectorMetadataMaintenanceOperation::expire_table_versions(
+                table,
+                Some(i64::MAX),
+                Some(1),
+            )
+        } else {
+            ConnectorMetadataMaintenanceOperation::rewrite_metadata_layout(table)
+        }
+        .expect("operation");
+        ConnectorMetadataMaintenancePlanningRequest::try_new(
+            ConnectorMutationOperationId::new(),
+            key.clone(),
+            operation,
+            context(),
+        )
+        .expect("planning request")
+    }
+
+    fn inventory_without_private_artifacts(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        fn visit(path: &std::path::Path, inventory: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(path).expect("table inventory") {
+                let entry = entry.expect("table entry");
+                assert_ne!(
+                    entry.file_name(),
+                    "_novarocks",
+                    "private maintenance artifact"
+                );
+                inventory.push(entry.path());
+                if entry.file_type().expect("entry type").is_dir() {
+                    visit(&entry.path(), inventory);
+                }
+            }
+        }
+        let mut inventory = Vec::new();
+        visit(root, &mut inventory);
+        inventory.sort();
+        inventory
+    }
+
+    // Responsibility: real Hadoop/FileIO adapter behavior, including no-op and
+    // rejected plans. SQL/system tests own the distributed product surface.
+    #[test]
+    fn metadata_maintenance_keeps_plans_and_receipts_out_of_table_locations() {
+        let (executor, _warehouse, adapter, key) = adapter();
+        let table = create_local_table(&executor, &adapter);
+        let location =
+            novarocks_fs::FsLocation::parse(table.metadata().location()).expect("table location");
+        let root = std::path::PathBuf::from(location.path());
+        for expire in [false, true] {
+            let before = inventory_without_private_artifacts(&root);
+            let plan = adapter
+                .plan_maintenance(local_planning_request(&key, expire))
+                .expect("no-op plan");
+            assert_eq!(inventory_without_private_artifacts(&root), before);
+            let payload: IcebergMetadataMaintenancePlanPayloadV1 =
+                decode_canonical_json(plan.provider_payload(), "test plan").expect("plan payload");
+            assert_eq!(payload.base_snapshot_id, None);
+            let outcome = adapter
+                .execute(
+                    ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context())
+                        .expect("execute request"),
+                )
+                .expect("no-op execute");
+            let ExternalMutationOutcome::KnownCommitted { receipt, .. } = outcome else {
+                panic!("no-op maintenance must complete")
+            };
+            assert_eq!(
+                receipt.summary(),
+                ConnectorMetadataMaintenanceReceiptSummary::default()
+            );
+            assert_eq!(inventory_without_private_artifacts(&root), before);
+        }
+
+        append_local_file(&executor, &adapter, table.identifier(), "a");
+        append_local_file(&executor, &adapter, table.identifier(), "b");
+        for expire in [false, true] {
+            let before = inventory_without_private_artifacts(&root);
+            let plan = adapter
+                .plan_maintenance(local_planning_request(&key, expire))
+                .expect("maintenance plan");
+            assert_eq!(inventory_without_private_artifacts(&root), before);
+            let outcome = adapter
+                .execute(
+                    ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context())
+                        .expect("execute request"),
+                )
+                .expect("maintenance execute");
+            let ExternalMutationOutcome::KnownCommitted { receipt, .. } = outcome else {
+                panic!("maintenance must commit")
+            };
+            if expire {
+                assert!(receipt.summary().affected_versions > 0);
+            } else {
+                assert!(receipt.summary().rewritten_items > 0);
+            }
+            let payload: serde_json::Value =
+                serde_json::from_slice(receipt.provider_payload()).expect("receipt JSON");
+            assert_eq!(payload.as_object().expect("receipt object").len(), 2);
+            assert!(payload.get("snapshot_id").is_some());
+            inventory_without_private_artifacts(&root);
+        }
+    }
+
+    #[test]
+    fn metadata_maintenance_rejected_payload_and_stale_plan_leave_no_artifacts() {
+        let (executor, _warehouse, adapter, key) = adapter();
+        let table = create_local_table(&executor, &adapter);
+        let location =
+            novarocks_fs::FsLocation::parse(table.metadata().location()).expect("table location");
+        let root = std::path::PathBuf::from(location.path());
+        for expire in [false, true] {
+            let request = local_planning_request(&key, expire);
+            let plan = adapter.plan_maintenance(request.clone()).expect("plan");
+            let before = inventory_without_private_artifacts(&root);
+            let mut payload: IcebergMetadataMaintenancePlanPayloadV1 =
+                decode_canonical_json(plan.provider_payload(), "test plan").expect("payload");
+            payload.operation_kind = "mismatched-operation".to_string();
+            let invalid_plan = ConnectorMetadataMaintenancePlan::try_new(
+                &request,
+                plan.state_digest(),
+                plan.summary(),
+                canonical_json(&payload, "test invalid plan").expect("encode payload"),
+            )
+            .expect("invalid provider plan");
+            let error = adapter
+                .execute(
+                    ConnectorMetadataMaintenanceExecuteRequest::try_new(invalid_plan, context())
+                        .expect("execute request"),
+                )
+                .expect_err("provider payload must be validated without a cache");
+            assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+            assert_eq!(inventory_without_private_artifacts(&root), before);
+
+            append_local_file(
+                &executor,
+                &adapter,
+                table.identifier(),
+                if expire {
+                    "expire-conflict"
+                } else {
+                    "rewrite-conflict"
+                },
+            );
+            let before = inventory_without_private_artifacts(&root);
+            let outcome = adapter
+                .execute(
+                    ConnectorMetadataMaintenanceExecuteRequest::try_new(plan, context())
+                        .expect("execute request"),
+                )
+                .expect("stale plan outcome");
+            assert!(matches!(
+                outcome,
+                ExternalMutationOutcome::KnownUncommitted { .. }
+            ));
+            assert_eq!(inventory_without_private_artifacts(&root), before);
+        }
     }
 
     #[test]
@@ -1327,7 +1455,6 @@ mod tests {
                 } else {
                     "background"
                 }));
-                assert!(adapter.plans.lock().expect("plans").is_empty());
                 assert_admission_left_no_io(&warehouse, &listener);
             }
         }

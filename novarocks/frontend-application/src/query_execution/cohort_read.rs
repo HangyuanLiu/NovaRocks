@@ -63,7 +63,7 @@ impl std::fmt::Debug for QueryRewriteGroupRead {
             .debug_struct("RewriteGroupRead")
             .field("namespace", &self.group.schema_name())
             .field("table", &self.group.table_name())
-            .field("artifact_location", &self.group.artifact_location())
+            .field("operation_id", &self.group.operation_id())
             .finish_non_exhaustive()
     }
 }

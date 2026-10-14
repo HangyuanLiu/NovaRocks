@@ -386,7 +386,7 @@ fn rewrite_fixture() -> Fixture {
                 IcebergRewritePositionDeleteFilesHandle::try_new(
                     handle,
                     IcebergRewriteArtifactContentId::try_new(
-                        "s3://warehouse/artifact/rewrite.json",
+                        novarocks_spi::connector::ConnectorWriteOperationId::from_bytes([1; 16]),
                         "12".repeat(32),
                     )
                     .unwrap(),

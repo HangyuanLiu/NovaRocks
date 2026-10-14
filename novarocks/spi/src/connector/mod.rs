@@ -42,9 +42,9 @@ mod mv_storage_observation;
 mod original_result_scope;
 mod payload_retention;
 mod predicate;
+mod process_local;
 pub mod provider;
 mod provider_binding;
-mod process_local;
 mod publication;
 mod read;
 mod read_session;
@@ -206,7 +206,7 @@ pub use metadata_maintenance::{
     ConnectorMetadataMaintenancePlanSummary, ConnectorMetadataMaintenancePlanningRequest,
     ConnectorMetadataMaintenanceReceipt, ConnectorMetadataMaintenanceReceiptSummary,
     ConnectorMetadataMaintenanceResolver, EXPIRE_TABLE_VERSIONS_KIND,
-    MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES, MAX_CONNECTOR_METADATA_MAINTENANCE_PATH_BYTES,
+    MAX_CONNECTOR_METADATA_MAINTENANCE_MARKER_BYTES,
     MAX_CONNECTOR_METADATA_MAINTENANCE_PROVIDER_PAYLOAD_BYTES, REWRITE_METADATA_LAYOUT_KIND,
 };
 pub use mutation::{

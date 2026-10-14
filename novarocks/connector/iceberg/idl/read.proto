@@ -263,7 +263,7 @@ message IcebergOptimizeHandle {
 }
 
 message IcebergRewriteArtifactContentId {
-  string artifact_location = 1;
+  bytes operation_id = 1;
   string artifact_digest_hex = 2;
 }
 

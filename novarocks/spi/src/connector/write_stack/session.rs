@@ -244,21 +244,11 @@ pub enum ConnectorWriteSessionFlavor {
         selection: ConnectorRowMutationSelection,
         match_contract: ConnectorMutationMatchContract,
     },
-    /// A rewrite arbitrated by the provider's ordinary base-state compare and
-    /// swap rather than by the distributed-write external fence.
-    ///
-    /// It is a distinct flavor rather than a flag because the difference is not
-    /// a tuning knob: a rewrite that took the external fence would serialize
-    /// against ordinary DML it does not conflict with, and a DML write that
-    /// skipped it would lose the fence's protection.
-    ///
-    /// It carries the frozen rewrite's shape for the same reason
-    /// [`Self::CopyOnWrite`] carries its selection: the provider cuts the same
-    /// groups a second time when it seals the session, and which artifacts a
-    /// rewrite selected is not a function of the target alone. Reading it off
-    /// the writer input instead would make the branch kind a property of what
-    /// the caller signed rather than of the operation the frontend froze.
-    DistributedRewrite(ConnectorDistributedRewriteShape),
+    /// A rewrite whose reads, writers and replacement set consume one provider-owned frozen plan.
+    DistributedRewrite {
+        shape: ConnectorDistributedRewriteShape,
+        frozen: crate::connector::ConnectorProcessLocalPayload,
+    },
 }
 
 /// How a publication's rows reach it.
@@ -306,6 +296,7 @@ pub struct ConnectorWriteTargetPlan {
     route: Option<ConnectorWriteRouteFacts>,
     routing_proof: Option<ConnectorWriteCohortRoutingProof>,
     rewrite_source: Option<ConnectorWriteRewriteSource>,
+    rewrite_group_digest: Option<[u8; 32]>,
 }
 
 /// What one copy-on-write target must read to produce its rows.
@@ -730,6 +721,7 @@ impl ConnectorWriteTargetPlan {
             route: None,
             routing_proof: None,
             rewrite_source: None,
+            rewrite_group_digest: None,
         }
     }
 
@@ -757,6 +749,14 @@ impl ConnectorWriteTargetPlan {
     pub fn with_rewrite_source(mut self, source: ConnectorWriteRewriteSource) -> Self {
         self.rewrite_source = Some(source);
         self
+    }
+
+    pub fn with_rewrite_group_digest(mut self, digest: [u8; 32]) -> Self {
+        self.rewrite_group_digest = Some(digest);
+        self
+    }
+    pub const fn rewrite_group_digest(&self) -> Option<[u8; 32]> {
+        self.rewrite_group_digest
     }
 
     /// Present exactly for a row-mutation branch.
