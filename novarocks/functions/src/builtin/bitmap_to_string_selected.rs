@@ -18,10 +18,10 @@
 //! Library internals remain opaque; these are actual host reservations, not a
 //! formal MEM claim or a claim of cooperative 256-work inside roaring/std.
 use crate::aggregate_host_allocator::HostAggregateAllocator;
+use crate::bitmap_decode_resources::BitmapDecodeResources;
 use crate::bitmap_value::BitmapDecodePort;
 use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
-use crate::bitmap_decode_resources::BitmapDecodeResources;
 use crate::{
     AggregateStateAllocator, FunctionArgumentType, KernelEvaluationControl, KernelFailure,
     RowDataError, ScalarCallContract, ScalarCallInput, SelectedValues,

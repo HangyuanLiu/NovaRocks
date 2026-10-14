@@ -231,5 +231,5 @@ fn numeric_unary_raw_largeint_minimum_original_wrapping_and_null() {
 }
 
 #[cfg(test)]
-#[path="numeric_unary_intrinsic_oracle_tests.rs"]
+#[path = "numeric_unary_intrinsic_oracle_tests.rs"]
 mod oracle_tests;

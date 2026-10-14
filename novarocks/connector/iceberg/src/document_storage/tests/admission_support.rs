@@ -65,6 +65,10 @@ impl AdmissionCatalogSpy {
 
 #[async_trait]
 impl NovaRocksCatalog for AdmissionCatalogSpy {
+    fn admits_uncommitted_proof(&self, error: &crate::iceberg::Error) -> bool {
+        self.inner.admits_uncommitted_proof(error)
+    }
+
     fn listing_admission(&self) -> Arc<crate::catalog::listing_admission::ListingAdmission> {
         Arc::new(Default::default())
     }

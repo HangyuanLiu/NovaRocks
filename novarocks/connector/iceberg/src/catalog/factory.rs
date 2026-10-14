@@ -119,7 +119,12 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
             Arc::new(TokioFileTaskSpawner::new(runtime)),
         );
-        let client = crate::catalog_runtime::build_catalog_client(configuration, binding).await?;
+        let client = crate::catalog_runtime::build_catalog_client(
+            configuration,
+            binding,
+            crate::iceberg::Runtime::try_current().expect("test runtime"),
+        )
+        .await?;
         NovaRocksCatalogFactory::adopt(configuration, &client)
     }
 

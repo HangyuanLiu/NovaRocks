@@ -49,7 +49,11 @@ impl LogicalRewriteRule for PruneValuesColumns {
     fn matches(&self, _expr: &OptExpr, _ctx: &RewriteContext) -> bool {
         true
     }
-    fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, crate::compiler::SqlCompileError> {
+    fn apply(
+        &self,
+        expr: OptExpr,
+        ctx: &mut RewriteContext,
+    ) -> Result<RewriteResult, crate::compiler::SqlCompileError> {
         let OptExpr {
             op,
             children,
@@ -92,7 +96,8 @@ impl LogicalRewriteRule for PruneValuesColumns {
                 *keep
                     && matches!(arena.node(node.rows[0][i]), ScalarNode::Literal(_))
                     && arena.data_type(node.rows[0][i]) == &node.columns[i].value_type.data_type
-                    && arena.value_type(node.rows[0][i]).logical_type == node.columns[i].value_type.logical_type
+                    && arena.value_type(node.rows[0][i]).logical_type
+                        == node.columns[i].value_type.logical_type
                     && node.rows.iter().all(|row| row[i] == node.rows[0][i])
             })
             .collect::<Vec<_>>();
@@ -118,7 +123,11 @@ impl LogicalRewriteRule for PruneValuesColumns {
                     ScalarNode::ColumnRef(column.column_id)
                 };
                 Ok(ScalarProjectItem {
-                    expr: arena.intern_observed(scalar, column.value_type.clone(), &ctx.control_view())?,
+                    expr: arena.intern_observed(
+                        scalar,
+                        column.value_type.clone(),
+                        &ctx.control_view(),
+                    )?,
                     output_name: column.name.clone(),
                     output_column_id: column.column_id,
                     expr_display: None,

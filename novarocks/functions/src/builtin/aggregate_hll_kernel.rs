@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Exact NDV lifecycle over the original shared HLL register/state author.
-use super::aggregate_hll_core::{self as core, HLL_REGISTERS_COUNT, HllError, HllRawState, HllWork};
+use super::aggregate_hll_core::{
+    self as core, HLL_REGISTERS_COUNT, HllError, HllRawState, HllWork,
+};
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
 use crate::kernel_control::{KernelControlObservation, compile_failure, internal, invalid};

@@ -525,12 +525,13 @@ mod t8b_tests {
         inputs.live_set().await.unwrap().clone()
     }
     async fn raw_entries(writer: &Writer, metadata: &TableMetadata) -> Vec<ManifestEntry> {
-        let list = metadata
-            .current_snapshot()
-            .unwrap()
-            .load_manifest_list(writer.file_io(), metadata)
-            .await
-            .unwrap();
+        let list = crate::manifest::load_manifest_list(
+            metadata.current_snapshot().unwrap(),
+            writer.file_io(),
+            metadata,
+        )
+        .await
+        .unwrap();
         let mut out = Vec::new();
         for mf in list.entries() {
             let bytes = writer
@@ -732,7 +733,7 @@ mod t8b_tests {
             .allocate(ArtifactClass::Attempt, ArtifactKind::ManifestList)
             .unwrap();
         let output = writer.file_io().new_output(object.path()).unwrap();
-        let mut list = ManifestListWriter::v2(output, 11, None, 1);
+        let mut list = ManifestListWriter::v2(output.writer().await.unwrap(), 11, None, 1);
         list.add_manifests([assigned, historical].into_iter())
             .unwrap();
         list.close().await.unwrap();

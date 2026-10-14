@@ -168,7 +168,9 @@ impl ColumnIdentity {
             ));
         }
         let (category, children) = match field.field_type.as_ref() {
-            Type::Primitive(_) => (ColumnIdentityCategory::Primitive, Vec::new()),
+            Type::Primitive(_) | Type::Variant(_) => {
+                (ColumnIdentityCategory::Primitive, Vec::new())
+            }
             Type::Struct(struct_type) => {
                 let mut children = Vec::with_capacity(struct_type.fields().len());
                 for child in struct_type.fields() {
@@ -552,7 +554,7 @@ fn resolve_field_id_path(
     let mut optional_on_path = false;
     for field_id in field_id_path {
         let child: &NestedField = match &current {
-            Type::Primitive(_) => {
+            Type::Primitive(_) | Type::Variant(_) => {
                 return Err(invalid(
                     "iceberg column dereference path descends into a primitive type",
                 ));

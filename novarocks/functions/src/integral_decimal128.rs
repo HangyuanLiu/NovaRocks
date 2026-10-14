@@ -18,7 +18,9 @@
 //! Original Types integral -> Decimal128 conversion and Execution policy projection.
 //! Observation grants no allocation. Raw legacy entrypoints retain full errors/panics.
 use crate::decimal128_rescale::{DecimalRescaleError, DecimalRescaleObservation};
-use arrow_array::{Array, ArrayRef, Decimal128Array, Int8Array, Int16Array, Int32Array, Int64Array};
+use arrow_array::{
+    Array, ArrayRef, Decimal128Array, Int8Array, Int16Array, Int32Array, Int64Array,
+};
 use arrow_schema::DataType;
 use novarocks_type_contract::DecimalOverflowPolicy;
 use std::{convert::Infallible, sync::Arc};

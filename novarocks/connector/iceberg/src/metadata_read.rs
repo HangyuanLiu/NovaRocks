@@ -187,8 +187,7 @@ pub(crate) async fn read_metadata_table_rows_with_control(
     let Some(snapshot) = metadata.current_snapshot() else {
         return Ok(json!({ "version": 1, "rows": [] }).to_string());
     };
-    let manifest_list = snapshot
-        .load_manifest_list(file_io, metadata)
+    let manifest_list = crate::manifest::load_manifest_list(&snapshot, file_io, metadata)
         .await
         .map_err(|e| format!("load manifest list: {e}"))?;
     check_active()?;
@@ -228,8 +227,7 @@ pub(crate) async fn read_metadata_table_rows_with_control(
             }));
             continue;
         }
-        let manifest = mf
-            .load_manifest(file_io)
+        let manifest = crate::manifest::load_manifest(&mf, file_io)
             .await
             .map_err(|e| format!("load manifest {}: {e}", mf.manifest_path))?;
         check_active()?;

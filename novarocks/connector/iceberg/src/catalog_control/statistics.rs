@@ -538,7 +538,7 @@ fn collection_requirements(
         // Preserve ANALYZE's existing VARIANT capability boundary. Its SQL
         // byte carrier is supported by collect-on-write, but ANALYZE did not
         // admit the storage Struct representation before this type migration.
-        let supported_storage = matches!(iceberg_field.field_type.as_ref(), Type::Primitive(primitive) if !matches!(primitive, crate::iceberg::spec::PrimitiveType::Variant));
+        let supported_storage = matches!(iceberg_field.field_type.as_ref(), Type::Primitive(_));
         if !supported_storage {
             if explicit.is_some() {
                 return Err(unsupported_column(
@@ -1181,7 +1181,7 @@ mod tests {
             .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::optional(
                 7,
                 "v",
-                Type::Primitive(PrimitiveType::Variant),
+                Type::Variant(crate::iceberg::spec::VariantType),
             ))])
             .build()
             .expect("schema");

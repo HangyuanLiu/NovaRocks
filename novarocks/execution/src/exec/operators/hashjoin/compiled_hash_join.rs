@@ -66,7 +66,9 @@ use super::join_hash_map::gather::{
 };
 use super::join_hash_map::method::{BuildKeyBatch, JoinHashMap, JoinHashMapBuildOptions};
 use super::join_hash_map::search::{JoinSelection, append_cross_selection};
-use super::native_runtime_filter::{NativeRuntimeFilterProducerFactory, NativeRuntimeFilterProducerSet};
+use super::native_runtime_filter::{
+    NativeRuntimeFilterProducerFactory, NativeRuntimeFilterProducerSet,
+};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::node::join::JoinType;

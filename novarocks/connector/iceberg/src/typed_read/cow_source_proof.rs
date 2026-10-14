@@ -19,11 +19,11 @@
 //! This contains no read/access capability. The provider-owned pending source
 //! remains FE-local; its exact file and access recipe never cross this wire.
 
-use std::collections::BTreeSet;
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
-use crate::wire::dto;
-use super::{IcebergColumnHandle, IcebergTableHandle};
 use super::schema_binding::{IcebergMetadataColumn, metadata_target_field};
+use super::{IcebergColumnHandle, IcebergTableHandle};
+use crate::wire::dto;
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IcebergCowSourceProof {

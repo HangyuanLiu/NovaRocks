@@ -385,8 +385,7 @@ pub(super) fn package_typed(
     let complete =
         novarocks_functions::builtin::catalogue::build_builtin_engine_function_catalog().unwrap();
     let mut builder = FragmentBuilder::new(FragmentId::new(43));
-    let (columns, integral_literal_cast) =
-        typed_literal_values(&mut builder, types, literal_rows);
+    let (columns, integral_literal_cast) = typed_literal_values(&mut builder, types, literal_rows);
     // Constants: one non-null BIGINT pool, one ordinal per constant argument.
     let constants = shape
         .calls

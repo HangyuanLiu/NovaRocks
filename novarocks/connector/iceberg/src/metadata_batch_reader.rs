@@ -269,8 +269,9 @@ pub(crate) fn iceberg_type_to_arrow_type(
                 i32::try_from(*width)
                     .map_err(|_| format!("iceberg fixed width out of range: {width}"))?,
             ),
-            PrimitiveType::Binary | PrimitiveType::Variant => DataType::Binary,
+            PrimitiveType::Binary => DataType::Binary,
         }),
+        Type::Variant(_) => Ok(DataType::Binary),
         other => Err(format!(
             "iceberg metadata partition field must be primitive, got {other:?}"
         )),

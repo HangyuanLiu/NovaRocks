@@ -18,16 +18,16 @@
 //! Actual compiled window first-Data witness, through the original physical
 //! fixture emitter, real binding, LocalCompiler, runtime allocator and driver.
 //! This permanent original-equivalence expectation must not be changed to #1.
-use super::*;
 use super::super::window_fixture::package_typed;
-use novarocks_functions::{FunctionKind, KernelFailure};
-use novarocks_type_contract::FunctionValueType;
-use novarocks_physical_plan::LiteralValue;
-use arrow::datatypes::DataType;
-use crate::runtime::mem_tracker::MemTracker;
+use super::*;
 use crate::runtime::fragment::ExecutionFailureCause;
+use crate::runtime::mem_tracker::MemTracker;
+use arrow::datatypes::DataType;
+use novarocks_functions::{FunctionKind, KernelFailure};
+use novarocks_physical_plan::LiteralValue;
+use novarocks_type_contract::FunctionValueType;
 fn whole_invocation_probe(step: usize, later_root_error: bool) {
-    use WindowBound::{UnboundedPreceding, CurrentRow};
+    use WindowBound::{CurrentRow, UnboundedPreceding};
     let shape = Shape {
         partition: vec![3],
         order: vec![key(4, true, true)],

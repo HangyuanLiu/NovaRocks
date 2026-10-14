@@ -1848,7 +1848,7 @@ fn scalar_root_contract(
 
 #[test]
 fn scalar_local_program_rejects_naked_domain_without_wire_guard() {
-    use novarocks_local_program::{LocalProgramGraph, LocalProgramError, StaticSinkProgram};
+    use novarocks_local_program::{LocalProgramError, LocalProgramGraph, StaticSinkProgram};
     use novarocks_result_contract::{
         FrozenRootOutput, InternalResultDomain, RootOutputContract, RootProfileId, ScalarField,
         ScalarValueType,

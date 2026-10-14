@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::iceberg::spec::{Datum, PrimitiveType, Type};
+use crate::iceberg::spec::{Datum, Type};
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
 
@@ -491,9 +491,6 @@ fn decode_report_bounds(
                 ));
             }
         };
-        if matches!(prim, PrimitiveType::Variant) {
-            continue;
-        }
         let datum = Datum::try_from_bytes(&bytes, prim)
             .map_err(|e| format!("decode column stat {field}[{field_id}] failed: {e}"))?;
         out.insert(field_id, datum);

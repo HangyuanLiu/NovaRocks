@@ -182,7 +182,8 @@ fn sql_dependency_type_host_abort_borrows_the_actual_foreign_authority_cause_wit
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
     let cause = foreign
-        .resources().expect("test workload resource authority")
+        .resources()
+        .expect("test workload resource authority")
         .reserve(&task.owner.scope(), 1, ResourceClass::Data)
         .err()
         .unwrap();
@@ -215,8 +216,22 @@ fn sql_dependency_type_host_abort_borrows_the_actual_foreign_authority_cause_wit
     assert!(matches!(error,ProjectionFailure::Host(error) if std::ptr::eq(error,&cause)));
     assert_eq!(calls.load(Ordering::Relaxed), 1);
     assert_eq!(control.calls.lock().unwrap().len(), 1);
-    assert_eq!(actual.resources().expect("test workload resource authority").snapshot().held_bytes(), 0);
-    assert_eq!(foreign.resources().expect("test workload resource authority").snapshot().held_bytes(), 0);
+    assert_eq!(
+        actual
+            .resources()
+            .expect("test workload resource authority")
+            .snapshot()
+            .held_bytes(),
+        0
+    );
+    assert_eq!(
+        foreign
+            .resources()
+            .expect("test workload resource authority")
+            .snapshot()
+            .held_bytes(),
+        0
+    );
 }
 #[test]
 fn sql_dependency_type_host_abort_every_actual_admission_rolls_back_and_has_no_tail() {
@@ -226,7 +241,9 @@ fn sql_dependency_type_host_abort_every_actual_admission_rolls_back_and_has_no_t
     // It includes Arrow Field/metadata backing omitted by the old inline-only invoice.
     let source = 64 * 1024;
     let actual = owner();
-    let resources = actual.resources().expect("test workload resource authority");
+    let resources = actual
+        .resources()
+        .expect("test workload resource authority");
     let task = actual
         .try_begin_root(WorkRequest::new(WorkClass::Query))
         .unwrap();
@@ -272,7 +289,8 @@ fn sql_dependency_type_host_abort_every_actual_admission_rolls_back_and_has_no_t
                 seen += 1;
                 if seen == at {
                     let cause = foreign
-                        .resources().expect("test workload resource authority")
+                        .resources()
+                        .expect("test workload resource authority")
                         .reserve(
                             &scope,
                             facts.allocation_request_bytes_upper_bound.max(1) as u64,
@@ -301,7 +319,14 @@ fn sql_dependency_type_host_abort_every_actual_admission_rolls_back_and_has_no_t
         assert_eq!(seen, at);
         drop(held);
         assert_eq!(resources.snapshot().held_bytes(), 0);
-        assert_eq!(foreign.resources().expect("test workload resource authority").snapshot().held_bytes(), 0);
+        assert_eq!(
+            foreign
+                .resources()
+                .expect("test workload resource authority")
+                .snapshot()
+                .held_bytes(),
+            0
+        );
     }
 }
 #[test]
@@ -387,7 +412,8 @@ fn sql_dependency_type_host_abort_only_real_capacity_uses_control_projection_and
         limits(),
         &mut |facts| -> Result<(), AdmissionRefusal<WorkError>> {
             let cause = actual
-                .resources().expect("test workload resource authority")
+                .resources()
+                .expect("test workload resource authority")
                 .reserve(
                     &task.owner.scope(),
                     facts.allocation_request_bytes_upper_bound as u64,
@@ -416,5 +442,12 @@ fn sql_dependency_type_host_abort_only_real_capacity_uses_control_projection_and
         ))
     ));
     assert!(matches!(provenance, Some(WorkError::Capacity(_))));
-    assert_eq!(actual.resources().expect("test workload resource authority").snapshot().held_bytes(), 0);
+    assert_eq!(
+        actual
+            .resources()
+            .expect("test workload resource authority")
+            .snapshot()
+            .held_bytes(),
+        0
+    );
 }

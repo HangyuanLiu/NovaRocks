@@ -284,6 +284,18 @@ pub(crate) fn read_error_kind(kind: crate::iceberg::ErrorKind) -> ConnectorError
     }
 }
 
+/// REST conflict kinds produced by a received HTTP 409 response.
+/// Other SDK errors do not establish a safe cleanup frontier.
+pub(crate) fn proves_received_conflict(error: &crate::iceberg::Error) -> bool {
+    use crate::iceberg::ErrorKind;
+    matches!(
+        error.kind(),
+        ErrorKind::CatalogCommitConflicts
+            | ErrorKind::TableAlreadyExists
+            | ErrorKind::NamespaceAlreadyExists
+    )
+}
+
 /// Whether a vendored catalog error proves the mutation was **not** applied.
 ///
 /// This is the single place the dispatch question is answered, and it answers
@@ -371,6 +383,10 @@ pub(crate) fn classify_bridge_failure<T>(
 
 #[cfg(test)]
 mod tests {
+    //! Correctness coverage for the REST owner's temporary proof rule. The
+    //! expected set follows the received-409 contract; SDK retryability is not
+    //! an oracle. These local tests run with the connector suite and are owned
+    //! by the catalog maintainer until IRU-13a replaces this seam.
     use super::*;
     use crate::iceberg::{Error as IcebergError, ErrorKind};
 
@@ -458,6 +474,27 @@ mod tests {
         assert_eq!(failure.kind(), ConnectorMutationFailureKind::Conflict);
         assert!(outcome.permits_cleanup());
         assert!(!outcome.closes_mutation_authority());
+    }
+
+    #[test]
+    fn rest_proof_requires_a_received_conflict_kind() {
+        for kind in [
+            ErrorKind::CatalogCommitConflicts,
+            ErrorKind::TableAlreadyExists,
+            ErrorKind::NamespaceAlreadyExists,
+        ] {
+            assert!(proves_received_conflict(&err(kind)), "{kind:?}");
+        }
+        for kind in [
+            ErrorKind::TableNotFound,
+            ErrorKind::NamespaceNotFound,
+            ErrorKind::DataInvalid,
+            ErrorKind::PreconditionFailed,
+            ErrorKind::FeatureUnsupported,
+            ErrorKind::Unexpected,
+        ] {
+            assert!(!proves_received_conflict(&err(kind)), "{kind:?}");
+        }
     }
 
     #[test]

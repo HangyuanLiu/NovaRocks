@@ -152,9 +152,12 @@ fn original_unknown_zone_deepest_error_retains_entire_long_string() {
         args[0],
         DataType::Timestamp(TimeUnit::Microsecond, Some(zone.clone().into())),
     );
-    let expected = format!(
-        "Parser error: Invalid timezone \"{zone}\": only offset based timezones supported without chrono-tz feature"
-    );
+    // The feature-selected Arrow parser authors the complete source error.
+    let expected = zone
+        .parse::<arrow::array::timezone::Tz>()
+        .unwrap_err()
+        .to_string();
+    assert!(expected.contains(&zone));
     assert!(expected.len() > 512);
     assert_eq!(
         crate::exec::expr::function::date::parse_from_cast_source(&arena, cast, &chunk)

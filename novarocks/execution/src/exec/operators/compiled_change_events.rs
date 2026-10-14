@@ -42,7 +42,9 @@ use novarocks_local_program::{
     ProgramNodeKind,
 };
 
-use super::compiled_expression::{RuntimeKernelControl, evaluate_all, evaluate_selected, instances};
+use super::compiled_expression::{
+    RuntimeKernelControl, evaluate_all, evaluate_selected, instances,
+};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};

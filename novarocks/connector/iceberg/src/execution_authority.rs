@@ -241,6 +241,7 @@ impl ExecutionNodeCredentialsEndpointRefresher {
             .block_on(crate::catalog_runtime::build_rest_catalog_from_properties(
                 properties,
                 RestAccessDelegationMode::Vended,
+                self.runtime.iceberg_runtime().clone(),
             ))
             .map_err(|error| {
                 ConnectorError::new(

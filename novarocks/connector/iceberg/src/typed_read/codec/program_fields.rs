@@ -1038,7 +1038,7 @@ mod tests {
     fn exact_uuid_variant_and_legacy_declared_nominal_storage_are_distinct() {
         let schema = schema(vec![
             NestedField::required(1, "u", Type::Primitive(PrimitiveType::Uuid)),
-            NestedField::required(2, "v", Type::Primitive(PrimitiveType::Variant)),
+            NestedField::required(2, "v", Type::Variant(crate::iceberg::spec::VariantType)),
             NestedField::required(3, "raw", Type::Primitive(PrimitiveType::Fixed(16))),
             NestedField::required(4, "sketch", Type::Primitive(PrimitiveType::Binary)),
             NestedField::required(5, "text", Type::Primitive(PrimitiveType::String)),

@@ -18,9 +18,9 @@
 //! Actual original concat versus hosted concat; these probes do not activate
 //! compiled/public BY or manufacture a production Chunk/source pairing proof.
 use super::*;
-use novarocks_functions::selected_copy::concat_copy_in;
 use arrow::array::ListViewArray;
 use arrow::buffer::{BooleanBuffer, NullBuffer};
+use novarocks_functions::selected_copy::concat_copy_in;
 
 fn original(arrays: &[ArrayRef]) -> Result<ArrayRef, arrow::error::ArrowError> {
     arrow::compute::concat(&arrays.iter().map(|a| a.as_ref()).collect::<Vec<_>>())

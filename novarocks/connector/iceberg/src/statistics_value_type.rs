@@ -52,7 +52,7 @@ pub(crate) fn statistics_input_value_type(
             }
             ValueLogicalType::Uuid
         }
-        Type::Primitive(PrimitiveType::Variant) => {
+        Type::Variant(_) => {
             if field.data_type() != &DataType::LargeBinary {
                 return Err(
                     "Iceberg VARIANT statistics input requires its exact LargeBinary SQL carrier"
@@ -156,7 +156,8 @@ mod tests {
 
     #[test]
     fn variant_storage_identity_does_not_come_from_large_binary_carrier() {
-        let variant = NestedField::optional(7, "v", Type::Primitive(PrimitiveType::Variant));
+        let variant =
+            NestedField::optional(7, "v", Type::Variant(crate::iceberg::spec::VariantType));
         let binary = NestedField::optional(8, "v", Type::Primitive(PrimitiveType::Binary));
         let field = Field::new("v", DataType::LargeBinary, true);
         assert_eq!(

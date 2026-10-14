@@ -20,11 +20,11 @@
 //! must not be called before admission, even with a counting fmt::Write sink.
 //! This module measures their borrowed structural inputs, never renders an
 //! alternative message or selects concat value semantics.
-use super::{CopyError, add, mul, buffer_extent};
 use super::copy_diagnostic::{OriginalCopyData, OriginalTakeDiagnosticFacts};
+use super::{CopyError, add, buffer_extent, mul};
+use crate::KernelFailure;
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::opaque_memory::{OpaqueReservation, OpaqueRetainedCharge};
-use crate::KernelFailure;
 use arrow_array::Array;
 use arrow_schema::{ArrowError, DataType, Field};
 use std::fmt::{self, Write};

@@ -111,6 +111,10 @@ fn legacy_regexp_extract_baseline_group_zero_missing_negative_and_null() {
     }
 }
 #[test]
+#[expect(
+    clippy::invalid_regex,
+    reason = "The test verifies malformed pattern errors and evaluation order."
+)]
 fn legacy_regexp_extract_baseline_negative_index_regex_error_order_differs() {
     for wide in [false, true] {
         let columns = vec![

@@ -23,23 +23,39 @@ use crate::iceberg::spec::{
     Type,
 };
 
-fn schema(extra: bool) -> IcebergSchema {
+// Non-null initial defaults are lawful stock metadata only from v3 onward.
+// Write defaults remain valid across all tested versions under the SDK check.
+fn with_initial_default_for_version(
+    field: NestedField,
+    default: Literal,
+    version: FormatVersion,
+) -> NestedField {
+    if version == FormatVersion::V3 {
+        field.with_initial_default(default)
+    } else {
+        field
+    }
+}
+
+fn schema(version: FormatVersion, extra: bool) -> IcebergSchema {
     let mut fields = vec![
-        Arc::new(
+        Arc::new(with_initial_default_for_version(
             NestedField::optional(1, "tiny", PrimitiveType::Int.into())
-                .with_doc("real stored column documentation")
-                .with_initial_default(Literal::int(7)),
-        ),
+                .with_doc("real stored column documentation"),
+            Literal::int(7),
+            version,
+        )),
         Arc::new(NestedField::optional(
             2,
             "hidden",
             PrimitiveType::Long.into(),
         )),
-        Arc::new(
+        Arc::new(with_initial_default_for_version(
             NestedField::optional(3, "label", PrimitiveType::String.into())
-                .with_initial_default(Literal::string("quote \" and newline\n"))
                 .with_write_default(Literal::string("write default")),
-        ),
+            Literal::string("quote \" and newline\n"),
+            version,
+        )),
     ];
     if extra {
         fields.push(Arc::new(NestedField::optional(
@@ -80,7 +96,7 @@ fn loaded_stock_metadata(version: FormatVersion) -> TableMetadata {
         (HIDDEN_COLUMNS_PROPERTY.to_string(), "hidden".to_string()),
     ]);
     let base = TableMetadataBuilder::new(
-        schema(false),
+        schema(version, false),
         PartitionSpec::unpartition_spec().into_unbound(),
         SortOrder::unsorted_order(),
         "memory://cow-schema".to_string(),
@@ -97,7 +113,7 @@ fn loaded_stock_metadata(version: FormatVersion) -> TableMetadata {
         .into_builder(None)
         .add_snapshot(old_snapshot)
         .expect("historic snapshot")
-        .add_schema(schema(true))
+        .add_schema(schema(version, true))
         .expect("current schema")
         .set_current_schema(-1)
         .expect("select actual new schema")
@@ -156,7 +172,7 @@ fn stock_v1_v2_v3_current_and_historical_cow_schemas_keep_defaults_hidden_and_in
                     .metadata()
                     .get(crate::default_value::ICEBERG_INITIAL_DEFAULT_META_KEY)
                     .map(String::as_str),
-                Some("7")
+                (version == FormatVersion::V3).then_some("7")
             );
             assert_eq!(
                 borrowed

@@ -338,8 +338,7 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
         .iter()
         .map(|f| (f.id, f.name.clone()))
         .collect();
-    let manifest_list = snapshot
-        .load_manifest_list(table.file_io(), metadata)
+    let manifest_list = crate::manifest::load_manifest_list(&snapshot, table.file_io(), metadata)
         .await
         .map_err(|e| format!("load manifest list: {e}"))?;
     let mut seen_manifests = HashSet::new();
@@ -354,8 +353,7 @@ async fn observe_read_files<P: ObservedDataFileProjection>(
         if !seen_manifests.insert(manifest_file.manifest_path.as_str()) {
             continue;
         }
-        let manifest = manifest_file
-            .load_manifest(table.file_io())
+        let manifest = crate::manifest::load_manifest(&manifest_file, table.file_io())
             .await
             .map_err(|e| format!("load manifest: {e}"))?;
         check_read_control(control)?;
@@ -1401,7 +1399,6 @@ mod tests {
                 io.new_output(format!("memory:///manifest-{i}.avro"))
                     .unwrap(),
                 Some(77),
-                None,
                 metadata.current_schema().clone(),
                 spec.as_ref().clone(),
             );
@@ -1419,8 +1416,13 @@ mod tests {
             manifest_files.push(manifest_files[i].clone());
         }
         let list_path = "memory:///list.avro";
-        let mut list =
-            ManifestListWriter::v3(io.new_output(list_path).unwrap(), 77, None, 7, Some(0));
+        let mut list = ManifestListWriter::v3(
+            io.new_output(list_path).unwrap().writer().await.unwrap(),
+            77,
+            None,
+            7,
+            Some(0),
+        );
         list.add_manifests(manifest_files.into_iter()).unwrap();
         let added_rows = list.next_row_id().unwrap();
         list.close().await.unwrap();
@@ -1445,6 +1447,7 @@ mod tests {
             .unwrap()
             .metadata;
         Table::builder()
+            .runtime(crate::iceberg::Runtime::try_current().expect("test runtime"))
             .file_io(io)
             .metadata(metadata)
             .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
@@ -1455,6 +1458,7 @@ mod tests {
 
     fn with_metadata(table: &Table, metadata: TableMetadata) -> Table {
         Table::builder()
+            .runtime(crate::iceberg::Runtime::try_current().expect("test runtime"))
             .file_io(table.file_io().clone())
             .metadata(metadata)
             .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap())

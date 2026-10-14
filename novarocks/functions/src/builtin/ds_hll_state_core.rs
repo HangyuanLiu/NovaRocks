@@ -24,7 +24,9 @@ use crate::datasketches_hll::{HllHandle, HllTargetType};
 use crate::datasketches_hll_failure::{
     HllDataRecipe, HllFailureSink, HllInvariantRecipe, HllObservation,
 };
-use crate::sketch_hash::{SketchHashFailure, SketchHashFailureSink, prehash_array_value_with_failure};
+use crate::sketch_hash::{
+    SketchHashFailure, SketchHashFailureSink, prehash_array_value_with_failure,
+};
 use arrow_array::{ArrayRef, builder::BinaryBuilder};
 use std::{fmt, sync::Arc};
 type Error<F> = <F as HllFailureSink>::Error;

@@ -6306,6 +6306,8 @@ mod tests {
                 if let Err(failure) = result {
                     cause_preserved = failure
                         .source()
+                        .and_then(|source| source.source())
+                        .and_then(|source| source.source())
                         .and_then(|source| source.downcast_ref::<ConnectorError>())
                         .is_some_and(|actual| {
                             actual.message().as_ptr() == original_pointer && actual == &expected
@@ -6314,6 +6316,8 @@ mod tests {
                         crate::dml::error::DmlExecutionError::from(failure).into_dml_error(None);
                     dml_preserved = dml
                         .source()
+                        .and_then(|source| source.source())
+                        .and_then(|source| source.source())
                         .and_then(|source| source.source())
                         .and_then(|source| source.downcast_ref::<ConnectorError>())
                         .is_some_and(|actual| {

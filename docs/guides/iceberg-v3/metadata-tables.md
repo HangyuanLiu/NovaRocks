@@ -37,12 +37,12 @@ under the License.
 
 实现入口：
 
-- 读路径 op：`src/connector/iceberg/metadata.rs::IcebergMetadataScanOp`（native Rust，基于 vendored iceberg-rust 0.9 的 `iceberg::spec::TableMetadata`，不再走 JNI/Java SDK）
+- 读路径 op：`novarocks/connector/iceberg/src/typed_read/system_page_source.rs`（native Rust，基于 vendored iceberg-rust 0.11 的 `iceberg::spec::TableMetadata`，不再走 JNI/Java SDK）
 - Parser 路由：`src/sql/parser/dialect/mod.rs`（`<tbl>$<metatype>` 重写为 `<tbl>.__nr_meta_<metatype>__`）
 - Analyzer：`src/sql/analyzer/iceberg_metadata.rs`（`split_metadata_suffix`）+ `Relation::IcebergMetadataScan` variant
 - 当前覆盖：snapshots / history / refs。Files / Manifests / Partitions / LogicalIcebergMetadata 在 op 构造时 fail-fast 报 `not yet implemented in the native-Rust scan path`，留给后续 PR 用 iceberg-rust 的 manifest/scan API 补
 
-参考 plan：[2026-05-06-iceberg-v3-row-lineage-completion.md](../../design/plans/2026-05-06-iceberg-v3-row-lineage-completion.md)（Phase A）
+依赖基线与补丁政策见 [ADR-0174](../../adr/ADR-0174-vendored-iceberg-baseline-and-patch-policy.md)。0.11 的 metadata 解析拒绝 v1/v2 中的 v3 专有类型；Decimal 显示与 JSON 使用 `decimal(p, s)`，Binary/Fixed 默认值的奇数长度 hex 明确报错。V2 snapshot 缺 `sequence-number` 时取 0；v3 构建时解析加密属性，不意味着 NovaRocks 已支持加密读取。
 
 ---
 

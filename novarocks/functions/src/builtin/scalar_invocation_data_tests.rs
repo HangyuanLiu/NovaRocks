@@ -17,7 +17,9 @@
 
 use super::*;
 use crate::opaque_memory::{OpaqueAllocationHost, OpaqueRetainedCharge};
-use crate::{AggregateStateAllocator, FunctionValueType, KernelDiagnostic, KernelEvaluationControl};
+use crate::{
+    AggregateStateAllocator, FunctionValueType, KernelDiagnostic, KernelEvaluationControl,
+};
 use arrow_schema::DataType;
 use novarocks_type_contract::DecimalOverflowPolicy;
 use std::{

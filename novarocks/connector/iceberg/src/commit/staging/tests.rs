@@ -314,6 +314,7 @@ async fn every_stage_equals_canonical_prefix_and_whole_request() {
             .contains(&TableRequirement::DefaultSpecIdMatch { default_spec_id: 0 })
     );
     let table = crate::iceberg::table::Table::builder()
+        .runtime(crate::iceberg::Runtime::try_current().expect("test runtime"))
         .identifier(intent.target().ident.clone())
         .metadata(base.clone())
         .file_io(writer.io.clone())
@@ -690,6 +691,51 @@ async fn manifest_roundtrip_preserves_d12_sequences_and_carried_row_ids() {
     assert_eq!(entries[3].status, ManifestStatus::Deleted);
     assert_eq!(entries[3].snapshot_id, Some(11));
     assert_eq!(entries[3].data_file.first_row_id(), Some(100));
+}
+// Canonical provider-read protection: the expected inheritance is the legacy
+// physical-entry contract, independent of the SDK's v3 row-ID assignment.
+#[tokio::test]
+async fn provider_manifest_read_inherits_sequences_without_assigning_v3_row_ids() {
+    let metadata = fixture(FormatVersion::V3);
+    let artifacts = TestWriter::new();
+    let object = artifacts
+        .allocate(ArtifactClass::Attempt, ArtifactKind::Manifest)
+        .unwrap();
+    let mut writer = ManifestWriterBuilder::new(
+        artifacts.file_io().new_output(object.path()).unwrap(),
+        None,
+        metadata.current_schema().clone(),
+        metadata.default_partition_spec().as_ref().clone(),
+    )
+    .build_v3_data();
+    writer.add_file(data("new", 3, None), -1).unwrap();
+    writer.add_file(data("rewrite", 4, Some(80)), 2).unwrap();
+    writer
+        .add_existing_file(data("existing", 5, Some(100)), 1, 3, Some(4))
+        .unwrap();
+    let mut descriptor = writer.write_manifest_file().await.unwrap();
+    descriptor.added_snapshot_id = 11;
+    descriptor.first_row_id = Some(999);
+    for sequence in [0, 17] {
+        descriptor.sequence_number = sequence;
+        let manifest = crate::manifest::load_manifest(&descriptor, artifacts.file_io())
+            .await
+            .unwrap();
+        let entries = manifest.entries();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].snapshot_id, Some(11));
+        assert_eq!(entries[0].sequence_number, Some(sequence));
+        assert_eq!(entries[0].file_sequence_number, Some(sequence));
+        assert_eq!(entries[0].data_file.first_row_id(), None);
+        assert_eq!(entries[1].snapshot_id, Some(11));
+        assert_eq!(entries[1].sequence_number, Some(2));
+        assert_eq!(entries[1].file_sequence_number, Some(sequence));
+        assert_eq!(entries[1].data_file.first_row_id(), Some(80));
+        assert_eq!(entries[2].snapshot_id, Some(1));
+        assert_eq!(entries[2].sequence_number, Some(3));
+        assert_eq!(entries[2].file_sequence_number, Some(4));
+        assert_eq!(entries[2].data_file.first_row_id(), Some(100));
+    }
 }
 #[tokio::test]
 async fn manifest_list_allocates_historical_null_ranges_from_actual_writer_counter() {

@@ -228,7 +228,7 @@ impl<'a> CaptureBudget<'a> {
                         field(budget, &ty.value_field, child_prefix, child_depth)?,
                     ))?;
                 }
-                Type::Primitive(_) => (),
+                Type::Primitive(_) | Type::Variant(_) => (),
             }
             Ok(total)
         }

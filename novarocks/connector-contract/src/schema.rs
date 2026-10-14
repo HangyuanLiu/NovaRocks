@@ -19,10 +19,10 @@
 use crate::owned_copy::PlainCopy;
 use crate::{ConnectorError, ConnectorErrorKind, owned_copy::OwnedCopy};
 use arrow_schema::{DataType, Field, Schema};
-use novarocks_type_contract::owned_resources::{hashmap, layout};
 use novarocks_type_contract::owned_resources::metadata_materialization::{
     MaterializedField, MaterializedMetadataMap,
 };
+use novarocks_type_contract::owned_resources::{hashmap, layout};
 use std::{alloc::Layout, collections::HashMap, sync::Arc};
 
 fn absent() -> ConnectorError {

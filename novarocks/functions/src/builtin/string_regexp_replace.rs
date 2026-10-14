@@ -201,6 +201,10 @@ mod tests {
         }
     }
     #[test]
+    #[expect(
+        clippy::invalid_regex,
+        reason = "The test verifies malformed pattern errors and row masking."
+    )]
     fn selected_regexp_replace_sparse_masks_and_maps_original_rows() {
         let arrays = [
             Arc::new(StringArray::from(vec![

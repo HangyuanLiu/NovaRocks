@@ -46,19 +46,19 @@ pub use root_scratch_host::{
 mod child_scratch;
 use child_scratch::ChildScratchVec;
 
-#[path = "selected_copy/copy_diagnostic.rs"]
-mod copy_diagnostic;
 #[path = "selected_copy/concat_diagnostic.rs"]
 mod concat_diagnostic;
+#[path = "selected_copy/copy_diagnostic.rs"]
+mod copy_diagnostic;
 pub use copy_diagnostic::OriginalCopyData;
 
 use crate::KernelFailure;
+use arrow_array::cast::AsArray;
 use arrow_array::types::{ByteArrayType, Int16Type, Int32Type, Int64Type, RunEndIndexType};
 use arrow_array::{
     Array, ArrayRef, FixedSizeListArray, GenericByteArray, GenericListArray, GenericListViewArray,
     MapArray, OffsetSizeTrait, RunArray, StructArray, UnionArray, make_array,
 };
-use arrow_array::cast::AsArray;
 use arrow_data::ArrayData;
 use arrow_schema::{DataType, UnionMode};
 use std::ops::Range;

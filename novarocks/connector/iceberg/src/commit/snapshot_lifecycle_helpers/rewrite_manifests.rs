@@ -139,6 +139,10 @@ async fn write_manifest_list(
     let output = file_io
         .new_output(out_path)
         .map_err(|error| format!("create manifest-list output {out_path}: {error}"))?;
+    let output = output
+        .writer()
+        .await
+        .map_err(|error| format!("open manifest-list writer {out_path}: {error}"))?;
     let mut writer = match format_version {
         FormatVersion::V1 => ManifestListWriter::v1(output, snapshot_id, parent_snapshot_id),
         FormatVersion::V2 => {
@@ -186,7 +190,7 @@ async fn run_rewrite_manifests_with_table(
     let Some(current) = metadata.current_snapshot() else {
         return Ok(RewriteManifestsOutcome::default());
     };
-    let manifest_list = current.load_manifest_list(&file_io, metadata).await?;
+    let manifest_list = crate::manifest::load_manifest_list(&current, &file_io, metadata).await?;
     let manifest_files: Vec<ManifestFile> = manifest_list.entries().to_vec();
     if manifest_files.len() <= 1 {
         // Single (or zero) manifest: nothing to merge.
@@ -599,13 +603,8 @@ async fn merge_manifest_group(
     let schema = table_metadata.current_schema().clone();
 
     let output_file = file_io.new_output(new_manifest_path)?;
-    let builder = ManifestWriterBuilder::new(
-        output_file,
-        Some(new_snapshot_id),
-        None, // key_metadata
-        schema,
-        partition_spec,
-    );
+    let builder =
+        ManifestWriterBuilder::new(output_file, Some(new_snapshot_id), schema, partition_spec);
 
     let mut writer = match (format_version, content) {
         (FormatVersion::V1, ManifestContentType::Data) => builder.build_v1(),
@@ -619,7 +618,7 @@ async fn merge_manifest_group(
 
     // Collect all live entries from all manifests in the group.
     for manifest_file in group {
-        let manifest = manifest_file.load_manifest(file_io).await?;
+        let manifest = crate::manifest::load_manifest(&manifest_file, file_io).await?;
 
         // For V3 row-lineage: stamp an explicit first_row_id on each data file
         // so that the value is preserved after merge. When INSERT writes data

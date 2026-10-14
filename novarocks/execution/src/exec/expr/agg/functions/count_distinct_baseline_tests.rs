@@ -19,8 +19,8 @@
 //! Register as a cfg(test) child of agg::functions::count_distinct.
 use super::*;
 use arrow::array::{LargeStringArray, ListArray, NullArray, StructArray, UInt64Array};
-use arrow_buffer::i256;
 use arrow::datatypes::{Field, Fields, Int32Type};
+use arrow_buffer::i256;
 use std::mem::MaybeUninit;
 
 struct LegacyState {

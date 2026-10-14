@@ -884,10 +884,10 @@ fn sum_over_fails_the_query_only_for_a_frame_whose_result_overflows_bigint() {
 #[path = "compiled_window_crosscall_order_probe.rs"]
 mod compiled_window_crosscall_order_probe;
 
-#[path = "compiled_window_whole_invocation_order_tests.rs"]
-mod compiled_window_whole_invocation_order_tests;
 #[path = "compiled_window_tracked_by_tests.rs"]
 mod compiled_window_tracked_by_tests;
+#[path = "compiled_window_whole_invocation_order_tests.rs"]
+mod compiled_window_whole_invocation_order_tests;
 
 #[path = "compiled_window_memory_binding_tests.rs"]
 mod memory_binding_tests;

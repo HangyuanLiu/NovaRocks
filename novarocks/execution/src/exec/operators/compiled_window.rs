@@ -53,10 +53,10 @@ use arrow::compute::{concat, concat_batches};
 use arrow::record_batch::RecordBatch;
 use arrow::row::{OwnedRow, RowConverter, Rows, SortField};
 use novarocks_functions::{
-    EvaluatedArgument, FullPartitionWindowInput, PreparedWindowKernel, Selection,
-    WindowEvaluationPartition, WindowInvocationContext, WindowPartitionInput, WindowRowRange,
-    WindowResultCarrier, WindowInvocationScratch, AggregateStateAllocator, KernelEvaluationControl,
-    KernelFailure,
+    AggregateStateAllocator, EvaluatedArgument, FullPartitionWindowInput, KernelEvaluationControl,
+    KernelFailure, PreparedWindowKernel, Selection, WindowEvaluationPartition,
+    WindowInvocationContext, WindowInvocationScratch, WindowPartitionInput, WindowResultCarrier,
+    WindowRowRange,
 };
 use novarocks_local_program::{
     AnalyticOutputColumn, LocalProgram, ProgramCallSite, ProgramExpressionRootSite,
@@ -68,8 +68,10 @@ use novarocks_local_program::{
 mod invocation_input;
 use invocation_input::InvocationInputBuffer;
 
+use super::analytic_shared::{
+    AnalyticOutputValidationFailure, validate_analytic_output_columns_typed,
+};
 use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
-use super::analytic_shared::{AnalyticOutputValidationFailure, validate_analytic_output_columns_typed};
 use super::compiled_window_geometry::{admit_frame, frame_table, frame_table_tracked, peer_groups};
 use super::sort::normalize_sort_key_array;
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
@@ -457,7 +459,7 @@ impl CompiledWindowProcessor {
     }
     fn finish_invocation(&mut self) -> ExecutionResult<()> {
         use novarocks_functions::{
-            FullWindowInvocationInput, WindowInvocationInput, WindowEvaluationInvocation,
+            FullWindowInvocationInput, WindowEvaluationInvocation, WindowInvocationInput,
         };
         // Check the real capability even for an empty source. No default host.
         let host = self.control.allocator().ok_or_else(|| {

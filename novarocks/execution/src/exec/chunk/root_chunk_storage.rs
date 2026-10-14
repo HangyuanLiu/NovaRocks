@@ -19,7 +19,7 @@
 
 use super::root_array_storage::borrowed_root_batch_storage_with_types;
 use super::root_schema_backing::{
-    RootFieldSource, RootSchemaSource, RootSchemaBackingError, RootSchemaInspection,
+    RootFieldSource, RootSchemaBackingError, RootSchemaInspection, RootSchemaSource,
 };
 
 /// Explicit construction namespaces attached to this same ChunkSchema.

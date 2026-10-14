@@ -61,7 +61,9 @@ use crate::exec::node::table_write_relation::{
     ConnectorCommitFragmentEncoder, WriterMultiplexRelationSchema,
 };
 #[cfg(debug_assertions)]
-use crate::exec::node::table_write_relation::{TableWriteAggregateBoundary, TableWriteAggregateGuard};
+use crate::exec::node::table_write_relation::{
+    TableWriteAggregateBoundary, TableWriteAggregateGuard,
+};
 use crate::exec::node::table_writer::{
     TableWriterInputProjection, TableWriterNode, TableWriterPhysicalContextTemplate,
     TableWriterRuntimeBinding,

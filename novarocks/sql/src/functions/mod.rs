@@ -1071,11 +1071,7 @@ mod tests {
         for name in ["variant_get", "try_variant_get"] {
             let mut arguments = vec![
                 value_argument(DataType::LargeBinary, true, None),
-                value_argument(
-                    DataType::Utf8,
-                    false,
-                    Some(test_utf8_constant("$.value")),
-                ),
+                value_argument(DataType::Utf8, false, Some(test_utf8_constant("$.value"))),
             ];
             let binding = resolve_exact_scalar(&catalog, name, &arguments);
             assert_eq!(scalar_result(&binding).data_type, DataType::LargeBinary);
@@ -1366,17 +1362,9 @@ mod tests {
     fn literal_dependent_dynamic_scalars_freeze_exact_result_shapes() {
         let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
         let named = [
-            value_argument(
-                DataType::Utf8,
-                false,
-                Some(test_utf8_constant("left")),
-            ),
+            value_argument(DataType::Utf8, false, Some(test_utf8_constant("left"))),
             value_argument(DataType::Int64, false, None),
-            value_argument(
-                DataType::Utf8,
-                false,
-                Some(test_utf8_constant("right")),
-            ),
+            value_argument(DataType::Utf8, false, Some(test_utf8_constant("right"))),
             value_argument(DataType::Boolean, true, None),
         ];
         let named = resolve_exact_scalar(&catalog, "named_struct", &named);
@@ -1393,11 +1381,7 @@ mod tests {
             "round",
             &[
                 value_argument(DataType::Decimal128(18, 6), false, None),
-                value_argument(
-                    DataType::Int64,
-                    false,
-                    Some(test_i64_constant(2)),
-                ),
+                value_argument(DataType::Int64, false, Some(test_i64_constant(2))),
             ],
         );
         assert_eq!(
@@ -1410,16 +1394,8 @@ mod tests {
             "variant_get",
             &[
                 value_argument(DataType::LargeBinary, false, None),
-                value_argument(
-                    DataType::Utf8,
-                    false,
-                    Some(test_utf8_constant("$.x")),
-                ),
-                value_argument(
-                    DataType::Utf8,
-                    false,
-                    Some(test_utf8_constant("BIGINT")),
-                ),
+                value_argument(DataType::Utf8, false, Some(test_utf8_constant("$.x"))),
+                value_argument(DataType::Utf8, false, Some(test_utf8_constant("BIGINT"))),
             ],
         );
         assert_eq!(scalar_result(&variant).data_type, DataType::Int64);
@@ -1480,8 +1456,15 @@ mod tests {
     #[test]
     fn aggregate_resolution_is_catalog_backed_and_exact() {
         let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
-        let resolved = resolve_bound_aggregate(&catalog, "count", &[], &[], false, &crate::compiler::SqlCompileControl::unbounded())
-            .expect("count star resolves");
+        let resolved = resolve_bound_aggregate(
+            &catalog,
+            "count",
+            &[],
+            &[],
+            false,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("count star resolves");
         assert_eq!(
             resolved.overload.as_str(),
             "builtin.aggregate/count/derived-v1"
@@ -1502,7 +1485,14 @@ mod tests {
             Err(FunctionResolutionError::NoMatchingSignature { .. })
         ));
         assert_eq!(
-            resolve_bound_aggregate(&catalog, "not_an_aggregate", &[], &[], false, &crate::compiler::SqlCompileControl::unbounded()),
+            resolve_bound_aggregate(
+                &catalog,
+                "not_an_aggregate",
+                &[],
+                &[],
+                false,
+                &crate::compiler::SqlCompileControl::unbounded()
+            ),
             Err(FunctionResolutionError::UnknownFunction)
         );
 
@@ -1600,7 +1590,14 @@ mod tests {
             [DataType::Int64, DataType::Utf8, DataType::Boolean]
         );
         assert!(matches!(
-            resolve_bound_aggregate(&catalog, "multi_distinct_count", &[], &[], false, &crate::compiler::SqlCompileControl::unbounded()),
+            resolve_bound_aggregate(
+                &catalog,
+                "multi_distinct_count",
+                &[],
+                &[],
+                false,
+                &crate::compiler::SqlCompileControl::unbounded()
+            ),
             Err(FunctionResolutionError::NoMatchingSignature { .. })
         ));
 

@@ -17,9 +17,9 @@
 //! Source-paired per-request layouts, before SAME host band/admission policy.
 //! These probes do not grant memory or claim complete analytic stage funding.
 use super::*;
-use std::alloc::Layout;
-use novarocks_type_contract::owned_resources::metadata_materialization::MetadataAllocationLoan;
 use novarocks_memory::attribution::band;
+use novarocks_type_contract::owned_resources::metadata_materialization::MetadataAllocationLoan;
+use std::alloc::Layout;
 
 #[test]
 fn by_schema_allocation_stream_equals_original_request_contribution() {

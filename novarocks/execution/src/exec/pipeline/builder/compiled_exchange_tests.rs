@@ -29,7 +29,9 @@ use arrow::array::{Array, ArrayRef, Int64Array};
 use arrow::datatypes::DataType;
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::ConstantPolicy;
-use novarocks_local_compiler::{LocalCompileOptions, compile_fragment, validate_fragment_providers};
+use novarocks_local_compiler::{
+    LocalCompileOptions, compile_fragment, validate_fragment_providers,
+};
 use novarocks_local_program::{
     DataStreamPartitionType, KernelAbiVersion, LocalProgram, ProgramNodeKind, StaticSinkProgram,
 };

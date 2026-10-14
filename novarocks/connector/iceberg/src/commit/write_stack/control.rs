@@ -57,12 +57,12 @@ use novarocks_spi::connector::{
     CatalogHandle, ConnectorDistributedRewriteShape, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorManagedPublicationIntent, ConnectorMutationFailure,
     ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorProviderBindingKey,
-    ConnectorRequestContext, ConnectorWriteAbortOutcome, ConnectorWriteBaseVersion,
-    ConnectorWriteFieldBinding, ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
-    ConnectorWriteInputRequest, ConnectorWriteInputShape, ConnectorWriteReceipt,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome, ProviderBindingEpoch, StatisticsArtifactIdentity,
-    StatisticsRequiredAggregation, StatisticsScanColumn,
+    ConnectorRequestContext, ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose,
+    ConnectorWriteBaseVersion, ConnectorWriteFieldBinding, ConnectorWriteFieldRequest,
+    ConnectorWriteFieldToken, ConnectorWriteInputRequest, ConnectorWriteInputShape,
+    ConnectorWriteReceipt, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome, ProviderBindingEpoch,
+    StatisticsArtifactIdentity, StatisticsRequiredAggregation, StatisticsScanColumn,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2138,6 +2138,24 @@ impl IcebergWriteSessionControl {
         if staged.is_none() {
             crate::commit::validation::ensure_iceberg_write_supported_from_metadata(&metadata)
                 .map_err(|error| ConnectorError::new(ConnectorErrorKind::Unsupported, error))?;
+            // INSERT uses this ordinary data session instead of the legacy
+            // prepare_write call. Reuse its intent/ref policy after the existing
+            // generic support gate; other session flavors and input families
+            // retain their independent admission contracts.
+            if matches!(request.flavor, ConnectorWriteSessionFlavor::Ordinary)
+                && request.purpose == ConnectorWriteAdmissionPurpose::OrdinaryDml
+                && matches!(request.input, ConnectorWriteInputRequest::Data { .. })
+            {
+                let target_fqn = format!("{}.{}", self.key.instance_id.as_str(), request.table);
+                if let Some(denied) = crate::commit::write_preparation::insert_intent_support_denial(
+                    &metadata,
+                    request.intent,
+                    request.target_ref.as_str(),
+                    &target_fqn,
+                ) {
+                    return Err(denied);
+                }
+            }
         }
         let target_ref = request.target_ref.as_str();
         let base_snapshot_id = match &staged {
@@ -2598,16 +2616,18 @@ impl IcebergWriteSessionControl {
                     .await?;
                     let snapshot = owned.metadata().snapshot_by_id(snapshot_id).ok_or_else(||
                 format!("Iceberg frozen snapshot {snapshot_id} disappeared from pinned metadata"))?;
-                    let manifests = snapshot
-                        .load_manifest_list(owned.file_io(), owned.metadata())
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    let manifests = crate::manifest::load_manifest_list(
+                        snapshot,
+                        owned.file_io(),
+                        owned.metadata(),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
                     check()?;
                     let mut facts = BTreeMap::new();
                     for descriptor in manifests.entries() {
                         check()?;
-                        let manifest = descriptor
-                            .load_manifest(owned.file_io())
+                        let manifest = crate::manifest::load_manifest(descriptor, owned.file_io())
                             .await
                             .map_err(|error| error.to_string())?;
                         check()?;
@@ -3540,7 +3560,7 @@ mod statistics_contract_tests {
         let iceberg = schema(vec![Arc::new(NestedField::optional(
             9,
             "v",
-            Type::Primitive(PrimitiveType::Variant),
+            Type::Variant(crate::iceberg::spec::VariantType),
         ))]);
         let arrow = crate::schema_mapping::sql_read_schema_from_iceberg(&iceberg)
             .expect("SQL read carrier");
@@ -3896,6 +3916,17 @@ mod eager_attempt_io_tests {
             self.inner.delete(path).await
         }
 
+        async fn delete_stream(
+            &self,
+            mut paths: futures::stream::BoxStream<'static, String>,
+        ) -> crate::iceberg::Result<()> {
+            use futures::StreamExt;
+            while let Some(path) = paths.next().await {
+                self.delete(&path).await?;
+            }
+            Ok(())
+        }
+
         async fn delete_prefix(&self, path: &str) -> crate::iceberg::Result<()> {
             self.inner.delete_prefix(path).await
         }
@@ -4030,13 +4061,16 @@ mod eager_attempt_io_tests {
         .build()
         .expect("metadata")
         .metadata;
+        let sdk_runtime = crate::iceberg::Runtime::try_current().expect("test runtime");
         let table = crate::iceberg::table::Table::builder()
             .identifier(TableIdent::from_strs(["db", "t"]).expect("identifier"))
             .metadata(metadata)
             .file_io(file_io)
+            .runtime(sdk_runtime.clone())
             .build()
             .expect("table");
         let catalog = MemoryCatalogBuilder::default()
+            .with_runtime(sdk_runtime)
             .with_storage_factory(factory)
             .load(
                 "counting",

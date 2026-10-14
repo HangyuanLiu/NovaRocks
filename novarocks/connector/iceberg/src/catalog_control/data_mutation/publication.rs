@@ -59,6 +59,13 @@ impl Publisher for MutationPublisher {
             )));
         };
         let table = crate::iceberg::table::Table::builder()
+            .runtime(
+                self.runtime
+                    .resources()
+                    .catalog_runtime()
+                    .iceberg_runtime()
+                    .clone(),
+            )
             .identifier(self.inner.ident.clone())
             .metadata(metadata.clone())
             .metadata_location(metadata_location.clone())
@@ -361,7 +368,7 @@ impl RegisteredIcebergDataMutationBackend {
                 .table
                 .metadata()
                 .properties()
-                .get(crate::iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
+                .get(crate::iceberg::spec::TableProperties::PROPERTY_DEFAULT_NAME_MAPPING)
                 .map(|mapping| crate::schema_mapping::canonical_name_mapping(mapping))
                 .transpose()
                 .map_err(map_provider_error)?;

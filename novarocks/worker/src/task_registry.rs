@@ -4553,7 +4553,9 @@ mod registry_lock_observation_tests {
 mod preparation_snapshot_tests {
     use super::*;
     use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
-    use novarocks_types::{AttemptId, BackendProcessId, FrontendProcessId, QueryId, StageId, TaskId};
+    use novarocks_types::{
+        AttemptId, BackendProcessId, FrontendProcessId, QueryId, StageId, TaskId,
+    };
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::mpsc;
 

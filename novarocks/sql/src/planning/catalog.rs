@@ -798,8 +798,16 @@ mod tests {
             let [Statement::Query(query)] = statements.as_slice() else {
                 panic!("expected query")
             };
-            let error = analyze_view_query(query, &catalog, "default", functions, crate::constant::test_constant_policy(), &crate::compiler::SqlCompileControl::unbounded()).map_err(|error| error.to_string())
-                .expect_err("private producer must not become VARBINARY");
+            let error = analyze_view_query(
+                query,
+                &catalog,
+                "default",
+                functions,
+                crate::constant::test_constant_policy(),
+                &crate::compiler::SqlCompileControl::unbounded(),
+            )
+            .map_err(|error| error.to_string())
+            .expect_err("private producer must not become VARBINARY");
             assert_eq!(
                 error,
                 "Object and Percentile result domains are unsupported for persisted schemas"
@@ -810,8 +818,16 @@ mod tests {
         let [Statement::Query(query)] = statements.as_slice() else {
             panic!("expected query")
         };
-        let columns = analyze_view_query(query, &catalog, "default", functions, crate::constant::test_constant_policy(), &crate::compiler::SqlCompileControl::unbounded()).map_err(|error| error.to_string())
-            .expect("ordinary Binary view remains admitted");
+        let columns = analyze_view_query(
+            query,
+            &catalog,
+            "default",
+            functions,
+            crate::constant::test_constant_policy(),
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .map_err(|error| error.to_string())
+        .expect("ordinary Binary view remains admitted");
         assert_eq!(columns[0].data_type, arrow::datatypes::DataType::Binary);
     }
 
@@ -844,7 +860,15 @@ mod tests {
         };
         let functions = crate::functions::builtin_sql_function_catalog();
         assert_eq!(
-            analyze_view_query(query, &catalog, "default", functions, crate::constant::test_constant_policy(), &crate::compiler::SqlCompileControl::unbounded()).map_err(|error| error.to_string()),
+            analyze_view_query(
+                query,
+                &catalog,
+                "default",
+                functions,
+                crate::constant::test_constant_policy(),
+                &crate::compiler::SqlCompileControl::unbounded()
+            )
+            .map_err(|error| error.to_string()),
             Err(
                 "Object and Percentile result domains are unsupported for persisted schemas".into()
             )

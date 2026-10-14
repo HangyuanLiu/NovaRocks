@@ -17,20 +17,20 @@
 
 //! Complete take probes borrow the actual production expression host. Test
 //! ledgers are diagnostics, never an alternative allocator or capacity wallet.
-use super::{expression_allocation_host, MemTracker};
+use super::{MemTracker, expression_allocation_host};
 use arrow::array::{
-    Array, ArrayRef, Int8Array, Int16Array, Int32Array, Int64Array, StringArray, LargeStringArray,
-    StringViewArray, ListArray, DictionaryArray, UInt32Array, UInt64Array, RunArray, UnionArray,
-    StructArray, NullArray,
+    Array, ArrayRef, DictionaryArray, Int8Array, Int16Array, Int32Array, Int64Array,
+    LargeStringArray, ListArray, NullArray, RunArray, StringArray, StringViewArray, StructArray,
+    UInt32Array, UInt64Array, UnionArray,
 };
 use arrow::buffer::{OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, Int8Type, Int16Type, UnionFields};
+use novarocks_functions::opaque_memory::OpaqueAllocationHost;
+use novarocks_functions::selected_copy::{CopyIndices, CopyOperationError, take_copy_in};
 use novarocks_functions::{
     AggregateStateAllocator, KernelDiagnostic, KernelEvaluationControl, KernelFailure,
     MAX_UNOBSERVED_KERNEL_WORK,
 };
-use novarocks_functions::opaque_memory::OpaqueAllocationHost;
-use novarocks_functions::selected_copy::{CopyIndices, CopyOperationError, take_copy_in};
 use std::{
     alloc::Layout,
     ptr::NonNull,

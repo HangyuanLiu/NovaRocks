@@ -1414,12 +1414,13 @@ mod tests {
         execution: QueryExecutionId,
         purpose: FullBindPurpose,
     ) -> super::super::RequestBoundNativeTemplate {
-        use arrow::datatypes::DataType;
+        use arrow::array::{Array, Int64Array};
+        use arrow::datatypes::{DataType, Field};
         use novarocks_physical_plan::{
-            Distribution, ExprKind, FragmentBuilder, FragmentSink, LiteralValue, NodeKind,
-            OutputPort, PhysicalNode, PhysicalProperties, PipelineDopDomain, PlanBuilder,
-            PlanVersionId, ResultField, ResultPort, ResultValueDomain, RowMultiplicity,
-            ValueOrigin, ValueType,
+            ConstantPoolId, ConstantPools, ConstantReference, Distribution, ExprKind,
+            FragmentBuilder, FragmentSink, NodeKind, OutputPort, PhysicalNode, PhysicalProperties,
+            PipelineDopDomain, PlanBuilder, PlanVersionId, ResultField, ResultPort,
+            ResultValueDomain, RowMultiplicity, ValueOrigin, ValueType,
         };
         use novarocks_query_application::preparation::{
             CompletedPhysicalPlanCandidate, CompletedPlanWithAccess, FinalPlanRuntimeAccess,
@@ -1431,9 +1432,28 @@ mod tests {
         let mut fragment = FragmentBuilder::new(fragment_id);
         let node = fragment.reserve_node_id().expect("one node");
         let ty = ValueType::new(DataType::Int64, false);
+        let pool_id = ConstantPoolId::new(0);
+        let pool = novarocks_physical_plan::ConstantPool::try_new(
+            std::sync::Arc::new(Field::new("payload", DataType::Int64, false)),
+            ty.clone(),
+            Int64Array::from(vec![7]).to_data(),
+            crate::application::test_constant_policy(),
+            novarocks_type_contract::CompilePhase::Encode,
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("one checked original Int64 constant");
+        let mut constants = ConstantPools::empty();
+        constants.insert(pool_id, pool).expect("one constant pool");
         let literal = fragment
-            .add_expression(node, ty.clone(), ExprKind::Literal(LiteralValue::Int64(7)))
-            .expect("one exact Int64 literal");
+            .add_expression(
+                node,
+                ty.clone(),
+                ExprKind::Constant(ConstantReference {
+                    pool: pool_id,
+                    ordinal: 0,
+                }),
+            )
+            .expect("one exact checked Int64 constant reference");
         let value = fragment
             .add_value(
                 ty.clone(),
@@ -1474,7 +1494,7 @@ mod tests {
                 },
             )
             .expect("one singleton result fragment");
-        let mut plan = PlanBuilder::new(version);
+        let mut plan = PlanBuilder::new(version).with_constant_pools(constants);
         plan.add_fragment(fragment).expect("one fragment");
         plan.set_result_port(ResultPort {
             scalar_schema: None,
@@ -1489,7 +1509,9 @@ mod tests {
             }]),
         })
         .expect("one original result occurrence");
-        let plan = plan.finish().expect("production whole-plan validation");
+        let plan = plan
+            .finish_observed(&novarocks_sql::compiler::SqlCompileControl::unbounded())
+            .expect("production caller-observed whole-plan validation");
         let output = match purpose {
             FullBindPurpose::ClientRows => FrozenRootOutput::ClientRows(
                 novarocks_sql::compiler::client_render_schema(&plan, 0)
@@ -1501,9 +1523,9 @@ mod tests {
             plan,
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
-            .expect("production completed program validation")
-            .freeze_root_output(output)
-            .expect("freeze the original root purpose");
+        .expect("production completed program validation")
+        .freeze_root_output(output)
+        .expect("freeze the original root purpose");
         let paired =
             CompletedPlanWithAccess::try_pair(
                 candidate,

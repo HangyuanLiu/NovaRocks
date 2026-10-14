@@ -532,9 +532,13 @@ fn complete_profile(
         }
     }
     lines.extend(match formatter.plan {
-        ProfilePlan::Completed { plan, annotations } => {
-            render_completed_profile(&plan, &annotations, &actuals, &per_fragment, &formatter.control)?
-        }
+        ProfilePlan::Completed { plan, annotations } => render_completed_profile(
+            &plan,
+            &annotations,
+            &actuals,
+            &per_fragment,
+            &formatter.control,
+        )?,
     });
     build_string_query_result("Explain String", lines).map(StatementResult::Query)
 }

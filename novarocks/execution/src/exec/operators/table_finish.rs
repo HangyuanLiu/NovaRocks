@@ -65,13 +65,17 @@ use crate::exec::node::table_write_relation::{
     WriterMultiplexRelationSchema,
 };
 #[cfg(debug_assertions)]
-use crate::exec::node::table_write_relation::{TableWriteAggregateBoundary, TableWriteAggregateGuard};
+use crate::exec::node::table_write_relation::{
+    TableWriteAggregateBoundary, TableWriteAggregateGuard,
+};
 use crate::exec::node::unpivot::{UnpivotPassthroughColumn, UnpivotValueMapping};
 use crate::exec::operators::aggregate::AggregateProcessorFactory;
 use crate::exec::operators::blocked_duration::BlockedDuration;
 use crate::exec::operators::table_writer::TableWriteRelationColumns;
 use crate::exec::operators::unpivot_processor::UnpivotProcessorFactory;
-use crate::exec::pipeline::operator::{FinishWatch, Operator, ProcessorOperator, forward_observable};
+use crate::exec::pipeline::operator::{
+    FinishWatch, Operator, ProcessorOperator, forward_observable,
+};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};

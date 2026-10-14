@@ -23,21 +23,36 @@ use novarocks_physical_plan::RuntimeFilterConsumerTarget;
 use novarocks_sql::compiler::SqlPhysicalEmissionMode;
 
 fn sources() -> Vec<novarocks_sql::compiler::SqlAuthoredPhysicalPlan> {
-    let original = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/sql/correctness/filter/sql/filter_multiple_subqueries.sql"));
+    let original = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/sql/correctness/filter/sql/filter_multiple_subqueries.sql"
+    ));
     let selects = &original[original.find("-- query 2\n").unwrap()..];
-    let queries = selects.split(';').map(|statement| {
-        statement.lines().filter(|line| !line.trim_start().starts_with("--"))
-            .collect::<Vec<_>>().join("\n").trim().to_owned()
-    }).filter(|statement| !statement.is_empty()).collect::<Vec<_>>();
+    let queries = selects
+        .split(';')
+        .map(|statement| {
+            statement
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .trim()
+                .to_owned()
+        })
+        .filter(|statement| !statement.is_empty())
+        .collect::<Vec<_>>();
     assert_eq!(queries.len(), 5);
-    queries.into_iter().map(|statement| {
-        assert!(statement.starts_with("SELECT"));
-        sql_source_with_columns(
-            &statement.replace("${case_db}", "fixture"),
-            SqlPhysicalEmissionMode::OriginalNativeV1,
-            &[("id", DataType::Int64), ("v", DataType::Int64)],
-        )
-    }).collect()
+    queries
+        .into_iter()
+        .map(|statement| {
+            assert!(statement.starts_with("SELECT"));
+            sql_source_with_columns(
+                &statement.replace("${case_db}", "fixture"),
+                SqlPhysicalEmissionMode::OriginalNativeV1,
+                &[("id", DataType::Int64), ("v", DataType::Int64)],
+            )
+        })
+        .collect()
 }
 
 #[test]
@@ -46,14 +61,23 @@ fn join_probe_filter_actual_original_sql_full_target_contract() {
     for (query, source) in sources().into_iter().enumerate() {
         for (id, filter) in source.plan().runtime_filters() {
             for consumer in &filter.consumers {
-                eprintln!("original subquery query={} filter={id:?} consumer={consumer:?} contract={filter:?}", query + 2);
-                if matches!(consumer.target, RuntimeFilterConsumerTarget::JoinProbeKey { .. }) {
+                eprintln!(
+                    "original subquery query={} filter={id:?} consumer={consumer:?} contract={filter:?}",
+                    query + 2
+                );
+                if matches!(
+                    consumer.target,
+                    RuntimeFilterConsumerTarget::JoinProbeKey { .. }
+                ) {
                     probes += 1;
                 }
             }
         }
     }
-    assert!(probes > 0, "original required SQL must exercise the missing probe-key consumer");
+    assert!(
+        probes > 0,
+        "original required SQL must exercise the missing probe-key consumer"
+    );
 }
 
 #[test]
@@ -61,7 +85,8 @@ fn join_probe_filter_actual_original_sql_complete_compilation() {
     let functions = installed_builtin_owner_catalogue();
     for source in sources() {
         for (fragment, result) in compiler_results(&source, &functions) {
-            result.unwrap_or_else(|error| panic!("original subquery fragment {fragment:?}: {error}"));
+            result
+                .unwrap_or_else(|error| panic!("original subquery fragment {fragment:?}: {error}"));
         }
     }
 }
@@ -69,9 +94,9 @@ fn join_probe_filter_actual_original_sql_complete_compilation() {
 #[test]
 fn join_probe_owned_actual_sql_compiler_every_callback_preserves_three_causes() {
     use super::filter_conjunction_actual_sql_compiler_tests::{
-        source_packages, validate_package, compile_options,
+        compile_options, source_packages, validate_package,
     };
-    use novarocks_type_contract::{PureCompileControl, CompilePhase, CompileControlError};
+    use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
     use std::sync::Mutex;
     struct Trace {
         events: Mutex<Vec<(CompilePhase, u32)>>,

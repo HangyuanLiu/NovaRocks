@@ -28,7 +28,9 @@ use novarocks_local_program::{
     LocalProgram, ProgramExpressionRootSite, ProgramRootInput, StaticExprKind, root_input_layout,
 };
 use novarocks_sql::compiler::SqlPhysicalEmissionMode;
-use novarocks_type_contract::{CompileControlError, CompilePhase, ControlShape, PureCompileControl};
+use novarocks_type_contract::{
+    CompileControlError, CompilePhase, ControlShape, PureCompileControl,
+};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,

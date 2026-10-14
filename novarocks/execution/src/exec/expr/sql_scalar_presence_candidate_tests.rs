@@ -127,9 +127,13 @@ fn sql_presence_candidate_snapshot_keeps_exact_bindings_and_table_owner_separate
     let again = scoped.snapshot().snapshot_for_scalar_presence();
     let control = SqlCompileControl::unbounded();
     let args = [argument(DataType::Utf8)];
-    let expected = original
+    let original_binding = original
         .resolve_scalar_binding("reverse", &args, &control)
         .unwrap();
+    assert_eq!(original_binding.admitted_execution_abi, None);
+    // Scoped admission adds its exact ABI without replacing original facts.
+    let mut expected = original_binding.clone();
+    expected.admitted_execution_abi = Some(novarocks_functions::PureKernelAbi::ScalarV1);
     assert_eq!(
         scoped
             .resolve_scalar_binding("reverse", &args, &control)
@@ -159,17 +163,20 @@ fn sql_presence_candidate_snapshot_keeps_exact_bindings_and_table_owner_separate
         .resolve_table_binding("unnest", &bounds, &control)
         .unwrap();
     assert_eq!(table.kind, FunctionKind::Table);
+    assert_eq!(table.admitted_execution_abi, None);
+    let mut expected_table = table.clone();
+    expected_table.admitted_execution_abi = Some(novarocks_functions::PureKernelAbi::TableV1);
     assert_eq!(
         scoped
             .resolve_table_binding("unnest", &bounds, &control)
             .unwrap(),
-        table
+        expected_table
     );
     assert_eq!(
         again
             .resolve_table_binding("unnest", &bounds, &control)
             .unwrap(),
-        table
+        expected_table
     );
 }
 

@@ -2413,6 +2413,7 @@ fn struct_types_share_field_identities(previous: &StructType, next: &StructType)
 fn types_share_field_identities(previous: &Type, next: &Type) -> bool {
     match (previous, next) {
         (Type::Primitive(previous), Type::Primitive(next)) => previous == next,
+        (Type::Variant(previous), Type::Variant(next)) => previous == next,
         (Type::Struct(previous), Type::Struct(next)) => {
             struct_types_share_field_identities(previous, next)
         }
@@ -2437,7 +2438,10 @@ fn types_share_field_identities(previous: &Type, next: &Type) -> bool {
                     &next.value_field.field_type,
                 )
         }
-        (Type::Primitive(_) | Type::Struct(_) | Type::List(_) | Type::Map(_), _) => false,
+        (
+            Type::Primitive(_) | Type::Variant(_) | Type::Struct(_) | Type::List(_) | Type::Map(_),
+            _,
+        ) => false,
     }
 }
 
@@ -2633,8 +2637,7 @@ async fn pinned_snapshot_manifest_list(
     let snapshot = metadata
         .snapshot_by_id(snapshot_id)
         .ok_or_else(|| format!("iceberg snapshot {snapshot_id} is absent from table metadata"))?;
-    let manifest_list = snapshot
-        .load_manifest_list(table.file_io(), metadata)
+    let manifest_list = crate::manifest::load_manifest_list(snapshot, table.file_io(), metadata)
         .await
         .map_err(|error| format!("load manifest list: {error}"))?;
     check_manifest_control(control.map(|control| control as &dyn ConnectorOperationControl))?;
@@ -2912,7 +2915,7 @@ fn connector_value_type(primitive: &PrimitiveType) -> Option<ConnectorValueType>
             }
         }
         PrimitiveType::Binary => ConnectorValueType::Varbinary,
-        PrimitiveType::Variant | PrimitiveType::Decimal { .. } | PrimitiveType::Fixed(_) => {
+        PrimitiveType::Decimal { .. } | PrimitiveType::Fixed(_) => {
             return None;
         }
     })
@@ -3741,6 +3744,7 @@ mod attempt_access_tests {
     }
 
     fn physical_table(
+        runtime: &crate::iceberg::Runtime,
         binding: crate::access_binding::IcebergReadBinding,
         metadata_location: &str,
     ) -> IcebergPhysicalTable {
@@ -3772,6 +3776,7 @@ mod attempt_access_tests {
             ))
             .metadata(metadata)
             .metadata_location(metadata_location.to_string())
+            .runtime(runtime.clone())
             .build()
             .expect("table");
         IcebergPhysicalTable::new(table)
@@ -3827,7 +3832,15 @@ mod attempt_access_tests {
             .resources()
             .planning_binding()
             .for_request(old_attempt.clone());
-        let physical = physical_table(old_binding, "s3://warehouse/data/table/metadata/v1.json");
+        let physical = physical_table(
+            template
+                .runtime
+                .resources()
+                .catalog_runtime()
+                .iceberg_runtime(),
+            old_binding,
+            "s3://warehouse/data/table/metadata/v1.json",
+        );
         let old_file_io = physical.table.file_io() as *const _;
         let frozen_uuid = physical.table.metadata().uuid();
         let frozen_snapshot = physical.table.metadata().current_snapshot_id();

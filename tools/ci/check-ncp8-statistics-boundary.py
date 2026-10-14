@@ -36,6 +36,8 @@ EXECUTION = "novarocks-execution"
 FUNCTIONS = "novarocks-functions"
 TYPE_CONTRACT = "novarocks-type-contract"
 RESULT_CONTRACT = "novarocks-result-contract"
+CONSTANT_CONTRACT = "novarocks-constant-contract"
+FUNCTION_CONTRACT = "novarocks-function-contract"
 ICEBERG_FUNCTIONS = "novarocks-connector-iceberg-functions"
 ICEBERG_PROVIDER = "novarocks-connector-iceberg"
 NATIVE_ADAPTER = "novarocks-native-adapter"
@@ -43,7 +45,7 @@ FRONTEND_APPLICATION = "novarocks-frontend-application"
 SERVER = "novarocks-server"
 
 ROLE_PACKAGES = {FRONTEND_APPLICATION, NATIVE_ADAPTER, SERVER}
-ALLOWED_PRODUCTION_DATASKETCHES_OWNERS = {EXECUTION, ICEBERG_FUNCTIONS}
+ALLOWED_PRODUCTION_DATASKETCHES_OWNERS = {EXECUTION, FUNCTIONS, ICEBERG_FUNCTIONS}
 FORBIDDEN_ICEBERG_FUNCTIONS_CLOSURE = {
     EXECUTION,
     NATIVE_ADAPTER,
@@ -209,7 +211,9 @@ def verify_dependency_boundary(metadata, repo_root):
     if result_contract["dependencies"]:
         fail(f"{RESULT_CONTRACT} must not declare dependencies")
 
+    # Both the runtime aggregate adapter and pure scalar HLL owner use HLL only.
     require_exact_dependency(execution, DATASKETCHES, kind=None, features={"hll"})
+    require_exact_dependency(functions, DATASKETCHES, kind=None, features={"hll"})
     require_exact_dependency(
         iceberg_functions, DATASKETCHES, kind=None, features={"theta"}
     )
@@ -241,12 +245,13 @@ def verify_dependency_boundary(metadata, repo_root):
         for name in normal_closure(metadata, ICEBERG_FUNCTIONS)
         if name.startswith("novarocks-")
     }
-    # novarocks-functions carries shared type/result vocabulary through
-    # novarocks-type-contract and dependency-free novarocks-result-contract.
-    # These are contract crates, not application or provider owners; the forbidden set
-    # below still fences execution, the native adapter, the server, and the
-    # Iceberg provider.
-    expected_internal = {ICEBERG_FUNCTIONS, FUNCTIONS, TYPE_CONTRACT, RESULT_CONTRACT}
+    # Functions carries exact type/result vocabulary, immutable typed constants,
+    # and original call requests. These contracts own no runtime or provider
+    # authority; arbitrary internal owners remain outside this exact closure.
+    expected_internal = {
+        ICEBERG_FUNCTIONS, FUNCTIONS, TYPE_CONTRACT, RESULT_CONTRACT,
+        CONSTANT_CONTRACT, FUNCTION_CONTRACT,
+    }
     if iceberg_internal != expected_internal:
         fail(
             f"{ICEBERG_FUNCTIONS} internal normal closure must be exactly "
@@ -268,15 +273,28 @@ def verify_dependency_boundary(metadata, repo_root):
         if name.startswith("novarocks-")
     }
     # Keep the same exact pure vocabulary closure for the scalar owner.
-    expected_functions_internal = {FUNCTIONS, TYPE_CONTRACT, RESULT_CONTRACT}
+    expected_functions_internal = {
+        FUNCTIONS, TYPE_CONTRACT, RESULT_CONTRACT, CONSTANT_CONTRACT, FUNCTION_CONTRACT,
+    }
     if functions_internal != expected_functions_internal:
         fail(
             f"{FUNCTIONS} internal normal closure must be exactly "
             f"{sorted(expected_functions_internal)}, got "
             + ", ".join(sorted(functions_internal))
         )
-    if DATASKETCHES in normal_closure(metadata, FUNCTIONS):
-        fail(f"{FUNCTIONS} normal closure must not contain {DATASKETCHES}")
+    functions_closure = normal_closure(metadata, FUNCTIONS)
+    functions_sketch_owners = sorted(
+        package["name"]
+        for package in metadata["packages"]
+        if package["name"] in functions_closure
+        and direct_dependencies(package, DATASKETCHES)
+        and package["name"] != FUNCTIONS
+    )
+    if functions_sketch_owners:
+        fail(
+            f"{FUNCTIONS} normal closure has indirect {DATASKETCHES} owners: "
+            + ", ".join(functions_sketch_owners)
+        )
 
     if direct_dependencies(execution, ICEBERG_PROVIDER):
         fail(f"{EXECUTION} must not directly depend on {ICEBERG_PROVIDER}")
@@ -299,7 +317,7 @@ def verify_dependency_boundary(metadata, repo_root):
         for package in metadata["packages"]
         if package["name"] in execution_closure
         and direct_dependencies(package, DATASKETCHES)
-        and package["name"] != EXECUTION
+        and package["name"] not in {EXECUTION, FUNCTIONS}
     )
     if execution_sketch_owners:
         fail(

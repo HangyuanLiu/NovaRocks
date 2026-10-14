@@ -18,8 +18,8 @@
 //! Optional positive receipts emitted by the existing owned schema visitor.
 use crate::owned_copy::OwnedCopy;
 use novarocks_type_contract::owned_resources::metadata_materialization::{
-    SchemaMetadataMaterializations, SharedMaterializedField, SharedMaterializedSchema,
-    MetadataFieldLoan,
+    MetadataFieldLoan, SchemaMetadataMaterializations, SharedMaterializedField,
+    SharedMaterializedSchema,
 };
 use std::{alloc::Layout, collections::TryReserveError};
 

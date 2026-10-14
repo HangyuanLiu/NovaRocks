@@ -18,8 +18,8 @@
 //! Raw original Arrow concat authors used by ONE analytic gather. These
 //! probes distinguish concat resources from MutableArrayData semantics.
 use arrow::array::{
-    Array, ArrayRef, DictionaryArray, Int8Array, Int16Array, Int64Array, StringArray,
-    ListViewArray, RunArray,
+    Array, ArrayRef, DictionaryArray, Int8Array, Int16Array, Int64Array, ListViewArray, RunArray,
+    StringArray,
 };
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{DataType, Field, Int8Type, Int16Type};

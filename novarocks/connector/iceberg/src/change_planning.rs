@@ -308,6 +308,7 @@ fn field_differs_only_by_name(previous: &NestedField, next: &NestedField) -> boo
 fn type_differs_only_by_field_names(previous: &Type, next: &Type) -> bool {
     match (previous, next) {
         (Type::Primitive(previous), Type::Primitive(next)) => previous == next,
+        (Type::Variant(previous), Type::Variant(next)) => previous == next,
         (Type::Struct(previous), Type::Struct(next)) => {
             fields_differ_only_by_names(previous.fields(), next.fields())
         }

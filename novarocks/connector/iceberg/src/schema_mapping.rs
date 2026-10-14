@@ -69,7 +69,7 @@ fn sql_read_field(
     // carrier and VARIANT, do not confer the same semantic identity.
     let logical = match iceberg_field.field_type.as_ref() {
         Type::Primitive(PrimitiveType::Uuid) => ValueLogicalType::Uuid,
-        Type::Primitive(PrimitiveType::Variant) => ValueLogicalType::Variant,
+        Type::Variant(_) => ValueLogicalType::Variant,
         _ => ValueLogicalType::Physical,
     };
     if let Some(label) = field.metadata().get(NR_LOGICAL_TYPE_KEY) {
@@ -119,7 +119,7 @@ fn sql_read_data_type(
 
     match iceberg_type {
         Type::Primitive(PrimitiveType::Binary) => Ok(DataType::Binary),
-        Type::Primitive(PrimitiveType::Variant) => Ok(DataType::LargeBinary),
+        Type::Variant(_) => Ok(DataType::LargeBinary),
         Type::Primitive(PrimitiveType::Timestamptz) => {
             Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
         }
@@ -732,8 +732,12 @@ mod tests {
                 NestedField::required(11, "uuid", Type::Primitive(PrimitiveType::Uuid)).into(),
                 NestedField::optional(12, "fixed", Type::Primitive(PrimitiveType::Fixed(16)))
                     .into(),
-                NestedField::optional(13, "variant", Type::Primitive(PrimitiveType::Variant))
-                    .into(),
+                NestedField::optional(
+                    13,
+                    "variant",
+                    Type::Variant(crate::iceberg::spec::VariantType),
+                )
+                .into(),
                 NestedField::required(14, "binary", Type::Primitive(PrimitiveType::Binary)).into(),
             ])
             .build()
@@ -791,7 +795,7 @@ mod tests {
                         Arc::new(NestedField::optional(
                             3,
                             "payload",
-                            Type::Primitive(PrimitiveType::Variant),
+                            Type::Variant(crate::iceberg::spec::VariantType),
                         )),
                     ])),
                 )
@@ -816,7 +820,7 @@ mod tests {
                         )),
                         Arc::new(NestedField::map_value_element(
                             8,
-                            Type::Primitive(PrimitiveType::Variant),
+                            Type::Variant(crate::iceberg::spec::VariantType),
                             true,
                         )),
                     )),
@@ -890,7 +894,8 @@ mod tests {
         let forged_variant = Field::new("u", DataType::LargeBinary, true)
             .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "variant".into())].into());
         assert!(sql_read_field(&forged_variant, &binary).is_err());
-        let variant = NestedField::optional(14, "u", Type::Primitive(PrimitiveType::Variant));
+        let variant =
+            NestedField::optional(14, "u", Type::Variant(crate::iceberg::spec::VariantType));
         assert!(sql_read_field(&valid, &variant).is_err());
         // An unlabelled LargeBinary field itself does not author VARIANT.
         let plain = sql_read_field(
@@ -948,7 +953,12 @@ mod tests {
             .with_schema_id(1)
             .with_fields(vec![
                 NestedField::required(1, "binary", Type::Primitive(PrimitiveType::Binary)).into(),
-                NestedField::optional(2, "variant", Type::Primitive(PrimitiveType::Variant)).into(),
+                NestedField::optional(
+                    2,
+                    "variant",
+                    Type::Variant(crate::iceberg::spec::VariantType),
+                )
+                .into(),
                 NestedField::required(
                     3,
                     "timestamptz",
@@ -1003,7 +1013,7 @@ mod tests {
                         )),
                         Arc::new(NestedField::map_value_element(
                             7,
-                            Type::Primitive(PrimitiveType::Variant),
+                            Type::Variant(crate::iceberg::spec::VariantType),
                             false,
                         )),
                     )),

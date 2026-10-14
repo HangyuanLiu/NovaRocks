@@ -19,7 +19,9 @@
 //! Registration remains disabled until actual host and lifecycle probes pass.
 use super::aggregate_ds_hll_core::{self as core, TypedDsHllStateAccess, TypedDsHllStorage};
 use super::aggregate_ds_hll_failure::*;
-use super::aggregate_ds_hll_state::{self as state_core, DsHllRetainedOperation, DsHllRetainedPort};
+use super::aggregate_ds_hll_state::{
+    self as state_core, DsHllRetainedOperation, DsHllRetainedPort,
+};
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::aggregate_invocation_backing::HostDiagnostic;
 use crate::aggregate_scalar::ScalarStateError;

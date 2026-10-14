@@ -371,6 +371,7 @@ async fn verify_case(
         );
     }
     let table = Table::builder()
+        .runtime(novarocks_connector_iceberg::iceberg::Runtime::try_current()?)
         .file_io(io.clone())
         .metadata(metadata.clone())
         .metadata_location(metadata_path)
@@ -564,16 +565,21 @@ async fn observe_manifests(
     let snapshot = metadata
         .snapshot_by_id(snapshot_id)
         .context("snapshot missing")?;
-    let list = snapshot
-        .load_manifest_list(table.file_io(), metadata)
-        .await?;
+    let list = novarocks_connector_iceberg::manifest::load_manifest_list(
+        &snapshot,
+        table.file_io(),
+        metadata,
+    )
+    .await?;
     let mut seen = BTreeSet::new();
     let mut observed = Vec::new();
     for manifest_file in list.entries() {
         if !seen.insert(&manifest_file.manifest_path) {
             continue;
         }
-        let manifest = manifest_file.load_manifest(table.file_io()).await?;
+        let manifest =
+            novarocks_connector_iceberg::manifest::load_manifest(&manifest_file, table.file_io())
+                .await?;
         let spec = metadata
             .partition_spec_by_id(manifest_file.partition_spec_id)
             .context("unknown manifest spec")?;

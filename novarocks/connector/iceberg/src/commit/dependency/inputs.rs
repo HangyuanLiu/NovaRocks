@@ -93,8 +93,7 @@ impl<'a> ValidationInputs<'a> {
         own_only: bool,
     ) -> Result<Vec<(EntryIdentity, LiveEntry)>> {
         self.io.check_active()?;
-        let list = snapshot
-            .load_manifest_list(self.io.file_io(), self.metadata)
+        let list = crate::manifest::load_manifest_list(&snapshot, self.io.file_io(), self.metadata)
             .await?;
         self.io.check_active()?;
         let mut entries = Vec::new();
@@ -113,7 +112,7 @@ impl<'a> ValidationInputs<'a> {
         include_deleted: bool,
     ) -> Result<Vec<(EntryIdentity, LiveEntry)>> {
         self.io.check_active()?;
-        let loaded = manifest.load_manifest(self.io.file_io()).await?;
+        let loaded = crate::manifest::load_manifest(&manifest, self.io.file_io()).await?;
         self.io.check_active()?;
         let mut next_row = manifest
             .first_row_id

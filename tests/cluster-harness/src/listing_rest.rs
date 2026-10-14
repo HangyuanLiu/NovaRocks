@@ -249,7 +249,24 @@ async fn reply(state: Arc<FixtureState>, method: Method, uri: Uri) -> Result<Res
             .into_response());
     }
     if segments.as_slice() == ["v1", "config"] {
-        return Ok(axum::Json(json!({"defaults":{},"overrides":{}})).into_response());
+        return Ok(axum::Json(json!({
+            "defaults":{},
+            "overrides":{},
+            "endpoints":[
+                "GET /v1/{prefix}/namespaces",
+                "GET /v1/{prefix}/namespaces/{namespace}",
+                "HEAD /v1/{prefix}/namespaces/{namespace}",
+                "DELETE /v1/{prefix}/namespaces/{namespace}",
+                "GET /v1/{prefix}/namespaces/{namespace}/tables",
+                "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+                "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+                "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+                "GET /v1/{prefix}/namespaces/{namespace}/views",
+                "HEAD /v1/{prefix}/namespaces/{namespace}/views/{view}",
+                "DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}"
+            ]
+        }))
+        .into_response());
     }
     ensure!(
         segments.first() == Some(&"v1") && segments.get(1) == Some(&"namespaces"),
@@ -563,7 +580,20 @@ mod tests {
             .unwrap()
             .json()
             .unwrap();
-        assert_eq!(config, json!({"defaults":{},"overrides":{}}));
+        assert_eq!(config["defaults"], json!({}));
+        assert_eq!(config["overrides"], json!({}));
+        let endpoints = config["endpoints"].as_array().unwrap();
+        for endpoint in [
+            "HEAD /v1/{prefix}/namespaces/{namespace}",
+            "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+        ] {
+            assert!(endpoints.contains(&json!(endpoint)));
+        }
+        assert!(
+            endpoints
+                .iter()
+                .all(|endpoint| { !endpoint.as_str().unwrap().starts_with("POST ") })
+        );
         fixture.set_mode(ListingMode::Normal).unwrap();
         let table: Value = client
             .get(format!(
@@ -577,6 +607,20 @@ mod tests {
             .json()
             .unwrap();
         assert_eq!(table["metadata"]["format-version"], 2);
+        assert_eq!(fixture.snapshot().unwrap().table_loads, 1);
+        for route in [
+            "/v1/namespaces/cl_ns_0000",
+            "/v1/namespaces/cl_ns_0000/tables/cl_table_000000",
+        ] {
+            assert!(
+                client
+                    .head(format!("{}{route}", fixture.endpoint()))
+                    .send()
+                    .unwrap()
+                    .status()
+                    .is_success()
+            );
+        }
         assert_eq!(fixture.snapshot().unwrap().table_loads, 1);
         let page: Value = client
             .get(format!(

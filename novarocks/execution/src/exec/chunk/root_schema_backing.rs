@@ -26,10 +26,10 @@ use std::sync::atomic::AtomicUsize;
 
 use arrow::datatypes::{DataType, FieldRef, Fields, SchemaRef, TimeUnit};
 use novarocks_result_contract::RootProfileV1;
-use novarocks_types::arrow_metadata_owner::{FieldMetadataOrigins, MetadataOwnedSchema};
 use novarocks_type_contract::owned_resources::metadata_materialization::{
     MetadataFieldLoan, MetadataMaterializationError, SharedMaterializedSchema,
 };
+use novarocks_types::arrow_metadata_owner::{FieldMetadataOrigins, MetadataOwnedSchema};
 
 /// Borrowed, positively authored namespaces. No content equality or numerical
 /// conversion between independent construction receipts establishes identity.

@@ -213,7 +213,9 @@ pub(crate) fn bind_compiled_writer(
         binding.execution(),
         execution_id,
         node_id,
-        Arc::new(NativeConnectorWriteObservationPort::new(task.backend_process_id)),
+        Arc::new(NativeConnectorWriteObservationPort::new(
+            task.backend_process_id,
+        )),
         crate::debug_environment::debug_emit_connector_writer_marker(),
     ));
     let fragment_encoder = Arc::new(RoleBoundCommitFragmentEncoder::new(

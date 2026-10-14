@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 //! Original scalar HLL_HASH carrier reader and array projection. No expression/name/environment access.
+use arrow_array::builder::BinaryBuilder;
 use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
     Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
     LargeStringArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, TimestampSecondArray,
 };
-use arrow_array::builder::BinaryBuilder;
 use arrow_schema::DataType;
 use std::{fmt, sync::Arc};
 #[derive(Clone, Copy)]

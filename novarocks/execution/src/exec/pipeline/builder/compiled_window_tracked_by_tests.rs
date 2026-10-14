@@ -17,11 +17,11 @@
 
 //! Actual LocalCompiler window binding, runtime allocator, and output custody.
 //! The old FixedZero driver helper and its oracle remain untouched.
-use super::*;
 use super::super::window_fixture::window_catalog_from_actual;
-use novarocks_functions::FunctionKind;
+use super::*;
 use crate::runtime::fragment::ExecutionFailureCause;
 use crate::runtime::mem_tracker::MemTracker;
+use novarocks_functions::FunctionKind;
 
 fn source(rows: &[Row], running: bool) -> (Arc<LocalProgram>, RecordBatch) {
     use WindowBound::{CurrentRow, UnboundedPreceding};
@@ -200,9 +200,9 @@ fn by_window_compiled_actual_missing_and_refused_allocator_latch_no_prefix_repla
 }
 #[test]
 fn by_window_compiled_original_output_validator_keeps_full_text_and_check_order() {
-    use crate::exec::chunk::{ChunkSlotSchema, ChunkSchema};
+    use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
     use crate::exec::operators::analytic_shared::validate_analytic_output_columns_typed;
-    use arrow::datatypes::{Field, DataType};
+    use arrow::datatypes::{DataType, Field};
     use novarocks_types::SlotId;
     let schema = Arc::new(
         ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
