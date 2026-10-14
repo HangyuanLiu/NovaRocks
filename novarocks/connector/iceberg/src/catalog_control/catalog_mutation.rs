@@ -1169,13 +1169,15 @@ fn alter_partition_spec(
             "evolved Iceberg partition spec has unexpected updates",
         ));
     }
-    let commit = TableCommit::builder()
-        .ident(table_ident(table).map_err(invalid)?)
-        .requirements(vec![TableRequirement::DefaultSpecIdMatch {
+    let commit = crate::commit::existing_commit::existing_table_commit(
+        table_ident(table).map_err(invalid)?,
+        metadata,
+        vec![TableRequirement::DefaultSpecIdMatch {
             default_spec_id: base_spec_id,
-        }])
-        .updates(updates)
-        .build();
+        }],
+        updates,
+    )
+    .map_err(|error| internal(error.to_string()))?;
     update_table(runtime, commit, "alter Iceberg partition spec")?;
     runtime
         .control_state()
@@ -1385,13 +1387,13 @@ fn alter_properties(
     if updates.is_empty() {
         return Ok(());
     }
-    let commit = TableCommit::builder()
-        .ident(table_ident(table).map_err(invalid)?)
-        .requirements(vec![TableRequirement::UuidMatch {
-            uuid: metadata.uuid(),
-        }])
-        .updates(updates)
-        .build();
+    let commit = crate::commit::existing_commit::existing_table_commit(
+        table_ident(table).map_err(invalid)?,
+        metadata,
+        Vec::new(),
+        updates,
+    )
+    .map_err(|error| internal(error.to_string()))?;
     update_table(runtime, commit, "alter Iceberg table properties")?;
     runtime
         .control_state()
@@ -1582,18 +1584,20 @@ fn alter_schema(
         .build()
         .map_err(|error| invalid(format!("build evolved Iceberg schema: {error}")))?;
     let updates = scalar_integer_schema_updates(metadata, change, new_schema, integer_domains)?;
-    let commit = TableCommit::builder()
-        .ident(table_ident(table).map_err(invalid)?)
-        .requirements(vec![
+    let commit = crate::commit::existing_commit::existing_table_commit(
+        table_ident(table).map_err(invalid)?,
+        metadata,
+        vec![
             TableRequirement::CurrentSchemaIdMatch {
                 current_schema_id: metadata.current_schema_id(),
             },
             TableRequirement::LastAssignedFieldIdMatch {
                 last_assigned_field_id: metadata.last_column_id(),
             },
-        ])
-        .updates(updates)
-        .build();
+        ],
+        updates,
+    )
+    .map_err(|error| internal(error.to_string()))?;
     update_table(runtime, commit, "alter Iceberg schema")?;
     runtime
         .control_state()
@@ -2445,18 +2449,15 @@ fn execute_guarded_properties(
         &request.context,
     )?;
     validate_context(&request.context)?;
-    let commit = TableCommit::builder()
-        .ident(table_ident(table).map_err(invalid)?)
-        .requirements(vec![
-            TableRequirement::UuidMatch {
-                uuid: metadata.uuid(),
-            },
-            TableRequirement::DefaultSpecIdMatch {
-                default_spec_id: expected.spec_id(),
-            },
-        ])
-        .updates(updates)
-        .build();
+    let commit = crate::commit::existing_commit::existing_table_commit(
+        table_ident(table).map_err(invalid)?,
+        metadata,
+        vec![TableRequirement::DefaultSpecIdMatch {
+            default_spec_id: expected.spec_id(),
+        }],
+        updates,
+    )
+    .map_err(|error| internal(error.to_string()))?;
     let catalog = provider.runtime().novarocks_catalog().vendored_client();
     let committed = provider
         .runtime()
@@ -5700,5 +5701,148 @@ mod tests {
             .load_table(&table.namespace, &table.table)
             .unwrap();
         assert_eq!(after.table.metadata(), before.table.metadata());
+    }
+
+    /// Each existing-table commit freezes the UUID of the metadata that
+    /// produced its updates. The request scope below retains the first
+    /// incarnation's metadata; after a drop and an identical recreate (same
+    /// schema, spec and field IDs) every commit must be rejected rather than
+    /// applied to the replacement table.
+    #[test]
+    fn existing_table_commits_reject_a_recreated_table_with_the_produced_uuid() {
+        let (_executor, _warehouse, provider) = provider();
+        create_namespace(&provider, "replaced");
+        let table = ConnectorTableIdentity {
+            instance_id: provider.descriptor().instance_id.clone(),
+            namespace: "replaced".into(),
+            table: "orders".into(),
+        };
+        let create = || {
+            create_table_fixture(
+                &provider,
+                &table,
+                &[ConnectorColumnDefinition {
+                    name: "id".into(),
+                    data_type: ConnectorDataType::BigInt,
+                    nullable: false,
+                    aggregation: None,
+                    default: None,
+                }],
+                None,
+                &[ConnectorPartitionTransform::Identity {
+                    column: "id".into(),
+                }],
+                &[],
+                CreatePolicy::FailIfExists,
+            )
+            .expect("create table")
+        };
+        create();
+        let stale = context();
+        let original = provider
+            .runtime()
+            .load_table_for_request(&table.namespace, &table.table, &stale)
+            .expect("load original table into the request scope");
+        drop_table(
+            &provider,
+            &table,
+            DropPolicy::FailIfMissing,
+            ConnectorDropTableDataDisposition::Purge,
+            &context(),
+        )
+        .expect("drop original table");
+        create();
+        let replacement = provider
+            .runtime()
+            .load_table_for_request(&table.namespace, &table.table, &context())
+            .expect("load replacement table");
+        assert_ne!(
+            replacement.table.metadata().uuid(),
+            original.table.metadata().uuid()
+        );
+        assert_eq!(
+            replacement.table.metadata().current_schema_id(),
+            original.table.metadata().current_schema_id()
+        );
+        assert_eq!(
+            replacement.table.metadata().default_partition_spec_id(),
+            original.table.metadata().default_partition_spec_id()
+        );
+        assert_eq!(
+            replacement.table.metadata().last_column_id(),
+            original.table.metadata().last_column_id()
+        );
+
+        alter_partition_spec(
+            provider.runtime(),
+            &table,
+            &[ConnectorPartitionTransform::Bucket {
+                column: "id".into(),
+                num_buckets: 4,
+            }],
+            &[],
+            &stale,
+        )
+        .expect_err("partition evolution must not land on the replacement");
+        alter_schema(
+            provider.runtime(),
+            &table,
+            &[ConnectorSchemaChange::AddColumn {
+                parent: ConnectorColumnPath { segments: vec![] },
+                column: ConnectorColumnDefinition {
+                    name: "extra".into(),
+                    data_type: ConnectorDataType::Int,
+                    nullable: true,
+                    aggregation: None,
+                    default: None,
+                },
+                position: ConnectorColumnPosition::Default,
+            }],
+            &stale,
+        )
+        .expect_err("schema evolution must not land on the replacement");
+        let properties = vec![ConnectorPropertyChange::Set {
+            key: "novarocks.mv.partition".into(),
+            value: "stale".into(),
+        }];
+        alter_properties(
+            provider.runtime(),
+            &table,
+            &properties,
+            ConnectorPropertyAuthority::EngineOwned,
+            &stale,
+        )
+        .expect_err("property mutation must not land on the replacement");
+        let expected = committed_partitioning_from_metadata(
+            original.table.metadata(),
+            original.table.metadata().default_partition_spec_id(),
+        )
+        .expect("canonical partitioning");
+        let guarded = provider
+            .execute(ConnectorCatalogMutationRequest {
+                operation_id: ConnectorMutationOperationId::new(),
+                target: ConnectorProviderBindingKey {
+                    instance_id: provider.descriptor().instance_id.clone(),
+                    incarnation: provider.incarnation(),
+                },
+                operation: ConnectorCatalogMutationOperation::AlterProperties {
+                    table: table.clone(),
+                    changes: properties,
+                    authority: ConnectorPropertyAuthority::EngineOwned,
+                    expected_committed_partitioning: Some(expected),
+                },
+                context: stale.clone(),
+            })
+            .expect("execute guarded property mutation");
+        assert!(!matches!(
+            guarded,
+            ExternalMutationOutcome::KnownCommitted { .. }
+        ));
+
+        let after = provider
+            .runtime()
+            .load_table_for_request(&table.namespace, &table.table, &context())
+            .expect("reload replacement table");
+        assert_eq!(after.table.metadata(), replacement.table.metadata());
     }
 }

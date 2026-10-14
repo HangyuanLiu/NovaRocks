@@ -21,7 +21,8 @@ use std::str::FromStr;
 use novarocks_spi::connector::LakePublicationId;
 use uuid::Uuid;
 
-use crate::iceberg::spec::{Snapshot, SnapshotReference, SnapshotRetention};
+use crate::commit::existing_commit::{ExistingCommitError, existing_table_commit};
+use crate::iceberg::spec::{Snapshot, SnapshotReference, SnapshotRetention, TableMetadata};
 use crate::iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
 
 pub const MV_PUBLICATION_ID_PROP: &str = "novarocks.mv.publication_id";
@@ -141,8 +142,10 @@ pub async fn publish_staging_branch_to_main(
             plan.staging_snapshot_id
         ));
     }
+    let commit = build_publish_commit(ident, metadata, plan)
+        .map_err(|error| format!("iceberg mv publish: {error}"))?;
     catalog
-        .update_table(build_publish_commit(ident, plan))
+        .update_table(commit)
         .await
         .map_err(|e| format!("iceberg mv publish: commit failed: {e}"))?;
     Ok(MvRefreshPublishOutcome {
@@ -150,21 +153,17 @@ pub async fn publish_staging_branch_to_main(
     })
 }
 
-fn build_publish_commit(ident: TableIdent, plan: &MvRefreshPublishPlan) -> TableCommit {
-    TableCommit::builder()
-        .ident(ident)
-        .updates(vec![TableUpdate::SetSnapshotRef {
-            ref_name: "main".to_string(),
-            reference: SnapshotReference {
-                snapshot_id: plan.staging_snapshot_id,
-                retention: SnapshotRetention::Branch {
-                    min_snapshots_to_keep: None,
-                    max_snapshot_age_ms: None,
-                    max_ref_age_ms: None,
-                },
-            },
-        }])
-        .requirements(vec![
+/// The plan's frozen target UUID must name the loaded incarnation the publish
+/// was validated against; the commit entry refuses it otherwise.
+fn build_publish_commit(
+    ident: TableIdent,
+    metadata: &TableMetadata,
+    plan: &MvRefreshPublishPlan,
+) -> Result<TableCommit, ExistingCommitError> {
+    existing_table_commit(
+        ident,
+        metadata,
+        vec![
             TableRequirement::UuidMatch {
                 uuid: plan.target_table_uuid,
             },
@@ -176,14 +175,55 @@ fn build_publish_commit(ident: TableIdent, plan: &MvRefreshPublishPlan) -> Table
                 r#ref: plan.staging_branch.clone(),
                 snapshot_id: Some(plan.staging_snapshot_id),
             },
-        ])
-        .build()
+        ],
+        vec![TableUpdate::SetSnapshotRef {
+            ref_name: "main".to_string(),
+            reference: SnapshotReference {
+                snapshot_id: plan.staging_snapshot_id,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            },
+        }],
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use super::*;
-    use crate::iceberg::spec::{Operation, Summary};
+    use crate::iceberg::spec::{
+        FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, SortOrder,
+        Summary, TableMetadataBuilder, Type,
+    };
+
+    fn metadata_with_uuid(uuid: Uuid) -> TableMetadata {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("schema");
+        TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "memory://warehouse/db/mv".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("metadata builder")
+        .assign_uuid(uuid)
+        .build()
+        .expect("metadata")
+        .metadata
+    }
 
     fn plan() -> MvRefreshPublishPlan {
         MvRefreshPublishPlan {
@@ -206,7 +246,12 @@ mod tests {
     #[test]
     fn publish_commit_uses_uuid_main_and_staging_cas_only() {
         let plan = plan();
-        let mut commit = build_publish_commit(TableIdent::from_strs(["db", "mv"]).unwrap(), &plan);
+        let mut commit = build_publish_commit(
+            TableIdent::from_strs(["db", "mv"]).unwrap(),
+            &metadata_with_uuid(plan.target_table_uuid),
+            &plan,
+        )
+        .expect("publish commit");
         let requirements = commit.take_requirements();
         assert_eq!(requirements.len(), 3);
         assert!(requirements.contains(&TableRequirement::UuidMatch {
@@ -223,6 +268,26 @@ mod tests {
                 r#ref: plan.staging_branch.clone(),
                 snapshot_id: Some(300),
             })
+        );
+    }
+
+    #[test]
+    fn publish_commit_refuses_a_plan_frozen_for_another_incarnation() {
+        let plan = plan();
+        let loaded = Uuid::from_u128(0x5678);
+        let error = build_publish_commit(
+            TableIdent::from_strs(["db", "mv"]).unwrap(),
+            &metadata_with_uuid(loaded),
+            &plan,
+        )
+        .expect_err("plan UUID differs from the loaded table");
+
+        assert_eq!(
+            error,
+            ExistingCommitError::ConflictingTableUuid {
+                base: loaded,
+                asserted: plan.target_table_uuid,
+            }
         );
     }
 

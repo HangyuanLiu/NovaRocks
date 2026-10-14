@@ -23,7 +23,8 @@
 
 #![allow(dead_code)]
 
-use crate::iceberg::spec::{SnapshotReference, SnapshotRetention};
+use crate::commit::existing_commit::{ExistingCommitError, existing_table_commit};
+use crate::iceberg::spec::{SnapshotReference, SnapshotRetention, TableMetadata};
 use crate::iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
 use uuid::Uuid;
 
@@ -219,27 +220,23 @@ pub enum ExactBranchDropOutcome {
 
 fn build_exact_branch_drop_commit(
     ident: TableIdent,
-    expected_table_uuid: Uuid,
+    metadata: &TableMetadata,
     name: &str,
     expected_head_snapshot_id: i64,
-) -> TableCommit {
-    TableCommit::builder()
-        .ident(ident)
-        .updates(vec![TableUpdate::RemoveSnapshotRef {
+) -> Result<TableCommit, ExistingCommitError> {
+    // The pre-read is only candidate discovery. The frozen incarnation proof
+    // stays in the destructive commit so DROP/recreate abandons GC.
+    existing_table_commit(
+        ident,
+        metadata,
+        vec![TableRequirement::RefSnapshotIdMatch {
+            r#ref: name.to_string(),
+            snapshot_id: Some(expected_head_snapshot_id),
+        }],
+        vec![TableUpdate::RemoveSnapshotRef {
             ref_name: name.to_string(),
-        }])
-        .requirements(vec![
-            // The pre-read is only candidate discovery. Keep the incarnation
-            // proof in the destructive commit so DROP/recreate abandons GC.
-            TableRequirement::UuidMatch {
-                uuid: expected_table_uuid,
-            },
-            TableRequirement::RefSnapshotIdMatch {
-                r#ref: name.to_string(),
-                snapshot_id: Some(expected_head_snapshot_id),
-            },
-        ])
-        .build()
+        }],
+    )
 }
 
 /// Drop one provider-owned branch only if its table incarnation and observed
@@ -269,10 +266,11 @@ pub async fn drop_branch_if_exact(
     }
     let commit = build_exact_branch_drop_commit(
         loaded.identifier().clone(),
-        metadata.uuid(),
+        metadata,
         name,
         expected_head_snapshot_id,
-    );
+    )
+    .map_err(|error| format!("iceberg cleanup ref: {error}"))?;
     match catalog.update_table(commit).await {
         Ok(_) => Ok(ExactBranchDropOutcome::Retired),
         // A concurrently moved/deleted ref is a failed compare-and-swap proof,
@@ -312,6 +310,8 @@ pub async fn execute_ref_action(
             }
             existing => {
                 let parent = existing.map(|r| r.snapshot_id);
+                // The caller's frozen UUID, when present, must name the
+                // loaded incarnation; the commit entry checks and freezes it.
                 let mut requirements = vec![TableRequirement::RefSnapshotIdMatch {
                     r#ref: name.clone(),
                     snapshot_id: parent,
@@ -348,6 +348,8 @@ pub async fn execute_ref_action(
             }
             existing => {
                 let parent = existing.map(|r| r.snapshot_id);
+                // The caller's frozen UUID, when present, must name the
+                // loaded incarnation; the commit entry checks and freezes it.
                 let mut requirements = vec![TableRequirement::RefSnapshotIdMatch {
                     r#ref: name.clone(),
                     snapshot_id: parent,
@@ -465,11 +467,8 @@ pub async fn execute_ref_action(
         }
     };
 
-    let commit = TableCommit::builder()
-        .ident(ident)
-        .updates(updates)
-        .requirements(requirements)
-        .build();
+    let commit = existing_table_commit(ident, metadata, requirements, updates)
+        .map_err(|error| format!("iceberg ref: {error}"))?;
 
     catalog
         .update_table(commit)
@@ -481,17 +480,147 @@ pub async fn execute_ref_action(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
     use super::*;
+    use crate::commit::existing_commit::test_support::{LocalTable, local_table};
+    use crate::iceberg::spec::{
+        FormatVersion, NestedField, PartitionSpec, PrimitiveType, Schema, SortOrder,
+        TableMetadataBuilder, Type,
+    };
+
+    fn metadata_with_uuid(uuid: Uuid) -> TableMetadata {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("schema");
+        TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec(),
+            SortOrder::unsorted_order(),
+            "memory://warehouse/db/orders".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("metadata builder")
+        .assign_uuid(uuid)
+        .build()
+        .expect("metadata")
+        .metadata
+    }
+
+    fn plan(action: RefAction) -> RefActionPlan {
+        RefActionPlan {
+            catalog: "iceberg".to_string(),
+            namespace: "db".to_string(),
+            table: "t".to_string(),
+            action,
+        }
+    }
+
+    /// Runs one action against a fresh load and returns the UUID assertions of
+    /// the dispatched commit together with the UUID of the metadata it used.
+    async fn run_action(fixture: &LocalTable, action: RefAction) -> (Vec<Uuid>, Uuid) {
+        let loaded = fixture.load().await;
+        let outcome = execute_ref_action(fixture.catalog.as_ref(), &loaded, &plan(action))
+            .await
+            .expect("execute ref action");
+        assert_eq!(outcome, RefActionOutcome::Committed);
+        (
+            fixture.catalog.take_single_commit_uuids(),
+            loaded.metadata().uuid(),
+        )
+    }
+
+    #[tokio::test]
+    async fn every_ref_action_freezes_the_uuid_of_the_metadata_it_used() {
+        let fixture = local_table().await;
+        let first = fixture.append("first").await;
+
+        let create_branch = RefAction::CreateBranch {
+            name: "dev".to_string(),
+            snapshot_id: first,
+            replace: false,
+            if_not_exists: false,
+            expected_table_uuid: None,
+        };
+        let create_tag = RefAction::CreateTag {
+            name: "v1".to_string(),
+            snapshot_id: first,
+            replace: false,
+            if_not_exists: false,
+            expected_table_uuid: None,
+        };
+        for action in [create_branch, create_tag] {
+            let (asserted, loaded) = run_action(&fixture, action).await;
+            assert_eq!(asserted, vec![loaded]);
+        }
+
+        let second = fixture.append("second").await;
+        let fast_forward = RefAction::FastForwardBranch {
+            source_branch: "main".to_string(),
+            target_branch: "dev".to_string(),
+            source_snapshot_id: second,
+            expected_target_snapshot_id: Some(first),
+        };
+        let drop_tag = RefAction::DropTag {
+            name: "v1".to_string(),
+            if_exists: false,
+        };
+        let drop_branch = RefAction::DropBranch {
+            name: "dev".to_string(),
+            if_exists: false,
+        };
+        for action in [fast_forward, drop_tag, drop_branch] {
+            let (asserted, loaded) = run_action(&fixture, action).await;
+            assert_eq!(asserted, vec![loaded]);
+        }
+
+        let refs = fixture.load().await.metadata().refs().clone();
+        assert_eq!(refs.keys().collect::<Vec<_>>(), vec!["main"]);
+    }
+
+    #[tokio::test]
+    async fn ref_create_with_another_incarnation_uuid_is_not_dispatched() {
+        let fixture = local_table().await;
+        let first = fixture.append("first").await;
+        let loaded = fixture.load().await;
+        let foreign = Uuid::new_v4();
+        assert_ne!(foreign, loaded.metadata().uuid());
+
+        let error = execute_ref_action(
+            fixture.catalog.as_ref(),
+            &loaded,
+            &plan(RefAction::CreateBranch {
+                name: "dev".to_string(),
+                snapshot_id: first,
+                replace: false,
+                if_not_exists: false,
+                expected_table_uuid: Some(foreign),
+            }),
+        )
+        .await
+        .expect_err("foreign incarnation UUID");
+
+        assert!(error.contains("table UUID"), "{error}");
+        assert!(fixture.catalog.commits().is_empty());
+    }
 
     #[test]
     fn exact_branch_drop_commit_pins_table_incarnation_and_branch_head() {
         let table_uuid = Uuid::new_v4();
         let mut commit = build_exact_branch_drop_commit(
             TableIdent::from_strs(["db", "orders"]).expect("valid table identifier"),
-            table_uuid,
+            &metadata_with_uuid(table_uuid),
             "__novarocks_mv_refresh",
             42,
-        );
+        )
+        .expect("exact branch drop commit");
 
         assert_eq!(
             commit.take_requirements(),
