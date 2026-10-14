@@ -393,9 +393,6 @@ impl Debug for LoadCredentialsResult {
     }
 }
 
-/// `GET .../namespaces/{ns}/views` shares the list-tables wire shape.
-pub type ListViewsResponse = ListTablesResponse;
-
 #[cfg(test)]
 mod tests {
     //! R10 correctness: parsed protocol category/status survive while response
