@@ -17,6 +17,8 @@
 
 //! Validated view creations and replacements.
 //!
+//! Design: ADR-0176 (docs/adr/ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md)
+//!
 //! The semantic checks a server repeats at commit time — dialect retention
 //! and the version-history property — run here, before anything is
 //! dispatched: a request refused by the server after dispatch is an unknown

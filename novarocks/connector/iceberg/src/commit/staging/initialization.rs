@@ -17,6 +17,8 @@
 
 //! Initialization updates for a REST staged create.
 //!
+//! Design: ADR-0176 (docs/adr/ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md)
+//!
 //! A staged-create response is not yet a table: its authoritative metadata
 //! must travel with the first `assert-create` commit, ahead of the
 //! transaction's own data updates. Only an empty initial table can be

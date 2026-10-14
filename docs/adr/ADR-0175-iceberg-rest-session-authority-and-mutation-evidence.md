@@ -5,6 +5,10 @@ domain: [provider-spi, distributed-query-lifecycle, crate-boundary]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0176
+    scope: "Compromise that the REST-only core patches (staged-create initialization updates, AddSchema.last_column_id, view API) remain and that stage and view requests use their types: the patches are deleted and the Connector owns that vocabulary"
+    link: "ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md"
 partially-supersedes:
   - id: ADR-0151
     scope: "Meaning of the announced acquisition paths: both now carry the frozen public routing context (complete address and public routing headers); the execution node never opens its own catalog session; a vended read is admitted only when execution-node first acquisition can be formed. Consumer-driven renewal, role-local material and the ratio windows remain effective"

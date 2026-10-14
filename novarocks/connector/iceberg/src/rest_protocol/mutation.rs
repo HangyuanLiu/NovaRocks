@@ -48,6 +48,7 @@ use crate::rest_protocol::minimal_view::{
     MutationView, NamespaceSink, TableResponseSink, ViewMutationSink,
 };
 
+// Design: ADR-0176 (docs/adr/ADR-0176-iceberg-rest-request-vocabulary-and-supported-server-floor.md)
 // NovaRocks owns the view wire vocabulary: the upstream REST crate has no
 // view API, and the core view types cannot express a request the reference
 // server accepts for an unchanged schema.
