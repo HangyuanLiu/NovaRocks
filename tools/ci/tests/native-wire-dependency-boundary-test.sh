@@ -45,6 +45,22 @@ assert_rejected() {
   grep -Fq "$expected_error" "$metadata_path.stderr"
 }
 
+# The boundary concerns dependency ownership, not external feature spelling.
+# Reaching Types and libc through local aliases remains a lawful typed graph.
+failpoint_legal_platform="$tmpdir/failpoint-legal-platform.json"
+failpoint_id="$(package_id novarocks-failpoint)"
+jq --arg failpoint_id "$failpoint_id" '
+  (.packages[] | select(.name == "novarocks-failpoint") | .features) |= (
+    .typed = ["neutral-identities", "receipt-platform"] |
+    .["neutral-identities"] = ["dep:novarocks-types"] |
+    .["receipt-platform"] = ["dep:libc"]
+  ) |
+  (.resolve.nodes[] | select(.id == $failpoint_id) | .features) += [
+    "neutral-identities", "receipt-platform"
+  ]
+' "$base_metadata" >"$failpoint_legal_platform"
+"$CHECKER" --metadata-path "$failpoint_legal_platform"
+
 # Mirror of add_normal_resolve_edge: remove every normal edge from the source
 # owner to the target package, so a fixture can exercise what happens once a
 # dependency the checker still expects has actually been cut.
@@ -318,12 +334,30 @@ for forbidden in novarocks-proto-codec novarocks-proto-models novarocks-spi; do
 done
 
 failpoint_typed_feature="$tmpdir/failpoint-typed-feature.json"
-jq '
-  (.packages[] | select(.name == "novarocks-failpoint") | .features.typed) += [
-    "dep:novarocks-spi"
-  ]
-' "$base_metadata" >"$failpoint_typed_feature"
+add_normal_resolve_edge novarocks-failpoint novarocks-spi "$failpoint_typed_feature"
+jq --arg failpoint_id "$failpoint_id" '
+  (.packages[] | select(.name == "novarocks-failpoint")) |= (
+    .dependencies += [{name: "novarocks-spi", kind: null, optional: true}] |
+    .features.typed += ["dep:novarocks-spi"]
+  ) |
+  (.resolve.nodes[] | select(.id == $failpoint_id) | .deps[-1].name) = "novarocks_spi"
+' "$failpoint_typed_feature" >"$tmpdir/failpoint-typed-feature-consistent.json"
+mv "$tmpdir/failpoint-typed-feature-consistent.json" "$failpoint_typed_feature"
 assert_rejected "$failpoint_typed_feature" \
-  "novarocks-failpoint feature typed must be exactly: dep:novarocks-types"
+  "novarocks-failpoint typed normal dependency closure contains forbidden packages:"
+grep -Fq "novarocks-spi" "$failpoint_typed_feature.stderr"
+
+# Removing typed's neutral identity activation must remove the resolved edge
+# as well. Keep the optional declaration so this is a coherent feature graph.
+failpoint_missing_types="$tmpdir/failpoint-missing-types.json"
+drop_normal_resolve_edge novarocks-failpoint novarocks-types "$failpoint_missing_types"
+jq '
+  (.packages[] | select(.name == "novarocks-failpoint") | .features.typed) |= map(
+    select(. != "dep:novarocks-types")
+  )
+' "$failpoint_missing_types" >"$tmpdir/failpoint-missing-types-consistent.json"
+mv "$tmpdir/failpoint-missing-types-consistent.json" "$failpoint_missing_types"
+assert_rejected "$failpoint_missing_types" \
+  "novarocks-failpoint feature typed must activate neutral normal dependency novarocks-types"
 
 echo "native-wire-dependency-boundary-test: PASS"
