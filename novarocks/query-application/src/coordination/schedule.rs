@@ -271,6 +271,7 @@ pub(crate) fn build_attempt_schedule(
     frontend_process_id: FrontendProcessId,
     eligible_backends: &[BackendProcessId],
     plan: &ExecutionSchedulingFacts,
+    #[cfg(feature = "test-controls")] preferred_process: Result<Option<BackendProcessId>, String>,
 ) -> Result<AttemptSchedule, AttemptScheduleError> {
     if eligible_backends.is_empty() {
         return Err(AttemptScheduleError::new(
@@ -376,6 +377,8 @@ pub(crate) fn build_attempt_schedule(
     counts.insert(plan.execution_anchor_fragment_id, 1);
 
     let preferred = (execution.query_id().low() as usize) % backend_count;
+    #[cfg(feature = "test-controls")]
+    let preferred = match preferred_process.map_err(AttemptScheduleError::new)? { Some(process) => backends.iter().position(|backend| *backend == process).ok_or_else(|| AttemptScheduleError::new("the exact controlled placement process is absent from the retained eligible set"))?, None => preferred };
     let mut next_stage = 1_u32;
     let mut next_task = 1_u32;
     let mut contexts = BTreeSet::new();
@@ -713,7 +716,15 @@ mod tests {
         backends: &[BackendProcessId],
         work: NativeScanWork,
     ) -> AttemptSchedule {
-        build_attempt_schedule(execution, frontend, backends, &scan_edge_inputs(work)).unwrap()
+        build_attempt_schedule(
+            execution,
+            frontend,
+            backends,
+            &scan_edge_inputs(work),
+            #[cfg(feature = "test-controls")]
+            Ok(None),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -833,7 +844,15 @@ mod tests {
             .find(|fragment| !fragment.scans.is_empty())
             .unwrap()
             .fragment_id;
-        let schedule = build_attempt_schedule(execution, frontend, &backends, &scheduling).unwrap();
+        let schedule = build_attempt_schedule(
+            execution,
+            frontend,
+            &backends,
+            &scheduling,
+            #[cfg(feature = "test-controls")]
+            Ok(None),
+        )
+        .unwrap();
         let scan_fragment = schedule
             .fragments()
             .iter()
@@ -1031,6 +1050,58 @@ mod tests {
         assert_eq!(
             take_exchange_edge_id(&mut last).unwrap_err().to_string(),
             "exchange edge id space exhausted"
+        );
+    }
+    #[test]
+    #[cfg(feature = "test-controls")]
+    fn controlled_single_fragment_placement_requires_the_retained_exact_process() {
+        let execution =
+            QueryExecutionId::new(QueryId::new(53, 59), AttemptId::new(1).unwrap()).unwrap();
+        let frontend = FrontendProcessId::new_v7();
+        let backends = [
+            BackendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+            BackendProcessId::new_v7(),
+        ];
+        let plan = scan_edge_inputs(NativeScanWork::WholeRelation);
+        let schedule =
+            build_attempt_schedule(execution, frontend, &backends, &plan, Ok(Some(backends[2])))
+                .unwrap();
+        assert_eq!(
+            schedule.contexts().len(),
+            1,
+            "a placement preference cannot mint service-only contexts"
+        );
+        assert!(
+            schedule
+                .fragments()
+                .iter()
+                .flat_map(ScheduledFragment::tasks)
+                .all(|task| task.identity().backend_process_id() == backends[2])
+        );
+        assert!(
+            build_attempt_schedule(
+                execution,
+                frontend,
+                &backends,
+                &plan,
+                Ok(Some(BackendProcessId::new_v7()))
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("retained eligible")
+        );
+        assert!(
+            build_attempt_schedule(
+                execution,
+                frontend,
+                &backends,
+                &plan,
+                Err("owner preference failed".into())
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("owner preference failed")
         );
     }
 }

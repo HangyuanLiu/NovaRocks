@@ -64,14 +64,18 @@ use crate::exec::node::table_write_relation::{
     ConnectorCommitFragmentCarrierValidator, RootWriteResultRelationSchema,
     WriterMultiplexRelationSchema,
 };
-#[cfg(debug_assertions)]
-use crate::exec::node::table_write_relation::{TableWriteAggregateBoundary, TableWriteAggregateGuard};
+#[cfg(feature = "test-controls")]
+use crate::exec::node::table_write_relation::{
+    TableWriteAggregateBoundary, TableWriteAggregateGuard,
+};
 use crate::exec::node::unpivot::{UnpivotPassthroughColumn, UnpivotValueMapping};
 use crate::exec::operators::aggregate::AggregateProcessorFactory;
 use crate::exec::operators::blocked_duration::BlockedDuration;
 use crate::exec::operators::table_writer::TableWriteRelationColumns;
 use crate::exec::operators::unpivot_processor::UnpivotProcessorFactory;
-use crate::exec::pipeline::operator::{FinishWatch, Operator, ProcessorOperator, forward_observable};
+use crate::exec::pipeline::operator::{
+    FinishWatch, Operator, ProcessorOperator, forward_observable,
+};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
@@ -156,7 +160,7 @@ pub struct TableFinishOperatorFactory {
     final_plan: WriterFinalAggregatePlan,
     coverage: FinishStatisticsCoverage,
     statistics: Option<Arc<dyn FinishStatisticsFactory>>,
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
     arena: Arc<ExprArena>,
 }
@@ -191,7 +195,7 @@ impl TableFinishOperatorFactory {
             coverage: FinishStatisticsCoverage::from_plan(&final_plan),
             final_plan,
             statistics: None,
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "test-controls")]
             aggregate_guard: Arc::clone(&binding.aggregate_guard),
             arena,
         })
@@ -242,7 +246,7 @@ impl TableFinishOperatorFactory {
             final_plan: node.final_aggregate_plan().clone(),
             coverage: FinishStatisticsCoverage::from_plan(node.final_aggregate_plan()),
             statistics: None,
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "test-controls")]
             aggregate_guard: Arc::clone(node.aggregate_guard()),
             arena,
         }
@@ -269,7 +273,7 @@ impl TableFinishOperatorFactory {
             final_plan: self.final_plan.clone(),
             coverage: self.coverage.clone(),
             statistics: self.statistics.clone(),
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "test-controls")]
             aggregate_guard: Arc::clone(&self.aggregate_guard),
             channel_to_call: self
                 .writer_schema
@@ -554,7 +558,7 @@ struct TableFinishOperator {
     final_plan: WriterFinalAggregatePlan,
     coverage: FinishStatisticsCoverage,
     statistics: Option<Arc<dyn FinishStatisticsFactory>>,
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
     channel_to_call: Vec<Option<usize>>,
     arena: Arc<ExprArena>,
@@ -1593,7 +1597,7 @@ impl ProcessorOperator for TableFinishOperator {
         }
         if partial_rows.iter().any(|value| *value) {
             let filtered = self.filter_aggregate_rows(&chunk, &partial_rows)?;
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "test-controls")]
             if let Err(error) = self
                 .aggregate_guard
                 .check(TableWriteAggregateBoundary::FinalMerge)
@@ -1749,7 +1753,7 @@ impl ProcessorOperator for TableFinishOperator {
         }
         self.phase = FinishPhase::Finalizing;
         self.finish_final_aggregate_blocked_interval();
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "test-controls")]
         if self.aggregate.is_some()
             && let Err(error) = self
                 .aggregate_guard
@@ -1939,10 +1943,10 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     struct RejectAggregateBoundary(TableWriteAggregateBoundary);
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     impl TableWriteAggregateGuard for RejectAggregateBoundary {
         fn check(&self, boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError> {
             if boundary == self.0 {
@@ -3617,7 +3621,7 @@ mod tests {
         assert_eq!(tracker.current(), 0, "failed finalize releases all buffers");
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     #[test]
     fn final_aggregate_guard_rejects_merge_without_root_output() {
         let (mut factory, state, writer_schema) = composite_fixture(1, 1, 8);
@@ -3659,7 +3663,7 @@ mod tests {
         );
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     #[test]
     fn final_aggregate_guard_rejects_finalize_without_root_output() {
         let (mut factory, state, writer_schema) = composite_fixture(1, 1, 8);

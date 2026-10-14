@@ -1416,10 +1416,9 @@ mod tests {
     ) -> super::super::RequestBoundNativeTemplate {
         use arrow::datatypes::DataType;
         use novarocks_physical_plan::{
-            Distribution, ExprKind, FragmentBuilder, FragmentSink, LiteralValue, NodeKind,
-            OutputPort, PhysicalNode, PhysicalProperties, PipelineDopDomain, PlanBuilder,
-            PlanVersionId, ResultField, ResultPort, ResultValueDomain, RowMultiplicity,
-            ValueOrigin, ValueType,
+            Distribution, ExprKind, FragmentBuilder, FragmentSink, NodeKind, OutputPort,
+            PhysicalNode, PhysicalProperties, PipelineDopDomain, PlanBuilder, PlanVersionId,
+            ResultField, ResultPort, ResultValueDomain, RowMultiplicity, ValueOrigin, ValueType,
         };
         use novarocks_query_application::preparation::{
             CompletedPhysicalPlanCandidate, CompletedPlanWithAccess, FinalPlanRuntimeAccess,
@@ -1431,9 +1430,27 @@ mod tests {
         let mut fragment = FragmentBuilder::new(fragment_id);
         let node = fragment.reserve_node_id().expect("one node");
         let ty = ValueType::new(DataType::Int64, false);
+        let constant_id = novarocks_physical_plan::ConstantPoolId::new(0);
+        let constant_array = arrow::array::Int64Array::from(vec![7]);
+        let constant_pool = novarocks_physical_plan::ConstantPool::try_new(
+            std::sync::Arc::new(ty.try_to_field("payload").expect("original Int64 field")),
+            ty.clone(),
+            arrow::array::Array::to_data(&constant_array),
+            crate::application::test_constant_policy(),
+            novarocks_type_contract::CompilePhase::Validate,
+            &novarocks_sql::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("original scalar checked by the constant owner");
         let literal = fragment
-            .add_expression(node, ty.clone(), ExprKind::Literal(LiteralValue::Int64(7)))
-            .expect("one exact Int64 literal");
+            .add_expression(
+                node,
+                ty.clone(),
+                ExprKind::Constant(novarocks_physical_plan::ConstantReference {
+                    pool: constant_id,
+                    ordinal: 0,
+                }),
+            )
+            .expect("one exact checked Int64 literal");
         let value = fragment
             .add_value(
                 ty.clone(),
@@ -1475,6 +1492,8 @@ mod tests {
             )
             .expect("one singleton result fragment");
         let mut plan = PlanBuilder::new(version);
+        plan.insert_constant_pool(constant_id, constant_pool)
+            .expect("one original checked constant pool");
         plan.add_fragment(fragment).expect("one fragment");
         plan.set_result_port(ResultPort {
             scalar_schema: None,
@@ -1489,7 +1508,9 @@ mod tests {
             }]),
         })
         .expect("one original result occurrence");
-        let plan = plan.finish().expect("production whole-plan validation");
+        let plan = plan
+            .finish_observed(&novarocks_sql::compiler::SqlCompileControl::unbounded())
+            .expect("production caller-observed whole-plan validation");
         let output = match purpose {
             FullBindPurpose::ClientRows => FrozenRootOutput::ClientRows(
                 novarocks_sql::compiler::client_render_schema(&plan, 0)
@@ -1501,9 +1522,9 @@ mod tests {
             plan,
             &novarocks_sql::compiler::SqlCompileControl::unbounded(),
         )
-            .expect("production completed program validation")
-            .freeze_root_output(output)
-            .expect("freeze the original root purpose");
+        .expect("production completed program validation")
+        .freeze_root_output(output)
+        .expect("freeze the original root purpose");
         let paired =
             CompletedPlanWithAccess::try_pair(
                 candidate,

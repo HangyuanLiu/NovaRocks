@@ -51,18 +51,24 @@ use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, anyhow, bail};
 use mysql::prelude::Queryable;
 use mysql::{Row, Value};
-use novarocks_cluster_harness::{CrossProcessChildEnvironment, ServerHandle};
+use novarocks_cluster_harness::ServerHandle;
 use novarocks_connector_iceberg::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1;
 use novarocks_connector_iceberg::iceberg::spec::TableMetadata;
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::query_lifecycle::native_sql_controls::{
+    SelectedStatement, SqlIntentOwner, StatementSpec,
+};
+#[path = "writer_statement_actor.rs"]
+mod writer_statement_actor;
+use writer_statement_actor::{WriterActor, retain_write_result};
+
 use super::connector::{
-    await_resource_convergence, connector_launch_config, connector_reader_environment,
-    create_catalog, create_warehouse, mysql_endpoint, require_three_backends, resource_baseline,
+    await_resource_convergence, connector_launch_config, create_catalog, create_warehouse,
+    mysql_endpoint, require_three_backends, resource_baseline,
 };
 
 const WRITER_OPENS: &str = "novarocks_backend_connector_write_writer_opens_total";
@@ -112,7 +118,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(DistributedStatisticsDataflow),
         Box::new(DistributedWriterOverwrite),
         Box::new(DistributedWriterRowLevel),
-        Box::new(DistributedWriterFaults),
+        Box::new(DistributedWriterFaults::default()),
     ]
 }
 
@@ -613,10 +619,6 @@ impl Scenario for DistributedWriterDataflow {
         "connector/distributed-writer-dataflow"
     }
 
-    fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
-    }
-
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
         Ok(connector_launch_config())
     }
@@ -781,10 +783,6 @@ struct DistributedStatisticsDataflow;
 impl Scenario for DistributedStatisticsDataflow {
     fn name(&self) -> &'static str {
         "statistics/native-aggregate-and-collect-on-write"
-    }
-
-    fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
     }
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
@@ -1448,10 +1446,6 @@ impl Scenario for DistributedWriterOverwrite {
         "connector/distributed-writer-overwrite"
     }
 
-    fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
-    }
-
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
         Ok(connector_launch_config())
     }
@@ -1598,10 +1592,6 @@ struct DistributedWriterRowLevel;
 impl Scenario for DistributedWriterRowLevel {
     fn name(&self) -> &'static str {
         "connector/distributed-writer-row-level"
-    }
-
-    fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
     }
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
@@ -1984,18 +1974,25 @@ const TASK_CONTEXT_ABORT_APPLIED: &str = "NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED";
 impl WriteFault {
     /// How many times this fault has left evidence in a backend process.
     ///
-    /// A fault that is armable but never bound to the attempt is inert, and an
+    /// A fault that is nominated but never hit by its exact owner is inert, and an
     /// inert fault reads exactly like a fault that did not reproduce: the
     /// statement fails for some unrelated reason and the scenario still passes.
     /// Every case therefore has to show that its own injection fired.
-    fn injection_marker_count(&self, context: &mut ScenarioContext) -> Result<usize> {
+    fn injection_marker_count(
+        &self,
+        context: &mut ScenarioContext,
+        selected: &SelectedStatement,
+    ) -> Result<usize> {
         match self.injection_evidence() {
-            InjectionEvidence::Frontend(marker) => {
-                let log = context
-                    .handle()
-                    .fe_log_contents()
-                    .context("read FE log for fault-injection evidence")?;
-                Ok(log.matches(marker).count())
+            InjectionEvidence::NativeFault => {
+                selected.faults.iter().try_fold(0, |total, &(index, kind)| {
+                    Ok(total
+                        + usize::from(context.handle().selected_query_lifecycle_fault_hit(
+                            index,
+                            kind,
+                            &selected.token,
+                        )?))
+                })
             }
             InjectionEvidence::Backend(index, marker) => context
                 .handle()
@@ -2012,24 +2009,12 @@ impl WriteFault {
     /// Where this case's own injection leaves its evidence.
     const fn injection_evidence(&self) -> InjectionEvidence {
         match self {
-            Self::WriterEgress => InjectionEvidence::Frontend(
-                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-writer-failure ",
-            ),
-            Self::RootValidation => InjectionEvidence::Frontend(
-                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-root-failure ",
-            ),
-            Self::PartialAggregateUpdate => InjectionEvidence::Frontend(
-                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-partial-update-failure ",
-            ),
-            Self::PartialAggregateFinalize => InjectionEvidence::Frontend(
-                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-partial-finalize-failure ",
-            ),
-            Self::FinalAggregateMerge => InjectionEvidence::Frontend(
-                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-final-merge-failure ",
-            ),
-            Self::FinalAggregateFinalize => InjectionEvidence::Frontend(
-                "NOVAROCKS_QUERY_FAULT_BOUND kind=connector-write-final-finalize-failure ",
-            ),
+            Self::WriterEgress
+            | Self::RootValidation
+            | Self::PartialAggregateUpdate
+            | Self::PartialAggregateFinalize
+            | Self::FinalAggregateMerge
+            | Self::FinalAggregateFinalize => InjectionEvidence::NativeFault,
             Self::SeveredWriterStream => {
                 InjectionEvidence::Backend(SEVERED_BACKEND, TASK_EXECUTION_FAILURE_INJECTED)
             }
@@ -2175,8 +2160,8 @@ impl WriteFault {
 
 /// Where one case's injection leaves the evidence that it actually fired.
 enum InjectionEvidence {
-    /// In the frontend's own log, because the fault is bound there.
-    Frontend(&'static str),
+    /// Actual owner hit for this selected SQL, separately from nomination.
+    NativeFault,
     /// On the one backend the fault was armed on.
     Backend(usize, &'static str),
     /// Anywhere across the backends, summed, because which backends the
@@ -2210,30 +2195,45 @@ struct WriteStatements<'a> {
 /// root's result; and -- the case that separates the two halves of the barrier
 /// -- the data plane can close completely while the lifecycle still fails.
 /// Every case ends with the same published fact: zero commit invocations.
-struct DistributedWriterFaults;
+#[derive(Default)]
+struct DistributedWriterFaults {
+    intent: SqlIntentOwner,
+}
 
 impl Scenario for DistributedWriterFaults {
     fn name(&self) -> &'static str {
         "connector/distributed-writer-faults"
     }
 
-    fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
-    }
-
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
         Ok(connector_launch_config())
+    }
+
+    fn test_session_plan(
+        &self,
+        _: &ScenarioLaunchConfig,
+        _: &Path,
+        cluster_size: usize,
+        _: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(self.intent.freeze(
+            writer_fault_specs(cluster_size),
+            &[],
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
         let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect distributed writer fault control session")?,
-        )?;
+        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
 
         const CATALOG: &str = "distributed_writer_faults";
         const DATABASE: &str = "distributed_writer_fault_db";
@@ -2275,24 +2275,16 @@ impl Scenario for DistributedWriterFaults {
 
         // A committed row would prove the frontend committed despite a broken
         // write, so seed nothing into the target and require it to stay empty.
-        for fault in [
-            WriteFault::WriterEgress,
-            WriteFault::RootValidation,
-            WriteFault::PartialAggregateUpdate,
-            WriteFault::PartialAggregateFinalize,
-            WriteFault::FinalAggregateMerge,
-            WriteFault::FinalAggregateFinalize,
-            WriteFault::SeveredWriterStream,
-            WriteFault::FetchAbort,
-            WriteFault::DeadlineAbort,
-        ] {
+        for (ordinal, fault) in WRITE_FAULTS.into_iter().enumerate() {
             let case = fault.case();
+            let selected = self.intent.take(ordinal)?;
             context.action(format!("inject {case} and require no snapshot"));
             let before_terminals = publication_terminals(context, WRITE_FAMILY)?;
             let before = all_write_counters(context)?;
-            let before_injections = fault.injection_marker_count(context)?;
+            let before_injections = fault.injection_marker_count(context, &selected)?;
 
-            let outcome = run_faulted_write(context, &fault, &user, port, &statements)?;
+            let outcome =
+                run_faulted_write(context, &fault, &user, port, &statements, selected.clone())?;
             let Err(error) = outcome else {
                 bail!("{case} did not fail the write");
             };
@@ -2320,13 +2312,33 @@ impl Scenario for DistributedWriterFaults {
                 delta.result_finished,
                 delta.result_aborted
             );
-            let after_injections = fault.injection_marker_count(context)?;
+            let after_injections = fault.injection_marker_count(context, &selected)?;
             if after_injections <= before_injections {
                 bail!(
                     "{case} produced no fault-injection evidence on its target backend \
                      ({before_injections} -> {after_injections}); the write may have failed for an \
                      unrelated reason"
                 );
+            }
+            if !selected.faults.is_empty() {
+                let hits = selected
+                    .faults
+                    .iter()
+                    .try_fold(0usize, |total, &(index, kind)| {
+                        Ok::<_, anyhow::Error>(
+                            total
+                                + usize::from(
+                                    context.handle().selected_query_lifecycle_fault_hit(
+                                        index,
+                                        kind,
+                                        &selected.token,
+                                    )?,
+                                ),
+                        )
+                    })?;
+                if hits == 0 {
+                    bail!("{case} left no actual fault hit for its selected statement");
+                }
             }
             fault.assert_case_evidence(&delta, case)?;
 
@@ -2360,263 +2372,172 @@ impl Scenario for DistributedWriterFaults {
     }
 }
 
-/// Arm one fault, run the write, and undo the arming.
-///
-/// The two cases that hold a process open -- a fragment failure that blocks
-/// until the runner releases it, and a frontend that blocks at a lifecycle
-/// phase until the runner acts -- run the write on its own connection so the
-/// scenario thread stays free to release them.
+/// Run only the selected write after its actual idle connection is bound.
 fn run_faulted_write(
     context: &mut ScenarioContext,
     fault: &WriteFault,
     user: &str,
     port: u16,
     statements: &WriteStatements<'_>,
+    selected: SelectedStatement,
 ) -> Result<Result<(), mysql::Error>> {
     let case = fault.case();
     let insert = fault.statement(statements);
     match fault {
-        WriteFault::WriterEgress
-        | WriteFault::RootValidation
-        | WriteFault::PartialAggregateUpdate
-        | WriteFault::PartialAggregateFinalize
-        | WriteFault::FinalAggregateMerge
-        | WriteFault::FinalAggregateFinalize => {
-            let kind = match fault {
-                WriteFault::WriterEgress => "connector-write-writer-failure",
-                WriteFault::RootValidation => "connector-write-root-failure",
-                WriteFault::PartialAggregateUpdate => "connector-write-partial-update-failure",
-                WriteFault::PartialAggregateFinalize => "connector-write-partial-finalize-failure",
-                WriteFault::FinalAggregateMerge => "connector-write-final-merge-failure",
-                WriteFault::FinalAggregateFinalize => "connector-write-final-finalize-failure",
-                _ => unreachable!("aggregate/egress fault match is exhaustive"),
-            };
-            for index in 0..context.handle().be_count() {
+        WriteFault::FetchAbort => {
+            let created_baseline = backend_marker_total(context, TASK_CREATE_APPLIED)?;
+            let write = WriterActor::start(context, insert, selected, None)?;
+            let primary = (|| {
+                await_backend_marker_above(
+                    context,
+                    TASK_CREATE_APPLIED,
+                    created_baseline,
+                    "a task admitted for the write this case aborts",
+                )?;
+                let deadline = context.deadline();
                 context
                     .handle()
-                    .arm_query_lifecycle_fault(index, kind)
-                    .with_context(|| format!("arm {kind} on BE[{index}]"))?;
-            }
-            let outcome = run_write_on_own_connection(context, user, port, insert, case)?;
-            context
-                .handle()
-                .clear_query_lifecycle_faults()
-                .with_context(|| format!("clear {kind} tokens"))?;
-            Ok(outcome)
-        }
-        WriteFault::SeveredWriterStream => {
-            // One task on this backend is failed after it published RUNNING,
-            // so the root's gather keeps a sender that never reaches
-            // end-of-stream.
-            //
-            // This replaced `arm_fragment_executor_failure`, whose injection
-            // point was the retired protocol's Stage/Start fragment ingress:
-            // the task protocol runs its fragments from
-            // `NativeTaskExecutionHost`, so that trigger was never consumed,
-            // the write succeeded untouched, and the case waited out its
-            // budget for a marker with no emitter.
-            // `TaskExecutionFailure` is the successor with the same shape --
-            // the task is genuinely admitted and genuinely started before it
-            // fails -- and it needs no release, because it is an injection
-            // rather than a rendezvous.
-            //
-            // It is still the closest injection the fault channel offers to a
-            // transport-level loss between a writer and the root. There is no
-            // failpoint inside the exchange itself, and the exchange ingress
-            // handler has no query execution identity to scope one to, so a
-            // transport fault would have to be a second, unscoped channel.
-            //
-            // The fault is not one of the kinds that pin a single-instance
-            // fragment, so the root finish task may land on this backend and
-            // be the task that fails. The case's own evidence covers that: it
-            // requires writers to have opened on at least two backends, so a
-            // root that failed still failed with live senders behind it.
-            context
-                .handle()
-                .arm_query_lifecycle_fault(SEVERED_BACKEND, TASK_EXECUTION_FAILURE)
-                .context("arm the severed writer task failure")?;
-            let outcome = run_write_on_own_connection(context, user, port, insert, case)?;
-            context
-                .handle()
-                .clear_query_lifecycle_faults()
-                .context("clear the severed writer task failure")?;
-            Ok(outcome)
-        }
-        WriteFault::FetchAbort => {
-            // The attempt is aborted while its tasks are running, so the
-            // frontend never fetches the root's complete prepared write set.
-            //
-            // The retired chain gave this case a frontend rendezvous: the
-            // runner armed a phase trigger and the coordinator parked at
-            // `running` until the kill landed. That barrier is
-            // `FrontendQueryLifecycleBarrier::start_all`, which only ANALYZE
-            // reaches now, so waiting on its marker waits out the whole
-            // budget. The task protocol's anchor is a task actually being
-            // created on a backend -- the same trigger
-            // `distributed-resilience`'s `task-kill-query` case uses -- and
-            // the sleeping source is what keeps the write in flight long
-            // enough for the kill to land inside it rather than after it.
-            let created_baseline = backend_marker_total(context, TASK_CREATE_APPLIED)?;
-            let write = start_write_on_own_connection(user, port, insert)?;
-            let connection_id = write
-                .connection_id
-                .recv_timeout(context.remaining("receive aborted write connection id")?)
-                .context("aborted write session ended before publishing its connection id")?;
-            await_backend_marker_above(
-                context,
-                TASK_CREATE_APPLIED,
-                created_baseline,
-                "a task admitted for the write this case aborts",
-            )?;
-            let deadline = context.deadline();
-            context
-                .handle()
-                .kill_query_until(connection_id, deadline)
-                .context("abort the in-flight distributed write")?;
-            let outcome = write
-                .done
-                .recv_timeout(context.remaining("await the aborted write result")?)
-                .context("aborted write session did not finish")?;
-            write
-                .thread
-                .join()
-                .map_err(|_| anyhow::anyhow!("aborted write session thread panicked"))??;
-            Ok(outcome)
+                    .kill_query_until(write.connection_id, deadline)
+                    .context("abort the in-flight distributed write")?;
+                write
+                    .done
+                    .recv_timeout(context.remaining("await the aborted write result")?)
+                    .context("aborted write session did not finish")
+            })();
+            write.settle(context, primary)
         }
         WriteFault::DeadlineAbort => {
             const QUERY_TIMEOUT_SECS: u64 = 10;
             let writer_baseline = all_write_counters(context)?;
-            for index in 0..context.handle().be_count() {
-                context
+            let write = WriterActor::start(context, insert, selected, Some(QUERY_TIMEOUT_SECS))?;
+            let primary = (|| {
+                await_append_holds(context, &writer_baseline)?;
+                match write.done.try_recv() {
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Ok(outcome) => bail!(
+                        "deadline write became terminal before its three live append holds: {outcome:?}"
+                    ),
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        bail!("deadline write actor disconnected before its own deadline")
+                    }
+                }
+                let outcome = write
+                    .done
+                    .recv_timeout(context.remaining("await the deadline write result")?)
+                    .context("deadline write session did not finish")?;
+                await_deadline_abort_terminals(context, &writer_baseline)?;
+                Ok(outcome)
+            })();
+            write.settle(context, primary)
+        }
+        _ => {
+            let deadline = context.deadline();
+            let mut connection = mysql_actor::connect_until(user, port, deadline)?;
+            let observation = match selected.arm(context, connection.connection_id(), insert) {
+                Ok(observation) => observation,
+                Err(primary) => {
+                    return writer_statement_actor::combine(Err(primary), connection.finish());
+                }
+            };
+            let outcome = connection.query_drop(insert);
+            let observed = match &outcome {
+                Ok(()) => {
+                    let terminal = context
+                        .handle()
+                        .await_query_lifecycle_statement_observation(&observation, true, deadline)
+                        .map(|_| ());
+                    let drain = context
+                        .handle()
+                        .drain_query_lifecycle_statement_observation(&observation);
+                    writer_statement_actor::combine(terminal, drain)
+                }
+                Err(mysql::Error::MySqlError(_)) => {
+                    let reentry =
+                        writer_statement_actor::require_public_error_reentry(&mut connection);
+                    let drain = context
+                        .handle()
+                        .drain_query_lifecycle_statement_binding(&observation, deadline);
+                    writer_statement_actor::combine(reentry, drain)
+                }
+                Err(_) => context
                     .handle()
-                    .arm_query_lifecycle_fault(index, "connector-write-append-hold")
-                    .with_context(|| format!("arm writer append hold on BE[{index}]"))?;
-            }
-            let write =
-                start_deadline_write_on_own_connection(user, port, insert, QUERY_TIMEOUT_SECS)?;
-            let _connection_id = write
-                .connection_id
-                .recv_timeout(context.remaining("await deadline write session setup")?)
-                .context("deadline write session ended before applying query_timeout")?;
-            await_append_holds(context, &writer_baseline)?;
-            match write.done.try_recv() {
-                Err(mpsc::TryRecvError::Empty) => {}
-                Ok(outcome) => {
-                    bail!(
-                        "deadline write became terminal before its three live append holds: \
-                         {outcome:?}"
-                    );
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    bail!("deadline write actor disconnected before its own deadline")
-                }
-            }
-            let outcome = write
-                .done
-                .recv_timeout(context.remaining("await the deadline write result")?)
-                .context("deadline write session did not finish")?;
-            write
-                .thread
-                .join()
-                .map_err(|_| anyhow::anyhow!("deadline write session thread panicked"))??;
-            await_deadline_abort_terminals(context, &writer_baseline)?;
-            context
-                .handle()
-                .clear_query_lifecycle_faults()
-                .context("clear writer append hold tokens")?;
-            Ok(outcome)
+                    .drain_query_lifecycle_statement_binding(&observation, deadline),
+            };
+            let primary = match outcome {
+                Err(error) if !matches!(&error, mysql::Error::MySqlError(_)) => Err(error.into()),
+                outcome => Ok(outcome),
+            };
+            retain_write_result(retain_write_result(primary, observed), connection.finish())
         }
     }
 }
 
-struct PendingWrite {
-    thread: thread::JoinHandle<Result<()>>,
-    connection_id: mpsc::Receiver<u32>,
-    done: mpsc::Receiver<Result<(), mysql::Error>>,
-}
+const WRITE_FAULTS: [WriteFault; 9] = [
+    WriteFault::WriterEgress,
+    WriteFault::RootValidation,
+    WriteFault::PartialAggregateUpdate,
+    WriteFault::PartialAggregateFinalize,
+    WriteFault::FinalAggregateMerge,
+    WriteFault::FinalAggregateFinalize,
+    WriteFault::SeveredWriterStream,
+    WriteFault::FetchAbort,
+    WriteFault::DeadlineAbort,
+];
 
-/// Run one faulted write on its own connection.
-///
-/// Each case gets a fresh session so a broken attempt cannot leave session
-/// state behind for the next one, and so the control session stays usable for
-/// the read-backs that follow.
-fn run_write_on_own_connection(
-    context: &mut ScenarioContext,
-    user: &str,
-    port: u16,
-    insert: &str,
-    case: &str,
-) -> Result<Result<(), mysql::Error>> {
-    let mut connection = mysql_actor::connect(
-        user,
-        port,
-        context.remaining(&format!("connect the {case} write session"))?,
-    )?;
-    Ok(connection.query_drop(insert))
-}
-
-fn start_write_on_own_connection(user: &str, port: u16, insert: &str) -> Result<PendingWrite> {
-    let (id_tx, connection_id) = mpsc::sync_channel(1);
-    let (done_tx, done) = mpsc::sync_channel(1);
-    let user = user.to_string();
-    let insert = insert.to_string();
-    let thread = thread::Builder::new()
-        .name("distributed-writer-abort".to_string())
-        .spawn(move || -> Result<()> {
-            // This session's statement is deliberately left hanging until
-            // another session cancels it, so it uses the connection form whose
-            // wait is bounded by the scenario rather than by a socket read
-            // timeout.
-            let mut connection =
-                mysql_actor::connect_for_cancellation(&user, port, Duration::from_secs(30))?;
-            id_tx
-                .send(connection.connection_id())
-                .context("publish the aborted write connection id")?;
-            let outcome = connection.query_drop(insert);
-            done_tx
-                .send(outcome)
-                .context("publish the aborted write result")
+fn writer_fault_specs(cluster_size: usize) -> Vec<StatementSpec> {
+    let target =
+        "distributed_writer_faults.distributed_writer_fault_db.distributed_writer_fault_data";
+    let full = format!(
+        "INSERT INTO {target} SELECT v FROM distributed_writer_faults.distributed_writer_fault_db.distributed_writer_fault_source"
+    );
+    let delayed = format!(
+        "INSERT INTO {target} SELECT v FROM distributed_writer_faults.distributed_writer_fault_db.distributed_writer_fault_delay WHERE sleep(delay_s)"
+    );
+    let statements = WriteStatements {
+        full: &full,
+        delayed: &delayed,
+    };
+    WRITE_FAULTS
+        .into_iter()
+        .map(|fault| {
+            let kind = match fault {
+                WriteFault::WriterEgress => Some("connector-write-writer-failure"),
+                WriteFault::RootValidation => Some("connector-write-root-failure"),
+                WriteFault::PartialAggregateUpdate => {
+                    Some("connector-write-partial-update-failure")
+                }
+                WriteFault::PartialAggregateFinalize => {
+                    Some("connector-write-partial-finalize-failure")
+                }
+                WriteFault::FinalAggregateMerge => Some("connector-write-final-merge-failure"),
+                WriteFault::FinalAggregateFinalize => {
+                    Some("connector-write-final-finalize-failure")
+                }
+                WriteFault::SeveredWriterStream => Some(TASK_EXECUTION_FAILURE),
+                WriteFault::FetchAbort => None,
+                WriteFault::DeadlineAbort => Some("connector-write-append-hold"),
+            };
+            StatementSpec {
+                sql: fault.statement(&statements).to_owned(),
+                faults: kind
+                    .map(|kind| {
+                        if matches!(fault, WriteFault::SeveredWriterStream) {
+                            vec![(SEVERED_BACKEND, kind)]
+                        } else {
+                            (0..cluster_size).map(|index| (index, kind)).collect()
+                        }
+                    })
+                    .unwrap_or_default(),
+                observations: if matches!(fault, WriteFault::FetchAbort) {
+                    (0..cluster_size)
+                        .map(|index| (index, "grpc-fragment", None))
+                        .collect()
+                } else {
+                    vec![]
+                },
+            }
         })
-        .context("start the aborted write session")?;
-    Ok(PendingWrite {
-        thread,
-        connection_id,
-        done,
-    })
-}
-
-fn start_deadline_write_on_own_connection(
-    user: &str,
-    port: u16,
-    insert: &str,
-    query_timeout_secs: u64,
-) -> Result<PendingWrite> {
-    let (id_tx, connection_id) = mpsc::sync_channel(1);
-    let (done_tx, done) = mpsc::sync_channel(1);
-    let user = user.to_string();
-    let insert = insert.to_string();
-    let thread = thread::Builder::new()
-        .name("distributed-writer-deadline".to_string())
-        .spawn(move || -> Result<()> {
-            let mut connection =
-                mysql_actor::connect_for_cancellation(&user, port, Duration::from_secs(30))?;
-            connection
-                .query_drop(format!("SET query_timeout = {query_timeout_secs}"))
-                .context("set the deadline write session query_timeout")?;
-            id_tx
-                .send(connection.connection_id())
-                .context("publish the deadline write session readiness")?;
-            let outcome = connection.query_drop(insert);
-            done_tx
-                .send(outcome)
-                .context("publish the deadline write result")
-        })
-        .context("start the deadline write session")?;
-    Ok(PendingWrite {
-        thread,
-        connection_id,
-        done,
-    })
+        .collect()
 }
 
 /// How many times `marker` appears across every Backend log.
@@ -2709,5 +2630,55 @@ fn await_deadline_abort_terminals(
             );
         }
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod controlled_writer_tests {
+    use super::*;
+
+    #[test]
+    fn fault_matrix_has_only_targeted_write_permissions() {
+        let specs = writer_fault_specs(3);
+        assert_eq!(specs.len(), 9);
+        assert!(specs.iter().all(|spec| {
+            spec.sql
+                .starts_with("INSERT INTO distributed_writer_faults.")
+        }));
+        assert!(specs.iter().all(|spec| {
+            spec.observations
+                .iter()
+                .all(|(_, action, _)| *action == "grpc-fragment")
+        }));
+        assert_eq!(
+            specs.iter().map(|spec| spec.faults.len()).sum::<usize>(),
+            22
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| spec.observations.len())
+                .sum::<usize>(),
+            3
+        );
+        assert_eq!(
+            specs[6].faults,
+            vec![(SEVERED_BACKEND, TASK_EXECUTION_FAILURE)]
+        );
+        assert!(specs[7].faults.is_empty());
+        assert!(specs[7].sql.ends_with("WHERE sleep(delay_s)"));
+        assert!(specs.iter().flat_map(|spec| &spec.faults).all(|(_, kind)| {
+            novarocks_failpoint::QueryLifecycleFaultKind::parse(kind).is_some()
+        }));
+        // This is 26 FE grants: the statement owner plus 22 binds and three
+        // Task observations. Seed/setup and the healthy post-matrix write
+        // deliberately receive no permission.
+        assert_eq!(
+            1 + specs
+                .iter()
+                .map(|spec| spec.faults.len() + spec.observations.len())
+                .sum::<usize>(),
+            26
+        );
     }
 }

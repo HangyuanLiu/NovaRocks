@@ -17,29 +17,38 @@
 
 #[cfg(all(feature = "normal-build", feature = "test-controls"))]
 compile_error!("normal-build cannot include test-controls");
-#[cfg(all(feature = "mem-1-m07-hms-listing-observe", not(feature = "test-controls")))]
+#[cfg(all(
+    feature = "mem-1-m07-hms-listing-observe",
+    not(feature = "test-controls")
+))]
 compile_error!("mem-1-m07-hms-listing-observe requires test-controls");
 #[cfg(all(feature = "mem-1-m07-closing-pressure", not(feature = "test-controls")))]
 compile_error!("mem-1-m07-closing-pressure requires test-controls");
 #[cfg(all(feature = "mem-1-m07-root-observation", not(feature = "test-controls")))]
 compile_error!("mem-1-m07-root-observation requires test-controls");
-#[cfg(all(feature = "mem-1-m07-exact-mysql-write", not(feature = "test-controls")))]
+#[cfg(all(
+    feature = "mem-1-m07-exact-mysql-write",
+    not(feature = "test-controls")
+))]
 compile_error!("mem-1-m07-exact-mysql-write requires test-controls");
 
 /// Capabilities compiled by this owner; activation still requires a role session.
 pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
-    (env!("CARGO_PKG_NAME"), &[
-        #[cfg(feature = "test-controls")]
-        "test-controls",
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        "mem-1-m07-hms-listing-observe",
-        #[cfg(feature = "mem-1-m07-closing-pressure")]
-        "mem-1-m07-closing-pressure",
-        #[cfg(feature = "mem-1-m07-root-observation")]
-        "mem-1-m07-root-observation",
-        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-        "mem-1-m07-exact-mysql-write",
-    ])
+    (
+        env!("CARGO_PKG_NAME"),
+        &[
+            #[cfg(feature = "test-controls")]
+            "test-controls",
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            "mem-1-m07-hms-listing-observe",
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            "mem-1-m07-closing-pressure",
+            #[cfg(feature = "mem-1-m07-root-observation")]
+            "mem-1-m07-root-observation",
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            "mem-1-m07-exact-mysql-write",
+        ],
+    )
 }
 
 pub(crate) mod application;
@@ -61,6 +70,7 @@ pub use mv::management_audit::FileManagementAuditSink;
 pub use mv::startup_isolation_file::StartupIsolationSource;
 mod native;
 pub use query_execution::package_freeze::{CompiledPackageCarrier, StaticPlanCarrier};
+#[cfg(feature = "test-controls")]
 mod preparation_diagnostics;
 pub(crate) mod query;
 mod query_execution;
@@ -89,3 +99,6 @@ mod topology_metrics;
 pub use topology::ClusterBackendOpenConfig;
 mod view;
 pub(crate) mod workload_lifecycle;
+
+#[cfg(feature = "test-controls")]
+pub mod test_session;

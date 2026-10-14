@@ -1,3 +1,6 @@
+#[path = "mv_control_plan.rs"]
+pub(super) mod control_plan;
+
 use super::mv_uea7::{
     ManagedMvRestFixture, property, require_status_phase, status, wait_for_status_phase,
 };
@@ -6,15 +9,17 @@ use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use ::mysql::prelude::{FromRow, Queryable};
 use ::mysql::{Conn, Row};
 use anyhow::{Context, Result, bail};
+use control_plan::FeLaunchIntent;
 use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan;
 use reqwest::blocking::Client;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -65,6 +70,26 @@ impl Scenario for MvStateStoreRestart {
         Ok(launch)
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _scenario_root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<ClusterTestSessionPlan>> {
+        control_plan::plan(
+            cluster_size,
+            ordinary_binary,
+            controlled_binary,
+            original_deadline,
+            vec![FeLaunchIntent::Ordinary, FeLaunchIntent::Ordinary],
+        )
+        .map(Some)
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let catalog = "system_mv_restart";
@@ -93,7 +118,7 @@ impl Scenario for MvStateStoreRestart {
             &[(1, 10), (2, 20)],
             "read first MV publication before FE restart",
         )?;
-        drop(conn);
+        conn.finish()?;
 
         restart_frontend(context, "restart FE with the persisted StateStore")?;
         let mut conn = connect(context)?;
@@ -206,10 +231,6 @@ impl Scenario for MvSchedulerRecovery {
             bail!("managed MV fixture was initialized more than once");
         }
         *slot = Some(fixture);
-        launch.child_environment.fe.insert(
-            "NOVAROCKS_MVX4_SCHEDULER_TEST_DIR".to_string(),
-            barrier_dir.to_string_lossy().into_owned(),
-        );
         let mut fe_overlay = launch.config_overlay.fe.take().unwrap_or_default();
         fe_overlay.push_str(
             r#"
@@ -223,6 +244,57 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
         );
         launch.config_overlay.fe = Some(fe_overlay);
         Ok(launch)
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        scenario_root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<ClusterTestSessionPlan>> {
+        control_plan::plan(
+            cluster_size,
+            ordinary_binary,
+            controlled_binary,
+            original_deadline,
+            vec![
+                FeLaunchIntent::MvActions(vec![
+                    control_plan::scheduler(
+                        "scheduler-a",
+                        "system_mv_scheduler",
+                        "ns",
+                        "orders_mv_a",
+                        &scenario_root.join("mv-scheduler-barrier"),
+                    ),
+                    control_plan::scheduler(
+                        "scheduler-b",
+                        "system_mv_scheduler",
+                        "ns",
+                        "orders_mv_b",
+                        &scenario_root.join("mv-scheduler-barrier"),
+                    ),
+                    control_plan::scheduler(
+                        "scheduler-recovery",
+                        "system_mv_scheduler",
+                        "ns",
+                        "orders_mv_recovery",
+                        &scenario_root.join("mv-scheduler-barrier"),
+                    ),
+                ]),
+                FeLaunchIntent::MvActions(vec![control_plan::transient(
+                    "recovery-transient",
+                    "system_mv_scheduler",
+                    "ns",
+                    "orders_mv_recovery",
+                    &scenario_root.join("mv-scheduler-barrier"),
+                )]),
+            ],
+        )
+        .map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -350,7 +422,7 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             "inject one typed connector unavailability after FE restart\n",
         )?;
         context.action("armed one transient scheduler preparation fault for FE recovery");
-        drop(conn);
+        conn.finish()?;
         context.action("terminate held scheduler FE attempt for recovery");
         context
             .handle()
@@ -415,7 +487,7 @@ impl Scenario for MvRewriteBindingBarrier {
                 barrier_dir.display()
             )
         })?;
-        let (fixture, mut launch) =
+        let (fixture, launch) =
             ManagedMvRestFixture::start(scenario_root, "system_mv_rewrite_binding")?;
         let mut slot = self
             .fixture
@@ -425,11 +497,35 @@ impl Scenario for MvRewriteBindingBarrier {
             bail!("managed MV fixture was initialized more than once");
         }
         *slot = Some(fixture);
-        launch.child_environment.fe.insert(
-            "NOVAROCKS_MVX4_REWRITE_TEST_DIR".to_string(),
-            barrier_dir.to_string_lossy().into_owned(),
-        );
         Ok(launch)
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        scenario_root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<ClusterTestSessionPlan>> {
+        control_plan::plan(
+            cluster_size,
+            ordinary_binary,
+            controlled_binary,
+            original_deadline,
+            vec![FeLaunchIntent::ObservedMvActions(vec![
+                control_plan::rewrite(
+                    "final-target-rewrite",
+                    "system_mv_rewrite_binding",
+                    "ns",
+                    control_plan::REWRITE_BINDING_TOKEN,
+                    &scenario_root.join("mv-rewrite-barrier"),
+                ),
+            ])],
+        )
+        .map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -482,34 +578,42 @@ impl Scenario for MvRewriteBindingBarrier {
         }
         context.action("confirmed query selection uses the M1 MV publication");
 
-        let _hold = FileTrigger::create(&hold_trigger, "hold\n")?;
-        let query = spawn_aggregate_query(
-            context.mysql_user().to_string(),
-            context.mysql_port(),
+        let hold = FileTrigger::create(&hold_trigger, "hold\n")?;
+        let query = match control_plan::ObservedQuery::start(
+            context,
             catalog,
-            context.remaining("start rewritten query at final target barrier")?,
-        );
-        wait_for_file_or_query(
+            "ns",
+            control_plan::REWRITE_BINDING_TOKEN,
+        ) {
+            Ok(query) => query,
+            Err(error) => return control_plan::with_cleanup(Err(error), hold.remove()),
+        };
+        let phase = (|| -> Result<()> {
+            wait_for_file_or_query(
+                context,
+                &frozen_marker,
+                &query,
+                "wait for completed M1 plan and read access to freeze",
+            )?;
+            context.action("observed completed query plan and access frozen on M1");
+            execute(
+                context,
+                &mut conn,
+                "advance source to S102 while query is held after M1 target freeze",
+                "INSERT INTO orders VALUES (3, 99)",
+            )?;
+            refresh(context, &mut conn, "orders_agg_mv")?;
+            context.action("published the normal M2 MV target before releasing the query");
+            Ok(())
+        })();
+        let released = hold.remove();
+        context.action("release rewritten query after M2 publication or failed barrier phase");
+        let rows = query.finish_after_release(
             context,
-            &frozen_marker,
-            &query,
-            "wait for completed M1 plan and read access to freeze",
+            phase,
+            released,
+            "wait for rewritten query frozen against M1",
         )?;
-        context.action("observed completed query plan and access frozen on M1");
-
-        execute(
-            context,
-            &mut conn,
-            "advance source to S102 while query is held after M1 target freeze",
-            "INSERT INTO orders VALUES (3, 99)",
-        )?;
-        refresh(context, &mut conn, "orders_agg_mv")?;
-        context.action("published the normal M2 MV target before releasing the query");
-
-        _hold.remove()?;
-        context.action("release rewritten query after M2 publication");
-        let rows =
-            receive_aggregate_query(context, query, "wait for rewritten query frozen against M1")?;
         if rows != [(0, 1800), (1, 1800), (2, 1800)] {
             bail!(
                 "rewritten query did not consume its frozen M1 target: rows={rows:?}; {}",
@@ -563,14 +667,38 @@ impl Scenario for MvRefreshConfigurationInterleaving {
             bail!("managed MV fixture was initialized more than once");
         }
         *slot = Some(fixture);
-        launch.child_environment.fe.insert(
-            "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR".to_string(),
-            fault_dir.to_string_lossy().into_owned(),
-        );
         let mut fe_overlay = launch.config_overlay.fe.take().unwrap_or_default();
         fe_overlay.push_str("\n[runtime]\nquery_blocking_worker_threads = 2\n");
         launch.config_overlay.fe = Some(fe_overlay);
         Ok(launch)
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        scenario_root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<ClusterTestSessionPlan>> {
+        control_plan::plan(
+            cluster_size,
+            ordinary_binary,
+            controlled_binary,
+            original_deadline,
+            vec![FeLaunchIntent::MvActions(vec![control_plan::recovery(
+                "configuration-data-prepared",
+                "system_mv_config_interleaving",
+                "ns",
+                "orders_mv",
+                "data-prepared",
+                "before-configuration-write",
+                &scenario_root.join("mv-recovery-faults"),
+            )?])],
+        )
+        .map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -625,7 +753,7 @@ impl Scenario for MvRefreshConfigurationInterleaving {
             context.mysql_port(),
             catalog,
             "orders_mv",
-            context.remaining("start held refresh before configuration write")?,
+            context.deadline(),
         );
         wait_for_fe_marker(
             context,
@@ -648,21 +776,28 @@ impl Scenario for MvRefreshConfigurationInterleaving {
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         let user = context.mysql_user().to_string();
         let port = context.mysql_port();
-        let timeout = context.remaining("start concurrent MV configuration write")?;
-        thread::spawn(move || {
-            let result = (|| -> Result<()> {
-                let mut writer = mysql_actor::connect(&user, port, timeout)?;
-                writer.query_drop(format!("SET CATALOG {catalog}"))?;
-                writer.query_drop("USE ns")?;
-                started_tx
-                    .send(())
-                    .context("signal configuration writer readiness")?;
-                writer.query_drop("ALTER MATERIALIZED VIEW orders_mv PAUSE REFRESH")?;
-                Ok(())
-            })()
-            .map_err(|error| format!("{error:#}"));
-            let _ = result_tx.send(result);
+        context.remaining("start concurrent MV configuration write")?;
+        let deadline = context.deadline();
+        let writer_actor = thread::spawn(move || -> Result<()> {
+            let result = mysql_actor::connect_until(&user, port, deadline)?
+                .run(|writer| {
+                    writer.query_drop(format!("SET CATALOG {catalog}"))?;
+                    writer.query_drop("USE ns")?;
+                    started_tx
+                        .send(())
+                        .context("signal configuration writer readiness")?;
+                    writer.query_drop("ALTER MATERIALIZED VIEW orders_mv PAUSE REFRESH")?;
+                    Ok(())
+                })
+                .map_err(|error| format!("{error:#}"));
+            result_tx
+                .send(result)
+                .map_err(|error| anyhow::anyhow!("MV writer result owner closed: {error}"))
         });
+        let result_rx = JoinedSqlResult {
+            result: result_rx,
+            actor: Mutex::new(Some(writer_actor)),
+        };
         started_rx
             .recv_timeout(context.remaining("wait for configuration writer readiness")?)
             .context("configuration writer did not reach its SQL request")?;
@@ -810,7 +945,7 @@ impl Scenario for MvCurrentDependencyRecheck {
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
         let fault_dir = scenario_root.join("mv-recovery-faults");
         fs::create_dir_all(&fault_dir)?;
-        let (fixture, mut launch) =
+        let (fixture, launch) =
             ManagedMvRestFixture::start(scenario_root, "system_mv_dependency_recheck")?;
         let mut slot = self
             .fixture
@@ -820,11 +955,35 @@ impl Scenario for MvCurrentDependencyRecheck {
             bail!("managed MV fixture was initialized more than once");
         }
         *slot = Some(fixture);
-        launch.child_environment.fe.insert(
-            "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR".to_string(),
-            fault_dir.to_string_lossy().into_owned(),
-        );
         Ok(launch)
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        scenario_root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<ClusterTestSessionPlan>> {
+        control_plan::plan(
+            cluster_size,
+            ordinary_binary,
+            controlled_binary,
+            original_deadline,
+            vec![FeLaunchIntent::MvActions(vec![control_plan::recovery(
+                "dependency-data-prepared",
+                "system_mv_dependency_recheck",
+                "ns",
+                "orders_mv",
+                "data-prepared",
+                "before-current-dependency-recheck",
+                &scenario_root.join("mv-recovery-faults"),
+            )?])],
+        )
+        .map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -869,7 +1028,7 @@ impl Scenario for MvCurrentDependencyRecheck {
             context.mysql_port(),
             catalog,
             "orders_mv",
-            context.remaining("start held MV refresh")?,
+            context.deadline(),
         );
         wait_for_fe_marker(
             context,
@@ -928,6 +1087,26 @@ impl Scenario for MvLegacyInterpretationRebuild {
         Ok(launch)
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _scenario_root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<ClusterTestSessionPlan>> {
+        control_plan::plan(
+            cluster_size,
+            ordinary_binary,
+            controlled_binary,
+            original_deadline,
+            vec![FeLaunchIntent::Ordinary, FeLaunchIntent::Ordinary],
+        )
+        .map(Some)
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let catalog = "system_mv_legacy_interpretation";
@@ -949,7 +1128,7 @@ impl Scenario for MvLegacyInterpretationRebuild {
         let create = "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders";
         execute(context, &mut conn, "create an unpublished MV", create)?;
         externally_persist_old_endian_interpretation(context, &rest_uri, "ns", "orders_mv")?;
-        drop(conn);
+        conn.finish()?;
 
         restart_frontend(context, "restart FE over an old nonzero big-endian L")?;
         let mut conn = connect(context)?;
@@ -1037,8 +1216,7 @@ impl Scenario for MvStagedPublishedRecovery {
         fs::create_dir_all(&fault_dir).with_context(|| {
             format!("create MV recovery fault directory {}", fault_dir.display())
         })?;
-        let (fixture, mut launch) =
-            ManagedMvRestFixture::start(scenario_root, "system_mv_recovery")?;
+        let (fixture, launch) = ManagedMvRestFixture::start(scenario_root, "system_mv_recovery")?;
         let mut slot = self
             .fixture
             .lock()
@@ -1047,11 +1225,47 @@ impl Scenario for MvStagedPublishedRecovery {
             bail!("managed MV fixture was initialized more than once");
         }
         *slot = Some(fixture);
-        launch.child_environment.fe.insert(
-            "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR".to_string(),
-            fault_dir.to_string_lossy().into_owned(),
-        );
         Ok(launch)
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        scenario_root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<ClusterTestSessionPlan>> {
+        control_plan::plan(
+            cluster_size,
+            ordinary_binary,
+            controlled_binary,
+            original_deadline,
+            vec![
+                FeLaunchIntent::MvActions(vec![control_plan::recovery(
+                    "staged-write-committed",
+                    "system_mv_recovery",
+                    "ns",
+                    "orders_mv",
+                    "write-committed",
+                    "staged-before-publication",
+                    &scenario_root.join("mv-recovery-faults"),
+                )?]),
+                FeLaunchIntent::MvActions(vec![control_plan::recovery(
+                    "published-before-cleanup",
+                    "system_mv_recovery",
+                    "ns",
+                    "orders_mv",
+                    "publication-committed",
+                    "published-before-cleanup",
+                    &scenario_root.join("mv-recovery-faults"),
+                )?]),
+                FeLaunchIntent::Ordinary,
+            ],
+        )
+        .map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -1090,7 +1304,7 @@ impl Scenario for MvStagedPublishedRecovery {
             context.mysql_port(),
             catalog,
             "orders_mv",
-            context.remaining("start staged recovery refresh")?,
+            context.deadline(),
         );
         wait_for_fe_marker(
             context,
@@ -1143,7 +1357,7 @@ impl Scenario for MvStagedPublishedRecovery {
             context.mysql_port(),
             catalog,
             "orders_mv",
-            context.remaining("start publication recovery refresh")?,
+            context.deadline(),
         );
         wait_for_fe_marker(
             context,
@@ -1212,6 +1426,25 @@ impl Scenario for MvFirstRefreshStaging {
         Ok(launch)
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _scenario_root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<ClusterTestSessionPlan>> {
+        control_plan::first_refresh_plan(
+            cluster_size,
+            ordinary_binary,
+            controlled_binary,
+            original_deadline,
+        )
+        .map(Some)
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let catalog = "system_mv_staging";
@@ -1270,13 +1503,38 @@ impl Scenario for MvFirstRefreshStaging {
         // its scan fragment is placed on every live backend and that backend
         // does get a task.
         let injected_baseline = total_be_marker_count(context, TASK_EXECUTION_FAILURE_MARKER)?;
-        context
-            .handle()
-            .arm_query_lifecycle_fault(0, TASK_EXECUTION_FAILURE)?;
+        let deadline = context.deadline();
+        // The actual connection is idle after catalog/database setup. Arm the
+        // exact outer REFRESH bytes before its real statement admission.
+        let observation = context.handle().arm_selected_statement_observation(
+            control_plan::FIRST_REFRESH_TOKEN,
+            conn.connection_id(),
+            control_plan::FIRST_REFRESH_SQL,
+            deadline,
+        )?;
+        let armed = context.handle().arm_selected_query_lifecycle_fault(
+            0,
+            TASK_EXECUTION_FAILURE,
+            control_plan::FIRST_REFRESH_TOKEN,
+        );
+        if let Err(error) = armed {
+            let drained = context
+                .handle()
+                .drain_query_lifecycle_statement_observation(&observation);
+            return control_plan::with_cleanup(Err(error), drained);
+        }
         context.action("armed an injected task execution failure for MV first refresh");
-        let refresh_result = conn.query_drop("REFRESH MATERIALIZED VIEW orders_start_fault_mv");
-        let cleanup_result = context.handle().clear_query_lifecycle_faults();
-        cleanup_result.context("clear injected task execution failure")?;
+        let refresh_result = conn.query_drop(control_plan::FIRST_REFRESH_SQL);
+        let cleanup_result = context
+            .handle()
+            .clear_query_lifecycle_faults()
+            .context("clear injected task execution failure");
+        // query_drop returned the actual response before its observation is drained.
+        let drained = context
+            .handle()
+            .drain_query_lifecycle_statement_observation(&observation);
+        control_plan::with_cleanup(cleanup_result, drained)
+            .with_context(|| format!("first-refresh actual response: {refresh_result:?}"))?;
         let error = refresh_result
             .expect_err("an injected task execution failure must fail the MV first refresh");
         if error.to_string().is_empty() {
@@ -1341,6 +1599,26 @@ impl Scenario for MvBaseIdentityReplacement {
         Ok(launch)
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _scenario_root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<ClusterTestSessionPlan>> {
+        control_plan::plan(
+            cluster_size,
+            ordinary_binary,
+            controlled_binary,
+            original_deadline,
+            vec![FeLaunchIntent::Ordinary, FeLaunchIntent::Ordinary],
+        )
+        .map(Some)
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let catalog = "system_mv_base_identity";
@@ -1374,7 +1652,7 @@ impl Scenario for MvBaseIdentityReplacement {
             "read publication before replacing its base table",
         )?;
 
-        drop(conn);
+        conn.finish()?;
         externally_drop_rest_table(context, &rest_uri, "ns", "orders")?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
@@ -1390,7 +1668,7 @@ impl Scenario for MvBaseIdentityReplacement {
             "seed replacement base table incarnation",
             "INSERT INTO orders VALUES (9, 90)",
         )?;
-        drop(conn);
+        conn.finish()?;
 
         restart_frontend(context, "restart FE after same-name base replacement")?;
         let mut conn = connect(context)?;
@@ -1426,7 +1704,7 @@ impl Scenario for MvLakePublicationRestartRebuild {
     }
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        let (fixture, mut launch) =
+        let (fixture, launch) =
             ManagedMvRestFixture::start(scenario_root, "system_mv_lake_rebuild")?;
         let mut slot = self
             .fixture
@@ -1436,11 +1714,39 @@ impl Scenario for MvLakePublicationRestartRebuild {
             bail!("managed MV fixture was initialized more than once");
         }
         *slot = Some(fixture);
-        launch.child_environment.fe.insert(
-            "NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD".to_string(),
-            "1".to_string(),
-        );
         Ok(launch)
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _scenario_root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<ClusterTestSessionPlan>> {
+        control_plan::plan(
+            cluster_size,
+            ordinary_binary,
+            controlled_binary,
+            original_deadline,
+            vec![
+                FeLaunchIntent::MvActions(vec![
+                    control_plan::observation(
+                        "lake-provenance",
+                        "system_mv_lake_rebuild",
+                        "ns",
+                        "orders_mv",
+                        "provenance",
+                    ),
+                    control_plan::wipe("accelerator-family-wipe"),
+                ]),
+                FeLaunchIntent::Ordinary,
+            ],
+        )
+        .map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -1509,7 +1815,7 @@ impl Scenario for MvLakePublicationRestartRebuild {
         {
             bail!("unexpected MV Accelerator wipe report: {wipe_report:?}");
         }
-        drop(conn);
+        conn.finish()?;
         restart_frontend(context, "restart FE after MV Accelerator wipe")?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
@@ -1568,10 +1874,14 @@ fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
     Ok(())
 }
 
-fn connect(context: &mut ScenarioContext) -> Result<Conn> {
-    let timeout = context.remaining("connect MySQL client")?;
+fn connect(context: &mut ScenarioContext) -> Result<mysql_actor::DeadlineConnection> {
+    context.remaining("connect MySQL client")?;
     context.action("connect through public MySQL protocol");
-    mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)
+    mysql_actor::connect_until(
+        context.mysql_user(),
+        context.mysql_port(),
+        context.deadline(),
+    )
 }
 
 fn setup_orders_fixture_rest(
@@ -2142,20 +2452,16 @@ fn wait_for_file(context: &mut ScenarioContext, path: &Path, action: &str) -> Re
 fn wait_for_file_or_query(
     context: &mut ScenarioContext,
     path: &Path,
-    query: &Receiver<std::result::Result<Vec<(i32, i64)>, String>>,
+    query: &control_plan::ObservedQuery,
     action: &str,
 ) -> Result<()> {
     context.action(action);
     while !path.exists() {
-        match query.try_recv() {
-            Ok(result) => bail!(
-                "rewritten query completed before its completed-plan barrier: {result:?}; {}",
+        if query.is_finished() {
+            bail!(
+                "rewritten query completed before its completed-plan barrier; {}",
                 context.diagnostics()
-            ),
-            Err(TryRecvError::Disconnected) => {
-                bail!("rewritten query channel closed before its completed-plan barrier")
-            }
-            Err(TryRecvError::Empty) => {}
+            );
         }
         context.remaining(action)?;
         thread::sleep(POLL_INTERVAL);
@@ -2207,69 +2513,82 @@ fn wait_for_fe_marker(context: &mut ScenarioContext, marker: &str, action: &str)
     }
 }
 
+struct JoinedSqlResult {
+    result: Receiver<std::result::Result<(), String>>,
+    actor: Mutex<Option<thread::JoinHandle<Result<()>>>>,
+}
+impl JoinedSqlResult {
+    fn recv_timeout(&self, timeout: Duration) -> Result<std::result::Result<(), String>> {
+        let result = self
+            .result
+            .recv_timeout(timeout)
+            .context("receive original MV SQL result");
+        let cleanup = self.join();
+        match (result, cleanup) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(primary), Err(cleanup)) => {
+                bail!("{primary:#}; original MV actor cleanup: {cleanup:#}")
+            }
+            (Ok(Err(primary)), Err(cleanup)) => {
+                bail!("{primary}; original MV actor cleanup: {cleanup:#}")
+            }
+            (Err(error), _) | (_, Err(error)) => Err(error),
+        }
+    }
+    fn join(&self) -> Result<()> {
+        if let Some(actor) = self
+            .actor
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MV SQL actor lock poisoned"))?
+            .take()
+        {
+            actor
+                .join()
+                .map_err(|_| anyhow::anyhow!("original MV SQL actor panicked"))??;
+        }
+        Ok(())
+    }
+}
+impl Drop for JoinedSqlResult {
+    fn drop(&mut self) {
+        if let Err(error) = self.join() {
+            eprintln!("Original MV SQL actor cleanup failed: {error:#}");
+        }
+    }
+}
+
 fn spawn_refresh(
     user: String,
     port: u16,
     catalog: &str,
     mv: &str,
-    timeout: Duration,
-) -> Receiver<std::result::Result<(), String>> {
+    deadline: Instant,
+) -> JoinedSqlResult {
     let catalog = catalog.to_string();
     let mv = mv.to_string();
     let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let result = (|| -> Result<()> {
-            let mut conn = mysql_actor::connect(&user, port, timeout)?;
-            conn.query_drop(format!("SET CATALOG {catalog}"))?;
-            conn.query_drop("USE ns")?;
-            conn.query_drop(format!("REFRESH MATERIALIZED VIEW {mv}"))?;
-            Ok(())
-        })()
-        .map_err(|error| format!("{error:#}"));
-        let _ = sender.send(result);
+    let actor = thread::spawn(move || -> Result<()> {
+        let result = mysql_actor::connect_until(&user, port, deadline)?
+            .run(|conn| {
+                conn.query_drop(format!("SET CATALOG {catalog}"))?;
+                conn.query_drop("USE ns")?;
+                conn.query_drop(format!("REFRESH MATERIALIZED VIEW {mv}"))?;
+                Ok(())
+            })
+            .map_err(|error| format!("{error:#}"));
+        sender
+            .send(result)
+            .map_err(|error| anyhow::anyhow!("MV refresh result owner closed: {error}"))
     });
-    receiver
-}
-
-fn spawn_aggregate_query(
-    user: String,
-    port: u16,
-    catalog: &str,
-    timeout: Duration,
-) -> Receiver<std::result::Result<Vec<(i32, i64)>, String>> {
-    let catalog = catalog.to_string();
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let result = (|| -> Result<Vec<(i32, i64)>> {
-            let mut conn = mysql_actor::connect(&user, port, timeout)?;
-            conn.query_drop(format!("SET CATALOG {catalog}"))?;
-            conn.query_drop("USE ns")?;
-            conn.query("SELECT k1, SUM(v2) FROM orders GROUP BY k1 ORDER BY k1")
-                .context("execute rewritten aggregate query")
-        })()
-        .map_err(|error| format!("{error:#}"));
-        let _ = sender.send(result);
-    });
-    receiver
-}
-
-fn receive_aggregate_query(
-    context: &mut ScenarioContext,
-    receiver: Receiver<std::result::Result<Vec<(i32, i64)>, String>>,
-    action: &str,
-) -> Result<Vec<(i32, i64)>> {
-    context.action(action);
-    let timeout = context.remaining(action)?;
-    match receiver.recv_timeout(timeout) {
-        Ok(Ok(rows)) => Ok(rows),
-        Ok(Err(error)) => bail!("{action} failed: {error}"),
-        Err(error) => bail!("{action} did not finish before deadline: {error}"),
+    JoinedSqlResult {
+        result: receiver,
+        actor: Mutex::new(Some(actor)),
     }
 }
 
 fn expect_refresh_failure(
     context: &mut ScenarioContext,
-    receiver: Receiver<std::result::Result<(), String>>,
+    receiver: JoinedSqlResult,
     action: &str,
 ) -> Result<()> {
     context.action(action);
@@ -2360,5 +2679,211 @@ fn remove_if_exists(path: &Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error).with_context(|| format!("remove trigger {}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod control_plan_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    struct PlanInputs {
+        root: tempfile::TempDir,
+        ordinary: PathBuf,
+        controlled: PathBuf,
+    }
+    impl PlanInputs {
+        fn new() -> Self {
+            let root = tempfile::tempdir().unwrap();
+            let ordinary = root.path().join("ordinary-selection");
+            let controlled = root.path().join("controlled-selection");
+            // Selection-only fixtures; no executable is started or self-report trusted.
+            fs::write(&ordinary, b"selection fixture").unwrap();
+            fs::write(&controlled, b"selection fixture").unwrap();
+            Self {
+                root,
+                ordinary,
+                controlled,
+            }
+        }
+        fn summaries(&self, scenario: &dyn Scenario, controlled: Option<&Path>) -> Value {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let plan = scenario
+                .test_session_plan(
+                    &ScenarioLaunchConfig::default(),
+                    self.root.path(),
+                    3,
+                    &self.ordinary,
+                    &self.ordinary,
+                    controlled,
+                    deadline,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(plan.deadline(), deadline);
+            plan.planned_launch_summaries()
+        }
+    }
+    fn frontend_launches(value: &Value) -> Vec<&Value> {
+        value
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|launch| launch["role"] == "fe")
+            .collect()
+    }
+    fn actions(launch: &Value) -> Vec<&str> {
+        launch["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|grant| grant["action"].as_str().unwrap())
+            .collect()
+    }
+    fn assert_backends_ordinary(value: &Value) {
+        for launch in value
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|launch| launch["role"].as_str().unwrap().starts_with("be-"))
+        {
+            assert_eq!(launch["ordinary"], true);
+            assert!(launch["grants"].as_array().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn staged_recovery_grants_follow_the_two_actual_restart_boundaries() {
+        let input = PlanInputs::new();
+        let value = input.summaries(
+            &MvStagedPublishedRecovery::default(),
+            Some(&input.controlled),
+        );
+        let launches = frontend_launches(&value);
+        assert_eq!(launches.len(), 3);
+        assert_eq!(actions(launches[0]), ["recovery-hold"]);
+        assert_eq!(actions(launches[1]), ["recovery-hold"]);
+        assert_eq!(launches[0]["ordinary"], false);
+        assert_eq!(launches[1]["ordinary"], false);
+        assert_ne!(launches[0]["session_id"], launches[1]["session_id"]);
+        assert_eq!(launches[2]["ordinary"], true);
+        assert!(actions(launches[2]).is_empty());
+        assert_backends_ordinary(&value);
+    }
+
+    #[test]
+    fn scheduler_successor_only_receives_its_remaining_transient_action() {
+        let input = PlanInputs::new();
+        let value = input.summaries(&MvSchedulerRecovery::default(), Some(&input.controlled));
+        let launches = frontend_launches(&value);
+        assert_eq!(launches.len(), 2);
+        assert_eq!(
+            actions(launches[0]),
+            ["scheduler-hold", "scheduler-hold", "scheduler-hold"]
+        );
+        assert_eq!(actions(launches[1]), ["transient-preparation"]);
+        assert_backends_ordinary(&value);
+    }
+
+    #[test]
+    fn lake_wipe_is_not_inherited_by_the_ordinary_successor() {
+        let input = PlanInputs::new();
+        let value = input.summaries(
+            &MvLakePublicationRestartRebuild::default(),
+            Some(&input.controlled),
+        );
+        let launches = frontend_launches(&value);
+        assert_eq!(launches.len(), 2);
+        assert_eq!(
+            actions(launches[0]),
+            ["document-observation", "accelerator-wipe"]
+        );
+        assert_eq!(launches[0]["binary"], json!(input.controlled));
+        assert_eq!(launches[1]["ordinary"], true);
+        assert_eq!(launches[1]["binary"], json!(input.ordinary));
+        assert!(actions(launches[1]).is_empty());
+        assert_backends_ordinary(&value);
+    }
+
+    #[test]
+    fn retained_state_restart_does_not_request_any_control_capability() {
+        let input = PlanInputs::new();
+        let value = input.summaries(&MvStateStoreRestart::default(), None);
+        assert_eq!(frontend_launches(&value).len(), 2);
+        for launch in value.as_array().unwrap() {
+            assert_eq!(launch["ordinary"], true);
+            assert!(actions(launch).is_empty());
+            assert_eq!(launch["binary"], json!(input.ordinary));
+        }
+    }
+
+    #[test]
+    fn first_refresh_fault_targets_only_the_selected_backend_launch() {
+        let input = PlanInputs::new();
+        let value = input.summaries(&MvFirstRefreshStaging::default(), Some(&input.controlled));
+        let launches = value.as_array().unwrap();
+        let frontend = launches
+            .iter()
+            .find(|launch| launch["role"] == "fe")
+            .unwrap();
+        assert_eq!(
+            actions(frontend),
+            ["bind-task-execution-failure", "observe"]
+        );
+        let backend = launches
+            .iter()
+            .find(|launch| launch["role"] == "be-0")
+            .unwrap();
+        assert_eq!(backend["ordinary"], false);
+        assert_eq!(actions(backend), ["task-execution-failure"]);
+        for launch in launches
+            .iter()
+            .filter(|launch| launch["role"] == "be-1" || launch["role"] == "be-2")
+        {
+            assert_eq!(launch["ordinary"], true);
+            assert!(actions(launch).is_empty());
+        }
+        assert!(
+            launches
+                .iter()
+                .flat_map(|launch| actions(launch))
+                .all(|action| action != "accelerator-wipe")
+        );
+    }
+
+    #[test]
+    fn storage_rewrite_observer_does_not_survive_the_ordinary_restart_slot() {
+        let input = PlanInputs::new();
+        let value = input.summaries(
+            &crate::scenarios::mv_uea7_storage::MvStorageContract::default(),
+            Some(&input.controlled),
+        );
+        let launches = frontend_launches(&value);
+        assert_eq!(launches.len(), 2);
+        assert_eq!(actions(launches[0]), ["rewrite-hold", "observe"]);
+        assert_eq!(launches[1]["ordinary"], true);
+        assert!(actions(launches[1]).is_empty());
+        assert_backends_ordinary(&value);
+    }
+
+    #[test]
+    fn selected_mv_control_fails_prelaunch_without_its_controlled_binary() {
+        let input = PlanInputs::new();
+        let result = MvLakePublicationRestartRebuild::default().test_session_plan(
+            &ScenarioLaunchConfig::default(),
+            input.root.path(),
+            3,
+            &input.ordinary,
+            &input.ordinary,
+            None,
+            Instant::now() + Duration::from_secs(5),
+        );
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("test-controls binary")
+        );
     }
 }

@@ -46,6 +46,7 @@ impl MysqlWriteFixtureFailureObservation {
 
 /// The original FE service owner keeps this outside the borrowed control future.
 pub struct MysqlWriteFixture {
+    authorization: Option<Arc<crate::test_fixture_authorization::FixtureActionObservation>>,
     control: UnixMysqlWriteControl,
     joins: Arc<MysqlFixtureSessionJoins>,
     binding: Option<MysqlWriteFixtureListenerBinding>,
@@ -155,10 +156,39 @@ impl std::error::Error for MysqlWriteFixtureError {
     }
 }
 impl MysqlWriteFixture {
+    pub fn bind_authorized(
+        authorization: crate::test_fixture_authorization::MysqlFixtureAuthorization,
+        actual_frontend: FrontendProcessId,
+    ) -> Result<Self, MysqlWriteFixtureError> {
+        let (path, nonce, cancellation, claim) = authorization
+            .claim("exact-write", actual_frontend)
+            .map_err(|gate| MysqlWriteFixtureError {
+                gate: Some(gate),
+                ..Default::default()
+            })?;
+        let deadline = cancellation
+            .deadline()
+            .min(Instant::now() + std::time::Duration::from_secs(20));
+        let mut fixture = Self::bind_unchecked(path, actual_frontend, nonce, deadline)?;
+        let observation = crate::test_fixture_authorization::FixtureActionObservation::new(claim);
+        fixture
+            .binding
+            .as_ref()
+            .expect("unmoved original binding")
+            .hub
+            .install_action_observation(Arc::clone(&observation));
+        fixture.authorization = Some(observation);
+        Ok(fixture)
+    }
+    pub fn control_cancellation(&self) -> Option<novarocks_failpoint::scope::ControlCancellation> {
+        self.authorization
+            .as_ref()
+            .map(|claim| claim.cancellation())
+    }
     pub fn failure_observation(&self) -> MysqlWriteFixtureFailureObservation {
         MysqlWriteFixtureFailureObservation(Arc::clone(&self.joins))
     }
-    pub fn bind(
+    fn bind_unchecked(
         path: PathBuf,
         actual_frontend: FrontendProcessId,
         nonce: [u8; 16],
@@ -176,6 +206,7 @@ impl MysqlWriteFixture {
         })?;
         let joins = Arc::new(MysqlFixtureSessionJoins::default());
         Ok(Self {
+            authorization: None,
             control,
             binding: Some(MysqlWriteFixtureListenerBinding {
                 hub,
@@ -354,5 +385,38 @@ mod startup_projection_tests {
                 .kind(),
             io::ErrorKind::PermissionDenied
         );
+    }
+}
+
+#[cfg(test)]
+mod startup_source_tests {
+    use super::*;
+    #[test]
+    fn actual_bind_io_source_is_retained_by_original_fixture_owner() {
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/g2-missing-parent-{}-{}/gate.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let error = match MysqlWriteFixture::bind_unchecked(
+            path,
+            FrontendProcessId::new_v7(),
+            [1; 16],
+            Instant::now() + std::time::Duration::from_secs(3),
+        ) {
+            Ok(_) => panic!("missing private parent must fail"),
+            Err(error) => error,
+        };
+        let mut source = std::error::Error::source(&error).expect("original source");
+        loop {
+            if let Some(io) = source.downcast_ref::<std::io::Error>() {
+                assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
+                break;
+            }
+            source = source.source().expect("actual original IO is retained");
+        }
     }
 }

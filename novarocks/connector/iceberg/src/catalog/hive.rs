@@ -111,12 +111,14 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
             )
         })?;
         #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        {
+        if let Some(observer) = self.delegate.listing.active_observer() {
             let target = None;
-            self.delegate
+            return self
+                .delegate
                 .listing
                 .run_hms(
                     context,
+                    observer,
                     super::hms_listing_observer::HmsListingOperation::Namespaces,
                     target,
                     |invocation| async move {
@@ -125,9 +127,8 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
                             .await
                     },
                 )
-                .await
+                .await;
         }
-        #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
         {
             self.delegate
                 .listing
@@ -149,13 +150,15 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
             )
         })?;
         #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        {
+        if let Some(observer) = self.delegate.listing.active_observer() {
             use sha2::Digest;
             let target = Some(sha2::Sha256::digest(namespace.namespace.as_bytes()).into());
-            self.delegate
+            return self
+                .delegate
                 .listing
                 .run_hms(
                     context,
+                    observer,
                     super::hms_listing_observer::HmsListingOperation::Tables,
                     target,
                     |invocation| async move {
@@ -164,9 +167,8 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
                             .await
                     },
                 )
-                .await
+                .await;
         }
-        #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
         {
             self.delegate
                 .listing
@@ -182,13 +184,15 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
         bound: ConnectorListingBound,
     ) -> Result<Vec<String>, ConnectorError> {
         #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        {
+        if let Some(observer) = self.delegate.listing.active_observer() {
             use sha2::Digest;
             let target = Some(sha2::Sha256::digest(namespace.namespace.as_bytes()).into());
-            self.delegate
+            return self
+                .delegate
                 .listing
                 .run_hms(
                     &context,
+                    observer,
                     super::hms_listing_observer::HmsListingOperation::Views,
                     target,
                     |invocation| async move {
@@ -197,9 +201,8 @@ impl NovaRocksCatalog for NovaRocksHiveCatalog {
                             .await
                     },
                 )
-                .await
+                .await;
         }
-        #[cfg(not(feature = "mem-1-m07-hms-listing-observe"))]
         {
             self.delegate
                 .listing

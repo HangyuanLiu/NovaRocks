@@ -31,28 +31,64 @@ use crate::catalog_application::{
 pub struct HmsListingObservationSetup {
     handler: HmsListingObservationHandler,
     selector: OwnerSelector,
+    cancellation: Option<novarocks_failpoint::scope::ControlCancellation>,
 }
 impl HmsListingObservationSetup {
-    pub fn new(handler: HmsListingObservationHandler, selector: OwnerSelector) -> Self {
-        Self { handler, selector }
+    pub fn new(
+        handler: HmsListingObservationHandler,
+        selector: OwnerSelector,
+        cancellation: novarocks_failpoint::scope::ControlCancellation,
+    ) -> Self {
+        let scope = cancellation.clone();
+        let authorized_selector: OwnerSelector = Arc::new(move |candidate| {
+            if !scope.is_active() {
+                return Ok(None);
+            }
+            selector(candidate)
+        });
+        Self {
+            handler,
+            selector: authorized_selector,
+            cancellation: Some(cancellation),
+        }
+    }
+    #[cfg(test)]
+    fn test_fixture(handler: HmsListingObservationHandler, selector: OwnerSelector) -> Self {
+        Self {
+            handler,
+            selector,
+            cancellation: None,
+        }
+    }
+    fn require_active(&self) -> Result<(), &'static str> {
+        if self
+            .cancellation
+            .as_ref()
+            .is_some_and(|scope| !scope.is_active())
+        {
+            Err("HMS observation session is closed")
+        } else {
+            Ok(())
+        }
     }
 }
 
-pub(super) struct HmsAdmissionObservation {
+pub(crate) struct HmsAdmissionObservation {
     setup: HmsListingObservationSetup,
     installed: Mutex<Option<Arc<AdmissionCompletion>>>,
 }
 impl HmsAdmissionObservation {
-    pub(super) fn new(setup: &HmsListingObservationSetup) -> Arc<Self> {
+    pub(crate) fn new(setup: &HmsListingObservationSetup) -> Arc<Self> {
         Arc::new(Self {
             setup: setup.clone(),
             installed: Mutex::new(None),
         })
     }
-    pub(super) fn install(
+    pub(crate) fn install(
         &self,
         projection: &Arc<CatalogRuntimeProjection>,
     ) -> Result<(), &'static str> {
+        self.setup.require_active()?;
         let mut installed = self
             .installed
             .lock()
@@ -62,13 +98,18 @@ impl HmsAdmissionObservation {
             return Err("HMS admission original projection is already installed");
         }
         projection.bind_hms_admission_selector(Arc::clone(&self.setup.selector))?;
-        *installed = Some(projection.hms_admission_completion());
+        *installed = Some(
+            projection
+                .hms_admission_completion()
+                .ok_or("HMS admission owner was not installed")?,
+        );
         Ok(())
     }
     pub(super) fn require_installed(
         &self,
         projection: &Arc<CatalogRuntimeProjection>,
     ) -> Result<(), &'static str> {
+        self.setup.require_active()?;
         let installed = self
             .installed
             .lock()
@@ -76,7 +117,10 @@ impl HmsAdmissionObservation {
         let original = installed
             .as_ref()
             .ok_or("HMS admission original projection is not installed")?;
-        if !Arc::ptr_eq(original, &projection.hms_admission_completion()) {
+        if !projection
+            .hms_admission_completion()
+            .is_some_and(|candidate| Arc::ptr_eq(original, &candidate))
+        {
             original.fail();
             return Err("HMS admission serving projection differs from the original opened host");
         }
@@ -87,6 +131,7 @@ impl HmsAdmissionObservation {
         Arc::new(move |body| owner.observe(body))
     }
     fn observe(&self, body: &[u8]) -> Result<Vec<u8>, &'static str> {
+        self.setup.require_active()?;
         if body.len() > 1024 {
             return Err("HMS observation request exceeds its limit");
         }
@@ -149,7 +194,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let received = Arc::clone(&calls);
         let selected = Arc::clone(&selections);
-        let setup = HmsListingObservationSetup::new(
+        let setup = HmsListingObservationSetup::test_fixture(
             Arc::new(move |body| {
                 received.lock().unwrap().push(body.to_vec());
                 Ok(b"original-handler".to_vec())
@@ -225,7 +270,9 @@ mod tests {
             let (binding, _, _) = fixture();
             let host = CatalogRuntimeProjection::new();
             binding.install(&host).unwrap();
-            let original = host.hms_admission_completion();
+            let original = host
+                .hms_admission_completion()
+                .expect("explicitly installed owner");
             let result = if replacement {
                 binding.require_installed(&CatalogRuntimeProjection::new())
             } else {
@@ -269,7 +316,7 @@ mod tests {
             [snapshot.to_vec(), reset.to_vec()]
         );
         let original: &'static str = "original-finite-probe-failure";
-        let setup = HmsListingObservationSetup::new(
+        let setup = HmsListingObservationSetup::test_fixture(
             Arc::new(move |_| Err(original)),
             Arc::new(|_| Ok(None)),
         );

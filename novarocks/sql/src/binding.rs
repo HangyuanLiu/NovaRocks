@@ -62,14 +62,21 @@ pub(crate) struct GroupConcatSourceFacts {
 }
 impl GroupConcatSourceFacts {
     /// Original lexical values and sparse identities, shared with lowering.
-    pub(crate) fn parameter_entries(&self) -> Option<[(
-        novarocks_type_contract::SemanticParameterId,
-        novarocks_type_contract::SemanticParameterValue,
-    ); 2]> {
+    pub(crate) fn parameter_entries(
+        &self,
+    ) -> Option<
+        [(
+            novarocks_type_contract::SemanticParameterId,
+            novarocks_type_contract::SemanticParameterValue,
+        ); 2],
+    > {
         use novarocks_type_contract::{SemanticParameterId as I, SemanticParameterValue as V};
         let raw = self.max_len?;
         Some([
-            (I::new(if self.legacy { 2 } else { 1 }), V::GroupConcatLegacy(self.legacy)),
+            (
+                I::new(if self.legacy { 2 } else { 1 }),
+                V::GroupConcatLegacy(self.legacy),
+            ),
             (I::new(3), V::GroupConcatMaxLen(raw)),
         ])
     }

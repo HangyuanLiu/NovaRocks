@@ -16,6 +16,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/build_capabilities.sh"
+
 # Native 1FE+NBE System Scenario stage.
 #
 # This file selects, invokes and reports. It deliberately owns no cluster
@@ -32,56 +34,34 @@ ci_system_scenario_list() {
   "$runner" --list-default
 }
 
-# Build the two explicit native-compatibility fixtures without leaving the
-# workspace binary on a test-only identity or compatibility epoch. The caller
-# owns the fixture root and may retain it with the rest of the CI artifacts for
-# exact scenario reruns.
+# Build controls and compatibility artifacts in independent Cargo targets.
+# The normal workspace binary is never overwritten, including on failure.
 ci_prepare_system_scenario_binaries() {
-  local binary="$1"
-  local profile="$2"
-  local fixture_root="$3"
-  local build_suffix="$4"
-  local log_path="$5"
-
+  local binary="$1" profile="$2" fixture_root="$3" build_suffix="$4" log_path="$5"
+  local control_target variant_target controls compatible other_island code=0
   SYSTEM_SCENARIO_PRIMARY_BINARY=""
+  SYSTEM_SCENARIO_CONTROL_BINARY=""
   SYSTEM_SCENARIO_COMPATIBLE_BINARY=""
   SYSTEM_SCENARIO_OTHER_ISLAND_BINARY=""
-
-  if [ ! -x "$binary" ]; then
-    echo "error: system scenario primary binary is not executable: $binary" >"$log_path"
-    return 1
-  fi
-
-  mkdir -p "$fixture_root"
-  local primary="$fixture_root/novarocks-primary"
-  local compatible="$fixture_root/novarocks-compatible"
-  local other_island="$fixture_root/novarocks-other-island"
-  cp "$binary" "$primary" || return 1
-
-  local code=0
+  [ -x "$binary" ] || { echo "error: system scenario primary binary is not executable" >"$log_path"; return 1; }
+  ci_validate_target_separation || return $?
+  control_target="$(ci_target_directory test-controls)" || return $?
+  variant_target="$(ci_target_directory variants)" || return $?
+  controls="$(ci_artifact_path "$control_target" "$profile" novarocks)" || return $?
+  compatible="$(ci_artifact_path "$variant_target/compatible" "$profile" novarocks)" || return $?
+  other_island="$(ci_artifact_path "$variant_target/other-island" dev-opt novarocks)" || return $?
+  mkdir -p "$fixture_root" || return $?
   (
-    set -x
-    NOVAROCKS_NATIVE_BUILD_IDENTITY="ci-compatible-$build_suffix" \
-      cargo build -p novarocks-server --bin novarocks --profile "$profile" &&
-    cp "$binary" "$compatible" &&
-    NOVAROCKS_NATIVE_BUILD_IDENTITY="ci-other-island-$build_suffix" \
-      cargo build -p novarocks-server --bin novarocks --profile "$profile" \
-      --features native-compatibility-test-fixture &&
-    cp "$binary" "$other_island"
+    ci_capture_build_info "$binary" normal-build "$profile" "$fixture_root/normal" &&
+    ci_capture_build_info "$controls" test-controls "$profile" "$fixture_root/test-controls" &&
+    ci_build_server "$variant_target/compatible" "$profile" test-controls "" "ci-compatible-$build_suffix" &&
+    ci_capture_build_info "$compatible" test-controls "$profile" "$fixture_root/compatible" "" "ci-compatible-$build_suffix" &&
+    ci_build_server "$variant_target/other-island" dev-opt test-controls native-compatibility-test-fixture "ci-other-island-$build_suffix" &&
+    ci_capture_build_info "$other_island" test-controls dev-opt "$fixture_root/other-island" native-compatibility-test-fixture "ci-other-island-$build_suffix"
   ) >"$log_path" 2>&1 || code=$?
-
-  # The second build deliberately produces the test-alternate-epoch binary at
-  # the canonical target path. Restore the workspace binary even when either fixture build
-  # fails so later diagnostics and cleanup never observe a test-only server.
-  if ! cp "$primary" "$binary" >>"$log_path" 2>&1; then
-    echo "error: failed to restore system scenario primary binary $binary" >>"$log_path"
-    return 1
-  fi
-  if [ "$code" -ne 0 ]; then
-    return "$code"
-  fi
-
-  SYSTEM_SCENARIO_PRIMARY_BINARY="$primary"
+  [ "$code" -eq 0 ] || return "$code"
+  SYSTEM_SCENARIO_PRIMARY_BINARY="$binary"
+  SYSTEM_SCENARIO_CONTROL_BINARY="$controls"
   SYSTEM_SCENARIO_COMPATIBLE_BINARY="$compatible"
   SYSTEM_SCENARIO_OTHER_ISLAND_BINARY="$other_island"
 }
@@ -100,6 +80,8 @@ ci_run_system_scenarios() {
   local artifact_root="$6"
   local cluster_size="$7"
   local timeout_secs="$8"
+  local control_binary="$9"
+  local primary_binary
 
   local scenarios=()
   local scenario
@@ -137,10 +119,16 @@ ci_run_system_scenarios() {
     artifact_dir="$artifact_root/$slug"
     mkdir -p "$artifact_dir"
 
+    primary_binary="$binary"
+    case "$scenario" in
+      native-compatibility/*) primary_binary="$control_binary" ;;
+    esac
     start="$(ci_epoch)"
     ci_run_logged "$log_path" \
       "$runner" \
-      --binary "$binary" \
+      --binary "$primary_binary" \
+      --ordinary-binary "$binary" \
+      --test-control-binary "$control_binary" \
       --compatible-binary "$compatible_binary" \
       --other-island-binary "$other_island_binary" \
       --config "$base_config" \

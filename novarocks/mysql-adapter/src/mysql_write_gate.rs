@@ -563,6 +563,287 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::task::JoinSet;
 
+    #[cfg(all(
+        unix,
+        feature = "test-controls",
+        feature = "mem-1-m07-exact-mysql-write"
+    ))]
+    mod authorization_tests {
+        use super::*;
+        use crate::{
+            exact_mysql_write_fixture::MysqlWriteFixture,
+            test_fixture_authorization::MysqlFixtureAuthorization,
+        };
+        use novarocks_failpoint::{
+            liveness::{PreparedRoleSession, RunnerSession},
+            scope::ProcessBinding,
+            session::{DECLARATION_VERSION, DomainGrant, SessionDeclaration, SessionRole},
+        };
+        use novarocks_types::FrontendProcessId;
+        use std::os::unix::fs::DirBuilderExt;
+        use tokio::net::UnixStream;
+
+        #[derive(Debug)]
+        struct OwnedErrors(Vec<io::Error>);
+        impl std::fmt::Display for OwnedErrors {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "authorized exact-write owner failures: {}", self.0.len())
+            }
+        }
+        impl std::error::Error for OwnedErrors {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.0.first().map(|e| e as _)
+            }
+        }
+        struct OriginalPanic(Mutex<Box<dyn std::any::Any + Send>>);
+        impl std::fmt::Debug for OriginalPanic {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                let _retained = &self.0;
+                f.write_str("OriginalAuthorizedWriterPanic { payload_retained: true }")
+            }
+        }
+        impl std::fmt::Display for OriginalPanic {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                std::fmt::Debug::fmt(self, f)
+            }
+        }
+        impl std::error::Error for OriginalPanic {}
+        async fn owned_work<F: Future<Output = io::Result<()>>>(work: F) -> io::Result<()> {
+            tokio::pin!(work);
+            std::future::poll_fn(|cx| {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    work.as_mut().poll(cx)
+                })) {
+                    Ok(poll) => poll,
+                    Err(original) => {
+                        Poll::Ready(Err(io::Error::other(OriginalPanic(Mutex::new(original)))))
+                    }
+                }
+            })
+            .await
+        }
+        async fn command(
+            peer: &mut UnixStream,
+            frontend: FrontendProcessId,
+            arm: bool,
+            connection: u32,
+        ) -> io::Result<()> {
+            let mut body = vec![2, if arm { 1 } else { 3 }];
+            for (tag, value) in [(1u8, frontend.to_bytes().to_vec()), (2, vec![1; 16])] {
+                body.push(tag);
+                body.extend_from_slice(&(value.len() as u16).to_le_bytes());
+                body.extend_from_slice(&value);
+            }
+            if arm {
+                for (tag, value) in [
+                    (3u8, connection.to_le_bytes().to_vec()),
+                    (4, vec![0; 32]),
+                    (5, 2u64.to_le_bytes().to_vec()),
+                ] {
+                    body.push(tag);
+                    body.extend_from_slice(&(value.len() as u16).to_le_bytes());
+                    body.extend_from_slice(&value);
+                }
+            }
+            peer.write_all(&(body.len() as u32).to_le_bytes()).await?;
+            peer.write_all(&body).await?;
+            let mut length = [0; 4];
+            peer.read_exact(&mut length).await?;
+            let n = u32::from_le_bytes(length) as usize;
+            if !(3..=4092).contains(&n) {
+                return Err(io::Error::other(
+                    "original exact-write reply exceeded bound",
+                ));
+            }
+            let mut reply = vec![0; n];
+            peer.read_exact(&mut reply).await?;
+            if reply[..3] != [2, if arm { 1 } else { 3 }, 0] {
+                return Err(io::Error::other("original exact-write command refused"));
+            }
+            Ok(())
+        }
+        #[tokio::test]
+        async fn finite_fe_grant_binds_real_uds_and_records_actual_tcp_cut_before_end_and_join()
+        -> io::Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let frontend = FrontendProcessId::new_v7();
+            let root = std::path::PathBuf::from(format!("/tmp/nr-exact-auth-{}", frontend));
+            std::fs::DirBuilder::new().mode(0o700).create(&root)?;
+            let socket = root.join("gate.sock");
+            let path = root.join("declaration.json");
+            let declaration = SessionDeclaration {
+                schema_version: DECLARATION_VERSION,
+                session_id: "exact-session".into(),
+                launch_id: "exact-launch".into(),
+                role: SessionRole::Fe,
+                lifetime_millis: 10_000,
+                liveness_socket: root.join("live.sock"),
+                handshake_secret: "abcdefghijklmnopqrstuvwxyz0123456789".into(),
+                domain_grants: vec![DomainGrant {
+                    domain: MysqlFixtureAuthorization::DOMAIN.into(),
+                    grant_id: "exact-once".into(),
+                    parameters: serde_json::json!({"action":"exact-write", "socket":socket,"nonce_hex":"01010101010101010101010101010101"}),
+                }],
+            };
+            declaration.write_private(&path)?;
+            let prepared = PreparedRoleSession::read_and_claim(&path, SessionRole::Fe)?;
+            let mut runner = RunnerSession::start_until(declaration, deadline)?;
+            let mut role = match prepared.bind(ProcessBinding::Frontend(frontend)) {
+                Ok(role) => role,
+                Err(primary) => {
+                    let mut failures = vec![primary];
+                    if let Err(error) = runner.end_and_join() {
+                        failures.push(error);
+                    }
+                    return Err(io::Error::other(OwnedErrors(failures)));
+                }
+            };
+            let scope = role.scope().clone();
+            let grants = scope.grants_for(MysqlFixtureAuthorization::DOMAIN);
+            let mut fixture = None;
+            let primary = owned_work(async {
+                assert!(MysqlFixtureAuthorization::from_grants(Vec::new())?.is_none());
+                assert!(!socket.exists());
+                let authorization =
+                    MysqlFixtureAuthorization::from_grants(grants.clone())?.unwrap();
+                fixture = Some(
+                    MysqlWriteFixture::bind_authorized(authorization, frontend)
+                        .map_err(io::Error::other)?,
+                );
+                assert!(socket.exists());
+                assert!(
+                    MysqlWriteFixture::bind_authorized(
+                        MysqlFixtureAuthorization::from_grants(grants.clone())?.unwrap(),
+                        frontend
+                    )
+                    .is_err()
+                );
+                let owner = fixture.as_mut().unwrap();
+                let cancellation = owner.control_cancellation().unwrap();
+                assert!(cancellation.deadline() <= deadline);
+                let binding = owner.listener_binding().map_err(io::Error::other)?;
+                let work = async {
+                    let mut control = UnixStream::connect(&socket).await?;
+                    let (connection, statement) = identities();
+                    command(&mut control, frontend, true, connection.connection_id()).await?;
+                    let (mut client, write) = pair().await?;
+                    let hook = binding
+                        .hub
+                        .bind_statement(connection, statement, [0; 32])?
+                        .unwrap();
+                    let gate = super::super::late_binding::InitiallyRawMysqlWriter::new(
+                        write,
+                        connection,
+                        Arc::clone(&binding.hub),
+                    );
+                    let mut writer =
+                        OwnedStreamingMysqlWriter::new(gate, ProtocolLimits::default(), 1)?;
+                    // The original socket flush attaches the selected gate before row admission.
+                    writer.flush_socket().await?;
+                    hook.begin_rows(writer.receipt())?;
+                    writer.start_row(8)?;
+                    writer.push_slice(b"abcdefgh")?;
+                    let mut wire = [0; 2];
+                    {
+                        let flush = writer.flush_pending();
+                        tokio::pin!(flush);
+                        tokio::select! {
+                            biased;
+                            result = &mut flush => { result?; return Err(io::Error::other("authorized writer escaped exact cut")); },
+                            result = client.read_exact(&mut wire) => { result?; },
+                        }
+                        // Keep polling the original pending writer until its real cut publishes the hit.
+                        tokio::select! {
+                            biased;
+                            result = &mut flush => { result?; return Err(io::Error::other("authorized writer escaped exact cut")); },
+                            _ = async { loop { if scope.observations().iter().any(|o| o.event == "hit") { break; } tokio::task::yield_now().await; } } => {},
+                        }
+                    }
+                    assert_eq!(wire, [8, 0]);
+                    hook.record_cancel_and_resume(writer.receipt())?;
+                    runner.end_and_join()?;
+                    cancellation.cancelled().await;
+                    assert!(!cancellation.is_active());
+                    drop(writer);
+                    drop(hook);
+                    assert_eq!(client.read(&mut [0; 1]).await?, 0);
+                    command(&mut control, frontend, false, connection.connection_id()).await?;
+                    assert_eq!(control.read(&mut [0; 1]).await?, 0);
+                    Ok::<_, io::Error>(())
+                };
+                let (control, work) = tokio::join!(owner.run_control(), work);
+                let mut failures = Vec::new();
+                if let Err(error) = control {
+                    failures.push(io::Error::other(error));
+                }
+                if let Err(error) = work {
+                    failures.push(error);
+                }
+                if failures.is_empty() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other(OwnedErrors(failures)))
+                }
+            });
+            let mut failures = Vec::new();
+            if let Err(error) =
+                timeout_result(tokio::time::timeout_at(deadline.into(), primary).await)
+            {
+                failures.push(error);
+            }
+            if let Some(owner) = fixture.as_mut() {
+                if !failures.is_empty() {
+                    owner.fail_and_stop();
+                }
+                if let Err(error) = owner.close_control() {
+                    failures.push(io::Error::other(error));
+                }
+            }
+            if let Err(error) = runner.end_and_join() {
+                failures.push(error);
+            }
+            scope.wait_closed();
+            if let Err(error) = role.close_and_join() {
+                failures.push(error);
+            }
+            drop(fixture);
+            for event in ["claimed", "hit", "claim-released"] {
+                if scope
+                    .observations()
+                    .iter()
+                    .filter(|o| o.event == event)
+                    .count()
+                    != 1
+                {
+                    failures.push(io::Error::other(format!(
+                        "exact action did not record one {event}"
+                    )));
+                }
+            }
+            if socket.exists() || root.join("live.sock").exists() {
+                failures.push(io::Error::other(
+                    "original authorized owner socket remained",
+                ));
+            }
+            if let Err(error) = std::fs::remove_file(runner.process_receipt_path()) {
+                failures.push(error);
+            }
+            if let Err(error) = std::fs::remove_file(path.with_extension("claimed")) {
+                failures.push(error);
+            }
+            if let Err(error) = std::fs::remove_file(path) {
+                failures.push(error);
+            }
+            if let Err(error) = std::fs::remove_dir(root) {
+                failures.push(error);
+            }
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(io::Error::other(OwnedErrors(failures)))
+            }
+        }
+    }
     // Only this parent owns task handles. Work borrows the set, so timeout or
     // unwinding cannot detach a child by consuming a JoinHandle.
     #[derive(Debug)]

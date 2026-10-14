@@ -26,8 +26,6 @@ use crate::query_execution::contract::{DistributedQueryError, DistributedQueryEr
 use crate::query_execution::fragment_scheduling::{FragmentSchedulingFacts, SchedulingStreamKind};
 #[cfg(test)]
 use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
-#[cfg(debug_assertions)]
-use novarocks_failpoint::{QueryLifecycleFaultKind, arm_path, configured_root};
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_query_application::api::LiveBackendTarget;
 use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
@@ -128,12 +126,31 @@ impl FrontendBackendSnapshot {
 
 #[derive(Clone)]
 pub struct FrontendFragmentScheduler {
+    #[cfg(feature = "test-controls")]
+    nomination: Option<(
+        std::sync::Arc<novarocks_native_adapter::test_controls::NativeTestControls>,
+        std::sync::Arc<novarocks_failpoint::target_binding::StatementWorkNomination>,
+    )>,
     backends: FrontendBackendSnapshot,
 }
 
 impl FrontendFragmentScheduler {
+    #[cfg(feature = "test-controls")]
+    pub(crate) fn with_test_nomination(
+        mut self,
+        controls: std::sync::Arc<novarocks_native_adapter::test_controls::NativeTestControls>,
+        nomination: std::sync::Arc<novarocks_failpoint::target_binding::StatementWorkNomination>,
+    ) -> Self {
+        self.nomination = Some((controls, nomination));
+        self
+    }
+
     pub const fn new(backends: FrontendBackendSnapshot) -> Self {
-        Self { backends }
+        Self {
+            backends,
+            #[cfg(feature = "test-controls")]
+            nomination: None,
+        }
     }
 
     pub fn backend_entries(&self) -> &[LiveBackendTarget] {
@@ -178,6 +195,13 @@ impl FrontendFragmentScheduler {
         facts: &FragmentSchedulingFacts,
         execution_id: QueryExecutionId,
     ) -> Result<ValidatedFragmentSchedule, DistributedQueryError> {
+        #[cfg(feature = "test-controls")]
+        let test_execution = novarocks_types::QueryExecutionId::new(
+            execution_id.query_id(),
+            novarocks_types::AttemptId::new(execution_id.attempt_id().get())
+                .map_err(|error| contract_error(error.to_string()))?,
+        )
+        .map_err(|error| contract_error(error.to_string()))?;
         let fragments = &facts.fragments;
         let scheduled_ids = fragments.keys().copied().collect::<BTreeSet<_>>();
         let ordered_ids = facts.order.iter().copied().collect::<BTreeSet<_>>();
@@ -205,8 +229,7 @@ impl FrontendFragmentScheduler {
         }
 
         let live_backend_count = self.backends.entries.len();
-        let backend_count = query_control_fragment_backend_limit(execution_id, live_backend_count)?
-            .unwrap_or(live_backend_count);
+        let backend_count = live_backend_count;
         let mut counts = BTreeMap::<FragmentId, usize>::new();
         for &fragment_id in &facts.order {
             let fragment = fragments.get(&fragment_id).ok_or_else(|| {
@@ -252,7 +275,16 @@ impl FrontendFragmentScheduler {
         })?;
         counts.insert(root_fragment_id, 1);
 
-        let fault_preferred = query_lifecycle_fault_preferred_live_index(&self.backends)?;
+        let fault_preferred = None::<usize>;
+        #[cfg(feature = "test-controls")]
+        let fault_preferred = if let Some((controls, nomination)) = &self.nomination {
+            match controls.preferred_backend_process(nomination, test_execution).map_err(contract_error)? {
+                Some(process) => Some(self.backends.entries.iter().position(|target| target.process_id().ok() == Some(process)).ok_or_else(|| contract_error("the exact nominated backend process is absent from the frozen live topology"))?),
+                None => None,
+            }
+        } else {
+            fault_preferred
+        };
         if fault_preferred.is_some_and(|live_index| live_index >= backend_count) {
             return Err(contract_error(
                 "runner-owned lifecycle fault target is excluded by the fragment backend limit",
@@ -282,7 +314,25 @@ impl FrontendFragmentScheduler {
             draft.assign_fragment(fragment_id, placements)?;
         }
         let schedule = ValidatedFragmentSchedule::validate(facts, execution_id, draft)?;
-        bind_query_lifecycle_fault_scopes(execution_id, &self.backends)?;
+        #[cfg(feature = "test-controls")]
+        if let Some((controls, nomination)) = &self.nomination {
+            let attempt = novarocks_types::AttemptId::new(execution_id.attempt_id().get())
+                .map_err(|error| contract_error(error.to_string()))?;
+            let execution =
+                novarocks_types::QueryExecutionId::new(execution_id.query_id(), attempt)
+                    .map_err(|error| contract_error(error.to_string()))?;
+            for target in &self.backends.entries {
+                controls
+                    .publish_nominated_binding(
+                        nomination,
+                        target
+                            .process_id()
+                            .map_err(|error| contract_error(error.to_string()))?,
+                        execution,
+                    )
+                    .map_err(contract_error)?;
+            }
+        }
         Ok(schedule)
     }
 }
@@ -311,179 +361,6 @@ fn scan_fragment_parallelism(
         }
     }
     parallelism.clamp(1, backend_count)
-}
-
-#[cfg(debug_assertions)]
-fn bind_query_lifecycle_fault_scopes(
-    execution_id: QueryExecutionId,
-    backends: &FrontendBackendSnapshot,
-) -> Result<(), DistributedQueryError> {
-    use novarocks_failpoint::{QueryLifecycleFaultKind, bind_armed_fault};
-
-    let Some(root) = novarocks_failpoint::configured_root() else {
-        return Ok(());
-    };
-    for target in &backends.entries {
-        let backend_index = target.backend_idx();
-        let process_id = target
-            .process_id()
-            .map_err(|error| contract_error(error.to_string()))?;
-        // Every declared fault kind is bound, rather than a hand-maintained
-        // subset. A literal list here silently leaves a newly added kind inert
-        // -- armable by a harness, never bound to an attempt, and therefore
-        // never firing -- which reads exactly like a fault that did not
-        // reproduce.
-        for kind in QueryLifecycleFaultKind::ALL {
-            if let Some(scope) = bind_armed_fault(
-                &root,
-                kind,
-                protocol_execution_id(execution_id)?,
-                backend_index,
-                process_id,
-            )
-            .map_err(contract_error)?
-            {
-                eprintln!(
-                    "NOVAROCKS_QUERY_FAULT_BOUND kind={} execution_id={}:{}:{} backend_index={} process_id={} token={}",
-                    kind.file_stem(),
-                    execution_id.query_id().high(),
-                    execution_id.query_id().low(),
-                    execution_id.attempt_id().get(),
-                    scope.backend_index,
-                    scope.process_id,
-                    scope.token
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(debug_assertions)]
-fn protocol_execution_id(
-    execution_id: QueryExecutionId,
-) -> Result<novarocks_proto_codec::lifecycle::QueryExecutionId, DistributedQueryError> {
-    let attempt = novarocks_proto_codec::lifecycle::AttemptId::new(execution_id.attempt_id().get())
-        .map_err(|error| contract_error(error.to_string()))?;
-    novarocks_proto_codec::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
-        .map_err(|error| contract_error(error.to_string()))
-}
-
-#[cfg(not(debug_assertions))]
-fn bind_query_lifecycle_fault_scopes(
-    _execution_id: QueryExecutionId,
-    _backends: &FrontendBackendSnapshot,
-) -> Result<(), DistributedQueryError> {
-    Ok(())
-}
-
-/// A runner arm normally names one exact BE. Pin single-instance fragments to
-/// that BE so owner-local faults are reachable; contribution ACK loss is
-/// receiver-agnostic because remote materialization may accept it elsewhere.
-#[cfg(debug_assertions)]
-fn query_lifecycle_fault_preferred_live_index(
-    backends: &FrontendBackendSnapshot,
-) -> Result<Option<usize>, DistributedQueryError> {
-    let Some(root) = configured_root() else {
-        return Ok(None);
-    };
-    // The task protocol's successor of the retired `RestartAfterInitAck`.
-    // Without this pinning a single-instance fragment lands on
-    // `query_id.low() % backend_count`, so a fault armed on one backend has a
-    // one-in-N chance of being reached at all -- which is the difference
-    // between a scenario that proves something and one that passes because the
-    // fault never fired.
-    let fault_kinds = [QueryLifecycleFaultKind::RestartAfterEstablishContext];
-    let armed = backends
-        .entries
-        .iter()
-        .enumerate()
-        .filter_map(|(live_index, target)| {
-            fault_kinds
-                .iter()
-                .any(|kind| arm_path(&root, target.backend_idx(), *kind).exists())
-                .then_some(live_index)
-        })
-        .collect::<Vec<_>>();
-    match armed.as_slice() {
-        [] => Ok(None),
-        [live_index] => Ok(Some(*live_index)),
-        _ => Err(contract_error(
-            "runner-owned query lifecycle faults target more than one live backend",
-        )),
-    }
-}
-
-#[cfg(not(debug_assertions))]
-fn query_lifecycle_fault_preferred_live_index(
-    _backends: &FrontendBackendSnapshot,
-) -> Result<Option<usize>, DistributedQueryError> {
-    Ok(None)
-}
-
-#[cfg(debug_assertions)]
-fn query_control_fragment_backend_limit(
-    execution_id: QueryExecutionId,
-    live_backend_count: usize,
-) -> Result<Option<usize>, DistributedQueryError> {
-    let Some(root) = novarocks_failpoint::configured_root() else {
-        return Ok(None);
-    };
-    let path = root.join("fragment-backend-limit.trigger");
-    let contents = match std::fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(contract_error(format!(
-                "read runner-owned fragment backend limit trigger {}: {error}",
-                path.display()
-            )));
-        }
-    };
-    std::fs::remove_file(&path).map_err(|error| {
-        contract_error(format!(
-            "consume runner-owned fragment backend limit trigger {}: {error}",
-            path.display()
-        ))
-    })?;
-    let mut lines = contents.lines();
-    let token = lines.next().unwrap_or_default().trim();
-    let limit = lines
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .parse::<usize>()
-        .map_err(|error| contract_error(format!("invalid fragment backend limit: {error}")))?;
-    if token.is_empty()
-        || !token
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        || lines.any(|line| !line.trim().is_empty())
-    {
-        return Err(contract_error(
-            "runner-owned fragment backend limit trigger has invalid tokenized contents",
-        ));
-    }
-    if !(1..=live_backend_count).contains(&limit) {
-        return Err(contract_error(format!(
-            "runner-owned fragment backend limit {limit} is outside 1..={live_backend_count}"
-        )));
-    }
-    eprintln!(
-        "NOVAROCKS_QUERY_CONTROL_FRAGMENT_LIMIT execution_id={}:{}:{} limit={limit} live_backends={live_backend_count} token={token}",
-        execution_id.query_id().high(),
-        execution_id.query_id().low(),
-        execution_id.attempt_id().get()
-    );
-    Ok(Some(limit))
-}
-
-#[cfg(not(debug_assertions))]
-fn query_control_fragment_backend_limit(
-    _execution_id: QueryExecutionId,
-    _live_backend_count: usize,
-) -> Result<Option<usize>, DistributedQueryError> {
-    Ok(None)
 }
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {

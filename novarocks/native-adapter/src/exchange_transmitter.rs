@@ -15,10 +15,15 @@ use crate::{BackendDataRuntime, NativeRpcClient};
 pub fn grpc_exchange_transmitter(
     runtime: BackendDataRuntime,
     send_timeout: Duration,
+    #[cfg(feature = "test-controls")] observations: Option<
+        Arc<crate::test_observation_controls::NativeObservationControls>,
+    >,
 ) -> Arc<dyn ExchangeFrameTransmitter> {
     Arc::new(GrpcExchangeFrameTransmitter {
         runtime,
         send_timeout,
+        #[cfg(feature = "test-controls")]
+        observations,
     })
 }
 
@@ -32,6 +37,8 @@ fn failed(kind: FragmentIoErrorKind, detail: impl Into<String>) -> ExchangeTrans
 }
 
 struct GrpcExchangeFrameTransmitter {
+    #[cfg(feature = "test-controls")]
+    observations: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
     runtime: BackendDataRuntime,
     send_timeout: Duration,
 }
@@ -84,7 +91,20 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
             .map_err(|error| failed(FragmentIoErrorKind::Unavailable, error))?;
         match normal_closed {
             None => Ok(()),
-            Some(proof) => validate_normal_close(&frame, &proof),
+            Some(proof) => validate_normal_close(
+                &frame,
+                &proof,
+                #[cfg(feature = "test-controls")]
+                self.observations
+                    .as_deref()
+                    .map(|controls| {
+                        controls.observation_for("exchange-snapshot", target.query_execution_id())
+                    })
+                    .transpose()
+                    .map_err(|error| failed(FragmentIoErrorKind::InvalidResponse, error))?
+                    .flatten()
+                    .as_deref(),
+            ),
         }
     }
 }
@@ -92,6 +112,9 @@ impl ExchangeFrameTransmitter for GrpcExchangeFrameTransmitter {
 fn validate_normal_close(
     frame: &ExchangeFrame,
     proof: &proto::ExchangeNormalClosed,
+    #[cfg(feature = "test-controls")] observer: Option<
+        &dyn novarocks_execution::runtime::exchange::TestEventObserver,
+    >,
 ) -> Result<(), ExchangeTransmitRejection> {
     let expected_task = frame.destination_task_identity.ok_or_else(|| {
         failed(
@@ -126,14 +149,9 @@ fn validate_normal_close(
             "normal-close response does not match frozen exchange destination and sender",
         ));
     }
-    #[cfg(debug_assertions)]
-    if std::env::var("NOVAROCKS_SQL_TEST_EMIT_EXCHANGE_SNAPSHOT_MARKER").is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    }) {
-        eprintln!(
+    #[cfg(feature = "test-controls")]
+    if let Some(observer) = observer {
+        observer.observe(&format!(
             "NOVAROCKS_EXCHANGE_SNAPSHOT event=normal_close_validated destination_task={} attempt={} dest_finst={} node_id={} sender_finst={} sender_ordinal={} sender_count={} seq={} eos={}",
             expected_task,
             expected_task.query_execution_id().attempt_id().get(),
@@ -144,7 +162,7 @@ fn validate_normal_close(
             frame.sender_count,
             frame.sequence,
             frame.eos,
-        );
+        ));
     }
     Err(ExchangeTransmitRejection::DestinationCanceled(
         CancelReason::UpstreamNoLongerNeeded,
@@ -219,6 +237,8 @@ mod tests {
         let transmitter = super::grpc_exchange_transmitter(
             crate::backend_test_support::test_backend_data_runtime(),
             std::time::Duration::from_secs(1),
+            #[cfg(feature = "test-controls")]
+            None,
         );
         let error = transmitter.transmit(frame).unwrap_err();
         assert_eq!(
@@ -235,7 +255,12 @@ mod tests {
     fn exact_normal_close_cancels_only_one_destination() {
         let (frame, proof) = frame_and_proof();
         assert_eq!(
-            validate_normal_close(&frame, &proof),
+            validate_normal_close(
+                &frame,
+                &proof,
+                #[cfg(feature = "test-controls")]
+                None
+            ),
             Err(ExchangeTransmitRejection::DestinationCanceled(
                 CancelReason::UpstreamNoLongerNeeded
             ))
@@ -247,31 +272,46 @@ mod tests {
         let (frame, mut proof) = frame_and_proof();
         proof.destination_task = Some(novarocks_task_codec::identity::encode_task_identity(task()));
         assert_eq!(
-            validate_normal_close(&frame, &proof)
-                .unwrap_err()
-                .failure()
-                .unwrap()
-                .kind(),
+            validate_normal_close(
+                &frame,
+                &proof,
+                #[cfg(feature = "test-controls")]
+                None
+            )
+            .unwrap_err()
+            .failure()
+            .unwrap()
+            .kind(),
             FragmentIoErrorKind::InvalidResponse
         );
         let (_, mut proof) = frame_and_proof();
         proof.source_finst_id_lo += 1;
         assert_eq!(
-            validate_normal_close(&frame, &proof)
-                .unwrap_err()
-                .failure()
-                .unwrap()
-                .kind(),
+            validate_normal_close(
+                &frame,
+                &proof,
+                #[cfg(feature = "test-controls")]
+                None
+            )
+            .unwrap_err()
+            .failure()
+            .unwrap()
+            .kind(),
             FragmentIoErrorKind::InvalidResponse
         );
         let (_, mut proof) = frame_and_proof();
         proof.sender_ordinal = 0;
         assert_eq!(
-            validate_normal_close(&frame, &proof)
-                .unwrap_err()
-                .failure()
-                .unwrap()
-                .kind(),
+            validate_normal_close(
+                &frame,
+                &proof,
+                #[cfg(feature = "test-controls")]
+                None
+            )
+            .unwrap_err()
+            .failure()
+            .unwrap()
+            .kind(),
             FragmentIoErrorKind::InvalidResponse
         );
     }
@@ -281,20 +321,30 @@ mod tests {
         let (mut frame, mut proof) = frame_and_proof();
         proof.destination_task = None;
         assert_eq!(
-            validate_normal_close(&frame, &proof)
-                .unwrap_err()
-                .failure()
-                .unwrap()
-                .kind(),
+            validate_normal_close(
+                &frame,
+                &proof,
+                #[cfg(feature = "test-controls")]
+                None
+            )
+            .unwrap_err()
+            .failure()
+            .unwrap()
+            .kind(),
             FragmentIoErrorKind::InvalidResponse
         );
         frame.destination_task_identity = None;
         assert_eq!(
-            validate_normal_close(&frame, &proof)
-                .unwrap_err()
-                .failure()
-                .unwrap()
-                .kind(),
+            validate_normal_close(
+                &frame,
+                &proof,
+                #[cfg(feature = "test-controls")]
+                None
+            )
+            .unwrap_err()
+            .failure()
+            .unwrap()
+            .kind(),
             FragmentIoErrorKind::InvalidResponse
         );
     }

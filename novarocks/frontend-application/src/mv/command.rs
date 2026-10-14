@@ -44,8 +44,7 @@ use novarocks_types::naming::normalize_identifier;
 use super::FrontendMvProductAdapter;
 use crate::mv::domain::refresh::resolve_refresh_mv_target;
 use crate::mv::domain::{
-    alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports,
-    execute_typed_novarocks_imv_stateless_rebuild, list_mvs_with_backend,
+    alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports, list_mvs_with_backend,
 };
 use std::sync::Arc;
 
@@ -216,13 +215,20 @@ impl MvCommandExecutor {
         )? {
             return Ok(Some(result));
         }
-        execute_typed_novarocks_imv_stateless_rebuild(
+        #[cfg(feature = "test-controls")]
+        return crate::mv::domain::execute_typed_novarocks_imv_stateless_rebuild(
             self.ports.connector_control(),
             self.ports.readiness().as_ref(),
+            self.refresh_service.product_service(),
             statement,
             current_database,
             connector_context.clone(),
-        )
+        );
+        #[cfg(not(feature = "test-controls"))]
+        {
+            let _ = (current_database, connector_context);
+            Ok(None)
+        }
     }
 
     fn execute_explain_refresh(

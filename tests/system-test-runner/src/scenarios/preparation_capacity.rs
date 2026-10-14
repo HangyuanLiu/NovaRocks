@@ -18,34 +18,50 @@
 //! Temporary preparation ownership through the authenticated native listener.
 
 use std::fs;
-use std::io::{Read, Write};
+
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail, ensure};
 use novarocks_cluster_harness::ServerHandle;
 use novarocks_proto_models::novarocks as proto;
 
-use super::native_compatibility::raw_apply_task_operations;
+use super::native_compatibility::raw_apply_task_operations_until;
 use super::native_creation::{
     RawBackendSession, RawCreate, await_installed, ensure_accepted,
     observe_all_canceled_and_stopped, outcome, quiesce_session, raw_create_identity,
+};
+use super::native_direct_controls::{
+    DirectIntent, DirectIntentOwner, close_hold, read_marker, release_hold,
 };
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
-        Box::new(PreparationCapacity { bytes: false }),
-        Box::new(PreparationCapacity { bytes: true }),
-        Box::new(PreparationInterleaving { same_batch: false }),
-        Box::new(PreparationInterleaving { same_batch: true }),
+        Box::new(PreparationCapacity {
+            bytes: false,
+            intent: DirectIntentOwner::default(),
+        }),
+        Box::new(PreparationCapacity {
+            bytes: true,
+            intent: DirectIntentOwner::default(),
+        }),
+        Box::new(PreparationInterleaving {
+            same_batch: false,
+            intent: DirectIntentOwner::default(),
+        }),
+        Box::new(PreparationInterleaving {
+            same_batch: true,
+            intent: DirectIntentOwner::default(),
+        }),
     ]
 }
 
 struct PreparationCapacity {
     bytes: bool,
+    intent: DirectIntentOwner,
 }
 
 impl Scenario for PreparationCapacity {
@@ -57,24 +73,47 @@ impl Scenario for PreparationCapacity {
         }
     }
 
-    fn launch_config(&self, root: &Path) -> Result<ScenarioLaunchConfig> {
-        fs::create_dir_all(root)?;
-        let token = format!(
-            "prep-{}-{}",
-            std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-        );
-        fs::write(root.join("preparation-hold-token"), &token)?;
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let targets = if self.bytes {
+            (1..=32)
+                .chain(std::iter::once(100))
+                .map(|task| (0, 0, Some(task)))
+                .collect::<Vec<_>>()
+        } else {
+            vec![
+                (0, 0, Some(1)),
+                (0, 0, Some(2)),
+                (0, 1, Some(1)),
+                (0, 0, Some(3)),
+                (0, 2, Some(1)),
+                (0, 1, Some(2)),
+                (0, 2, Some(2)),
+                (0, 2, Some(3)),
+            ]
+        };
+        Ok(Some(self.intent.freeze(
+            "preparation-hold",
+            if self.bytes { 1 } else { 3 },
+            &targets,
+            true,
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
+    }
+
+    fn launch_config(&self, _root: &Path) -> Result<ScenarioLaunchConfig> {
         let mut launch = ScenarioLaunchConfig::default();
-        launch
-            .child_environment
-            .be_by_index
-            .entry(0)
-            .or_default()
-            .insert(
-                "NOVAROCKS_SQL_TEST_TASK_PREPARATION_HOLD_TOKEN".into(),
-                token,
-            );
         let (per_context, count, bytes) = if self.bytes {
             (32, 32, 2048)
         } else {
@@ -92,18 +131,23 @@ impl Scenario for PreparationCapacity {
             context.handle().be_count() == 3,
             "preparation evidence requires native 1FE+3BE"
         );
-        let token = fs::read_to_string(context.scenario_root().join("preparation-hold-token"))?;
-        let mut gate = PreparationRendezvous::bind(&token)?;
+        let intent = self.intent.get()?;
+        ensure!(
+            context.deadline() == intent.deadline,
+            "Native preparation deadline changed after freeze"
+        );
+        let mut gate = PreparationRendezvous::bind(intent.token(0)?)?;
         if self.bytes {
-            byte_capacity(context, &mut gate)
+            byte_capacity(context, &mut gate, &intent)
         } else {
-            fifo_capacity(context, &mut gate)
+            fifo_capacity(context, &mut gate, &intent)
         }
     }
 }
 
 struct PreparationInterleaving {
     same_batch: bool,
+    intent: DirectIntentOwner,
 }
 
 impl Scenario for PreparationInterleaving {
@@ -115,26 +159,40 @@ impl Scenario for PreparationInterleaving {
         }
     }
 
-    fn launch_config(&self, root: &Path) -> Result<ScenarioLaunchConfig> {
-        fs::create_dir_all(root)?;
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let targets = if self.same_batch {
+            vec![(0, 0, Some(1)), (0, 1, Some(2))]
+        } else {
+            vec![
+                (0, 0, Some(1)),
+                (1, 0, Some(2)),
+                (1, 1, Some(1)),
+                (0, 1, Some(2)),
+            ]
+        };
+        Ok(Some(self.intent.freeze(
+            "preparation-hold",
+            2,
+            &targets,
+            true,
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
+    }
+
+    fn launch_config(&self, _root: &Path) -> Result<ScenarioLaunchConfig> {
         let mut launch = ScenarioLaunchConfig::default();
-        for index in 0..if self.same_batch { 1 } else { 2 } {
-            let token = format!(
-                "prep-mix-{}-{}-{index}",
-                std::process::id(),
-                SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
-            );
-            fs::write(root.join(format!("preparation-hold-token-{index}")), &token)?;
-            launch
-                .child_environment
-                .be_by_index
-                .entry(index)
-                .or_default()
-                .insert(
-                    "NOVAROCKS_SQL_TEST_TASK_PREPARATION_HOLD_TOKEN".into(),
-                    token,
-                );
-        }
         launch.config_overlay.fe = Some("[runtime]\ntask_dispatch_create_permits = 2\n".into());
         launch.config_overlay.be = Some("[runtime]\ntask_preparation_max_tasks_per_context = 2\ntask_preparation_max_tasks = 4\ntask_preparation_max_bytes = 67108864\ntask_preparation_max_workers = 2\n".into());
         Ok(launch)
@@ -145,21 +203,39 @@ impl Scenario for PreparationInterleaving {
             context.handle().be_count() == 3,
             "preparation evidence requires native 1FE+3BE"
         );
-        let bind = |index| -> Result<PreparationRendezvous> {
-            PreparationRendezvous::bind(&fs::read_to_string(
-                context
-                    .scenario_root()
-                    .join(format!("preparation-hold-token-{index}")),
-            )?)
-        };
-        let mut first = bind(0)?;
+        let intent = self.intent.get()?;
+        ensure!(
+            context.deadline() == intent.deadline,
+            "Native preparation deadline changed after freeze"
+        );
+        let mut first = PreparationRendezvous::bind(intent.token(0)?)?;
         if self.same_batch {
-            same_batch(context, &mut first)
+            same_batch(context, &mut first, &intent)
         } else {
-            let mut second = bind(1)?;
-            cross_backend(context, &mut first, &mut second)
+            let mut second = PreparationRendezvous::bind(intent.token(1)?)?;
+            cross_backend(context, &mut first, &mut second, &intent)
         }
     }
+}
+
+fn establish_declared(
+    context: &mut ScenarioContext,
+    intent: &DirectIntent,
+    query_index: usize,
+    backend_index: usize,
+) -> Result<RawBackendSession> {
+    let query = intent
+        .queries
+        .get(query_index)
+        .context("query outside frozen Native preparation set")?;
+    let session = RawBackendSession::establish_declared(
+        context,
+        backend_index,
+        query.query_id.clone(),
+        query.frontend,
+    )?;
+    intent.verify_backend(backend_index, session.backend)?;
+    Ok(session)
 }
 
 fn assert_still_preparing(session: &RawBackendSession, create: &RawCreate) -> Result<()> {
@@ -183,12 +259,13 @@ fn cross_backend(
     context: &mut ScenarioContext,
     gate0: &mut PreparationRendezvous,
     gate1: &mut PreparationRendezvous,
+    intent: &DirectIntent,
 ) -> Result<()> {
     // Exercise both target orders. The later target finishes before the first
     // target releases its preparation worker, without bypassing either FIFO.
-    for order in [[0, 1], [1, 0]] {
-        let slow = RawBackendSession::establish(context, order[0])?;
-        let fast = RawBackendSession::establish_same_attempt(context, order[1], &slow)?;
+    for (query_index, order) in [[0, 1], [1, 0]].into_iter().enumerate() {
+        let slow = establish_declared(context, intent, query_index, order[0])?;
+        let fast = establish_declared(context, intent, query_index, order[1])?;
         let slow_create = receiver(&slow, 1);
         let fast_create = receiver(&fast, 2);
         let (slow_gate, fast_gate) = if order[0] == 0 {
@@ -219,11 +296,15 @@ fn cross_backend(
     Ok(())
 }
 
-fn same_batch(context: &mut ScenarioContext, gate: &mut PreparationRendezvous) -> Result<()> {
+fn same_batch(
+    context: &mut ScenarioContext,
+    gate: &mut PreparationRendezvous,
+    intent: &DirectIntent,
+) -> Result<()> {
     // Worker intentionally serializes preparation within one Context. Two
     // Contexts on the same BE allow its two workers to progress independently.
-    let slow = RawBackendSession::establish(context, 0)?;
-    let fast = RawBackendSession::establish(context, 0)?;
+    let slow = establish_declared(context, intent, 0, 0)?;
+    let fast = establish_declared(context, intent, 1, 0)?;
     let slow_create = receiver(&slow, 1);
     let fast_create = receiver(&fast, 2);
     let operations = vec![slow_create.operation(), fast_create.operation()];
@@ -236,7 +317,12 @@ fn same_batch(context: &mut ScenarioContext, gate: &mut PreparationRendezvous) -
                 .and_then(|envelope| envelope.operation_id.clone())
         })
         .collect::<Vec<_>>();
-    let response = raw_apply_task_operations(&slow.connector, &slow.authorization, operations)?;
+    let response = raw_apply_task_operations_until(
+        &slow.connector,
+        &slow.authorization,
+        operations,
+        intent.deadline,
+    )?;
     ensure!(
         response.grpc_status == 0,
         "same ApplyBatch failed at the Native boundary: {:?} {:?}",
@@ -279,10 +365,10 @@ fn same_batch(context: &mut ScenarioContext, gate: &mut PreparationRendezvous) -
         let (marker, stream) = gate.capture(context)?;
         if marker == gate.marker(&slow, &slow_create) {
             ensure!(held_slow.is_none(), "slow preparation entered twice");
-            held_slow = Some(PreparationHold(Some(stream)));
+            held_slow = Some(PreparationHold(Some(stream), context.deadline()));
         } else if marker == gate.marker(&fast, &fast_create) {
             ensure!(held_fast.is_none(), "fast preparation entered twice");
-            held_fast = Some(PreparationHold(Some(stream)));
+            held_fast = Some(PreparationHold(Some(stream), context.deadline()));
         } else {
             bail!("same batch preparation entered an unrelated identity: {marker:?}");
         }
@@ -312,13 +398,15 @@ fn same_batch(context: &mut ScenarioContext, gate: &mut PreparationRendezvous) -
     Ok(())
 }
 
-struct PreparationHold(Option<UnixStream>);
+struct PreparationHold(Option<UnixStream>, Instant);
 impl PreparationHold {
     fn release(&mut self) -> Result<()> {
-        self.0
-            .as_mut()
-            .context("preparation hold already released")?
-            .write_all(b"R")?;
+        release_hold(
+            self.0
+                .as_mut()
+                .context("preparation hold already released")?,
+            self.1,
+        )?;
         self.0 = None;
         Ok(())
     }
@@ -326,7 +414,7 @@ impl PreparationHold {
 impl Drop for PreparationHold {
     fn drop(&mut self) {
         if let Some(stream) = &mut self.0 {
-            let _ = stream.write_all(b"R");
+            close_hold(stream);
         }
     }
 }
@@ -338,9 +426,13 @@ fn receiver(session: &RawBackendSession, id: u32) -> RawCreate {
     create
 }
 
-fn fifo_capacity(context: &mut ScenarioContext, gate: &mut PreparationRendezvous) -> Result<()> {
-    let a = RawBackendSession::establish(context, 0)?;
-    let b = RawBackendSession::establish(context, 0)?;
+fn fifo_capacity(
+    context: &mut ScenarioContext,
+    gate: &mut PreparationRendezvous,
+    intent: &DirectIntent,
+) -> Result<()> {
+    let a = establish_declared(context, intent, 0, 0)?;
+    let b = establish_declared(context, intent, 1, 0)?;
     let a1 = receiver(&a, 1);
     let a2 = receiver(&a, 2);
     let b1 = receiver(&b, 1);
@@ -397,7 +489,7 @@ fn fifo_capacity(context: &mut ScenarioContext, gate: &mut PreparationRendezvous
     finish(context, &b, &[b1])?;
     context.action("P=2/global=3/workers=1: full Context and global positions rejected with PreparationBusy; exact rendezvous order A1,A2,B1 and owner gauges 3->2->1->0 proved FIFO and live Installed charge handoff; the previously Busy A3 was then Accepted while A1/A2 stayed live");
 
-    let canceled = RawBackendSession::establish(context, 0)?;
+    let canceled = establish_declared(context, intent, 2, 0)?;
     let first = receiver(&canceled, 1);
     let queued = receiver(&canceled, 2);
     ensure_accepted(&canceled, &first)?;
@@ -431,8 +523,12 @@ fn fifo_capacity(context: &mut ScenarioContext, gate: &mut PreparationRendezvous
     Ok(())
 }
 
-fn byte_capacity(context: &mut ScenarioContext, gate: &mut PreparationRendezvous) -> Result<()> {
-    let session = RawBackendSession::establish(context, 0)?;
+fn byte_capacity(
+    context: &mut ScenarioContext,
+    gate: &mut PreparationRendezvous,
+    intent: &DirectIntent,
+) -> Result<()> {
+    let session = establish_declared(context, intent, 0, 0)?;
     let first = receiver(&session, 1);
     ensure_accepted(&session, &first)?;
     gate.await_entered(context, &session, &first)?;
@@ -525,7 +621,11 @@ struct Snapshot {
 fn scrape(context: &mut ScenarioContext, index: usize) -> Result<Snapshot> {
     let port = context.handle().runtime().be[index].http;
     let body = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(3))
+        .timeout(
+            context
+                .remaining("read preparation owner metrics")?
+                .min(Duration::from_secs(3)),
+        )
         .build()?
         .get(format!("http://127.0.0.1:{port}/metrics"))
         .send()?
@@ -600,6 +700,7 @@ fn await_snapshot_at(
 }
 
 struct PreparationRendezvous {
+    deadline: Option<Instant>,
     path: PathBuf,
     listener: UnixListener,
     stream: Option<UnixStream>,
@@ -612,6 +713,7 @@ impl PreparationRendezvous {
         let listener = UnixListener::bind(&path)?;
         listener.set_nonblocking(true)?;
         Ok(Self {
+            deadline: None,
             path,
             listener,
             stream: None,
@@ -630,6 +732,7 @@ impl PreparationRendezvous {
             "preparation FIFO/identity changed: {marker:?}"
         );
         self.stream = Some(stream);
+        self.deadline = Some(context.deadline());
         Ok(())
     }
     fn marker(&self, session: &RawBackendSession, create: &RawCreate) -> String {
@@ -655,9 +758,8 @@ impl PreparationRendezvous {
                 Err(error) => return Err(error.into()),
             }
         };
-        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-        let mut marker = String::new();
-        stream.read_to_string(&mut marker)?;
+        let marker = read_marker(&mut stream, deadline)?;
+        stream.set_write_timeout(Some(context.remaining("release preparation hold")?))?;
         Ok((marker, stream))
     }
 
@@ -670,10 +772,13 @@ impl PreparationRendezvous {
     }
 
     fn release(&mut self) -> Result<()> {
-        self.stream
-            .as_mut()
-            .context("preparation hold never entered")?
-            .write_all(b"R")?;
+        release_hold(
+            self.stream
+                .as_mut()
+                .context("preparation hold never entered")?,
+            self.deadline
+                .context("preparation hold lacks original deadline")?,
+        )?;
         self.stream = None;
         Ok(())
     }
@@ -681,7 +786,7 @@ impl PreparationRendezvous {
 impl Drop for PreparationRendezvous {
     fn drop(&mut self) {
         if let Some(stream) = &mut self.stream {
-            let _ = stream.write_all(b"R");
+            close_hold(stream);
         }
         let _ = fs::remove_file(&self.path);
     }

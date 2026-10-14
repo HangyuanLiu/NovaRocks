@@ -229,6 +229,10 @@ pub struct NativeQueryContextHost {
     catalog_install_runtime: BackendDataRuntime,
     contexts: Mutex<HostContexts>,
     catalog_metrics_publish: Mutex<()>,
+    #[cfg(feature = "test-controls")]
+    test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
+    #[cfg(feature = "test-controls")]
+    observations: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
 }
 
 impl BackendRuntimeFilterParticipantAuthority for NativeQueryContextHost {
@@ -276,7 +280,28 @@ impl NativeQueryContextHost {
             catalog_install_runtime,
             contexts: Mutex::new(HostContexts::default()),
             catalog_metrics_publish: Mutex::new(()),
+            #[cfg(feature = "test-controls")]
+            test_controls: None,
+            #[cfg(feature = "test-controls")]
+            observations: None,
         }
+    }
+
+    #[cfg(feature = "test-controls")]
+    pub(crate) fn with_test_controls(
+        mut self,
+        controls: Option<Arc<crate::test_controls::NativeTestControls>>,
+    ) -> Self {
+        self.test_controls = controls;
+        self
+    }
+    #[cfg(feature = "test-controls")]
+    pub(crate) fn with_observation_controls(
+        mut self,
+        controls: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
+    ) -> Self {
+        self.observations = controls;
+        self
     }
 
     /// The vended-credential authority of one live query context.
@@ -334,7 +359,7 @@ impl NativeQueryContextHost {
         facts.participant.clone()
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     fn wait_for_accepted_contribution_retry_rendezvous(&self, context: QueryContextRef) {
         let participant = {
             let contexts = self
@@ -638,12 +663,73 @@ impl NativeQueryContextHost {
         // this establish is a cold install. That is the only state the
         // runner-owned rendezvous below is about, and it is the state the
         // marker names.
-        emit_catalog_install_started(execution_id, catalogs.len());
-        hold_cold_catalog_install(installed)?;
-        inject_catalog_install_failure(execution_id, installed)?;
+        #[cfg(feature = "test-controls")]
+        if let Some(controls) = self.observations.as_deref() {
+            if let Some(observer) = controls
+                .observation_for("catalog-lifecycle", execution_id)
+                .map_err(|error| {
+                    catalog_rejection(
+                        installed,
+                        CatalogManagerError::materialization_failed(error),
+                    )
+                })?
+            {
+                emit_catalog_install_started(observer.as_ref(), execution_id, catalogs.len());
+            }
+            controls
+                .catalog_hold(execution_id, || installed.is_released())
+                .map_err(|error| {
+                    catalog_rejection(
+                        installed,
+                        CatalogManagerError::materialization_failed(error),
+                    )
+                })?;
+            if controls.catalog_failure(execution_id).map_err(|error| {
+                catalog_rejection(
+                    installed,
+                    CatalogManagerError::materialization_failed(error),
+                )
+            })? {
+                if let Some(observer) = controls
+                    .observation_for("catalog-lifecycle", execution_id)
+                    .map_err(|error| {
+                        catalog_rejection(
+                            installed,
+                            CatalogManagerError::materialization_failed(error),
+                        )
+                    })?
+                {
+                    observer.observe(&format!(
+                        "NOVAROCKS_CATALOG_INSTALL_FAILED execution_id={}:{}:{}",
+                        execution_id.query_id().high(),
+                        execution_id.query_id().low(),
+                        execution_id.attempt_id().get()
+                    ));
+                }
+                return Err(catalog_rejection(
+                    installed,
+                    CatalogManagerError::materialization_failed(
+                        "runner-injected catalog install failure",
+                    ),
+                ));
+            }
+        }
 
         for properties in catalogs {
             let factories = Arc::clone(&self.execution_role_binding_factories);
+            #[cfg(feature = "test-controls")]
+            let observation = self
+                .observations
+                .as_deref()
+                .map(|controls| controls.observation_for("catalog-materialization", execution_id))
+                .transpose()
+                .map_err(|error| {
+                    catalog_rejection(
+                        installed,
+                        CatalogManagerError::materialization_failed(error),
+                    )
+                })?
+                .flatten();
             self.catalog_manager
                 .ensure_while(
                     execution_id,
@@ -653,7 +739,8 @@ impl NativeQueryContextHost {
                         factories
                             .bind(
                                 properties,
-                                novarocks_native_adapter::debug_environment::debug_emit_catalog_materialization_marker(),
+                                #[cfg(feature = "test-controls")]
+                                observation.clone(),
                             )
                             .map_err(CatalogManagerError::from_materialization)
                     },
@@ -799,7 +886,7 @@ impl QueryContextHost for NativeQueryContextHost {
     }
 
     fn release(&self, context: QueryContextRef) -> ReleasedContextEvidence {
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "test-controls")]
         self.wait_for_accepted_contribution_retry_rendezvous(context);
         let installed = {
             let mut contexts = self
@@ -1040,13 +1127,6 @@ fn sealed_participant() -> HostRejection {
     )
 }
 
-/// How long a held cold install waits between checks for its own retirement.
-///
-/// The same interval the retired stack's hold used. It bounds how long a
-/// cancelled establish stays parked after its context is released, and nothing
-/// else: the rendezvous itself ends on a file the runner removes.
-const CATALOG_INSTALL_HOLD_POLL: std::time::Duration = std::time::Duration::from_millis(10);
-
 /// One backend is about to build at least one catalog runtime for this
 /// attempt.
 ///
@@ -1059,84 +1139,18 @@ const CATALOG_INSTALL_HOLD_POLL: std::time::Duration = std::time::Duration::from
 /// The identity is printed in the task protocol's marker shape -- the same
 /// `execution_id=<high>:<low>:<attempt>` word the operation markers use -- so
 /// one execution's evidence can be selected across all of them.
-fn emit_catalog_install_started(execution_id: QueryExecutionId, catalog_count: usize) {
-    if !novarocks_native_adapter::debug_environment::debug_emit_catalog_lifecycle_marker() {
-        return;
-    }
-    println!(
+#[cfg(feature = "test-controls")]
+fn emit_catalog_install_started(
+    observer: &dyn novarocks_execution::runtime::exchange::TestEventObserver,
+    execution_id: QueryExecutionId,
+    catalog_count: usize,
+) {
+    observer.observe(&format!(
         "NOVAROCKS_CATALOG_INSTALL_STARTED execution_id={}:{}:{} catalog_count={catalog_count}",
         execution_id.query_id().high(),
         execution_id.query_id().low(),
         execution_id.attempt_id().get(),
-    );
-    let _ = std::io::Write::flush(&mut std::io::stdout());
-}
-
-/// Parks a cold catalog install while the runner's hold file exists.
-///
-/// The task protocol installs shared facts inside the establish rather than in
-/// a background pass, so this is the one place a cold install is observably
-/// in flight. A case about cancelling an install mid-flight has nowhere else
-/// to stand: without the hold the install is a few milliseconds long and the
-/// cancellation always arrives before or after it, never during.
-///
-/// The wait ends on the context's own retirement as well as on the file, and
-/// that ordering matters: an abort that arrives while this is parked has to
-/// end the install rather than wait for the runner. Returning the cancelled
-/// rejection here is what keeps the provider bind below from running at all,
-/// so a cancelled attempt materializes no catalog runtime.
-fn hold_cold_catalog_install(installed: &InstalledContext) -> Result<(), HostRejection> {
-    let Some(hold_file) =
-        novarocks_native_adapter::debug_environment::debug_catalog_install_hold_file()
-    else {
-        return Ok(());
-    };
-    while hold_file.exists() {
-        if installed.is_released() {
-            return Err(cancelled_establish());
-        }
-        std::thread::sleep(CATALOG_INSTALL_HOLD_POLL);
-    }
-    // Checked once more after the file is gone: the release may have landed in
-    // the same instant the runner lifted the hold.
-    if installed.is_released() {
-        return Err(cancelled_establish());
-    }
-    Ok(())
-}
-
-/// Fails one selected backend's cold catalog install on the runner's trigger.
-///
-/// Checked before the catalog manager is touched, exactly as the retired stack
-/// checked it: a failure recorded in a manager cell would be suppressed for
-/// its retry cooldown, and the case that clears the trigger and retries
-/// immediately would then be measuring the cooldown instead of the retry.
-///
-/// The detail is routed through `catalog_rejection` so an injected failure is
-/// classified by the same rule as a real one, rather than by a category chosen
-/// here.
-fn inject_catalog_install_failure(
-    execution_id: QueryExecutionId,
-    installed: &InstalledContext,
-) -> Result<(), HostRejection> {
-    let armed = novarocks_native_adapter::debug_environment::debug_catalog_install_failure_file()
-        .is_some_and(|failure_file| failure_file.exists());
-    if !armed {
-        return Ok(());
-    }
-    if novarocks_native_adapter::debug_environment::debug_emit_catalog_lifecycle_marker() {
-        println!(
-            "NOVAROCKS_CATALOG_INSTALL_FAILED execution_id={}:{}:{}",
-            execution_id.query_id().high(),
-            execution_id.query_id().low(),
-            execution_id.attempt_id().get(),
-        );
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-    }
-    Err(catalog_rejection(
-        installed,
-        CatalogManagerError::materialization_failed("runner-injected catalog install failure"),
-    ))
+    ));
 }
 
 /// Maps a catalog install failure onto this protocol's categories.
@@ -2740,10 +2754,17 @@ impl TaskQueryContextFacts for NativeQueryContextHost {
         let Some(participant) = facts.participant.clone() else {
             return false;
         };
-        let sink = Arc::new(TaskRuntimeFilterFeedbackEgress::new(
-            carrier,
-            reporter.clone(),
-        ));
+        let sink = TaskRuntimeFilterFeedbackEgress::new(carrier, reporter.clone());
+        #[cfg(feature = "test-controls")]
+        let sink = {
+            let sink = if let Some(controls) = self.test_controls.clone() {
+                sink.with_test_controls(controls)
+            } else {
+                sink
+            };
+            sink.with_observation_controls(self.observations.clone())
+        };
+        let sink = Arc::new(sink);
         // The participant holds this weakly, exactly as the lifecycle egress
         // was held: a background publisher must not be able to keep the query
         // context alive through its own sink.

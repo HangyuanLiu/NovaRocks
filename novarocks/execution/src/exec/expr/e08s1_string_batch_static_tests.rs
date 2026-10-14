@@ -24,7 +24,9 @@ use novarocks_functions::{
 use novarocks_sql::compiler::{
     SqlCompileControl, SqlPhysicalEmissionMode, builtin_sql_function_catalog,
 };
-use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType};
+use novarocks_type_contract::{
+    CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
+};
 use std::sync::Mutex;
 fn full_binding(name: &str, mask: usize) -> ResolvedFunctionBinding {
     // Exact test inputs use original declared argument types; the original

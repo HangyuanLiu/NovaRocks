@@ -189,8 +189,8 @@ impl PreparedNativeLikeRecipe {
         result: &novarocks_type_contract::FunctionValueType,
         control: &dyn novarocks_type_contract::PureCompileControl,
     ) -> Result<Self, crate::ComparisonPrepareError> {
-        use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ValueLogicalType};
         use arrow_schema::DataType;
+        use novarocks_type_contract::{CompileCheckpoints, CompilePhase, ValueLogicalType};
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
         let outcome = (|| {
             for ty in [text, pattern, result] {
@@ -253,8 +253,8 @@ impl PreparedNativeLikeRecipe {
         truth_only: bool,
         control: &dyn crate::KernelEvaluationControl,
     ) -> Result<crate::SelectedValues<'a>, crate::KernelFailure> {
+        use crate::kernel_control::{internal, invalid};
         use crate::{EvaluatedArgument, KernelEvaluationControl, KernelFailure};
-        use crate::kernel_control::{invalid, internal};
         let observed = crate::KernelControlObservation::new(control);
         observed.checkpoint(0)?;
         let mut work = crate::EvaluationCheckpoints::new(&observed);

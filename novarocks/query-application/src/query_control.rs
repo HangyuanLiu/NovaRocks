@@ -183,6 +183,28 @@ impl QueryApplicationControl {
     }
 }
 
+#[cfg(feature = "test-controls")]
+impl QueryApplicationControl {
+    /// Reads this owner's current session; it neither registers nor keeps it alive.
+    pub fn current_session_for_test_controls(
+        &self,
+        connection_id: u32,
+    ) -> Result<SessionToken, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "statement input query-control lock poisoned".to_owned())?;
+        let entry = state
+            .sessions
+            .get(&connection_id)
+            .filter(|entry| !entry.unregister_pending)
+            .ok_or_else(|| {
+                "statement input requires an active registered client session".to_owned()
+            })?;
+        Ok(SessionToken::new(connection_id, entry.session_epoch))
+    }
+}
+
 impl QueryControlPort for QueryApplicationControl {
     fn register_session(
         &self,

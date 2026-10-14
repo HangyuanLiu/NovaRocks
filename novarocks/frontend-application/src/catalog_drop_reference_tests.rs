@@ -638,6 +638,7 @@ async fn an_observed_materialized_view_reference_refuses_the_drop_as_an_operatio
 /// to a check that no longer runs there, so success alone would not separate
 /// the two. Zero MV scans inside the delete's write transaction does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "test-controls")]
 async fn an_entirely_wiped_accelerator_still_lets_the_catalog_drop() {
     let host = state_store_fixture::open_persistent(format!(
         "catalog-drop-guard-wiped-{}",

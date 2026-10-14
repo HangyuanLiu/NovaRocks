@@ -19,7 +19,7 @@
 //! This probe covers one original input custody operation, not whole BY/MEM.
 use super::*;
 use crate::exec::operators::compiled_expression::RuntimeKernelControl;
-use novarocks_functions::{retain_source_backing, SourceBackingOwner};
+use novarocks_functions::{SourceBackingOwner, retain_source_backing};
 
 fn owned_source(source_tracker: &Arc<MemTracker>) -> Chunk {
     let (program, batch) = source(

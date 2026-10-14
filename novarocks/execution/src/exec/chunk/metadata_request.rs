@@ -19,7 +19,6 @@
 //! stock, a grant, a post-operation capacity estimate or a result-drop receipt.
 //! Legacy constructors do not call this optional positive-source entrypoint.
 use super::*;
-use novarocks_type_contract::{ControlResourceError, ValueTypeError, ValueTypeVisit};
 use novarocks_type_contract::owned_resources::{
     hashmap::fresh_table_layout,
     layout::arc_layout,
@@ -29,6 +28,7 @@ use novarocks_type_contract::owned_resources::{
     type_validation::TypeValidationScratch,
     vec::original_fresh_push_allocation_requests_observed,
 };
+use novarocks_type_contract::{ControlResourceError, ValueTypeError, ValueTypeVisit};
 use std::alloc::Layout;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

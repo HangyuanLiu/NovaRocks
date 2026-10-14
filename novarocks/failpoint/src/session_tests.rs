@@ -213,6 +213,15 @@ fn one_launch_binds_existing_native_identity_and_end_joins_both_helpers() {
         runner.bound_process().unwrap().unwrap(),
         process.process_id()
     );
+    let receipt =
+        crate::target_binding::RoleProcessReceipt::read_private(&runner.process_receipt_path())
+            .unwrap();
+    assert_eq!(
+        receipt.backend_process().unwrap().to_string(),
+        process.process_id()
+    );
+    assert_eq!(receipt.session_id, "test-session");
+    assert_eq!(receipt.launch_id, "launch-one");
     let scope = role.scope().clone();
     runner.end_and_join().unwrap();
     scope.wait_closed();
@@ -243,6 +252,57 @@ fn total_lifetime_closes_without_a_new_action_or_explicit_end() {
     );
     role.close_and_join().unwrap();
     runner.end_and_join().unwrap();
+}
+
+#[test]
+fn original_deadline_charges_late_start_and_both_helpers_actually_join() {
+    let root = PrivateRoot::new();
+    let declaration = root.declaration(5000);
+    let path = root.0.join("declaration.json");
+    declaration.write_private(&path).unwrap();
+    let prepared = PreparedRoleSession::read_and_claim(&path, SessionRole::Be).unwrap();
+    let original_deadline = Instant::now() + Duration::from_millis(1500);
+    std::thread::sleep(Duration::from_millis(50));
+    let mut runner = RunnerSession::start_until(declaration, original_deadline).unwrap();
+    assert_eq!(runner.deadline(), original_deadline);
+    let process = ProcessBinding::Backend(novarocks_types::BackendProcessId::new_v7());
+    let mut role = prepared.bind(process).unwrap();
+    let scope = role.scope().clone();
+    assert!(scope.deadline() <= original_deadline);
+    scope.wait_closed();
+    assert!(!scope.is_active());
+    role.close_and_join().unwrap();
+    runner.end_and_join().unwrap();
+    role.close_and_join().unwrap();
+    runner.end_and_join().unwrap();
+    assert!(!root.0.join("live.sock").exists());
+}
+
+#[test]
+fn expired_original_deadline_never_binds_a_socket_or_starts_a_helper() {
+    let root = PrivateRoot::new();
+    let declaration = root.declaration(2000);
+    let socket = declaration.liveness_socket.clone();
+    let result = RunnerSession::start_until(declaration, Instant::now());
+    let Err(error) = result else {
+        panic!("an expired original deadline must refuse startup");
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert!(!socket.exists());
+}
+
+#[test]
+fn a_later_original_deadline_does_not_extend_declared_lifetime() {
+    let root = PrivateRoot::new();
+    let declaration = root.declaration(200);
+    let before = Instant::now();
+    let mut runner =
+        RunnerSession::start_until(declaration, before + Duration::from_secs(2)).unwrap();
+    let after = Instant::now();
+    assert!(runner.deadline() >= before + Duration::from_millis(200));
+    assert!(runner.deadline() <= after + Duration::from_millis(200));
+    runner.end_and_join().unwrap();
+    assert!(!root.0.join("live.sock").exists());
 }
 
 #[test]
@@ -329,4 +389,367 @@ fn invalid_handshake_cannot_bind_or_take_over_a_launch() {
     }
     assert!(runner.end_and_join().is_err());
     assert!(!root.0.join("live.sock").exists());
+}
+
+/// Own every queued client so dropping a probe cannot make the listener ready
+/// again. No peer accepts during the assertion window.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct BackloggedControlSocket {
+    listener: socket2::Socket,
+    _queued_clients: Vec<socket2::Socket>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, PartialEq, Eq)]
+enum BacklogConnectOutcome {
+    Pending,
+    Refused,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl BackloggedControlSocket {
+    fn saturate(path: &std::path::Path) -> std::io::Result<(Self, BacklogConnectOutcome)> {
+        use socket2::{Domain, SockAddr, Socket, Type};
+        let address = SockAddr::unix(path)?;
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+        listener.bind(&address)?;
+        listener.listen(1)?;
+        listener.set_nonblocking(true)?;
+        let mut queued_clients = Vec::new();
+        for _ in 0..32 {
+            let probe = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+            probe.set_nonblocking(true)?;
+            match probe.connect(&address) {
+                Ok(()) => queued_clients.push(probe),
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || matches!(
+                            error.raw_os_error(),
+                            Some(libc::EINPROGRESS) | Some(libc::EALREADY)
+                        ) =>
+                {
+                    // BSD may initially report EINPROGRESS even for a free
+                    // slot. Require the probe to remain unconnected before
+                    // claiming that the kernel backlog is actually full.
+                    let probe_deadline = Instant::now() + Duration::from_millis(20);
+                    while probe.peer_addr().is_err() && Instant::now() < probe_deadline {
+                        if let Some(error) = probe.take_error()? {
+                            if error.kind() == std::io::ErrorKind::ConnectionRefused {
+                                return Ok((
+                                    Self {
+                                        listener,
+                                        _queued_clients: queued_clients,
+                                    },
+                                    BacklogConnectOutcome::Refused,
+                                ));
+                            }
+                            return Err(error);
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    let still_pending = probe.peer_addr().is_err();
+                    queued_clients.push(probe);
+                    if still_pending {
+                        return Ok((
+                            Self {
+                                listener,
+                                _queued_clients: queued_clients,
+                            },
+                            BacklogConnectOutcome::Pending,
+                        ));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => {
+                    return Ok((
+                        Self {
+                            listener,
+                            _queued_clients: queued_clients,
+                        },
+                        BacklogConnectOutcome::Refused,
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::other(
+            "test could not saturate the private Unix listener backlog",
+        ))
+    }
+
+    /// Release kernel queue pressure even when a regressed blocking connect
+    /// missed the assertion deadline. This is cleanup, not a retry of the test.
+    fn drain(&self) -> std::io::Result<()> {
+        loop {
+            match self.listener.accept() {
+                Ok((peer, _)) => drop(peer),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+/// Join the actual helper before reporting the primary assertion failure. The
+/// cancellation plus backlog drain also releases a blocking-connect regression.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn finish_backlogged_connect(
+    backlog: &BackloggedControlSocket,
+    stop: &std::sync::atomic::AtomicBool,
+    worker: std::thread::JoinHandle<()>,
+) {
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    let cleanup_deadline = Instant::now() + Duration::from_secs(1);
+    let mut cleanup_error = None;
+    while !worker.is_finished() && Instant::now() < cleanup_deadline {
+        if let Err(error) = backlog.drain() {
+            cleanup_error = Some(error);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // A queue slot is now free even if the helper has not yet been scheduled.
+    // The helper is joined rather than detached on the failure path.
+    let joined = worker.join();
+    assert!(joined.is_ok(), "control-connect helper panicked");
+    assert!(
+        cleanup_error.is_none(),
+        "backlog cleanup failed: {cleanup_error:?}"
+    );
+}
+
+#[test]
+fn control_connect_expired_absolute_deadline_never_reaches_a_ready_listener() {
+    use std::os::unix::net::UnixListener;
+    let root = PrivateRoot::new();
+    let path = root.0.join("expired-connect.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let original_deadline = Instant::now() - Duration::from_millis(1);
+    let error = crate::liveness::connect_until(&path, original_deadline, || false).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn control_connect_cancellation_is_checked_before_and_after_connection_readiness() {
+    use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = PrivateRoot::new();
+    let path = root.0.join("cancel-connect.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    assert_eq!(
+        crate::liveness::connect_until(&path, deadline, || true)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::Interrupted
+    );
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let calls = AtomicUsize::new(0);
+    let actual_peer = std::sync::Mutex::new(None);
+    let error =
+        crate::liveness::connect_until(&path, Instant::now() + Duration::from_secs(1), || {
+            calls.fetch_add(1, Ordering::AcqRel);
+            match listener.accept() {
+                Ok((peer, _)) => {
+                    *actual_peer.lock().unwrap() = Some(peer);
+                    true
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                Err(error) => panic!("readiness probe failed: {error}"),
+            }
+        })
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+    assert!(calls.load(Ordering::Acquire) >= 2);
+    assert!(
+        actual_peer.lock().unwrap().is_some(),
+        "cancellation must follow an actual connection"
+    );
+}
+
+// Linux AF_UNIX queue saturation provides a real WouldBlock retry. macOS
+// refuses a full queue; that behavior is tested separately below and cannot
+// substitute for this pending-connect deadline/cancellation evidence.
+#[cfg(target_os = "linux")]
+#[test]
+fn control_connect_backlog_retries_keep_the_original_deadline() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let root = PrivateRoot::new();
+    let path = root.0.join("deadline-backlog.sock");
+    let (backlog, outcome) = BackloggedControlSocket::saturate(&path).unwrap();
+    assert_eq!(
+        outcome,
+        BacklogConnectOutcome::Pending,
+        "this platform must provide an actual pending backlog for retry coverage"
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let original_deadline = Instant::now() + Duration::from_millis(80);
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker_stop = stop.clone();
+    let worker_polls = polls.clone();
+    let worker = std::thread::spawn(move || {
+        let result = crate::liveness::connect_until(&path, original_deadline, || {
+            worker_polls.fetch_add(1, Ordering::AcqRel);
+            worker_stop.load(Ordering::Acquire)
+        });
+        let _ = send.send((Instant::now(), result));
+    });
+    // This is a failure watchdog, never a replacement operation deadline.
+    let received = receive.recv_timeout(Duration::from_millis(500));
+    finish_backlogged_connect(&backlog, &stop, worker);
+    let (finished_at, result) = received.expect("backlog connect exceeded its bounded watchdog");
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    assert!(
+        finished_at >= original_deadline,
+        "original deadline was shortened"
+    );
+    assert!(
+        polls.load(Ordering::Acquire) >= 2,
+        "kernel backlog did not exercise connect retries"
+    );
+}
+
+// Linux AF_UNIX queue saturation provides a real WouldBlock retry. macOS
+// refuses a full queue; that behavior is tested separately below and cannot
+// substitute for this pending-connect deadline/cancellation evidence.
+#[cfg(target_os = "linux")]
+#[test]
+fn control_connect_cancellation_unblocks_a_saturated_unix_backlog() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let root = PrivateRoot::new();
+    let path = root.0.join("cancel-backlog.sock");
+    let (backlog, outcome) = BackloggedControlSocket::saturate(&path).unwrap();
+    assert_eq!(
+        outcome,
+        BacklogConnectOutcome::Pending,
+        "this platform must provide an actual pending backlog for retry coverage"
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let original_deadline = Instant::now() + Duration::from_secs(2);
+    let (entered_send, entered_receive) = std::sync::mpsc::sync_channel(1);
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker_stop = stop.clone();
+    let worker = std::thread::spawn(move || {
+        let result = crate::liveness::connect_until(&path, original_deadline, || {
+            if polls.fetch_add(1, Ordering::AcqRel) == 1 {
+                let _ = entered_send.try_send(());
+            }
+            worker_stop.load(Ordering::Acquire)
+        });
+        let _ = send.send((Instant::now(), result));
+    });
+    // Cancellation is requested only after a real blocked-connect retry.
+    let entered = entered_receive.recv_timeout(Duration::from_millis(300));
+    stop.store(true, Ordering::Release);
+    let received = receive.recv_timeout(Duration::from_millis(300));
+    finish_backlogged_connect(&backlog, &stop, worker);
+    entered.expect("kernel backlog never reached a connect retry");
+    let (finished_at, result) = received.expect("cancellation did not release backlog connect");
+    assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+    assert!(
+        finished_at < original_deadline,
+        "connect waited for deadline rather than cancellation"
+    );
+}
+
+// Linux AF_UNIX queue saturation provides a real WouldBlock retry. macOS
+// refuses a full queue; that behavior is tested separately below and cannot
+// substitute for this pending-connect deadline/cancellation evidence.
+#[cfg(target_os = "linux")]
+#[test]
+fn control_connect_backlog_readiness_after_expiry_cannot_renew_the_attempt() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let root = PrivateRoot::new();
+    let path = root.0.join("late-ready-backlog.sock");
+    let (backlog, outcome) = BackloggedControlSocket::saturate(&path).unwrap();
+    assert_eq!(
+        outcome,
+        BacklogConnectOutcome::Pending,
+        "this platform must provide an actual pending backlog for retry coverage"
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let original_deadline = Instant::now() + Duration::from_millis(60);
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker_stop = stop.clone();
+    let worker = std::thread::spawn(move || {
+        let result = crate::liveness::connect_until(&path, original_deadline, || {
+            worker_stop.load(Ordering::Acquire)
+        });
+        let _ = send.send(result);
+    });
+    // Make the socket ready only after the caller's original absolute expiry.
+    // A retry that renewed its budget would now return a successful stream.
+    std::thread::sleep(
+        original_deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(10),
+    );
+    let release = backlog.drain();
+    let received = receive.recv_timeout(Duration::from_millis(300));
+    finish_backlogged_connect(&backlog, &stop, worker);
+    release.expect("release the expired attempt's backlog pressure");
+    assert_eq!(
+        received
+            .expect("late-readiness probe exceeded its watchdog")
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::TimedOut
+    );
+}
+
+// macOS returns ECONNREFUSED for a full AF_UNIX queue. This covers fail-fast
+// refusal, not retry-loop expiry or cancellation; those require the Linux
+// pending fixture above. Unexpected kernel behavior fails this assertion.
+#[cfg(target_os = "macos")]
+#[test]
+fn control_connect_macos_full_backlog_refuses_without_waiting_for_deadline() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let root = PrivateRoot::new();
+    let path = root.0.join("refused-backlog.sock");
+    let (backlog, outcome) = BackloggedControlSocket::saturate(&path).unwrap();
+    assert_eq!(outcome, BacklogConnectOutcome::Refused);
+    assert!(
+        !backlog._queued_clients.is_empty(),
+        "refusal must follow real queued clients on a live listener"
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let polls = Arc::new(AtomicUsize::new(0));
+    let original_deadline = Instant::now() + Duration::from_secs(2);
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker_stop = stop.clone();
+    let worker_polls = polls.clone();
+    let worker_path = path.clone();
+    let worker = std::thread::spawn(move || {
+        let result = crate::liveness::connect_until(&worker_path, original_deadline, || {
+            worker_polls.fetch_add(1, Ordering::AcqRel);
+            worker_stop.load(Ordering::Acquire)
+        });
+        let _ = send.send((Instant::now(), result));
+    });
+    let received = receive.recv_timeout(Duration::from_millis(300));
+    finish_backlogged_connect(&backlog, &stop, worker);
+    let (finished_at, result) = received.expect("full backlog refusal did not fail fast");
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+    assert_eq!(error.raw_os_error(), Some(libc::ECONNREFUSED));
+    assert_eq!(polls.load(Ordering::Acquire), 1, "refusal was retried");
+    assert!(finished_at < original_deadline);
+
+    // Prove the refusal came from queue pressure, not an absent or closed
+    // endpoint. Once accepted clients leave the queue, the same listener works.
+    backlog.drain().unwrap();
+    let connected =
+        crate::liveness::connect_until(&path, Instant::now() + Duration::from_secs(1), || false)
+            .unwrap();
+    let (accepted, _) = backlog.listener.accept().unwrap();
+    drop((connected, accepted));
 }

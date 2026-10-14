@@ -103,6 +103,8 @@ impl FrontendMvProductAdapter {
                 query_execution,
                 connector_control: Arc::clone(&connector_control),
                 provider_activation: Arc::clone(&provider_activation),
+                #[cfg(feature = "test-controls")]
+                test_controls: readiness.test_controls_owner(),
             },
             readiness: Arc::clone(&readiness),
             product_service,
@@ -598,8 +600,13 @@ fn execute_scheduled_refresh(
     cancellation: novarocks_query_application::cancellation::QueryCancellationView,
     result_capacity: &novarocks_query_application::admitted_query_context::QueryResultCapacityBinding,
 ) -> ScheduledRefreshDisposition {
-    if scheduled_refresh_test_barrier(&request.target, &cancellation) {
-        return ScheduledRefreshDisposition::ShutdownCancelled(None);
+    #[cfg(feature = "test-controls")]
+    if let Some(controls) = dependencies.readiness.test_controls() {
+        match controls.scheduler(&request.target, &cancellation) {
+            Ok(true) => return ScheduledRefreshDisposition::ShutdownCancelled(None),
+            Err(error) => return ScheduledRefreshDisposition::TransientUnavailable(error.into()),
+            Ok(false) => {}
+        }
     }
     let topology = match dependencies.topology.snapshot() {
         Ok(snapshot) => snapshot,
@@ -703,38 +710,6 @@ fn execute_scheduled_refresh(
     } else {
         ScheduledRefreshDisposition::NoOp
     }
-}
-
-/// Debug-only native-test seam for asserting that frontend scheduler permits
-/// bound actual refresh execution, rather than just queue admission.  Normal
-/// production builds do not inspect this environment variable.
-#[cfg(debug_assertions)]
-fn scheduled_refresh_test_barrier(
-    target: &novarocks_sql::planning::mv::SqlMvTarget,
-    cancellation: &novarocks_query_application::cancellation::QueryCancellationView,
-) -> bool {
-    let Some(directory) = std::env::var_os("NOVAROCKS_MVX4_SCHEDULER_TEST_DIR") else {
-        return false;
-    };
-    let directory = std::path::PathBuf::from(directory);
-    let marker = directory.join(format!("mvx4-scheduler-admitted-{}.marker", target.name));
-    let _ = std::fs::write(marker, "admitted\n");
-    let hold = directory.join("mvx4-scheduler-hold.trigger");
-    while hold.exists() {
-        if cancellation.is_cancelled() {
-            return true;
-        }
-        std::thread::park_timeout(Duration::from_millis(10));
-    }
-    cancellation.is_cancelled()
-}
-
-#[cfg(not(debug_assertions))]
-fn scheduled_refresh_test_barrier(
-    _target: &novarocks_sql::planning::mv::SqlMvTarget,
-    _cancellation: &novarocks_query_application::cancellation::QueryCancellationView,
-) -> bool {
-    false
 }
 
 fn repository_disposition(

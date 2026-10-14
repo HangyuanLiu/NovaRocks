@@ -248,6 +248,8 @@ fn bind_filtered(
         consumers,
         layout,
         &CompiledScanTask {
+            #[cfg(feature = "test-controls")]
+            observation_controls: None,
             runtime,
             fragment_instance_id: UniqueId::new(3, 4),
             query_options: &options,

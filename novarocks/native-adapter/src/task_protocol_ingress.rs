@@ -69,6 +69,7 @@ use crate::task_protocol::{
     fetch_task_result, fetch_task_result_with_ownership, get_final_task_info,
     host_rejection_status, subscribe_task_status,
 };
+#[cfg(feature = "test-controls")]
 use crate::task_protocol_fault as fault;
 use novarocks_worker::{
     AdmissionTicketObservation, RootResultRoute, StatusAdvance, TaskExecutionRegistry,
@@ -77,6 +78,11 @@ use novarocks_worker::{
 /// The wire adapter of one backend's task protocol owner.
 pub struct RegistryTaskExecutionIngress {
     registry: Arc<TaskExecutionRegistry>,
+    #[cfg(feature = "test-controls")]
+    test_controls: std::sync::OnceLock<Arc<crate::test_controls::NativeTestControls>>,
+    #[cfg(feature = "test-controls")]
+    observation_controls:
+        std::sync::OnceLock<Arc<crate::test_observation_controls::NativeObservationControls>>,
     native_compatibility_id: NativeCompatibilityId,
     /// Present exactly when this process composed the compiled-package
     /// interpreter; it bounds every create's package before the owner sees it.
@@ -114,9 +120,33 @@ impl RegistryTaskExecutionIngress {
         );
         Arc::new(Self {
             registry,
+            #[cfg(feature = "test-controls")]
+            test_controls: std::sync::OnceLock::new(),
+            #[cfg(feature = "test-controls")]
+            observation_controls: std::sync::OnceLock::new(),
             native_compatibility_id,
             static_package_admission,
         })
+    }
+
+    #[cfg(feature = "test-controls")]
+    pub fn install_test_controls(
+        &self,
+        controls: Arc<crate::test_controls::NativeTestControls>,
+    ) -> Result<(), String> {
+        self.test_controls
+            .set(controls)
+            .map_err(|_| "Native ingress test controls were already installed".into())
+    }
+
+    #[cfg(feature = "test-controls")]
+    pub fn install_observation_controls(
+        &self,
+        controls: Arc<crate::test_observation_controls::NativeObservationControls>,
+    ) -> Result<(), String> {
+        self.observation_controls
+            .set(controls)
+            .map_err(|_| "Native result observation controls were already installed".into())
     }
 
     /// Dispatches one decoded item and encodes its receipt.
@@ -165,10 +195,14 @@ impl RegistryTaskExecutionIngress {
                 })
             }
             DecodedOperation::CreateTask(decoded) => {
-                fault::create_task_before_worker_hold(
-                    decoded.request().identity(),
-                    decoded.descriptor().topology().outbound().len(),
-                )?;
+                #[cfg(feature = "test-controls")]
+                if let Some(controls) = self.test_controls.get() {
+                    fault::create_task_before_worker_hold(
+                        controls,
+                        decoded.request().identity(),
+                        decoded.descriptor().topology().outbound().len(),
+                    )?;
+                }
                 // The request is what the owner decides on; the input is the
                 // body only this identity's creation winner will interpret.
                 let (request, input, retained_bytes) = decoded.into_parts_with_retained_bytes();
@@ -180,7 +214,10 @@ impl RegistryTaskExecutionIngress {
                 );
                 // Claimed after Worker took ownership. Installation and
                 // driver start are independent later status facts.
-                fault::create_task_ack_dropped(identity, receipt.outcome())?;
+                #[cfg(feature = "test-controls")]
+                if let Some(controls) = self.test_controls.get() {
+                    fault::create_task_ack_dropped(controls, identity, receipt.outcome())?;
+                }
                 let mut encoded = encode_operation_receipt(&receipt, |status| {
                     encode_create_task_ack(&CreateTaskReceipt::new(
                         identity,
@@ -198,8 +235,24 @@ impl RegistryTaskExecutionIngress {
                 // the acknowledgement body, as a genuine rejection has none, so
                 // the reverse order would leave the identity fault nothing to
                 // forge and silently consume its arming.
-                fault::create_task_receipt_foreign_task(identity, receipt.outcome(), &mut encoded)?;
-                fault::create_task_rejected_after_apply(identity, receipt.outcome(), &mut encoded)?;
+                #[cfg(feature = "test-controls")]
+                if let Some(controls) = self.test_controls.get() {
+                    fault::create_task_receipt_foreign_task(
+                        controls,
+                        identity,
+                        receipt.outcome(),
+                        &mut encoded,
+                    )?;
+                }
+                #[cfg(feature = "test-controls")]
+                if let Some(controls) = self.test_controls.get() {
+                    fault::create_task_rejected_after_apply(
+                        controls,
+                        identity,
+                        receipt.outcome(),
+                        &mut encoded,
+                    )?;
+                }
                 Ok(encoded)
             }
             DecodedOperation::UpdateTask(request) => {
@@ -209,6 +262,7 @@ impl RegistryTaskExecutionIngress {
                 // splits and sealed its plan node, and the receipt's watermark
                 // is where that fact lives. The request's payload would have to
                 // be decoded again to learn the same thing.
+                #[cfg(feature = "test-controls")]
                 let terminal_nonempty = receipt.acknowledgement().is_some_and(|ack| {
                     ack.domains().iter().any(|domain| match domain {
                         TaskDomainReceipt::SplitAssignment { nodes, .. } => {
@@ -220,11 +274,15 @@ impl RegistryTaskExecutionIngress {
                         _ => false,
                     })
                 });
-                fault::task_update_terminal_ack_dropped(
-                    request.request().identity(),
-                    receipt.outcome(),
-                    terminal_nonempty,
-                )?;
+                #[cfg(feature = "test-controls")]
+                if let Some(controls) = self.test_controls.get() {
+                    fault::task_update_terminal_ack_dropped(
+                        controls,
+                        request.request().identity(),
+                        receipt.outcome(),
+                        terminal_nonempty,
+                    )?;
+                }
                 encode_operation_receipt(&receipt, |ack| {
                     encode_update_task_ack(ack).map(ReceiptAck::UpdateTask)
                 })
@@ -240,8 +298,13 @@ impl RegistryTaskExecutionIngress {
                 // fault has to prevent the extension itself so the lease can
                 // run out. Dropping the answer afterwards is the other fault,
                 // and the frontend survives that one by resending.
+                #[cfg(feature = "test-controls")]
                 if matches!(&neutral, UpdateQueryContext::RenewLease(_))
-                    && fault::lease_renewal_stopped(context)?
+                    && if let Some(controls) = self.test_controls.get() {
+                        fault::lease_renewal_stopped(controls, context)?
+                    } else {
+                        false
+                    }
                 {
                     return Err(tonic::Status::deadline_exceeded(
                         "runner-owned lease renewal refused so the lease expires",
@@ -251,7 +314,10 @@ impl RegistryTaskExecutionIngress {
                     // Arm before the registry releases its creation gate. A
                     // create may already be waiting there, and must observe
                     // the runner-owned process-loss rendezvous when it wakes.
-                    fault::arm_restart_after_establish_context(context)?;
+                    #[cfg(feature = "test-controls")]
+                    if let Some(controls) = self.test_controls.get() {
+                        fault::arm_restart_after_establish_context(controls, context)?;
+                    }
                 }
                 let receipt = self
                     .registry
@@ -262,11 +328,28 @@ impl RegistryTaskExecutionIngress {
                         // establish open so the harness can replace this exact
                         // process, and an answer dropped afterwards would
                         // belong to a process that no longer exists.
-                        fault::restart_after_establish_context(context, receipt.outcome())?;
-                        fault::establish_context_ack_dropped(context, receipt.outcome())?;
+                        #[cfg(feature = "test-controls")]
+                        if let Some(controls) = self.test_controls.get() {
+                            fault::restart_after_establish_context(
+                                controls,
+                                context,
+                                receipt.outcome(),
+                            )?;
+                        }
+                        #[cfg(feature = "test-controls")]
+                        if let Some(controls) = self.test_controls.get() {
+                            fault::establish_context_ack_dropped(
+                                controls,
+                                context,
+                                receipt.outcome(),
+                            )?;
+                        }
                     }
                     UpdateQueryContext::RenewLease(_) => {
-                        fault::lease_renewal_ack_dropped(context, receipt.outcome())?;
+                        #[cfg(feature = "test-controls")]
+                        if let Some(controls) = self.test_controls.get() {
+                            fault::lease_renewal_ack_dropped(controls, context, receipt.outcome())?;
+                        }
                     }
                     UpdateQueryContext::AdvanceDomain(_) => {}
                 }
@@ -328,6 +411,7 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
         request: TaskResultReadRequest,
         ownership: Option<Arc<crate::native_ingress::NativeIngressOwnership>>,
     ) -> Result<TaskResultRead, TaskResultReadError> {
+        #[cfg(feature = "test-controls")]
         use crate::task_result_diagnostics::emit_task_fetch_marker;
         use novarocks_worker::result_buffer::{
             TryFetchTypedResult, replays_task_terminal_ack, wait_fetch_task_typed,
@@ -359,11 +443,29 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
             {
                 let packet_sequence =
                     acknowledged.expect("an exact terminal replay carries its sequence");
-                emit_task_fetch_marker(identity, FetchStatus::Eof, packet_sequence, true, 0);
+                #[cfg(feature = "test-controls")]
+                emit_task_fetch_marker(
+                    self.observation_controls.get().map(AsRef::as_ref),
+                    identity,
+                    FetchStatus::Eof,
+                    packet_sequence,
+                    true,
+                    0,
+                )
+                .map_err(TaskResultReadError::new)?;
                 return Ok(TaskResultRead::EndOfStream { packet_sequence });
             }
             RootResultRoute::AwaitTerminalControl => {
-                emit_task_fetch_marker(identity, FetchStatus::AwaitTerminalControl, 0, false, 0);
+                #[cfg(feature = "test-controls")]
+                emit_task_fetch_marker(
+                    self.observation_controls.get().map(AsRef::as_ref),
+                    identity,
+                    FetchStatus::AwaitTerminalControl,
+                    0,
+                    false,
+                    0,
+                )
+                .map_err(TaskResultReadError::new)?;
                 return Ok(TaskResultRead::AwaitTerminalControl);
             }
             route => {
@@ -379,7 +481,16 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
                     route = ?route,
                     "root result poll refused"
                 );
-                emit_task_fetch_marker(identity, FetchStatus::Error, 0, false, 0);
+                #[cfg(feature = "test-controls")]
+                emit_task_fetch_marker(
+                    self.observation_controls.get().map(AsRef::as_ref),
+                    identity,
+                    FetchStatus::Error,
+                    0,
+                    false,
+                    0,
+                )
+                .map_err(TaskResultReadError::new)?;
                 return Ok(TaskResultRead::Error { detail });
             }
         };
@@ -393,13 +504,16 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
             .await
             {
                 TryFetchTypedResult::Ready(result) => {
+                    #[cfg(feature = "test-controls")]
                     emit_task_fetch_marker(
+                        self.observation_controls.get().map(AsRef::as_ref),
                         identity,
                         FetchStatus::Ready,
                         result.packet_seq,
                         result.eos,
                         result.payload.len(),
-                    );
+                    )
+                    .map_err(TaskResultReadError::new)?;
                     TaskResultRead::Ready {
                         packet_sequence: result.packet_seq,
                         end_of_stream: result.eos,
@@ -420,7 +534,16 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
                     }
                     let packet_sequence =
                         acknowledged.expect("an acknowledged end carries its packet sequence");
-                    emit_task_fetch_marker(identity, FetchStatus::Eof, packet_sequence, true, 0);
+                    #[cfg(feature = "test-controls")]
+                    emit_task_fetch_marker(
+                        self.observation_controls.get().map(AsRef::as_ref),
+                        identity,
+                        FetchStatus::Eof,
+                        packet_sequence,
+                        true,
+                        0,
+                    )
+                    .map_err(TaskResultReadError::new)?;
                     TaskResultRead::EndOfStream { packet_sequence }
                 }
                 TryFetchTypedResult::NotReady => TaskResultRead::NotReady,
@@ -430,16 +553,28 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
                         .await?;
                     match &resolved {
                         TaskResultRead::AwaitTerminalControl => {
+                            #[cfg(feature = "test-controls")]
                             emit_task_fetch_marker(
+                                self.observation_controls.get().map(AsRef::as_ref),
                                 identity,
                                 FetchStatus::AwaitTerminalControl,
                                 0,
                                 false,
                                 0,
-                            );
+                            )
+                            .map_err(TaskResultReadError::new)?;
                         }
                         TaskResultRead::Error { .. } => {
-                            emit_task_fetch_marker(identity, FetchStatus::Error, 0, false, 0);
+                            #[cfg(feature = "test-controls")]
+                            emit_task_fetch_marker(
+                                self.observation_controls.get().map(AsRef::as_ref),
+                                identity,
+                                FetchStatus::Error,
+                                0,
+                                false,
+                                0,
+                            )
+                            .map_err(TaskResultReadError::new)?;
                         }
                         _ => {
                             return Err(TaskResultReadError::new(
@@ -505,6 +640,10 @@ impl TaskObservationReader for RegistryTaskExecutionIngress {
 }
 
 impl TaskStatusSubscriptionReader for RegistryTaskExecutionIngress {
+    #[cfg(feature = "test-controls")]
+    fn test_controls(&self) -> Option<Arc<crate::test_controls::NativeTestControls>> {
+        self.test_controls.get().cloned()
+    }
     fn task_status_source(
         &self,
         context: novarocks_execution_contract::task_execution::identity::QueryContextRef,
@@ -564,7 +703,7 @@ impl TaskOperationBatchApplier for RegistryTaskExecutionIngress {
 
 #[tonic::async_trait]
 impl TaskExecutionIngress for RegistryTaskExecutionIngress {
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     fn with_registry_lock_for_test(
         &self,
         callback: &mut dyn FnMut() -> Result<(), tonic::Status>,
@@ -877,7 +1016,10 @@ mod tests {
                 Arc::clone(&clock) as Arc<dyn WorkerMonotonicClock>,
                 Arc::new(AcceptingContextHost),
                 Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
-                crate::task_execution_observation::backend_task_execution_ports(),
+                crate::task_execution_observation::backend_task_execution_ports(
+                    #[cfg(feature = "test-controls")]
+                    None,
+                ),
             );
             let ingress = match admission {
                 None => RegistryTaskExecutionIngress::new(

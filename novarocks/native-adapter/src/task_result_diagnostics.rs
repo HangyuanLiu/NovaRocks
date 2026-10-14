@@ -7,35 +7,39 @@
 use novarocks_execution_contract::task_execution::identity::TaskIdentity;
 use novarocks_proto_models as proto;
 
-fn emit_typed_fetch_marker(
-    identity: TaskIdentity,
-    status: proto::novarocks::fetch_result_response::Status,
-    packet_seq: i64,
-    eos: bool,
-    payload_bytes: usize,
-) {
-    if crate::debug_environment::debug_emit_grpc_fragment_marker()
-        && should_emit_typed_fetch_marker(status, packet_seq, eos)
-    {
-        println!(
-            "{}",
-            typed_fetch_marker(identity, status, packet_seq, eos, payload_bytes)
-        );
-    }
-}
-
-/// Emits the role-local task-result diagnostic after the result owner has
-/// settled the read, while Native Adapter owns the wire response itself.
+/// Emits only after the exact result owner settled the read.
+#[cfg(feature = "test-controls")]
 pub fn emit_task_fetch_marker(
+    controls: Option<&crate::test_observation_controls::NativeObservationControls>,
     identity: TaskIdentity,
     status: proto::novarocks::fetch_result_response::Status,
     packet_seq: i64,
     eos: bool,
     payload_bytes: usize,
-) {
-    emit_typed_fetch_marker(identity, status, packet_seq, eos, payload_bytes);
+) -> Result<(), String> {
+    let Some(controls) = controls else {
+        return Ok(());
+    };
+    if !controls.owns_backend(identity.backend_process_id()) {
+        return Err("task fetch observation names another backend process".into());
+    }
+    if should_emit_typed_fetch_marker(status, packet_seq, eos) {
+        if let Some(observer) =
+            controls.observation_for("grpc-fragment", identity.query_execution_id())?
+        {
+            observer.observe(&typed_fetch_marker(
+                identity,
+                status,
+                packet_seq,
+                eos,
+                payload_bytes,
+            ));
+        }
+    }
+    Ok(())
 }
 
+#[cfg(any(test, feature = "test-controls"))]
 fn should_emit_typed_fetch_marker(
     status: proto::novarocks::fetch_result_response::Status,
     packet_seq: i64,
@@ -50,6 +54,7 @@ fn should_emit_typed_fetch_marker(
     }
 }
 
+#[cfg(any(test, feature = "test-controls"))]
 fn typed_fetch_marker(
     identity: TaskIdentity,
     status: proto::novarocks::fetch_result_response::Status,

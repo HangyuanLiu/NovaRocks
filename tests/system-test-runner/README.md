@@ -17,13 +17,15 @@ path is not a shared evidence handoff.
 List all registered scenarios (including explicit stages):
 
 ```bash
-cargo run -p novarocks-system-test-runner -- --list
+NOVAROCKS_BUILD_PROFILE=dev-opt cargo run -p novarocks-system-test-runner \
+  --locked --profile dev-opt --target-dir "${NOVA_CI_NORMAL_TARGET_DIR:-$PWD/target/normal}" -- --list
 ```
 
 List the default functional baseline:
 
 ```bash
-cargo run -p novarocks-system-test-runner -- --list-default
+NOVAROCKS_BUILD_PROFILE=dev-opt cargo run -p novarocks-system-test-runner \
+  --locked --profile dev-opt --target-dir "${NOVA_CI_NORMAL_TARGET_DIR:-$PWD/target/normal}" -- --list-default
 ```
 
 The default list uses the same registry classification as a run without
@@ -34,15 +36,32 @@ discoverable through `--list` and selectable by exact `--only`. 当前阶段不�
 Run one scenario against the native 1FE+3BE default:
 
 ```bash
-cargo build --workspace --profile dev-opt
-cargo run -p novarocks-system-test-runner --profile dev-opt -- \
-  --binary target/dev-opt/novarocks \
+normal_target="${NOVA_CI_NORMAL_TARGET_DIR:-$PWD/target/normal}"
+control_target="${NOVA_CI_CONTROL_TARGET_DIR:-$PWD/target/test-controls}"
+export NOVAROCKS_BUILD_PROFILE=dev-opt
+cargo build --workspace --locked --profile dev-opt --target-dir "$normal_target"
+cargo build -p novarocks-server --bin novarocks --no-default-features \
+  --features jemalloc,test-controls --locked --profile dev-opt --target-dir "$control_target"
+cargo run -p novarocks-system-test-runner --locked --profile dev-opt --target-dir "$normal_target" -- \
+  --binary "$normal_target/dev-opt/novarocks" \
+  --ordinary-binary "$normal_target/dev-opt/novarocks" \
+  --test-control-binary "$control_target/dev-opt/novarocks" \
   --config tools/ci/fixtures/system-scenarios-base.toml \
   --artifact-root "$(mktemp -d)" \
   --cluster-size 3 \
   --timeout-secs 300 \
-  --only query-lifecycle/mysql-disconnect
+  --only query-lifecycle/distributed-baseline
 ```
+
+## 产物与有限授权
+
+普通、控制及兼容性变体使用独立 target，默认 `target/normal`、`target/test-controls`、`target/variants`；CI 的三种 `NOVA_CI_*_TARGET_DIR` 可复用已有 owner 管理的互斥缓存根，运行 artifact root 仍每次独占。构建同时声明 `--profile` 与 `NOVAROCKS_BUILD_PROFILE`，`dev` 映射到 `debug` 目录；不能用目录、feature 或 runner profile 代替实际 FE/BE 自报。[构建 helper](../../tools/ci/lib/build_capabilities.sh) 统一现有 CI 选择，不维护第二份能力目录。
+
+`--binary` 是场景 Primary，`--ordinary-binary` 是普通对照/普通后继，`--test-control-binary` 是具有所需内部能力的产物。场景从本次所选有限动作冻结必要角色需求；缺能力在 spawn 前失败，旧环境、FaultScenario 名称与 feature 编入都不发授权。内部 statement 观察独立授权，观察不触发注入；正常 READY、MySQL、公开 metrics 不需要内部观察权。普通场景可只提供普通产物；上例的 distributed-baseline 同场景追加普通 peer 的三次 public SQL/资源收敛，随后完整执行受控三 statement 的 typed namespace/sequence/attempt 与 Native 断言，两个阶段各自记录实际产物。
+
+兼容性场景的 `Primary/Compatible/OtherIsland` 使用启动前解析的实际选中产物，包括 peer 和 replacement；不能用基础 controls 自动替换用户选中的兼容性变体。CI 明确给 `native-compatibility/*` 选择 controls Primary，仍传独立 ordinary 及 compatible/other-island 路径，普通 workspace binary 不被覆写后恢复。
+
+`--build-info` 不依赖 config/fixture；harness 保留真实自报双流、实际退出和各角色 launch/restart 映射。声明 profile、binary `actual_cfg`、package 局部事实与 null/unknown 分列；最终 LTO/codegen/dependency override/额外 flags 等仍未知，`not-certified-by-self-report` 不构成发布认证。本文的接口说明不宣称 G2 全部完成或验收通过。历史私有 exact/held/HMS 原输入缺失时完整矩阵记 `NOT_RUN`，局部机制、明确授权动作与实际退出证据另列，不能伪造历史 receipt。
 
 Most scenarios build their Iceberg warehouse on the local filesystem under
 the harness runtime directory. The vended credential scenarios and the default
@@ -57,14 +76,12 @@ when started through the exact `--role all-in-one --fe-config ... --be-config
 ...` command; it adds object-store settings that local-filesystem scenarios
 do not read.
 
-The consumer credential acceptance cases are
-`connector/vended-credential-refresh`,
-`connector/vended-credential-targeted-deadline`,
-`connector/vended-credential-late-close`, and
-`connector/vended-credential-unreachable`. Run each with an exact `--only`
-filter and `--cluster-size 3 --timeout-secs 180`. The fixture identifies the
-BE principal and holds its refresh only after that request arrives. The
-late-close case enables a debug-only, exact-authority trigger on BE[0].
+凭据消费者场景为 `connector/vended-credential-refresh`、
+`connector/vended-credential-targeted-deadline`、`connector/vended-credential-late-close`
+与 `connector/vended-credential-unreachable`。逐个用准确 `--only` 和
+`--cluster-size 3 --timeout-secs 180` 运行。fixture 识别真实 BE principal，
+仅在对应刷新请求到达后 hold；late-close 在 BE[0] 使用 test-controls 下
+显式授权的 exact-authority trigger。
 
 Scenarios run sequentially. On failure the runner prints action history,
 process diagnostics, the retained runtime/log directory and an exact rerun
@@ -133,10 +150,10 @@ async worker threads can be saturated safely.
 termination, the `running_deadline` counter, holder release, and a later
 control receipt. HTTP/2 may end that half-open stream with a reset, leaving no
 readable gRPC status; a fully received unary request has separate status checks.
-`registry-contention-control` uses a runner-owned, debug-only rendezvous while
-the Worker registry mutex is held. It distinguishes an already-started control
-executor job waiting for that mutex from a control job still queued at ingress,
-then checks the receipt and lock-wait observation after release.
+`registry-contention-control` 在真实 Worker registry mutex 被持有时，使用
+runner-owned、test-controls 下显式授权的 rendezvous。它区分已开始且等待
+mutex 的 control executor job 与仍排在 ingress 的 job，再验证释放后的
+receipt 和 lock-wait 观察。
 Each selected case records its individual probes in `scenario-evidence.json`;
 the scenario must execute at least one probe to count as passed. These are
 correctness and coarse regression checks, not throughput benchmarks.
@@ -199,4 +216,8 @@ pass and transport supervisor composition tests, not by these scenarios.
 
 range/planning输入准备与校验见保留的 [range fixture](../benchmarks/uea4a2/README.md) 和 [planning fixture](../benchmarks/uea4a4/README.md)。原目录名不赋予测量责任。正常held转发仍要求真正forward完成；取消路径按同request精确connection的上游终态观察，不能把其他连接关闭或ERR当退出。
 
-结果owner相关writer/buffer/ACK/取消/helper改动必跑对应场景；range/delete/planning/DOP由Connector/scan领域按provider/cache/range/admission/fixture改动必跑。高成本显式组每周由维护者手工相关领域轮次，记录缺输入与raw FAIL，不扩默认registry选择。周期调度与共享存储尚未交付；G7a/G7b已取消，不作为未来服务承诺。FE statement observation/auth保留，运行级计时collector退出；G2发布能力/profile自报及门控仍未知。
+结果owner相关writer/buffer/ACK/取消/helper改动必跑对应场景；range/delete/planning/DOP由Connector/scan领域按provider/cache/range/admission/fixture改动必跑。高成本显式组每周由维护者手工相关领域轮次，记录缺输入与raw FAIL，不扩默认registry选择。周期调度与共享存储尚未交付；G7a/G7b已取消，不作为未来服务承诺。FE statement observation/auth保留，运行级计时collector退出；实际能力/profile见每次产物自报，未运行范围不能据接口存在宣称通过。
+
+普通 Rust 默认测试保持普通构建；full CI 的显式七 control-owner stage 不选择 Server，与 normal workspace tests 分开 target/feature。HMS/MySQL 旧 feature 专属测试另选 owner，不以七包通过代替。维护命令见 [测试治理](../../docs/guides/development/test-governance.md#构建选择与控制授权)。
+
+MV 旧场景及独立 oracle 保留，禁止扩展旧屏障/CALL/directive。7B3 唯一承接非聚合冷恢复、配置/paused、known-committed、Unknown/迟到提交和管理接续；7B4 承接 spine SUM/COUNT、聚合状态、聚合冷恢复与后续刷新；7B5 承接 V/S 身份、发现/CREATE/DROP、REST 路由和实际 materialized S/fallback；7B11 同格式切换承接 `mv_recovery.rs` / `mv_uea7_storage.rs` 的 document graph 与 shared-document-revisions。替代保护实际通过后逐项退出，最后消费者退出再删共享载体；G2 不新建启动期缓存缺失或通用擦除接口。

@@ -320,9 +320,9 @@ fn original_float_arithmetic_child_error_order_and_nominal_arrow_refusal() {
         vec![f64_values()],
     )
     .unwrap();
-    let schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-        batch.schema().as_ref(), &[SlotId::new(1)],
-    ).unwrap();
+    let schema =
+        ChunkSchema::try_ref_from_schema_and_slot_ids(batch.schema().as_ref(), &[SlotId::new(1)])
+            .unwrap();
     let chunk = Chunk::new_with_chunk_schema(batch, schema);
     let mut arena = ExprArena::default();
     let missing_left = ExprId(usize::MAX);

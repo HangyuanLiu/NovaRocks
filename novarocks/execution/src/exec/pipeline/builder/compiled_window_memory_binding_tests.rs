@@ -17,14 +17,14 @@
 
 use super::*;
 
-use crate::runtime::query_memory::QueryMemoryBinding;
 use crate::runtime::execution_runtime::test_execution_runtime;
 use crate::runtime::fragment::runtime_state::{RuntimeStateInputs, build_runtime_state};
+use crate::runtime::query_memory::QueryMemoryBinding;
 use novarocks_execution_contract::TaskIdentity;
 use novarocks_memory::{AccountKind, ExternalRef};
 use novarocks_types::{
     QueryId,
-    identity::{QueryExecutionId, AttemptId, StageId, TaskId, BackendProcessId},
+    identity::{AttemptId, BackendProcessId, QueryExecutionId, StageId, TaskId},
 };
 
 #[test]
@@ -58,6 +58,8 @@ fn by_runtime_memory_ready_actual_compiled_window_operator_borrows_prepared_task
         execution_runtime: Some(runtime),
         query_memory: Some(binding.clone()),
         task_identity: Some(task),
+        #[cfg(feature = "test-controls")]
+        exchange_test_observer: None,
     })
     .unwrap();
     let catalog = installed_catalog();

@@ -45,7 +45,7 @@ use crate::runtime_filter_rpc::{
     BackendNativeContributionRouteIdentity, BackendNativeRuntimeFilterEnvelope,
     BackendRuntimeFilterEnvelopeIngress,
 };
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 use novarocks_execution::runtime_filter::RuntimeFilterChannelId;
 use novarocks_worker::runtime_filter::domain::{BackendIngressResult, BackendParticipantIdentity};
 
@@ -77,15 +77,34 @@ pub trait BackendRuntimeFilterParticipantAuthority: Send + Sync + 'static {
 /// The wire ingress every runtime-filter envelope arrives through.
 pub struct CompositeRuntimeFilterEnvelopeIngress {
     authorities: Vec<Arc<dyn BackendRuntimeFilterParticipantAuthority>>,
+    #[cfg(feature = "test-controls")]
+    controls: std::sync::OnceLock<Arc<crate::test_controls::NativeTestControls>>,
 }
 
 impl CompositeRuntimeFilterEnvelopeIngress {
+    #[cfg(feature = "test-controls")]
+    pub fn install_test_controls(
+        &self,
+        controls: Arc<crate::test_controls::NativeTestControls>,
+    ) -> Result<(), String> {
+        self.controls
+            .set(controls)
+            .map_err(|_| "Runtime Filter ingress controls were already installed".into())
+    }
     pub fn new(authorities: Vec<Arc<dyn BackendRuntimeFilterParticipantAuthority>>) -> Arc<Self> {
-        Arc::new(Self { authorities })
+        Arc::new(Self {
+            authorities,
+            #[cfg(feature = "test-controls")]
+            controls: std::sync::OnceLock::new(),
+        })
     }
 }
 
 impl BackendRuntimeFilterEnvelopeIngress for CompositeRuntimeFilterEnvelopeIngress {
+    #[cfg(feature = "test-controls")]
+    fn test_controls(&self) -> Option<Arc<crate::test_controls::NativeTestControls>> {
+        self.controls.get().cloned()
+    }
     fn accept(&self, envelope: BackendNativeRuntimeFilterEnvelope) -> BackendIngressResult {
         let identity = envelope.participant();
         let mut claimants: Vec<(&'static str, Arc<RuntimeFilterParticipant>)> = Vec::new();
@@ -141,12 +160,13 @@ impl BackendRuntimeFilterEnvelopeIngress for CompositeRuntimeFilterEnvelopeIngre
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     fn arm_accepted_contribution_retry_rendezvous(
         &self,
         identity: BackendParticipantIdentity,
         channel_id: RuntimeFilterChannelId,
         route: BackendNativeContributionRouteIdentity,
+        claim: crate::test_controls::NativeFaultClaim,
     ) -> Result<(), String> {
         let mut claimants: Vec<(&'static str, Arc<RuntimeFilterParticipant>)> = Vec::new();
         for authority in &self.authorities {
@@ -158,7 +178,7 @@ impl BackendRuntimeFilterEnvelopeIngress for CompositeRuntimeFilterEnvelopeIngre
             0 => Err(NO_OWNER_REJECTION.to_string()),
             1 => {
                 let (_, participant) = claimants.pop().expect("one claimant");
-                participant.arm_accepted_contribution_retry_rendezvous(channel_id, route);
+                participant.arm_accepted_contribution_retry_rendezvous(channel_id, route, claim);
                 Ok(())
             }
             _ => Err(CONFLICTING_OWNERS_REJECTION.to_string()),
@@ -186,7 +206,7 @@ fn rejected(reason: &'static str) -> BackendIngressResult {
 /// fallback.
 pub fn native_runtime_filter_envelope_ingress(
     authority: Arc<dyn BackendRuntimeFilterParticipantAuthority>,
-) -> Arc<dyn BackendRuntimeFilterEnvelopeIngress> {
+) -> Arc<CompositeRuntimeFilterEnvelopeIngress> {
     CompositeRuntimeFilterEnvelopeIngress::new(vec![authority])
 }
 

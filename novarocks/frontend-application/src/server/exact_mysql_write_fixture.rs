@@ -20,44 +20,24 @@
 use super::*;
 use novarocks_mysql_adapter::exact_mysql_write_fixture::MysqlWriteFixture;
 use novarocks_native_trust::NativeProcessIdentity;
-use std::path::PathBuf;
 
-const PATH_ENV: &str = "NOVAROCKS_MEM_1_M07_MYSQL_WRITE_SOCKET";
-const NONCE_ENV: &str = "NOVAROCKS_MEM_1_M07_MYSQL_WRITE_NONCE_HEX";
-const CONTROL_DEADLINE: Duration = Duration::from_secs(20);
-
-pub(super) fn bind_from_environment(
+pub(super) fn bind_authorized(
     trust: &NativeTrust,
-) -> Result<Option<MysqlWriteFixture>, FrontendApplicationError> {
-    let path = std::env::var_os(PATH_ENV);
-    let nonce = std::env::var_os(NONCE_ENV);
-    let (path, nonce) = match (path, nonce) {
-        (None, None) => return Ok(None),
-        (Some(path), Some(nonce)) => (PathBuf::from(path), nonce),
-        _ => {
-            return Err(FrontendApplicationError::server(
-                "exact MySQL fixture requires both startup environment fields",
-            ));
-        }
-    };
-    let nonce = nonce.to_str().ok_or_else(|| {
-        FrontendApplicationError::server("exact MySQL fixture nonce is not canonical ASCII hex")
-    })?;
-    let nonce = decode_nonce(nonce).map_err(FrontendApplicationError::server)?;
+    authorization: novarocks_mysql_adapter::test_fixture_authorization::MysqlFixtureAuthorization,
+) -> Result<MysqlWriteFixture, FrontendApplicationError> {
     let Some(NativeProcessIdentity::Frontend(frontend)) = trust.local_process_identity() else {
         return Err(FrontendApplicationError::server(
-            "exact MySQL fixture requires the original bound FE process identity",
+            "MySQL fixture requires the original bound FE process identity",
         ));
     };
-    let mut fixture =
-        MysqlWriteFixture::bind(path, frontend, nonce, Instant::now() + CONTROL_DEADLINE)
-            .map_err(FrontendApplicationError::server_fixture)?;
+    let mut fixture = MysqlWriteFixture::bind_authorized(authorization, frontend)
+        .map_err(FrontendApplicationError::server_fixture)?;
     if let Err(cause) = write_frontend_identity_marker(&mut std::io::stdout().lock(), frontend) {
         return Err(FrontendApplicationError::server_fixture(
             fixture.fail_startup_projection(cause),
         ));
     }
-    Ok(Some(fixture))
+    Ok(fixture)
 }
 // Only this feature's successful original fixture bind emits this fixed projection.
 // No marker is emitted by the default server or feature builds with no explicit inputs.
@@ -76,31 +56,6 @@ fn write_frontend_identity_marker(
         target.position() as usize
     };
     output.write_all(&bytes[..length])
-}
-fn decode_nonce(text: &str) -> Result<[u8; 16], &'static str> {
-    let bytes = text.as_bytes();
-    if bytes.len() != 32
-        || !bytes
-            .iter()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
-    {
-        return Err("exact MySQL fixture nonce is not canonical 32-byte lowercase hex");
-    }
-    let digit = |byte: u8| {
-        if byte.is_ascii_digit() {
-            byte - b'0'
-        } else {
-            byte - b'a' + 10
-        }
-    };
-    let mut nonce = [0; 16];
-    for (value, pair) in nonce.iter_mut().zip(bytes.chunks_exact(2)) {
-        *value = digit(pair[0]) * 16 + digit(pair[1]);
-    }
-    if nonce == [0; 16] {
-        return Err("exact MySQL fixture nonce must be nonzero");
-    }
-    Ok(nonce)
 }
 
 enum Exit {
@@ -153,6 +108,7 @@ where
     );
     tokio::pin!(mysql_server);
     tokio::pin!(shutdown);
+    let cancellation = fixture.control_cancellation().expect("authorized fixture");
     let mut control_completed = false;
     let exit = loop {
         // Only this borrow is cancelled at a sibling exit. The controller and original
@@ -163,6 +119,7 @@ where
             tokio::select! {
                 result = &mut mysql_server => Some(Exit::Mysql(result)),
                 _ = &mut shutdown => Some(Exit::Shutdown),
+                _ = cancellation.cancelled() => Some(Exit::Shutdown),
                 error = wait_for_frontend_listener_failure(report_server, management_server)
                     => Some(Exit::Listener(error)),
                 _ = original_failures.wait_for_failure() => Some(Exit::OriginalTask),
@@ -250,63 +207,6 @@ where
         combine_server_and_shutdown(combine_server_and_shutdown(result, close), drained),
         owners,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::decode_nonce;
-    #[test]
-    fn startup_nonce_rejects_noncanonical_and_zero_without_echoing_input() {
-        assert_eq!(
-            decode_nonce("0102030405060708090a0b0c0d0e0f10").unwrap(),
-            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-        );
-        for text in [
-            "",
-            "00000000000000000000000000000000",
-            "0102030405060708090A0B0C0D0E0F10",
-            "0102030405060708090a0b0c0d0e0f1x",
-        ] {
-            assert!(decode_nonce(text).is_err());
-        }
-    }
-    #[test]
-    fn original_control_io_source_survives_role_cleanup_aggregation() {
-        use super::*;
-        use std::error::Error;
-        // No directory is created; this negative probes an actual local filesystem error.
-        let path = PathBuf::from(format!(
-            "/tmp/nr-m07-missing-{}-{}/gate.sock",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let control = match MysqlWriteFixture::bind(
-            path,
-            novarocks_types::FrontendProcessId::new_v7(),
-            [1; 16],
-            Instant::now() + Duration::from_secs(3),
-        ) {
-            Ok(_) => panic!("nonexistent private directory must fail"),
-            Err(error) => error,
-        };
-        let role = FrontendApplicationError::server("original role failure")
-            .with_role_cleanup(FrontendApplicationError::server_fixture(control));
-        let mut source = role.source().expect("actual fixture source retained");
-        loop {
-            if let Some(io) = source.downcast_ref::<std::io::Error>() {
-                assert_eq!(io.kind(), std::io::ErrorKind::NotFound);
-                break;
-            }
-            source = source.source().expect("original local IO cause retained");
-        }
-        assert!(
-            role.to_string()
-                .starts_with("Server: original role failure; cleanup failed:")
-        );
-    }
 }
 
 #[cfg(test)]

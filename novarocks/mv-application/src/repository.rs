@@ -359,16 +359,9 @@ pub trait MvRepository: Send + Sync {
         request: DeleteMvProjectionRequest,
     ) -> Result<bool, MvRepositoryError>;
 
-    /// Test/harness-only destructive wipe of one rebuildable projection.
-    /// It deliberately has no source-equivalence semantics.
-    async fn wipe_projection_by_target(
-        &self,
-        operation_id: Uuid,
-        target: &MvTarget,
-    ) -> Result<bool, MvRepositoryError>;
-
     /// Test/harness-only wipe of the complete current Accelerator family,
     /// including the internal sequence. Old physical families remain untouched.
+    #[cfg(any(test, feature = "test-controls"))]
     async fn wipe_accelerator(&self, operation_id: Uuid) -> Result<(), MvRepositoryError>;
 
     async fn list_dependencies_by_downstream(

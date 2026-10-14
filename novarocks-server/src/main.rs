@@ -123,6 +123,8 @@ fn run_frontend(
         provider_manifest,
         memory_authority,
         runtime.handle().clone(),
+        #[cfg(feature = "test-controls")]
+        role.test_session.clone(),
     )?;
     runtime
         .block_on(novarocks_server::roles::frontend::run_until_shutdown(
@@ -154,6 +156,8 @@ fn run_backend(
         memory_authority,
         runtime.handle().clone(),
         &scan_io.services(),
+        #[cfg(feature = "test-controls")]
+        role.test_session.clone(),
     ) {
         Ok(backend) => backend,
         Err(error) => {
@@ -217,6 +221,8 @@ async fn run_all_in_one(
         // Both roles consume the same authority: one OS process, one bound.
         Arc::clone(&memory_authority),
         runtime.clone(),
+        #[cfg(feature = "test-controls")]
+        fe.test_session.clone(),
     )?;
     let scan_io = ScanIoRuntime::start(&be.config.runtime)?;
     let backend = match composition::compose_backend_server_config(
@@ -229,6 +235,8 @@ async fn run_all_in_one(
         memory_authority,
         runtime.clone(),
         &scan_io.services(),
+        #[cfg(feature = "test-controls")]
+        be.test_session.clone(),
     ) {
         Ok(backend) => backend,
         Err(error) => {
@@ -345,15 +353,6 @@ fn run(args: launch::StandaloneLaunchArgs) -> anyhow::Result<()> {
         launch::ResolvedServerLaunch::AllInOne { fe, .. } => &fe.config,
     };
     let provider_manifest = ServerProviderManifest::seal()?;
-    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    let provider_manifest = match std::env::var("NOVAROCKS_HMS_LISTING_OBSERVATION_CATALOG") {
-        Ok(name) => provider_manifest.with_hms_listing_probe(Arc::new(
-            novarocks_connector_iceberg::hms_listing_probe::HmsListingProbe::new(&name)
-                .map_err(anyhow::Error::msg)?,
-        )),
-        Err(std::env::VarError::NotPresent) => provider_manifest,
-        Err(_) => anyhow::bail!("HMS observation catalog selection is not Unicode"),
-    };
     let provider_manifest = Arc::new(provider_manifest);
     let runtime = init_process(process_config)?;
     // After `init_process`, because composing the authority is the first thing
@@ -558,7 +557,13 @@ mod tests {
 fn main() {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args.as_slice() == ["--build-info"] {
-        println!("{}", novarocks_server::build_information::value(cfg!(debug_assertions), cfg!(panic = "unwind")));
+        println!(
+            "{}",
+            novarocks_server::build_information::value(
+                cfg!(debug_assertions),
+                cfg!(panic = "unwind")
+            )
+        );
         return;
     }
     #[cfg(feature = "mem-1-m07-hms-listing-observe")]

@@ -72,6 +72,19 @@ pub(crate) enum RoundCredentialLeaseSource {
 }
 
 impl RoundCredentialLeaseSource {
+    #[cfg(feature = "test-controls")]
+    pub(crate) fn test_statement_nomination(
+        &self,
+    ) -> Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>> {
+        match self {
+            Self::Reservation {
+                reservation: Some(reservation),
+                ..
+            } => reservation.test_statement_nomination(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn fresh(execution: QueryExecutionId) -> Self {
         Self::Fresh {
             collector: AttemptCredentialLeaseCollector::new(execution),
@@ -82,20 +95,27 @@ impl RoundCredentialLeaseSource {
     pub(crate) fn connector_request_context(
         &self,
         context: ConnectorRequestContext,
-    ) -> ConnectorRequestContext {
+    ) -> Result<ConnectorRequestContext, String> {
         match self {
-            Self::Frozen(_) => context,
+            Self::Frozen(_) => Ok(context),
             Self::Fresh {
                 collector,
                 request_scope,
-            } => context
-                .with_request_scope(request_scope.clone())
-                .with_storage_resolver(collector.storage_resolver())
-                .with_vended_credential_lease_sink(collector.sink()),
+            } => {
+                let context = context
+                    .with_request_scope(request_scope.clone())
+                    .with_storage_resolver(collector.storage_resolver())
+                    .with_vended_credential_lease_sink(collector.sink());
+                Ok(context)
+            }
             Self::Reservation { reservation, .. } => reservation
                 .as_ref()
                 .expect("attempt reservation exists before credential sealing")
-                .connector_request_context(context),
+                .connector_request_context(
+                    context,
+                    #[cfg(feature = "test-controls")]
+                    None,
+                ),
         }
     }
 

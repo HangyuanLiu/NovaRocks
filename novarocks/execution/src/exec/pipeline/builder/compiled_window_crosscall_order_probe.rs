@@ -18,17 +18,17 @@
 //! Actual compiled window first-Data witness, through the original physical
 //! fixture emitter, real binding, LocalCompiler, runtime allocator and driver.
 //! This permanent original-equivalence expectation must not be changed to #1.
-use super::*;
 use super::super::window_fixture::{package_typed, window_catalog};
-use novarocks_functions::{FunctionKind, KernelFailure};
-use novarocks_type_contract::FunctionValueType;
-use novarocks_physical_plan::LiteralValue;
-use arrow::datatypes::DataType;
-use crate::runtime::mem_tracker::MemTracker;
+use super::*;
 use crate::runtime::fragment::ExecutionFailureCause;
+use crate::runtime::mem_tracker::MemTracker;
+use arrow::datatypes::DataType;
+use novarocks_functions::{FunctionKind, KernelFailure};
+use novarocks_physical_plan::LiteralValue;
+use novarocks_type_contract::FunctionValueType;
 #[test]
 fn by_window_compiled_function_major_error_order_across_partitions() {
-    use WindowBound::{UnboundedPreceding, CurrentRow};
+    use WindowBound::{CurrentRow, UnboundedPreceding};
     let shape = Shape {
         partition: vec![3],
         order: vec![key(4, true, true)],
@@ -69,13 +69,14 @@ fn by_window_compiled_function_major_error_order_across_partitions() {
         })
         .collect::<Vec<_>>();
     let actual = novarocks_functions::builtin::catalogue::by_window_private_test_catalog();
-    let catalogue = crate::exec::pipeline::builder::compiled::window_fixture::window_catalog_from_actual(
-        &[
-            ("max_by", FunctionKind::Aggregate),
-            ("min_by", FunctionKind::Aggregate),
-        ],
-        &actual,
-    );
+    let catalogue =
+        crate::exec::pipeline::builder::compiled::window_fixture::window_catalog_from_actual(
+            &[
+                ("max_by", FunctionKind::Aggregate),
+                ("min_by", FunctionKind::Aggregate),
+            ],
+            &actual,
+        );
     let program = compile(
         package_typed(&literal_rows, &types, &shape, &catalogue, 1),
         &catalogue,

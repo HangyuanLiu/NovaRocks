@@ -367,6 +367,13 @@ impl DriverTask {
         self.driver.fragment_instance_id()
     }
 
+    #[cfg(feature = "test-controls")]
+    pub(crate) fn exchange_test_observer(
+        &self,
+    ) -> Option<Arc<dyn crate::runtime::exchange::TestEventObserver>> {
+        self.fragment_ctx.runtime_state().exchange_test_observer()
+    }
+
     pub(crate) fn fragment_ctx(&self) -> &Arc<FragmentContext> {
         &self.fragment_ctx
     }

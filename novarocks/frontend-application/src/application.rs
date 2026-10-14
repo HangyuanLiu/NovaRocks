@@ -467,11 +467,6 @@ impl FrontendExecutionRuntimeOwner {
             frontend_process_id = %frontend_process_id,
             "frontend logical execution runtime initialized"
         );
-        if cfg!(debug_assertions)
-            && std::env::var_os(novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV).is_some()
-        {
-            eprintln!("NOVAROCKS_QUERY_PROCESS_NAMESPACE query_process_namespace={namespace}");
-        }
         let lifecycle_diagnostics = Arc::new(FrontendLifecycleDiagnostics::default());
         let (supervisor, logical_execution_client) = LogicalExecutionSupervisor::new(
             runtime.clone(),
@@ -809,6 +804,8 @@ impl FrontendCatalogRoleRuntime {
 }
 
 pub struct FrontendApplicationHost {
+    #[cfg(feature = "test-controls")]
+    pub(crate) test_session: Option<crate::test_session::FrontendTestSession>,
     catalog_role_runtime: Option<FrontendCatalogRoleRuntime>,
     catalog_runtime_projection: Arc<crate::catalog_application::CatalogRuntimeProjection>,
     serving_lifecycle: Arc<FrontendServingLifecycle>,
@@ -896,6 +893,8 @@ impl FrontendLogicalExecutionRuntimeConfig {
 
 #[derive(Clone)]
 pub struct FrontendExecutionConfig {
+    #[cfg(feature = "test-controls")]
+    test_session: Option<crate::test_session::FrontendTestSessionConfig>,
     runtime_filter_worker_count: NonZeroUsize,
     native_compatibility_id: NativeCompatibilityId,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
@@ -952,6 +951,15 @@ pub struct FrontendExecutionConfig {
 }
 
 impl FrontendExecutionConfig {
+    #[cfg(feature = "test-controls")]
+    pub fn with_test_session(
+        mut self,
+        config: crate::test_session::FrontendTestSessionConfig,
+    ) -> Self {
+        self.test_session = Some(config);
+        self
+    }
+
     pub fn new(
         runtime_filter_worker_count: NonZeroUsize,
         native_compatibility_id: NativeCompatibilityId,
@@ -960,6 +968,8 @@ impl FrontendExecutionConfig {
         constant_policy: novarocks_functions::ConstantPolicy,
     ) -> Self {
         Self {
+            #[cfg(feature = "test-controls")]
+            test_session: None,
             runtime_filter_worker_count,
             native_compatibility_id,
             function_catalog,
@@ -1181,6 +1191,15 @@ impl FrontendExecutionConfig {
 }
 
 impl FrontendApplicationHost {
+    #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+    pub fn hms_listing_test_observation(
+        &self,
+    ) -> Option<crate::server::HmsListingObservationSetup> {
+        self.test_session
+            .as_ref()
+            .and_then(|session| session.hms_listing_observation())
+    }
+
     pub async fn open(
         state_store: Option<StateStoreHostInput>,
         execution: FrontendExecutionConfig,
@@ -1283,6 +1302,15 @@ impl FrontendApplicationHost {
             .map_err(|error| {
                 FrontendApplicationError::new(FrontendApplicationErrorKind::CoordinatorOpen, error)
             })?;
+        #[cfg(feature = "test-controls")]
+        let test_session = execution
+            .test_session
+            .as_ref()
+            .map(|config| config.bind(frontend_process_id))
+            .transpose()
+            .map_err(|error| {
+                FrontendApplicationError::new(FrontendApplicationErrorKind::CoordinatorOpen, error)
+            })?;
         let query_runtime = data_runtime.clone();
         execution.workload.validate().map_err(|error| {
             FrontendApplicationError::new(
@@ -1309,9 +1337,36 @@ impl FrontendApplicationHost {
             execution.query_cpu_executor_config,
             execution.query_blocking_executor_config,
         )?;
+        #[cfg(feature = "test-controls")]
+        if let Some(owner) = test_session
+            .as_ref()
+            .and_then(|session| session.statement.as_ref())
+        {
+            execution_runtime_owner
+                .lifecycle_diagnostics
+                .activate(owner)
+                .map_err(|error| {
+                    FrontendApplicationError::new(
+                        FrontendApplicationErrorKind::CoordinatorOpen,
+                        error,
+                    )
+                })?;
+            // Retain the existing startup attribution evidence only for the
+            // explicitly installed, live statement observation owner.
+            if owner.is_active() {
+                let bytes = frontend_process_id.to_bytes();
+                let namespace = QueryProcessNamespace::new(
+                    u64::from_be_bytes(bytes[..8].try_into().expect("UUID high half"))
+                        ^ u64::from_be_bytes(bytes[8..].try_into().expect("UUID low half")),
+                );
+                eprintln!("NOVAROCKS_QUERY_PROCESS_NAMESPACE query_process_namespace={namespace}");
+            }
+        }
         let catalog_runtime_projection =
             crate::catalog_application::CatalogRuntimeProjection::new();
         let mut host = Self {
+            #[cfg(feature = "test-controls")]
+            test_session,
             catalog_role_runtime: None,
             catalog_runtime_projection,
             serving_lifecycle: Arc::new(FrontendServingLifecycle::new()),
@@ -1342,6 +1397,36 @@ impl FrontendApplicationHost {
             constant_policy: execution.constant_policy,
             static_plan_carrier: execution.static_plan_carrier,
         };
+
+        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+        if let Some(owner) = host
+            .test_session
+            .as_ref()
+            .and_then(|session| session.hms_admission_owner.as_ref())
+        {
+            if let Err(error) = owner.install(&host.catalog_runtime_projection) {
+                return Err(host
+                    .cleanup_open_error(FrontendApplicationError::new(
+                        FrontendApplicationErrorKind::CoordinatorOpen,
+                        error,
+                    ))
+                    .await);
+            }
+        }
+        #[cfg(feature = "test-controls")]
+        if let Some(session) = &mut host.test_session {
+            if let Err(error) = session.start_cleanup(
+                host.execution_runtime_owner.lifecycle_diagnostics(),
+                host.catalog_runtime_projection.clone(),
+            ) {
+                return Err(host
+                    .cleanup_open_error(FrontendApplicationError::new(
+                        FrontendApplicationErrorKind::CoordinatorOpen,
+                        error,
+                    ))
+                    .await);
+            }
+        }
 
         // Unique original Apply owner is now in Host. No Native caller has
         // received a projection yet; early try_new failure had no reaper.
@@ -1815,21 +1900,29 @@ impl FrontendApplicationHost {
         &self,
     ) -> Result<QueryExecutionService, FrontendApplicationError> {
         let config = self.query_runtime;
-        let coordinator = Arc::new(
-            FrontendDistributedQueryCoordinator::new(
-                config.runtime_filter_worker_count,
-                config.native_compatibility_id,
-                config.task_update_retry_policy,
-                config.split_initial_wait_cap,
-                config.coordination_budgets,
-                config.transport_budget.into_codec(),
-                self.backend_topology_port(),
-                self.data_runtime.clone(),
-                self.execution_runtime_owner.lifecycle_diagnostics(),
-                self.execution_runtime_owner.internal_result_cpu(),
-            )
-            .map_err(FrontendApplicationError::server)?,
-        );
+        let coordinator = FrontendDistributedQueryCoordinator::new(
+            config.runtime_filter_worker_count,
+            config.native_compatibility_id,
+            config.task_update_retry_policy,
+            config.split_initial_wait_cap,
+            config.coordination_budgets,
+            config.transport_budget.into_codec(),
+            self.backend_topology_port(),
+            self.data_runtime.clone(),
+            self.execution_runtime_owner.lifecycle_diagnostics(),
+            self.execution_runtime_owner.internal_result_cpu(),
+        )
+        .map_err(FrontendApplicationError::server)?;
+        #[cfg(feature = "test-controls")]
+        let coordinator = match &self.test_session {
+            Some(session) => coordinator.with_test_controls(
+                session.native.clone(),
+                session.observation.clone(),
+                session.statement.clone(),
+            ),
+            None => coordinator,
+        };
+        let coordinator = Arc::new(coordinator);
         Ok(QueryExecutionService::new(coordinator))
     }
 
@@ -1879,6 +1972,12 @@ impl FrontendApplicationHost {
             config.abort_capacity,
             self.execution_runtime_owner.lifecycle_diagnostics(),
         );
+        #[cfg(feature = "test-controls")]
+        let native_runtime = match &self.test_session {
+            Some(session) => native_runtime
+                .with_test_controls(session.native.clone(), session.observation.clone()),
+            None => native_runtime,
+        };
         Arc::new(FrontendNativeLogicalReadLauncher::new(
             self.logical_execution_client(),
             native_runtime,
@@ -1989,11 +2088,23 @@ impl FrontendApplicationHost {
         &mut self,
         deadline: Instant,
     ) -> Result<(), FrontendApplicationError> {
-        self.release_resources_until(deadline)
-            .await
-            .map_err(|error| {
-                FrontendApplicationError::new(FrontendApplicationErrorKind::Shutdown, error)
-            })
+        #[cfg(feature = "test-controls")]
+        let controls = match &mut self.test_session {
+            Some(session) => session.close_and_join(),
+            None => Ok(()),
+        };
+        let resources = self.release_resources_until(deadline).await;
+        #[cfg(feature = "test-controls")]
+        let resources = match (controls, resources) {
+            (Ok(()), result) => result,
+            (Err(error), Ok(())) => Err(error),
+            (Err(control), Err(resource)) => {
+                Err(format!("{resource}; test-session cleanup: {control}"))
+            }
+        };
+        resources.map_err(|error| {
+            FrontendApplicationError::new(FrontendApplicationErrorKind::Shutdown, error)
+        })
     }
 
     /// Releases process-local join ownership after bounded graceful shutdown
@@ -2039,7 +2150,7 @@ impl FrontendApplicationHost {
         primary: FrontendApplicationError,
     ) -> FrontendApplicationError {
         match self
-            .release_resources_until(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)
+            .shutdown_until(Instant::now() + STATE_STORE_SHUTDOWN_TIMEOUT)
             .await
         {
             Ok(()) => primary,

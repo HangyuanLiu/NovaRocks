@@ -18,11 +18,11 @@
 //! Scope ownership is supplied by the caller. Observing a source or a Layout
 //! grants no capacity; the legacy adapter supplies only its original lifetime.
 use super::{ArrayRef, Chunk, ChunkSchemaRef, Ordering, UInt32Builder, compare_at, take};
-use std::{collections::VecDeque, convert::Infallible, sync::Arc};
 use arrow::array::{Array, RecordBatch, RecordBatchOptions, UInt32Array};
+use arrow::compute::concat;
 use arrow::datatypes::SchemaRef;
 use arrow::error::ArrowError;
-use arrow::compute::concat;
+use std::{collections::VecDeque, convert::Infallible, sync::Arc};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AnalyticInputStage {

@@ -280,25 +280,7 @@ impl MvRepository for InMemoryMvRepository {
         Ok(true)
     }
 
-    async fn wipe_projection_by_target(
-        &self,
-        operation_id: Uuid,
-        target: &MvTarget,
-    ) -> Result<bool, MvRepositoryError> {
-        let Some(loaded) = self.find_by_target(target).await? else {
-            return Ok(false);
-        };
-        self.delete_projection(
-            operation_id,
-            DeleteMvProjectionRequest {
-                mv_id: loaded.projection.mv_id,
-                expected_version: loaded.version,
-                expected_source_revision: loaded.projection.facts.source_revision().clone(),
-            },
-        )
-        .await
-    }
-
+    #[cfg(any(test, feature = "test-controls"))]
     async fn wipe_accelerator(&self, _operation_id: Uuid) -> Result<(), MvRepositoryError> {
         let mut state = self.state()?;
         *state = State::default();

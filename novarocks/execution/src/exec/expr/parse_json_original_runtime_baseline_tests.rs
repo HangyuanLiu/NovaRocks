@@ -17,7 +17,9 @@
 //! Unchanged original runtime dispatcher values, errors and source ordering.
 use super::{ExprArena, ExprId, ExprNode, LiteralValue};
 use crate::exec::chunk::{Chunk, ChunkSchema};
-use arrow::array::{Array, ArrayRef, BinaryArray, Int32Array, LargeStringArray, NullArray, StringArray};
+use arrow::array::{
+    Array, ArrayRef, BinaryArray, Int32Array, LargeStringArray, NullArray, StringArray,
+};
 use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
 use arrow::datatypes::{Field, Schema};
 use arrow::record_batch::RecordBatch;

@@ -18,8 +18,8 @@
 //! Narrow full-partition carrier handoff to the original output-layout owner.
 //! Actual legacy carriers may reveal a final layout Data error; that is not a
 //! license to weaken SelectedValues or FixedZero scalar/window validation.
-use crate::window_invocation_data::{WindowDataSlot, WindowInvocationData, WindowInvocationPhase};
 use crate::opaque_memory::OpaqueReservation;
+use crate::window_invocation_data::{WindowDataSlot, WindowInvocationData, WindowInvocationPhase};
 use crate::{KernelFailure, WindowCallContract};
 use arrow_array::ArrayRef;
 use std::sync::Arc;

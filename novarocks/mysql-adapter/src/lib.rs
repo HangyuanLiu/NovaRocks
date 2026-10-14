@@ -21,19 +21,25 @@
 compile_error!("normal-build cannot include test-controls");
 #[cfg(all(feature = "mem-1-m07-closing-pressure", not(feature = "test-controls")))]
 compile_error!("mem-1-m07-closing-pressure requires test-controls");
-#[cfg(all(feature = "mem-1-m07-exact-mysql-write", not(feature = "test-controls")))]
+#[cfg(all(
+    feature = "mem-1-m07-exact-mysql-write",
+    not(feature = "test-controls")
+))]
 compile_error!("mem-1-m07-exact-mysql-write requires test-controls");
 
 /// Capabilities compiled by this owner; activation still requires a role session.
 pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
-    (env!("CARGO_PKG_NAME"), &[
-        #[cfg(feature = "test-controls")]
-        "test-controls",
-        #[cfg(feature = "mem-1-m07-closing-pressure")]
-        "mem-1-m07-closing-pressure",
-        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-        "mem-1-m07-exact-mysql-write",
-    ])
+    (
+        env!("CARGO_PKG_NAME"),
+        &[
+            #[cfg(feature = "test-controls")]
+            "test-controls",
+            #[cfg(feature = "mem-1-m07-closing-pressure")]
+            "mem-1-m07-closing-pressure",
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            "mem-1-m07-exact-mysql-write",
+        ],
+    )
 }
 
 mod active_delivery_budget;
@@ -177,3 +183,6 @@ pub use startup_profile::{
 
 #[cfg(feature = "mem-1-m07-closing-pressure")]
 pub use query_application_shim::serve_query_application_mysql_until_drain_then_shutdown_pressure as closing_pressure_fixture_listener;
+
+#[cfg(feature = "test-controls")]
+pub mod test_fixture_authorization;

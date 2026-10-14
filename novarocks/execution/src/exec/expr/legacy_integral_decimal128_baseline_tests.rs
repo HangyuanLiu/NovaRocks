@@ -18,7 +18,9 @@
 //! Independent original Types conversion and ExprArena precision/policy evidence.
 //! These new expectations are UNRUN until the root's serialized Execution window.
 pub(super) use super::legacy_decimal128_rescale_baseline_tests::{OVERFLOW, actual, modes, values};
-use arrow::array::{Array, ArrayRef, Decimal128Array, Int8Array, Int16Array, Int32Array, Int64Array};
+use arrow::array::{
+    Array, ArrayRef, Decimal128Array, Int8Array, Int16Array, Int32Array, Int64Array,
+};
 use arrow::datatypes::DataType;
 use novarocks_type_contract::DecimalOverflowPolicy;
 use std::sync::Arc;

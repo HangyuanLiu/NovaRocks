@@ -57,7 +57,7 @@ use crate::typed_read::page_source_provider::IcebergPageSourceProviderOptions;
 pub struct IcebergControlRoleBindingFactory {
     resources: IcebergMetadataResources,
     #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    hms_listing_probe: Option<Arc<crate::hms_listing_probe::HmsListingProbe>>,
+    hms_listing_slot: Option<crate::hms_listing_probe::HmsListingObservationSlot>,
     blocking_materialization_permits: Arc<tokio::sync::Semaphore>,
 }
 
@@ -69,18 +69,18 @@ impl IcebergControlRoleBindingFactory {
         Self {
             resources,
             #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-            hms_listing_probe: None,
+            hms_listing_slot: None,
             blocking_materialization_permits: Arc::new(tokio::sync::Semaphore::new(
                 max_blocking_materializations.get(),
             )),
         }
     }
     #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-    pub fn with_hms_listing_probe(
+    pub fn with_hms_listing_observation_slot(
         mut self,
-        probe: Arc<crate::hms_listing_probe::HmsListingProbe>,
+        slot: crate::hms_listing_probe::HmsListingObservationSlot,
     ) -> Self {
-        self.hms_listing_probe = Some(probe);
+        self.hms_listing_slot = Some(slot);
         self
     }
 }
@@ -106,7 +106,10 @@ impl ConnectorControlRoleBindingFactory for IcebergControlRoleBindingFactory {
     {
         let resources = self.resources.clone();
         #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        let probe = self.hms_listing_probe.clone();
+        let probe = self
+            .hms_listing_slot
+            .as_ref()
+            .and_then(|slot| slot.active_probe());
         let permits = Arc::clone(&self.blocking_materialization_permits);
         Box::pin(async move {
             context.check_active()?;
@@ -164,6 +167,8 @@ fn materialize_control_blocking(
     // complete role group rather than a parallel FE registry.
     let captured_read = Arc::new(Mutex::new(None));
     let capture = Arc::clone(&captured_read);
+    #[cfg(feature = "test-controls")]
+    let observation_slot = resources.planning_binding().test_observation().cloned();
     let factory = IcebergConnectorFactory::new(resources).with_read_control_installer(Arc::new(
         move |_handle, metadata, splits, encoder, request_factory| {
             let read =
@@ -251,12 +256,15 @@ fn materialize_control_blocking(
                 .catalog_handle()
                 .map_err(ConnectorMaterializationError::from)?
                 .clone();
-            let session = Arc::new(IcebergWriteSessionControl::new(
+            let session = IcebergWriteSessionControl::new(
                 descriptor.clone(),
                 control.incarnation(),
                 catalog_handle.clone(),
                 runtime,
-            ));
+            );
+            #[cfg(feature = "test-controls")]
+            let session = session.with_test_observation(observation_slot.clone());
+            let session = Arc::new(session);
             let adapter = build_write_adapter(descriptor, catalog_handle);
             Some(ConnectorControlWriteBinding::new(
                 write,

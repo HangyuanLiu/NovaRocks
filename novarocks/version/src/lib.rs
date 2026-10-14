@@ -17,17 +17,23 @@
 
 #[cfg(all(feature = "normal-build", feature = "test-controls"))]
 compile_error!("normal-build cannot include test-controls");
-#[cfg(all(feature = "native-compatibility-test-fixture", not(feature = "test-controls")))]
+#[cfg(all(
+    feature = "native-compatibility-test-fixture",
+    not(feature = "test-controls")
+))]
 compile_error!("native-compatibility-test-fixture requires test-controls");
 
 /// Capabilities compiled by this owner; activation still requires a role session.
 pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
-    (env!("CARGO_PKG_NAME"), &[
-        #[cfg(feature = "test-controls")]
-        "test-controls",
-        #[cfg(feature = "native-compatibility-test-fixture")]
-        "native-compatibility-test-fixture",
-    ])
+    (
+        env!("CARGO_PKG_NAME"),
+        &[
+            #[cfg(feature = "test-controls")]
+            "test-controls",
+            #[cfg(feature = "native-compatibility-test-fixture")]
+            "native-compatibility-test-fixture",
+        ],
+    )
 }
 
 use std::fmt;

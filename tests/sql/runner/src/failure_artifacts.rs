@@ -172,7 +172,7 @@ impl FailureArtifactRecorder {
             "runner": runner, "server": server,
             "requested_launch_profile": format!("{profile:?}"), "cluster_mode": format!("{mode:?}"),
             "requested_backend_count": backend_count,
-            "capability_note": "Binary hashes identify content; build capability and Cargo profile self-report are unavailable."
+            "capability_note": "Binary hashes identify content. Each actual cross-process role launch separately checks and retains its binary-native build-info before spawn; unknown compiler settings remain unknown and self-report does not certify release acceptance."
         }));
         Ok(())
     }

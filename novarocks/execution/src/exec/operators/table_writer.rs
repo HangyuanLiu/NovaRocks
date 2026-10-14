@@ -60,8 +60,10 @@ use crate::exec::node::aggregate::{AggFunction, AggTypeSignature};
 use crate::exec::node::table_write_relation::{
     ConnectorCommitFragmentEncoder, WriterMultiplexRelationSchema,
 };
-#[cfg(debug_assertions)]
-use crate::exec::node::table_write_relation::{TableWriteAggregateBoundary, TableWriteAggregateGuard};
+#[cfg(feature = "test-controls")]
+use crate::exec::node::table_write_relation::{
+    TableWriteAggregateBoundary, TableWriteAggregateGuard,
+};
 use crate::exec::node::table_writer::{
     TableWriterInputProjection, TableWriterNode, TableWriterPhysicalContextTemplate,
     TableWriterRuntimeBinding,
@@ -98,7 +100,7 @@ struct TableWriterPlan {
     /// `AGGREGATE_PARTIAL` rows. A plan-tree writer binds it from the
     /// process function set; a compiled writer from its prepared calls.
     partial_aggregate_factory: Option<Arc<dyn OperatorFactory>>,
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
 }
 
@@ -190,7 +192,7 @@ impl TableWriterOperatorFactory {
                 fragment_encoder: Arc::clone(&binding.fragment_encoder),
                 writer_multiplex_schema,
                 partial_aggregate_factory,
-                #[cfg(debug_assertions)]
+                #[cfg(feature = "test-controls")]
                 aggregate_guard: Arc::clone(&binding.aggregate_guard),
             }),
         })
@@ -233,7 +235,7 @@ impl TableWriterOperatorFactory {
                 fragment_encoder: Arc::clone(&binding.fragment_encoder),
                 writer_multiplex_schema,
                 partial_aggregate_factory,
-                #[cfg(debug_assertions)]
+                #[cfg(feature = "test-controls")]
                 aggregate_guard: Arc::clone(&binding.aggregate_guard),
             }),
         })
@@ -270,7 +272,7 @@ impl TableWriterOperatorFactory {
                 fragment_encoder: Arc::clone(node.fragment_encoder()),
                 writer_multiplex_schema: node.writer_multiplex_schema().clone(),
                 partial_aggregate_factory,
-                #[cfg(debug_assertions)]
+                #[cfg(feature = "test-controls")]
                 aggregate_guard: Arc::clone(node.aggregate_guard()),
             }),
         })
@@ -413,7 +415,7 @@ impl TableWriterOperatorFactory {
             target,
             relation: plan.writer_multiplex_schema.clone(),
             partial_aggregate,
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "test-controls")]
             aggregate_guard: Arc::clone(&plan.aggregate_guard),
             state: TableWriterState::Open,
             logical_rows: 0,
@@ -492,7 +494,7 @@ struct TableWriterOperator {
     target: WriteTargetOrdinal,
     relation: WriterMultiplexRelationSchema,
     partial_aggregate: Option<Box<dyn Operator>>,
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     aggregate_guard: Arc<dyn TableWriteAggregateGuard>,
     state: TableWriterState,
     logical_rows: u64,
@@ -785,7 +787,7 @@ impl ProcessorOperator for TableWriterOperator {
             // bytes, so accounting never leaves live source buffers ownerless.
             drop(chunk);
             if let Some(partial) = self.partial_aggregate.as_mut() {
-                #[cfg(debug_assertions)]
+                #[cfg(feature = "test-controls")]
                 self.aggregate_guard
                     .check(TableWriteAggregateBoundary::PartialUpdate)
                     .map_err(|error| format!("update writer partial aggregate: {error}"))?;
@@ -888,7 +890,7 @@ impl ProcessorOperator for TableWriterOperator {
         self.state = TableWriterState::Draining;
         self.finish_blocked_intervals();
         if let Some(partial) = self.partial_aggregate.as_mut() {
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "test-controls")]
             if let Err(error) = self
                 .aggregate_guard
                 .check(TableWriteAggregateBoundary::PartialFinalize)
@@ -1466,10 +1468,10 @@ pub(crate) mod tests {
         pred()
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     struct RejectAggregateBoundary(TableWriteAggregateBoundary);
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     impl TableWriteAggregateGuard for RejectAggregateBoundary {
         fn check(&self, boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError> {
             if boundary == self.0 {
@@ -2476,7 +2478,7 @@ pub(crate) mod tests {
         );
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     #[test]
     fn partial_aggregate_guard_rejects_update_before_either_consumer_accepts_the_page() {
         let stats = Arc::new(WriteExecutionStats::default());
@@ -2504,7 +2506,7 @@ pub(crate) mod tests {
         assert!(!operator.as_processor_ref().expect("processor").has_output());
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     #[test]
     fn partial_aggregate_guard_rejects_finalize_without_success_output() {
         let stats = Arc::new(WriteExecutionStats::default());

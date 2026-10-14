@@ -46,14 +46,17 @@ use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 
 use super::native_compatibility::{
     HEARTBEAT_PATH, RawUnaryResponse, authorization_header, decode_hex_32, only_successful_receipt,
-    raw_acquire_admission_ticket, raw_apply_task_operations, raw_establish, raw_operation_envelope,
-    raw_unary, raw_unary_response,
+    raw_acquire_admission_ticket, raw_apply_task_operations_until, raw_establish,
+    raw_operation_envelope, raw_unary, raw_unary_response, raw_unary_until,
 };
 use super::query_lifecycle::{
     NID2_FENCE_QUERY, arm_on_every_backend, assert_two_sleep_rows, await_backend_exit,
     await_fresh_task_create, await_resource_convergence, await_terminal_snapshot,
     await_token_scoped_marker, latest_execution_id, resource_snapshot,
 };
+
+#[path = "raw_creation_controls.rs"]
+mod raw_creation_controls;
 
 const REQUIRED_BACKENDS: usize = 3;
 const BASELINE_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v";
@@ -74,7 +77,7 @@ const CREATE_PAYLOADS_RETAINED: &str = "novarocks_task_create_payloads_retained"
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
-        Box::new(FrozenReplayAndMembership),
+        Box::new(FrozenReplayAndMembership::default()),
         Box::new(CreationPayloadLifetime),
         Box::new(FixedPlanRecovery),
         Box::new(NormalCloseCapacity {
@@ -111,16 +114,39 @@ fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
 /// domain names a member its descriptor never froze is accepted, then fails
 /// preparation while retaining its identity. After
 /// the context is released, a replay still cannot bring a task back.
-struct FrozenReplayAndMembership;
+#[derive(Default)]
+struct FrozenReplayAndMembership {
+    observation: raw_creation_controls::RawCreationObservationOwner,
+}
 
 impl Scenario for FrozenReplayAndMembership {
     fn name(&self) -> &'static str {
         "native-creation/frozen-replay-and-membership"
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &std::path::Path,
+        cluster_size: usize,
+        _primary: &std::path::Path,
+        ordinary: &std::path::Path,
+        controlled: Option<&std::path::Path>,
+        deadline: std::time::Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(Some(self.observation.freeze(
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
-        let session = RawBackendSession::establish(context, 0)?;
+        let (query_id, frontend) = self.observation.take_identity(context.deadline())?;
+        let session = RawBackendSession::establish_declared(context, 0, query_id, frontend)?;
+        self.observation.verify_backend(session.backend)?;
         let applied = |context: &mut ScenarioContext| session.marker_count(context, CREATE_APPLIED);
         let idempotent =
             |context: &mut ScenarioContext| session.marker_count(context, CREATE_IDEMPOTENT);
@@ -304,11 +330,33 @@ pub(super) struct RawBackendSession {
     pub(super) frontend: FrontendProcessId,
     pub(super) query_id: common::UniqueId,
     pub(super) establish_request: Option<proto::TaskOperation>,
+    pub(super) original_deadline: std::time::Instant,
 }
 
 impl RawBackendSession {
     pub(super) fn establish(context: &mut ScenarioContext, index: usize) -> Result<Self> {
         Self::establish_with_identity(context, index, None)
+    }
+
+    /// Allocate the existing fixture identity once, before role launch when declared.
+    pub(super) fn declare_identity() -> (common::UniqueId, FrontendProcessId) {
+        static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
+        let query_id = common::UniqueId {
+            hi: 0x5b5b,
+            lo: ((u64::from(std::process::id()) << 32)
+                | NEXT_SESSION.fetch_add(1, Ordering::Relaxed)) as i64,
+        };
+        (query_id, FrontendProcessId::new_v7())
+    }
+
+    /// Use the request identities fixed by this direct consumer before role launch.
+    pub(super) fn establish_declared(
+        context: &mut ScenarioContext,
+        index: usize,
+        query_id: common::UniqueId,
+        frontend: FrontendProcessId,
+    ) -> Result<Self> {
+        Self::establish_with_identity(context, index, Some((query_id, frontend)))
     }
 
     /// Establish another backend Context for the same frozen first attempt.
@@ -349,7 +397,7 @@ impl RawBackendSession {
             .native_probe_connector(control_endpoint, mode)?;
         let trust = context.handle().native_probe_trust()?;
         let authorization = authorization_header(&trust)?;
-        let heartbeat: proto::HeartbeatResponse = raw_unary(
+        let heartbeat: proto::HeartbeatResponse = raw_unary_until(
             control_connector.clone(),
             HEARTBEAT_PATH,
             &authorization,
@@ -358,33 +406,23 @@ impl RawBackendSession {
                     value: backend.to_bytes().to_vec(),
                 }),
             },
+            context.deadline(),
         )?;
         let admission_epoch = heartbeat
             .admission_epoch_capability
             .context("the target heartbeat omitted its admission epoch capability")?;
+        let (query_id, frontend) = shared.unwrap_or_else(Self::declare_identity);
         let mut session = Self {
             index,
+            original_deadline: context.deadline(),
             connector,
             control_connector,
             authorization,
             backend,
-            frontend: FrontendProcessId::new_v7(),
-            // A query id of this scenario's own, so every marker it counts is
-            // this session's and no other case's.
+            frontend,
             establish_request: None,
-            query_id: common::UniqueId {
-                hi: 0x5b5b,
-                lo: {
-                    static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
-                    ((u64::from(std::process::id()) << 32)
-                        | NEXT_SESSION.fetch_add(1, Ordering::Relaxed)) as i64
-                },
-            },
+            query_id,
         };
-        if let Some((query_id, frontend)) = shared {
-            session.query_id = query_id;
-            session.frontend = frontend;
-        }
         let query_context = session.context_under(session.frontend, 1);
         let acquisition = session.apply(
             raw_acquire_admission_ticket(query_context.clone(), compatibility, admission_epoch),
@@ -448,7 +486,12 @@ impl RawBackendSession {
         subject: &str,
     ) -> Result<proto::TaskOperationReceipt> {
         only_successful_receipt(
-            raw_apply_task_operations(&self.connector, &self.authorization, vec![operation])?,
+            raw_apply_task_operations_until(
+                &self.connector,
+                &self.authorization,
+                vec![operation],
+                self.original_deadline,
+            )?,
             subject,
         )
     }
@@ -472,6 +515,7 @@ impl RawBackendSession {
                     )),
                 }],
             },
+            self.original_deadline,
         )?;
         let receipt = only_successful_receipt(quiesce, "QuiesceQueryContext")?;
         let Some(proto::task_operation_receipt::Ack::QuiesceQueryContext(fence)) = receipt.ack
@@ -504,6 +548,7 @@ impl RawBackendSession {
                             ),
                         }],
                     },
+                    self.original_deadline,
                 )?;
             let receipt = only_successful_receipt(response, "ReleaseQueryContext")?;
             let Some(proto::task_operation_receipt::Ack::ReleaseQueryContext(ack)) = receipt.ack
@@ -937,10 +982,10 @@ fn backend_marker_total(context: &mut ScenarioContext, marker: &str) -> Result<u
 }
 
 fn run_baseline_query(context: &mut ScenarioContext) -> Result<()> {
-    let mut connection = mysql_actor::connect(
+    let mut connection = mysql_actor::connect_until(
         context.mysql_user(),
         context.mysql_port(),
-        context.remaining("connect the baseline read")?,
+        context.deadline(),
     )?;
     let rows: Vec<i64> = connection
         .query(BASELINE_QUERY)
@@ -949,14 +994,29 @@ fn run_baseline_query(context: &mut ScenarioContext) -> Result<()> {
         rows == vec![1, 2],
         "the baseline read returned {rows:?} instead of [1, 2]"
     );
+    connection.finish()?;
     Ok(())
 }
 
 /// One statement running on its own connection, cancellable by id.
 struct PendingRead {
-    thread: thread::JoinHandle<Result<()>>,
+    thread: Option<thread::JoinHandle<Result<()>>>,
     connection_id: u32,
     done: mpsc::Receiver<Result<Vec<i64>, mysql::Error>>,
+}
+
+impl Drop for PendingRead {
+    fn drop(&mut self) {
+        if let Some(actor) = self.thread.take() {
+            match actor.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    eprintln!("Original delayed read actor cleanup failed: {error:#}")
+                }
+                Err(_) => eprintln!("Original delayed read actor panicked during join"),
+            }
+        }
+    }
 }
 
 impl PendingRead {
@@ -965,40 +1025,47 @@ impl PendingRead {
         let (done_tx, done) = mpsc::sync_channel(1);
         let user = context.mysql_user().to_owned();
         let port = context.mysql_port();
-        let connect = context.remaining("connect the delayed read")?;
+        context.remaining("connect the delayed read")?;
+        let deadline = context.deadline();
         let thread = thread::Builder::new()
             .name("native-creation-read".to_owned())
             .spawn(move || -> Result<()> {
-                let mut connection = mysql_actor::connect_for_cancellation(&user, port, connect)?;
-                id_tx
-                    .send(connection.connection_id())
-                    .context("publish the delayed read connection id")?;
-                let outcome = connection.query(sql);
-                done_tx
-                    .send(outcome)
-                    .context("publish the delayed read result")
+                mysql_actor::connect_for_cancellation_until(&user, port, deadline)?.run(
+                    |connection| {
+                        id_tx
+                            .send(connection.connection_id())
+                            .context("publish the delayed read connection id")?;
+                        let outcome = connection.query(sql);
+                        done_tx
+                            .send(outcome)
+                            .context("publish the delayed read result")
+                    },
+                )
             })
             .context("start the delayed read")?;
-        let connection_id = id_rx
+        let mut pending = Self {
+            thread: Some(thread),
+            connection_id: 0,
+            done,
+        };
+        pending.connection_id = id_rx
             .recv_timeout(context.remaining("receive the delayed read connection id")?)
             .context("the delayed read ended before publishing its connection id")?;
-        Ok(Self {
-            thread,
-            connection_id,
-            done,
-        })
+        Ok(pending)
     }
 
     fn still_running(&self) -> bool {
         matches!(self.done.try_recv(), Err(mpsc::TryRecvError::Empty))
     }
 
-    fn finish(self, context: &mut ScenarioContext) -> Result<Vec<i64>> {
+    fn finish(mut self, context: &mut ScenarioContext) -> Result<Vec<i64>> {
         let outcome = self
             .done
             .recv_timeout(context.remaining("await the delayed read")?)
             .context("the delayed read did not finish")?;
         self.thread
+            .take()
+            .expect("original delayed read actor")
             .join()
             .map_err(|_| anyhow::anyhow!("the delayed read thread panicked"))??;
         outcome.context("the delayed read failed")
@@ -1324,6 +1391,7 @@ fn exchange_probe(
             sender_ordinal: 0,
             sender_count: 1,
         },
+        session.original_deadline,
     )
 }
 
@@ -1566,6 +1634,7 @@ pub(super) fn session_control(
                     control: Some(control),
                 }],
             },
+            session.original_deadline,
         )?,
         "native control probe",
     )

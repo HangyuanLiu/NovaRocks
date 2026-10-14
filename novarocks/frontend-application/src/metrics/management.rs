@@ -21,12 +21,11 @@ use std::sync::Arc;
 use novarocks_memory::MemoryAuthority;
 
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+#[cfg(feature = "test-controls")]
+use axum::http::HeaderMap;
+use axum::http::{StatusCode, header};
 use axum::response::IntoResponse;
-use axum::{
-    Json, Router,
-    routing::{get, post},
-};
+use axum::{Json, Router, routing::get};
 
 use crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceReader;
 use crate::topology::{BackendIslandSnapshot, BackendIslandSnapshotReader};
@@ -34,6 +33,8 @@ use crate::workload_lifecycle::{
     FrontendCatalogServingSnapshot, FrontendDrainServingSnapshot, FrontendServingLifecycle,
     FrontendServingSnapshot, FrontendServingSnapshotReader, FrontendWorkloadServingSnapshot,
 };
+#[cfg(feature = "test-controls")]
+use axum::routing::post;
 use novarocks_query_application::serving_admission::FrontendServingState;
 
 use super::{FrontendMetricsRegistry, render_metrics, render_metrics_json};
@@ -44,6 +45,8 @@ struct FrontendManagementState {
     serving_reader: Arc<dyn FrontendServingSnapshotReader>,
     island_reader: Arc<dyn BackendIslandSnapshotReader>,
     memory_authority: Arc<MemoryAuthority>,
+    #[cfg(feature = "test-controls")]
+    statement_observation: Option<Arc<crate::preparation_diagnostics::StatementObservationOwner>>,
 }
 
 /// Versioned management document composed from independent read-only owners.
@@ -226,12 +229,17 @@ pub(crate) fn frontend_management_router_with_readers(
     convergence_reader: Option<Arc<dyn QueryLifecycleConvergenceReader>>,
     memory_authority: Arc<MemoryAuthority>,
     debug_enabled: bool,
+    #[cfg(feature = "test-controls")] statement_observation: Option<
+        Arc<crate::preparation_diagnostics::StatementObservationOwner>,
+    >,
 ) -> Router {
     let state = FrontendManagementState {
         registry,
         serving_reader,
         island_reader,
         memory_authority,
+        #[cfg(feature = "test-controls")]
+        statement_observation: statement_observation.clone(),
     };
     let router = Router::new()
         .route("/metrics", get(handle_management_metrics))
@@ -240,16 +248,29 @@ pub(crate) fn frontend_management_router_with_readers(
         .route("/island-readyz", get(island_readyz))
         .route("/v1/frontend/state", get(frontend_state))
         .route("/v1/memory/authority", get(memory_authority_snapshot));
-    let router = if debug_enabled && convergence_reader.is_some() {
+    #[cfg(feature = "test-controls")]
+    let router = if debug_enabled && statement_observation.is_some() && convergence_reader.is_some()
+    {
         let convergence_reader = convergence_reader.expect("checked above");
+        let owner = statement_observation
+            .as_ref()
+            .expect("checked above")
+            .clone();
         router.route(
             crate::native::report_server::LIFECYCLE_CONVERGENCE_DEBUG_PATH,
-            get(move || latest_lifecycle_convergence_snapshot(Arc::clone(&convergence_reader))),
+            get(move |headers: HeaderMap| {
+                latest_lifecycle_convergence_snapshot(
+                    Arc::clone(&convergence_reader),
+                    Arc::clone(&owner),
+                    headers,
+                )
+            }),
         )
     } else {
         router
     };
-    let router = if crate::preparation_diagnostics::enabled() {
+    #[cfg(feature = "test-controls")]
+    let router = if statement_observation.is_some() {
         router
             .route(
                 "/v1/diagnostics/preparation/statement/arm",
@@ -269,47 +290,66 @@ pub(crate) fn frontend_management_router_with_readers(
     router.with_state(state)
 }
 
+#[cfg(feature = "test-controls")]
 async fn arm_statement_observation(
+    State(state): State<FrontendManagementState>,
     headers: HeaderMap,
     Json(request): Json<crate::preparation_diagnostics::StatementObservationArmRequest>,
 ) -> axum::response::Response {
-    if !preparation_diagnostic_authorized(&headers) {
+    let Some(owner) = state.statement_observation.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !preparation_diagnostic_authorized(owner, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    match crate::preparation_diagnostics::arm_statement_observation(request) {
+    match owner.arm(request) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => (StatusCode::CONFLICT, error).into_response(),
     }
 }
 
+#[cfg(feature = "test-controls")]
 async fn peek_statement_observation(
+    State(state): State<FrontendManagementState>,
     headers: HeaderMap,
     Json(request): Json<crate::preparation_diagnostics::ControlRequest>,
 ) -> axum::response::Response {
-    if !preparation_diagnostic_authorized(&headers) {
+    let Some(owner) = state.statement_observation.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !preparation_diagnostic_authorized(owner, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    match crate::preparation_diagnostics::peek_statement_observation(&request.run_token) {
+    match owner.peek(&request.run_token) {
         Ok(response) => Json(response).into_response(),
         Err(error) => (StatusCode::CONFLICT, error).into_response(),
     }
 }
 
+#[cfg(feature = "test-controls")]
 async fn drain_statement_observation(
+    State(state): State<FrontendManagementState>,
     headers: HeaderMap,
     Json(request): Json<crate::preparation_diagnostics::ControlRequest>,
 ) -> axum::response::Response {
-    if !preparation_diagnostic_authorized(&headers) {
+    let Some(owner) = state.statement_observation.as_ref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !preparation_diagnostic_authorized(owner, &headers) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    match crate::preparation_diagnostics::drain_statement_observation(&request.run_token) {
+    match owner.drain(&request.run_token) {
         Ok(response) => Json(response).into_response(),
         Err(error) => (StatusCode::CONFLICT, error).into_response(),
     }
 }
 
-fn preparation_diagnostic_authorized(headers: &HeaderMap) -> bool {
-    crate::preparation_diagnostics::authorize(
+#[cfg(feature = "test-controls")]
+fn preparation_diagnostic_authorized(
+    owner: &crate::preparation_diagnostics::StatementObservationOwner,
+    headers: &HeaderMap,
+) -> bool {
+    owner.authorize(
         headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok()),
@@ -390,9 +430,15 @@ fn management_snapshot(state: &FrontendManagementState) -> FrontendManagementSna
     FrontendManagementSnapshot::compose(serving, state.island_reader.backend_island_snapshot())
 }
 
+#[cfg(feature = "test-controls")]
 async fn latest_lifecycle_convergence_snapshot(
     reader: Arc<dyn QueryLifecycleConvergenceReader>,
+    owner: Arc<crate::preparation_diagnostics::StatementObservationOwner>,
+    headers: HeaderMap,
 ) -> axum::response::Response {
+    if !preparation_diagnostic_authorized(&owner, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let Some(snapshot) = reader.latest_convergence_snapshot() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -492,6 +538,8 @@ mod tests {
             Some(Arc::new(EmptyConvergenceReader)),
             test_memory_authority(),
             debug_enabled,
+            #[cfg(feature = "test-controls")]
+            None,
         )
     }
 
@@ -653,7 +701,7 @@ mod tests {
             )
             .await
             .expect("debug-on response");
-        assert_eq!(debug_on.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(debug_on.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

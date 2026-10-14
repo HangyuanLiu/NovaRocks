@@ -47,6 +47,7 @@ fn known(value: &str) -> serde_json::Value {
     }
 }
 
+// Design: ADR-0174 (docs/adr/ADR-0174-test-capabilities-and-finite-role-authorization.md)
 pub fn value(debug_assertions: bool, panic_unwind: bool) -> serde_json::Value {
     let mut capabilities = owners().into_iter().map(|(owner, compiled)|
         serde_json::json!({"owner": owner, "compiled_capabilities": compiled}))

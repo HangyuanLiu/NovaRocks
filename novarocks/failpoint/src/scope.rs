@@ -78,6 +78,7 @@ struct Inner {
     notified: Notify,
 }
 
+// Design: ADR-0174 (docs/adr/ADR-0174-test-capabilities-and-finite-role-authorization.md)
 #[derive(Clone)]
 pub struct SessionScope {
     inner: Arc<Inner>,
@@ -267,6 +268,10 @@ pub struct GrantHandle {
 }
 
 impl GrantHandle {
+    pub fn domain(&self) -> &str {
+        &self.scope.inner.declaration.domain_grants[self.index].domain
+    }
+
     pub fn parameters(&self) -> &serde_json::Value {
         &self.scope.inner.declaration.domain_grants[self.index].parameters
     }

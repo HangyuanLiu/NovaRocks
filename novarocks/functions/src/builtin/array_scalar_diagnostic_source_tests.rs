@@ -19,7 +19,9 @@ use super::super::array_struct_subfield_core::{project, project_with_port};
 use super::super::scalar_invocation_data::{ScalarInvocationData, ScalarInvocationLatch};
 use super::*;
 use crate::opaque_memory::{OpaqueAllocationHost, OpaqueRetainedCharge};
-use crate::{AggregateStateAllocator, FunctionValueType, KernelDiagnostic, KernelEvaluationControl};
+use crate::{
+    AggregateStateAllocator, FunctionValueType, KernelDiagnostic, KernelEvaluationControl,
+};
 use arrow_array::{Array, ArrayRef, Int32Array, ListArray, StringArray, StructArray};
 use arrow_buffer::OffsetBuffer;
 use arrow_schema::DataType;

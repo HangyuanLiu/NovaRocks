@@ -68,7 +68,11 @@ fn ndv_sql_source_with_semantics(
         sql,
         emission_mode,
         sql_semantics,
-        &[("k", DataType::Int32), ("v", DataType::Int32), ("s", DataType::Utf8)],
+        &[
+            ("k", DataType::Int32),
+            ("v", DataType::Int32),
+            ("s", DataType::Utf8),
+        ],
     )
 }
 

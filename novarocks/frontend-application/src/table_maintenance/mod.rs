@@ -52,6 +52,8 @@ use novarocks_table_maintenance::{
 
 pub mod admission;
 pub mod result;
+#[cfg(feature = "test-controls")]
+pub(crate) mod test_controls;
 pub mod worker;
 
 // Design: ADR-0111 (docs/adr/ADR-0111-frontend-process-runtime-jobs-and-gc-observation-accelerator.md)
@@ -59,6 +61,8 @@ pub struct FrontendTableMaintenanceService {
     product: Arc<TableMaintenanceProduct>,
     runtime: Handle,
     root_admission: RootAdmissionHandle,
+    #[cfg(feature = "test-controls")]
+    controls: Option<Arc<test_controls::MaintenanceTestControls>>,
 }
 
 impl FrontendTableMaintenanceService {
@@ -84,6 +88,8 @@ impl FrontendTableMaintenanceService {
             product: Arc::new(product),
             runtime,
             root_admission,
+            #[cfg(feature = "test-controls")]
+            controls: None,
         })
     }
 
@@ -101,7 +107,49 @@ impl FrontendTableMaintenanceService {
             ),
             runtime: self.runtime,
             root_admission: self.root_admission,
+            #[cfg(feature = "test-controls")]
+            controls: self.controls,
         }
+    }
+
+    #[cfg(feature = "test-controls")]
+    pub(crate) fn with_test_controls(
+        mut self,
+        controls: Option<Arc<test_controls::MaintenanceTestControls>>,
+    ) -> Self {
+        self.controls = controls;
+        self
+    }
+
+    // This synchronous helper retains the receipt only across the existing
+    // block_on submission; no non-Send mutex guard crosses an async await.
+    fn submit_statement_optimize(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+        target: MaintenanceTarget,
+    ) -> Result<OptimizeSubmission, String> {
+        let capture = FrontendOptimizeTargetCapturePort::for_statement(engine);
+        #[cfg(feature = "test-controls")]
+        {
+            let receipt = match self.controls.as_ref() {
+                Some(owner) => match engine.test_statement_nomination() {
+                    Some(nomination) => owner.begin_submission(&nomination, &target)?,
+                    None => None,
+                },
+                None => None,
+            };
+            let capture = capture.with_test_receipt(receipt.as_ref());
+            let submission = self.block_on(self.product.submit_optimize(target, &capture));
+            drop(capture);
+            if let (Some(receipt), Ok(OptimizeSubmission::Submitted { job_id, .. })) =
+                (receipt, &submission)
+            {
+                receipt.bind(*job_id)?;
+            }
+            return submission;
+        }
+        #[cfg(not(feature = "test-controls"))]
+        self.block_on(self.product.submit_optimize(target, &capture))
     }
 
     fn block_on<F: Future>(&self, future: F) -> F::Output {
@@ -169,6 +217,8 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             Arc::new(FrontendOptimizeJobExecutionPort::new(
                 Arc::downgrade(&engine),
                 Arc::downgrade(&self.product),
+                #[cfg(feature = "test-controls")]
+                self.controls.clone(),
             )),
         )
     }
@@ -197,8 +247,7 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             ParsedMaintenanceStatement::SubmitOptimize { name_parts } => {
                 let target = engine.resolve_target(&name_parts, context)?;
                 engine.reject_user_action_on_mv(&target)?;
-                let capture = FrontendOptimizeTargetCapturePort::for_statement(engine);
-                let submission = self.block_on(self.product.submit_optimize(target, &capture))?;
+                let submission = self.submit_statement_optimize(engine, target)?;
                 if matches!(
                     submission,
                     OptimizeSubmission::Submitted {
@@ -234,7 +283,8 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                         if cancelled {
                             return Err(
                                 "OPTIMIZE statement cancelled; optimize job has actually exited"
-                                    .to_string().into(),
+                                    .to_string()
+                                    .into(),
                             );
                         }
                         if terminal != MaintenanceJobState::Finished {

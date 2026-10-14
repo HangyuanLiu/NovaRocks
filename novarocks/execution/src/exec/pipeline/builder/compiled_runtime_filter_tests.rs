@@ -1986,8 +1986,10 @@ fn join_probe_owned_shared_processor_gate_starts_at_input_and_has_exact_observab
 
 #[test]
 fn join_probe_owned_root_frame_every_actual_callback_keeps_seven_causes_and_latch() {
-    use novarocks_functions::{KernelEvaluationControl, KernelFailure, KernelDiagnostic, Selection};
     use crate::exec::expr::compiled_program::CompiledExpressionInstance;
+    use novarocks_functions::{
+        KernelDiagnostic, KernelEvaluationControl, KernelFailure, Selection,
+    };
     struct Control {
         calls: Mutex<Vec<u32>>,
         refusal: Option<(usize, KernelFailure)>,

@@ -21,6 +21,9 @@
 //! cancellation stops both active and queued roots; single-query KILL QUERY
 //! protocol conformance is covered by its dedicated scenarios.
 
+use super::query_lifecycle::native_sql_controls::{
+    SelectedStatement, SqlIntentOwner, StatementSpec,
+};
 use crate::actors::mysql as mysql_actor;
 use crate::actors::mysql_stream::{AsyncMysqlStream, MysqlStream};
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
@@ -36,9 +39,13 @@ use novarocks_cluster_harness::{
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+#[path = "query_concurrency_controls.rs"]
+mod concurrency_controls;
+use concurrency_controls::{JoinedThread, created_for};
 use tokio::runtime::{Builder as TokioRuntimeBuilder, Runtime as TokioRuntime};
 use tokio::sync::Barrier;
 use tokio::task::{JoinHandle, JoinSet};
@@ -70,9 +77,9 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(QueryConcurrency),
         Box::new(WarehouseAdmission),
-        Box::new(TerminalReleasesSlot),
-        Box::new(RemoteCleanupRetires),
-        Box::new(LateWorkLeaseExpiry),
+        Box::new(TerminalReleasesSlot::default()),
+        Box::new(RemoteCleanupRetires::default()),
+        Box::new(LateWorkLeaseExpiry::default()),
     ]
 }
 
@@ -115,7 +122,10 @@ impl Scenario for WarehouseAdmission {
 
 /// A query's terminal result must wake the next logical query even when the
 /// first query's Worker has not yet received its stop request.
-struct TerminalReleasesSlot;
+#[derive(Default)]
+struct TerminalReleasesSlot {
+    intent: SqlIntentOwner,
+}
 
 impl Scenario for TerminalReleasesSlot {
     fn name(&self) -> &'static str {
@@ -126,22 +136,52 @@ impl Scenario for TerminalReleasesSlot {
         Ok(fault_launch_config(1, REMOTE_CLEANUP_TIMEOUT_MS))
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let statement = StatementSpec {
+            sql: HELD_QUERY.into(),
+            faults: vec![],
+            observations: (0..REQUIRED_BACKENDS)
+                .map(|index| (index, "grpc-fragment", None))
+                .collect(),
+        };
+        Ok(Some(self.intent.freeze(
+            vec![statement],
+            &[],
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline_resources = query_resources(context)?;
         let creates = task_create_counts(context)?;
-        let mut first = start_timed_hold(context)?;
-        let target = await_fresh_task_create(context, &creates)?;
+        let selected = self.intent.take(0)?;
+        let mut first = start_timed_hold(context, &selected)?;
+        let target = await_fresh_task_create(context, &creates, &selected)?;
         let process_id = context.process_ids().backends[target];
         let proxy = native_proxy(context, target)?;
         await_proxy_connection(context, &proxy, target)?;
         pause_native(&proxy);
+        let restore_native = RestoreNative(proxy.clone());
         await_resource_activity(context, &baseline_resources)?;
         context.action(format!(
             "paused an admitted q1 on BE[{target}] while retaining process identity {process_id}"
         ));
 
         let second = start_follow_up_query(context)?;
+        let _restore_native = restore_native;
         await_frontend_state(context, "observe q2 waiting behind q1", |state| {
             state.workload.active.statement == 2
                 && state.workload.governance.admitted_queries == 1
@@ -194,7 +234,10 @@ impl Scenario for TerminalReleasesSlot {
 /// The Frontend may end its local remote-observation record after the cleanup
 /// deadline, but it must not fabricate a Worker stop or require endpoint
 /// replacement to make that local retirement possible.
-struct RemoteCleanupRetires;
+#[derive(Default)]
+struct RemoteCleanupRetires {
+    intent: SqlIntentOwner,
+}
 
 impl Scenario for RemoteCleanupRetires {
     fn name(&self) -> &'static str {
@@ -205,17 +248,46 @@ impl Scenario for RemoteCleanupRetires {
         Ok(fault_launch_config(1, REMOTE_CLEANUP_TIMEOUT_MS))
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let statement = StatementSpec {
+            sql: HELD_QUERY.into(),
+            faults: vec![],
+            observations: (0..REQUIRED_BACKENDS)
+                .map(|index| (index, "grpc-fragment", None))
+                .collect(),
+        };
+        Ok(Some(self.intent.freeze(
+            vec![statement],
+            &[],
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline_resources = query_resources(context)?;
         let baseline_governance = frontend_state(context)?.workload.governance;
         let creates = task_create_counts(context)?;
-        let mut stream = start_timed_hold(context)?;
-        let target = await_fresh_task_create(context, &creates)?;
+        let selected = self.intent.take(0)?;
+        let mut stream = start_timed_hold(context, &selected)?;
+        let target = await_fresh_task_create(context, &creates, &selected)?;
         let process_id = context.process_ids().backends[target];
         let proxy = native_proxy(context, target)?;
         await_proxy_connection(context, &proxy, target)?;
         pause_native(&proxy);
+        let _restore_native = RestoreNative(proxy.clone());
         await_resource_activity(context, &baseline_resources)?;
         assert_timeout_terminal(stream.read_timeout_query_error()?, "partitioned query")?;
 
@@ -261,7 +333,10 @@ impl Scenario for RemoteCleanupRetires {
 /// A BE can accept already-issued work after the FE has become terminal. The
 /// FE must not renew that work: the last valid Worker lease remains the final
 /// authority and eventually releases the real local resources.
-struct LateWorkLeaseExpiry;
+#[derive(Default)]
+struct LateWorkLeaseExpiry {
+    intent: SqlIntentOwner,
+}
 
 impl Scenario for LateWorkLeaseExpiry {
     fn name(&self) -> &'static str {
@@ -272,17 +347,46 @@ impl Scenario for LateWorkLeaseExpiry {
         Ok(fault_launch_config(1, REMOTE_CLEANUP_TIMEOUT_MS))
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let statement = StatementSpec {
+            sql: HELD_QUERY.into(),
+            faults: vec![],
+            observations: (0..REQUIRED_BACKENDS)
+                .map(|index| (index, "grpc-fragment", None))
+                .collect(),
+        };
+        Ok(Some(self.intent.freeze(
+            vec![statement],
+            &[],
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline_resources = query_resources(context)?;
         let baseline_governance = frontend_state(context)?.workload.governance;
         let creates = task_create_counts(context)?;
-        let mut stream = start_timed_hold(context)?;
-        let target = await_fresh_task_create(context, &creates)?;
+        let selected = self.intent.take(0)?;
+        let mut stream = start_timed_hold(context, &selected)?;
+        let target = await_fresh_task_create(context, &creates, &selected)?;
         let process_id = context.process_ids().backends[target];
         let proxy = native_proxy(context, target)?;
         await_proxy_connection(context, &proxy, target)?;
         pause_native(&proxy);
+        let _restore_native = RestoreNative(proxy.clone());
         await_resource_activity(context, &baseline_resources)?;
         assert_timeout_terminal(stream.read_timeout_query_error()?, "late-work query")?;
         await_frontend_state(
@@ -834,20 +938,40 @@ fn task_create_counts(context: &mut ScenarioContext) -> Result<Vec<usize>> {
         .collect()
 }
 
-fn await_fresh_task_create(context: &mut ScenarioContext, before: &[usize]) -> Result<usize> {
+fn await_fresh_task_create(
+    context: &mut ScenarioContext,
+    before: &[usize],
+    selected: &SelectedStatement,
+) -> Result<usize> {
     loop {
         for (index, count) in before.iter().copied().enumerate() {
-            if context
-                .handle()
-                .be_log_count(index, "NOVAROCKS_TASK_CREATE_APPLIED")?
-                > count
-            {
+            let Some(binding) = context.handle().selected_native_observation_binding(
+                index,
+                "grpc-fragment",
+                &selected.token,
+                None,
+            )?
+            else {
+                continue;
+            };
+            let log = context.handle().be_log_contents(index)?;
+            let mut total = 0;
+            let mut exact = false;
+            for line in log.lines() {
+                if line.contains("NOVAROCKS_TASK_CREATE_APPLIED") {
+                    total += 1;
+                    if total > count && created_for(line, &binding)? {
+                        exact = true;
+                    }
+                }
+            }
+            if exact {
                 return Ok(index);
             }
         }
         thread::sleep(
             context
-                .remaining("observe an admitted Native TaskCreate")?
+                .remaining("observe q1 exact admitted Native TaskCreate")?
                 .min(Duration::from_millis(25)),
         );
     }
@@ -889,7 +1013,17 @@ fn resume_native(proxy: &NativeFaultProxyControl) {
     proxy.set_mode(ProxyDirection::UpstreamToClient, ProxyMode::Forward);
 }
 
-fn start_timed_hold(context: &ScenarioContext) -> Result<MysqlStream> {
+struct RestoreNative(NativeFaultProxyControl);
+impl Drop for RestoreNative {
+    fn drop(&mut self) {
+        resume_native(&self.0);
+    }
+}
+
+fn start_timed_hold(
+    context: &mut ScenarioContext,
+    selected: &SelectedStatement,
+) -> Result<MysqlStream> {
     let mut stream = MysqlStream::connect(
         context.mysql_user(),
         context.mysql_port(),
@@ -897,12 +1031,13 @@ fn start_timed_hold(context: &ScenarioContext) -> Result<MysqlStream> {
     )?;
     stream.send_query(&format!("SET query_timeout = {TERMINAL_TIMEOUT_SECONDS}"))?;
     stream.expect_ok_packet("SET query_timeout for timed hold")?;
+    selected.arm(context, stream.connection_id()?, HELD_QUERY)?;
     stream.send_query(HELD_QUERY)?;
     Ok(stream)
 }
 
 struct PendingFollowUpQuery {
-    thread: thread::JoinHandle<Result<()>>,
+    thread: JoinedThread<Result<()>>,
     done: mpsc::Receiver<Result<Vec<i64>>>,
 }
 
@@ -910,25 +1045,29 @@ fn start_follow_up_query(context: &ScenarioContext) -> Result<PendingFollowUpQue
     let (done_tx, done) = mpsc::sync_channel(1);
     let user = context.mysql_user().to_owned();
     let port = context.mysql_port();
-    let timeout = bounded_io_timeout(context, "connect q2 waiting client")?;
+    let deadline = context.deadline();
     let thread = thread::Builder::new()
         .name("query-concurrency-follow-up".to_string())
         .spawn(move || -> Result<()> {
-            let mut connection = mysql_actor::connect_for_cancellation(&user, port, timeout)?;
-            let rows = connection
-                .query("SELECT sleep(1) FROM TABLE(generate_series(1, 1))")
-                .context("run q2 after q1 terminal")?;
-            done_tx.send(Ok(rows)).context("publish q2 rows")
+            mysql_actor::connect_until(&user, port, deadline)?.run(|connection| {
+                let rows = connection
+                    .query("SELECT sleep(1) FROM TABLE(generate_series(1, 1))")
+                    .context("run q2 after q1 terminal")?;
+                done_tx.send(Ok(rows)).context("publish q2 rows")
+            })
         })
         .context("start q2 waiting client")?;
-    Ok(PendingFollowUpQuery { thread, done })
+    Ok(PendingFollowUpQuery {
+        thread: JoinedThread::new(thread),
+        done,
+    })
 }
 
 fn execute_follow_up_query(context: &ScenarioContext) -> Result<()> {
-    let mut connection = mysql_actor::connect(
+    let mut connection = mysql_actor::connect_until(
         context.mysql_user(),
         context.mysql_port(),
-        bounded_io_timeout(context, "connect post-retirement query")?,
+        context.deadline(),
     )?;
     let rows: Vec<i64> = connection
         .query("SELECT sleep(1) FROM TABLE(generate_series(1, 1))")
@@ -937,6 +1076,7 @@ fn execute_follow_up_query(context: &ScenarioContext) -> Result<()> {
         rows == vec![1],
         "post-retirement query returned unexpected rows: {rows:?}"
     );
+    connection.finish()?;
     Ok(())
 }
 

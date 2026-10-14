@@ -26,10 +26,13 @@ compile_error!("normal-build cannot include test-controls");
 
 /// Capabilities compiled by this owner; activation still requires a role session.
 pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
-    (env!("CARGO_PKG_NAME"), &[
-        #[cfg(feature = "test-controls")]
-        "test-controls",
-    ])
+    (
+        env!("CARGO_PKG_NAME"),
+        &[
+            #[cfg(feature = "test-controls")]
+            "test-controls",
+        ],
+    )
 }
 
 mod access;
@@ -118,3 +121,6 @@ pub use storage_authority::{
 };
 
 // Design: ADR-0014 (docs/adr/ADR-0014-connector-neutral-file-foundation.md)
+
+#[cfg(feature = "test-controls")]
+pub use storage_authority::StorageAuthorityCloseControls;

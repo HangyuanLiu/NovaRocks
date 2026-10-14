@@ -7,6 +7,8 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct RunnerConfig {
     pub binary: PathBuf,
+    pub ordinary_binary: Option<PathBuf>,
+    pub test_control_binary: Option<PathBuf>,
     pub compatible_binary: Option<PathBuf>,
     pub other_island_binary: Option<PathBuf>,
     pub base_config_path: PathBuf,
@@ -47,6 +49,14 @@ impl RunnerConfig {
             .clone()
             .context("--artifact-root is required when running scenarios")?;
         Ok(Self {
+            ordinary_binary: validate_optional_binary(
+                cli.ordinary_binary.clone(),
+                "--ordinary-binary",
+            )?,
+            test_control_binary: validate_optional_binary(
+                cli.test_control_binary.clone(),
+                "--test-control-binary",
+            )?,
             binary,
             compatible_binary,
             other_island_binary,

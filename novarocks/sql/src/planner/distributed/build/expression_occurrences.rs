@@ -36,7 +36,9 @@ use novarocks_type_contract::{
 use super::lowered_draft::{SqlAuthoredPhysicalPlan, SqlSourceJournalError};
 use super::physical_temporal_sources::{self, SourceError};
 use crate::compiler::SqlFunctionCatalog;
-use novarocks_type_contract::{TemporalSourceDefinitions, TemporalSourceOccurrence, TemporalSourcePlan};
+use novarocks_type_contract::{
+    TemporalSourceDefinitions, TemporalSourceOccurrence, TemporalSourcePlan,
+};
 use std::collections::BTreeMap;
 
 #[derive(Debug)]

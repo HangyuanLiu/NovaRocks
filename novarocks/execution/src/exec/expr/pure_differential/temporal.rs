@@ -16,8 +16,8 @@
 //! Test-only real temporal ControlIntrinsic route, sharing the checked package
 //! author rather than invoking an owner through the ordinary scalar ABI.
 use super::*;
-use arrow::array::StringArray;
 use crate::exec::expr::compiled_program::{CompiledExpressionInstance, guarded_tests as host};
+use arrow::array::StringArray;
 use novarocks_functions::{
     EngineFunctionCatalogBuilder, InstalledPureKernel, PureEngineFunctionCatalog,
 };

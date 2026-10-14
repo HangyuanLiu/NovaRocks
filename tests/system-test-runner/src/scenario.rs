@@ -59,6 +59,21 @@ pub trait Scenario: Send + Sync {
         })
     }
 
+    /// Selected domain scenarios derive finite intent from their existing exact
+    /// inputs before any role spawn. Default scenarios request no authority.
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _scenario_root: &Path,
+        _cluster_size: usize,
+        _primary_binary: &Path,
+        _ordinary_binary: &Path,
+        _controlled_binary: Option<&Path>,
+        _original_deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        Ok(None)
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()>;
 
     /// Opt-in independent neutral source; caller captures once before all role launch.
@@ -98,8 +113,18 @@ pub trait Scenario: Send + Sync {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ResolvedScenarioArtifacts {
+    pub frontend: PathBuf,
+    pub backends: Vec<PathBuf>,
+    pub compatible: Option<PathBuf>,
+    pub other_island: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ScenarioLaunchConfig {
+    /// Actual role artifacts resolved by the runner before finite intent freezing.
+    pub resolved_artifacts: Option<ResolvedScenarioArtifacts>,
     pub binary_layout: ScenarioBinaryLayout,
     /// `None` preserves the runner's full-cluster topology barrier.
     pub expected_eligible_backend_count: Option<usize>,
@@ -205,6 +230,7 @@ impl ScenarioContext {
         handle: CrossProcessServerHandle,
         scenario_root: PathBuf,
         timeout: Duration,
+        original_deadline: Instant,
         binary: PathBuf,
         compatible_binary: Option<PathBuf>,
         other_island_binary: Option<PathBuf>,
@@ -217,7 +243,7 @@ impl ScenarioContext {
             name,
             handle,
             scenario_root,
-            deadline: Instant::now() + timeout,
+            deadline: original_deadline,
             exact_mysql_clock,
             actions: Vec::new(),
             phase_observations: Vec::new(),
@@ -430,6 +456,14 @@ impl ScenarioContext {
         let source = source_checkout_identity()?;
         let repository = workspace_root()?;
         let runner_executable = runner_executable_identity()?;
+        // Keep the original sealed schema5/oracle unchanged. Build facts are a
+        // separate retained artifact before the disposable cluster is removed.
+        fs::write(
+            self.scenario_root()
+                .join("scenario-role-build-information.json"),
+            serde_json::to_vec_pretty(&self.handle.build_information_evidence()?)?,
+        )
+        .context("retain actual role binary build information")?;
         let evidence = ScenarioEvidence {
             schema_version: 5,
             scenario: self.name,
@@ -487,8 +521,30 @@ impl ScenarioContext {
         name: &str,
         launch_config: ScenarioLaunchConfig,
     ) -> Result<CrossProcessServerHandle> {
+        self.launch_peer_cluster_inner(name, launch_config, None)
+    }
+
+    pub fn launch_peer_cluster_with_test_session(
+        &self,
+        name: &str,
+        launch_config: ScenarioLaunchConfig,
+        plan: novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan,
+    ) -> Result<CrossProcessServerHandle> {
+        self.launch_peer_cluster_inner(name, launch_config, Some(plan))
+    }
+
+    fn launch_peer_cluster_inner(
+        &self,
+        name: &str,
+        launch_config: ScenarioLaunchConfig,
+        plan: Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>,
+    ) -> Result<CrossProcessServerHandle> {
+        anyhow::ensure!(
+            Instant::now() < self.deadline,
+            "original scenario deadline expired before peer launch"
+        );
         let runtime_root = self.scenario_root.join(name);
-        CrossProcessServerHandle::launch(novarocks_cluster_harness::CrossProcessClusterOptions {
+        let options = novarocks_cluster_harness::CrossProcessClusterOptions {
             binary: self.binary.clone(),
             fe_binary: resolve_binary(
                 launch_config.binary_layout.frontend,
@@ -507,11 +563,34 @@ impl ScenarioContext {
             runtime_root,
             cluster_size: self.cluster_size,
             launch_profile: self.launch_profile,
-            startup_timeout: self.startup_timeout,
+            startup_timeout: self
+                .startup_timeout
+                .min(self.deadline.saturating_duration_since(Instant::now())),
             child_environment: launch_config.child_environment,
             config_overlay: launch_config.config_overlay,
             native_trust_fixture: launch_config.native_trust_fixture,
-        })
+        };
+        let mut handle = match plan {
+            Some(plan) => CrossProcessServerHandle::launch_with_test_sessions(options, plan)?,
+            None => CrossProcessServerHandle::launch(options)?,
+        };
+        let evidence = (|| -> Result<()> {
+            fs::write(
+                self.scenario_root
+                    .join(format!("{name}-role-build-information.json")),
+                serde_json::to_vec_pretty(&handle.build_information_evidence()?)?,
+            )?;
+            Ok(())
+        })();
+        if let Err(error) = evidence {
+            return match handle.shutdown() {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(anyhow::anyhow!(
+                    "{error:#}; peer shutdown failed: {cleanup:#}"
+                )),
+            };
+        }
+        Ok(handle)
     }
 }
 

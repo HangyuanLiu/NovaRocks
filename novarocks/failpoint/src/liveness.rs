@@ -30,6 +30,73 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// Nonblocking connection work retains one absolute deadline and cancellation.
+#[cfg(feature = "test-controls")]
+pub fn connect_until(
+    path: &std::path::Path,
+    deadline: Instant,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<UnixStream> {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    use std::os::fd::OwnedFd;
+    let address = SockAddr::unix(path)?;
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    socket.set_nonblocking(true)?;
+    loop {
+        if cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "control connection was cancelled",
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "control connection deadline expired",
+            ));
+        }
+        match socket.connect(&address) {
+            Ok(()) => break,
+            Err(error) if error.raw_os_error() == Some(libc::EISCONN) => break,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || matches!(
+                        error.raw_os_error(),
+                        Some(libc::EINPROGRESS) | Some(libc::EALREADY)
+                    ) =>
+            {
+                if let Some(error) = socket.take_error()? {
+                    return Err(error);
+                }
+                if socket.peer_addr().is_ok() {
+                    break;
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(20)),
+        );
+    }
+    if cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "control connection was cancelled",
+        ));
+    }
+    if Instant::now() >= deadline {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "control connection deadline expired",
+        ));
+    }
+    socket.set_nonblocking(false)?;
+    let descriptor: OwnedFd = socket.into();
+    Ok(UnixStream::from(descriptor))
+}
+
 fn read_exact_until(
     stream: &mut UnixStream,
     bytes: &mut [u8],
@@ -160,10 +227,28 @@ pub struct RunnerSession {
 
 impl RunnerSession {
     pub fn start(declaration: SessionDeclaration) -> io::Result<Self> {
-        declaration.validate_envelope()?;
         let deadline = Instant::now()
             .checked_add(Duration::from_millis(declaration.lifetime_millis))
             .ok_or_else(|| invalid("test-session lifetime cannot be represented"))?;
+        Self::start_until(declaration, deadline)
+    }
+
+    /// Charge setup and liveness to the original caller deadline without renewal.
+    pub fn start_until(
+        declaration: SessionDeclaration,
+        original_deadline: Instant,
+    ) -> io::Result<Self> {
+        declaration.validate_envelope()?;
+        let deadline = Instant::now()
+            .checked_add(Duration::from_millis(declaration.lifetime_millis))
+            .ok_or_else(|| invalid("test-session lifetime cannot be represented"))?
+            .min(original_deadline);
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "test-session original deadline expired before startup",
+            ));
+        }
         let listener = UnixListener::bind(&declaration.liveness_socket)?;
         let socket = SocketLease::capture(declaration.liveness_socket.clone())?;
         if let Err(error) = listener.set_nonblocking(true) {
@@ -236,6 +321,11 @@ impl RunnerSession {
                                 .map_err(|_| invalid("invalid backend process identity"))?;
                         }
                     }
+                    crate::target_binding::RoleProcessReceipt::from_hello(
+                        &input,
+                        process_id.clone(),
+                    )?
+                    .write_private(&input.liveness_socket.with_extension("process.json"))?;
                     let remaining = deadline
                         .saturating_duration_since(Instant::now())
                         .as_millis();
@@ -296,6 +386,11 @@ impl RunnerSession {
             worker: Some(worker),
             socket,
         })
+    }
+    pub fn process_receipt_path(&self) -> PathBuf {
+        self.declaration
+            .liveness_socket
+            .with_extension("process.json")
     }
     pub fn declaration(&self) -> &SessionDeclaration {
         &self.declaration
@@ -382,7 +477,11 @@ mod receiver {
                 .checked_add(Duration::from_millis(self.declaration.lifetime_millis))
                 .ok_or_else(|| invalid("test-session lifetime cannot be represented"))?;
             let stop = Arc::new(AtomicBool::new(false));
-            let mut stream = UnixStream::connect(&self.declaration.liveness_socket)?;
+            let mut stream = connect_until(
+                &self.declaration.liveness_socket,
+                waiting.min(started + HEARTBEAT_LOSS),
+                || stop.load(Ordering::Acquire),
+            )?;
             stream.set_write_timeout(Some(Duration::from_secs(1)))?;
             write_frame(
                 &mut stream,

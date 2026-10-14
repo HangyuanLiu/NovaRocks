@@ -1405,6 +1405,10 @@ impl Operator for DataStreamSinkOperator {
     }
 
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
+        #[cfg(feature = "test-controls")]
+        if let Some(observer) = state.exchange_test_observer() {
+            self.send_tracker.install_test_observer(observer.clone())?;
+        }
         self.be_number = state.backend_num().unwrap_or(0);
         self.max_transmit_batched_bytes = state
             .execution_runtime()

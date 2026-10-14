@@ -19,12 +19,12 @@
 //! Only already-read scalar graph capacities and exact output type structure
 //! are inspected here. This module does not decode, compare or cast a value.
 
+use crate::KernelFailure;
 use crate::aggregate_scalar::{
-    AggScalarValue as V, TrackedAggScalarValue as T, ScalarStateAllocator, ScalarStateError,
-    ScalarWork, tracked_scalar_heap_capacity,
+    AggScalarValue as V, ScalarStateAllocator, ScalarStateError, ScalarWork,
+    TrackedAggScalarValue as T, tracked_scalar_heap_capacity,
 };
 use arrow_schema::DataType;
-use crate::KernelFailure;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ScalarOutputResources {

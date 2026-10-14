@@ -16,8 +16,8 @@
 // under the License.
 //! Independent original analytic COUNT frame receipts; child of analytic_shared.
 use super::*;
-use arrow::array::{Int64Array, StringArray};
 use arrow::array::{DictionaryArray, Int8Array, NullArray};
+use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::Int8Type;
 fn values(output: ArrayRef) -> Vec<i64> {
     assert_eq!(output.data_type(), &DataType::Int64);

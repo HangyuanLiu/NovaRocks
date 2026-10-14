@@ -23,6 +23,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 source "$SCRIPT_DIR/lib/logging.sh"
 source "$SCRIPT_DIR/lib/command.sh"
+source "$SCRIPT_DIR/lib/build_capabilities.sh"
 source "$SCRIPT_DIR/lib/sql_suites.sh"
 source "$SCRIPT_DIR/lib/known_failures.sh"
 source "$SCRIPT_DIR/lib/server.sh"
@@ -75,7 +76,7 @@ Runs NovaRocks local full CI with local logs under logs/ci-full/<timestamp>/.
 SQL suites are executed with novarocks-sql-test -j 1 because parallel case execution is
 not stable in the current local environment.
 Rust tests are executed with --test-threads=1 for the same reason.
-Cargo build/test/run stages use NOVA_CI_CARGO_PROFILE, defaulting to dev-opt.
+Cargo check/clippy/build/test/run stages use NOVA_CI_CARGO_PROFILE, defaulting to dev-opt.
 Clippy runs in warning-only mode until the repository has a clean strict-clippy
 baseline.
 Selected SQL suites run once on a native 1FE+3BE cross-process cluster by
@@ -513,8 +514,12 @@ run_fail_fast_stage() {
 }
 
 run_cargo_gates() {
+  run_fail_fast_stage "CI build inputs" "build-inputs.log" \
+    ci_validate_build_inputs "$NOVA_CI_CARGO_PROFILE"
+  local normal_target
+  normal_target="$(ci_target_directory normal)" || return $?
   run_fail_fast_stage "locked Cargo metadata" "cargo-metadata.log" \
-    cargo metadata --locked --format-version 1 --no-deps
+    cargo metadata --locked --format-version 1
   run_fail_fast_stage "Cargo dependency policy" "cargo-deny.log" \
     cargo deny --locked check advisories bans licenses sources
   run_fail_fast_stage "generated artifact hygiene" "generated-artifact-hygiene.log" \
@@ -581,21 +586,25 @@ run_cargo_gates() {
     python3 tests/sql/fixtures/benchmarks/tests/fixture-contract-test.py
   run_fail_fast_stage "cargo fmt" "cargo-fmt.log" cargo fmt --check
   run_fail_fast_stage "cargo check all targets" "cargo-check-all-targets.log" \
-    cargo check --workspace --all-targets --locked
+    env NOVAROCKS_BUILD_PROFILE="$NOVA_CI_CARGO_PROFILE" cargo check --workspace --all-targets --locked --profile "$NOVA_CI_CARGO_PROFILE" --target-dir "$normal_target"
   # Without its default `jemalloc` feature the server keeps the system
   # allocator. That build is never deployed, but same-revision allocator
   # baselines and allocator-sensitive tools depend on it, so it must compile.
   run_fail_fast_stage "cargo check server without jemalloc" \
     "cargo-check-server-system-allocator.log" \
-    cargo check -p novarocks-server --no-default-features --all-targets --locked
+    env NOVAROCKS_BUILD_PROFILE="$NOVA_CI_CARGO_PROFILE" cargo check -p novarocks-server --no-default-features --features normal-build --all-targets --locked --profile "$NOVA_CI_CARGO_PROFILE" --target-dir "$normal_target"
   # `--workspace` is load-bearing. Without it Cargo falls back to
   # `default-members = ["novarocks-server"]`, so the lint/build/test gates
   # silently covered one package and every other workspace member's tests
   # never ran.
   run_fail_fast_stage "cargo clippy" "cargo-clippy.log" \
-    cargo clippy --workspace --all-targets --locked
+    env NOVAROCKS_BUILD_PROFILE="$NOVA_CI_CARGO_PROFILE" cargo clippy --workspace --all-targets --locked --profile "$NOVA_CI_CARGO_PROFILE" --target-dir "$normal_target"
   run_fail_fast_stage "cargo build" "cargo-build.log" \
-    cargo build --workspace --profile "$NOVA_CI_CARGO_PROFILE" --locked
+    env NOVAROCKS_BUILD_PROFILE="$NOVA_CI_CARGO_PROFILE" cargo build --workspace --profile "$NOVA_CI_CARGO_PROFILE" --locked --target-dir "$normal_target"
+  run_fail_fast_stage "normal binary build information" "normal-build-info.log" \
+    ci_capture_normal_builds "$normal_target" "$NOVA_CI_CARGO_PROFILE" "$CI_RUN_DIR/build-info/normal"
+  run_fail_fast_stage "base controls build" "cargo-build-test-controls.log" \
+    ci_build_base_controls "$(ci_target_directory test-controls)" "$NOVA_CI_CARGO_PROFILE" "$CI_RUN_DIR/build-info/test-controls"
   # The SQL error manifest is a generated whitelist that other tools consume as
   # fact: the sql-test runner include_str!s it and rejects any @expect_sql_code
   # missing from it. A stale manifest therefore does not surface as "this file
@@ -604,9 +613,10 @@ run_cargo_gates() {
   # The manifest path keeps the entry point explicit while Cargo resolves the
   # package through the repository workspace, profile, and committed lock.
   run_fail_fast_stage "SQL error manifest freshness" "error-manifest-check.log" \
-    cargo run --quiet --locked --manifest-path tools/error-manifest/Cargo.toml -- --check
+    env NOVAROCKS_BUILD_PROFILE="$NOVA_CI_CARGO_PROFILE" cargo run --quiet --locked --manifest-path tools/error-manifest/Cargo.toml --profile "$NOVA_CI_CARGO_PROFILE" --target-dir "$normal_target" -- --check
 
   if [ "$SKIP_CARGO_TEST" = "true" ]; then
+    ci_record_stage "test-control owner tests" "SKIP" "0" ""
     ci_record_stage "workspace component tests" "SKIP" "0" ""
     ci_record_stage "server owner tests" "SKIP" "0" ""
     ci_record_stage "server binary smoke" "SKIP" "0" ""
@@ -614,21 +624,28 @@ run_cargo_gates() {
     return 0
   fi
 
-  # Each Cargo target belongs to exactly one stage below, so no test runs
-  # twice and a failure names its own layer:
+  # Ordinary Cargo targets belong to one stage below. Control capabilities
+  # are tested separately with an explicit owner set and target directory:
   #   - component: every workspace member except the server package;
   #   - server owner: the server lib, its bin (`main.rs` carries unit tests)
   #     and the direct-call config/composition target;
   #   - server smoke: the child-process binary target only.
+  run_fail_fast_stage "test-control owner tests" "cargo-test-control-owners.log" \
+    env NOVAROCKS_BUILD_PROFILE="$NOVA_CI_CARGO_PROFILE" cargo test \
+    -p novarocks-failpoint -p novarocks-mv-application -p novarocks-frontend-application \
+    -p novarocks-native-adapter -p novarocks-worker -p novarocks-fs -p novarocks-execution \
+    --lib --features novarocks-failpoint/typed,novarocks-failpoint/test-controls,novarocks-mv-application/test-controls,novarocks-frontend-application/test-controls,novarocks-native-adapter/test-controls,novarocks-worker/test-controls,novarocks-fs/test-controls,novarocks-execution/test-controls \
+    --profile "$NOVA_CI_CARGO_PROFILE" --locked --target-dir "$(ci_target_directory test-controls)" \
+    -- --test-threads=1
   run_fail_fast_stage "workspace component tests" "cargo-test-component.log" \
-    cargo test --workspace --exclude novarocks-server \
-    --profile "$NOVA_CI_CARGO_PROFILE" --locked -- --test-threads=1
+    env NOVAROCKS_BUILD_PROFILE="$NOVA_CI_CARGO_PROFILE" cargo test --workspace --exclude novarocks-server \
+    --profile "$NOVA_CI_CARGO_PROFILE" --locked --target-dir "$normal_target" -- --test-threads=1
   run_fail_fast_stage "server owner tests" "cargo-test-server-owner.log" \
-    cargo test -p novarocks-server --lib --bins --test state_store_app_config \
-    --profile "$NOVA_CI_CARGO_PROFILE" --locked -- --test-threads=1
+    env NOVAROCKS_BUILD_PROFILE="$NOVA_CI_CARGO_PROFILE" cargo test -p novarocks-server --lib --bins --test state_store_app_config \
+    --profile "$NOVA_CI_CARGO_PROFILE" --locked --target-dir "$normal_target" -- --test-threads=1
   run_fail_fast_stage "server binary smoke" "cargo-test-server-smoke.log" \
-    cargo test -p novarocks-server --test server_binary_smoke \
-    --profile "$NOVA_CI_CARGO_PROFILE" --locked -- --test-threads=1
+    env NOVAROCKS_BUILD_PROFILE="$NOVA_CI_CARGO_PROFILE" cargo test -p novarocks-server --test server_binary_smoke \
+    --profile "$NOVA_CI_CARGO_PROFILE" --locked --target-dir "$normal_target" -- --test-threads=1
 }
 
 run_system_scenario_fixture_stage() {
@@ -638,7 +655,7 @@ run_system_scenario_fixture_stage() {
     return 0
   fi
 
-  local binary="target/$NOVA_CI_CARGO_PROFILE/novarocks"
+  local binary="$(ci_novarocks_binary_path "$NOVA_CI_CARGO_PROFILE")"
   local fixture_root="$CI_RUN_DIR/system/fixtures"
   local log_path="$CI_RUN_DIR/system-scenario-fixtures.log"
   local start
@@ -674,7 +691,7 @@ run_system_scenarios_stage() {
     return 0
   fi
 
-  local runner="target/$NOVA_CI_CARGO_PROFILE/novarocks-system-tests"
+  local runner="$(ci_artifact_path "$(ci_target_directory normal)" "$NOVA_CI_CARGO_PROFILE" novarocks-system-tests)"
   local start
   local code
   local duration
@@ -684,6 +701,7 @@ run_system_scenarios_stage() {
   # production-topology layer.
   if [ ! -x "$runner" ] || \
     [ ! -x "$SYSTEM_SCENARIO_PRIMARY_BINARY" ] || \
+    [ ! -x "$SYSTEM_SCENARIO_CONTROL_BINARY" ] || \
     [ ! -x "$SYSTEM_SCENARIO_COMPATIBLE_BINARY" ] || \
     [ ! -x "$SYSTEM_SCENARIO_OTHER_ISLAND_BINARY" ]; then
     ci_record_stage "system scenarios" "FAIL" "0" ""
@@ -701,7 +719,8 @@ run_system_scenarios_stage() {
     "$SYSTEM_SCENARIO_BASE_CONFIG" \
     "$CI_RUN_DIR/system/artifacts" \
     "$SYSTEM_SCENARIO_CLUSTER_SIZE" \
-    "$SYSTEM_SCENARIO_TIMEOUT_SECS"
+    "$SYSTEM_SCENARIO_TIMEOUT_SECS" \
+    "$SYSTEM_SCENARIO_CONTROL_BINARY"
   code=$?
   duration=$(($(ci_epoch) - start))
 
@@ -1073,7 +1092,7 @@ run_sql_suites() {
   local suite_cluster_mode
   local suite_cluster_size
 
-  novarocks_bin="$REPO_ROOT/$(ci_novarocks_binary_path "$NOVA_CI_CARGO_PROFILE")"
+  novarocks_bin="$(ci_novarocks_binary_path "$NOVA_CI_CARGO_PROFILE")"
 
   resolve_suites
   if [ "${#SUITES[@]}" -eq 0 ]; then
@@ -1119,9 +1138,11 @@ run_sql_suites() {
     ci_run_logged "$log_path" \
       env NO_PROXY=127.0.0.1,localhost \
       NOVAROCKS_BIN="$novarocks_bin" \
-      NOVAROCKS_WORKSPACE_ROOT="$REPO_ROOT" \
+      NOVAROCKS_TEST_CONTROL_BIN="$(ci_artifact_path "$(ci_target_directory test-controls)" "$NOVA_CI_CARGO_PROFILE" novarocks)" \
+      NOVAROCKS_BUILD_PROFILE="$NOVA_CI_CARGO_PROFILE" \
       NOVA_ENV_REST_ENV_FILE="$NOVA_ENV_REST_ENV_FILE" \
-      cargo run --manifest-path tests/sql/runner/Cargo.toml --profile "$NOVA_CI_CARGO_PROFILE" --bin novarocks-sql-test -- \
+      NOVAROCKS_WORKSPACE_ROOT="$REPO_ROOT" \
+      cargo run --locked --target-dir "$(ci_target_directory normal)" --manifest-path tests/sql/runner/Cargo.toml --profile "$NOVA_CI_CARGO_PROFILE" --bin novarocks-sql-test -- \
         --config "$NOVAROCKS_SQL_TEST_CONFIG" \
         --suite "$suite" \
         --mode verify \
@@ -1209,7 +1230,7 @@ run_native_cross_process_sql_suites() {
   fi
 
   mkdir -p "$CI_RUN_DIR/sql-native-cross-process"
-  novarocks_bin="$REPO_ROOT/$(ci_novarocks_binary_path "$NOVA_CI_CARGO_PROFILE")"
+  novarocks_bin="$(ci_novarocks_binary_path "$NOVA_CI_CARGO_PROFILE")"
 
   if ! suites_output="$(ci_native_cross_process_suites)"; then
     echo "error: failed to resolve native cross-process SQL suites" >&2
@@ -1261,8 +1282,11 @@ run_native_cross_process_sql_suites() {
     ci_run_logged "$log_path" \
       env NO_PROXY=127.0.0.1,localhost \
       NOVAROCKS_BIN="$novarocks_bin" \
+      NOVAROCKS_TEST_CONTROL_BIN="$(ci_artifact_path "$(ci_target_directory test-controls)" "$NOVA_CI_CARGO_PROFILE" novarocks)" \
+      NOVAROCKS_BUILD_PROFILE="$NOVA_CI_CARGO_PROFILE" \
       NOVA_ENV_REST_ENV_FILE="$NOVA_ENV_REST_ENV_FILE" \
-      cargo run --manifest-path tests/sql/runner/Cargo.toml --profile "$NOVA_CI_CARGO_PROFILE" -- \
+      NOVAROCKS_WORKSPACE_ROOT="$REPO_ROOT" \
+      cargo run --locked --target-dir "$(ci_target_directory normal)" --manifest-path tests/sql/runner/Cargo.toml --profile "$NOVA_CI_CARGO_PROFILE" --bin novarocks-sql-test -- \
         --config "$NOVAROCKS_SQL_TEST_CONFIG" \
         --suite "$suite" \
         --mode verify \

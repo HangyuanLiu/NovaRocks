@@ -28,7 +28,9 @@ use novarocks_local_program::{
     LocalProgram, ProgramExpressionRootSite, ProgramRootInput, StaticExprKind, root_input_layout,
 };
 use novarocks_sql::compiler::SqlPhysicalEmissionMode;
-use novarocks_type_contract::{CompileControlError, CompilePhase, ControlShape, PureCompileControl};
+use novarocks_type_contract::{
+    CompileControlError, CompilePhase, ControlShape, PureCompileControl,
+};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -181,8 +183,8 @@ fn between_actual_after_nullable_case_sparse_sliced_and_empty_three_valued_outpu
 }
 fn original_negate_error() -> String {
     use crate::exec::chunk::{Chunk, ChunkSchema};
-    use novarocks_types::SlotId;
     use crate::exec::expr::{ExprArena, ExprNode, LiteralValue};
+    use novarocks_types::SlotId;
     let data = RecordBatch::try_new(
         Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)])),
         vec![Arc::new(Int64Array::from(vec![i64::MIN]))],

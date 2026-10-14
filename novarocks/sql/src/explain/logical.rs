@@ -167,7 +167,13 @@ fn visit(
                             if aggregate.distinct {
                                 out.write_str("DISTINCT ")?;
                             }
-                            expressions(out, aggregate.source.arguments(), ", ", 0, Some(diagnostic))?;
+                            expressions(
+                                out,
+                                aggregate.source.arguments(),
+                                ", ",
+                                0,
+                                Some(diagnostic),
+                            )?;
                             out.write_char(')')?;
                         }
                         Ok(())
@@ -570,10 +576,7 @@ fn project(
 }
 
 #[cfg(test)]
-pub(super) struct SortItems<'a>(
-    pub &'a [SortItem],
-    pub Option<&'a RenderDiagnostic<'a>>,
-);
+pub(super) struct SortItems<'a>(pub &'a [SortItem], pub Option<&'a RenderDiagnostic<'a>>);
 #[cfg(test)]
 impl fmt::Display for SortItems<'_> {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {

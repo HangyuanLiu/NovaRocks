@@ -15,24 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::mv_recovery::control_plan::{self, FeLaunchIntent};
 use super::mv_uea7::{
-    ManagedMvRestFixture, assert_rows, connect, execute, property, require_property,
-    require_three_backends, select_catalog_and_namespace, status, wait_for_status_phase,
+    ManagedMvRestFixture, assert_rows, execute, property, require_property, require_three_backends,
+    select_catalog_and_namespace, status, wait_for_status_phase,
 };
-use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
 use novarocks_cluster_harness::ServerHandle;
+use novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan;
 use reqwest::blocking::Client;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CATALOG: &str = "uea7_mv_storage";
 const NAMESPACE: &str = "ns";
@@ -54,13 +54,9 @@ impl Scenario for MvStorageContract {
     }
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        let (rest, mut launch) = ManagedMvRestFixture::start(scenario_root, CATALOG)?;
+        let (rest, launch) = ManagedMvRestFixture::start(scenario_root, CATALOG)?;
         let barrier_dir = scenario_root.join("mv-rewrite-final-barrier");
         fs::create_dir_all(&barrier_dir).context("create final MV rewrite barrier directory")?;
-        launch.child_environment.fe.insert(
-            "NOVAROCKS_MVX4_REWRITE_TEST_DIR".to_string(),
-            barrier_dir.to_string_lossy().into_owned(),
-        );
         let mut fixture = self
             .fixture
             .lock()
@@ -71,6 +67,35 @@ impl Scenario for MvStorageContract {
         );
         *fixture = Some(rest);
         Ok(launch)
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        scenario_root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<ClusterTestSessionPlan>> {
+        control_plan::plan(
+            cluster_size,
+            ordinary_binary,
+            controlled_binary,
+            original_deadline,
+            vec![
+                FeLaunchIntent::ObservedMvActions(vec![control_plan::rewrite(
+                    "storage-final-rewrite",
+                    CATALOG,
+                    NAMESPACE,
+                    control_plan::STORAGE_REWRITE_TOKEN,
+                    &scenario_root.join("mv-rewrite-final-barrier"),
+                )]),
+                FeLaunchIntent::Ordinary,
+            ],
+        )
+        .map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -168,9 +193,9 @@ impl Scenario for MvStorageContract {
                 .any(|(line,)| line.contains("rewritten with mv: orders_mv")),
             "EXPLAIN ANALYZE final plan did not select the MV: {analyzed:?}"
         );
-        drop(independent_reader);
+        independent_reader.finish()?;
         require_actual_rewrite_barrier(context)?;
-        drop(conn);
+        conn.finish()?;
 
         context.action("restart FE while preserving the private REST catalog and its MV documents");
         let deadline = context.deadline();
@@ -291,6 +316,14 @@ impl RewriteHold {
         fs::write(&path, "hold\n").with_context(|| format!("create {}", path.display()))?;
         Ok(Self(path))
     }
+
+    fn release(self) -> Result<()> {
+        match fs::remove_file(&self.0) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("release {}", self.0.display())),
+        }
+    }
 }
 
 impl Drop for RewriteHold {
@@ -306,38 +339,29 @@ fn require_actual_rewrite_barrier(context: &mut ScenarioContext) -> Result<()> {
         fs::remove_file(&marker).context("remove stale final MV rewrite marker")?;
     }
     let hold = RewriteHold::create(barrier_dir.join("mvx4-rewrite-hold.trigger"))?;
-    let user = context.mysql_user().to_string();
-    let port = context.mysql_port();
-    let timeout = context.remaining("start actual MV rewrite query")?;
-    let (sender, receiver) = mpsc::sync_channel(1);
-    thread::spawn(move || {
-        let result = (|| -> Result<Vec<(i32, i64)>> {
-            let mut conn = mysql_actor::connect(&user, port, timeout)?;
-            conn.query_drop(format!("SET CATALOG {CATALOG}"))?;
-            conn.query_drop(format!("USE {NAMESPACE}"))?;
-            conn.query("SELECT k1, SUM(v2) FROM orders GROUP BY k1 ORDER BY k1")
-                .context("run query after final MV rewrite selection")
-        })()
-        .map_err(|error| format!("{error:#}"));
-        let _ = sender.send(result);
-    });
-    context.action("wait for actual query to freeze its completed MV plan and read access");
-    while !marker.exists() {
-        match receiver.try_recv() {
-            Ok(result) => {
-                bail!("actual query completed before completed MV plan freeze: {result:?}")
+    let query = match control_plan::ObservedQuery::start(
+        context,
+        CATALOG,
+        NAMESPACE,
+        control_plan::STORAGE_REWRITE_TOKEN,
+    ) {
+        Ok(query) => query,
+        Err(error) => return control_plan::with_cleanup(Err(error), hold.release()),
+    };
+    let phase = (|| -> Result<()> {
+        context.action("wait for actual query to freeze its completed MV plan and read access");
+        while !marker.exists() {
+            if query.is_finished() {
+                bail!("actual query completed before completed MV plan freeze");
             }
-            Err(TryRecvError::Disconnected) => bail!("actual MV query channel closed"),
-            Err(TryRecvError::Empty) => {}
+            context.remaining("wait for actual completed MV plan")?;
+            thread::sleep(Duration::from_millis(100));
         }
-        context.remaining("wait for actual completed MV plan")?;
-        thread::sleep(Duration::from_millis(100));
-    }
-    drop(hold);
-    let rows = receiver
-        .recv_timeout(context.remaining("finish actual MV rewrite query")?)
-        .context("actual MV query did not finish after final target release")?
-        .map_err(anyhow::Error::msg)?;
+        Ok(())
+    })();
+    let released = hold.release();
+    let rows =
+        query.finish_after_release(context, phase, released, "finish actual MV rewrite query")?;
     ensure!(
         rows == [(1, 98_000), (2, 100_000)],
         "actual MV query returned {rows:?}"
@@ -531,4 +555,12 @@ fn documents<'a>(manifest: &'a Value, owner: &str) -> Result<&'a [Value]> {
         .as_array()
         .map(Vec::as_slice)
         .with_context(|| format!("{owner} manifest lacks documents"))
+}
+
+fn connect(context: &mut ScenarioContext) -> Result<crate::actors::mysql::DeadlineConnection> {
+    crate::actors::mysql::connect_until(
+        context.mysql_user(),
+        context.mysql_port(),
+        context.deadline(),
+    )
 }

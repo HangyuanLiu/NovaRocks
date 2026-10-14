@@ -665,7 +665,7 @@ impl TaskExecutionRegistry {
 
     /// Test-only rendezvous on the actual registry mutex. The callback owns
     /// no Worker state and cannot alter a task or context verdict.
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     pub fn with_registry_lock_for_test<T>(&self, callback: impl FnOnce() -> T) -> T {
         let _state = self.state.lock().expect(REGISTRY_LOCK);
         callback()
@@ -4553,7 +4553,9 @@ mod registry_lock_observation_tests {
 mod preparation_snapshot_tests {
     use super::*;
     use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
-    use novarocks_types::{AttemptId, BackendProcessId, FrontendProcessId, QueryId, StageId, TaskId};
+    use novarocks_types::{
+        AttemptId, BackendProcessId, FrontendProcessId, QueryId, StageId, TaskId,
+    };
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::mpsc;
 

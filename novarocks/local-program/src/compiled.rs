@@ -28,10 +28,10 @@ use crate::{
     ProviderLinkError,
 };
 use novarocks_connector_contract::ConnectorWriteRecipe;
-use novarocks_types::SlotId;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, PureCompileControl,
 };
+use novarocks_types::SlotId;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,

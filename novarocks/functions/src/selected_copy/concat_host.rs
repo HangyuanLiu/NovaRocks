@@ -19,10 +19,10 @@
 //! neither merges dictionaries itself nor substitutes MutableArrayData for the
 //! specialized original ListView/Run/Dictionary author. Caller-owned sources
 //! and their actual lease owner are transferred to returned Buffer custody.
-use super::{CopyOperationError, CopyOperationFacts, add};
 use super::child_scratch::ChildScratchVec;
 use super::concat_diagnostic::OriginalConcatDiagnosticFacts;
 use super::take_host::CopyInvoiceTotals;
+use super::{CopyOperationError, CopyOperationFacts, add};
 use crate::aggregate_host_allocator::HostAggregateAllocator;
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::opaque_memory::OpaqueRetainedCharge;

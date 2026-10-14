@@ -18,13 +18,13 @@
 //! Task-owned funding capability and one synchronous Ready continuation.
 //! Observation is not admission. The caller supplies a source-proven workset,
 //! stock, threshold and maintenance budget; this module invents none of them.
+use crate::runtime::query_memory::QueryMemoryBinding;
+use novarocks_memory::attribution::scope::AmbientStepObservation;
 use novarocks_memory::{
     CapacityError, CoverageReceipt, FundingDomain, RequestOutcome, ScopeLease, ShortageReceipt,
     StepReceipt, TeardownError,
 };
-use novarocks_memory::attribution::scope::AmbientStepObservation;
 use std::cell::Cell;
-use crate::runtime::query_memory::QueryMemoryBinding;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::exec::operators) struct KernelMemoryRequest {

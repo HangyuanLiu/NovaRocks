@@ -24,7 +24,9 @@ use arrow::{
     datatypes::DataType,
 };
 use novarocks_constant_contract::{ConstantPolicy, ConstantPool, ConstantValue};
-use novarocks_type_contract::{CompileControlError, CompilePhase, FunctionValueType, PureCompileControl};
+use novarocks_type_contract::{
+    CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
+};
 use std::sync::{Arc, Mutex};
 
 struct Control {

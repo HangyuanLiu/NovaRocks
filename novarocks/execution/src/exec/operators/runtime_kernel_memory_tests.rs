@@ -15,25 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::*;
 use super::super::RuntimeKernelControl;
-use crate::runtime::fragment::runtime_state::{RuntimeStateInputs, build_runtime_state};
+use super::*;
 use crate::runtime::execution_runtime::test_execution_runtime;
+use crate::runtime::fragment::runtime_state::{RuntimeStateInputs, build_runtime_state};
 use crate::runtime::runtime_state::RuntimeState;
 use novarocks_execution_contract::TaskIdentity;
-use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority};
-use novarocks_memory::attribution::{AttributingAllocator, binding};
 use novarocks_memory::attribution::scope::{AmbientEntryObservation, AmbientExitObservation};
+use novarocks_memory::attribution::{AttributingAllocator, binding};
 use novarocks_memory::lane::RecordRef;
+use novarocks_memory::{AccountKind, AuthorityConfig, ExternalRef, MemoryAuthority};
 use novarocks_types::{
     QueryId,
-    identity::{QueryExecutionId, AttemptId, StageId, TaskId, BackendProcessId},
+    identity::{AttemptId, BackendProcessId, QueryExecutionId, StageId, TaskId},
 };
 use std::{
     alloc::{GlobalAlloc, Layout, System},
-    sync::Arc,
-    ptr::NonNull,
     cell::Cell,
+    ptr::NonNull,
+    sync::Arc,
 };
 
 fn execution() -> QueryExecutionId {
@@ -101,6 +101,8 @@ fn by_runtime_memory_ready_actual_task_state_installs_exact_account_without_gran
         execution_runtime: Some(runtime),
         query_memory: Some(binding.clone()),
         task_identity: Some(task),
+        #[cfg(feature = "test-controls")]
+        exchange_test_observer: None,
     })
     .unwrap();
     let before = binding.authority().root().committed_bytes();

@@ -67,6 +67,12 @@ code-anchors:
 
 ## 领域索引
 
+### test-capabilities
+
+领域哲学：普通产品通过真实依赖图排除测试控制；编入的能力仍须经每个实际角色启动的有限授权，准确绑定产品 owner 签发的工作身份。构建事实、权限、控制结束、helper join、角色退出与资源收敛分别取证。共享测试层只提供机械能力，领域解释和生命周期仍属于原 owner。
+
+- [ADR-0174](ADR-0174-test-capabilities-and-finite-role-authorization.md) — 测试控制为何分离编译能力、准确角色启动授权与实际退出（active）
+
 ### runtime-filter
 
 领域哲学：runtime filter 是**纯性能优化**——任何 activation、等待、降级策略都不得改变 SQL 结果语义（RF 是保守预过滤，join 本体兜底）。数据面走 query-global `RuntimeFilterGraph + DeploymentCompiler + Service`；静态层**宁严勿宽**（证明不了安全就在 fragment submission 前 fail-fast），运行时 timeout + PassThrough 只是生产可用性兜底、不是语义权威。planner 与 deployment 双侧独立验证，二者之间不传裸布尔结论。

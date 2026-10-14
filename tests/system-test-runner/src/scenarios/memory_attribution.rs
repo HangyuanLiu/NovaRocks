@@ -17,7 +17,8 @@
 
 //! Native process observation acceptance; query/R1 wiring belongs to later MEM steps.
 use crate::actors::{mysql as mysql_actor, mysql_stream::MysqlStream};
-use crate::scenario::{Scenario, ScenarioContext};
+use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
+use crate::scenarios::query_lifecycle::native_sql_controls::{SqlIntentOwner, StatementSpec};
 use crate::scenarios::{query_lifecycle, task_evidence};
 use anyhow::{Context, Result, ensure};
 use mysql::prelude::Queryable;
@@ -25,17 +26,55 @@ use novarocks_cluster_harness::ServerHandle;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs, thread,
-    time::Duration,
+    fs,
+    path::Path,
+    thread,
+    time::{Duration, Instant},
 };
+const OBSERVATION_QUERIES: [&str; 2] = [
+    "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v",
+    "SELECT SUM(i) FROM TABLE(generate_series(1, 1000)) AS t(i)",
+];
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
-    vec![Box::new(ObservationFamilies)]
+    vec![Box::new(ObservationFamilies::default())]
 }
-struct ObservationFamilies;
+#[derive(Default)]
+struct ObservationFamilies {
+    intent: SqlIntentOwner,
+}
 impl Scenario for ObservationFamilies {
     fn name(&self) -> &'static str {
         "memory-attribution/observation-families"
+    }
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let statements = OBSERVATION_QUERIES
+            .iter()
+            .map(|sql| StatementSpec {
+                sql: (*sql).into(),
+                faults: vec![],
+                observations: (0..cluster_size)
+                    .map(|index| (index, "grpc-fragment", None))
+                    .collect(),
+            })
+            .collect();
+        Ok(Some(self.intent.freeze(
+            statements,
+            &[],
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
     }
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         ensure!(
@@ -48,38 +87,54 @@ impl Scenario for ObservationFamilies {
             "backend observation must come from three independent processes"
         );
         let baseline = query_lifecycle::resource_snapshot(context)?;
-        let mut connection = mysql_actor::connect(
+        let mut connection = mysql_actor::connect_until(
             context.mysql_user(),
             context.mysql_port(),
-            context
-                .remaining("connect memory observation actor")?
-                .min(Duration::from_secs(10)),
+            context.deadline(),
         )?;
-        for (sql, expected) in [
-            (
-                "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v",
-                vec![1, 2],
-            ),
-            (
-                "SELECT SUM(i) FROM TABLE(generate_series(1, 1000)) AS t(i)",
-                vec![500500],
-            ),
-        ] {
-            let previous = query_lifecycle::latest_execution_id(context)?;
-            let rows: Vec<i64> = connection
+        for (ordinal, (sql, expected)) in [
+            (OBSERVATION_QUERIES[0], vec![1, 2]),
+            (OBSERVATION_QUERIES[1], vec![500500]),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let observation =
+                self.intent
+                    .take(ordinal)?
+                    .arm(context, connection.connection_id(), sql)?;
+            let rows: Result<Vec<i64>> = connection
                 .query(sql)
-                .context("execute distributed observation query")?;
-            ensure!(
-                rows == expected,
-                "observation workload returned unexpected rows: {rows:?}"
-            );
-            let terminal = query_lifecycle::await_terminal_snapshot(context, previous.as_deref())?;
-            task_evidence::assert_query_completed_across_boundary(
-                context,
-                &terminal,
-                "memory observation workload",
-            )?;
+                .context("execute distributed observation query");
+            let result = (|| -> Result<()> {
+                let rows = rows?;
+                ensure!(
+                    rows == expected,
+                    "observation workload returned unexpected rows: {rows:?}"
+                );
+                let deadline = context.deadline();
+                let terminal = context
+                    .handle()
+                    .await_query_lifecycle_statement_observation(&observation, true, deadline)?;
+                task_evidence::assert_query_completed_across_boundary(
+                    context,
+                    &terminal,
+                    "memory observation workload",
+                )?;
+                Ok(())
+            })();
+            let cleanup = context
+                .handle()
+                .drain_query_lifecycle_statement_observation(&observation);
+            match (result, cleanup) {
+                (Ok(()), Ok(())) => {}
+                (Err(primary), Err(cleanup)) => {
+                    anyhow::bail!("{primary:#}; memory statement cleanup: {cleanup:#}")
+                }
+                (Err(error), _) | (_, Err(error)) => return Err(error),
+            }
         }
+        connection.finish()?;
         query_lifecycle::await_resource_convergence(context, &baseline)?;
         let stream = MysqlStream::query(
             context.mysql_user(),

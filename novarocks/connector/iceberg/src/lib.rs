@@ -27,17 +27,23 @@
 /// Stable provider identity used by server composition and SPI declarations.
 #[cfg(all(feature = "normal-build", feature = "test-controls"))]
 compile_error!("normal-build cannot include test-controls");
-#[cfg(all(feature = "mem-1-m07-hms-listing-observe", not(feature = "test-controls")))]
+#[cfg(all(
+    feature = "mem-1-m07-hms-listing-observe",
+    not(feature = "test-controls")
+))]
 compile_error!("mem-1-m07-hms-listing-observe requires test-controls");
 
 /// Capabilities compiled by this owner; activation still requires a role session.
 pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
-    (env!("CARGO_PKG_NAME"), &[
-        #[cfg(feature = "test-controls")]
-        "test-controls",
-        #[cfg(feature = "mem-1-m07-hms-listing-observe")]
-        "mem-1-m07-hms-listing-observe",
-    ])
+    (
+        env!("CARGO_PKG_NAME"),
+        &[
+            #[cfg(feature = "test-controls")]
+            "test-controls",
+            #[cfg(feature = "mem-1-m07-hms-listing-observe")]
+            "mem-1-m07-hms-listing-observe",
+        ],
+    )
 }
 
 pub const PROVIDER_ID: &str = "iceberg";
@@ -135,3 +141,6 @@ mod contract_revision;
 #[cfg(test)]
 #[path = "../../../../vendor/iceberg-catalog-hms-0.9.0/src/table_projection.rs"]
 mod hms_table_projection_contract_tests;
+
+#[cfg(feature = "test-controls")]
+pub mod test_observation;

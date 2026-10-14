@@ -36,7 +36,9 @@ use crate::exec::node::analytic::{
     WindowType as RuntimeWindowType,
 };
 use crate::exec::node::assert::{AssertNumRowsMode, Assertion};
-use crate::exec::node::change_event_expand::{ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec};
+use crate::exec::node::change_event_expand::{
+    ChangeEventRuntimeOutputExpr, ChangeEventRuntimeSpec,
+};
 use crate::exec::node::exchange_source::ExchangeSourceNode;
 use crate::exec::node::join::{
     JoinDistributionMode as RuntimeJoinDistributionMode, JoinRuntimeFilterProducerBinding,

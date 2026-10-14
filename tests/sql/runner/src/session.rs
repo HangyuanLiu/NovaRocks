@@ -66,28 +66,65 @@ pub fn mysql_row_to_strings(row: MysqlRow) -> Vec<String> {
 pub struct MysqlSession {
     pub conn: MysqlConn,
     base_config: ConnectionConfig,
+    // Field order keeps the watchdog alive during Conn's COM_QUIT/drop writes.
+    #[cfg(unix)]
+    deadline_owner: Option<crate::socket_deadline::SocketDeadlineOwner>,
 }
 
 impl MysqlSession {
     pub fn new(conn: &ConnectionConfig) -> Result<Self> {
+        Self::create(conn, None)
+    }
+    pub(crate) fn new_with_deadline(
+        conn: &ConnectionConfig,
+        deadline: Option<Instant>,
+    ) -> Result<Self> {
+        #[cfg(not(unix))]
+        if deadline.is_some() {
+            bail!("controlled SQL socket deadlines require Unix");
+        }
+        Self::create(conn, deadline)
+    }
+    fn create(conn: &ConnectionConfig, deadline: Option<Instant>) -> Result<Self> {
         let port = conn
             .port
             .parse::<u16>()
             .with_context(|| format!("invalid mysql port: {}", conn.port))?;
-        let builder = OptsBuilder::new()
+        let mut builder = OptsBuilder::new()
             .ip_or_hostname(Some(conn.host.clone()))
             .tcp_port(port)
             .prefer_socket(false)
             .user(Some(conn.user.clone()))
             .pass(conn.password.clone());
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("SQL connect original deadline expired");
+            }
+            // Before Conn exposes its socket these are finite per-I/O bounds;
+            // they do not certify a cumulative slow-drip handshake deadline.
+            builder = builder
+                .tcp_connect_timeout(Some(remaining))
+                .read_timeout(Some(remaining))
+                .write_timeout(Some(remaining));
+        }
+        let connection = MysqlConn::new(builder).with_context(|| {
+            format!(
+                "failed to establish mysql protocol session to {}:{}",
+                conn.host, conn.port
+            )
+        })?;
+        #[cfg(unix)]
+        let deadline_owner = deadline
+            .map(|deadline| {
+                crate::socket_deadline::SocketDeadlineOwner::duplicate(&connection, deadline)
+            })
+            .transpose()?;
         let mut session = Self {
-            conn: MysqlConn::new(builder).with_context(|| {
-                format!(
-                    "failed to establish mysql protocol session to {}:{}",
-                    conn.host, conn.port
-                )
-            })?,
+            conn: connection,
             base_config: conn.clone(),
+            #[cfg(unix)]
+            deadline_owner,
         };
 
         session.apply_base_context(conn)?;
@@ -95,6 +132,7 @@ impl MysqlSession {
     }
 
     pub fn apply_base_context(&mut self, conn: &ConnectionConfig) -> Result<()> {
+        self.before_operation()?;
         // Align SQL-test sessions with the default dev/test harness so FE planner timeouts do not
         // dominate correctness runs under suite-wide load.
         self.conn
@@ -103,6 +141,7 @@ impl MysqlSession {
         if let Some(catalog) = conn.catalog.as_deref()
             && !catalog.is_empty()
         {
+            self.before_operation()?;
             self.conn
                 .query_drop(format!("SET catalog {}", catalog))
                 .with_context(|| format!("failed to set catalog {}", catalog))?;
@@ -110,6 +149,7 @@ impl MysqlSession {
         if let Some(db) = conn.db.as_deref()
             && !db.is_empty()
         {
+            self.before_operation()?;
             self.conn
                 .query_drop(format!("USE {}", db))
                 .with_context(|| format!("failed to USE {}", db))?;
@@ -123,7 +163,53 @@ impl MysqlSession {
 
     pub fn reconnect(&mut self) -> Result<()> {
         let config = self.base_config.clone();
-        *self = Self::new(&config)?;
+        #[cfg(unix)]
+        let replacement = Self::create(
+            &config,
+            self.deadline_owner.as_ref().map(|owner| owner.deadline()),
+        )?;
+        #[cfg(not(unix))]
+        let replacement = Self::new(&config)?;
+        let original = std::mem::replace(self, replacement);
+        original.finish()
+    }
+    pub(crate) fn original_deadline(&self) -> Option<Instant> {
+        #[cfg(unix)]
+        {
+            self.deadline_owner.as_ref().map(|owner| owner.deadline())
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+    fn wait_retry(&self, delay: Duration) -> Result<()> {
+        self.before_operation()?;
+        let remaining = self
+            .original_deadline()
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        std::thread::sleep(remaining.map_or(delay, |remaining| delay.min(remaining)));
+        self.before_operation()
+    }
+    pub(crate) fn before_operation(&self) -> Result<()> {
+        #[cfg(unix)]
+        if let Some(owner) = &self.deadline_owner {
+            owner.before_operation()?;
+        }
+        Ok(())
+    }
+    pub(crate) fn finish(self) -> Result<()> {
+        let Self {
+            conn,
+            base_config: _,
+            #[cfg(unix)]
+            mut deadline_owner,
+        } = self;
+        drop(conn);
+        #[cfg(unix)]
+        if let Some(owner) = &mut deadline_owner {
+            owner.close_and_join()?;
+        }
         Ok(())
     }
 
@@ -132,6 +218,18 @@ impl MysqlSession {
         query_timeout: u64,
         sql: &str,
         db_override: Option<&str>,
+    ) -> (bool, Option<QueryExecution>, String) {
+        self.execute_query_with_before_submit(query_timeout, sql, db_override, |_, _, _, _| Ok(()))
+    }
+
+    /// The consumer selects a predeclared exact target immediately before each
+    /// real submission. USE and query-timeout setup are not that statement.
+    pub(crate) fn execute_query_with_before_submit(
+        &mut self,
+        query_timeout: u64,
+        sql: &str,
+        db_override: Option<&str>,
+        mut before_submit: impl FnMut(usize, usize, u32, &str) -> Result<()>,
     ) -> (bool, Option<QueryExecution>, String) {
         const MAX_TRANSIENT_ATTEMPTS: usize = 2;
         const TRANSIENT_RETRY_DELAY_MS: u64 = 300;
@@ -142,8 +240,16 @@ impl MysqlSession {
             }
         };
 
+        let original_deadline = self.original_deadline();
         for attempt in 0..MAX_TRANSIENT_ATTEMPTS {
             let started = Instant::now();
+            if let Err(error) = self.before_operation() {
+                return (
+                    false,
+                    None,
+                    format!("SQL transport deadline failed: {error:#}"),
+                );
+            }
             if let Some(db) = db_override
                 && !db.is_empty()
                 && let Err(exc) = self.conn.query_drop(format!("USE {}", db))
@@ -174,6 +280,37 @@ impl MysqlSession {
             let mut failed = None;
 
             for (statement_index, statement) in statements.iter().enumerate() {
+                if let Err(error) = self.before_operation() {
+                    return (
+                        false,
+                        None,
+                        format_statement_failure(
+                            started.elapsed(),
+                            statement_index,
+                            statements.len(),
+                            statement,
+                            &format!("SQL transport deadline failed: {error:#}"),
+                        ),
+                    );
+                }
+                if let Err(error) = before_submit(
+                    attempt,
+                    statement_index,
+                    self.conn.connection_id(),
+                    statement,
+                ) {
+                    return (
+                        false,
+                        None,
+                        format_statement_failure(
+                            started.elapsed(),
+                            statement_index,
+                            statements.len(),
+                            statement,
+                            &format!("runner before-submit control failed: {error:#}"),
+                        ),
+                    );
+                }
                 match self.conn.query_iter(statement) {
                     Ok(mut query_result) => {
                         while let Some(mut result_set) = query_result.iter() {
@@ -186,6 +323,16 @@ impl MysqlSession {
                             let mut rows: Vec<Vec<String>> = Vec::new();
 
                             for row_result in result_set.by_ref() {
+                                if original_deadline
+                                    .is_some_and(|deadline| Instant::now() >= deadline)
+                                {
+                                    failed = Some((
+                                        statement_index,
+                                        "original SQL deadline expired while consuming results"
+                                            .into(),
+                                    ));
+                                    break;
+                                }
                                 match row_result {
                                     Ok(row) => rows.push(mysql_row_to_strings(row)),
                                     Err(exc) => {
@@ -234,7 +381,11 @@ impl MysqlSession {
                 if attempt + 1 < MAX_TRANSIENT_ATTEMPTS
                     && is_transient_iceberg_commit_error(&message)
                 {
-                    std::thread::sleep(Duration::from_millis(TRANSIENT_RETRY_DELAY_MS));
+                    if let Err(error) =
+                        self.wait_retry(Duration::from_millis(TRANSIENT_RETRY_DELAY_MS))
+                    {
+                        return (false, None, format!("SQL retry deadline failed: {error:#}"));
+                    }
                     continue;
                 }
                 let clipped = if message.len() > 500 {
@@ -262,6 +413,13 @@ impl MysqlSession {
                 rows: last_rows,
                 elapsed,
             };
+            if let Err(error) = self.before_operation() {
+                return (
+                    false,
+                    None,
+                    format!("SQL completion deadline failed: {error:#}"),
+                );
+            }
             return (true, Some(execution), String::new());
         }
 
@@ -456,10 +614,25 @@ fn normalize_statement_fragment(fragment: &str) -> Option<String> {
 }
 
 pub fn run_mysql_sql(conn: &ConnectionConfig, query_timeout: u64, sql: &str) -> Result<String> {
-    let mut session = MysqlSession::new(conn)?;
+    run_mysql_sql_until(conn, query_timeout, sql, None)
+}
+
+pub(crate) fn run_mysql_sql_until(
+    conn: &ConnectionConfig,
+    query_timeout: u64,
+    sql: &str,
+    deadline: Option<Instant>,
+) -> Result<String> {
+    let mut session = MysqlSession::new_with_deadline(conn, deadline)?;
     let (ok, execution, message) = session.execute_query(query_timeout, sql, None);
-    if !ok {
-        bail!("mysql protocol command failed: {message}");
+    let cleanup = session.finish();
+    match (ok, cleanup) {
+        (false, Err(cleanup)) => {
+            bail!("mysql protocol command failed: {message}; socket cleanup: {cleanup:#}")
+        }
+        (false, Ok(())) => bail!("mysql protocol command failed: {message}"),
+        (true, Err(cleanup)) => return Err(cleanup.context("MySQL socket cleanup")),
+        (true, Ok(())) => {}
     }
     Ok(execution.map_or_else(String::new, |execution| execution.text_output))
 }
@@ -470,7 +643,16 @@ pub fn execute_suite_hook(
     hook: &SuiteHook,
     label: &str,
 ) -> Result<()> {
-    run_mysql_sql(conn, query_timeout, &hook.sql)
+    execute_suite_hook_until(conn, query_timeout, hook, label, None)
+}
+pub(crate) fn execute_suite_hook_until(
+    conn: &ConnectionConfig,
+    query_timeout: u64,
+    hook: &SuiteHook,
+    label: &str,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    run_mysql_sql_until(conn, query_timeout, &hook.sql, deadline)
         .with_context(|| format!("{} suite hook failed: {}", label, hook.path.display()))?;
     Ok(())
 }
@@ -489,6 +671,7 @@ fn case_table_names(
     conn: &ConnectionConfig,
     query_timeout: u64,
     db_name: &str,
+    deadline: Option<Instant>,
 ) -> Result<Vec<String>> {
     let Some(catalog) = conn.catalog.as_deref() else {
         return Ok(Vec::new());
@@ -497,11 +680,16 @@ fn case_table_names(
         "SELECT table_name FROM `{catalog}`.information_schema.tables \
          WHERE table_schema = '{db_name}';"
     );
-    let output = match run_mysql_sql(conn, query_timeout, &sql) {
+    let output = match run_mysql_sql_until(conn, query_timeout, &sql, deadline) {
         Ok(output) => output,
         // A database that does not exist has no tables to drop, and the drop
         // below is idempotent either way.
-        Err(_) => return Ok(Vec::new()),
+        Err(error) => {
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(error);
+            }
+            return Ok(Vec::new());
+        }
     };
     Ok(output
         .lines()
@@ -518,11 +706,21 @@ pub fn reset_case_database(
     db_name: &str,
     label: &str,
 ) -> Result<()> {
-    drop_case_database(conn, query_timeout, db_name, label)?;
-    run_mysql_sql(
+    reset_case_database_until(conn, query_timeout, db_name, label, None)
+}
+pub(crate) fn reset_case_database_until(
+    conn: &ConnectionConfig,
+    query_timeout: u64,
+    db_name: &str,
+    label: &str,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    drop_case_database_until(conn, query_timeout, db_name, label, deadline)?;
+    run_mysql_sql_until(
         conn,
         query_timeout,
         &format!("CREATE DATABASE `{db_name}`;"),
+        deadline,
     )
     .with_context(|| format!("{} case database reset failed: {}", label, db_name))?;
     Ok(())
@@ -534,22 +732,31 @@ pub fn drop_case_database(
     db_name: &str,
     label: &str,
 ) -> Result<()> {
+    drop_case_database_until(conn, query_timeout, db_name, label, None)
+}
+pub(crate) fn drop_case_database_until(
+    conn: &ConnectionConfig,
+    query_timeout: u64,
+    db_name: &str,
+    label: &str,
+    deadline: Option<Instant>,
+) -> Result<()> {
     // Without a catalog there is nothing to enumerate against, so the explicit
     // path cannot see the children it would need to drop first. Fall back to
     // FORCE, which is what the local catalog still supports and what this did
     // everywhere before enumeration existed.
     if conn.catalog.is_none() {
         let sql = format!("DROP DATABASE IF EXISTS `{db_name}` FORCE;");
-        run_mysql_sql(conn, query_timeout, &sql)
+        run_mysql_sql_until(conn, query_timeout, &sql, deadline)
             .with_context(|| format!("{} case database cleanup failed: {}", label, db_name))?;
         return Ok(());
     }
     let mut sql = String::new();
-    for table in case_table_names(conn, query_timeout, db_name)? {
+    for table in case_table_names(conn, query_timeout, db_name, deadline)? {
         sql.push_str(&format!("DROP TABLE IF EXISTS `{db_name}`.`{table}`;\n"));
     }
     sql.push_str(&format!("DROP DATABASE IF EXISTS `{db_name}`;"));
-    run_mysql_sql(conn, query_timeout, &sql)
+    run_mysql_sql_until(conn, query_timeout, &sql, deadline)
         .with_context(|| format!("{} case database cleanup failed: {}", label, db_name))?;
     Ok(())
 }

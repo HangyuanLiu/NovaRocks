@@ -23,17 +23,23 @@
 
 #[cfg(all(feature = "normal-build", feature = "test-controls"))]
 compile_error!("normal-build cannot include test-controls");
-#[cfg(all(feature = "mem-1-m07-exact-mysql-write", not(feature = "test-controls")))]
+#[cfg(all(
+    feature = "mem-1-m07-exact-mysql-write",
+    not(feature = "test-controls")
+))]
 compile_error!("mem-1-m07-exact-mysql-write requires test-controls");
 
 /// Capabilities compiled by this owner; activation still requires a role session.
 pub const fn compiled_test_capabilities() -> (&'static str, &'static [&'static str]) {
-    (env!("CARGO_PKG_NAME"), &[
-        #[cfg(feature = "test-controls")]
-        "test-controls",
-        #[cfg(feature = "mem-1-m07-exact-mysql-write")]
-        "mem-1-m07-exact-mysql-write",
-    ])
+    (
+        env!("CARGO_PKG_NAME"),
+        &[
+            #[cfg(feature = "test-controls")]
+            "test-controls",
+            #[cfg(feature = "mem-1-m07-exact-mysql-write")]
+            "mem-1-m07-exact-mysql-write",
+        ],
+    )
 }
 
 pub mod api;

@@ -26,6 +26,7 @@ use super::{
 };
 use arrow::datatypes::{DataType, Field, UnionFields, UnionMode};
 use novarocks_proto_models::{physical_type_v2 as wire, plan};
+use novarocks_type_contract::owned_resources::metadata_materialization::MaterializedMetadataMap;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, FunctionValueType, MAX_ARROW_FIELD_METADATA_BYTES,
     MAX_ARROW_FIELD_METADATA_ENTRIES, MAX_ARROW_FIELD_METADATA_KEY_BYTES,
@@ -35,7 +36,6 @@ use novarocks_type_contract::{
 };
 use std::{collections::BTreeMap, sync::Arc};
 use wire::carrier_type_definition::Kind;
-use novarocks_type_contract::owned_resources::metadata_materialization::{MaterializedMetadataMap};
 
 use super::graph::{Index, Node, add, required};
 

@@ -27,6 +27,94 @@ use serde_json::{Value, json};
 use std::time::Duration;
 use std::{sync::Arc, time::Instant};
 
+struct ProbeFixture {
+    probe: Option<Arc<HmsListingProbe>>,
+    role: novarocks_failpoint::liveness::RoleSessionOwner,
+    runner: novarocks_failpoint::liveness::RunnerSession,
+    root: std::path::PathBuf,
+}
+impl std::ops::Deref for ProbeFixture {
+    type Target = HmsListingProbe;
+    fn deref(&self) -> &Self::Target {
+        self.probe.as_ref().expect("authorized test probe").as_ref()
+    }
+}
+impl Drop for ProbeFixture {
+    fn drop(&mut self) {
+        let role_join = self.role.close_and_join();
+        if let Some(probe) = self.probe.take() {
+            probe.close();
+        }
+        let runner_join = self.runner.end_and_join();
+        let cleanup = std::fs::remove_dir_all(&self.root);
+        if std::thread::panicking() {
+            if role_join.is_err() || runner_join.is_err() || cleanup.is_err() {
+                eprintln!(
+                    "HMS test fixture cleanup failed: role_join={} runner_join={} files={}",
+                    role_join.is_err(),
+                    runner_join.is_err(),
+                    cleanup.is_err()
+                );
+            }
+        } else {
+            assert!(
+                role_join.is_ok() && runner_join.is_ok() && cleanup.is_ok(),
+                "HMS test fixture helpers and files must actually exit"
+            );
+        }
+    }
+}
+fn test_probe(catalog_name: &str) -> Result<ProbeFixture, &'static str> {
+    use novarocks_failpoint::{
+        liveness::{PreparedRoleSession, RunnerSession},
+        scope::ProcessBinding,
+        session::{DECLARATION_VERSION, DomainGrant, SessionDeclaration, SessionRole},
+    };
+    use std::os::unix::fs::DirBuilderExt;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let root = std::path::PathBuf::from(format!(
+        "/tmp/g2hmstest-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&root)
+        .unwrap();
+    let declaration = SessionDeclaration {
+        schema_version: DECLARATION_VERSION,
+        session_id: "hms-test".into(),
+        launch_id: "one-launch".into(),
+        role: SessionRole::Fe,
+        lifetime_millis: 30_000,
+        liveness_socket: root.join("live.sock"),
+        handshake_secret: "abcdefghijklmnopqrstuvwxyz0123456789".into(),
+        domain_grants: vec![DomainGrant {
+            domain: HmsListingProbe::DOMAIN.into(),
+            grant_id: "one-observer".into(),
+            parameters: json!({"action":"observe","catalog_name":catalog_name}),
+        }],
+    };
+    let path = root.join("declaration.json");
+    declaration.write_private(&path).unwrap();
+    let prepared = PreparedRoleSession::read_and_claim(&path, SessionRole::Fe).unwrap();
+    let runner = RunnerSession::start(declaration).unwrap();
+    let role = prepared
+        .bind(ProcessBinding::Frontend(
+            novarocks_types::FrontendProcessId::new_v7(),
+        ))
+        .unwrap();
+    let mut fixture = ProbeFixture {
+        probe: None,
+        role,
+        runner,
+        root,
+    };
+    fixture.probe =
+        HmsListingProbe::from_grants(fixture.role.scope().grants_for(HmsListingProbe::DOMAIN))?;
+    Ok(fixture)
+}
+
 fn handle(version: u8) -> CatalogHandle {
     CatalogHandle::new(
         ConnectorInstanceId::parse("hms_test").unwrap(),
@@ -45,7 +133,7 @@ fn attach(probe: &HmsListingProbe, gate: &Arc<ListingAdmission>, epoch: Provider
 
 #[test]
 fn observation_does_not_retain_or_replace_the_original_generation() {
-    let probe = HmsListingProbe::new("HMS_TEST").unwrap();
+    let probe = test_probe("HMS_TEST").unwrap();
     let gate = Arc::new(ListingAdmission::default());
     let weak = Arc::downgrade(&gate);
     let epoch = ProviderBindingEpoch::new();
@@ -89,7 +177,7 @@ fn observation_does_not_retain_or_replace_the_original_generation() {
 
 #[tokio::test]
 async fn actual_pending_call_prevents_reset_until_sdk_and_position_exit() {
-    let probe = HmsListingProbe::new("hms_test").unwrap();
+    let probe = test_probe("hms_test").unwrap();
     let gate = Arc::new(ListingAdmission::default());
     attach(&probe, &gate, ProviderBindingEpoch::new());
     let stop = ConnectorStopOwner::new();
@@ -102,6 +190,7 @@ async fn actual_pending_call_prevents_reset_until_sdk_and_position_exit() {
     .unwrap();
     let call = gate.run_hms(
         &context,
+        gate.active_observer().unwrap(),
         HmsListingOperation::Tables,
         Some([3; 32]),
         |invocation| async move {
@@ -157,7 +246,7 @@ async fn actual_pending_call_prevents_reset_until_sdk_and_position_exit() {
 
 #[tokio::test]
 async fn full_original_journal_fits_finite_export_and_overflow_stays_invalid() {
-    let probe = HmsListingProbe::new("hms_test").unwrap();
+    let probe = test_probe("hms_test").unwrap();
     let gate = Arc::new(ListingAdmission::default());
     attach(&probe, &gate, ProviderBindingEpoch::new());
     let stop = ConnectorStopOwner::new();
@@ -171,6 +260,7 @@ async fn full_original_journal_fits_finite_export_and_overflow_stays_invalid() {
     for _ in 0..1024 {
         gate.run_hms(
             &context,
+            gate.active_observer().unwrap(),
             HmsListingOperation::Tables,
             Some([255; 32]),
             |invocation| async move {
@@ -185,9 +275,13 @@ async fn full_original_journal_fits_finite_export_and_overflow_stays_invalid() {
     assert!(body.capacity() <= RESPONSE_LIMIT);
     let s: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(s["records"].as_array().unwrap().len(), 1024);
-    gate.run_hms(&context, HmsListingOperation::Namespaces, None, |_| async {
-        Ok::<_, ConnectorError>(())
-    })
+    gate.run_hms(
+        &context,
+        gate.active_observer().unwrap(),
+        HmsListingOperation::Namespaces,
+        None,
+        |_| async { Ok::<_, ConnectorError>(()) },
+    )
     .await
     .unwrap();
     assert!(probe.handle_json(br#"{"operation":"snapshot"}"#).is_err());
@@ -196,7 +290,7 @@ async fn full_original_journal_fits_finite_export_and_overflow_stays_invalid() {
 
 #[test]
 fn malformed_requests_cannot_reset_and_foreign_catalog_cannot_attach() {
-    let probe = HmsListingProbe::new("hms_test").unwrap();
+    let probe = test_probe("hms_test").unwrap();
     let gate = Arc::new(ListingAdmission::default());
     let epoch = ProviderBindingEpoch::new();
     let foreign = CatalogHandle::new(
@@ -223,7 +317,7 @@ fn malformed_requests_cannot_reset_and_foreign_catalog_cannot_attach() {
     assert!(probe.handle_json(&vec![b' '; REQUEST_LIMIT + 1]).is_err());
     assert_eq!(snapshot(&probe), before);
     for name in ["", "bad/name", "has space"] {
-        assert!(HmsListingProbe::new(name).is_err());
+        assert!(test_probe(name).is_err());
     }
-    assert!(HmsListingProbe::new(&"a".repeat(65)).is_err());
+    assert!(test_probe(&"a".repeat(65)).is_err());
 }

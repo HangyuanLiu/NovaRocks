@@ -67,9 +67,19 @@ pub struct QueryAttemptReservation {
     execution_id: QueryExecutionId,
     credential_collector: Arc<AttemptCredentialLeaseCollector>,
     request_scope: ConnectorRequestScope,
+    #[cfg(feature = "test-controls")]
+    test_nomination:
+        std::sync::OnceLock<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
 }
 
 impl QueryAttemptReservation {
+    #[cfg(feature = "test-controls")]
+    pub(crate) fn test_statement_nomination(
+        &self,
+    ) -> Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>> {
+        self.test_nomination.get().cloned()
+    }
+
     pub(crate) fn first(
         query_id: QueryId,
     ) -> Result<Self, crate::query_execution::contract::DistributedQueryError> {
@@ -107,6 +117,8 @@ impl QueryAttemptReservation {
             execution_id,
             credential_collector: AttemptCredentialLeaseCollector::new(execution_id),
             request_scope: ConnectorRequestScope::new(),
+            #[cfg(feature = "test-controls")]
+            test_nomination: std::sync::OnceLock::new(),
         })
     }
 
@@ -136,11 +148,29 @@ impl QueryAttemptReservation {
     pub(crate) fn connector_request_context(
         &self,
         context: ConnectorRequestContext,
-    ) -> ConnectorRequestContext {
-        context
+        #[cfg(feature = "test-controls")] nomination: Option<
+            &Arc<novarocks_failpoint::target_binding::StatementWorkNomination>,
+        >,
+    ) -> Result<ConnectorRequestContext, String> {
+        let context = context
             .with_request_scope(self.request_scope.clone())
             .with_storage_resolver(self.credential_storage_resolver())
-            .with_vended_credential_lease_sink(self.credential_lease_sink())
+            .with_vended_credential_lease_sink(self.credential_lease_sink());
+        #[cfg(feature = "test-controls")]
+        if let Some(nomination) = nomination {
+            nomination.validate().map_err(|error| error.to_string())?;
+            if let Err(candidate) = self.test_nomination.set(nomination.clone()) {
+                if self.test_nomination.get() != Some(&candidate) {
+                    return Err("attempt reservation already names another statement".into());
+                }
+            }
+            let installed =
+                context.request_scope_extension_or_insert_with(|| nomination.as_ref().clone());
+            if installed != *nomination {
+                return Err("attempt scope has a foreign statement nomination".into());
+            }
+        }
+        Ok(context)
     }
 
     pub(crate) fn has_collected_credential_leases(&self) -> bool {
@@ -532,9 +562,13 @@ fn complete_profile(
         }
     }
     lines.extend(match formatter.plan {
-        ProfilePlan::Completed { plan, annotations } => {
-            render_completed_profile(&plan, &annotations, &actuals, &per_fragment, &formatter.control)?
-        }
+        ProfilePlan::Completed { plan, annotations } => render_completed_profile(
+            &plan,
+            &annotations,
+            &actuals,
+            &per_fragment,
+            &formatter.control,
+        )?,
     });
     build_string_query_result("Explain String", lines).map(StatementResult::Query)
 }

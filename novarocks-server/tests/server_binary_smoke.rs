@@ -136,6 +136,18 @@ mode = "dynamic-state-store"
 provider = "sqlite"
 cluster_id = "server-binary-smoke"
 path = "{}"
+
+[runtime.frontend_constant_policy]
+max_rows = 1048576
+max_array_nodes = 1048576
+max_logical_elements = 16777216
+max_retained_buffer_bytes = 1073741824
+max_type_depth = 64
+max_type_nodes = 4096
+max_dictionary_depth = 64
+max_metadata_bytes = 1048576
+max_library_validation_work = 1073741824
+max_library_validation_bytes = 4294967296
 "#,
                 log_dir.display(),
                 state_store.display(),
@@ -340,7 +352,7 @@ fn assert_native_rejects_management(port: u16, path: &str) {
 /// idle process, and "present on the FE port" a real leak. Its FE counterpart
 /// `novarocks_backend_registry_entries` is the FE's own view of BE membership,
 /// which the FE publishes for the same reason.
-fn assert_role_scoped_surfaces(pair: &ConfigPair, lifecycle_debug_enabled: bool) {
+fn assert_role_scoped_surfaces(pair: &ConfigPair) {
     const BE_OWNED_FAMILY: &str = "novarocks_backend_task_execution_tasks_created_total";
     const FE_OWNED_FAMILY: &str = "novarocks_backend_registry_entries";
 
@@ -369,16 +381,44 @@ fn assert_role_scoped_surfaces(pair: &ConfigPair, lifecycle_debug_enabled: bool)
     );
 
     let debug_response = http_request(pair.fe_http_port, "POST", LIFECYCLE_DEBUG_PATH);
-    let expected_status = if lifecycle_debug_enabled {
-        "405"
-    } else {
-        "404"
-    };
+    let expected_status = "404";
     assert!(
         debug_response.starts_with(&format!("HTTP/1.1 {expected_status}"))
             || debug_response.starts_with(&format!("HTTP/1.0 {expected_status}")),
         "FE management debug gate expected {expected_status}: {debug_response}"
     );
+    for action in ["arm", "peek", "drain"] {
+        let response = http_request(
+            pair.fe_http_port,
+            "POST",
+            &format!("/v1/diagnostics/preparation/statement/{action}"),
+        );
+        assert!(
+            response.starts_with("HTTP/1.1 404") || response.starts_with("HTTP/1.0 404"),
+            "unauthorized statement diagnostic route {action}: {response}"
+        );
+    }
+    let hms_response = http_request(pair.fe_http_port, "POST", "/debug/hms-listing-observation");
+    assert!(
+        hms_response.starts_with("HTTP/1.1 404") || hms_response.starts_with("HTTP/1.0 404"),
+        "unauthorized HMS observation route: {hms_response}"
+    );
+}
+
+fn assert_grantless_role_output(process: &ManagedProcess, role: &str) {
+    let output = process.log_contents().expect("read original role output");
+    // Keep the actual role output in the test log before ConfigPair drops its temporary files.
+    eprintln!("grantless {role} original process output:\n{output}");
+    for marker in [
+        "NOVAROCKS_MEM_1_M07_ROOT_OBSERVATION_FE",
+        "NOVAROCKS_MEM_1_M07_EXACT_MYSQL_FE",
+        "NOVAROCKS_MEM_1_M07_CLOSING_PRESSURE_FE",
+    ] {
+        assert!(
+            !output.contains(marker),
+            "grantless {role} activated {marker}"
+        );
+    }
 }
 
 fn run_binary(args: &[&str]) -> Output {
@@ -413,12 +453,11 @@ fn assert_rejected(args: &[&str], expected: &str) {
 #[test]
 fn same_config_pair_has_cross_process_and_all_in_one_listener_parity_without_static_membership() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
-    if !binary.exists() {
-        return;
-    }
+    assert!(binary.is_file(), "Cargo-built Server binary must exist");
     let _lock = lock_server_binary_smoke();
     let mut pair = ConfigPair::new();
     let lifecycle_fault_dir = pair.lifecycle_fault_dir.clone();
+    // Legacy environment input must not activate diagnostics in either build kind.
     let frontend_debug_env = [(
         novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV,
         lifecycle_fault_dir.as_path(),
@@ -433,22 +472,25 @@ fn same_config_pair_has_cross_process_and_all_in_one_listener_parity_without_sta
         "NOVAROCKS_READY mysql_port=",
         &frontend_debug_env,
     );
-    assert_role_scoped_surfaces(&pair, true);
+    assert_role_scoped_surfaces(&pair);
     frontend
         .interrupt_and_wait(Duration::from_secs(10))
         .expect("shut down FE cleanly");
     backend
         .interrupt_and_wait(Duration::from_secs(10))
         .expect("shut down BE cleanly");
+    assert_grantless_role_output(&frontend, "FE");
+    assert_grantless_role_output(&backend, "BE");
 
     let mut all_in_one = spawn_all_in_one(&pair, &[]);
-    assert_role_scoped_surfaces(&pair, false);
+    assert_role_scoped_surfaces(&pair);
     all_in_one
         .request_termination()
         .expect("send SIGTERM to all-in-one roles");
     all_in_one
         .wait_for_successful_exit_until(Instant::now() + Duration::from_secs(10))
         .expect("drain and stop all-in-one roles cleanly after SIGTERM");
+    assert_grantless_role_output(&all_in_one, "all-in-one");
 
     for port in [
         pair.fe_mysql_port,
@@ -471,9 +513,7 @@ fn same_config_pair_has_cross_process_and_all_in_one_listener_parity_without_sta
 #[test]
 fn binary_rejects_removed_and_ambiguous_launch_shapes() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
-    if !binary.exists() {
-        return;
-    }
+    assert!(binary.is_file(), "Cargo-built Server binary must exist");
     let _lock = lock_server_binary_smoke();
     let pair = ConfigPair::new();
     let missing_role = write_config(
@@ -488,6 +528,17 @@ fn binary_rejects_removed_and_ambiguous_launch_shapes() {
     );
 
     assert_rejected(&["standalone"], "missing required --role");
+    #[cfg(feature = "normal-build")]
+    assert_rejected(
+        &[
+            "standalone",
+            "--role",
+            "fe",
+            "--test-session",
+            "unread-declaration.json",
+        ],
+        "unknown standalone arg: --test-session",
+    );
     assert_rejected(
         &["standalone", "--role", "fe", "--port", "9030"],
         "--port is not supported",
@@ -550,9 +601,7 @@ fn binary_rejects_removed_and_ambiguous_launch_shapes() {
 #[test]
 fn all_in_one_preflight_conflict_has_no_startup_side_effects() {
     let binary = Path::new(env!("CARGO_BIN_EXE_novarocks"));
-    if !binary.exists() {
-        return;
-    }
+    assert!(binary.is_file(), "Cargo-built Server binary must exist");
     let _lock = lock_server_binary_smoke();
     let mut pair = ConfigPair::new();
     let conflict_port = pair.fe_grpc_port;

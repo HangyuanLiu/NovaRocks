@@ -53,17 +53,16 @@ where
 {
     let mv_storage_observation = Arc::clone(&config.mv_storage_observation);
     let cleanup_timeout = config.serving.frontend_cleanup_timeout;
-    let mut management_server = start_frontend_management_server(&config.management)?;
-    let mut host =
-        match open_frontend_application_for_server(&config.application, data_runtime).await {
-            Ok(host) => host,
-            Err(error) => {
-                let cleanup = management_server
-                    .stop()
-                    .map_err(FrontendApplicationError::server);
-                return combine(Err(error), cleanup);
-            }
-        };
+    let mut host = open_frontend_application_for_server(&config.application, data_runtime).await?;
+    let management = config.management;
+    let mut management_server = match start_frontend_management_server(&management, &host) {
+        Ok(server) => server,
+        Err(error) => {
+            let cleanup =
+                shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;
+            return combine(Err(error), cleanup);
+        }
+    };
     if let Err(error) = management_server.install(&host) {
         let shutdown =
             shutdown_frontend_application_to_convergence(&mut host, cleanup_timeout).await;

@@ -39,6 +39,8 @@ pub mod liveness;
 #[cfg(feature = "test-controls")]
 pub mod scope;
 pub mod session;
+#[cfg(feature = "typed")]
+pub mod target_binding;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -319,10 +321,6 @@ pub fn runner_rfo_kind_names() -> impl Iterator<Item = &'static str> {
         .map(QueryLifecycleFaultKind::file_stem)
 }
 
-pub fn configured_root() -> Option<PathBuf> {
-    std::env::var_os(QUERY_LIFECYCLE_FAULT_DIR_ENV).map(PathBuf::from)
-}
-
 pub fn mv_known_committed_before_projector_cas_trigger_path(root: &Path) -> PathBuf {
     root.join(MV_KNOWN_COMMITTED_BEFORE_PROJECTOR_CAS_TRIGGER)
 }
@@ -495,13 +493,6 @@ pub fn claim_cleanup_fault(root: &Path, kind: CleanupFaultKind) -> Result<bool, 
             trigger.display()
         )),
     }
-}
-
-pub fn claim_configured_cleanup_fault(kind: CleanupFaultKind) -> Result<bool, String> {
-    let Some(root) = std::env::var_os(CLEANUP_FAULT_DIR_ENV) else {
-        return Ok(false);
-    };
-    claim_cleanup_fault(Path::new(&root), kind)
 }
 
 static NEXT_CLAIM: AtomicU64 = AtomicU64::new(1);

@@ -77,6 +77,9 @@ impl RequestAdmission {
 /// to manufacture a later round by modifying an already prepared request.
 #[derive(Clone)]
 pub struct StatementAdmissionContext {
+    #[cfg(feature = "test-controls")]
+    test_statement_nomination:
+        Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
     session: RequestSessionContext,
     role: ClusterRole,
     deadline: Option<Instant>,
@@ -85,6 +88,22 @@ pub struct StatementAdmissionContext {
 }
 
 impl StatementAdmissionContext {
+    #[cfg(feature = "test-controls")]
+    pub fn with_test_statement_nomination(
+        mut self,
+        nomination: Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
+    ) -> Result<Self, String> {
+        if let Some(nomination) = &nomination {
+            nomination.validate().map_err(|error| error.to_string())?;
+        }
+        if self.test_statement_nomination.is_some() && self.test_statement_nomination != nomination
+        {
+            return Err("statement admission already names a different test nomination".into());
+        }
+        self.test_statement_nomination = nomination;
+        Ok(self)
+    }
+
     pub fn new(
         current_catalog: Option<String>,
         current_database: String,
@@ -95,6 +114,8 @@ impl StatementAdmissionContext {
         sql_semantics: novarocks_sql::sql_mode::SqlSemanticSettings,
     ) -> Self {
         Self {
+            #[cfg(feature = "test-controls")]
+            test_statement_nomination: None,
             session: RequestSessionContext::new(
                 current_catalog,
                 current_database,
@@ -146,6 +167,12 @@ impl StatementAdmissionContext {
         let execution = match &self.fold_dependency_observer {
             Some(observer) => execution.with_fold_dependency_observer(Arc::clone(observer)),
             None => execution,
+        };
+        #[cfg(feature = "test-controls")]
+        let execution = {
+            let mut execution = execution;
+            execution.test_statement_nomination = self.test_statement_nomination.clone();
+            execution
         };
         RequestContext::new(self.session.clone(), execution)
     }
@@ -267,6 +294,9 @@ impl QueryResultCapacityBinding {
 /// receive it as a parameter. Those consumers leave with CLS-R3 and CLS-R5.
 #[derive(Clone)]
 pub struct QueryExecutionContext {
+    #[cfg(feature = "test-controls")]
+    test_statement_nomination:
+        Option<Arc<novarocks_failpoint::target_binding::StatementWorkNomination>>,
     result_capacity: Option<QueryResultCapacityBinding>,
     role: ClusterRole,
     topology: BackendTopologySnapshot,
@@ -278,6 +308,29 @@ pub struct QueryExecutionContext {
 }
 
 impl QueryExecutionContext {
+    #[cfg(feature = "test-controls")]
+    pub fn with_test_statement_nomination(
+        mut self,
+        nomination: Arc<novarocks_failpoint::target_binding::StatementWorkNomination>,
+    ) -> Result<Self, String> {
+        nomination.validate().map_err(|error| error.to_string())?;
+        if self
+            .test_statement_nomination
+            .as_ref()
+            .is_some_and(|existing| existing != &nomination)
+        {
+            return Err("admitted context has a foreign statement nomination".into());
+        }
+        self.test_statement_nomination = Some(nomination);
+        Ok(self)
+    }
+    #[cfg(feature = "test-controls")]
+    pub fn test_statement_nomination(
+        &self,
+    ) -> Option<&Arc<novarocks_failpoint::target_binding::StatementWorkNomination>> {
+        self.test_statement_nomination.as_ref()
+    }
+
     pub fn new(
         role: ClusterRole,
         topology: BackendTopologySnapshot,
@@ -293,6 +346,8 @@ impl QueryExecutionContext {
             optimizer_settings.effective_backend_count = Some(topology.targets().len() as f64);
         }
         Self {
+            #[cfg(feature = "test-controls")]
+            test_statement_nomination: None,
             result_capacity: None,
             role,
             topology,
@@ -374,6 +429,15 @@ pub struct RequestContext {
     reason = "Retained for target-specific frontend integration and regression coverage."
 )]
 impl RequestContext {
+    #[cfg(feature = "test-controls")]
+    pub fn with_test_statement_nomination(
+        mut self,
+        nomination: Arc<novarocks_failpoint::target_binding::StatementWorkNomination>,
+    ) -> Result<Self, String> {
+        self.execution = self.execution.with_test_statement_nomination(nomination)?;
+        Ok(self)
+    }
+
     pub fn new(session: RequestSessionContext, execution: QueryExecutionContext) -> Self {
         Self { session, execution }
     }

@@ -283,7 +283,9 @@ pub fn compiled_fragment_sink_assignment(
         StaticSinkProgram::DataStream { branch, .. } => {
             vec![(branch.dest_node_id(), branch.partition_type())]
         }
-        StaticSinkProgram::Result | StaticSinkProgram::RootResult(_) | StaticSinkProgram::Noop => Vec::new(),
+        StaticSinkProgram::Result | StaticSinkProgram::RootResult(_) | StaticSinkProgram::Noop => {
+            Vec::new()
+        }
         StaticSinkProgram::MultiCastDataStream { .. }
         | StaticSinkProgram::SplitDataStream { .. } => {
             return Err(error(

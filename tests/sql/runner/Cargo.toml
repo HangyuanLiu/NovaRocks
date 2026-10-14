@@ -37,6 +37,7 @@ axum = "0.8"
 clap = { version = "4.5", features = ["derive"] }
 mysql.workspace = true
 novarocks-cluster-harness.workspace = true
+novarocks-test-support.workspace = true
 novarocks-failpoint.workspace = true
 novarocks-parser.workspace = true
 novarocks-sql.workspace = true

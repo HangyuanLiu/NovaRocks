@@ -18,8 +18,8 @@
 //! Same actual host as the complete take probes; standalone slice does not
 //! replace original metadata/error authors or assert an upstream grant.
 use super::*;
-use novarocks_functions::selected_copy::slice_copy_in;
 use arrow::buffer::{BooleanBuffer, NullBuffer};
+use novarocks_functions::selected_copy::slice_copy_in;
 
 #[test]
 fn by_copy_original_slice_actual_metadata_grant_and_last_buffer_custody() {
