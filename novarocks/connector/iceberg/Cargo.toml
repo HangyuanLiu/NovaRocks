@@ -28,10 +28,13 @@ workspace = true
 doctest = false
 
 [features]
+normal-build = ["novarocks-fs/normal-build", "novarocks-failpoint?/normal-build"]
+test-controls = ["novarocks-fs/test-controls", "dep:novarocks-failpoint", "novarocks-failpoint/test-controls"]
 # Test fixture observation only; excluded from ordinary/release acceptance.
 mem-1-m07-hms-listing-observe = []
 
 [dependencies]
+novarocks-failpoint = { workspace = true, optional = true }
 anyhow.workspace = true
 base64.workspace = true
 iceberg = "0.11.0"

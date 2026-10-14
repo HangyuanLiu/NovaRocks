@@ -22,7 +22,7 @@
 //!
 //! Because this "bypass the runtime caches and rebuild from the lake" surface
 //! must never exist on a production path, the procedure is guarded behind the
-//! `NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD` environment flag. It is
+//! explicit finite MV domain grants for the current FE launch. It is
 //! wired only through the standalone CALL dispatch and is exercised by the
 //! sql-test runner's `@imv_stateless_rebuild` directive.
 //!
@@ -63,7 +63,6 @@ use novarocks_spi::connector::{
 use novarocks_types::naming::normalize_identifier;
 
 pub const PROCEDURE_NAME: &str = "novarocks_imv_stateless_rebuild";
-const TEST_ENABLE_ENV: &str = "NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD";
 
 /// Fidelity level a stateless rebuild is expected to reconstruct. Mirrors the
 /// sql-test runner's `ImvStatelessLevel`, but is a separate type because the
@@ -96,17 +95,6 @@ impl StatelessLevel {
             Self::Provenance => "provenance",
             Self::Wipe => "wipe",
         }
-    }
-}
-
-/// Pure, race-free guard so tests never touch process env or construct state.
-fn ensure_stateless_rebuild_enabled(flag: Option<&str>) -> Result<(), String> {
-    if flag == Some("1") {
-        Ok(())
-    } else {
-        Err(format!(
-            "{PROCEDURE_NAME} is test-only; set {TEST_ENABLE_ENV}=1 to enable"
-        ))
     }
 }
 
@@ -189,6 +177,7 @@ fn split_table_reference(table: &str, current_database: &str) -> Result<(String,
 pub fn execute_typed_novarocks_imv_stateless_rebuild(
     connector_control: &dyn ConnectorControlResolver,
     readiness: &MvReadinessPort,
+    product: &novarocks_mv_application::service::MvProductService,
     statement: &CallStatement,
     current_database: &str,
     connector_context: ConnectorRequestContext,
@@ -197,20 +186,33 @@ pub fn execute_typed_novarocks_imv_stateless_rebuild(
     else {
         return Ok(None);
     };
-    ensure_stateless_rebuild_enabled(std::env::var(TEST_ENABLE_ENV).ok().as_deref())?;
-    if req.required_level == StatelessLevel::Wipe {
-        readiness
-            .ensure_no_active_publications()
-            .map_err(|error| error.to_string())?;
-    }
-    execute_request_with_context(connector_control, readiness, &req, connector_context).map(Some)
+    let controls = readiness
+        .test_controls()
+        .ok_or("MV test CALL requires explicit authorization")?;
+    let claim = controls.claim_call(
+        &req.catalog,
+        &req.namespace,
+        &req.mv,
+        req.required_level.as_sql(),
+    )?;
+    execute_request_with_context(
+        connector_control,
+        readiness,
+        product,
+        &req,
+        connector_context,
+        claim,
+    )
+    .map(Some)
 }
 
 fn execute_request_with_context(
     connector_control: &dyn ConnectorControlResolver,
     readiness: &MvReadinessPort,
+    product: &novarocks_mv_application::service::MvProductService,
     req: &ImvStatelessRebuildRequest,
     connector_context: ConnectorRequestContext,
+    mut claim: novarocks_failpoint::scope::ActionClaim,
 ) -> Result<StatementResult, String> {
     let instance_id = ConnectorInstanceId::parse(&req.catalog)
         .map_err(|error| format!("parse stateless rebuild catalog identity: {error}"))?;
@@ -231,16 +233,14 @@ fn execute_request_with_context(
     .map_err(|error| format!("load stateless rebuild table metadata: {error}"))?;
     // `wipe` is deliberately not a rebuild level. It proves the exact MV exists
     // in the lake, clears only the closed current Accelerator family, and
-    // returns while the old FE remains alive. The runner must then kill/restart
+    // returns with admission permanently stopped. The runner must then kill/restart
     // that FE; startup observation is the only permitted rebuild path.
     //
     // The existence proof reads the same exact document set used by the
     // non-destructive levels below.
     let documents = observe_current_documents(&exact_lease, &loaded_table, connector_context, req)?;
     if req.required_level == StatelessLevel::Wipe {
-        readiness
-            .wipe_accelerator(uuid::Uuid::now_v7())
-            .map_err(|error| format!("wipe MV Accelerator family: {error}"))?;
+        readiness.wipe_accelerator_for_test(product, uuid::Uuid::now_v7(), &mut claim)?;
         return Ok(StatementResult::Query(build_rebuild_result(
             StatelessLevel::Wipe,
             &hex::encode(documents.definition_revision().as_bytes()),
@@ -253,6 +253,7 @@ fn execute_request_with_context(
         )?));
     }
 
+    claim.record_hit().map_err(|error| error.to_string())?;
     let publication_revision = documents
         .publication_revision()
         .map(|revision| hex::encode(revision.as_bytes()));
@@ -373,19 +374,6 @@ mod tests {
         ast::{MaintenanceStatement, Statement},
         parse,
     };
-
-    #[test]
-    fn guard_rejects_when_flag_absent() {
-        let err = ensure_stateless_rebuild_enabled(None).unwrap_err();
-        assert!(err.contains("test-only"), "unexpected error: {err}");
-        let err = ensure_stateless_rebuild_enabled(Some("0")).unwrap_err();
-        assert!(err.contains("test-only"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn guard_accepts_when_flag_enabled() {
-        assert!(ensure_stateless_rebuild_enabled(Some("1")).is_ok());
-    }
 
     #[test]
     fn available_level_tracks_exact_publication_presence() {

@@ -28,8 +28,10 @@ separate compatibility spreadsheet.
 Pick suites by the engine area a change touches; do not run the whole corpus to
 verify one fix. `--suite all` excludes suites whose manifest declares `explicit_only`;
 these must be named. Ask
-`cargo run --manifest-path tests/sql/runner/Cargo.toml -- --list-suites` for the
+`NOVAROCKS_BUILD_PROFILE=dev-opt cargo run --locked --profile dev-opt --target-dir target/normal --manifest-path tests/sql/runner/Cargo.toml --bin novarocks-sql-test -- --list-suites` for the
 authoritative current list.
+
+列表不启动产品或建立会话。实际运行显式设置普通 `NOVAROCKS_BIN` 和受控 `NOVAROCKS_TEST_CONTROL_BIN`；两者及兼容性变体使用独立 target，可复用已有 owner 管理的缓存根，详见 [SQL 入口](../README.md) 和 [构建选择](../../../docs/guides/development/test-governance.md#构建选择与控制授权)。每个实际角色读取自己的 `--build-info`，保留已知/unknown 与实际退出；路径、profile、feature 编入都不是授权或发布认证。
 
 | Suite | Engine area it exercises | Typical change entry | Extra requirement |
 |---|---|---|---|
@@ -68,7 +70,7 @@ authoritative current list.
 | `paimon` | Read-only Paimon append-only and `deduplicate` PK reads | `novarocks/connector/paimon/**` | `explicit_only`; provisioned external Spark/Paimon fixture |
 | `project` | Projection, cast semantics, arithmetic and string expression edges | `novarocks/execution/src/exec/operators/project_processor.rs`, `novarocks/execution/src/exec/expr/cast.rs` | — |
 | `runtime-filter` | Runtime filter build / probe, bitset filters, value domains | `novarocks/execution/src/runtime_filter/**`, `novarocks/execution/src/exec/operators/runtime_filter/**` | — |
-| `runtime-filter-distributed` | Runtime filters that cross the process boundary | the same paths plus `novarocks/worker/src/**` | — |
+| `runtime-filter-distributed` | Runtime filters that cross the process boundary | the same paths plus `novarocks/worker/src/**` | 内部 statement/native 断言步骤需实际 test-controls 产物与有限观察授权 |
 | `session` | Session and client-compatibility statements | `novarocks/mysql-adapter/**`, `novarocks/query-application/src/**` | — |
 | `set-op` | UNION / INTERSECT / EXCEPT, including NULL and cast behavior | `novarocks/execution/src/exec/operators/setop/**` | — |
 | `sort` | Sort, TopN, ranking, NULL and non-finite float ordering | `novarocks/execution/src/exec/operators/sort/**` | — |
@@ -85,6 +87,23 @@ marked "REST Catalog" also need the REST service. `docker/iceberg-rest/up.sh`
 provides both, while `iceberg-hms` additionally needs `docker/iceberg-hive/up.sh`.
 Suites with their own `README.md` keep the authority on their internals; this
 table only routes a change to the right suite.
+
+这里的 suite 分类不授予产品控制。授权只来自 merge/过滤后的有限步骤：正常 SQL 继续普通产物，内部观察/故障步骤缺能力必须失败，不能省略断言或按整个 MV suite 发 wipe 权。旧 env、`fault-scenario`/`performance` 名称及普通裸测试 CALL 不授予权限。非破坏观察与 wipe 各自独立，未知 `test-capability:` 标签明确拒绝。
+
+### MV 受控过渡与后续迁移
+
+LNP-3A/LNP-3D、`mv-storage-contract` 及现有 system MV 场景保留原 SQL、`.result`、独立 graph 与隔离串行要求；不扩展旧 CALL、`@imv_stateless_rebuild` 或 `@imv_accelerator_wipe_restart`。当前测试擦除是一次实际 FE launch 与整个 MV Accelerator family 的授权，先由 MV owner 停止 admission 并 actual join 后台，不是逐 MV 或 whole-StateStore 删除接口。正常 `mv/state-store-restart` 的保留缓存对照不等同冷恢复。
+
+`mv_storage_contract_shared_document_revisions.sql` query 5/6 的裸 package/provenance CALL 按规则需就近声明 `test-capability:mv-document-observation`，只授权非破坏观察，不授予 wipe，也不消费 wipe 次数。这两步已补齐 tag，并保留原六个普通标签；完整 storage-contract 十个 case 已通过，SQL/expected/oracle 保持原样。验证范围与未运行项见 [G2 验证记录](../../../docs/guides/development/tst-g2-validation-status.md)。
+
+| 唯一后续产品 owner | 必须承接的现有保护 |
+|---|---|
+| 7B3 | LNP-3A、LNP-3D 对应恢复/配置/paused/known-committed/Unknown/迟到提交/管理 case，及 `mv/lake-publication-restart-rebuild`；非聚合冷恢复与管理接续 |
+| 7B4 | spine SUM/COUNT、T/S/P 聚合状态、聚合冷恢复及后续刷新；实际物化结果和独立预期同时保护 |
+| 7B5 | V/S 身份、view 发现/CREATE/DROP、fixture/REST 路由、实际 materialized S 读取/fallback；前序已迁移场景的 V/S 适配 |
+| 7B11 | `mv_rest_document_graph.rs`、`mv_recovery.rs` / `mv_uea7_storage.rs` 的独立文档图与 shared-document-revisions；文档格式切换时成对替换 package/provenance 消费者 |
+
+每个 owner 按自己的 accepted spec/approved plan 取得替代保护后逐项退役，最后消费者退出再删共享载体；不统一推迟到 7B5。G2 只收敛当前控制边界，不新增启动期缓存缺失或管理/擦除 API，不表示这些产品任务已完成。历史私有 exact/held/HMS 完整矩阵缺原输入时标 `NOT_RUN`，不得伪造历史资格；领域变更必跑当前必要保护、显式高成本组由维护者每周手工轮次，默认 dataset/performance 策略保持原有选择。
 
 When a change does not map onto any row, that is a signal about the change, not
 about the table: either it has no SQL-visible behavior (verify it with the

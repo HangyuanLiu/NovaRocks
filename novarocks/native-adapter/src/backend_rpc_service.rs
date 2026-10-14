@@ -49,6 +49,8 @@ pub struct BackendRpcService {
     exchange_data_plane: NativeExchangeDataPlane,
     runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
     control_executor: Arc<NativeControlExecutor>,
+    #[cfg(feature = "test-controls")]
+    test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
 }
 
 impl BackendRpcService {
@@ -73,7 +75,17 @@ impl BackendRpcService {
             ),
             runtime_filter_ingress,
             control_executor,
+            #[cfg(feature = "test-controls")]
+            test_controls: None,
         }
+    }
+    #[cfg(feature = "test-controls")]
+    pub fn with_test_controls(
+        mut self,
+        controls: Arc<crate::test_controls::NativeTestControls>,
+    ) -> Self {
+        self.test_controls = Some(controls);
+        self
     }
 }
 
@@ -268,17 +280,22 @@ impl NovaRocksGrpc for BackendRpcService {
         let ownership = ingress_ownership(&request).ok_or_else(|| {
             tonic::Status::internal("task operation request is missing native ingress ownership")
         })?;
-        #[cfg(debug_assertions)]
-        let hold_token = crate::task_protocol_fault::native_ingress_ordinary_hold_token(&request)?;
-        #[cfg(debug_assertions)]
-        let hold_process = self.heartbeat.process_id();
-        #[cfg(debug_assertions)]
+        #[cfg(feature = "test-controls")]
+        let hold_token = if let Some(controls) = self.test_controls.as_ref() {
+            crate::task_protocol_fault::claim_native_ingress_hold(controls, &request)?
+        } else {
+            None
+        };
+        #[cfg(feature = "test-controls")]
         let hold_deadline = ownership.deadline();
         let timing = TaskIngressTiming::new(ownership.arrival(), ownership.deadline());
         let raw = request.into_inner();
-        #[cfg(debug_assertions)]
-        let registry_hold_token =
-            crate::task_protocol_fault::native_registry_hold_token_for_batch(&raw)?;
+        #[cfg(feature = "test-controls")]
+        let registry_hold_token = if let Some(controls) = self.test_controls.as_ref() {
+            crate::task_protocol_fault::claim_native_registry_hold(controls, &raw)?
+        } else {
+            None
+        };
         let queued_at = Instant::now();
         let response = tokio::task::spawn_blocking(move || {
             crate::backend_metrics::native_blocking_queue_wait(
@@ -286,20 +303,21 @@ impl NovaRocksGrpc for BackendRpcService {
                 queued_at.elapsed(),
             );
             let _ownership = ownership;
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "test-controls")]
             if let Some(token) = hold_token {
                 crate::task_protocol_fault::hold_native_ingress_ordinary_closure(
-                    &token,
-                    hold_process,
+                    token,
                     hold_deadline,
                 )?;
             }
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "test-controls")]
             if let Some(token) = registry_hold_token {
+                let mut token = Some(token);
                 ingress.with_registry_lock_for_test(&mut || {
                     crate::task_protocol_fault::hold_native_registry_lock(
-                        &token,
-                        hold_process,
+                        token.take().ok_or_else(|| {
+                            tonic::Status::internal("Native registry hold callback ran twice")
+                        })?,
                         hold_deadline,
                     )
                 })?;

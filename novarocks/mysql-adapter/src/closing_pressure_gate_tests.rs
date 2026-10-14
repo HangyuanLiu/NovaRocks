@@ -680,7 +680,46 @@ async fn tcp_cut<W: AsyncWrite + Unpin>(
     make: impl FnOnce(tokio::net::tcp::OwnedWriteHalf) -> W,
 ) -> io::Result<()> {
     let original_deadline = Instant::now() + Duration::from_secs(20);
-    let (owner, mut controller) = PressureOwner::new(frontend(), original_deadline)?;
+    let (owner, controller) = PressureOwner::new(frontend(), original_deadline)?;
+    tcp_cut_owned(
+        make,
+        original_deadline,
+        frontend(),
+        Arc::new(owner),
+        &mut TcpCutController::Kernel(controller),
+    )
+    .await
+}
+
+// Both paths borrow the same original TCP actor and independent wire oracle.
+enum TcpCutController {
+    Kernel(PressureController),
+    #[cfg(feature = "test-controls")]
+    Authorized(crate::closing_pressure_fixture::ClosingPressureFixture),
+}
+impl TcpCutController {
+    fn arm(&mut self, frontend: FrontendProcessId) -> io::Result<()> {
+        match self {
+            Self::Kernel(owner) => owner.arm_targets(frontend, inputs()),
+            #[cfg(feature = "test-controls")]
+            Self::Authorized(owner) => owner.arm_targets(frontend, inputs()),
+        }
+    }
+    fn stop(&mut self) {
+        match self {
+            Self::Kernel(owner) => owner.stop(),
+            #[cfg(feature = "test-controls")]
+            Self::Authorized(owner) => owner.stop(),
+        }
+    }
+}
+async fn tcp_cut_owned<W: AsyncWrite + Unpin>(
+    make: impl FnOnce(tokio::net::tcp::OwnedWriteHalf) -> W,
+    original_deadline: Instant,
+    actual_frontend: FrontendProcessId,
+    owner: Arc<PressureOwner>,
+    controller: &mut TcpCutController,
+) -> io::Result<()> {
     let listener =
         tokio::time::timeout_at(original_deadline.into(), TcpListener::bind("127.0.0.1:0"))
             .await
@@ -721,7 +760,7 @@ async fn tcp_cut<W: AsyncWrite + Unpin>(
     let mut scope_owner = None;
     let primary = {
         let mut body = Box::pin(async {
-            controller.arm_targets(frontend(), inputs())?;
+            controller.arm(actual_frontend)?;
             let scope = owner
                 .bind_statement(
                     ClientConnectionToken::new(100, 59).unwrap(),
@@ -1004,4 +1043,247 @@ async fn actual_tcp_scalar_rows_cut_original_drop_and_peer_join() {
 #[tokio::test]
 async fn actual_tcp_vectored_rows_cut_original_drop_and_peer_join() {
     tcp_cut(|writer| writer).await.unwrap();
+}
+
+#[cfg(feature = "test-controls")]
+mod authorization_tests {
+    use super::*;
+    use crate::{
+        closing_pressure_fixture::ClosingPressureFixture,
+        test_fixture_authorization::MysqlFixtureAuthorization,
+    };
+    use novarocks_failpoint::{
+        liveness::{PreparedRoleSession, RunnerSession},
+        scope::ProcessBinding,
+        session::{DECLARATION_VERSION, DomainGrant, SessionDeclaration, SessionRole},
+    };
+    use std::{error::Error, os::unix::fs::DirBuilderExt};
+    use tokio::net::UnixStream;
+
+    #[derive(Debug)]
+    struct OwnedErrors(Vec<io::Error>);
+    impl std::fmt::Display for OwnedErrors {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "authorized pressure owner failures: {}", self.0.len())
+        }
+    }
+    impl Error for OwnedErrors {
+        fn source(&self) -> Option<&(dyn Error + 'static)> {
+            self.0.first().map(|e| e as _)
+        }
+    }
+    #[tokio::test]
+    async fn finite_fe_grant_rows_and_control_eof_do_not_credit_closing_and_helpers_join()
+    -> io::Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let frontend = FrontendProcessId::new_v7();
+        let root = std::path::PathBuf::from(format!("/tmp/nr-pressure-auth-{}", frontend));
+        std::fs::DirBuilder::new().mode(0o700).create(&root)?;
+        let socket = root.join("gate.sock");
+        let path = root.join("declaration.json");
+        let declaration = SessionDeclaration {
+            schema_version: DECLARATION_VERSION,
+            session_id: "pressure-session".into(),
+            launch_id: "pressure-launch".into(),
+            role: SessionRole::Fe,
+            lifetime_millis: 20_000,
+            liveness_socket: root.join("live.sock"),
+            handshake_secret: "abcdefghijklmnopqrstuvwxyz0123456789".into(),
+            domain_grants: vec![DomainGrant {
+                domain: MysqlFixtureAuthorization::DOMAIN.into(),
+                grant_id: "pressure-once".into(),
+                parameters: serde_json::json!({"action":"closing-pressure", "socket":socket,"nonce_hex":"01010101010101010101010101010101"}),
+            }],
+        };
+        declaration.write_private(&path)?;
+        let prepared = PreparedRoleSession::read_and_claim(&path, SessionRole::Fe)?;
+        let mut runner = RunnerSession::start_until(declaration, deadline)?;
+        let mut role = match prepared.bind(ProcessBinding::Frontend(frontend)) {
+            Ok(role) => role,
+            Err(primary) => {
+                let mut failures = vec![primary];
+                if let Err(error) = runner.end_and_join() {
+                    failures.push(error);
+                }
+                return Err(io::Error::other(OwnedErrors(failures)));
+            }
+        };
+        let scope = role.scope().clone();
+        let grants = scope.grants_for(MysqlFixtureAuthorization::DOMAIN);
+        let mut controller = None;
+        let mut expected_disconnect = None;
+        let result = {
+            let primary = async {
+                assert!(MysqlFixtureAuthorization::from_grants(Vec::new())?.is_none());
+                assert!(!socket.exists());
+                let workload = novarocks_workload_control::WorkloadControl::try_new_counted(
+                    novarocks_workload_control::WorkloadConfig::default(),
+                )
+                .map_err(io::Error::other)?
+                .owner;
+                let mut fixture = ClosingPressureFixture::bind_authorized(
+                    MysqlFixtureAuthorization::from_grants(grants.clone())?.unwrap(),
+                    frontend,
+                    workload.observation(),
+                )
+                .map_err(io::Error::other)?;
+                assert!(socket.exists());
+                assert!(
+                    ClosingPressureFixture::bind_authorized(
+                        MysqlFixtureAuthorization::from_grants(grants.clone())?.unwrap(),
+                        frontend,
+                        workload.observation()
+                    )
+                    .is_err()
+                );
+                let cancellation = fixture.control_cancellation().unwrap();
+                assert!(cancellation.deadline() <= deadline);
+                let binding = fixture.listener_binding().map_err(io::Error::other)?;
+                controller = Some(TcpCutController::Authorized(fixture));
+                // Reuse the original actor, actual peer join, wire digest and physical writer destructor oracle.
+                tcp_cut_owned(
+                    |writer| writer,
+                    deadline,
+                    frontend,
+                    Arc::clone(&binding.owner),
+                    controller.as_mut().unwrap(),
+                )
+                .await?;
+                assert_eq!(
+                    scope
+                        .observations()
+                        .iter()
+                        .filter(|o| o.event == "hit")
+                        .count(),
+                    0,
+                    "Rows cutoff alone must never credit the Closing grant"
+                );
+                let TcpCutController::Authorized(fixture) = controller.as_mut().unwrap() else {
+                    unreachable!()
+                };
+                let peer = async {
+                    let mut peer = UnixStream::connect(&socket).await?;
+                    let mut body = b"NRCL65\0\x01".to_vec();
+                    body.push(2);
+                    body.extend_from_slice(&[1; 16]);
+                    body.extend_from_slice(&frontend.to_bytes());
+                    body.extend_from_slice(&1u16.to_le_bytes());
+                    body.push(0);
+                    peer.write_all(&(body.len() as u32).to_le_bytes()).await?;
+                    peer.write_all(&body).await?;
+                    let mut length = [0; 4];
+                    peer.read_exact(&mut length).await?;
+                    let length = u32::from_le_bytes(length) as usize;
+                    if !(10..=4092).contains(&length) {
+                        return Err(io::Error::other("pressure reply exceeded original bound"));
+                    }
+                    let mut reply = vec![0; length];
+                    peer.read_exact(&mut reply).await?;
+                    if &reply[..8] != b"NRCL65\0\x01" || reply[8..10] != [2, 0] {
+                        return Err(io::Error::other("original pressure snapshot refused"));
+                    }
+                    drop(peer); // Real original control EOF, never a fabricated disconnect DTO.
+                    Ok::<_, io::Error>(())
+                };
+                let peer = async {
+                    tokio::time::timeout_at(deadline.into(), peer)
+                        .await
+                        .map_err(|_| error(Failure::Deadline))?
+                };
+                let (control, peer) = tokio::join!(fixture.run_control(), peer);
+                if let Err(primary) = peer {
+                    let mut failures = vec![primary];
+                    if let Err(error) = control {
+                        failures.push(io::Error::other(error));
+                    }
+                    return Err(io::Error::other(OwnedErrors(failures)));
+                }
+                let disconnect =
+                    control.expect_err("control EOF must remain an actual owner failure");
+                let original = disconnect
+                    .source()
+                    .ok_or_else(|| io::Error::other("control disconnect source missing"))?;
+                if !original.to_string().contains("class=Eof") {
+                    return Err(io::Error::other(disconnect));
+                }
+                eprintln!(
+                    "expected original pressure disconnect retained: {disconnect}; original_source={original}"
+                );
+                runner.end_and_join()?;
+                cancellation.cancelled().await;
+                assert!(!cancellation.is_active());
+                drop(binding);
+                expected_disconnect = Some(disconnect);
+                Ok::<_, io::Error>(())
+            };
+            tokio::pin!(primary);
+            poll_fn(|cx| {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    primary.as_mut().poll(cx)
+                })) {
+                    Ok(poll) => poll,
+                    Err(original) => {
+                        Poll::Ready(Err(io::Error::other(OwnedPanic(Mutex::new(original)))))
+                    }
+                }
+            })
+            .await
+        };
+        let mut failures = Vec::new();
+        if let Err(error) = result {
+            failures.push(error);
+        }
+        if let Some(TcpCutController::Authorized(fixture)) = controller.as_mut() {
+            if !failures.is_empty() {
+                fixture.fail_and_stop();
+            }
+            if let Err(error) = fixture.close_control() {
+                failures.push(io::Error::other(error));
+            }
+        }
+        if let Err(error) = runner.end_and_join() {
+            failures.push(error);
+        }
+        scope.wait_closed();
+        if let Err(error) = role.close_and_join() {
+            failures.push(error);
+        }
+        drop(controller);
+        for (event, expected) in [("claimed", 1), ("hit", 0), ("claim-released", 1)] {
+            if scope
+                .observations()
+                .iter()
+                .filter(|o| o.event == event)
+                .count()
+                != expected
+            {
+                failures.push(io::Error::other(format!(
+                    "Rows-only pressure action did not record {expected} {event}"
+                )));
+            }
+        }
+        if socket.exists() || root.join("live.sock").exists() {
+            failures.push(io::Error::other("original pressure owner socket remained"));
+        }
+        if let Err(error) = std::fs::remove_file(runner.process_receipt_path()) {
+            failures.push(error);
+        }
+        if let Err(error) = std::fs::remove_file(path.with_extension("claimed")) {
+            failures.push(error);
+        }
+        if let Err(error) = std::fs::remove_file(path) {
+            failures.push(error);
+        }
+        if let Err(error) = std::fs::remove_dir(root) {
+            failures.push(error);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            if let Some(original) = expected_disconnect {
+                failures.push(io::Error::other(original));
+            }
+            Err(io::Error::other(OwnedErrors(failures)))
+        }
+    }
 }

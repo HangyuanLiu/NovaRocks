@@ -21,7 +21,6 @@ pub mod change_op;
 pub mod chunk;
 pub mod dict_encode;
 pub mod expr;
-pub mod failpoint;
 pub mod fragment;
 pub mod hash_table;
 pub mod hll;

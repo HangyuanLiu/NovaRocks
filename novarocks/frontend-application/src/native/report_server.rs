@@ -27,11 +27,6 @@ use novarocks_native_trust::NativeTrust;
 
 pub(crate) const LIFECYCLE_CONVERGENCE_DEBUG_PATH: &str = "/debug/query-lifecycle/latest";
 
-pub(crate) fn lifecycle_convergence_debug_enabled() -> bool {
-    cfg!(debug_assertions)
-        && std::env::var_os(novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV).is_some()
-}
-
 #[derive(serde::Serialize)]
 struct LifecycleConvergenceDebugSnapshot {
     execution_id: String,

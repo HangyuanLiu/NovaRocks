@@ -183,7 +183,7 @@ pub(crate) fn connector_request_context_for_execution_on_runtime(
     execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     runtime: &tokio::runtime::Handle,
 ) -> Result<ConnectorRequestContext, String> {
-    match execution.deadline() {
+    let context = match execution.deadline() {
         Some(deadline) => query_connector_request_context_on_runtime(
             runtime,
             deadline,
@@ -194,7 +194,15 @@ pub(crate) fn connector_request_context_for_execution_on_runtime(
             Instant::now() + query_expire_duration(query_options),
             execution.cancellation().clone(),
         ),
+    }?;
+    #[cfg(feature = "test-controls")]
+    if let Some(nomination) = execution.test_statement_nomination() {
+        let actual = context.request_scope_extension_or_insert_with(|| nomination.as_ref().clone());
+        if actual != *nomination {
+            return Err("connector execution scope has a foreign statement nomination".into());
+        }
     }
+    Ok(context)
 }
 
 fn query_expire_duration(query_options: Option<&QueryOptions>) -> Duration {

@@ -57,6 +57,8 @@ pub struct FragmentPrepareContext {
     mem_tracker: Option<Arc<MemTracker>>,
     runtime_filter: Option<RuntimeFilterSessionRef>,
     exchange_transmitter: Arc<dyn ExchangeFrameTransmitter>,
+    #[cfg(feature = "test-controls")]
+    exchange_test_observer: Option<Arc<dyn crate::runtime::exchange::TestEventObserver>>,
     result_writer: Arc<dyn FragmentResultWriter>,
     root_result_session: Option<Arc<dyn crate::runtime::fragment::io::RootResultSession>>,
     event_sink: Arc<dyn FragmentEventSink>,
@@ -64,7 +66,6 @@ pub struct FragmentPrepareContext {
     result_identity: Option<novarocks_execution_contract::TaskIdentity>,
     root_sink_dop: Option<i32>,
     group_execution_scan_dop: Option<i32>,
-    debug_exec_node_output: bool,
     execution_runtime: Option<Arc<ExecutionRuntime>>,
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     commit_port: Arc<dyn FragmentCommitPort>,
@@ -814,6 +815,8 @@ impl Default for FragmentPrepareContext {
             runtime_filter: None,
             exchange_transmitter:
                 crate::runtime::fragment::io::exchange::discard_exchange_transmitter(),
+            #[cfg(feature = "test-controls")]
+            exchange_test_observer: None,
             edge_gates: None,
             result_writer: crate::runtime::fragment::io::result::discard_result_writer(),
             event_sink: Arc::new(NoopFragmentEventSink),
@@ -822,7 +825,6 @@ impl Default for FragmentPrepareContext {
             result_identity: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
-            debug_exec_node_output: false,
             execution_runtime: Some(crate::runtime::execution_runtime::test_execution_runtime()),
             query_memory: None,
             commit_port: Arc::new(TestFragmentCommitPort),
@@ -856,6 +858,8 @@ impl FragmentPrepareContext {
             mem_tracker,
             runtime_filter,
             exchange_transmitter,
+            #[cfg(feature = "test-controls")]
+            exchange_test_observer: None,
             result_writer,
             event_sink,
             edge_gates: None,
@@ -864,7 +868,6 @@ impl FragmentPrepareContext {
             result_identity: None,
             root_sink_dop: None,
             group_execution_scan_dop: None,
-            debug_exec_node_output: false,
             execution_runtime: None,
             query_memory: None,
             commit_port: Arc::new(UnavailableFragmentCommitPort),
@@ -886,13 +889,17 @@ impl FragmentPrepareContext {
         self
     }
 
-    pub fn with_execution_runtime(mut self, runtime: Arc<ExecutionRuntime>) -> Self {
-        self.execution_runtime = Some(runtime);
+    #[cfg(feature = "test-controls")]
+    pub fn with_exchange_test_observer(
+        mut self,
+        observer: Option<Arc<dyn crate::runtime::exchange::TestEventObserver>>,
+    ) -> Self {
+        self.exchange_test_observer = observer;
         self
     }
 
-    pub fn with_debug_exec_node_output(mut self, enabled: bool) -> Self {
-        self.debug_exec_node_output = enabled;
+    pub fn with_execution_runtime(mut self, runtime: Arc<ExecutionRuntime>) -> Self {
+        self.execution_runtime = Some(runtime);
         self
     }
 
@@ -976,6 +983,8 @@ impl FragmentPrepareContext {
             mem_tracker,
             runtime_filter: None,
             exchange_transmitter,
+            #[cfg(feature = "test-controls")]
+            exchange_test_observer: None,
             result_writer,
             event_sink,
             edge_gates: None,
@@ -984,7 +993,6 @@ impl FragmentPrepareContext {
             result_identity: None,
             root_sink_dop,
             group_execution_scan_dop,
-            debug_exec_node_output: false,
             execution_runtime: None,
             query_memory: None,
             commit_port: Arc::new(UnavailableFragmentCommitPort),
@@ -1462,6 +1470,8 @@ pub fn prepare_fragment(
             execution_runtime: context.execution_runtime.clone(),
             query_memory: context.query_memory.clone(),
             task_identity: context.result_identity,
+            #[cfg(feature = "test-controls")]
+            exchange_test_observer: context.exchange_test_observer.clone(),
         })
         .map_err(|error| {
             FragmentLaunchError::new(
@@ -1491,7 +1501,7 @@ pub fn prepare_fragment(
         prepare_report_neutral_local_program_pipeline_execution(
             program.local_program(),
             submission.runtime_bindings(),
-            context.debug_exec_node_output,
+            false,
             Duration::from_millis(50),
             sink,
             exchange_bindings,

@@ -48,6 +48,7 @@ pub struct ClosingPressureJointSnapshot {
 }
 
 pub struct ClosingPressureFixture {
+    authorization: Option<Arc<crate::test_fixture_authorization::FixtureActionObservation>>,
     controller: PressureController,
     joins: Arc<MysqlFixtureSessionJoins>,
     binding: Option<ClosingPressureListenerBinding>,
@@ -132,10 +133,41 @@ impl std::error::Error for ClosingPressureFixtureError {
 }
 
 impl ClosingPressureFixture {
+    pub fn bind_authorized(
+        authorization: crate::test_fixture_authorization::MysqlFixtureAuthorization,
+        actual_frontend: FrontendProcessId,
+        original_workload: WorkloadObservationHandle,
+    ) -> Result<Self, ClosingPressureFixtureError> {
+        let (path, nonce, cancellation, claim) = authorization
+            .claim("closing-pressure", actual_frontend)
+            .map_err(|gate| ClosingPressureFixtureError {
+                gate: Some(gate),
+                ..Default::default()
+            })?;
+        let deadline = cancellation
+            .deadline()
+            .min(Instant::now() + std::time::Duration::from_secs(20));
+        let mut fixture =
+            Self::bind_unchecked(path, actual_frontend, nonce, deadline, original_workload)?;
+        let observation = crate::test_fixture_authorization::FixtureActionObservation::new(claim);
+        fixture
+            .binding
+            .as_ref()
+            .expect("unmoved original binding")
+            .owner
+            .install_action_observation(Arc::clone(&observation));
+        fixture.authorization = Some(observation);
+        Ok(fixture)
+    }
+    pub fn control_cancellation(&self) -> Option<novarocks_failpoint::scope::ControlCancellation> {
+        self.authorization
+            .as_ref()
+            .map(|claim| claim.cancellation())
+    }
     pub fn failure_observation(&self) -> ClosingPressureFailureObservation {
         ClosingPressureFailureObservation(Arc::clone(&self.joins))
     }
-    pub fn new(
+    pub(crate) fn new(
         actual_frontend: FrontendProcessId,
         original_absolute_deadline: Instant,
         original_workload: WorkloadObservationHandle,
@@ -147,6 +179,7 @@ impl ClosingPressureFixture {
         )?;
         let joins = Arc::new(MysqlFixtureSessionJoins::for_closing_pressure());
         Ok(Self {
+            authorization: None,
             controller,
             binding: Some(ClosingPressureListenerBinding {
                 owner: Arc::new(owner),
@@ -158,7 +191,7 @@ impl ClosingPressureFixture {
     }
     /// Explicit startup inputs, original FE identity and original workload authority.
     /// This owns the Unix IO; the polled run future only borrows it.
-    pub fn bind(
+    fn bind_unchecked(
         path: std::path::PathBuf,
         actual_frontend: FrontendProcessId,
         nonce: [u8; 16],
@@ -372,7 +405,7 @@ mod startup_source_tests {
         )
         .unwrap()
         .owner;
-        let mut fixture = ClosingPressureFixture::bind(
+        let mut fixture = ClosingPressureFixture::bind_unchecked(
             path.clone(),
             FrontendProcessId::new_v7(),
             [1; 16],

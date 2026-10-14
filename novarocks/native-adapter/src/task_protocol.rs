@@ -62,6 +62,7 @@ use tokio_stream::Stream;
 
 use crate::native_ingress::NativeIngressOwnership;
 use crate::static_package_admission::StaticPackageAdmission;
+#[cfg(feature = "test-controls")]
 use crate::task_protocol_fault;
 use novarocks_worker::{
     AdmissionTicketObservation, CoveredObservationFact, CoveredObservationFrame,
@@ -212,6 +213,11 @@ pub trait TaskObservationReader: Send + Sync {
 /// Role-local authority over the observation channel for one held query
 /// context. The channel and every retained status fact remain role-owned.
 pub trait TaskStatusSubscriptionReader: Send + Sync {
+    #[cfg(feature = "test-controls")]
+    fn test_controls(&self) -> Option<Arc<crate::test_controls::NativeTestControls>> {
+        None
+    }
+
     /// Returns the source only when this role currently holds the exact context.
     fn task_status_source(&self, context: QueryContextRef) -> Option<Arc<TaskStatusSource>>;
 }
@@ -529,7 +535,12 @@ pub fn subscribe_task_status(
             novarocks_task_codec::status::MAX_SUBSCRIPTION_CURSORS,
         )
         .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-    if task_protocol_fault::task_status_subscription_dropped(decoded.context)? {
+    #[cfg(feature = "test-controls")]
+    if if let Some(controls) = reader.test_controls() {
+        task_protocol_fault::task_status_subscription_dropped(&controls, decoded.context)?
+    } else {
+        false
+    } {
         return Ok(Box::pin(tokio_stream::once(Err(
             tonic::Status::unavailable(
                 "runner-owned task status stream dropped after the subscription was established",
@@ -540,6 +551,8 @@ pub fn subscribe_task_status(
         decoded.context,
         decoded.generation.get(),
         covered,
+        #[cfg(feature = "test-controls")]
+        reader.test_controls(),
     )))
 }
 
@@ -835,6 +848,8 @@ fn covered_frame_task_identity(frame: &CoveredObservationFrame) -> Option<TaskId
 /// ordered stream. A selected source frame becomes covered only when this
 /// stream returns it to the transport; periodic bookmarks use the same order.
 struct CoveredTaskStatusSubscription {
+    #[cfg(feature = "test-controls")]
+    test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
     generation: u64,
     position: Arc<CoveredSubscription>,
     wake: Option<Pin<Box<dyn Future<Output = u64> + Send>>>,
@@ -842,13 +857,22 @@ struct CoveredTaskStatusSubscription {
 }
 
 impl CoveredTaskStatusSubscription {
-    fn new(context: QueryContextRef, generation: u64, position: CoveredSubscription) -> Self {
+    fn new(
+        context: QueryContextRef,
+        generation: u64,
+        position: CoveredSubscription,
+        #[cfg(feature = "test-controls")] test_controls: Option<
+            Arc<crate::test_controls::NativeTestControls>,
+        >,
+    ) -> Self {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         context.hash(&mut hasher);
         let stagger = Duration::from_millis(hasher.finish() % 750);
         let first = tokio::time::Instant::now() + Duration::from_millis(250) + stagger;
         Self {
             generation,
+            #[cfg(feature = "test-controls")]
+            test_controls,
             position: Arc::new(position),
             wake: None,
             bookmark_timer: Box::pin(tokio::time::sleep_until(first)),
@@ -924,8 +948,15 @@ impl Stream for CoveredTaskStatusSubscription {
                             "covered observation frame exceeds the native message bound",
                         ))));
                     }
-                    if let Some(task_identity) = task_identity {
-                        task_protocol_fault::task_status_foreign_process(task_identity, &mut wire);
+                    #[cfg(feature = "test-controls")]
+                    if let (Some(task_identity), Some(controls)) =
+                        (task_identity, this.test_controls.as_ref())
+                    {
+                        task_protocol_fault::task_status_foreign_process(
+                            controls,
+                            task_identity,
+                            &mut wire,
+                        );
                     }
                     if let Err(error) = this.position.note_delivered(selected.delivery_id) {
                         return Poll::Ready(Some(Err(tonic::Status::internal(error.to_string()))));
@@ -968,7 +999,7 @@ impl Stream for CoveredTaskStatusSubscription {
 #[tonic::async_trait]
 pub trait TaskExecutionIngress: Send + Sync {
     /// Test-only rendezvous under the actual Worker registry mutex.
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     fn with_registry_lock_for_test(
         &self,
         callback: &mut dyn FnMut() -> Result<(), tonic::Status>,

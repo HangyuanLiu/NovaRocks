@@ -821,6 +821,11 @@ impl LogicalExecutionNativePort for FrontendLogicalExecutionNativePort {
 /// manifest through these handles and cannot reacquire policy from globals.
 #[derive(Clone)]
 pub(crate) struct FrontendNativeLogicalExecutionRuntime {
+    #[cfg(feature = "test-controls")]
+    test_controls: Option<Arc<novarocks_native_adapter::test_controls::NativeTestControls>>,
+    #[cfg(feature = "test-controls")]
+    observations:
+        Option<Arc<novarocks_native_adapter::test_observation_controls::NativeObservationControls>>,
     topology: BackendTopologyService,
     process_observation: BackendProcessObservationService,
     data_runtime: FrontendDataRuntime,
@@ -852,6 +857,19 @@ impl std::fmt::Debug for FrontendNativeLogicalExecutionRuntime {
 }
 
 impl FrontendNativeLogicalExecutionRuntime {
+    #[cfg(feature = "test-controls")]
+    pub(crate) fn with_test_controls(
+        mut self,
+        controls: Arc<novarocks_native_adapter::test_controls::NativeTestControls>,
+        observations: Option<
+            Arc<novarocks_native_adapter::test_observation_controls::NativeObservationControls>,
+        >,
+    ) -> Self {
+        self.test_controls = Some(controls);
+        self.observations = observations;
+        self
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "server composition supplies each independent Native runtime policy"
@@ -872,6 +890,10 @@ impl FrontendNativeLogicalExecutionRuntime {
         >,
     ) -> Self {
         Self {
+            #[cfg(feature = "test-controls")]
+            test_controls: None,
+            #[cfg(feature = "test-controls")]
+            observations: None,
             topology,
             process_observation,
             data_runtime,
@@ -908,6 +930,9 @@ impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
         read: PreparedLogicalRead,
         owner: WorkOwner,
         result_window: Option<novarocks_workload_control::ResultWindowAlias>,
+        #[cfg(feature = "test-controls")] observation: Option<
+            crate::preparation_diagnostics::StatementObservationHandle,
+        >,
     ) -> QueryExecutionFuture {
         let (description, template, options) = read.into_parts();
         if result_window
@@ -959,6 +984,12 @@ impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
             template,
             Arc::clone(&self.runtime.topology),
             factory,
+            #[cfg(feature = "test-controls")]
+            observation,
+            #[cfg(feature = "test-controls")]
+            self.runtime.test_controls.clone(),
+            #[cfg(feature = "test-controls")]
+            self.runtime.observations.clone(),
         );
         let replacement_port = match description.recovery() {
             RecoveryMode::NoRecovery => None,
@@ -1278,7 +1309,9 @@ impl ProductionManifestAttemptProjection {
             ),
         )
         .map_err(projection_message)?;
-        let connector_context = credential_source.connector_request_context(connector_context);
+        let connector_context = credential_source
+            .connector_request_context(connector_context)
+            .map_err(projection_message)?;
         let ProductionRootDelivery::Relayed { window, .. } = &self.delivery;
         let ready = AttemptInitializing::new_governed(
             execution,
@@ -1653,23 +1686,24 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
         let execution_id = inputs.execution_id();
         Box::pin(async move {
             let convergence = self.attempt.converge(cancellation).await;
-            let contributions = self
-                .attempt
-                .round
-                .execution()
-                .released_runtime_filter_contributions();
-            let runtime_filter = if contributions.is_complete() {
-                crate::query_execution::lifecycle_diagnostics::RuntimeFilterTerminalRollupSnapshot::Available(
+            if self.lifecycle_diagnostics.is_enabled() {
+                let contributions = self
+                    .attempt
+                    .round
+                    .execution()
+                    .released_runtime_filter_contributions();
+                let runtime_filter = if contributions.is_complete() {
+                    crate::query_execution::lifecycle_diagnostics::RuntimeFilterTerminalRollupSnapshot::Available(
                     crate::query_execution::runtime_filter_terminal_rollup::rollup_from_release_contributions(
                         contributions.contributions(),
                     ),
                 )
-            } else {
-                crate::query_execution::lifecycle_diagnostics::RuntimeFilterTerminalRollupSnapshot::Unavailable(
+                } else {
+                    crate::query_execution::lifecycle_diagnostics::RuntimeFilterTerminalRollupSnapshot::Unavailable(
                     crate::query_execution::lifecycle_diagnostics::RuntimeFilterTerminalRollupUnavailable::TerminalOutcomesIncomplete,
                 )
-            };
-            self.lifecycle_diagnostics.publish(
+                };
+                self.lifecycle_diagnostics.publish(
                 crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot {
                     execution_id,
                     error_source: None,
@@ -1677,6 +1711,7 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
                     runtime_filter,
                 },
             );
+            }
             convergence
         })
     }
@@ -1720,6 +1755,11 @@ struct SnapshotBoundDormantAttemptOwner<B, I = SnapshotBoundDormantAttemptInputs
 where
     I: RetainedAttemptInputs,
 {
+    #[cfg(feature = "test-controls")]
+    test_placement: Option<(
+        Arc<novarocks_native_adapter::test_controls::NativeTestControls>,
+        novarocks_failpoint::target_binding::StatementWorkNomination,
+    )>,
     dormant_inputs: Option<I>,
     manifest_inputs: Option<I::Manifest>,
     behavior: B,
@@ -1746,6 +1786,8 @@ where
 {
     fn new(inputs: I, behavior: B) -> Self {
         Self {
+            #[cfg(feature = "test-controls")]
+            test_placement: None,
             dormant_inputs: Some(inputs),
             manifest_inputs: None,
             behavior,
@@ -1755,6 +1797,8 @@ where
     #[cfg(test)]
     fn from_manifest(inputs: I::Manifest, behavior: B) -> Self {
         Self {
+            #[cfg(feature = "test-controls")]
+            test_placement: None,
             dormant_inputs: None,
             manifest_inputs: Some(inputs),
             behavior,
@@ -1912,6 +1956,18 @@ impl<B> DormantNativeAttemptOwner for SnapshotBoundDormantAttemptOwner<B>
 where
     B: FrontendDormantAttemptBehavior,
 {
+    #[cfg(feature = "test-controls")]
+    fn test_preferred_backend_process(
+        &self,
+        execution: novarocks_types::QueryExecutionId,
+    ) -> Result<Option<novarocks_types::BackendProcessId>, String> {
+        match &self.test_placement {
+            Some((controls, nomination)) => {
+                controls.preferred_backend_process(nomination, execution)
+            }
+            None => Ok(None),
+        }
+    }
     fn eligible_backends(&self) -> &[novarocks_types::identity::BackendProcessId] {
         self.retained_eligible_backends()
     }
@@ -1952,7 +2008,13 @@ struct FrontendNativeAttemptPreparationState<F> {
     template: PreparedDistributedAttemptTemplate,
     topology: BackendTopologyService,
     dormant_factory: F,
+    #[cfg(feature = "test-controls")]
     observation: Option<crate::preparation_diagnostics::StatementObservationHandle>,
+    #[cfg(feature = "test-controls")]
+    controls: Option<Arc<novarocks_native_adapter::test_controls::NativeTestControls>>,
+    #[cfg(feature = "test-controls")]
+    observations:
+        Option<Arc<novarocks_native_adapter::test_observation_controls::NativeObservationControls>>,
 }
 
 impl<F> std::fmt::Debug for FrontendNativeAttemptPreparationPort<F>
@@ -1974,13 +2036,27 @@ where
         template: PreparedDistributedAttemptTemplate,
         topology: BackendTopologyService,
         dormant_factory: F,
+        #[cfg(feature = "test-controls")] observation: Option<
+            crate::preparation_diagnostics::StatementObservationHandle,
+        >,
+        #[cfg(feature = "test-controls")] controls: Option<
+            Arc<novarocks_native_adapter::test_controls::NativeTestControls>,
+        >,
+        #[cfg(feature = "test-controls")] observations: Option<
+            Arc<novarocks_native_adapter::test_observation_controls::NativeObservationControls>,
+        >,
     ) -> Self {
         Self {
             state: Arc::new(AsyncMutex::new(FrontendNativeAttemptPreparationState {
                 template,
                 topology,
                 dormant_factory,
-                observation: crate::preparation_diagnostics::capture_statement_observation(),
+                #[cfg(feature = "test-controls")]
+                observation,
+                #[cfg(feature = "test-controls")]
+                controls,
+                #[cfg(feature = "test-controls")]
+                observations,
             })),
         }
     }
@@ -2009,11 +2085,9 @@ where
                 }
                 state = state.lock() => state,
             };
+            #[cfg(feature = "test-controls")]
             if let Some(observation) = &state.observation {
-                crate::preparation_diagnostics::bind_observed_attempt(
-                    observation,
-                    request.execution(),
-                );
+                observation.bind_attempt(request.execution());
             }
             // A failed attempt can be replaced on the same live processes once
             // its exact contexts are fenced. Qualification, not a topology
@@ -2025,13 +2099,58 @@ where
                 &cancellation,
             )
             .await?;
-            bind_query_lifecycle_fault_scopes(request.execution(), &snapshot).map_err(|error| {
-                attempt_failure(
-                    AttemptFailureClass::ContractViolation,
-                    QueryExecutionErrorKind::InvalidRequest,
-                    error,
-                )
-            })?;
+            #[cfg(feature = "test-controls")]
+            if let Some(nomination) = state
+                .observation
+                .as_ref()
+                .and_then(|handle| handle.nomination())
+            {
+                for target in snapshot.targets() {
+                    let process = target.process_id().map_err(|error| {
+                        attempt_failure(
+                            AttemptFailureClass::ContractViolation,
+                            QueryExecutionErrorKind::InvalidRequest,
+                            error.to_string(),
+                        )
+                    })?;
+                    let binding = (|| -> Result<(), String> {
+                        if let Some(controls) = &state.controls {
+                            controls.publish_nominated_binding(
+                                &nomination,
+                                process,
+                                request.execution(),
+                            )?;
+                        }
+                        if let Some(observations) = &state.observations {
+                            for action in [
+                                "grpc-fragment",
+                                "reader-marker",
+                                "writer-marker",
+                                "catalog-materialization",
+                                "catalog-lifecycle",
+                                "exchange-snapshot",
+                                "catalog-hold",
+                                "catalog-failure",
+                            ] {
+                                observations.publish_nominated_binding(
+                                    action,
+                                    &nomination,
+                                    process,
+                                    request.execution(),
+                                )?;
+                            }
+                        }
+                        Ok(())
+                    })();
+                    binding.map_err(|error| {
+                        attempt_failure(
+                            AttemptFailureClass::ContractViolation,
+                            QueryExecutionErrorKind::InvalidRequest,
+                            error,
+                        )
+                    })?;
+                }
+            }
             state
                 .dormant_factory
                 .register_candidate(request.execution(), &snapshot)?;
@@ -2053,6 +2172,17 @@ where
                     })?;
             let behavior = state.dormant_factory.create()?;
             let owner = SnapshotBoundDormantAttemptOwner::new(inputs, behavior);
+            #[cfg(feature = "test-controls")]
+            let owner = {
+                let mut owner = owner;
+                owner.test_placement = state.controls.clone().zip(
+                    state
+                        .observation
+                        .as_ref()
+                        .and_then(|handle| handle.nomination()),
+                );
+                owner
+            };
             request
                 .bind(scheduling, owner)
                 .map_err(NativeAttemptPreparationError::from)
@@ -2126,64 +2256,6 @@ fn capture_attempt_topology(
             format!("failed to capture Native attempt topology: {error}"),
         )
     })
-}
-
-/// Bind every runner-armed lifecycle fault to the exact attempt and immutable
-/// backend generations that this Native preparation captured. This belongs at
-/// the process adapter, not Query Application: the fault files are test-only
-/// process instrumentation and are not a logical query capability.
-#[cfg(debug_assertions)]
-fn bind_query_lifecycle_fault_scopes(
-    execution_id: novarocks_types::QueryExecutionId,
-    snapshot: &novarocks_query_application::api::BackendTopologySnapshot,
-) -> Result<(), String> {
-    use novarocks_failpoint::{QueryLifecycleFaultKind, bind_armed_fault};
-
-    let Some(root) = novarocks_failpoint::configured_root() else {
-        return Ok(());
-    };
-    let attempt = novarocks_proto_codec::lifecycle::AttemptId::new(execution_id.attempt_id().get())
-        .map_err(|error| error.to_string())?;
-    let protocol_execution_id =
-        novarocks_proto_codec::lifecycle::QueryExecutionId::new(execution_id.query_id(), attempt)
-            .map_err(|error| error.to_string())?;
-    for target in snapshot.targets() {
-        let backend_index = target.backend_idx();
-        let process_id = target.process_id().map_err(|error| error.to_string())?;
-        // Bind the manifest-wide set instead of naming individual kinds. A
-        // new runner arm must become reachable through this adapter by default.
-        for kind in QueryLifecycleFaultKind::ALL {
-            if let Some(scope) = bind_armed_fault(
-                &root,
-                kind,
-                protocol_execution_id,
-                backend_index,
-                process_id,
-            )
-            .map_err(|error| error.to_string())?
-            {
-                eprintln!(
-                    "NOVAROCKS_QUERY_FAULT_BOUND kind={} execution_id={}:{}:{} backend_index={} process_id={} token={}",
-                    kind.file_stem(),
-                    execution_id.query_id().high(),
-                    execution_id.query_id().low(),
-                    execution_id.attempt_id().get(),
-                    scope.backend_index,
-                    scope.process_id,
-                    scope.token
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(debug_assertions))]
-fn bind_query_lifecycle_fault_scopes(
-    _execution_id: novarocks_types::QueryExecutionId,
-    _snapshot: &novarocks_query_application::api::BackendTopologySnapshot,
-) -> Result<(), String> {
-    Ok(())
 }
 
 fn attempt_failure(

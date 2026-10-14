@@ -618,19 +618,6 @@ impl SplitAssignmentDriver {
                         error_kind = "retryable_network",
                         "retrying task update after unknown outcome"
                     );
-                    if cfg!(debug_assertions)
-                        && std::env::var_os("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER")
-                            .is_some()
-                    {
-                        eprintln!(
-                            "NOVAROCKS_TASK_UPDATE_RETRY backend={} finst={:x}:{:x} attempt={} elapsed_ms={}",
-                            current.target.backend_idx,
-                            current.request.fragment_instance_id().high(),
-                            current.request.fragment_instance_id().low(),
-                            current.retryable_attempts,
-                            started.elapsed().as_millis(),
-                        );
-                    }
                     current.next_attempt_at = Some(now + current.backoff.min(remaining));
                     current.backoff = current
                         .backoff
@@ -816,19 +803,6 @@ impl SplitAssignmentDriver {
                         error_kind = "retryable_network",
                         "retrying task update after unknown outcome"
                     );
-                    if cfg!(debug_assertions)
-                        && std::env::var_os("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER")
-                            .is_some()
-                    {
-                        eprintln!(
-                            "NOVAROCKS_TASK_UPDATE_RETRY backend={} finst={:x}:{:x} attempt={} elapsed_ms={}",
-                            target.backend_idx,
-                            request.fragment_instance_id().high(),
-                            request.fragment_instance_id().low(),
-                            retryable_attempts,
-                            started.elapsed().as_millis(),
-                        );
-                    }
                     if self.stop.wait_backoff(wait) {
                         return Err(TaskUpdateTransportError::closed(
                             "split assignment round stopped during task update retry",

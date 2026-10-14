@@ -16,6 +16,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/build_capabilities.sh"
+
 
 ci_load_stable_suites() {
   local manifest="$1"
@@ -77,7 +79,9 @@ ci_discover_sql_suites() {
     selection_args=(--suite all)
   fi
 
-  cargo run --quiet \
+  ci_validate_build_environment || return $?
+  env NOVAROCKS_BUILD_PROFILE="${NOVA_CI_CARGO_PROFILE:-dev-opt}" \
+  cargo run --quiet --locked --target-dir "$(ci_target_directory normal "$repo_root")" \
     --manifest-path "$repo_root/tests/sql/runner/Cargo.toml" \
     --profile "${NOVA_CI_CARGO_PROFILE:-dev-opt}" \
     --bin novarocks-sql-test -- --list-suites "${selection_args[@]}"

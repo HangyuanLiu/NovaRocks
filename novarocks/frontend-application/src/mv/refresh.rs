@@ -17,8 +17,6 @@
 //! Frontend execution of a lake-authoritative MV publication.
 
 use std::sync::Arc;
-#[cfg(debug_assertions)]
-use std::time::{Duration, Instant};
 
 use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
 use crate::query_execution::mv_assembly::refresh_artifact::PreparedMvMetadataOnlyWrite;
@@ -52,6 +50,8 @@ pub(super) struct FrontendMvRefreshDependencies {
     pub(super) query_execution: QueryExecutionService,
     pub(super) connector_control: Arc<dyn ConnectorControlRegistry>,
     pub(super) provider_activation: Arc<dyn MvRefreshProviderActivation>,
+    #[cfg(feature = "test-controls")]
+    pub(super) test_controls: Option<Arc<crate::mv::test_controls::MvTestControls>>,
 }
 
 pub(super) fn execute(
@@ -231,6 +231,13 @@ fn execute_data(
     context: ConnectorRequestContext,
     execution: &QueryExecutionContext,
 ) -> Result<FrontendKnownCommittedPublication, MvApplicationError> {
+    #[cfg(feature = "test-controls")]
+    let control_target = (
+        finalize.target.catalog.clone().unwrap_or_default(),
+        finalize.target.database.clone(),
+        finalize.target.name.clone(),
+    );
+
     if prepared.operation_id() != attempt.write_operation_id() {
         return Err(invalid(
             "SQL-prepared MV write does not use its Lake publication identity",
@@ -261,7 +268,8 @@ fn execute_data(
         .map_err(MvApplicationError::from_compile)?;
     let outcome = dispatch_data_write(dependencies, assembly, execution, &context)?;
     let authority = write_commit_authority(outcome.into_write_session())?;
-    if let Err(error) = wait_for_mv_recovery_phase(MvRecoveryPhase::DataPrepared) {
+    #[cfg(feature = "test-controls")]
+    if let Err(error) = wait_for_mv_recovery_phase(dependencies, &control_target, "data-prepared") {
         crate::query_execution::mv_assembly::iceberg_activation::release_mv_write_session_without_commit(
             authority.session(), &context,
         );
@@ -300,7 +308,8 @@ fn execute_data(
         .provider_activation
         .interpret_write_commit(intent, &receipt)
         .map_err(invalid)?;
-    wait_for_mv_recovery_phase(MvRecoveryPhase::WriteCommitted)?;
+    #[cfg(feature = "test-controls")]
+    wait_for_mv_recovery_phase(dependencies, &control_target, "write-committed")?;
     let publication_version = committed.committed_version().clone();
     let published = MvRefreshPublicationFinalizationFacts::try_new(
         committed.intent().clone(),
@@ -315,7 +324,8 @@ fn execute_data(
     // The publication is committed and its facts are frozen; only the
     // frontend's own projection is still missing. A single target commit makes
     // this the one window between the external effect and the record of it.
-    wait_for_mv_recovery_phase(MvRecoveryPhase::PublicationCommitted)?;
+    #[cfg(feature = "test-controls")]
+    wait_for_mv_recovery_phase(dependencies, &control_target, "publication-committed")?;
     let snapshot_id = published
         .publication_version()
         .snapshot_id()
@@ -332,6 +342,8 @@ fn execute_data(
             storage_rows,
         },
         published,
+        #[cfg(feature = "test-controls")]
+        test_controls: dependencies.test_controls.clone(),
     })
 }
 
@@ -480,6 +492,13 @@ fn execute_metadata_only(
     admitted: &mut crate::mv::domain::staged_create::AdmittedMvDataPublication,
     context: ConnectorRequestContext,
 ) -> Result<FrontendKnownCommittedPublication, MvApplicationError> {
+    #[cfg(feature = "test-controls")]
+    let control_target = (
+        finalize.target.catalog.clone().unwrap_or_default(),
+        finalize.target.database.clone(),
+        finalize.target.name.clone(),
+    );
+
     let intent = prepared.publication_intent().clone();
     if intent.publication_id() != attempt.publication_id {
         return Err(invalid(
@@ -524,7 +543,8 @@ fn execute_metadata_only(
         .provider_activation
         .interpret_write_commit(intent, &receipt)
         .map_err(invalid)?;
-    wait_for_mv_recovery_phase(MvRecoveryPhase::WriteCommitted)?;
+    #[cfg(feature = "test-controls")]
+    wait_for_mv_recovery_phase(dependencies, &control_target, "write-committed")?;
     let published = MvRefreshPublicationFinalizationFacts::try_new(
         committed.intent().clone(),
         committed.committed_version().clone(),
@@ -535,7 +555,8 @@ fn execute_metadata_only(
         namespace: finalize.target.database.into(),
         table: finalize.target.name.into(),
     };
-    wait_for_mv_recovery_phase(MvRecoveryPhase::PublicationCommitted)?;
+    #[cfg(feature = "test-controls")]
+    wait_for_mv_recovery_phase(dependencies, &control_target, "publication-committed")?;
     let snapshot_id = published
         .publication_version()
         .snapshot_id()
@@ -552,6 +573,8 @@ fn execute_metadata_only(
             storage_rows,
         },
         published,
+        #[cfg(feature = "test-controls")]
+        test_controls: dependencies.test_controls.clone(),
     })
 }
 
@@ -561,6 +584,8 @@ fn execute_metadata_only(
 struct FrontendKnownCommittedPublication {
     install: PublishedProjectionInstall,
     published: MvRefreshPublicationFinalizationFacts,
+    #[cfg(feature = "test-controls")]
+    test_controls: Option<Arc<crate::mv::test_controls::MvTestControls>>,
 }
 
 /// Everything the projection install needs, retained past the statement scope
@@ -585,12 +610,23 @@ impl MvRefreshKnownCommittedPort for FrontendKnownCommittedPublication {
 
     fn project_known_committed(
         self: Box<Self>,
-        _target: &ProductMvTarget,
+        target: &ProductMvTarget,
     ) -> Result<(), MvProviderFailure> {
         let attempt = self.published.intent().publication_id();
-        wait_for_known_committed_before_projector_cas(&attempt).map_err(|error| {
-            MvProviderFailure::new(MvProviderFailureKind::Unavailable, error.to_string())
-        })?;
+        #[cfg(feature = "test-controls")]
+        if let Some(controls) = &self.test_controls {
+            controls
+                .known_committed(
+                    self.install.table.instance_id.as_str(),
+                    &self.install.table.namespace,
+                    &self.install.table.table,
+                    &attempt,
+                )
+                .map_err(|error| {
+                    MvProviderFailure::new(MvProviderFailureKind::Unavailable, error)
+                })?;
+        }
+        let _ = target;
         let install = self.install;
         install
             .activation
@@ -637,115 +673,17 @@ fn product_error(error: MvProductError) -> MvApplicationError {
         .with_compile_control(error.compile_control_error())
 }
 
-/// Debug-only runner seam for the two durable MV recovery windows that are
-/// observable around the publication fence. Production builds never block on
-/// this filesystem trigger, and debug deployments do so only when the runner
-/// has supplied the exact fault root and trigger file.
-#[derive(Clone, Copy)]
-enum MvRecoveryPhase {
-    DataPrepared,
-    WriteCommitted,
-    PublicationCommitted,
-}
-
-#[cfg(debug_assertions)]
-impl MvRecoveryPhase {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::DataPrepared => "data-prepared",
-            Self::WriteCommitted => "write-committed",
-            Self::PublicationCommitted => "publication-committed",
-        }
-    }
-}
-
-#[cfg(debug_assertions)]
-fn wait_for_mv_recovery_phase(phase: MvRecoveryPhase) -> Result<(), MvApplicationError> {
-    let Some(root) = novarocks_failpoint::configured_root() else {
-        return Ok(());
-    };
-    let phase = phase.as_str();
-    let trigger = root.join(format!("mv-refresh-at-{phase}.trigger"));
-    let contents = match std::fs::read_to_string(&trigger) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(unavailable(format!(
-                "read runner-owned MV recovery trigger {}: {error}",
-                trigger.display()
-            )));
-        }
-    };
-    let mut fields = contents.lines().filter_map(|line| line.split_once('='));
-    let Some(("token", token)) = fields.next() else {
-        return Err(invalid("MV recovery trigger has no token"));
-    };
-    if token.is_empty() || fields.next().is_some() {
-        return Err(invalid("MV recovery trigger has invalid contents"));
-    }
-    eprintln!("NOVAROCKS_MV_RECOVERY_PHASE phase={phase} token={token}");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while trigger.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    if trigger.exists() {
-        return Err(unavailable(format!(
-            "timed out waiting for runner-owned MV recovery barrier at phase {phase}"
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(not(debug_assertions))]
-fn wait_for_mv_recovery_phase(_phase: MvRecoveryPhase) -> Result<(), MvApplicationError> {
-    Ok(())
-}
-
-/// Debug-only runner seam: the lake publication is known committed and its
-/// immutable package has been read, but the Accelerator projector has not yet
-/// entered its CAS. This is deliberately not a query-lifecycle phase.
-#[cfg(debug_assertions)]
-fn wait_for_known_committed_before_projector_cas(
-    publication_id: &novarocks_spi::connector::LakePublicationId,
+#[cfg(feature = "test-controls")]
+fn wait_for_mv_recovery_phase(
+    dependencies: &FrontendMvRefreshDependencies,
+    target: &(String, String, String),
+    phase: &str,
 ) -> Result<(), MvApplicationError> {
-    let Some(root) = novarocks_failpoint::configured_root() else {
-        return Ok(());
-    };
-    let trigger = novarocks_failpoint::mv_known_committed_before_projector_cas_trigger_path(&root);
-    if !trigger.exists() {
-        return Ok(());
+    if let Some(controls) = &dependencies.test_controls {
+        controls
+            .recovery(&target.0, &target.1, &target.2, phase)
+            .map_err(unavailable)?;
     }
-    let marker = novarocks_failpoint::mv_known_committed_before_projector_cas_marker_path(&root);
-    let contents = format!(
-        "publication_id={}\nphase=known-committed-before-projector-cas\n",
-        publication_id.as_uuid()
-    );
-    std::fs::write(&marker, contents).map_err(|error| {
-        unavailable(format!(
-            "write runner-owned MV projector barrier marker {}: {error}",
-            marker.display()
-        ))
-    })?;
-    eprintln!(
-        "NOVAROCKS_MV_PROJECTOR_PHASE publication_id={} phase=known-committed-before-projector-cas action=kill_fe",
-        publication_id.as_uuid()
-    );
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while trigger.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    if trigger.exists() {
-        return Err(unavailable(
-            "timed out waiting for runner-owned MV projector barrier release",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(debug_assertions))]
-fn wait_for_known_committed_before_projector_cas(
-    _publication_id: &novarocks_spi::connector::LakePublicationId,
-) -> Result<(), MvApplicationError> {
     Ok(())
 }
 

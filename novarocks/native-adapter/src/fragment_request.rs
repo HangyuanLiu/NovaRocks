@@ -76,6 +76,12 @@ impl NativeFragmentRequest {
         exchange_wait: std::time::Duration,
         typed_scan_runtime: Option<novarocks_worker::TypedScanRuntime>,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+        #[cfg(feature = "test-controls")] test_controls: Option<
+            Arc<crate::test_controls::NativeTestControls>,
+        >,
+        #[cfg(feature = "test-controls")] observation_controls: Option<
+            Arc<crate::test_observation_controls::NativeObservationControls>,
+        >,
     ) -> Result<Self, NativeFragmentIngressError> {
         let decoded = decode_fragment_submission(
             &fragment,
@@ -85,6 +91,10 @@ impl NativeFragmentRequest {
             exchange_wait,
             typed_scan_runtime,
             function_catalog,
+            #[cfg(feature = "test-controls")]
+            test_controls,
+            #[cfg(feature = "test-controls")]
+            observation_controls,
         )
         .map_err(NativeFragmentIngressError::new)?;
         let (submission, backend_num) = decoded.into_parts();
@@ -260,6 +270,10 @@ mod tests {
                 novarocks_sql::compiler::build_builtin_engine_function_catalog()
                     .expect("builtin function catalog"),
             ),
+            #[cfg(feature = "test-controls")]
+            None,
+            #[cfg(feature = "test-controls")]
+            None,
         )
         .expect("decode values request through backend ingress");
 

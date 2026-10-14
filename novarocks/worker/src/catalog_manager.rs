@@ -66,7 +66,9 @@ impl ConnectorExecutionRoleBindingFactorySet {
     pub fn bind(
         &self,
         properties: &CatalogProperties,
-        emit_materialization_marker: bool,
+        #[cfg(feature = "test-controls")] observation: Option<
+            Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>,
+        >,
     ) -> Result<ConnectorExecutionRoleBinding, ConnectorMaterializationError> {
         let normalized =
             NormalizedCatalogProperties::try_new(properties.clone()).map_err(|detail| {
@@ -84,11 +86,12 @@ impl ConnectorExecutionRoleBindingFactorySet {
             ));
         };
         let binding = factory.bind(&normalized)?;
-        if emit_materialization_marker {
-            println!(
+        #[cfg(feature = "test-controls")]
+        if let Some(observer) = observation {
+            observer.observe(&format!(
                 "NOVAROCKS_CATALOG_RUNTIME_MATERIALIZED catalog={:?}",
                 properties.handle()
-            );
+            ));
         }
         Ok(binding)
     }

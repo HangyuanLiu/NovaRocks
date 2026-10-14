@@ -69,6 +69,11 @@ pub struct TaskRuntimeFilterFeedbackEgress {
     /// their first reduction would both call it version one. The frontend's
     /// cursor is per task, so the version has to be per task as well.
     next_version: AtomicU64,
+    #[cfg(feature = "test-controls")]
+    test_controls: Option<std::sync::Arc<crate::test_controls::NativeTestControls>>,
+    #[cfg(feature = "test-controls")]
+    observation_controls:
+        Option<std::sync::Arc<crate::test_observation_controls::NativeObservationControls>>,
 }
 
 impl TaskRuntimeFilterFeedbackEgress {
@@ -77,7 +82,31 @@ impl TaskRuntimeFilterFeedbackEgress {
             carrier,
             reporter,
             next_version: AtomicU64::new(DomainVersion::FIRST.get()),
+            #[cfg(feature = "test-controls")]
+            test_controls: None,
+            #[cfg(feature = "test-controls")]
+            observation_controls: None,
         }
+    }
+
+    #[cfg(feature = "test-controls")]
+    pub fn with_observation_controls(
+        mut self,
+        controls: Option<
+            std::sync::Arc<crate::test_observation_controls::NativeObservationControls>,
+        >,
+    ) -> Self {
+        self.observation_controls = controls;
+        self
+    }
+
+    #[cfg(feature = "test-controls")]
+    pub fn with_test_controls(
+        mut self,
+        controls: std::sync::Arc<crate::test_controls::NativeTestControls>,
+    ) -> Self {
+        self.test_controls = Some(controls);
+        self
     }
 
     pub const fn carrier(&self) -> TaskIdentity {
@@ -98,20 +127,25 @@ impl BackendFrontendFeedbackSink for TaskRuntimeFilterFeedbackEgress {
         // stream's feedback sink used to claim it. A claim left behind on the
         // retired carrier is armed and unconsumed: the query succeeds
         // untouched and the case waits out its budget.
-        let outcome = if crate::task_protocol_fault::force_feedback_unavailable(self.carrier) {
+        #[cfg(feature = "test-controls")]
+        let outcome = if self.test_controls.as_ref().is_some_and(|controls| {
+            crate::task_protocol_fault::force_feedback_unavailable(controls, self.carrier)
+        }) {
             BackendFrontendFeedbackOutcome::ProducerUnavailable
         } else {
             outcome
         };
-        let deployment_epoch =
-            if crate::task_protocol_fault::forge_feedback_foreign_attempt(self.carrier) {
-                // Any epoch but this attempt's. Wrapping keeps it a legal u64
-                // rather than saturating onto a value the frontend could still
-                // read as the active attempt.
-                deployment_epoch.wrapping_add(1)
-            } else {
-                deployment_epoch
-            };
+        #[cfg(feature = "test-controls")]
+        let deployment_epoch = if self.test_controls.as_ref().is_some_and(|controls| {
+            crate::task_protocol_fault::forge_feedback_foreign_attempt(controls, self.carrier)
+        }) {
+            // Any epoch but this attempt's. Wrapping keeps it a legal u64
+            // rather than saturating onto a value the frontend could still
+            // read as the active attempt.
+            deployment_epoch.wrapping_add(1)
+        } else {
+            deployment_epoch
+        };
         let (kind, payload) = match &outcome {
             BackendFrontendFeedbackOutcome::CanonicalDomain(domain) => (
                 filter::RuntimeFilterEnvelopeKind::DegradedLogical,
@@ -138,7 +172,10 @@ impl BackendFrontendFeedbackSink for TaskRuntimeFilterFeedbackEgress {
         };
         let query_id = self.carrier.query_execution_id().query_id();
         let mut schema_digest = publication.contract_digest().to_vec();
-        if crate::task_protocol_fault::corrupt_feedback_contract_digest(self.carrier) {
+        #[cfg(feature = "test-controls")]
+        if self.test_controls.as_ref().is_some_and(|controls| {
+            crate::task_protocol_fault::corrupt_feedback_contract_digest(controls, self.carrier)
+        }) {
             // One bit, not a truncation: the frontend refuses a digest of the
             // wrong width before it ever compares one, so a shortened digest
             // would exercise the decoder instead of the contract fence.
@@ -189,7 +226,13 @@ impl BackendFrontendFeedbackSink for TaskRuntimeFilterFeedbackEgress {
             );
             return;
         }
-        emit_advertised_marker(self.carrier, channel_id, version);
+        #[cfg(feature = "test-controls")]
+        emit_advertised_marker(
+            self.observation_controls.as_deref(),
+            self.carrier,
+            channel_id,
+            version,
+        );
     }
 }
 
@@ -198,16 +241,27 @@ impl BackendFrontendFeedbackSink for TaskRuntimeFilterFeedbackEgress {
 /// It fires at the publication, not where the sink is installed: a marker
 /// logged at install time would say only that a carrier exists, which is
 /// exactly the defect this loop had.
+#[cfg(feature = "test-controls")]
 fn emit_advertised_marker(
+    controls: Option<&crate::test_observation_controls::NativeObservationControls>,
     carrier: TaskIdentity,
     channel_id: RuntimeFilterChannelId,
     version: DomainVersion,
 ) {
-    if !crate::debug_environment::debug_emit_connector_reader_marker() {
+    let Some(controls) = controls else { return };
+    if !controls.owns_backend(carrier.backend_process_id()) {
         return;
     }
+    let observer = match controls.observation_for("reader-marker", carrier.query_execution_id()) {
+        Ok(Some(observer)) => observer,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("Native filter observation rejected: {error}");
+            return;
+        }
+    };
     let execution = carrier.query_execution_id();
-    println!(
+    observer.observe(&format!(
         "NOVAROCKS_TASK_DYNAMIC_FILTER_ADVERTISED execution_id={}:{}:{} stage={} task={} channel={} version={}",
         execution.query_id().high(),
         execution.query_id().low(),
@@ -216,7 +270,7 @@ fn emit_advertised_marker(
         carrier.task_id().get(),
         channel_id.get(),
         version.get(),
-    );
+    ));
     let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 

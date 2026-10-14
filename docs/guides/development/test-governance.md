@@ -97,11 +97,46 @@ PY_CREATE
 
 | 写出端/材料 | 当前能表达的事实 | 尚不能由它单独证明、后续责任 |
 |---|---|---|
-| system [scenario.rs `write_evidence`](../../../tests/system-test-runner/src/scenario.rs) → 场景根 `scenario-evidence.json` | `scenario`、`command`、开始/结束时间、`source_revision/source_dirty/source_tree_sha256`、runner identity/路径、Cargo.lock hash、平台、`actions/phase_observations`、runtime/binary/config 路径及 config hash、`cluster_size`、`launch_profile`、进程 launch identities、有效配置及 hash、`outcome/exit_code`、失败 diagnostics；当前 schema 5 | `launch_profile` 是 harness 的 `fault-scenario/performance` 配置，不是 Cargo profile。binary 路径与 runner identity 不证明各 FE/BE 实际能力。字段不保证每个阶段均被观察或此次已运行。G2 补实际构建自报；各领域补缺少的性质/退出观察。 |
+| system [scenario.rs `write_evidence`](../../../tests/system-test-runner/src/scenario.rs) → 场景根 `scenario-evidence.json` | `scenario`、`command`、开始/结束时间、`source_revision/source_dirty/source_tree_sha256`、runner identity/路径、Cargo.lock hash、平台、`actions/phase_observations`、runtime/binary/config 路径及 config hash、`cluster_size`、`launch_profile`、进程 launch identities、有效配置及 hash、`outcome/exit_code`、失败 diagnostics；当前 schema 5 | `launch_profile` 是 harness 的 `fault-scenario/performance` 配置，不是 Cargo profile。binary 路径与 runner identity 不证明各 FE/BE 实际能力；实际 role-build-information 单独保留。字段不保证每个阶段均被观察或此次已运行，各领域仍须提供性质/退出观察。 |
 | system [runner.rs `run_one`](../../../tests/system-test-runner/src/runner.rs) → stdout/stderr、场景 evidence 与 runtime/log 根 | 选择由 registry/`--only` 决定；失败保留材料、动作、诊断和 rerun 命令。正常路径先检查 cluster shutdown 与 fixture teardown，追加 cleanup action，再写 Passed；失败路径先写 Failed，随后处理 cleanup 错误 | evidence 的 `exit_code` 按 outcome 合成 0/1，不是每个子进程退出码。Failed 写出时尚未完成 cleanup；cleanup 出错或启动失败可能缺最终 evidence，须保留 runner 原始错误与实际退出事实。打印的旧 rerun 根不能直接复用，复跑换新根。现有 G6b/领域链路承接隔离与终态缺口。 |
 | CI [logging.sh `ci_render_summary`](../../../tools/ci/lib/logging.sh) → `CI_SUMMARY` | 外层传入的 Status、开始/结束/耗时、Repo/Branch/Commit/Run dir、runtime/SQL config 与 MySQL port；stage、system scenario、SQL suite/case rows 的原生 status/耗时/log/artifact；可选 blocked、SQL failure classification、failure tail | summary 是外层记录的汇总，未写入的行不能补为通过；Commit 不等于二进制来源或能力，config 路径不证明有效配置。状态不代替实际进程退出/清理日志、不可变判据引用或共享保留。G2 补构建事实；实际 CI/领域 owner 与 G6b 保留运行边界；共享历史服务尚未交付。 |
 
-构建身份的当前来源见 [version/build.rs](../../../novarocks/version/build.rs)：`NOVAROCKS_NATIVE_BUILD_IDENTITY` 显式字符串或完整 Git commit，以及短 hash/full commit/time；未自报实际传递依赖合并的能力、profile 和有效编译设置。G2 交付前记录当前可确认的构建材料与缺口，不能从源码 HEAD、target 路径、文件名或 identity 推定“未编入测试能力”。G2 能力/profile 自报与正式发布门控未交付前仍为未知；本文没有实现该机制。
+Native build identity 仍由 [version/build.rs](../../../novarocks/version/build.rs) 提供，不是能力或发布认证。实际产物的 `--build-info` 由 [Server build_information](../../../novarocks-server/src/build_information.rs) 与两 runner 各自写出；owner 能力来自实际 crate 的编译事实，binary 的 `actual_cfg` 与 build-script 的 package 局部事实分列。未声明 profile、不可观测的最终 LTO/codegen/dependency overrides/额外 flags 保留 null/unknown；不能从源码 HEAD、target 路径、文件名、identity 或 runner profile 补造。`release_certification` 明确为 `not-certified-by-self-report`，字段存在不证明 G2 全部验收通过。
+
+## 构建选择与控制授权
+
+[CI build_capabilities](../../../tools/ci/lib/build_capabilities.sh) 复用既有 Cargo 构建入口，普通、控制和兼容性变体各用独立 target。默认 `target/normal`、`target/test-controls`、`target/variants`，可通过 `NOVA_CI_NORMAL_TARGET_DIR`、`NOVA_CI_CONTROL_TARGET_DIR`、`NOVA_CI_VARIANT_TARGET_DIR` 指向已有 owner 管理的缓存；三根不能相同或互相包含。缓存复用不意味着证据根复用，不覆盖普通 binary 后再恢复，也不以清理缓存解决产物选择。
+
+CI 支持 `dev`、`dev-opt`、`release`，默认 `NOVA_CI_CARGO_PROFILE=dev-opt`；每次构建同时显式传 `--profile` 和 `NOVAROCKS_BUILD_PROFILE`。实际 `--build-info` 在无 config/fixture 时读取并先保存原始双流与退出，随后校验本次已声明的 kind/profile/capability/identity；未知事实不被补成构建参数。受支持 flags 检查与实际 cfg 校验是当前构建约束，不能认证所有依赖的最终设置。
+
+普通 Rust workspace 测试保持普通构建。full CI 的 `test-control owner tests` 单独显式选择 failpoint（含 `typed`）、MV、FE、Native、Worker、fs、Execution 七 owner 的 `--lib`，使用 control target 和原 profile，串行运行；不能同次选择普通 Server 或用 `--workspace --all-features` 合并两种身份。`--skip-cargo-test` 记录此组为 SKIP，不能据此宣称机制保护通过。HMS/MySQL 的旧 feature 专属模块另选各 owner，不包含在基础七包覆盖内，例如：
+
+```bash
+NOVAROCKS_BUILD_PROFILE=dev-opt cargo test -p novarocks-connector-iceberg --lib \
+  --features test-controls,mem-1-m07-hms-listing-observe --profile dev-opt --locked \
+  --target-dir "$NOVA_CI_VARIANT_TARGET_DIR/hms" -- --test-threads=1
+NOVAROCKS_BUILD_PROFILE=dev-opt cargo test -p novarocks-mysql-adapter --lib \
+  --features test-controls,mem-1-m07-exact-mysql-write --profile dev-opt --locked \
+  --target-dir "$NOVA_CI_VARIANT_TARGET_DIR/exact-mysql" -- --test-threads=1
+NOVAROCKS_BUILD_PROFILE=dev-opt cargo test -p novarocks-mysql-adapter --lib \
+  --features test-controls,mem-1-m07-closing-pressure --profile dev-opt --locked \
+  --target-dir "$NOVA_CI_VARIANT_TARGET_DIR/closing" -- --test-threads=1
+```
+
+上述变量须先绑定真实、互斥的 owned cache，命令本身不是已运行证据。历史私有 exact/held/HMS 完整矩阵没有原输入时记录 `NOT_RUN`，不制造历史 SHA/receipt；局部 owner 测试、授权动作/退出与完整矩阵分开表达。
+
+System 使用实际 `--binary`、`--ordinary-binary`、`--test-control-binary`；兼容性场景冻结用户选中的各角色变体，CI 明确选择 controls Primary，ordinary 独立保留。SQL 使用 `NOVAROCKS_BIN` 与 `NOVAROCKS_TEST_CONTROL_BIN`，从实际选中的有限步骤生成必要授权；feature、路径、debug/profile、FaultScenario 名称及旧 env 不授予动作权。普通步骤继续普通产物，需要内部断言的步骤缺能力就失败，不能静默省略断言。裸测试 CALL 不授予权限，非破坏观察也不授予 wipe。
+
+当前 MV 测试保持受控过渡，LNP-3A/LNP-3D、storage-contract 和 system 现有 SQL/expected/独立 oracle 不重写，旧 CALL/directive 禁止扩展。whole-family wipe 绑定本次 FE launch 与 MV Accelerator family，一次认领、隔离串行，先由原 MV owner 停止 admission 并实际 join 后台；不能把传入 MV 名当逐 MV 权限，也不能删 whole StateStore 代替。
+
+| 唯一后续产品 owner | 成对迁移的现有性质与载体 |
+|---|---|
+| 7B3 | LNP-3A、LNP-3D 对应 case、`mv/lake-publication-restart-rebuild`：非聚合冷恢复、配置/paused、known-committed、Unknown/迟到提交与管理接续 |
+| 7B4 | spine SUM/COUNT、T/S/P 聚合状态、聚合冷恢复及后续刷新；保留缓存 restart 不冒充缺失缓存恢复 |
+| 7B5 | V/S 身份、view 发现与 CREATE/DROP、fixture/REST 路由、实际 materialized S 读取与 SQL fallback；适配前序已迁移场景 |
+| 7B11 | SQL/system 独立 document graph、shared-document-revisions、文档格式；替代保护通过后退出只服务旧图形的 package/provenance 消费者 |
+
+每个 owner 按自身 accepted spec/approved plan 取得替代保护后逐项退役，最后消费者退出再删共享载体。G2 不新增启动期缓存缺失、管理收束或通用擦除 API，不代表上述产品任务已完成。
 
 ## 当前功能资产、成本与频率
 

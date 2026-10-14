@@ -8,6 +8,10 @@ pub struct Cli {
     pub list_default: bool,
     pub only: Vec<String>,
     pub binary: Option<PathBuf>,
+    /// Explicit ordinary companion for a variant-bound primary binary.
+    pub ordinary_binary: Option<PathBuf>,
+    /// Actual test-controls artifact for selected owner-local demands.
+    pub test_control_binary: Option<PathBuf>,
     pub compatible_binary: Option<PathBuf>,
     pub other_island_binary: Option<PathBuf>,
     pub config: Option<PathBuf>,
@@ -37,6 +41,8 @@ impl Cli {
             list_default: false,
             only: Vec::new(),
             binary: None,
+            ordinary_binary: None,
+            test_control_binary: None,
             compatible_binary: None,
             other_island_binary: None,
             config: None,
@@ -62,6 +68,12 @@ impl Cli {
                 "--list-default" => cli.list_default = true,
                 "--only" => cli.only.push(value("--only")?),
                 "--binary" => cli.binary = Some(PathBuf::from(value("--binary")?)),
+                "--ordinary-binary" => {
+                    cli.ordinary_binary = Some(PathBuf::from(value("--ordinary-binary")?))
+                }
+                "--test-control-binary" => {
+                    cli.test_control_binary = Some(PathBuf::from(value("--test-control-binary")?))
+                }
                 "--compatible-binary" => {
                     cli.compatible_binary = Some(PathBuf::from(value("--compatible-binary")?));
                 }

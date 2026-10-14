@@ -65,6 +65,8 @@ pub struct StandaloneLaunchArgs {
     pub config_path: Option<PathBuf>,
     pub fe_config_path: Option<PathBuf>,
     pub be_config_path: Option<PathBuf>,
+    #[cfg(feature = "test-controls")]
+    pub test_session_paths: Vec<PathBuf>,
 }
 
 pub fn parse_standalone_launch_args(
@@ -75,6 +77,8 @@ pub fn parse_standalone_launch_args(
     let mut config_path = None;
     let mut fe_config_path = None;
     let mut be_config_path = None;
+    #[cfg(feature = "test-controls")]
+    let mut test_session_paths = Vec::new();
 
     while let Some(arg) = args.get(index) {
         match arg.as_str() {
@@ -113,6 +117,16 @@ pub fn parse_standalone_launch_args(
                 if be_config_path.replace(PathBuf::from(value)).is_some() {
                     return Err("--be-config may only be supplied once".to_string());
                 }
+            }
+            #[cfg(feature = "test-controls")]
+            "--test-session" => {
+                index += 1;
+                let value = args.get(index).ok_or("missing value for --test-session")?;
+                let path = PathBuf::from(value);
+                if test_session_paths.contains(&path) || test_session_paths.len() == 2 {
+                    return Err("test-session declarations must be distinct and bounded by the two native roles".into());
+                }
+                test_session_paths.push(path);
             }
             "--help" | "-h" => return Ok(None),
             "--port" | "-c" => {
@@ -156,6 +170,8 @@ pub fn parse_standalone_launch_args(
         config_path,
         fe_config_path,
         be_config_path,
+        #[cfg(feature = "test-controls")]
+        test_session_paths,
     }))
 }
 
@@ -165,6 +181,8 @@ pub struct RoleConfig {
     pub path: PathBuf,
     pub config: NovaRocksConfig,
     pub native_trust: NativeTrustSnapshot,
+    #[cfg(feature = "test-controls")]
+    pub test_session: Option<novarocks_failpoint::liveness::PreparedRoleSession>,
     endpoints: Vec<BindEndpoint>,
     process: ProcessCompatibilityProjection,
 }
@@ -178,7 +196,7 @@ pub enum ResolvedServerLaunch {
 
 pub fn resolve_server_launch(args: StandaloneLaunchArgs) -> Result<ResolvedServerLaunch> {
     // Design: ADR-0108 (docs/adr/ADR-0108-native-role-launch-and-management-surfaces.md)
-    match args.mode {
+    let resolved: Result<ResolvedServerLaunch> = match args.mode {
         ServerLaunchMode::Fe => Ok(ResolvedServerLaunch::Fe(load_role_config(
             ServerLaunchMode::Fe,
             args.config_path.expect("validated --config"),
@@ -207,7 +225,53 @@ pub fn resolve_server_launch(args: StandaloneLaunchArgs) -> Result<ResolvedServe
             ensure_all_in_one_trust_homogeneous(&fe.config, &be.config)?;
             Ok(ResolvedServerLaunch::AllInOne { fe, be })
         }
+    };
+    let resolved = resolved?;
+    #[cfg(feature = "test-controls")]
+    let mut resolved = resolved;
+    #[cfg(feature = "test-controls")]
+    assign_test_sessions(&mut resolved, args.test_session_paths)?;
+    Ok(resolved)
+}
+
+#[cfg(feature = "test-controls")]
+fn assign_test_sessions(resolved: &mut ResolvedServerLaunch, paths: Vec<PathBuf>) -> Result<()> {
+    use novarocks_failpoint::session::{SessionDeclaration, SessionRole};
+    let mut declarations = Vec::new();
+    for path in paths {
+        let declaration = SessionDeclaration::read_bounded(&path)?;
+        if declarations
+            .iter()
+            .any(|(_, role)| *role == declaration.role)
+        {
+            bail!("test-session role declaration is duplicated");
+        }
+        let valid = matches!(
+            (&*resolved, declaration.role),
+            (ResolvedServerLaunch::Fe(_), SessionRole::Fe)
+                | (ResolvedServerLaunch::Be(_), SessionRole::Be)
+                | (ResolvedServerLaunch::AllInOne { .. }, _)
+        );
+        if !valid {
+            bail!("test-session declaration does not match the selected native role");
+        }
+        declarations.push((path, declaration.role));
     }
+    // Validate the complete role set before consuming any declaration.
+    for (path, role) in declarations {
+        let prepared =
+            novarocks_failpoint::liveness::PreparedRoleSession::read_and_claim(&path, role)?;
+        match (resolved as &mut ResolvedServerLaunch, role) {
+            (ResolvedServerLaunch::Fe(config), SessionRole::Fe)
+            | (ResolvedServerLaunch::AllInOne { fe: config, .. }, SessionRole::Fe)
+            | (ResolvedServerLaunch::Be(config), SessionRole::Be)
+            | (ResolvedServerLaunch::AllInOne { be: config, .. }, SessionRole::Be) => {
+                config.test_session = Some(prepared)
+            }
+            _ => unreachable!("validated test-session role set"),
+        }
+    }
+    Ok(())
 }
 
 fn load_role_config(mode: ServerLaunchMode, path: PathBuf) -> Result<RoleConfig> {
@@ -254,6 +318,8 @@ fn load_role_config(mode: ServerLaunchMode, path: PathBuf) -> Result<RoleConfig>
         process: ProcessCompatibilityProjection::from_config(&config),
         config,
         native_trust,
+        #[cfg(feature = "test-controls")]
+        test_session: None,
         endpoints,
     })
 }

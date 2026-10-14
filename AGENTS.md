@@ -1060,4 +1060,18 @@ authorization in `dev-workflow-finish`.
 
 相关 Rust owner/helper/input 改动沿既有单测链路；结果慢端/并发与 range/delete/planning/DOP 显式功能组由领域维护者每周手工运行，相关 owner/fixture 改动必跑。三套 SSB/TPC correctness 成本较高，runner/输入绑定改动必跑三套，每周手工完整轮次，不扩默认 CI。MV/OPTIMIZE 沿既有 suite。周期调度与共享证据服务尚未交付，G7a/G7b 已取消，不作未来交付承诺。详见 [测试治理](docs/guides/development/test-governance.md)。
 
-FE preparation 只保留带独立 secret 鉴权的 `/statement/{arm,peek,drain}` 功能观测；运行级 `/arm`、`/drain` 与专用计时钩子退出。G2 发布能力/profile 自报与门控未交付前保持未知，不能从 binary 路径或源码 HEAD 推定发布物不含测试能力。
+FE preparation 只保留带独立 secret 鉴权的 `/statement/{arm,peek,drain}` 功能观测；运行级 `/arm`、`/drain` 与专用计时钩子退出。内部 statement 观测编入 `test-controls`，还需本次实际角色会话的独立观察授权；普通产品没有该内部路由。
+
+### 普通与受控测试产物
+
+Server 默认 `normal-build`，沿实际依赖边排除测试控制；叶子 owner 拒绝与 `test-controls` 合并。不要对 Server 使用 `--all-features`，也不要在一次 Cargo 命令中选择普通 Server 和控制 owner 测试。编入 feature、debug/profile 或 `fault-scenario` 名称都不授予控制权。
+
+CI 构建入口为 [build_capabilities.sh](tools/ci/lib/build_capabilities.sh)。普通、控制及兼容性变体使用独立 target，默认是 `target/normal`、`target/test-controls`、`target/variants`；`NOVA_CI_NORMAL_TARGET_DIR`、`NOVA_CI_CONTROL_TARGET_DIR`、`NOVA_CI_VARIANT_TARGET_DIR` 可指向已有 owner 管理的缓存根，三者不能相同或互相包含。缓存可复用，运行证据根仍每次独占，不为换产物清理已有缓存。`NOVA_CI_CARGO_PROFILE` 默认为 `dev-opt`，构建同时显式传 `--profile` 与 `NOVAROCKS_BUILD_PROFILE`；`dev` 的目录为 `debug`，另两个 profile 使用同名目录。
+
+`local-full-ci.sh` 保留普通 Rust workspace 测试，另有显式 `test-control owner tests` stage：failpoint（含 `typed`）、MV、FE、Native、Worker、fs、Execution 七 owner 的 `--lib` 控制配置，独立 control target，不选择 Server。HMS 与 MySQL exact/closing 的旧 feature 专属测试另外显式选 owner/feature，不能以基础七包通过代替；示例及边界见 [测试治理](docs/guides/development/test-governance.md)。
+
+System 传真实 `--binary`、`--ordinary-binary` 和 `--test-control-binary`；兼容性场景保留用户选择的 Primary/Compatible/OtherIsland 实际产物，CI 明确以 controls 作兼容性 Primary，同时单列 ordinary。SQL 传 `NOVAROCKS_BIN` 与 `NOVAROCKS_TEST_CONTROL_BIN`，按所选有限步骤建立必要会话，普通步骤仍用普通产物。旧环境变量不再激活产品控制，裸测试 CALL 不自动授予观察或擦除权。
+
+每个实际产物在启动前读取自身 `--build-info`，保留 stdout/stderr/实际退出、owner 能力、声明 profile、binary cfg 与 package 局部事实。未声明值及最终 LTO/codegen/dependency override/额外 flags 等未知项保留 unknown；自报不作发布认证。路径、源码 HEAD、build identity 或 runner profile 都不能代替实际 FE/BE 自报。这些接口说明不表示 G2 全部实现或验收已完成；历史私有 exact/held/HMS 矩阵缺输入时记 `NOT_RUN`。
+
+现有 LNP-3A/LNP-3D、MV storage-contract 与 system MV 资产保留，旧指令/CALL 禁止扩展。7B3 承接非聚合冷恢复、配置/paused、Unknown 与管理接续；7B4 承接 SUM/COUNT、聚合状态和聚合冷恢复；7B5 承接 V/S 身份、发现/CREATE/DROP、路由与 materialized S/fallback；7B11 承接文档格式、独立 graph 与 shared-document-revisions。每个唯一产品 owner 在替代保护实际通过后逐项退役对应旧载体，不在 G2 新增启动期缓存缺失或通用擦除接口。

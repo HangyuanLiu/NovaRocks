@@ -9,6 +9,8 @@ build = "build.rs"
 workspace = true
 
 [features]
+normal-build = ["novarocks-execution/normal-build", "novarocks-failpoint/normal-build", "novarocks-version/normal-build", "novarocks-worker/normal-build"]
+test-controls = ["novarocks-execution/test-controls", "novarocks-failpoint/test-controls", "novarocks-version/test-controls", "novarocks-worker/test-controls"]
 test-support = ["dep:novarocks-secret"]
 
 [dependencies]
@@ -58,6 +60,7 @@ protoc-bin-vendored.workspace = true
 tonic-build.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 novarocks-plan-codec = { workspace = true, features = ["test-support"] }
 h2.workspace = true
 novarocks-sql.workspace = true

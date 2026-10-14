@@ -17,28 +17,37 @@
 
 //! Evidence markers and file metrics of the page streams a typed scan reads.
 
+#[cfg(feature = "test-controls")]
 use novarocks_execution::connector::ScheduledSplitFacts;
 use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
 use novarocks_spi::connector::read_stack::PageSourceFileMetrics;
 
+#[cfg(feature = "test-controls")]
 use crate::read_attempt::ReceivedReadSplit;
 
 /// Test-only identity emitted with one provider-owned reader lifecycle.
+#[cfg(feature = "test-controls")]
 #[derive(Clone)]
 pub struct TypedConnectorReaderMarker {
+    observation: std::sync::Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>,
     provider_id: String,
     instance_id: String,
     catalog_version: String,
     scheduled_split_sequence_id: u64,
 }
 
+#[cfg(feature = "test-controls")]
 impl TypedConnectorReaderMarker {
-    pub fn for_split(split: &ReceivedReadSplit, enabled: bool) -> Option<Self> {
-        if !enabled {
-            return None;
-        }
+    pub fn for_split(
+        split: &ReceivedReadSplit,
+        observation: Option<
+            std::sync::Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>,
+        >,
+    ) -> Option<Self> {
+        let observation = observation.filter(|observer| observer.is_active())?;
         let binding = split.split().binding();
         Some(Self {
+            observation,
             provider_id: binding.descriptor().provider_id.as_str().to_string(),
             instance_id: binding.descriptor().instance_id.as_str().to_string(),
             catalog_version: hex_encode(binding.catalog_handle().version().as_bytes()),
@@ -47,17 +56,17 @@ impl TypedConnectorReaderMarker {
     }
 
     pub(crate) fn emit(&self, event: &str) {
-        println!(
+        self.observation.observe(&format!(
             "NOVAROCKS_CONNECTOR_UNIT_READER_{event} provider={} instance={} catalog_version={} scheduled_split_sequence_id={}",
             self.provider_id,
             self.instance_id,
             self.catalog_version,
             self.scheduled_split_sequence_id,
-        );
-        let _ = std::io::Write::flush(&mut std::io::stdout());
+        ));
     }
 }
 
+#[cfg(feature = "test-controls")]
 fn hex_encode(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));

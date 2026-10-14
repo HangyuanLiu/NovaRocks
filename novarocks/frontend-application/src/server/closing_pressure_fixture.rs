@@ -20,69 +20,25 @@
 use super::*;
 use novarocks_mysql_adapter::closing_pressure_fixture::ClosingPressureFixture;
 use novarocks_native_trust::NativeProcessIdentity;
-use std::path::PathBuf;
 
-const PATH_ENV: &str = "NOVAROCKS_MEM_1_M07_CLOSING_PRESSURE_SOCKET";
-const NONCE_ENV: &str = "NOVAROCKS_MEM_1_M07_CLOSING_PRESSURE_NONCE_HEX";
-const EXACT_PATH_ENV: &str = "NOVAROCKS_MEM_1_M07_MYSQL_WRITE_SOCKET";
-const EXACT_NONCE_ENV: &str = "NOVAROCKS_MEM_1_M07_MYSQL_WRITE_NONCE_HEX";
-const CONTROL_DEADLINE: Duration = Duration::from_secs(20);
-
-// Inspect coexistence before either fixture can bind, including exact-disabled builds.
-fn validate_input_presence(
-    path: bool,
-    nonce: bool,
-    exact_path: bool,
-    exact_nonce: bool,
-) -> Result<bool, &'static str> {
-    if (path || nonce) && (exact_path || exact_nonce) {
-        return Err("Closing pressure and exact MySQL fixture inputs cannot coexist");
-    }
-    match (path, nonce) {
-        (false, false) => Ok(false),
-        (true, true) => Ok(true),
-        _ => Err("Closing pressure fixture requires both startup environment fields"),
-    }
-}
-
-pub(super) fn bind_from_environment(
+pub(super) fn bind_authorized(
     trust: &NativeTrust,
+    authorization: novarocks_mysql_adapter::test_fixture_authorization::MysqlFixtureAuthorization,
     workload: novarocks_workload_control::WorkloadObservationHandle,
-) -> Result<Option<ClosingPressureFixture>, FrontendApplicationError> {
-    let path = std::env::var_os(PATH_ENV);
-    let nonce = std::env::var_os(NONCE_ENV);
-    let enabled = validate_input_presence(
-        path.is_some(),
-        nonce.is_some(),
-        std::env::var_os(EXACT_PATH_ENV).is_some(),
-        std::env::var_os(EXACT_NONCE_ENV).is_some(),
-    )
-    .map_err(FrontendApplicationError::server)?;
-    if !enabled {
-        return Ok(None);
-    }
-    let path = PathBuf::from(path.expect("validated pressure path"));
-    let nonce = nonce.expect("validated pressure nonce");
-    let nonce = nonce.to_str().ok_or_else(|| {
-        FrontendApplicationError::server("Closing pressure nonce is not canonical ASCII hex")
-    })?;
-    let nonce = decode_nonce(nonce).map_err(FrontendApplicationError::server)?;
+) -> Result<ClosingPressureFixture, FrontendApplicationError> {
     let Some(NativeProcessIdentity::Frontend(frontend)) = trust.local_process_identity() else {
         return Err(FrontendApplicationError::server(
-            "Closing pressure fixture requires the original bound FE process identity",
+            "Closing pressure requires the original bound FE process identity",
         ));
     };
-    // One original FE bind clock; control/Arm/Release/Stop never renew it.
-    // This is not the external runner's launch-inclusive clock.
-    let deadline = Instant::now() + CONTROL_DEADLINE;
-    let mut fixture = ClosingPressureFixture::bind(path, frontend, nonce, deadline, workload)
+    let mut fixture = ClosingPressureFixture::bind_authorized(authorization, frontend, workload)
         .map_err(FrontendApplicationError::server_pressure)?;
     if let Err(cause) = write_frontend_identity_marker(&mut std::io::stdout().lock(), frontend) {
         return Err(FrontendApplicationError::server_pressure(
             fixture.fail_startup_projection(cause),
         ));
     }
-    Ok(Some(fixture))
+    Ok(fixture)
 }
 
 fn write_frontend_identity_marker(
@@ -101,32 +57,6 @@ fn write_frontend_identity_marker(
     };
     output.write_all(&bytes[..length])?;
     output.flush()
-}
-
-fn decode_nonce(text: &str) -> Result<[u8; 16], &'static str> {
-    let bytes = text.as_bytes();
-    if bytes.len() != 32
-        || !bytes
-            .iter()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
-    {
-        return Err("Closing pressure nonce must be canonical 32-byte lowercase hex");
-    }
-    let digit = |b: u8| {
-        if b.is_ascii_digit() {
-            b - b'0'
-        } else {
-            b - b'a' + 10
-        }
-    };
-    let mut nonce = [0; 16];
-    for (value, pair) in nonce.iter_mut().zip(bytes.chunks_exact(2)) {
-        *value = digit(pair[0]) * 16 + digit(pair[1]);
-    }
-    if nonce == [0; 16] {
-        return Err("Closing pressure nonce must be nonzero");
-    }
-    Ok(nonce)
 }
 
 enum Exit {
@@ -189,6 +119,7 @@ where
     );
     tokio::pin!(mysql_server);
     tokio::pin!(shutdown);
+    let cancellation = fixture.control_cancellation().expect("authorized fixture");
     let mut control_completed = false;
     let exit = loop {
         // Only this borrow is cancelled at a sibling exit. The controller and original
@@ -199,6 +130,7 @@ where
             tokio::select! {
                 result = &mut mysql_server => Some(Exit::Mysql(result)),
                 _ = &mut shutdown => Some(Exit::Shutdown),
+                _ = cancellation.cancelled() => Some(Exit::Shutdown),
                 error = wait_for_frontend_listener_failure(report_server, management_server)
                     => Some(Exit::Listener(error)),
                 _ = original_failures.wait_for_failure() => Some(Exit::OriginalTask),
@@ -291,39 +223,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn canonical_nonce_rejects_zero_uppercase_lengths_and_non_ascii() {
-        assert_eq!(
-            decode_nonce("0123456789abcdef0123456789abcdef").unwrap(),
-            [
-                1, 35, 69, 103, 137, 171, 205, 239, 1, 35, 69, 103, 137, 171, 205, 239
-            ]
-        );
-        for invalid in [
-            "00000000000000000000000000000000",
-            "0123456789ABCDEF0123456789abcdef",
-            "1",
-            "0123456789abcdef0123456789abcdef00",
-            "é123456789abcdef0123456789abcdef",
-        ] {
-            assert!(decode_nonce(invalid).is_err());
-        }
-    }
-
-    #[test]
-    fn coexistence_rejected_before_binding_independent_of_exact_feature() {
-        for pressure in [(true, false), (false, true), (true, true)] {
-            for exact in [(true, false), (false, true), (true, true)] {
-                assert!(validate_input_presence(pressure.0, pressure.1, exact.0, exact.1).is_err());
-            }
-        }
-        assert!(!validate_input_presence(false, false, true, true).unwrap());
-        assert!(!validate_input_presence(false, false, false, false).unwrap());
-        assert!(validate_input_presence(true, true, false, false).unwrap());
-        assert!(validate_input_presence(true, false, false, false).is_err());
-        assert!(validate_input_presence(false, true, false, false).is_err());
-    }
 
     #[test]
     fn marker_projects_only_original_frontend_uuid() {

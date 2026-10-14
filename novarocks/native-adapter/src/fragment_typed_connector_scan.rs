@@ -270,7 +270,19 @@ fn lower_typed_connector_scan(
                 Arc::clone(&output_schema),
                 inputs.runtime_filter,
                 live_dynamic_filter_factory,
-                crate::debug_environment::debug_emit_connector_reader_marker(),
+                #[cfg(feature = "test-controls")]
+                ctx.observation_controls()
+                    .as_deref()
+                    .map(|controls| controls.observation_for("reader-marker", execution_id))
+                    .transpose()
+                    .map_err(|error| {
+                        NativeFragmentLeafDecodeError::at_field(
+                            ProtocolErrorKind::InvalidValue,
+                            "test_observation",
+                            error,
+                        )
+                    })?
+                    .flatten(),
                 inputs.runtime.stream_host().clone(),
             );
             match output_materialization {
@@ -300,7 +312,19 @@ fn lower_typed_connector_scan(
                 node.node_id,
                 read_slot_ids,
                 Arc::clone(&output_schema),
-                crate::debug_environment::debug_emit_connector_reader_marker(),
+                #[cfg(feature = "test-controls")]
+                ctx.observation_controls()
+                    .as_deref()
+                    .map(|controls| controls.observation_for("reader-marker", execution_id))
+                    .transpose()
+                    .map_err(|error| {
+                        NativeFragmentLeafDecodeError::at_field(
+                            ProtocolErrorKind::InvalidValue,
+                            "test_observation",
+                            error,
+                        )
+                    })?
+                    .flatten(),
                 inputs.runtime.stream_host().runtime().clone(),
             );
             match output_materialization {

@@ -211,6 +211,35 @@ impl Scenario for HmsClassificationPreflight {
         Ok(launch)
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _scenario_root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        _controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        use novarocks_cluster_harness::test_sessions::{ClusterTestSessionPlan, RoleSlot};
+        self.remaining()?;
+        ensure!(
+            cluster_size == 3,
+            "HMS classification requires original 1FE+3BE"
+        );
+        let mut plan =
+            ClusterTestSessionPlan::new(original_deadline.min(self.assertions_deadline))?;
+        let frontend = plan.reserve_launch(RoleSlot::Frontend)?;
+        plan.authorize_ordinary_launch(&frontend, ordinary_binary.to_path_buf())?;
+        for index in 0..cluster_size {
+            let backend = plan.reserve_launch(RoleSlot::Backend(index))?;
+            plan.authorize_ordinary_launch(&backend, ordinary_binary.to_path_buf())?;
+        }
+        // This small correctness preflight grants no HMS collector, root marker
+        // or fault action and cannot stand in for the independent bulk input.
+        Ok(Some(plan))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let identities = context.recheck_live_process_launch_identities()?;

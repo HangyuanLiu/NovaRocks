@@ -368,6 +368,8 @@ pub fn prepare_compiled_fragment(
             execution_runtime: context.execution_runtime.clone(),
             query_memory: context.query_memory.clone(),
             task_identity: context.result_identity,
+            #[cfg(feature = "test-controls")]
+            exchange_test_observer: context.exchange_test_observer.clone(),
         })
         .map_err(|error| {
             FragmentLaunchError::new(

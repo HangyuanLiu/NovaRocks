@@ -407,6 +407,16 @@ pub type NativeActiveAttemptConvergenceFuture<'a> =
 /// the returned active owner and leaves the dormant owner synchronously
 /// drop-safe.
 pub trait DormantNativeAttemptOwner: fmt::Debug + Send + 'static {
+    /// Only the controlled role adapter can supply a live, exact placement preference.
+    /// It is absent from ordinary builds and never travels on the Native wire.
+    #[cfg(feature = "test-controls")]
+    fn test_preferred_backend_process(
+        &self,
+        _execution: QueryExecutionId,
+    ) -> Result<Option<BackendProcessId>, String> {
+        Ok(None)
+    }
+
     /// Exact process identities from the role-local topology snapshot retained
     /// by this dormant owner. Query Application derives placement only from
     /// this view, so activation cannot substitute a later snapshot while

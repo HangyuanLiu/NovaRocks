@@ -16,23 +16,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/build_capabilities.sh"
+
 
 CI_SERVER_PID=""
 
 ci_novarocks_binary_path() {
   local cargo_profile="${1:-dev-opt}"
 
-  case "$cargo_profile" in
-    dev)
-      echo "target/debug/novarocks"
-      ;;
-    release)
-      echo "target/release/novarocks"
-      ;;
-    *)
-      echo "target/$cargo_profile/novarocks"
-      ;;
-  esac
+  ci_artifact_path "$(ci_target_directory normal)" "$cargo_profile" novarocks
 }
 
 ci_start_all_in_one_server() {
@@ -47,11 +39,10 @@ ci_start_all_in_one_server() {
   binary_path="$(ci_novarocks_binary_path "$cargo_profile")"
 
   {
-    printf "+ NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD=1 NO_PROXY=127.0.0.1,localhost %q standalone --role all-in-one --fe-config %q --be-config %q\n" \
+    printf "+ NO_PROXY=127.0.0.1,localhost %q standalone --role all-in-one --fe-config %q --be-config %q\n" \
       "$binary_path" \
       "$fe_config_path" \
       "$be_config_path"
-    NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD=1 \
     NO_PROXY=127.0.0.1,localhost \
       "$binary_path" standalone \
         --role all-in-one \

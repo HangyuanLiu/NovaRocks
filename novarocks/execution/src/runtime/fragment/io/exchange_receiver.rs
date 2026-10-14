@@ -81,11 +81,26 @@ pub trait ExchangeReceiverPort: Send + Sync + 'static {
 #[derive(Clone, Debug)]
 pub struct ExecutionRuntimeExchangeReceiverPort {
     runtime: Arc<ExecutionRuntime>,
+    #[cfg(feature = "test-controls")]
+    test_observer: Option<Arc<dyn crate::runtime::exchange::TestEventObserver>>,
 }
 
 impl ExecutionRuntimeExchangeReceiverPort {
     pub fn new(runtime: Arc<ExecutionRuntime>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            #[cfg(feature = "test-controls")]
+            test_observer: None,
+        }
+    }
+
+    #[cfg(feature = "test-controls")]
+    pub fn with_test_observer(
+        mut self,
+        observer: Arc<dyn crate::runtime::exchange::TestEventObserver>,
+    ) -> Self {
+        self.test_observer = Some(observer);
+        self
     }
 
     fn key(key: ExchangeReceiverKey) -> ExchangeKey {
@@ -99,14 +114,22 @@ impl ExecutionRuntimeExchangeReceiverPort {
 
 impl ExchangeReceiverPort for ExecutionRuntimeExchangeReceiverPort {
     fn register(&self, registration: ExchangeReceiverRegistration) -> Result<(), String> {
+        let key = Self::key(registration.key);
         self.runtime
             .exchange_registry()
             .try_register_expected_chunk_schema_with_binding(
-                Self::key(registration.key),
+                key,
                 registration.expected_senders,
                 registration.expected_chunk_schema,
                 registration.column_binding,
-            )
+            )?;
+        #[cfg(feature = "test-controls")]
+        if let Some(observer) = self.test_observer.clone() {
+            self.runtime
+                .exchange_registry()
+                .install_test_observer(key, observer)?;
+        }
+        Ok(())
     }
 
     fn push(&self, key: ExchangeReceiverKey, frame: ExchangeReceiverFrame) -> Result<(), String> {

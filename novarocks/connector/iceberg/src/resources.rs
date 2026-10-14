@@ -21,6 +21,8 @@
 //! discover a runtime or credentials from process-global state.
 
 use std::future::Future;
+#[cfg(feature = "test-controls")]
+use std::sync::Arc;
 
 use crate::access_binding::IcebergReadBinding;
 
@@ -79,6 +81,15 @@ pub struct IcebergMetadataResources {
 }
 
 impl IcebergMetadataResources {
+    #[cfg(feature = "test-controls")]
+    pub fn with_test_observation(
+        mut self,
+        slot: crate::test_observation::IcebergObservationSlot,
+    ) -> Self {
+        self.planning_binding = self.planning_binding.with_test_observation(slot);
+        self
+    }
+
     pub fn new(
         planning_binding: IcebergReadBinding,
         catalog_runtime: tokio::runtime::Handle,
@@ -124,6 +135,21 @@ pub struct IcebergExecutionResources {
 }
 
 impl IcebergExecutionResources {
+    #[cfg(feature = "test-controls")]
+    pub fn test_storage_authority_registry(&self) -> Arc<novarocks_fs::StorageAuthorityRegistry> {
+        self.read_binding.test_storage_authority_registry().clone()
+    }
+
+    #[cfg(feature = "test-controls")]
+    pub fn with_test_observation(
+        mut self,
+        slot: crate::test_observation::IcebergObservationSlot,
+    ) -> Self {
+        self.read_binding = self.read_binding.with_test_observation(slot.clone());
+        self.write_binding = self.write_binding.with_test_observation(slot);
+        self
+    }
+
     pub fn new(
         read_binding: IcebergReadBinding,
         write_binding: IcebergReadBinding,

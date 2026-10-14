@@ -16,6 +16,7 @@
 // under the License.
 
 pub mod actors;
+mod build_information;
 mod cli;
 mod config;
 #[cfg(unix)]
@@ -29,6 +30,13 @@ pub mod scenario;
 mod scenarios;
 
 fn main() {
+    if std::env::args().skip(1).eq(["--build-info"]) {
+        println!(
+            "{}",
+            build_information::value(cfg!(debug_assertions), cfg!(panic = "unwind"))
+        );
+        return;
+    }
     if let Err(error) = cli::Cli::parse_env().and_then(runner::run) {
         if let Some(verdict) = runner::exact_mysql_failure_presentation(&error) {
             eprintln!("system scenario runner failed: {verdict}");

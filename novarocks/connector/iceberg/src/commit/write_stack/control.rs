@@ -104,32 +104,28 @@ pub const ICEBERG_WRITE_SESSION_EVIDENCE_VERSION: u16 = 3;
 /// The operation-kind tag on the evidence envelope.
 pub const ICEBERG_WRITE_SESSION_OPERATION_KIND: &str = "iceberg.connector_write_session.v1";
 
-#[cfg(debug_assertions)]
-fn iceberg_write_phase_marker_enabled() -> bool {
-    std::env::var_os("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_WRITER_MARKER").is_some()
-}
-
-#[cfg(not(debug_assertions))]
-const fn iceberg_write_phase_marker_enabled() -> bool {
-    false
-}
-
+#[cfg(feature = "test-controls")]
 fn emit_iceberg_write_phase_marker(
+    slot: Option<&crate::test_observation::IcebergObservationSlot>,
+    context: &ConnectorRequestContext,
     session_id: IcebergWriteSessionId,
     attempt: usize,
     phase: &str,
     started: std::time::Instant,
 ) {
-    if !iceberg_write_phase_marker_enabled() {
+    let Some(slot) = slot else {
         return;
-    }
-    println!(
-        "{}",
-        iceberg_write_phase_marker(session_id, attempt, phase, started.elapsed().as_millis())
-    );
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+    };
+    slot.writer(session_id.to_bytes(), Some(context), || {
+        println!(
+            "{}",
+            iceberg_write_phase_marker(session_id, attempt, phase, started.elapsed().as_millis())
+        );
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    });
 }
 
+#[cfg(any(test, feature = "test-controls"))]
 fn iceberg_write_phase_marker(
     session_id: IcebergWriteSessionId,
     attempt: usize,
@@ -228,6 +224,8 @@ pub(crate) fn decode_write_recovery_facts_for_test(
 /// The frontend-only Iceberg write authority of one exact catalog generation.
 // Design: ADR-0136 (docs/adr/ADR-0136-ordinary-aggregate-statistics-dataflow.md)
 pub struct IcebergWriteSessionControl {
+    #[cfg(feature = "test-controls")]
+    observation_slot: Option<crate::test_observation::IcebergObservationSlot>,
     key: ConnectorProviderBindingKey,
     descriptor: ConnectorInstanceDescriptor,
     adapter: IcebergWriteAdapter,
@@ -235,6 +233,15 @@ pub struct IcebergWriteSessionControl {
 }
 
 impl IcebergWriteSessionControl {
+    #[cfg(feature = "test-controls")]
+    pub fn with_test_observation(
+        mut self,
+        slot: Option<crate::test_observation::IcebergObservationSlot>,
+    ) -> Self {
+        self.observation_slot = slot;
+        self
+    }
+
     pub fn new(
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -250,6 +257,8 @@ impl IcebergWriteSessionControl {
             catalog_handle,
         );
         Self {
+            #[cfg(feature = "test-controls")]
+            observation_slot: None,
             key,
             descriptor,
             adapter,
@@ -1090,9 +1099,19 @@ impl IcebergWriteSessionControl {
         document_publication: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        #[cfg(feature = "test-controls")]
         let phase_started = std::time::Instant::now();
+        #[cfg(feature = "test-controls")]
         let session_id = handle.session_id();
-        emit_iceberg_write_phase_marker(session_id, 0, "publication_enter", phase_started);
+        #[cfg(feature = "test-controls")]
+        emit_iceberg_write_phase_marker(
+            self.observation_slot.as_ref(),
+            context,
+            session_id,
+            0,
+            "publication_enter",
+            phase_started,
+        );
         validate_context(context)?;
         let validated = validate_prepared_set(handle, &self.adapter, prepared)?;
         validate_merged_old_references(frozen_old_references, &validated)?;
@@ -1100,19 +1119,46 @@ impl IcebergWriteSessionControl {
         if validated.is_empty()
             && handle.empty_write_decision() == IcebergEmptyWriteDecision::SkipExternalCommit
         {
-            emit_iceberg_write_phase_marker(session_id, 0, "publication_empty_exit", phase_started);
+            #[cfg(feature = "test-controls")]
+            emit_iceberg_write_phase_marker(
+                self.observation_slot.as_ref(),
+                context,
+                session_id,
+                0,
+                "publication_empty_exit",
+                phase_started,
+            );
             return settle_empty_write_without_commit(handle);
         }
 
+        #[cfg(feature = "test-controls")]
         emit_iceberg_write_phase_marker(
+            self.observation_slot.as_ref(),
+            context,
             session_id,
             0,
             "publication_admission_enter",
             phase_started,
         );
         handle.begin_commit()?;
-        emit_iceberg_write_phase_marker(session_id, 0, "publication_admission_exit", phase_started);
-        emit_iceberg_write_phase_marker(session_id, 0, "publication_dispatch_enter", phase_started);
+        #[cfg(feature = "test-controls")]
+        emit_iceberg_write_phase_marker(
+            self.observation_slot.as_ref(),
+            context,
+            session_id,
+            0,
+            "publication_admission_exit",
+            phase_started,
+        );
+        #[cfg(feature = "test-controls")]
+        emit_iceberg_write_phase_marker(
+            self.observation_slot.as_ref(),
+            context,
+            session_id,
+            0,
+            "publication_dispatch_enter",
+            phase_started,
+        );
         let mut outcome = self.dispatch_operation(
             handle,
             &validated,
@@ -1120,7 +1166,15 @@ impl IcebergWriteSessionControl {
             document_publication,
             context,
         );
-        emit_iceberg_write_phase_marker(session_id, 0, "publication_dispatch_exit", phase_started);
+        #[cfg(feature = "test-controls")]
+        emit_iceberg_write_phase_marker(
+            self.observation_slot.as_ref(),
+            context,
+            session_id,
+            0,
+            "publication_dispatch_exit",
+            phase_started,
+        );
         let terminal = match &outcome {
             Ok(ExternalMutationOutcome::KnownCommitted {
                 receipt,
@@ -1162,7 +1216,15 @@ impl IcebergWriteSessionControl {
                 handle.retain_finalization(cleanup.clone());
             }
         }
-        emit_iceberg_write_phase_marker(session_id, 0, "publication_settle_exit", phase_started);
+        #[cfg(feature = "test-controls")]
+        emit_iceberg_write_phase_marker(
+            self.observation_slot.as_ref(),
+            context,
+            session_id,
+            0,
+            "publication_settle_exit",
+            phase_started,
+        );
         outcome
     }
 

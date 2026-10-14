@@ -76,6 +76,16 @@ pub struct Sweep {
 }
 
 impl AdmissionCompletion {
+    pub(crate) fn close(&self) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.invalid = true;
+            inner.selector = None;
+            inner.identity = None;
+            inner.projection = None;
+            inner.row = None;
+        }
+    }
+
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner {

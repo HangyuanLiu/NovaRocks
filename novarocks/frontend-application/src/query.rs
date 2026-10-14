@@ -898,6 +898,8 @@ fn add_files_status(file_count: u32) -> Result<QueryResult, String> {
 /// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
 #[derive(Clone)]
 pub struct FrontendQueryService {
+    #[cfg(feature = "test-controls")]
+    statement_observation: Option<Arc<crate::preparation_diagnostics::StatementObservationOwner>>,
     session_catalog_resolver: SessionCatalogService,
     query_compiler: FrontendQueryCompiler,
     command_executor: Arc<dyn SpecializedStatementRoute>,
@@ -926,6 +928,15 @@ pub struct FrontendQueryService {
 }
 
 impl FrontendQueryService {
+    #[cfg(feature = "test-controls")]
+    pub(crate) fn with_statement_observation(
+        mut self,
+        owner: Option<Arc<crate::preparation_diagnostics::StatementObservationOwner>>,
+    ) -> Self {
+        self.statement_observation = owner;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         session_catalog_resolver: SessionCatalogService,
@@ -956,6 +967,8 @@ impl FrontendQueryService {
         serving_admission: FrontendServingAdmission,
     ) -> Self {
         Self {
+            #[cfg(feature = "test-controls")]
+            statement_observation: None,
             session_catalog_resolver,
             query_compiler,
             command_executor: Arc::new(TypedCommandRoute::new(
@@ -1390,22 +1403,38 @@ impl FrontendQuerySession {
         );
         let compiler = self.service.query_compiler.clone();
         let preparation_scope = preparation_scope.clone();
-        let observed_sql =
-            crate::preparation_diagnostics::statement_observations_active().then(|| sql.to_owned());
+        #[cfg(feature = "test-controls")]
+        let observation = self
+            .service
+            .statement_observation
+            .as_ref()
+            .and_then(|owner| owner.bound_statement(statement_token));
+        #[cfg(feature = "test-controls")]
+        let rewrite_target = observation
+            .as_ref()
+            .and_then(|observation| observation.statement_target())
+            .map(|(run, nominated)| {
+                crate::mv::test_controls::MvRewriteStatementTarget::new(
+                    statement_token,
+                    nominated,
+                    run,
+                )
+            })
+            .transpose()
+            .map_err(|error| GovernedPreparationError::Service(internal_error(error)))?;
         let (prepared, _preparation_window) = execute_cancellable_preparation(
             &self.service.query_cpu_executor,
             cancellation,
             preparation_window,
             move || {
-                let _observation_scope = observed_sql.as_deref().and_then(|sql| {
-                    crate::preparation_diagnostics::enter_statement_for_sql(statement_token, sql)
-                });
                 compiler.prepare_statement(
                     &parsed_statement,
                     purpose,
                     &context,
                     Some(query_options),
                     &preparation_scope,
+                    #[cfg(feature = "test-controls")]
+                    rewrite_target.as_ref(),
                 )
             },
         )
@@ -1477,6 +1506,12 @@ impl FrontendQuerySession {
             )
             .await
             .map_err(|error| self.governed_statement_begin_error(error))?;
+        #[cfg(feature = "test-controls")]
+        if let Some(owner) = &self.service.statement_observation {
+            if let Err(error) = owner.bind_statement(statement.token(), &source) {
+                return Ok(self.governed_typed_error(internal_error(error), statement));
+            }
+        }
         // The staged/live session overlap and every scalar child belong to
         // this one whole window, acquired before copying or compiling them.
         let mut staged_state = self.state.lock().map_err(poisoned_state)?.clone();
@@ -1624,11 +1659,16 @@ impl FrontendQuerySession {
                     None => None,
                 };
                 let start = {
-                    let _observation_scope =
-                        crate::preparation_diagnostics::enter_bound_statement(statement.token());
-                    self.service
-                        .logical_read_launcher
-                        .start(read, child, result_window)
+                    self.service.logical_read_launcher.start(
+                        read,
+                        child,
+                        result_window,
+                        #[cfg(feature = "test-controls")]
+                        self.service
+                            .statement_observation
+                            .as_ref()
+                            .and_then(|owner| owner.bound_statement(statement.token())),
+                    )
                 };
                 let started = start.await;
                 let mut execution = match started {
@@ -1688,6 +1728,13 @@ impl FrontendQuerySession {
             )
             .await
             .map_err(|error| self.governed_statement_begin_error(error))?;
+        #[cfg(feature = "test-controls")]
+        if let Some(owner) = &self.service.statement_observation {
+            if let Err(error) = owner.bind_statement(statement.token(), &sql) {
+                return Ok(self.governed_typed_error(internal_error(error), statement));
+            }
+        }
+
         let state = self.state.lock().map_err(poisoned_state)?.clone();
         let prepared = match self
             .prepare_governed_query_operation(
@@ -1749,11 +1796,16 @@ impl FrontendQuerySession {
             .take_execution_owner()
             .expect("governed query start transfers its root owner exactly once");
         let start = {
-            let _observation_scope =
-                crate::preparation_diagnostics::enter_bound_statement(statement.token());
-            self.service
-                .logical_read_launcher
-                .start(read, owner, statement.result_window_alias())
+            self.service.logical_read_launcher.start(
+                read,
+                owner,
+                statement.result_window_alias(),
+                #[cfg(feature = "test-controls")]
+                self.service
+                    .statement_observation
+                    .as_ref()
+                    .and_then(|owner| owner.bound_statement(statement.token())),
+            )
         };
         let execution = match start.await {
             Ok(execution) => execution,
@@ -1845,6 +1897,17 @@ impl FrontendQuerySession {
                 )
         }
         .map_err(|error| self.governed_statement_begin_error(error))?;
+        #[cfg(feature = "test-controls")]
+        let observation = match self
+            .service
+            .statement_observation
+            .as_ref()
+            .map(|owner| owner.bind_statement(statement.token(), &sql))
+            .transpose()
+        {
+            Ok(handle) => handle.flatten(),
+            Err(error) => return Ok(self.governed_typed_error(internal_error(error), statement)),
+        };
         let state = self.state.lock().map_err(poisoned_state)?.clone();
         let parsed_statement = state
             .substitute_user_variables(parsed_statement)
@@ -1975,6 +2038,30 @@ impl FrontendQuerySession {
                 }
             };
         let statement_token = statement.token();
+        #[cfg(feature = "test-controls")]
+        #[cfg(feature = "test-controls")]
+        if let Some(nomination) = observation.as_ref().and_then(|handle| handle.nomination()) {
+            let installed =
+                connector_context.request_scope_extension_or_insert_with(|| nomination.clone());
+            if installed.as_ref() != &nomination {
+                return Ok(self.governed_typed_error(
+                    internal_error("typed statement nomination conflicts with its request scope"),
+                    statement,
+                ));
+            }
+        }
+        #[cfg(feature = "test-controls")]
+        let context = match observation.as_ref().and_then(|handle| handle.nomination()) {
+            Some(nomination) => {
+                match context.with_test_statement_nomination(Arc::new(nomination)) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        return Ok(self.governed_typed_error(internal_error(error), statement));
+                    }
+                }
+            }
+            None => context,
+        };
         let command_context = CommandContext::new(
             statement.scope().clone(),
             connector_context,
@@ -2019,6 +2106,8 @@ impl FrontendQuerySession {
                                     &context,
                                     Some(query_options),
                                     &preparation_scope,
+                                    #[cfg(feature = "test-controls")]
+                                    None,
                                 )
                                 .map_err(|error| match error {
                                     FrontendQueryCompilerError::Engine(error) => {

@@ -47,7 +47,6 @@ use super::{
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::failpoint;
 use crate::exec::hash_table::key_builder::build_group_key_views;
 use crate::exec::hash_table::key_column::build_output_schema_from_kernels;
 use crate::exec::hash_table::key_strategy::GroupKeyStrategy;
@@ -396,18 +395,6 @@ impl AggregateStreamingSinkOperator {
 
         if chunk.is_empty() {
             return Ok(());
-        }
-
-        if !self.group_by.is_empty() {
-            let failpoint_name = if self.functions.is_empty() {
-                failpoint::AGG_HASH_SET_BAD_ALLOC
-            } else {
-                failpoint::AGGREGATE_BUILD_HASH_MAP_BAD_ALLOC
-            };
-            failpoint::maybe_error(
-                failpoint_name,
-                "Mem usage has exceed the limit of BE: BE:10004",
-            )?;
         }
 
         let num_rows = chunk.len();

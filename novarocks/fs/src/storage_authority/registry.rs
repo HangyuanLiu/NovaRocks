@@ -117,6 +117,8 @@ pub struct StorageAuthorityRegistry {
     misses: AtomicU64,
     capacity_evictions: AtomicU64,
     idle_expirations: AtomicU64,
+    #[cfg(feature = "test-controls")]
+    close_controls: Mutex<Option<super::StorageAuthorityCloseControls>>,
 }
 
 impl std::fmt::Debug for StorageAuthorityRegistry {
@@ -143,6 +145,8 @@ impl StorageAuthorityRegistry {
             misses: AtomicU64::new(0),
             capacity_evictions: AtomicU64::new(0),
             idle_expirations: AtomicU64::new(0),
+            #[cfg(feature = "test-controls")]
+            close_controls: Mutex::new(None),
         })
     }
 
@@ -161,7 +165,31 @@ impl StorageAuthorityRegistry {
             misses: AtomicU64::new(0),
             capacity_evictions: AtomicU64::new(0),
             idle_expirations: AtomicU64::new(0),
+            #[cfg(feature = "test-controls")]
+            close_controls: Mutex::new(None),
         }
+    }
+
+    /// Installed by role composition before authority consumers are opened.
+    /// Existing authorities are registered under their exact owner identity.
+    #[cfg(feature = "test-controls")]
+    pub fn attach_test_close_controls(
+        &self,
+        controls: super::StorageAuthorityCloseControls,
+    ) -> Result<(), String> {
+        let inner = self.lock_inner();
+        let mut installed = self
+            .close_controls
+            .lock()
+            .map_err(|_| "authority close composition lock failed")?;
+        if installed.is_some() {
+            return Err("authority close controls were already installed".into());
+        }
+        for entry in inner.entries.values() {
+            controls.register(&entry.authority)?;
+        }
+        *installed = Some(controls);
+        Ok(())
     }
 
     /// The authority for this identity, built once and reused afterwards.
@@ -195,6 +223,17 @@ impl StorageAuthorityRegistry {
             Arc::clone(&self.executor),
             self.policy,
         ));
+        #[cfg(feature = "test-controls")]
+        if let Some(controls) = self
+            .close_controls
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+        {
+            // Observer failure is retained for explicit role-owned join. It
+            // does not change ordinary storage authority or query semantics.
+            controls.register_or_record_failure(&authority);
+        }
         inner.entries.insert(
             id.clone(),
             RegistryEntry {

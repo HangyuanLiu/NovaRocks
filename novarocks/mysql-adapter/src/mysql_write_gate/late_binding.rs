@@ -41,6 +41,9 @@ struct HubState {
 
 /// One listener-owned slot. Per-connection aliases never allocate another scope.
 pub(crate) struct MysqlWriteGateHub {
+    #[cfg(feature = "test-controls")]
+    action_observation:
+        Mutex<Option<Arc<crate::test_fixture_authorization::FixtureActionObservation>>>,
     frontend: FrontendProcessId,
     nonce: [u8; 16],
     deadline: Instant,
@@ -77,6 +80,39 @@ fn hub_fail(state: &mut HubState, reason: GateFailure) -> io::Error {
     error(*state.failure.get_or_insert(earlier))
 }
 impl MysqlWriteGateHub {
+    #[cfg(feature = "test-controls")]
+    pub(crate) fn install_action_observation(
+        &self,
+        observation: Arc<crate::test_fixture_authorization::FixtureActionObservation>,
+    ) {
+        *self
+            .action_observation
+            .lock()
+            .expect("original fixture observation lock") = Some(observation);
+    }
+    #[cfg(feature = "test-controls")]
+    fn observe_reached_cut(&self) {
+        let reached = self
+            .state
+            .lock()
+            .expect("original hub lock")
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope.snapshot().blocked_after_acceptance);
+        if reached {
+            if let Some(observation) = self
+                .action_observation
+                .lock()
+                .expect("original observation lock")
+                .as_ref()
+            {
+                if observation.record_hit().is_err() {
+                    self.fail(GateFailure::Transition);
+                }
+            }
+        }
+    }
+
     pub(crate) fn new(
         actual_frontend: FrontendProcessId,
         nonce: [u8; 16],
@@ -89,6 +125,8 @@ impl MysqlWriteGateHub {
             return Err(error(GateFailure::Deadline));
         }
         let hub = Arc::new(Self {
+            #[cfg(feature = "test-controls")]
+            action_observation: Mutex::new(None),
             frontend: actual_frontend,
             nonce,
             deadline: original_absolute_deadline,
@@ -655,6 +693,8 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for InitiallyRawMysqlWriter<W> {
             (_, Some(original)) => Pin::new(original).poll_write(cx, bytes),
             _ => Poll::Ready(Err(error(GateFailure::Transition))),
         };
+        #[cfg(feature = "test-controls")]
+        this.hub.observe_reached_cut();
         this.hub.propagate_scope_failure();
         result
     }
@@ -672,6 +712,8 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for InitiallyRawMysqlWriter<W> {
             (_, Some(original)) => Pin::new(original).poll_write_vectored(cx, bytes),
             _ => Poll::Ready(Err(error(GateFailure::Transition))),
         };
+        #[cfg(feature = "test-controls")]
+        this.hub.observe_reached_cut();
         this.hub.propagate_scope_failure();
         result
     }
@@ -694,6 +736,8 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for InitiallyRawMysqlWriter<W> {
             (_, Some(original)) => Pin::new(original).poll_flush(cx),
             _ => Poll::Ready(Err(error(GateFailure::Transition))),
         };
+        #[cfg(feature = "test-controls")]
+        this.hub.observe_reached_cut();
         this.hub.propagate_scope_failure();
         result
     }
@@ -726,6 +770,112 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::oneshot;
     use tokio::task::JoinSet;
+    #[cfg(all(
+        unix,
+        feature = "test-controls",
+        feature = "mem-1-m07-exact-mysql-write"
+    ))]
+    #[tokio::test]
+    async fn explicit_grant_hit_is_the_actual_write_cut_and_not_fixture_construction() {
+        use crate::test_fixture_authorization::{
+            FixtureActionObservation, MysqlFixtureAuthorization,
+        };
+        use novarocks_failpoint::{
+            liveness::{PreparedRoleSession, RunnerSession},
+            scope::ProcessBinding,
+            session::{DECLARATION_VERSION, DomainGrant, SessionDeclaration, SessionRole},
+        };
+        use std::os::unix::fs::DirBuilderExt;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let root = std::path::PathBuf::from(format!(
+            "/tmp/g2hit-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let declaration = SessionDeclaration {
+            schema_version: DECLARATION_VERSION,
+            session_id: "cut-session".into(),
+            launch_id: "cut-launch".into(),
+            role: SessionRole::Fe,
+            lifetime_millis: 10_000,
+            liveness_socket: root.join("live.sock"),
+            handshake_secret: "abcdefghijklmnopqrstuvwxyz0123456789".into(),
+            domain_grants: vec![DomainGrant {
+                domain: MysqlFixtureAuthorization::DOMAIN.into(),
+                grant_id: "one-cut".into(),
+                parameters: serde_json::json!({"action":"exact-write","socket":root.join("fixture.sock"),"nonce_hex":"09090909090909090909090909090909"}),
+            }],
+        };
+        let path = root.join("declaration.json");
+        declaration.write_private(&path).unwrap();
+        let prepared = PreparedRoleSession::read_and_claim(&path, SessionRole::Fe).unwrap();
+        let mut runner = RunnerSession::start(declaration).unwrap();
+        let frontend = FrontendProcessId::new_v7();
+        let mut role = prepared.bind(ProcessBinding::Frontend(frontend)).unwrap();
+        let authorization = MysqlFixtureAuthorization::from_grants(
+            role.scope().grants_for(MysqlFixtureAuthorization::DOMAIN),
+        )
+        .unwrap()
+        .unwrap();
+        let (_, nonce, cancellation, claim) = authorization.claim("exact-write", frontend).unwrap();
+        let observation = FixtureActionObservation::new(claim);
+        let (hub, mut controller) =
+            MysqlWriteGateHub::new(frontend, nonce, cancellation.deadline()).unwrap();
+        hub.install_action_observation(Arc::clone(&observation));
+        assert!(!role.scope().observations().iter().any(|o| o.event == "hit"));
+        let connection = ClientConnectionToken::new(71, 19).unwrap();
+        let statement = StatementToken::new(SessionToken::new(71, 23), 30);
+        controller.arm(frontend, nonce, 71, SQL, 2).unwrap();
+        let hook = hub
+            .bind_statement(connection, statement, SQL)
+            .unwrap()
+            .unwrap();
+        let raw = InitiallyRawMysqlWriter::new(Vec::new(), connection, Arc::clone(&hub));
+        let mut writer = OwnedStreamingMysqlWriter::new(raw, ProtocolLimits::default(), 1).unwrap();
+        writer.start_metadata(metadata().unwrap()).unwrap();
+        writer.finish_metadata().await.unwrap();
+        hook.begin_rows(writer.receipt()).unwrap();
+        assert!(!role.scope().observations().iter().any(|o| o.event == "hit"));
+        writer.start_row(4).unwrap();
+        writer.push_slice(b"\x03abc").unwrap();
+        {
+            let flushing = writer.flush_pending();
+            tokio::pin!(flushing);
+            tokio::select! {result=&mut flushing=>panic!("cut must hold: {result:?}"), blocked=hook.scope.wait_blocked()=>{blocked.unwrap();}}
+        }
+        assert_eq!(
+            role.scope()
+                .observations()
+                .iter()
+                .filter(|o| o.event == "hit")
+                .count(),
+            1
+        );
+        hook.record_cancel_and_resume(writer.receipt()).unwrap();
+        writer.flush_pending().await.unwrap();
+        drop(writer);
+        drop(hook);
+        controller.stop();
+        assert!(controller.snapshot().original_writer_exited);
+        drop(controller);
+        drop(hub);
+        drop(observation);
+        assert_eq!(
+            role.scope()
+                .observations()
+                .iter()
+                .filter(|o| o.event == "claim-released")
+                .count(),
+            1
+        );
+        role.close_and_join().unwrap();
+        runner.end_and_join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[derive(Debug)]
     struct FixtureExitError {
         primary: Option<io::Error>,

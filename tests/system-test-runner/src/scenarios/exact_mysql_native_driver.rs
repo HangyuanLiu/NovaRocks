@@ -42,6 +42,9 @@ use std::time::{Duration, Instant};
 mod prepared_config;
 use prepared_config::OriginalPreparedConfig;
 
+#[path = "m07_variant_test_session.rs"]
+pub(super) mod variant_sessions;
+
 #[path = "result_delivery_held_late_ack.rs"]
 mod held_late_ack;
 /// Only the separate admitted new selector may call this. Old ten cases are unchanged.
@@ -405,6 +408,55 @@ impl Scenario for ExactNativeCase {
             ..Default::default()
         })
     }
+    fn test_session_plan(
+        &self,
+        launch: &ScenarioLaunchConfig,
+        _scenario_root: &Path,
+        cluster_size: usize,
+        primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        self.run.validate_shape()?;
+        let private = self
+            .private
+            .lock()
+            .map_err(|_| anyhow::anyhow!("original exact private owner poisoned"))?;
+        let owner = private
+            .as_ref()
+            .context("original exact private owner is absent")?;
+        ensure!(
+            launch.child_environment == owner.environment(),
+            "original exact private launch inputs changed before declaration"
+        );
+        let target_token = format!("{}-target", self.case.name);
+        let health_token = format!("{}-health", self.case.name);
+        let mut tokens = vec![target_token.as_str()];
+        if self.case.input.expect_complete_tail {
+            tokens.push(health_token.as_str());
+        }
+        Ok(Some(variant_sessions::fixture_plan(
+            primary_binary,
+            ordinary_binary,
+            controlled_binary,
+            cluster_size,
+            original_deadline,
+            vec![variant_sessions::grant(
+                "mysql-fixture",
+                "original-exact-write",
+                json!({"action":"exact-write", "socket":owner.socket,
+                    "nonce_hex":hex(&owner.nonce)}),
+            )],
+            "mem-1-m07-exact-mysql-write",
+            &[
+                "novarocks-server",
+                "novarocks-frontend-application",
+                "novarocks-mysql-adapter",
+            ],
+            &tokens,
+        )?))
+    }
     fn freeze_prepared_exact_config(
         &self,
         artifact: &novarocks_cluster_harness::EffectiveLaunchConfigEvidence,
@@ -590,6 +642,13 @@ async fn run_case(
             armed.failure.is_none() && armed.accepted_peers == 1 && armed.used_arm,
             "original Arm failed"
         );
+        variant_sessions::arm_statement_until(
+            context,
+            &format!("{}-target", case.name),
+            cid,
+            case.sql,
+            deadline,
+        )?;
         submitted = true; // Even a partially written original command must not skip actual cancellation.
         reader
             .as_mut()
@@ -720,6 +779,13 @@ async fn run_case(
         let before = census(context, deadline).await?.created;
         receipt.recovery_before = Some(before);
         if case.input.expect_complete_tail {
+            variant_sessions::arm_statement_until(
+                context,
+                &format!("{}-health", case.name),
+                reader.as_ref().unwrap().connection_id(),
+                HEALTH_SQL,
+                deadline,
+            )?;
             health(reader.as_mut().unwrap()).await?;
             await_idle(context, deadline).await?;
             let after = census(context, deadline).await?.created;

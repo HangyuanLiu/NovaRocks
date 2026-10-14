@@ -12,6 +12,8 @@ workspace = true
 doctest = false
 
 [features]
+normal-build = []
+test-controls = []
 native-compatibility-test-fixture = []
 
 [dependencies]

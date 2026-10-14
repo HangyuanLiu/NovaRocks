@@ -1632,7 +1632,12 @@ impl CtasEngine for DmlExecutionKernel {
                 internal_failure("standard CTAS attempt reservation was already consumed")
             })?;
             reservation
-                .connector_request_context(connector_context)
+                .connector_request_context(
+                    connector_context,
+                    #[cfg(feature = "test-controls")]
+                    request.execution.test_statement_nomination(),
+                )
+                .map_err(internal_failure)?
                 .with_vended_credential_lease_collection(
                     preflight.target_catalog_properties.clone(),
                 )

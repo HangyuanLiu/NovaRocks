@@ -46,8 +46,10 @@ use tokio::sync::watch;
 
 use crate::{FileError, FileErrorKind, FileResult};
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 mod debug_close;
+#[cfg(feature = "test-controls")]
+pub use debug_close::StorageAuthorityCloseControls;
 mod executor;
 mod registry;
 
@@ -546,8 +548,6 @@ impl StorageAuthority {
             }),
             executor,
         };
-        #[cfg(debug_assertions)]
-        debug_close::start_if_runner_enabled(&authority.shared);
         authority
     }
 

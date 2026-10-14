@@ -293,7 +293,11 @@ impl InsertEngine for DmlExecutionKernel {
             .query_execution()
             .reserve_initial_attempt()
             .map_err(|error| error.to_string())?;
-        let connector_context = attempt_reservation.connector_request_context(connector_context);
+        let connector_context = attempt_reservation.connector_request_context(
+            connector_context,
+            #[cfg(feature = "test-controls")]
+            request.execution.test_statement_nomination(),
+        )?;
 
         let target = crate::catalog_application::resolver::resolve_existing_table_target(
             self,
@@ -372,7 +376,11 @@ impl InsertEngine for DmlExecutionKernel {
             &request.execution,
         )?;
         crate::connector::validate_request_context(&connector_context)?;
-        let connector_context = attempt_reservation.connector_request_context(connector_context);
+        let connector_context = attempt_reservation.connector_request_context(
+            connector_context,
+            #[cfg(feature = "test-controls")]
+            request.execution.test_statement_nomination(),
+        )?;
         let prepared = iceberg_writer::prepare_iceberg_write_with_options(
             self,
             &target,

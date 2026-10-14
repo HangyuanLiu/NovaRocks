@@ -117,12 +117,15 @@ pub enum ConnectorWriterAbortOutcome {
 pub trait ConnectorWriteObservationPort: Send + Sync {
     fn observe(&self, observation: ConnectorWriteObservation);
 
-    /// Returns whether this exact live append should wait for cancellation.
-    ///
-    /// This is only a debug fault hook.  Returning `true` does not cancel,
-    /// retry, or replace the append; the Worker owns the resulting pending
-    /// future and the query lifecycle drops it on cancellation.
-    fn hold_append(&self, writer: ConnectorWriterObservation) -> bool;
+    /// Scoped hold permission only; Worker retains the provider operation and
+    /// its original cancellation owner. Session end merely releases this hold.
+    #[cfg(feature = "test-controls")]
+    fn hold_append(
+        &self,
+        _writer: ConnectorWriterObservation,
+    ) -> Result<Option<novarocks_failpoint::scope::ControlCancellation>, ConnectorError> {
+        Ok(None)
+    }
 }
 
 /// The Worker-owned decorator around one query-leased write capability.
@@ -135,7 +138,8 @@ pub struct ObservedConnectorWriteExecution {
     execution_id: QueryExecutionId,
     node_id: i32,
     observation: Arc<dyn ConnectorWriteObservationPort>,
-    emit_writer_markers: bool,
+    #[cfg(feature = "test-controls")]
+    writer_observer: Option<Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>>,
 }
 
 impl ObservedConnectorWriteExecution {
@@ -144,14 +148,17 @@ impl ObservedConnectorWriteExecution {
         execution_id: QueryExecutionId,
         node_id: i32,
         observation: Arc<dyn ConnectorWriteObservationPort>,
-        emit_writer_markers: bool,
+        #[cfg(feature = "test-controls")] writer_observer: Option<
+            Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>,
+        >,
     ) -> Self {
         Self {
             inner,
             execution_id,
             node_id,
             observation,
-            emit_writer_markers,
+            #[cfg(feature = "test-controls")]
+            writer_observer,
         }
     }
 }
@@ -177,8 +184,9 @@ impl ConnectorWriteExecution for ObservedConnectorWriteExecution {
             Ok(inner) => {
                 self.observation
                     .observe(ConnectorWriteObservation::WriterOpened { writer, catalog });
+                #[cfg(feature = "test-controls")]
                 emit_writer_marker(
-                    self.emit_writer_markers,
+                    self.writer_observer.as_deref(),
                     "NOVAROCKS_CONNECTOR_WRITER_OPENED",
                     writer.node_id(),
                     writer.target(),
@@ -215,8 +223,9 @@ struct ObservedConnectorBatchWriter {
 #[async_trait::async_trait]
 impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
     async fn append(&mut self, batch: RecordBatch) -> Result<(), ConnectorError> {
-        if self.observation.hold_append(self.writer) {
-            std::future::pending::<()>().await;
+        #[cfg(feature = "test-controls")]
+        if let Some(cancellation) = self.observation.hold_append(self.writer)? {
+            cancellation.cancelled().await;
         }
         let rows = batch.num_rows() as u64;
         self.inner.append(batch).await?;
@@ -263,20 +272,21 @@ impl ConnectorBatchWriter for ObservedConnectorBatchWriter {
     }
 }
 
-/// Emit one connector-writer evidence marker behind the immutable role input.
-///
-/// The marker is emitted by the Worker because it observes the writer opening;
-/// the Native adapter reads the process-owned debug switch before composing the
-/// Worker runtime.
-fn emit_writer_marker(enabled: bool, marker: &str, plan_node_id: i32, target: WriteTargetOrdinal) {
-    if !enabled {
-        return;
+/// The owner supplies a live, bounded observation grant; no startup boolean
+/// can keep this evidence surface active after its session closes.
+#[cfg(feature = "test-controls")]
+fn emit_writer_marker(
+    observer: Option<&dyn novarocks_execution::runtime::exchange::TestEventObserver>,
+    marker: &str,
+    plan_node_id: i32,
+    target: WriteTargetOrdinal,
+) {
+    if let Some(observer) = observer {
+        observer.observe(&format!(
+            "{marker} plan_node={plan_node_id} write_target={}",
+            target.get()
+        ));
     }
-    println!(
-        "{marker} plan_node={plan_node_id} write_target={}",
-        target.get()
-    );
-    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 #[cfg(test)]
@@ -405,10 +415,6 @@ mod tests {
         fn observe(&self, observation: ConnectorWriteObservation) {
             self.0.lock().expect("observations").push(observation);
         }
-
-        fn hold_append(&self, _: ConnectorWriterObservation) -> bool {
-            false
-        }
     }
 
     #[tokio::test]
@@ -424,7 +430,8 @@ mod tests {
             execution_id(),
             7,
             Arc::clone(&observation) as Arc<dyn ConnectorWriteObservationPort>,
-            false,
+            #[cfg(feature = "test-controls")]
+            None,
         );
         let physical = ConnectorWriterPhysicalContext::new([1; 16], 2, [3; 16], 4, 5);
         let mut writer = observed

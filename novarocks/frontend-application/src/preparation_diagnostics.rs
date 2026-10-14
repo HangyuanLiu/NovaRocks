@@ -17,22 +17,20 @@
 
 //! Authenticated, bounded statement observations for functional diagnostics.
 //!
-//! Authorization is immutable after first initialization and independent of
-//! statement observer state. Observation never controls product execution.
+//! One explicit role-session grant owns bounded observation state.
+//! Observation never controls product execution.
 
-use std::cell::RefCell;
+use novarocks_failpoint::scope::{ActionClaim, ControlCancellation, GrantHandle, ProcessBinding};
+use novarocks_failpoint::target_binding::StatementInputNomination;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, Weak};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::query_execution::lifecycle_diagnostics::QueryLifecycleConvergenceSnapshot;
-use novarocks_query_application::session_control::StatementToken;
+use novarocks_query_application::session_control::{SessionToken, StatementToken};
 use novarocks_types::{QueryExecutionId, QueryId};
-
-pub(crate) const CONTROL_SECRET_ENV: &str = "NOVAROCKS_PREPARATION_DIAGNOSTIC_SECRET";
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ControlRequest {
@@ -61,7 +59,6 @@ pub(crate) struct StatementObservationResponse {
 }
 
 const MAX_STATEMENT_OBSERVERS: usize = 64;
-static ACTIVE_STATEMENT_OBSERVERS: AtomicU64 = AtomicU64::new(0);
 
 /// An observation capability only: neither its lifetime nor its contents
 /// control admission, execution, recovery, result visibility, or cleanup.
@@ -69,11 +66,12 @@ static ACTIVE_STATEMENT_OBSERVERS: AtomicU64 = AtomicU64::new(0);
 pub(crate) struct StatementObservationHandle {
     run_token: String,
     generation: u64,
+    owner: Option<Weak<StatementObservationOwner>>,
 }
 
 struct StatementObserver {
     generation: u64,
-    connection_id: u32,
+    session: SessionToken,
     sql_digest: [u8; 32],
     statement: Option<StatementToken>,
     logical_query: Option<QueryId>,
@@ -88,23 +86,23 @@ struct StatementObservers {
 }
 
 impl StatementObservers {
-    fn arm(&mut self, request: StatementObservationArmRequest) -> Result<(), String> {
+    fn validate_arm(&self, request: &StatementObservationArmRequest) -> Result<[u8; 32], String> {
         if request.connection_id == 0 {
-            return Err("statement observation connection id must be nonzero".to_owned());
+            return Err("statement observation connection id must be nonzero".into());
         }
         if request.run_token.trim().is_empty() || request.run_token.len() > 256 {
-            return Err("statement observation token must contain 1..256 bytes".to_owned());
+            return Err("statement observation token must contain 1..256 bytes".into());
         }
         if self.runs.contains_key(&request.run_token)
             || self
                 .runs
                 .values()
-                .any(|run| run.connection_id == request.connection_id)
+                .any(|run| run.session.connection_id() == request.connection_id)
         {
-            return Err("statement observation token or connection is already armed".to_owned());
+            return Err("statement observation token or connection is already armed".into());
         }
         if self.runs.len() >= MAX_STATEMENT_OBSERVERS {
-            return Err("statement observation capacity exhausted".to_owned());
+            return Err("statement observation capacity exhausted".into());
         }
         if request.sql_sha256.len() != 64
             || !request
@@ -112,23 +110,37 @@ impl StatementObservers {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         {
-            return Err("statement SQL digest must be lowercase SHA-256 hex".to_owned());
+            return Err("statement SQL digest must be lowercase SHA-256 hex".into());
         }
+        self.next_generation
+            .checked_add(1)
+            .ok_or("statement observation generation exhausted")?;
         let mut sql_digest = [0u8; 32];
         for (index, byte) in sql_digest.iter_mut().enumerate() {
             *byte = u8::from_str_radix(&request.sql_sha256[index * 2..index * 2 + 2], 16)
                 .expect("validated SHA-256 hex");
         }
+        Ok(sql_digest)
+    }
+    fn arm(
+        &mut self,
+        request: StatementObservationArmRequest,
+        session: SessionToken,
+    ) -> Result<(), String> {
+        let sql_digest = self.validate_arm(&request)?;
+        if session.connection_id() != request.connection_id || session.session_epoch() == 0 {
+            return Err("statement observation requires its current exact session".into());
+        }
         let generation = self
             .next_generation
             .checked_add(1)
-            .ok_or_else(|| "statement observation generation exhausted".to_owned())?;
+            .expect("arm validated the unchanged journal generation");
         self.next_generation = generation;
         self.runs.insert(
             request.run_token,
             StatementObserver {
                 generation,
-                connection_id: request.connection_id,
+                session,
                 sql_digest,
                 statement: None,
                 logical_query: None,
@@ -148,9 +160,10 @@ impl StatementObservers {
             return None;
         }
         let digest: [u8; 32] = Sha256::digest(sql.as_bytes()).into();
-        let (token, run) = self.runs.iter_mut().find(|(_, run)| {
-            run.connection_id == statement.session().connection_id() && run.sql_digest == digest
-        })?;
+        let (token, run) = self
+            .runs
+            .iter_mut()
+            .find(|(_, run)| run.session == statement.session() && run.sql_digest == digest)?;
         if run.statement.is_some_and(|bound| bound != statement) {
             return None;
         }
@@ -158,6 +171,7 @@ impl StatementObservers {
         Some(StatementObservationHandle {
             run_token: token.clone(),
             generation: run.generation,
+            owner: None,
         })
     }
 
@@ -168,6 +182,7 @@ impl StatementObservers {
             .map(|(token, run)| StatementObservationHandle {
                 run_token: token.clone(),
                 generation: run.generation,
+                owner: None,
             })
     }
 
@@ -261,108 +276,356 @@ impl StatementObservers {
     }
 }
 
-fn statement_observers() -> &'static Mutex<StatementObservers> {
-    static OBSERVERS: OnceLock<Mutex<StatementObservers>> = OnceLock::new();
-    OBSERVERS.get_or_init(|| Mutex::new(StatementObservers::default()))
+/// The role composition passes this owner explicitly to HTTP and statement callers.
+/// A closed session invalidates every old handle and releases the bounded journal.
+pub(crate) struct StatementObservationOwner {
+    authorization: DiagnosticAuthorization,
+    cancellation: ControlCancellation,
+    claim: Mutex<ActionClaim>,
+    observed_hit: std::sync::atomic::AtomicBool,
+    input_freezer: std::sync::OnceLock<
+        Arc<dyn Fn(&StatementInputNomination) -> Result<(), String> + Send + Sync>,
+    >,
+    nomination_freezer: std::sync::OnceLock<
+        Arc<
+            dyn Fn(
+                    &StatementInputNomination,
+                    &novarocks_failpoint::target_binding::StatementWorkNomination,
+                ) -> Result<(), String>
+                + Send
+                + Sync,
+        >,
+    >,
+    session_resolver:
+        std::sync::OnceLock<Arc<dyn Fn(u32) -> Result<SessionToken, String> + Send + Sync>>,
+    state: Mutex<StatementObservers>,
 }
-
-pub(crate) fn arm_statement_observation(
-    request: StatementObservationArmRequest,
-) -> Result<(), String> {
-    if !enabled() {
-        return Err("preparation diagnostics are disabled".to_owned());
-    }
-    let mut state = statement_observers()
-        .lock()
-        .map_err(|_| "statement observation lock poisoned".to_owned())?;
-    state.arm(request)?;
-    ACTIVE_STATEMENT_OBSERVERS.store(state.runs.len() as u64, Ordering::Release);
-    Ok(())
-}
-
-pub(crate) fn peek_statement_observation(
-    token: &str,
-) -> Result<StatementObservationResponse, String> {
-    statement_observers()
-        .lock()
-        .map_err(|_| "statement observation lock poisoned".to_owned())?
-        .response(token)
-}
-
-pub(crate) fn drain_statement_observation(
-    token: &str,
-) -> Result<StatementObservationResponse, String> {
-    let mut state = statement_observers()
-        .lock()
-        .map_err(|_| "statement observation lock poisoned".to_owned())?;
-    let response = state.drain(token)?;
-    ACTIVE_STATEMENT_OBSERVERS.store(state.runs.len() as u64, Ordering::Release);
-    Ok(response)
-}
-
-thread_local! {
-    static STATEMENT_OBSERVATION: RefCell<Option<StatementObservationHandle>> = const { RefCell::new(None) };
-}
-
-pub(crate) struct StatementObservationScope(Option<StatementObservationHandle>);
-impl Drop for StatementObservationScope {
-    fn drop(&mut self) {
-        STATEMENT_OBSERVATION.with(|slot| {
-            slot.replace(self.0.take());
-        });
+impl std::fmt::Debug for StatementObservationOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StatementObservationOwner")
+            .finish_non_exhaustive()
     }
 }
-
-pub(crate) fn enter_statement_for_sql(
-    statement: StatementToken,
-    sql: &str,
-) -> Option<StatementObservationScope> {
-    if ACTIVE_STATEMENT_OBSERVERS.load(Ordering::Acquire) == 0 {
-        return None;
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObservationGrant {
+    action: String,
+    bearer_secret: String,
+}
+impl StatementObservationOwner {
+    pub(crate) const DOMAIN: &'static str = "statement-observation";
+    pub(crate) fn from_grants(grants: Vec<GrantHandle>) -> Result<Option<Arc<Self>>, String> {
+        if grants.is_empty() {
+            return Ok(None);
+        }
+        if grants.iter().any(|grant| grant.domain() != Self::DOMAIN) {
+            return Err("statement observation received a foreign domain grant".into());
+        }
+        if grants.len() != 1 {
+            return Err("statement observation requires exactly one grant".into());
+        }
+        let grant = grants.into_iter().next().expect("one grant");
+        let parameters: ObservationGrant = serde_json::from_value(grant.parameters().clone())
+            .map_err(|_| "statement observation grant is invalid".to_owned())?;
+        if parameters.action != "observe" {
+            return Err("statement observation action is unsupported".into());
+        }
+        let authorization = DiagnosticAuthorization::from_secret(Some(&parameters.bearer_secret));
+        if !authorization.enabled() {
+            return Err("statement observation secret is invalid".into());
+        }
+        let cancellation = grant.cancellation();
+        if !matches!(cancellation.process(), ProcessBinding::Frontend(_)) {
+            return Err("statement observation requires the actual FE process".into());
+        }
+        let claim = grant
+            .claim_once(cancellation.process())
+            .map_err(|_| "statement observation claim refused".to_owned())?;
+        Ok(Some(Arc::new(Self {
+            authorization,
+            cancellation,
+            claim: Mutex::new(claim),
+            observed_hit: std::sync::atomic::AtomicBool::new(false),
+            input_freezer: std::sync::OnceLock::new(),
+            nomination_freezer: std::sync::OnceLock::new(),
+            session_resolver: std::sync::OnceLock::new(),
+            state: Mutex::new(StatementObservers::default()),
+        })))
     }
-    let handle = statement_observers()
-        .lock()
-        .ok()?
-        .bind_statement(statement, sql);
-    Some(STATEMENT_OBSERVATION.with(|slot| StatementObservationScope(slot.replace(handle))))
-}
-
-pub(crate) fn enter_bound_statement(
-    statement: StatementToken,
-) -> Option<StatementObservationScope> {
-    if ACTIVE_STATEMENT_OBSERVERS.load(Ordering::Acquire) == 0 {
-        return None;
+    pub(crate) fn is_active(&self) -> bool {
+        self.cancellation.is_active()
     }
-    let handle = statement_observers()
-        .lock()
-        .ok()?
-        .bound_statement(statement);
-    Some(STATEMENT_OBSERVATION.with(|slot| StatementObservationScope(slot.replace(handle))))
-}
-
-pub(crate) fn capture_statement_observation() -> Option<StatementObservationHandle> {
-    STATEMENT_OBSERVATION.with(|slot| slot.borrow().clone())
-}
-
-pub(crate) fn statement_observations_active() -> bool {
-    ACTIVE_STATEMENT_OBSERVERS.load(Ordering::Acquire) != 0
-}
-
-pub(crate) fn bind_observed_attempt(
-    handle: &StatementObservationHandle,
-    execution: QueryExecutionId,
-) {
-    if let Ok(mut state) = statement_observers().lock() {
-        state.bind_attempt(handle, execution);
+    fn active(&self, state: &mut StatementObservers) -> bool {
+        if self.cancellation.is_active() {
+            true
+        } else {
+            state.runs.clear();
+            false
+        }
+    }
+    pub(crate) fn authorize(&self, header: Option<&str>) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        self.active(&mut state) && self.authorization.authorized(header)
+    }
+    pub(crate) fn arm(&self, request: StatementObservationArmRequest) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "statement observation lock poisoned")?;
+        if !self.active(&mut state) {
+            return Err("statement observation session is closed".into());
+        }
+        // Reject malformed, duplicate, full or exhausted journals before a
+        // finite domain can preserve an otherwise unaccepted input.
+        let sql_digest = state.validate_arm(&request)?;
+        let session = self
+            .session_resolver
+            .get()
+            .ok_or("statement observation session owner is not installed")?(
+            request.connection_id
+        )?;
+        if session.connection_id() != request.connection_id || session.session_epoch() == 0 {
+            return Err("statement observation requires its current exact session".into());
+        }
+        let input = self.input_for_session(session, &request.run_token, sql_digest)?;
+        self.input_freezer
+            .get()
+            .ok_or("statement input freezer is not installed")?(&input)?;
+        state.arm(request, session)
+    }
+    fn input_for_session(
+        &self,
+        session: SessionToken,
+        run_token: &str,
+        sql_sha256: [u8; 32],
+    ) -> Result<StatementInputNomination, String> {
+        let ProcessBinding::Frontend(process) = self.cancellation.process() else {
+            return Err("statement input requires the actual frontend process".into());
+        };
+        let input = StatementInputNomination {
+            target_session_id: self.cancellation.session_id().into(),
+            target_launch_id: self.cancellation.launch_id().into(),
+            statement_run_token: run_token.into(),
+            frontend_process_id: process.to_string(),
+            connection_id: session.connection_id(),
+            session_epoch: session.session_epoch(),
+            sql_sha256,
+        };
+        input.validate().map_err(|error| error.to_string())?;
+        Ok(input)
+    }
+    pub(crate) fn peek(&self, token: &str) -> Result<StatementObservationResponse, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "statement observation lock poisoned".to_owned())?;
+        if !self.active(&mut state) {
+            return Err("statement observation session is closed".into());
+        }
+        state.response(token)
+    }
+    pub(crate) fn drain(&self, token: &str) -> Result<StatementObservationResponse, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "statement observation lock poisoned".to_owned())?;
+        if !self.active(&mut state) {
+            return Err("statement observation session is closed".into());
+        }
+        state.drain(token)
+    }
+    /// Server composition installs the one actual QueryControl owner. Neither
+    /// the request nor the declaration can supply this identity resolver.
+    pub(crate) fn install_session_resolver(
+        &self,
+        resolver: Arc<dyn Fn(u32) -> Result<SessionToken, String> + Send + Sync>,
+    ) -> Result<(), String> {
+        self.session_resolver
+            .set(resolver)
+            .map_err(|_| "statement observation session owner was already installed".to_owned())
+    }
+    pub(crate) fn install_input_freezer(
+        &self,
+        freezer: Arc<dyn Fn(&StatementInputNomination) -> Result<(), String> + Send + Sync>,
+    ) -> Result<(), String> {
+        self.input_freezer
+            .set(freezer)
+            .map_err(|_| "statement input freezer was already installed".into())
+    }
+    pub(crate) fn install_nomination_freezer(
+        &self,
+        freezer: Arc<
+            dyn Fn(
+                    &StatementInputNomination,
+                    &novarocks_failpoint::target_binding::StatementWorkNomination,
+                ) -> Result<(), String>
+                + Send
+                + Sync,
+        >,
+    ) -> Result<(), String> {
+        self.nomination_freezer
+            .set(freezer)
+            .map_err(|_| "statement nomination freezer was already installed".to_owned())
+    }
+    pub(crate) fn bind_statement(
+        self: &Arc<Self>,
+        statement: StatementToken,
+        sql: &str,
+    ) -> Result<Option<StatementObservationHandle>, String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "statement observation lock poisoned".to_owned())?;
+        if !self.active(&mut state) {
+            return Ok(None);
+        }
+        let Some(mut handle) = state.bind_statement(statement, sql) else {
+            return Ok(None);
+        };
+        let ProcessBinding::Frontend(process) = self.cancellation.process() else {
+            return Err("statement nomination requires the actual frontend process".into());
+        };
+        let nomination = novarocks_failpoint::target_binding::StatementWorkNomination {
+            target_session_id: self.cancellation.session_id().to_owned(),
+            statement_run_token: handle.run_token.clone(),
+            frontend_process_id: process.to_string(),
+            connection_id: statement.session().connection_id(),
+            session_epoch: statement.session().session_epoch(),
+            statement_generation: statement.generation(),
+        };
+        nomination.validate().map_err(|error| error.to_string())?;
+        let input = self.input_for_session(
+            statement.session(),
+            &handle.run_token,
+            Sha256::digest(sql.as_bytes()).into(),
+        )?;
+        input
+            .validate_statement(&nomination)
+            .map_err(|error| error.to_string())?;
+        // Pure owner-local pins run under the same journal lock as bind, so
+        // drain/rearm cannot redirect an unclaimed grant to a later generation.
+        if let Some(freezer) = self.nomination_freezer.get() {
+            freezer(&input, &nomination)?;
+        }
+        if !self
+            .observed_hit
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.claim
+                .lock()
+                .map_err(|_| "statement observation claim lock poisoned".to_owned())?
+                .record_hit()
+                .map_err(|error| error.to_string())?;
+        }
+        handle.owner = Some(Arc::downgrade(self));
+        Ok(Some(handle))
+    }
+    pub(crate) fn bind_nominated_attempt(
+        self: &Arc<Self>,
+        nomination: &novarocks_failpoint::target_binding::StatementWorkNomination,
+        execution: QueryExecutionId,
+    ) -> Result<(), String> {
+        let token = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "statement observation lock poisoned")?;
+            if !self.active(&mut state) {
+                return Ok(());
+            }
+            state
+                .runs
+                .get(&nomination.statement_run_token)
+                .and_then(|run| run.statement)
+        };
+        if let Some(token) = token {
+            if let Some(handle) = self.bound_statement(token) {
+                if handle.nomination().as_ref() != Some(nomination) {
+                    return Err("distributed attempt differs from its nominated statement".into());
+                }
+                handle.bind_attempt(execution);
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn bound_statement(
+        self: &Arc<Self>,
+        statement: StatementToken,
+    ) -> Option<StatementObservationHandle> {
+        let mut state = self.state.lock().ok()?;
+        if !self.active(&mut state) {
+            return None;
+        }
+        let mut handle = state.bound_statement(statement)?;
+        handle.owner = Some(Arc::downgrade(self));
+        Some(handle)
+    }
+    pub(crate) fn publish(&self, snapshot: &QueryLifecycleConvergenceSnapshot) {
+        if let Ok(mut state) = self.state.lock() {
+            if self.active(&mut state) {
+                state.publish(snapshot);
+            }
+        }
+    }
+    pub(crate) fn close_observation(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.runs.clear();
+        }
+    }
+    /// The role owns this future and awaits it; no detached cleanup task exists.
+    pub(crate) async fn close_when_cancelled(&self) {
+        self.cancellation.cancelled().await;
+        if let Ok(mut state) = self.state.lock() {
+            state.runs.clear();
+        }
     }
 }
-
-pub(crate) fn publish_observed_convergence(snapshot: &QueryLifecycleConvergenceSnapshot) {
-    if ACTIVE_STATEMENT_OBSERVERS.load(Ordering::Acquire) == 0 {
-        return;
+impl StatementObservationHandle {
+    pub(crate) fn nomination(
+        &self,
+    ) -> Option<novarocks_failpoint::target_binding::StatementWorkNomination> {
+        let owner = self.owner.as_ref()?.upgrade()?;
+        let mut state = owner.state.lock().ok()?;
+        if !owner.active(&mut state) {
+            return None;
+        }
+        let statement = state.run_mut(self)?.statement?;
+        let ProcessBinding::Frontend(process) = owner.cancellation.process() else {
+            return None;
+        };
+        Some(
+            novarocks_failpoint::target_binding::StatementWorkNomination {
+                target_session_id: owner.cancellation.session_id().to_owned(),
+                statement_run_token: self.run_token.clone(),
+                frontend_process_id: process.to_string(),
+                connection_id: statement.session().connection_id(),
+                session_epoch: statement.session().session_epoch(),
+                statement_generation: statement.generation(),
+            },
+        )
     }
-    if let Ok(mut state) = statement_observers().lock() {
-        state.publish(snapshot);
+
+    /// A nomination is observation identity only, never injection authority.
+    pub(crate) fn statement_target(&self) -> Option<(String, StatementToken)> {
+        let owner = self.owner.as_ref()?.upgrade()?;
+        let mut state = owner.state.lock().ok()?;
+        if !owner.active(&mut state) {
+            return None;
+        }
+        let run = state.run_mut(self)?;
+        Some((self.run_token.clone(), run.statement?))
+    }
+    pub(crate) fn bind_attempt(&self, execution: QueryExecutionId) {
+        let Some(owner) = self.owner.as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+        if let Ok(mut state) = owner.state.lock() {
+            if owner.active(&mut state) {
+                state.bind_attempt(self, execution);
+            }
+        }
     }
 }
 
@@ -393,22 +656,6 @@ impl DiagnosticAuthorization {
             .map(|candidate| <[u8; 32]>::from(Sha256::digest(candidate.as_bytes())))
             .is_some_and(|candidate_digest| candidate_digest == secret_digest)
     }
-}
-
-fn authorization() -> &'static DiagnosticAuthorization {
-    static AUTHORIZATION: OnceLock<DiagnosticAuthorization> = OnceLock::new();
-    AUTHORIZATION.get_or_init(|| {
-        let secret = std::env::var(CONTROL_SECRET_ENV).ok();
-        DiagnosticAuthorization::from_secret(secret.as_deref())
-    })
-}
-
-pub(crate) fn enabled() -> bool {
-    authorization().enabled()
-}
-
-pub(crate) fn authorize(header: Option<&str>) -> bool {
-    authorization().authorized(header)
 }
 
 #[cfg(test)]
@@ -454,11 +701,14 @@ mod authorization_tests {
         assert!(auth.authorized(Some(&format!("Bearer {secret}"))));
         let mut observers = StatementObservers::default();
         observers
-            .arm(StatementObservationArmRequest {
-                run_token: "authorized-statement".to_owned(),
-                connection_id: 91,
-                sql_sha256: format!("{:x}", Sha256::digest(b"SELECT 1")),
-            })
+            .arm(
+                StatementObservationArmRequest {
+                    run_token: "authorized-statement".to_owned(),
+                    connection_id: 91,
+                    sql_sha256: format!("{:x}", Sha256::digest(b"SELECT 1")),
+                },
+                SessionToken::new(91, 1),
+            )
             .expect("the authorized statement owner remains available");
         assert_eq!(
             observers
@@ -512,7 +762,10 @@ mod statement_observation_tests {
     fn statement_observation_matches_exact_connection_sql_and_statement_owner() {
         let mut state = StatementObservers::default();
         state
-            .arm(arm_request("selected", 7, "SELECT k FROM t"))
+            .arm(
+                arm_request("selected", 7, "SELECT k FROM t"),
+                SessionToken::new(7, 9),
+            )
             .unwrap();
         assert!(
             state
@@ -567,7 +820,10 @@ mod statement_observation_tests {
     fn statement_observation_ignores_late_previous_query_and_old_attempt_snapshots() {
         let mut state = StatementObservers::default();
         state
-            .arm(arm_request("selected", 7, "SELECT k FROM t"))
+            .arm(
+                arm_request("selected", 7, "SELECT k FROM t"),
+                SessionToken::new(7, 9),
+            )
             .unwrap();
         let previous = execution(-19, 40, 1);
         state.publish(&snapshot(previous));
@@ -605,21 +861,87 @@ mod statement_observation_tests {
     }
 
     #[test]
+    fn session_capture_before_close_cannot_bind_the_replacement_after_arm() {
+        let control = Arc::new(
+            novarocks_query_application::query_control::QueryApplicationControl::default(),
+        );
+        let service =
+            novarocks_query_application::session_control::QueryControlService::new(control.clone());
+        let original = service
+            .register_session(
+                novarocks_query_application::session_control::SessionIdentity::new(
+                    novarocks_query_application::client_connection::ClientConnectionToken::new(
+                        7, 1,
+                    )
+                    .unwrap(),
+                    "capture-race",
+                ),
+            )
+            .unwrap();
+        let captured = control.current_session_for_test_controls(7).unwrap();
+        drop(original);
+        let replacement = service
+            .register_session(
+                novarocks_query_application::session_control::SessionIdentity::new(
+                    novarocks_query_application::client_connection::ClientConnectionToken::new(
+                        7, 2,
+                    )
+                    .unwrap(),
+                    "capture-race",
+                ),
+            )
+            .unwrap();
+        let mut state = StatementObservers::default();
+        state
+            .arm(arm_request("captured", 7, "SELECT 1"), captured)
+            .unwrap();
+        let mut actual = service.begin_statement(replacement.token()).unwrap();
+        assert!(state.bind_statement(actual.token(), "SELECT 1").is_none());
+        assert!(state.response("captured").unwrap().work_id.is_none());
+        actual.finish();
+        drop(replacement);
+    }
+
+    #[test]
     fn statement_observation_parallel_tokens_are_bounded_and_drain_invalidates_handles() {
         let mut state = StatementObservers::default();
-        assert!(state.arm(arm_request("zero", 0, "SELECT 1")).is_err());
+        assert!(
+            state
+                .arm(arm_request("zero", 0, "SELECT 1"), SessionToken::new(0, 1))
+                .is_err()
+        );
         for connection in 1..=MAX_STATEMENT_OBSERVERS as u32 {
             state
-                .arm(arm_request(
-                    &format!("run-{connection}"),
-                    connection,
-                    "SELECT 1",
-                ))
+                .arm(
+                    arm_request(&format!("run-{connection}"), connection, "SELECT 1"),
+                    SessionToken::new(connection, 1),
+                )
                 .unwrap();
         }
-        assert!(state.arm(arm_request("run-1", 100, "SELECT 1")).is_err());
-        assert!(state.arm(arm_request("another", 1, "SELECT 1")).is_err());
-        assert!(state.arm(arm_request("overflow", 100, "SELECT 1")).is_err());
+        assert!(
+            state
+                .arm(
+                    arm_request("run-1", 100, "SELECT 1"),
+                    SessionToken::new(100, 1)
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .arm(
+                    arm_request("another", 1, "SELECT 1"),
+                    SessionToken::new(1, 1)
+                )
+                .is_err()
+        );
+        assert!(
+            state
+                .arm(
+                    arm_request("overflow", 100, "SELECT 1"),
+                    SessionToken::new(100, 1)
+                )
+                .is_err()
+        );
         let a = state
             .bind_statement(statement(1, 1, 1), "SELECT 1")
             .unwrap();
@@ -633,7 +955,9 @@ mod statement_observation_tests {
         assert!(state.response("run-2").unwrap().snapshot.is_some());
         state.drain("run-1").unwrap();
         assert!(state.response("run-1").is_err());
-        state.arm(arm_request("run-1", 1, "SELECT 1")).unwrap();
+        state
+            .arm(arm_request("run-1", 1, "SELECT 1"), SessionToken::new(1, 1))
+            .unwrap();
         state.bind_attempt(&a, execution(5, 43, 2));
         state.publish(&snapshot(execution(5, 41, 1)));
         assert!(state.response("run-1").unwrap().work_id.is_none());
@@ -642,25 +966,364 @@ mod statement_observation_tests {
         assert_eq!(state.runs.len(), MAX_STATEMENT_OBSERVERS);
         state.next_generation = u64::MAX;
         state.drain("run-1").unwrap();
-        assert!(state.arm(arm_request("exhausted", 1, "SELECT 1")).is_err());
+        assert!(
+            state
+                .arm(
+                    arm_request("exhausted", 1, "SELECT 1"),
+                    SessionToken::new(1, 1)
+                )
+                .is_err()
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod session_owner_tests {
+    use super::*;
+    use novarocks_failpoint::liveness::{PreparedRoleSession, RunnerSession};
+    use novarocks_failpoint::session::{
+        DECLARATION_VERSION, DomainGrant, SessionDeclaration, SessionRole,
+    };
+    use novarocks_query_application::session_control::SessionToken;
+    use std::os::unix::fs::DirBuilderExt;
+
+    #[test]
+    fn explicit_observer_session_end_invalidates_generation_and_releases_journal() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let root = std::path::PathBuf::from(format!(
+            "/tmp/g2diag-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let mut declaration = SessionDeclaration {
+            schema_version: DECLARATION_VERSION,
+            session_id: "diag-session".into(),
+            launch_id: "diag-launch".into(),
+            role: SessionRole::Fe,
+            lifetime_millis: 10_000,
+            liveness_socket: root.join("live.sock"),
+            handshake_secret: "abcdefghijklmnopqrstuvwxyz0123456789".into(),
+            domain_grants: vec![DomainGrant {
+                domain: StatementObservationOwner::DOMAIN.into(),
+                grant_id: "observe".into(),
+                parameters: serde_json::json!({"action":"observe","bearer_secret":"abcdefghijklmnopqrstuvwxyz0123456789"}),
+            }],
+        };
+        let mut foreign = declaration.domain_grants[0].clone();
+        foreign.domain = "foreign-domain".into();
+        foreign.grant_id = "foreign-grant".into();
+        declaration.domain_grants.push(foreign);
+        let path = root.join("declaration.json");
+        declaration.write_private(&path).unwrap();
+        let prepared = PreparedRoleSession::read_and_claim(&path, SessionRole::Fe).unwrap();
+        let mut runner = RunnerSession::start(declaration).unwrap();
+        let mut role = prepared
+            .bind(ProcessBinding::Frontend(
+                novarocks_types::FrontendProcessId::new_v7(),
+            ))
+            .unwrap();
+        assert!(
+            StatementObservationOwner::from_grants(role.scope().grants_for("foreign-domain"))
+                .is_err()
+        );
+        let owner = StatementObservationOwner::from_grants(
+            role.scope().grants_for(StatementObservationOwner::DOMAIN),
+        )
+        .unwrap()
+        .unwrap();
+        let control = Arc::new(
+            novarocks_query_application::query_control::QueryApplicationControl::default(),
+        );
+        let service =
+            novarocks_query_application::session_control::QueryControlService::new(control.clone());
+        let session = service
+            .register_session(
+                novarocks_query_application::session_control::SessionIdentity::new(
+                    novarocks_query_application::client_connection::ClientConnectionToken::new(
+                        7, 1,
+                    )
+                    .unwrap(),
+                    "observer-test",
+                ),
+            )
+            .unwrap();
+        owner
+            .install_session_resolver(Arc::new(move |connection| {
+                control
+                    .current_session_for_test_controls(connection)
+                    .map_err(|error| {
+                        format!("statement observation session lookup failed: {error:?}")
+                    })
+            }))
+            .unwrap();
+        owner.install_input_freezer(Arc::new(|_| Ok(()))).unwrap();
+        owner
+            .install_nomination_freezer(Arc::new(|_, _| Ok(())))
+            .unwrap();
+        assert!(!owner.authorize(Some("Bearer wrong")));
+        owner
+            .arm(StatementObservationArmRequest {
+                run_token: "one".into(),
+                connection_id: 7,
+                sql_sha256: format!("{:x}", Sha256::digest(b"SELECT 1")),
+            })
+            .unwrap();
+        let mut actual = service.begin_statement(session.token()).unwrap();
+        let token = actual.token();
+        let handle = owner.bind_statement(token, "SELECT 1").unwrap().unwrap();
+        assert_eq!(handle.statement_target(), Some(("one".into(), token)));
+        assert!(
+            StatementObservationOwner::from_grants(
+                role.scope().grants_for(StatementObservationOwner::DOMAIN)
+            )
+            .is_err()
+        );
+        role.close_and_join().unwrap();
+        assert!(handle.statement_target().is_none());
+        assert!(owner.peek("one").is_err());
+        assert!(!owner.authorize(Some("Bearer abcdefghijklmnopqrstuvwxyz0123456789")));
+        assert!(owner.state.lock().unwrap().runs.is_empty());
+        actual.finish();
+        drop(session);
+        runner.end_and_join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    struct ObserverFixture {
+        root: std::path::PathBuf,
+        owner: Arc<StatementObservationOwner>,
+        service: novarocks_query_application::session_control::QueryControlService,
+        role: novarocks_failpoint::liveness::RoleSessionOwner,
+        runner: RunnerSession,
+    }
+    impl ObserverFixture {
+        fn new() -> Self {
+            Self::with_input_freezer(Arc::new(|_| Ok(())))
+        }
+        fn with_input_freezer(
+            freezer: Arc<dyn Fn(&StatementInputNomination) -> Result<(), String> + Send + Sync>,
+        ) -> Self {
+            let root = std::path::PathBuf::from("/tmp")
+                .join(format!("g2observe-{}", uuid::Uuid::now_v7()));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&root)
+                .unwrap();
+            let declaration = SessionDeclaration {
+                schema_version: DECLARATION_VERSION,
+                session_id: "observer-only".into(),
+                launch_id: "observer-only-launch".into(),
+                role: SessionRole::Fe,
+                lifetime_millis: 10_000,
+                liveness_socket: root.join("live.sock"),
+                handshake_secret: "abcdefghijklmnopqrstuvwxyz0123456789".into(),
+                domain_grants: vec![DomainGrant {
+                    domain: StatementObservationOwner::DOMAIN.into(),
+                    grant_id: "observe".into(),
+                    parameters: serde_json::json!({"action":"observe","bearer_secret":"abcdefghijklmnopqrstuvwxyz0123456789"}),
+                }],
+            };
+            let path = root.join("declaration.json");
+            declaration.write_private(&path).unwrap();
+            let prepared = PreparedRoleSession::read_and_claim(&path, SessionRole::Fe).unwrap();
+            let runner = RunnerSession::start(declaration).unwrap();
+            let role = prepared
+                .bind(ProcessBinding::Frontend(
+                    novarocks_types::FrontendProcessId::new_v7(),
+                ))
+                .unwrap();
+            let owner = StatementObservationOwner::from_grants(
+                role.scope().grants_for(StatementObservationOwner::DOMAIN),
+            )
+            .unwrap()
+            .unwrap();
+            let control = Arc::new(
+                novarocks_query_application::query_control::QueryApplicationControl::default(),
+            );
+            let service = novarocks_query_application::session_control::QueryControlService::new(
+                control.clone(),
+            );
+            owner
+                .install_session_resolver(Arc::new(move |connection| {
+                    control
+                        .current_session_for_test_controls(connection)
+                        .map_err(|error| format!("statement session lookup failed: {error:?}"))
+                }))
+                .unwrap();
+            owner.install_input_freezer(freezer).unwrap();
+            owner
+                .install_nomination_freezer(Arc::new(|_, _| Ok(())))
+                .unwrap();
+            Self {
+                root,
+                owner,
+                service,
+                role,
+                runner,
+            }
+        }
+        fn session(
+            &self,
+            connection: u32,
+            generation: u64,
+        ) -> novarocks_query_application::session_control::QuerySessionLease {
+            self.service
+                .register_session(
+                    novarocks_query_application::session_control::SessionIdentity::new(
+                        novarocks_query_application::client_connection::ClientConnectionToken::new(
+                            connection, generation,
+                        )
+                        .unwrap(),
+                        "observer-only",
+                    ),
+                )
+                .unwrap()
+        }
+        fn arm(token: &str, connection_id: u32, sql: &str) -> StatementObservationArmRequest {
+            StatementObservationArmRequest {
+                run_token: token.into(),
+                connection_id,
+                sql_sha256: format!("{:x}", Sha256::digest(sql.as_bytes())),
+            }
+        }
+    }
+    impl Drop for ObserverFixture {
+        fn drop(&mut self) {
+            self.role.close_and_join().unwrap();
+            self.runner.end_and_join().unwrap();
+            std::fs::remove_dir_all(&self.root).unwrap();
+        }
     }
 
     #[test]
-    fn statement_observation_scope_restores_previous_context_without_cross_statement_leak() {
-        assert!(capture_statement_observation().is_none());
-        let outer = StatementObservationHandle {
-            run_token: "outer".to_owned(),
-            generation: 1,
-        };
-        let outer_scope =
-            STATEMENT_OBSERVATION.with(|slot| StatementObservationScope(slot.replace(Some(outer))));
-        assert_eq!(capture_statement_observation().unwrap().run_token, "outer");
-        let unrelated_scope =
-            STATEMENT_OBSERVATION.with(|slot| StatementObservationScope(slot.replace(None)));
-        assert!(capture_statement_observation().is_none());
-        drop(unrelated_scope);
-        assert_eq!(capture_statement_observation().unwrap().run_token, "outer");
-        drop(outer_scope);
-        assert!(capture_statement_observation().is_none());
+    fn observer_only_same_token_can_drain_and_reuse_with_actual_replacement_session() {
+        let fixture = ObserverFixture::new();
+        let original = fixture.session(7, 1);
+        fixture
+            .owner
+            .arm(ObserverFixture::arm("reused", 7, "SELECT 1"))
+            .unwrap();
+        assert!(
+            !fixture
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .any(|event| event.event == "hit")
+        );
+        let original_session = original.token();
+        let mut first = fixture.service.begin_statement(original_session).unwrap();
+        let old_handle = fixture
+            .owner
+            .bind_statement(first.token(), "SELECT 1")
+            .unwrap()
+            .unwrap();
+        first.finish();
+        fixture.owner.drain("reused").unwrap();
+        assert!(old_handle.statement_target().is_none());
+        drop(original);
+        let replacement = fixture.session(7, 2);
+        fixture
+            .owner
+            .arm(ObserverFixture::arm("reused", 7, "SELECT 2"))
+            .unwrap();
+        let mut next = fixture
+            .service
+            .begin_statement(replacement.token())
+            .unwrap();
+        let new_handle = fixture
+            .owner
+            .bind_statement(next.token(), "SELECT 2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            new_handle.statement_target(),
+            Some(("reused".into(), next.token()))
+        );
+        assert_ne!(next.token().session(), original_session);
+        next.finish();
+        fixture.owner.drain("reused").unwrap();
+        assert_eq!(
+            fixture
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .filter(|event| event.event == "hit")
+                .count(),
+            1
+        );
+        drop(replacement);
+    }
+
+    #[test]
+    fn arm_preflight_refuses_invalid_duplicate_full_and_exhausted_before_input_freezer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let fixture = ObserverFixture::with_input_freezer(Arc::new(move |_| {
+            counter.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }));
+        let mut sessions = Vec::new();
+        for connection in 1..=MAX_STATEMENT_OBSERVERS as u32 {
+            sessions.push(fixture.session(connection, 1));
+        }
+        let mut invalid = ObserverFixture::arm("bad", 1, "SELECT 1");
+        invalid.sql_sha256 = "bad".into();
+        assert!(fixture.owner.arm(invalid).is_err());
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        for connection in 1..=MAX_STATEMENT_OBSERVERS as u32 {
+            fixture
+                .owner
+                .arm(ObserverFixture::arm(
+                    &format!("token-{connection}"),
+                    connection,
+                    "SELECT 1",
+                ))
+                .unwrap();
+        }
+        assert!(
+            fixture
+                .owner
+                .arm(ObserverFixture::arm("token-1", 1, "SELECT 1"))
+                .is_err()
+        );
+        assert!(
+            fixture
+                .owner
+                .arm(ObserverFixture::arm("overflow", 100, "SELECT 1"))
+                .is_err()
+        );
+        fixture.owner.drain("token-1").unwrap();
+        fixture.owner.state.lock().unwrap().next_generation = u64::MAX;
+        assert!(
+            fixture
+                .owner
+                .arm(ObserverFixture::arm("exhausted", 1, "SELECT 1"))
+                .is_err()
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), MAX_STATEMENT_OBSERVERS);
+        assert!(
+            !fixture
+                .role
+                .scope()
+                .observations()
+                .iter()
+                .any(|event| event.event == "hit")
+        );
+        drop(sessions);
+    }
+
+    #[test]
+    fn a_compiled_observer_with_no_grant_has_no_owner_or_secret_source() {
+        assert!(
+            StatementObservationOwner::from_grants(Vec::new())
+                .unwrap()
+                .is_none()
+        );
     }
 }

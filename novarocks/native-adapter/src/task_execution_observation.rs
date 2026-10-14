@@ -30,11 +30,19 @@ use novarocks_worker::{
 };
 
 #[derive(Debug)]
-struct NativeTaskExecutionPorts;
+struct NativeTaskExecutionPorts {
+    #[cfg(feature = "test-controls")]
+    observations: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
+}
 
 impl TaskProtocolObserver for NativeTaskExecutionPorts {
     fn observe(&self, event: TaskProtocolEvent) {
-        emit(event);
+        #[cfg(feature = "test-controls")]
+        if let Some(controls) = self.observations.as_deref() {
+            emit(controls, event);
+        }
+        #[cfg(not(feature = "test-controls"))]
+        let _ = event;
     }
 }
 
@@ -55,39 +63,57 @@ impl TaskExecutionMetrics for NativeTaskExecutionPorts {
 }
 
 /// Builds the Native role-local effects injected into the Worker task owner.
-pub fn backend_task_execution_ports() -> TaskExecutionPorts {
-    let adapter = Arc::new(NativeTaskExecutionPorts);
+pub fn backend_task_execution_ports(
+    #[cfg(feature = "test-controls")] observations: Option<
+        Arc<crate::test_observation_controls::NativeObservationControls>,
+    >,
+) -> TaskExecutionPorts {
+    let adapter = Arc::new(NativeTaskExecutionPorts {
+        #[cfg(feature = "test-controls")]
+        observations,
+    });
     let observer: Arc<dyn TaskProtocolObserver> = adapter.clone();
     let result_lifecycle: Arc<dyn TaskResultLifecycle> = adapter.clone();
     let metrics: Arc<dyn TaskExecutionMetrics> = adapter;
     TaskExecutionPorts::new(observer, result_lifecycle, metrics)
 }
 
-fn enabled() -> bool {
-    crate::debug_environment::debug_emit_connector_reader_marker()
+#[cfg(feature = "test-controls")]
+fn emit_context(
+    observer: &dyn novarocks_execution::runtime::exchange::TestEventObserver,
+    name: &str,
+    context: QueryContextRef,
+) {
+    emit_context_with(observer, name, context, "");
 }
 
-fn emit_context(name: &str, context: QueryContextRef) {
-    emit_context_with(name, context, "");
-}
-
-fn emit_context_with(name: &str, context: QueryContextRef, extra: &str) {
+#[cfg(feature = "test-controls")]
+fn emit_context_with(
+    observer: &dyn novarocks_execution::runtime::exchange::TestEventObserver,
+    name: &str,
+    context: QueryContextRef,
+    extra: &str,
+) {
     let execution = context.query_execution_id();
     let separator = if extra.is_empty() { "" } else { " " };
-    println!(
+    observer.observe(&format!(
         "{name} execution_id={}:{}:{} frontend={} backend={}{separator}{extra}",
         execution.query_id().high(),
         execution.query_id().low(),
         execution.attempt_id().get(),
         context.frontend_process_id(),
         context.backend_process_id(),
-    );
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+    ));
 }
 
-fn emit_task(name: &str, identity: TaskIdentity) {
+#[cfg(feature = "test-controls")]
+fn emit_task(
+    observer: &dyn novarocks_execution::runtime::exchange::TestEventObserver,
+    name: &str,
+    identity: TaskIdentity,
+) {
     let execution = identity.query_execution_id();
-    println!(
+    observer.observe(&format!(
         "{name} execution_id={}:{}:{} stage={} task={} backend={}",
         execution.query_id().high(),
         execution.query_id().low(),
@@ -95,23 +121,25 @@ fn emit_task(name: &str, identity: TaskIdentity) {
         identity.stage_id().get(),
         identity.task_id().get(),
         identity.backend_process_id(),
-    );
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+    ));
 }
 
 /// Test-only observation of the exact effective DOP admitted with a task.
 /// The execution kernel uses this positive descriptor value unchanged as its
 /// base graph DOP; this marker carries no scheduling authority.
+#[cfg(feature = "test-controls")]
 pub(crate) fn emit_prepared_task_dop(
+    controls: Option<&crate::test_observation_controls::NativeObservationControls>,
     identity: TaskIdentity,
     fragment_instance_id: novarocks_types::UniqueId,
     dop: usize,
 ) {
-    if !enabled() {
+    let Some(controls) = controls else { return };
+    let Some(observer) = task_observer(controls, identity) else {
         return;
-    }
+    };
     let execution = identity.query_execution_id();
-    println!(
+    observer.observe(&format!(
         "NOVAROCKS_TASK_PREPARED_DOP execution_id={}:{}:{} stage={} task={} backend={} finst={:x}:{:x} dop={dop}",
         execution.query_id().high(),
         execution.query_id().low(),
@@ -121,41 +149,85 @@ pub(crate) fn emit_prepared_task_dop(
         identity.backend_process_id(),
         fragment_instance_id.high(),
         fragment_instance_id.low(),
-    );
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+    ));
 }
 
 /// Test-only identity of a successfully prepared ClientRows root. This
 /// renders the exact bound channel contract, with no installation authority.
+#[cfg(feature = "test-controls")]
 pub(crate) fn emit_prepared_client_root(
+    controls: Option<&crate::test_observation_controls::NativeObservationControls>,
     identity: TaskIdentity,
     contract: &novarocks_result_contract::RootOutputContract,
 ) {
-    if enabled()
-        && contract.profile() == novarocks_result_contract::RootProfileId::V1
+    let Some(controls) = controls else { return };
+    let Some(observer) = task_observer(controls, identity) else {
+        return;
+    };
+    if contract.profile() == novarocks_result_contract::RootProfileId::V1
         && contract.kind() == novarocks_result_contract::RootOutputKind::ClientRows
     {
-        emit_task("NOVAROCKS_TASK_PREPARED_CLIENT_ROOT", identity);
+        emit_task(
+            observer.as_ref(),
+            "NOVAROCKS_TASK_PREPARED_CLIENT_ROOT",
+            identity,
+        );
     }
 }
 
-fn emit(event: TaskProtocolEvent) {
-    if !enabled() {
+#[cfg(feature = "test-controls")]
+fn emit(
+    controls: &crate::test_observation_controls::NativeObservationControls,
+    event: TaskProtocolEvent,
+) {
+    let (execution, process) = match &event {
+        TaskProtocolEvent::TaskCreateApplied { identity }
+        | TaskProtocolEvent::TaskCreateIdempotent { identity }
+        | TaskProtocolEvent::TaskTerminalRetained { identity, .. } => {
+            (identity.query_execution_id(), identity.backend_process_id())
+        }
+        TaskProtocolEvent::ContextEstablishApplied { context }
+        | TaskProtocolEvent::ContextEstablishIdempotent { context }
+        | TaskProtocolEvent::ContextEstablishConflict { context }
+        | TaskProtocolEvent::LeaseRenewed { context, .. }
+        | TaskProtocolEvent::ContextReleaseApplied { context, .. }
+        | TaskProtocolEvent::ContextLeaseExpired { context }
+        | TaskProtocolEvent::ContextTerminationCompleted { context, .. }
+        | TaskProtocolEvent::ContextAbortApplied { context } => {
+            (context.query_execution_id(), context.backend_process_id())
+        }
+    };
+    if !controls.owns_backend(process) {
         return;
     }
+    let Some(observer) = resolve_observer(controls, execution) else {
+        return;
+    };
     match event {
         TaskProtocolEvent::ContextEstablishApplied { context } => {
-            emit_context("NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED", context);
+            emit_context(
+                observer.as_ref(),
+                "NOVAROCKS_TASK_CONTEXT_ESTABLISH_APPLIED",
+                context,
+            );
         }
         TaskProtocolEvent::ContextEstablishIdempotent { context } => {
-            emit_context("NOVAROCKS_TASK_CONTEXT_ESTABLISH_IDEMPOTENT", context);
+            emit_context(
+                observer.as_ref(),
+                "NOVAROCKS_TASK_CONTEXT_ESTABLISH_IDEMPOTENT",
+                context,
+            );
         }
         TaskProtocolEvent::ContextEstablishConflict { context } => {
-            emit_context("NOVAROCKS_TASK_CONTEXT_ESTABLISH_CONFLICT", context);
+            emit_context(
+                observer.as_ref(),
+                "NOVAROCKS_TASK_CONTEXT_ESTABLISH_CONFLICT",
+                context,
+            );
         }
         TaskProtocolEvent::LeaseRenewed { context, sequence } => {
             let execution = context.query_execution_id();
-            println!(
+            observer.observe(&format!(
                 "NOVAROCKS_TASK_LEASE_RENEWED execution_id={}:{}:{} frontend={} backend={} sequence={}",
                 execution.query_id().high(),
                 execution.query_id().low(),
@@ -163,15 +235,16 @@ fn emit(event: TaskProtocolEvent) {
                 context.frontend_process_id(),
                 context.backend_process_id(),
                 sequence.get(),
-            );
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            ));
         }
         TaskProtocolEvent::TaskCreateApplied { identity } => {
-            emit_task("NOVAROCKS_TASK_CREATE_APPLIED", identity)
+            emit_task(observer.as_ref(), "NOVAROCKS_TASK_CREATE_APPLIED", identity)
         }
-        TaskProtocolEvent::TaskCreateIdempotent { identity } => {
-            emit_task("NOVAROCKS_TASK_CREATE_IDEMPOTENT", identity)
-        }
+        TaskProtocolEvent::TaskCreateIdempotent { identity } => emit_task(
+            observer.as_ref(),
+            "NOVAROCKS_TASK_CREATE_IDEMPOTENT",
+            identity,
+        ),
         TaskProtocolEvent::ContextReleaseApplied {
             context,
             runtime_filter,
@@ -182,13 +255,18 @@ fn emit(event: TaskProtocolEvent) {
                 RuntimeFilterReleaseObservation::Unavailable => "unavailable",
             };
             emit_context_with(
+                observer.as_ref(),
                 "NOVAROCKS_TASK_RELEASE_APPLIED",
                 context,
                 &format!("runtime_filter={runtime_filter}"),
             );
         }
         TaskProtocolEvent::ContextLeaseExpired { context } => {
-            emit_context("NOVAROCKS_TASK_CONTEXT_LEASE_EXPIRED", context);
+            emit_context(
+                observer.as_ref(),
+                "NOVAROCKS_TASK_CONTEXT_LEASE_EXPIRED",
+                context,
+            );
         }
         TaskProtocolEvent::ContextTerminationCompleted {
             context,
@@ -196,7 +274,7 @@ fn emit(event: TaskProtocolEvent) {
             retained_tasks,
         } => {
             let execution = context.query_execution_id();
-            println!(
+            observer.observe(&format!(
                 "NOVAROCKS_TASK_CONTEXT_TERMINATION_COMPLETED execution_id={}:{}:{} frontend={} backend={} cause={} retained_tasks={retained_tasks}",
                 execution.query_id().high(),
                 execution.query_id().low(),
@@ -204,8 +282,7 @@ fn emit(event: TaskProtocolEvent) {
                 context.frontend_process_id(),
                 context.backend_process_id(),
                 cause,
-            );
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            ));
         }
         TaskProtocolEvent::TaskTerminalRetained {
             identity,
@@ -213,7 +290,7 @@ fn emit(event: TaskProtocolEvent) {
             bytes,
         } => {
             let execution = identity.query_execution_id();
-            println!(
+            observer.observe(&format!(
                 "NOVAROCKS_TASK_TERMINAL_RETAINED execution_id={}:{}:{} stage={} task={} backend={} state={state} bytes={bytes}",
                 execution.query_id().high(),
                 execution.query_id().low(),
@@ -221,20 +298,42 @@ fn emit(event: TaskProtocolEvent) {
                 identity.stage_id().get(),
                 identity.task_id().get(),
                 identity.backend_process_id(),
-            );
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            ));
         }
         TaskProtocolEvent::ContextAbortApplied { context } => {
             let execution = context.query_execution_id();
-            println!(
+            observer.observe(&format!(
                 "NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED execution_id={}:{}:{} frontend={} backend={}",
                 execution.query_id().high(),
                 execution.query_id().low(),
                 execution.attempt_id().get(),
                 context.frontend_process_id(),
                 context.backend_process_id(),
-            );
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            ));
         }
     }
+}
+
+#[cfg(feature = "test-controls")]
+fn resolve_observer(
+    controls: &crate::test_observation_controls::NativeObservationControls,
+    execution: novarocks_types::QueryExecutionId,
+) -> Option<Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>> {
+    match controls.observation_for("grpc-fragment", execution) {
+        Ok(observer) => observer,
+        Err(error) => {
+            eprintln!("Native task observation rejected: {error}");
+            None
+        }
+    }
+}
+#[cfg(feature = "test-controls")]
+fn task_observer(
+    controls: &crate::test_observation_controls::NativeObservationControls,
+    identity: TaskIdentity,
+) -> Option<Arc<dyn novarocks_execution::runtime::exchange::TestEventObserver>> {
+    if !controls.owns_backend(identity.backend_process_id()) {
+        return None;
+    }
+    resolve_observer(controls, identity.query_execution_id())
 }

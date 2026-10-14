@@ -49,7 +49,6 @@ use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
 use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::agg;
 use crate::exec::expr::{ExprArena, ExprId, ExprNode};
-use crate::exec::failpoint;
 use crate::exec::hash_table::key_table::{KeyLookup, KeyTable};
 use crate::exec::node::aggregate::{AggFunction, AggregateTopNRuntimeFilterProducerBinding};
 use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
@@ -916,18 +915,6 @@ impl AggregateProcessorOperator {
             return Ok(None);
         }
 
-        if !self.group_by.is_empty() {
-            let failpoint_name = if self.functions.is_empty() {
-                failpoint::AGG_HASH_SET_BAD_ALLOC
-            } else {
-                failpoint::AGGREGATE_BUILD_HASH_MAP_BAD_ALLOC
-            };
-            failpoint::maybe_error(
-                failpoint_name,
-                "Mem usage has exceed the limit of BE: BE:10004",
-            )?;
-        }
-
         let num_rows = chunk.len();
         if let Some(profile) = self.profiles.as_ref() {
             profile
@@ -1294,11 +1281,6 @@ impl ProcessorOperator for AggregateProcessorOperator {
                 self.seal_final_domain()?;
             }
             self.release_finalized_state();
-            if failpoint::should_trigger(
-                failpoint::FORCE_RESET_AGGREGATOR_AFTER_STREAMING_SINK_FINISH,
-            ) {
-                self.reset_after_streaming_finish();
-            }
             self.pending_output = out;
             self.finalized = true;
             if self.pending_output.is_none() {
@@ -1381,6 +1363,11 @@ impl AggregateProcessorOperator {
         self.key_table = None;
     }
 
+    #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "Retained owner-local cleanup helper for aggregate regressions."
+    )]
     fn reset_after_streaming_finish(&mut self) {
         self.drop_group_states();
         self.state_ptrs.clear();

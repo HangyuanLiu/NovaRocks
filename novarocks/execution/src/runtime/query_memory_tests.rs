@@ -115,6 +115,8 @@ fn mem_a1_actual_runtime_builder_and_driver_transport_validate_identity_before_u
         execution_runtime: Some(runtime.clone()),
         query_memory: Some(binding.clone()),
         task_identity: task,
+        #[cfg(feature = "test-controls")]
+        exchange_test_observer: None,
     };
     assert_eq!(
         build_runtime_state(inputs(Some(identity(2)), Some(execution(1).query_id())))

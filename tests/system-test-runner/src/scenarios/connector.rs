@@ -1,3 +1,9 @@
+#[path = "storage_control_plan.rs"]
+mod storage_control_plan;
+
+#[path = "connector_control_plan.rs"]
+mod connector_control_plan;
+
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
@@ -101,11 +107,11 @@ parquet_page_cache_enable = true
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
-        Box::new(DistributedReaderCancel),
-        Box::new(DistributedReaderKillConnection),
-        Box::new(CatalogFeRestartCache),
-        Box::new(CatalogReadyLifecycle),
-        Box::new(CatalogReadWriteRuntime),
+        Box::new(DistributedReaderCancel::default()),
+        Box::new(DistributedReaderKillConnection::default()),
+        Box::new(CatalogFeRestartCache::default()),
+        Box::new(CatalogReadyLifecycle::default()),
+        Box::new(CatalogReadWriteRuntime::default()),
         Box::new(VendedRestReadWritePem::default()),
         Box::new(VendedRestRefreshPem::default()),
         Box::new(VendedCredentialFaultPem::new(
@@ -118,18 +124,21 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
             VendedCredentialFault::Unreachable,
         )),
         Box::new(VendedRestWriteOutcomePem::default()),
-        Box::new(CatalogVersionDrain),
+        Box::new(CatalogVersionDrain::default()),
         Box::new(StaticCredentialGeneration::default()),
         Box::new(AccessDomainCacheIsolation::default()),
         Box::new(PredicatePageIndexPruning),
-        Box::new(TypedReadData),
-        Box::new(Uea5dMultiSplitDop),
+        Box::new(TypedReadData::default()),
+        Box::new(Uea5dMultiSplitDop::default()),
     ]
 }
 
 /// A D00 correctness receipt for real Iceberg splits at two requested driver
 /// widths. It does not time queries or stand in for performance evidence.
-struct Uea5dMultiSplitDop;
+#[derive(Default)]
+struct Uea5dMultiSplitDop {
+    controls: connector_control_plan::Owner,
+}
 
 #[derive(Serialize)]
 struct Uea5dDopObservation {
@@ -148,112 +157,137 @@ impl Scenario for Uea5dMultiSplitDop {
     }
 
     fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
+        CrossProcessChildEnvironment::default()
     }
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
+        Ok(connector_control_plan::launch_config())
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: std::time::Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
+        self.controls
+            .freeze(
+                specs,
+                fe_restart,
+                &be_restarts,
+                cluster_size,
+                ordinary_binary,
+                controlled_binary,
+                original_deadline,
+            )
+            .map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
         let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect UEA-5D multi-split control session")?,
-        )?;
-        const CATALOG: &str = "uea5d_dop_catalog";
-        const DATABASE: &str = "uea5d_dop_db";
-        const TABLE: &str = "uea5d_dop_data";
-        let warehouse = create_warehouse(context, "uea5d-multi-split-dop")?;
-        context.action("create three independent Iceberg data files for UEA-5D DOP reads");
-        create_catalog_table_and_data(&mut control, CATALOG, DATABASE, TABLE, &warehouse)?;
+        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
+        let control_phase = (|| -> Result<()> {
+            const CATALOG: &str = "uea5d_dop_catalog";
+            const DATABASE: &str = "uea5d_dop_db";
+            const TABLE: &str = "uea5d_dop_data";
+            let warehouse = create_warehouse(context, "uea5d-multi-split-dop")?;
+            context.action("create three independent Iceberg data files for UEA-5D DOP reads");
+            create_catalog_table_and_data(&mut control, CATALOG, DATABASE, TABLE, &warehouse)?;
 
-        let mut observations = Vec::new();
-        for dop in [1, 4] {
-            control
-                .query_drop(format!("SET pipeline_dop = {dop}"))
-                .with_context(|| format!("select requested read DOP {dop}"))?;
-            let before = backend_log_snapshots(context)?;
-            context.action(format!(
-                "read three Iceberg splits with requested DOP {dop}"
-            ));
-            let rows: Vec<(i64, i64)> = control
-                .query(format!(
-                    "SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"
-                ))
+            let mut observations = Vec::new();
+            for (index, dop) in [1, 4].into_iter().enumerate() {
+                control
+                    .query_drop(format!("SET pipeline_dop = {dop}"))
+                    .with_context(|| format!("select requested read DOP {dop}"))?;
+                let before = backend_log_snapshots(context)?;
+                context.action(format!(
+                    "read three Iceberg splits with requested DOP {dop}"
+                ));
+                let rows: Vec<(i64, i64)> = connector_control_plan::query(
+                    context,
+                    &self.controls.take(index)?,
+                    &mut control,
+                    &format!("SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"),
+                )
                 .with_context(|| format!("read UEA-5D multi-split fixture at DOP {dop}"))?;
-            ensure!(
-                rows == [(300_000, 45_000_150_000)],
-                "DOP {dop} typed read returned {rows:?}, expected count and sum"
-            );
+                ensure!(
+                    rows == [(300_000, 45_000_150_000)],
+                    "DOP {dop} typed read returned {rows:?}, expected count and sum"
+                );
 
-            let logs = wait_for_backend_logs_while(
-                context,
-                &format!("observe DOP {dop} split completion on multiple backends"),
-                None,
-                |logs| {
-                    let added = appended_since(logs, &before, "UEA-5D DOP read")?;
-                    let added = added
+                let logs = wait_for_backend_logs_while(
+                    context,
+                    &format!("observe DOP {dop} split completion on multiple backends"),
+                    None,
+                    |logs| {
+                        let added = appended_since(logs, &before, "UEA-5D DOP read")?;
+                        let added = added
+                            .iter()
+                            .map(|log| (*log).to_owned())
+                            .collect::<Vec<_>>();
+                        Ok(assert_typed_split_evidence(&added).is_ok())
+                    },
+                )?;
+                let added = appended_since(&logs, &before, "UEA-5D DOP read")?
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                assert_typed_split_evidence(&added)?;
+                let actual_dop_marker = format!("dop={dop}");
+                ensure!(
+                    added.iter().any(|log| {
+                        let scan_instances = log
+                            .lines()
+                            .filter(|line| line.contains(TYPED_SPLIT_ACCEPTED))
+                            .filter_map(|line| line.split_once("finst=").map(|(_, rest)| rest))
+                            .filter_map(|rest| rest.split_whitespace().next())
+                            .collect::<Vec<_>>();
+                        log.lines().any(|line| {
+                            line.contains("NOVAROCKS_TASK_PREPARED_DOP")
+                                && line.contains(&actual_dop_marker)
+                                && scan_instances
+                                    .iter()
+                                    .any(|instance| line.contains(&format!("finst={instance} ")))
+                        })
+                    }),
+                    "DOP {dop} read produced no split-owning prepared task with {actual_dop_marker}"
+                );
+                observations.push(Uea5dDopObservation {
+                    requested_dop: dop,
+                    rows: rows[0],
+                    backend_markers: added
                         .iter()
-                        .map(|log| (*log).to_owned())
-                        .collect::<Vec<_>>();
-                    Ok(assert_typed_split_evidence(&added).is_ok())
-                },
-            )?;
-            let added = appended_since(&logs, &before, "UEA-5D DOP read")?
-                .into_iter()
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
-            assert_typed_split_evidence(&added)?;
-            let actual_dop_marker = format!("dop={dop}");
-            ensure!(
-                added.iter().any(|log| {
-                    let scan_instances = log
-                        .lines()
-                        .filter(|line| line.contains(TYPED_SPLIT_ACCEPTED))
-                        .filter_map(|line| line.split_once("finst=").map(|(_, rest)| rest))
-                        .filter_map(|rest| rest.split_whitespace().next())
-                        .collect::<Vec<_>>();
-                    log.lines().any(|line| {
-                        line.contains("NOVAROCKS_TASK_PREPARED_DOP")
-                            && line.contains(&actual_dop_marker)
-                            && scan_instances
-                                .iter()
-                                .any(|instance| line.contains(&format!("finst={instance} ")))
-                    })
-                }),
-                "DOP {dop} read produced no split-owning prepared task with {actual_dop_marker}"
-            );
-            observations.push(Uea5dDopObservation {
-                requested_dop: dop,
-                rows: rows[0],
-                backend_markers: added
-                    .iter()
-                    .map(|log| {
-                        log.lines()
-                            .filter(|line| {
-                                line.contains(TYPED_SPLIT_ACCEPTED)
-                                    || line.contains(TYPED_SPLIT_NO_MORE)
-                                    || line.contains(TYPED_PAGE_SOURCE_OPEN)
-                                    || line.contains(TYPED_PAGE_SOURCE_CLOSE)
-                                    || line.contains("NOVAROCKS_TASK_PREPARED_DOP")
-                            })
-                            .map(str::to_owned)
-                            .collect()
-                    })
-                    .collect(),
-            });
-        }
-        std::fs::write(
-            context.scenario_root().join("uea5d-multi-split-dop.json"),
-            serde_json::to_vec_pretty(&observations)?,
-        )
-        .context("persist exact UEA-5D multi-split DOP observations")?;
-        await_resource_convergence(context, &baseline, "UEA-5D multi-split DOP reads")?;
-        Ok(())
+                        .map(|log| {
+                            log.lines()
+                                .filter(|line| {
+                                    line.contains(TYPED_SPLIT_ACCEPTED)
+                                        || line.contains(TYPED_SPLIT_NO_MORE)
+                                        || line.contains(TYPED_PAGE_SOURCE_OPEN)
+                                        || line.contains(TYPED_PAGE_SOURCE_CLOSE)
+                                        || line.contains("NOVAROCKS_TASK_PREPARED_DOP")
+                                })
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .collect(),
+                });
+            }
+            std::fs::write(
+                context.scenario_root().join("uea5d-multi-split-dop.json"),
+                serde_json::to_vec_pretty(&observations)?,
+            )
+            .context("persist exact UEA-5D multi-split DOP observations")?;
+            await_resource_convergence(context, &baseline, "UEA-5D multi-split DOP reads")?;
+            Ok(())
+        })();
+        connector_control_plan::with_cleanup(control_phase, control.finish())
     }
 }
 
@@ -263,7 +297,10 @@ impl Scenario for Uea5dMultiSplitDop {
 /// A correct result alone would not show that: a single backend reading every
 /// file would produce exactly the same rows. The evidence that distinguishes
 /// the two is which processes accepted split assignments.
-struct TypedReadData;
+#[derive(Default)]
+struct TypedReadData {
+    controls: connector_control_plan::Owner,
+}
 
 impl Scenario for TypedReadData {
     fn name(&self) -> &'static str {
@@ -271,86 +308,111 @@ impl Scenario for TypedReadData {
     }
 
     fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
+        CrossProcessChildEnvironment::default()
     }
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
+        Ok(connector_control_plan::launch_config())
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: std::time::Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
+        self.controls
+            .freeze(
+                specs,
+                fe_restart,
+                &be_restarts,
+                cluster_size,
+                ordinary_binary,
+                controlled_binary,
+                original_deadline,
+            )
+            .map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
         let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect typed read control session")?,
-        )?;
-
-        // Cache service availability alone is intentionally inert: this
-        // scenario explicitly opts its control session into both cache reads
-        // and population before asserting the warm/cached profiles below.
-        control
-            .query_drop("SET enable_scan_datacache = true")
-            .context("enable cache reads for typed connector data")?;
-        control
-            .query_drop("SET enable_populate_datacache = true")
-            .context("enable cache population for typed connector data")?;
-
-        const CATALOG: &str = "typed_read_catalog";
-        const DATABASE: &str = "typed_read_db";
-        const TABLE: &str = "typed_read_data";
-        let warehouse = create_warehouse(context, "iceberg-typed-read-data")?;
-
-        // Three files, three backends: fewer splits than backends could not
-        // show distribution even if it worked.
-        context.action("create three independent Iceberg data files");
-        create_catalog_table_and_data(&mut control, CATALOG, DATABASE, TABLE, &warehouse)?;
-
-        let counted_query = format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}");
-        context.action("warm the enabled role-local cache through a typed connector read");
-        let warm_profile: Vec<String> =
+        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
+        let control_phase = (|| -> Result<()> {
+            // Cache service availability alone is intentionally inert: this
+            // scenario explicitly opts its control session into both cache reads
+            // and population before asserting the warm/cached profiles below.
             control
+                .query_drop("SET enable_scan_datacache = true")
+                .context("enable cache reads for typed connector data")?;
+            control
+                .query_drop("SET enable_populate_datacache = true")
+                .context("enable cache population for typed connector data")?;
+
+            const CATALOG: &str = "typed_read_catalog";
+            const DATABASE: &str = "typed_read_db";
+            const TABLE: &str = "typed_read_data";
+            let warehouse = create_warehouse(context, "iceberg-typed-read-data")?;
+
+            // Three files, three backends: fewer splits than backends could not
+            // show distribution even if it worked.
+            context.action("create three independent Iceberg data files");
+            create_catalog_table_and_data(&mut control, CATALOG, DATABASE, TABLE, &warehouse)?;
+
+            let counted_query = format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}");
+            context.action("warm the enabled role-local cache through a typed connector read");
+            let warm_profile: Vec<String> = control
                 .query(format!("EXPLAIN ANALYZE {counted_query}"))
                 .context("collect cache-warming typed connector EXPLAIN ANALYZE profile")?;
-        let warm_profile = warm_profile.join("\n");
-        assert_positive_profile_counter(&warm_profile, "ConnectorFileCacheMisses")?;
+            let warm_profile = warm_profile.join("\n");
+            assert_positive_profile_counter(&warm_profile, "ConnectorFileCacheMisses")?;
 
-        context.action("repeat the same typed connector read from the role-local cache");
-        let cached_profile: Vec<String> = control
-            .query(format!("EXPLAIN ANALYZE {counted_query}"))
-            .context("collect cached typed connector EXPLAIN ANALYZE profile")?;
-        let cached_profile = cached_profile.join("\n");
-        assert_positive_profile_counter(&cached_profile, "ConnectorFileCacheHits")?;
+            context.action("repeat the same typed connector read from the role-local cache");
+            let cached_profile: Vec<String> = control
+                .query(format!("EXPLAIN ANALYZE {counted_query}"))
+                .context("collect cached typed connector EXPLAIN ANALYZE profile")?;
+            let cached_profile = cached_profile.join("\n");
+            assert_positive_profile_counter(&cached_profile, "ConnectorFileCacheHits")?;
 
-        context.action("read every row through the typed connector stack");
-        let counted: Vec<i64> = control
-            .query(&counted_query)
+            context.action("read every row through the typed connector stack");
+            let counted: Vec<i64> = connector_control_plan::query(
+                context,
+                &self.controls.take(0)?,
+                &mut control,
+                &counted_query,
+            )
             .context("count rows through the typed connector read")?;
-        if counted != [300_000] {
-            bail!("typed connector read returned {counted:?} rows, expected [300000]");
-        }
-        // A count alone can be right while the values are not; the sum pins
-        // which rows were read, not just how many.
-        let summed: Vec<i64> = control
-            .query(format!("SELECT sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"))
-            .context("sum values through the typed connector read")?;
-        if summed != [45_000_150_000] {
-            bail!("typed connector read summed {summed:?}, expected [45000150000]");
-        }
+            if counted != [300_000] {
+                bail!("typed connector read returned {counted:?} rows, expected [300000]");
+            }
+            // A count alone can be right while the values are not; the sum pins
+            // which rows were read, not just how many.
+            let summed: Vec<i64> = control
+                .query(format!("SELECT sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+                .context("sum values through the typed connector read")?;
+            if summed != [45_000_150_000] {
+                bail!("typed connector read summed {summed:?}, expected [45000150000]");
+            }
 
-        context.action("assert splits reached more than one backend process");
-        let logs = wait_for_backend_logs(context, "observe typed split assignments", |logs| {
-            logs.iter()
-                .filter(|log| log.contains(TYPED_SPLIT_ACCEPTED))
-                .count()
-                >= 2
-        })?;
-        assert_typed_split_evidence(&logs)?;
+            context.action("assert splits reached more than one backend process");
+            let logs = wait_for_backend_logs(context, "observe typed split assignments", |logs| {
+                logs.iter()
+                    .filter(|log| log.contains(TYPED_SPLIT_ACCEPTED))
+                    .count()
+                    >= 2
+            })?;
+            assert_typed_split_evidence(&logs)?;
 
-        await_resource_convergence(context, &baseline, "typed connector read")?;
-        Ok(())
+            await_resource_convergence(context, &baseline, "typed connector read")?;
+            Ok(())
+        })();
+        connector_control_plan::with_cleanup(control_phase, control.finish())
     }
 }
 
@@ -395,7 +457,10 @@ fn assert_typed_split_evidence(logs: &[String]) -> Result<()> {
     Ok(())
 }
 
-struct DistributedReaderCancel;
+#[derive(Default)]
+struct DistributedReaderCancel {
+    controls: connector_control_plan::Owner,
+}
 
 impl Scenario for DistributedReaderCancel {
     fn name(&self) -> &'static str {
@@ -403,101 +468,124 @@ impl Scenario for DistributedReaderCancel {
     }
 
     fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
+        CrossProcessChildEnvironment::default()
     }
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
+        Ok(connector_control_plan::launch_config())
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: std::time::Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
+        self.controls
+            .freeze(
+                specs,
+                fe_restart,
+                &be_restarts,
+                cluster_size,
+                ordinary_binary,
+                controlled_binary,
+                original_deadline,
+            )
+            .map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
         let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect connector cancellation control session")?,
-        )?;
+        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
+        let control_phase = (|| -> Result<()> {
+            let warehouse = create_warehouse(context, "distributed-reader-cancel")?;
+            context.action("create Hadoop Iceberg catalog and three independent data files");
+            create_catalog_table_and_data(
+                &mut control,
+                "connector_cancel_catalog",
+                "connector_cancel_db",
+                "connector_cancel_data",
+                &warehouse,
+            )?;
 
-        let warehouse = create_warehouse(context, "distributed-reader-cancel")?;
-        context.action("create Hadoop Iceberg catalog and three independent data files");
-        create_catalog_table_and_data(
-            &mut control,
-            "connector_cancel_catalog",
-            "connector_cancel_db",
-            "connector_cancel_data",
-            &warehouse,
-        )?;
+            context.action("start a public-MySQL distributed read that retains connector readers");
+            let baseline_logs = backend_log_snapshots(context)?;
+            let selected = self.controls.take(0)?;
+            let owned =
+                connector_control_plan::Reader::start(context, &selected, &user, port, None)?;
+            let target = &owned.read;
+            let phase = (|| -> Result<()> {
+                let connection_id = target
+                    .ready
+                    .recv_timeout(context.remaining("receive connector read connection id")?)
+                    .context("connector read terminated before publishing its connection id")?;
 
-        context.action("start a public-MySQL distributed read that retains connector readers");
-        let baseline_logs = backend_log_snapshots(context)?;
-        let target = start_held_connector_read(
-            &user,
-            port,
-            "connector_cancel_catalog",
-            "connector_cancel_db",
-            "connector_cancel_data",
-        )?;
-        let connection_id = target
-            .ready
-            .recv_timeout(context.remaining("receive connector read connection id")?)
-            .context("connector read terminated before publishing its connection id")?;
+                wait_for_new_reader_on_every_backend(
+                    context,
+                    "connector_cancel_catalog",
+                    "wait for every BE to open a distributed connector reader",
+                    &baseline_logs,
+                    AwaitedRead::new(&target, "the connector read"),
+                )?;
+                // Kept alongside the barrier's own liveness check rather than folded
+                // into it: the barrier covers the wait, this covers the instant
+                // between its last poll and the cancellation below.
+                if let Ok(result) = target.done.try_recv() {
+                    bail!("connector read completed before cancellation was issued: {result:?}");
+                }
 
-        wait_for_new_reader_on_every_backend(
-            context,
-            "connector_cancel_catalog",
-            "wait for every BE to open a distributed connector reader",
-            &baseline_logs,
-            AwaitedRead::new(&target, "the connector read"),
-        )?;
-        // Kept alongside the barrier's own liveness check rather than folded
-        // into it: the barrier covers the wait, this covers the instant
-        // between its last poll and the cancellation below.
-        if let Ok(result) = target.done.try_recv() {
-            bail!("connector read completed before cancellation was issued: {result:?}");
-        }
+                context.action(format!(
+                    "cancel connector read through KILL QUERY {connection_id}"
+                ));
+                control
+                    .query_drop(format!("KILL QUERY {connection_id}"))
+                    .context("issue public MySQL KILL QUERY for connector read")?;
+                assert_cancelled_query(
+                    &target.done,
+                    context.remaining("await connector read cancellation")?,
+                )?;
+                assert_target_connection_remains_usable(
+                    &target,
+                    context.remaining("verify KILL QUERY target connection remains usable")?,
+                )?;
+                assert_idle_query(&mut control, connection_id)?;
+                release_connector_read(&target)?;
+                Ok(())
+            })();
+            owned.finish_after(context, &mut control, phase)?;
 
-        context.action(format!(
-            "cancel connector read through KILL QUERY {connection_id}"
-        ));
-        control
-            .query_drop(format!("KILL QUERY {connection_id}"))
-            .context("issue public MySQL KILL QUERY for connector read")?;
-        assert_cancelled_query(
-            &target.done,
-            context.remaining("await connector read cancellation")?,
-        )?;
-        assert_target_connection_remains_usable(
-            &target,
-            context.remaining("verify KILL QUERY target connection remains usable")?,
-        )?;
-        assert_idle_query(&mut control, connection_id)?;
-        release_connector_read(&target)?;
-        target
-            .thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("connector read thread panicked"))??;
+            let reader_logs = wait_for_balanced_reader_lifecycle(
+                context,
+                "wait for connector reader close after cancellation",
+            )?;
+            assert_no_reader_open_after_abort(&reader_logs)?;
+            await_resource_convergence(context, &baseline, "cancelled connector read")?;
 
-        let reader_logs = wait_for_balanced_reader_lifecycle(
-            context,
-            "wait for connector reader close after cancellation",
-        )?;
-        assert_no_reader_open_after_abort(&reader_logs)?;
-        await_resource_convergence(context, &baseline, "cancelled connector read")?;
-
-        context.action("verify a subsequent distributed query succeeds after connector cleanup");
-        let rows: Vec<i64> = control
-            .query("SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v")
-            .context("run post-cancellation distributed query")?;
-        if rows != [1, 2] {
-            bail!("post-cancellation distributed query returned {rows:?}, expected [1, 2]");
-        }
-        Ok(())
+            context
+                .action("verify a subsequent distributed query succeeds after connector cleanup");
+            let rows: Vec<i64> = control
+                .query("SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v")
+                .context("run post-cancellation distributed query")?;
+            if rows != [1, 2] {
+                bail!("post-cancellation distributed query returned {rows:?}, expected [1, 2]");
+            }
+            Ok(())
+        })();
+        connector_control_plan::with_cleanup(control_phase, control.finish())
     }
 }
 
-struct DistributedReaderKillConnection;
+#[derive(Default)]
+struct DistributedReaderKillConnection {
+    controls: connector_control_plan::Owner,
+}
 
 impl Scenario for DistributedReaderKillConnection {
     fn name(&self) -> &'static str {
@@ -505,533 +593,551 @@ impl Scenario for DistributedReaderKillConnection {
     }
 
     fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
+        CrossProcessChildEnvironment::default()
     }
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
+        Ok(connector_control_plan::launch_config())
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: std::time::Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
+        self.controls
+            .freeze(
+                specs,
+                fe_restart,
+                &be_restarts,
+                cluster_size,
+                ordinary_binary,
+                controlled_binary,
+                original_deadline,
+            )
+            .map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
         let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect connector KILL CONNECTION control session")?,
-        )?;
+        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
+        let control_phase = (|| -> Result<()> {
+            let warehouse = create_warehouse(context, "distributed-reader-kill-connection")?;
+            context.action("create Hadoop Iceberg catalog and three independent data files");
+            create_catalog_table_and_data(
+                &mut control,
+                "connector_kill_connection_catalog",
+                "connector_kill_connection_db",
+                "connector_kill_connection_data",
+                &warehouse,
+            )?;
 
-        let warehouse = create_warehouse(context, "distributed-reader-kill-connection")?;
-        context.action("create Hadoop Iceberg catalog and three independent data files");
-        create_catalog_table_and_data(
-            &mut control,
-            "connector_kill_connection_catalog",
-            "connector_kill_connection_db",
-            "connector_kill_connection_data",
-            &warehouse,
-        )?;
+            context.action("start a public-MySQL distributed read that retains connector readers");
+            let baseline_logs = backend_log_snapshots(context)?;
+            let selected = self.controls.take(0)?;
+            let owned =
+                connector_control_plan::Reader::start(context, &selected, &user, port, None)?;
+            let target = &owned.read;
+            let phase = (|| -> Result<()> {
+                let connection_id = target
+                    .ready
+                    .recv_timeout(context.remaining("receive KILL CONNECTION target id")?)
+                    .context(
+                        "KILL CONNECTION target terminated before publishing its connection id",
+                    )?;
+                wait_for_new_reader_on_every_backend(
+                    context,
+                    "connector_kill_connection_catalog",
+                    "wait for every BE to open a KILL CONNECTION target reader",
+                    &baseline_logs,
+                    AwaitedRead::new(&target, "the KILL CONNECTION target read"),
+                )?;
 
-        context.action("start a public-MySQL distributed read that retains connector readers");
-        let baseline_logs = backend_log_snapshots(context)?;
-        let target = start_held_connector_read(
-            &user,
-            port,
-            "connector_kill_connection_catalog",
-            "connector_kill_connection_db",
-            "connector_kill_connection_data",
-        )?;
-        let connection_id = target
-            .ready
-            .recv_timeout(context.remaining("receive KILL CONNECTION target id")?)
-            .context("KILL CONNECTION target terminated before publishing its connection id")?;
-        wait_for_new_reader_on_every_backend(
-            context,
-            "connector_kill_connection_catalog",
-            "wait for every BE to open a KILL CONNECTION target reader",
-            &baseline_logs,
-            AwaitedRead::new(&target, "the KILL CONNECTION target read"),
-        )?;
-
-        context.action(format!(
+                context.action(format!(
             "terminate the active public-MySQL reader through KILL CONNECTION {connection_id}"
         ));
-        control
-            .query_drop(format!("KILL CONNECTION {connection_id}"))
-            .context("issue public MySQL KILL CONNECTION for connector read")?;
-        assert_connection_killed_query(
-            &target.done,
-            context.remaining("await KILL CONNECTION target query termination")?,
-        )?;
-        assert_target_connection_is_closed(
-            &target,
-            context.remaining("verify KILL CONNECTION closes the target socket")?,
-        )?;
-        release_connector_read(&target)?;
-        target
-            .thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("KILL CONNECTION target thread panicked"))??;
+                control
+                    .query_drop(format!("KILL CONNECTION {connection_id}"))
+                    .context("issue public MySQL KILL CONNECTION for connector read")?;
+                assert_connection_killed_query(
+                    &target.done,
+                    context.remaining("await KILL CONNECTION target query termination")?,
+                )?;
+                assert_target_connection_is_closed(
+                    &target,
+                    context.remaining("verify KILL CONNECTION closes the target socket")?,
+                )?;
+                release_connector_read(&target)?;
+                Ok(())
+            })();
+            owned.finish_after(context, &mut control, phase)?;
 
-        let reader_logs = wait_for_balanced_reader_lifecycle(
-            context,
-            "wait for connector reader close after KILL CONNECTION",
-        )?;
-        assert_no_reader_open_after_abort(&reader_logs)?;
-        await_resource_convergence(context, &baseline, "KILL CONNECTION connector read")?;
+            let reader_logs = wait_for_balanced_reader_lifecycle(
+                context,
+                "wait for connector reader close after KILL CONNECTION",
+            )?;
+            assert_no_reader_open_after_abort(&reader_logs)?;
+            await_resource_convergence(context, &baseline, "KILL CONNECTION connector read")?;
 
-        context.action("verify bare KILL closes an idle public-MySQL target socket");
-        let idle_target = start_idle_mysql_connection(&user, port)?;
-        let idle_connection_id = idle_target
-            .ready
-            .recv_timeout(context.remaining("receive bare KILL target id")?)
-            .context("bare KILL target terminated before publishing its connection id")?;
-        control
-            .query_drop(format!("KILL {idle_connection_id}"))
-            .context("issue bare public MySQL KILL for idle target")?;
-        assert_idle_target_connection_is_closed(
-            &idle_target,
-            context.remaining("verify bare KILL closes the idle target socket")?,
-        )?;
-        idle_target
-            .thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("bare KILL target thread panicked"))??;
+            context.action("verify bare KILL closes an idle public-MySQL target socket");
+            let idle_owned = connector_control_plan::Idle::start(context, &user, port)?;
+            let idle_target = &idle_owned.client;
+            let idle_phase = (|| -> Result<()> {
+                let idle_connection_id = idle_target
+                    .ready
+                    .recv_timeout(context.remaining("receive bare KILL target id")?)
+                    .context("bare KILL target terminated before publishing its connection id")?;
+                control
+                    .query_drop(format!("KILL {idle_connection_id}"))
+                    .context("issue bare public MySQL KILL for idle target")?;
+                assert_idle_target_connection_is_closed(
+                    &idle_target,
+                    context.remaining("verify bare KILL closes the idle target socket")?,
+                )?;
+                Ok(())
+            })();
+            idle_owned.finish_after(&mut control, idle_phase)?;
 
-        context.action("verify the KILL requester remains usable after both target terminations");
-        let rows: Vec<i64> = control
-            .query("SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v")
-            .context("run requester query after KILL CONNECTION and bare KILL")?;
-        if rows != [1, 2] {
-            bail!("post-KILL requester query returned {rows:?}, expected [1, 2]");
-        }
-        Ok(())
+            context
+                .action("verify the KILL requester remains usable after both target terminations");
+            let rows: Vec<i64> = control
+                .query("SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v")
+                .context("run requester query after KILL CONNECTION and bare KILL")?;
+            if rows != [1, 2] {
+                bail!("post-KILL requester query returned {rows:?}, expected [1, 2]");
+            }
+            Ok(())
+        })();
+        connector_control_plan::with_cleanup(control_phase, control.finish())
     }
 }
 
-struct CatalogVersionDrain;
+#[derive(Default)]
+struct CatalogVersionDrain {
+    controls: connector_control_plan::Owner,
+}
 
 /// Drives one CatalogSet through its observable cold and warm lifecycle on
 /// the real control stream, including cancellation while installation is held.
-struct CatalogReadyLifecycle;
+#[derive(Default)]
+struct CatalogReadyLifecycle {
+    controls: connector_control_plan::Owner,
+}
 
 impl Scenario for CatalogReadyLifecycle {
     fn name(&self) -> &'static str {
         "connector/catalog-ready-lifecycle"
     }
 
-    fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        let mut config = connector_launch_config();
-        let hold_file = scenario_root.join("catalog-install-hold");
-        let failure_file = scenario_root.join("catalog-install-failure");
-        // Both triggers are cleared here, before the cluster is launched, and
-        // not only where each is written.
-        //
-        // Neither is armed by the scenario until well after the fixture has
-        // written 300,000 rows through this catalog, and those writes are
-        // themselves cold installs. So a trigger left behind by a run that
-        // died while armed takes effect on the *fixture*, long before the
-        // clear at either write site can run: the fixture's first cold
-        // install is held from startup, its lease renewal outruns the
-        // establish, and the write fails closed with "a renewal cannot create
-        // a query context" -- observed exactly that way. The scenario root
-        // outlives a single run and nothing else removes these files, so the
-        // only clear that can prevent it is one that happens before the
-        // backends exist.
-        for trigger in [&hold_file, &failure_file] {
-            if trigger.exists() {
-                std::fs::remove_file(trigger).with_context(|| {
-                    format!("clear stale catalog trigger {}", trigger.display())
-                })?;
-            }
-        }
-        config.child_environment.be.insert(
-            "NOVAROCKS_SQL_TEST_CATALOG_INSTALL_HOLD_FILE".to_string(),
-            hold_file.to_string_lossy().into_owned(),
-        );
-        config.child_environment.be.insert(
-            "NOVAROCKS_SQL_TEST_EMIT_CATALOG_LIFECYCLE_MARKER".to_string(),
-            "1".to_string(),
-        );
-        config
-            .child_environment
-            .be_by_index
-            .entry(CATALOG_FAILURE_BACKEND)
-            .or_default()
-            .insert(
-                "NOVAROCKS_SQL_TEST_CATALOG_INSTALL_FAILURE_FILE".to_string(),
-                failure_file.to_string_lossy().into_owned(),
-            );
-        Ok(config)
+    fn launch_config(&self, _scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        Ok(connector_control_plan::launch_config())
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: std::time::Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
+        self.controls
+            .freeze(
+                specs,
+                fe_restart,
+                &be_restarts,
+                cluster_size,
+                ordinary_binary,
+                controlled_binary,
+                original_deadline,
+            )
+            .map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
         let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect catalog ready lifecycle control session")?,
-        )?;
+        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
+        let control_phase = (|| -> Result<()> {
+            const CATALOG: &str = "catalog_ready_lifecycle";
+            const DATABASE: &str = "catalog_ready_db";
+            const TABLE: &str = "catalog_ready_data";
+            let warehouse = create_warehouse(context, "catalog-ready-lifecycle")?;
+            create_catalog_table_and_data(&mut control, CATALOG, DATABASE, TABLE, &warehouse)?;
 
-        const CATALOG: &str = "catalog_ready_lifecycle";
-        const DATABASE: &str = "catalog_ready_db";
-        const TABLE: &str = "catalog_ready_data";
-        let warehouse = create_warehouse(context, "catalog-ready-lifecycle")?;
-        create_catalog_table_and_data(&mut control, CATALOG, DATABASE, TABLE, &warehouse)?;
+            // A cold install that is cancelled while it is still held.
+            //
+            // The task protocol installs a query context's catalogs inside the
+            // establish that carries them, so "the install is in flight" lasts a
+            // few milliseconds and cancellation would otherwise always land
+            // before or after it. The hold is what makes that instant long enough
+            // to act on, and the marker is what proves this backend is inside it.
+            control
+                .query_drop(format!("DROP CATALOG {CATALOG}"))
+                .context("replace warm catalog before held cancellation")?;
+            create_catalog(&mut control, CATALOG, &warehouse)?;
+            let before_cancel = backend_log_snapshots(context)?;
+            let held_selection = self.controls.take(0)?;
+            held_selection.trigger(connector_control_plan::HOLD, "hold\n")?;
+            context
+                .action("hold a cold catalog install, then cancel it before any runtime is built");
+            // The scenario-bounded connection form, because this statement is
+            // parked before it produces a single row: its first response byte is
+            // the cancellation itself, so a socket read timeout would turn any
+            // server latency into EAGAIN and destroy the measurement below.
+            let cancelled_owner = connector_control_plan::Reader::start_with_hold(
+                context,
+                &held_selection,
+                &user,
+                port,
+            )?;
+            let cancelled = &cancelled_owner.read;
+            let phase = (|| -> Result<()> {
+                let connection_id = cancelled
+                    .ready
+                    .recv_timeout(context.remaining("receive held catalog query connection id")?)
+                    .context("held catalog query terminated before publishing connection id")?;
+                let installing = wait_for_cold_catalog_install(
+                    context,
+                    &before_cancel,
+                    "observe a held cold catalog install",
+                )?;
+                // The hold is before the provider bind, so nothing may be usable yet.
+                // This is the assertion that gives the whole phase its meaning: it is
+                // checked against a marker this same scenario later observes
+                // appearing, so it cannot pass because the marker has no emitter.
+                assert_no_appended_catalog_runtime(
+                    context,
+                    &before_cancel,
+                    CATALOG,
+                    "while the cold catalog install is held",
+                )?;
+                // And nothing may execute against a catalog that is not usable. On
+                // the retired chain this was `no Stage was admitted`; a task cannot be
+                // created before its context's establish returns, so the observable
+                // form of the same claim is that no reader for this catalog opened.
+                assert_no_appended_reader_open(
+                    context,
+                    &before_cancel,
+                    CATALOG,
+                    "while the cold catalog install is held",
+                )?;
+                control
+                    .query_drop(format!("KILL QUERY {connection_id}"))
+                    .context("cancel query while catalog install is held")?;
+                let killed_at = std::time::Instant::now();
+                // Delivery of the abort is asserted before the client's error code,
+                // and the order is load-bearing twice over.
+                //
+                // It is the more primitive fact: the backend standing its held
+                // install down is what has to happen for the client to be owed
+                // anything at all. Asserting it first splits a single opaque failure
+                // into two different diagnoses -- an abort that never reached a
+                // backend parked in its establish, versus one that did while the
+                // frontend still failed to report the interrupt.
+                //
+                // And it must precede lifting the hold: the held install ends on
+                // either the abort or the hold file, so lifting the file first would
+                // let a cancellation that had not arrived yet race a provider bind
+                // that then really would make the catalog usable.
+                wait_for_context_abort_on(
+                    context,
+                    &before_cancel,
+                    &installing,
+                    "observe the abort reach every Backend holding a cold catalog install",
+                )?;
+                // `KILL QUERY` owes this client 1317, and owes it only once the
+                // coordinator's worker has unwound: the frontend deliberately
+                // withholds the interrupt until the statement generation is released,
+                // so that the probe below can reuse this connection
+                // (`cancellation_requires_statement_fence` in
+                // `novarocks/frontend-application/src/query.rs`). By this line the abort has
+                // already reached every installing Backend, so anything other than a
+                // prompt 1317 is the frontend failing to report an interrupt it owes,
+                // never the expectation being wrong.
+                assert_held_query_interrupted(
+                    &cancelled.done,
+                    killed_at,
+                    HELD_QUERY_INTERRUPT_BUDGET
+                        .min(context.remaining("await held catalog query cancellation")?),
+                )?;
+                assert_target_connection_remains_usable(
+                    &cancelled,
+                    context.remaining("verify KILL QUERY preserves held client connection")?,
+                )?;
+                held_selection.release(connector_control_plan::HOLD)?;
+                release_connector_read(&cancelled)?;
+                Ok(())
+            })();
+            cancelled_owner.finish_after(context, &mut control, phase)?;
+            await_resource_convergence(context, &baseline, "cancelled catalog install")?;
+            // Re-checked over the whole cancelled window, after convergence: the
+            // attempt is fully unwound by now, so a runtime that appeared here
+            // would be one the cancelled install left behind.
+            assert_no_appended_catalog_runtime(
+                context,
+                &before_cancel,
+                CATALOG,
+                "as a result of the cancelled catalog install",
+            )?;
+            assert_no_appended_reader_open(
+                context,
+                &before_cancel,
+                CATALOG,
+                "as a result of the cancelled catalog install",
+            )?;
 
-        // A cold install that is cancelled while it is still held.
-        //
-        // The task protocol installs a query context's catalogs inside the
-        // establish that carries them, so "the install is in flight" lasts a
-        // few milliseconds and cancellation would otherwise always land
-        // before or after it. The hold is what makes that instant long enough
-        // to act on, and the marker is what proves this backend is inside it.
-        control
-            .query_drop(format!("DROP CATALOG {CATALOG}"))
-            .context("replace warm catalog before held cancellation")?;
-        create_catalog(&mut control, CATALOG, &warehouse)?;
-        let hold_file = context.scenario_root().join("catalog-install-hold");
-        // The scenario root outlives a single run, and a run that dies while
-        // the install is held leaves this file behind -- after which every
-        // later run's first cold install is held from the start, its lease
-        // renewal outruns the establish, and the fixture write fails closed
-        // with "a renewal cannot create a query context". Observed exactly
-        // that way. Clearing it here makes the setup idempotent rather than
-        // dependent on the previous run having exited cleanly.
-        if hold_file.exists() {
-            std::fs::remove_file(&hold_file).with_context(|| {
-                format!(
-                    "clear stale catalog-install hold file {}",
-                    hold_file.display()
-                )
-            })?;
-        }
-        let before_cancel = backend_log_snapshots(context)?;
-        std::fs::write(&hold_file, "hold\n")
-            .with_context(|| format!("create catalog-install hold file {}", hold_file.display()))?;
-        context.action("hold a cold catalog install, then cancel it before any runtime is built");
-        // The scenario-bounded connection form, because this statement is
-        // parked before it produces a single row: its first response byte is
-        // the cancellation itself, so a socket read timeout would turn any
-        // server latency into EAGAIN and destroy the measurement below.
-        let cancelled = start_held_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
-        let connection_id = cancelled
-            .ready
-            .recv_timeout(context.remaining("receive held catalog query connection id")?)
-            .context("held catalog query terminated before publishing connection id")?;
-        let installing = wait_for_cold_catalog_install(
-            context,
-            &before_cancel,
-            "observe a held cold catalog install",
-        )?;
-        // The hold is before the provider bind, so nothing may be usable yet.
-        // This is the assertion that gives the whole phase its meaning: it is
-        // checked against a marker this same scenario later observes
-        // appearing, so it cannot pass because the marker has no emitter.
-        assert_no_appended_catalog_runtime(
-            context,
-            &before_cancel,
-            CATALOG,
-            "while the cold catalog install is held",
-        )?;
-        // And nothing may execute against a catalog that is not usable. On
-        // the retired chain this was `no Stage was admitted`; a task cannot be
-        // created before its context's establish returns, so the observable
-        // form of the same claim is that no reader for this catalog opened.
-        assert_no_appended_reader_open(
-            context,
-            &before_cancel,
-            CATALOG,
-            "while the cold catalog install is held",
-        )?;
-        control
-            .query_drop(format!("KILL QUERY {connection_id}"))
-            .context("cancel query while catalog install is held")?;
-        let killed_at = std::time::Instant::now();
-        // Delivery of the abort is asserted before the client's error code,
-        // and the order is load-bearing twice over.
-        //
-        // It is the more primitive fact: the backend standing its held
-        // install down is what has to happen for the client to be owed
-        // anything at all. Asserting it first splits a single opaque failure
-        // into two different diagnoses -- an abort that never reached a
-        // backend parked in its establish, versus one that did while the
-        // frontend still failed to report the interrupt.
-        //
-        // And it must precede lifting the hold: the held install ends on
-        // either the abort or the hold file, so lifting the file first would
-        // let a cancellation that had not arrived yet race a provider bind
-        // that then really would make the catalog usable.
-        wait_for_context_abort_on(
-            context,
-            &before_cancel,
-            &installing,
-            "observe the abort reach every Backend holding a cold catalog install",
-        )?;
-        // `KILL QUERY` owes this client 1317, and owes it only once the
-        // coordinator's worker has unwound: the frontend deliberately
-        // withholds the interrupt until the statement generation is released,
-        // so that the probe below can reuse this connection
-        // (`cancellation_requires_statement_fence` in
-        // `novarocks/frontend-application/src/query.rs`). By this line the abort has
-        // already reached every installing Backend, so anything other than a
-        // prompt 1317 is the frontend failing to report an interrupt it owes,
-        // never the expectation being wrong.
-        assert_held_query_interrupted(
-            &cancelled.done,
-            killed_at,
-            HELD_QUERY_INTERRUPT_BUDGET
-                .min(context.remaining("await held catalog query cancellation")?),
-        )?;
-        assert_target_connection_remains_usable(
-            &cancelled,
-            context.remaining("verify KILL QUERY preserves held client connection")?,
-        )?;
-        release_catalog_install_hold(&hold_file)?;
-        release_connector_read(&cancelled)?;
-        cancelled
-            .thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("held catalog reader thread panicked"))??;
-        await_resource_convergence(context, &baseline, "cancelled catalog install")?;
-        // Re-checked over the whole cancelled window, after convergence: the
-        // attempt is fully unwound by now, so a runtime that appeared here
-        // would be one the cancelled install left behind.
-        assert_no_appended_catalog_runtime(
-            context,
-            &before_cancel,
-            CATALOG,
-            "as a result of the cancelled catalog install",
-        )?;
-        assert_no_appended_reader_open(
-            context,
-            &before_cancel,
-            CATALOG,
-            "as a result of the cancelled catalog install",
-        )?;
-
-        // One backend's cold install fails, and the retry after the trigger is
-        // cleared has to succeed on that same backend.
-        control
-            .query_drop(format!("DROP CATALOG {CATALOG}"))
-            .context("replace cancelled catalog before injected install failure")?;
-        create_catalog(&mut control, CATALOG, &warehouse)?;
-        let failure_file = context.scenario_root().join("catalog-install-failure");
-        let before_failure = backend_log_snapshots(context)?;
-        std::fs::write(&failure_file, "fail\n").with_context(|| {
-            format!(
-                "create catalog-install failure trigger {}",
-                failure_file.display()
-            )
-        })?;
-        context.action("fail the cold catalog install on one Backend and reject the query");
-        let failed_query: Result<Vec<i64>, mysql::Error> =
-            control.query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"));
-        match failed_query {
-            Err(mysql::Error::MySqlError(_)) => {}
-            Ok(rows) => bail!("catalog install failure query unexpectedly succeeded: {rows:?}"),
-            Err(error) => {
-                bail!("catalog install failure did not return a public SQL error: {error}")
+            // One backend's cold install fails, and the retry after the trigger is
+            // cleared has to succeed on that same backend.
+            control
+                .query_drop(format!("DROP CATALOG {CATALOG}"))
+                .context("replace cancelled catalog before injected install failure")?;
+            create_catalog(&mut control, CATALOG, &warehouse)?;
+            let failure_selection = self.controls.take(1)?;
+            let before_failure = backend_log_snapshots(context)?;
+            failure_selection.trigger(connector_control_plan::FAILURE, "fail\n")?;
+            context.action("fail the cold catalog install on one Backend and reject the query");
+            let failed = connector_control_plan::outcome::<i64>(
+                context,
+                &failure_selection,
+                &mut control,
+                &format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"),
+            );
+            let failed_query = connector_control_plan::with_cleanup(
+                failed,
+                failure_selection.release(connector_control_plan::FAILURE),
+            )?;
+            match failed_query {
+                Err(mysql::Error::MySqlError(_)) => {}
+                Ok(rows) => bail!("catalog install failure query unexpectedly succeeded: {rows:?}"),
+                Err(error) => {
+                    bail!("catalog install failure did not return a public SQL error: {error}")
+                }
             }
-        }
-        wait_for_catalog_lifecycle_marker_on_backend(
-            context,
-            &before_failure,
-            CATALOG_FAILURE_BACKEND,
-            CATALOG_INSTALL_FAILED,
-            "observe the injected catalog install failure from the selected Backend",
-        )?;
-        // Only on the Backend the failure was injected into, and deliberately
-        // not cluster-wide: the task protocol has no cross-Backend establish
-        // barrier, so a Backend whose own install succeeded may create its
-        // task and open its reader while this one is still failing. What the
-        // refusal has to mean is that *this* Backend never held usable
-        // catalog facts, and therefore never read through them.
-        assert_no_appended_reader_open_on_backend(
-            context,
-            &before_failure,
-            CATALOG_FAILURE_BACKEND,
-            CATALOG,
-            "after the injected catalog install failure",
-        )?;
-        std::fs::remove_file(&failure_file).with_context(|| {
-            format!(
-                "remove catalog-install failure trigger {}",
-                failure_file.display()
+            wait_for_catalog_lifecycle_marker_on_backend(
+                context,
+                &before_failure,
+                CATALOG_FAILURE_BACKEND,
+                CATALOG_INSTALL_FAILED,
+                "observe the injected catalog install failure from the selected Backend",
+            )?;
+            // Only on the Backend the failure was injected into, and deliberately
+            // not cluster-wide: the task protocol has no cross-Backend establish
+            // barrier, so a Backend whose own install succeeded may create its
+            // task and open its reader while this one is still failing. What the
+            // refusal has to mean is that *this* Backend never held usable
+            // catalog facts, and therefore never read through them.
+            assert_no_appended_reader_open_on_backend(
+                context,
+                &before_failure,
+                CATALOG_FAILURE_BACKEND,
+                CATALOG,
+                "after the injected catalog install failure",
+            )?;
+            let before_retry = backend_log_snapshots(context)?;
+            context
+                .action("retry the failed catalog version after clearing the one-Backend failure");
+            let rows: Vec<i64> = connector_control_plan::query(
+                context,
+                &self.controls.take(2)?,
+                &mut control,
+                &format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"),
             )
-        })?;
-        let before_retry = backend_log_snapshots(context)?;
-        context.action("retry the failed catalog version after clearing the one-Backend failure");
-        let rows: Vec<i64> = control
-            .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
             .context("retry catalog query after clearing injected install failure")?;
-        if rows != [300_000] {
-            bail!("catalog install retry returned {rows:?}, expected [300000]");
-        }
-        // Asserted on the one backend the failure was injected into, because
-        // it is the only one whose cell was never built: the others took the
-        // whole-set ready fast path on the retry and correctly rebuild
-        // nothing. A cluster-wide count here would be asserting that.
-        wait_for_catalog_runtime_on_backend(
-            context,
-            &before_retry,
-            CATALOG_FAILURE_BACKEND,
-            CATALOG,
-            "observe the formerly failing Backend build this catalog's runtime on retry",
-        )?;
+            if rows != [300_000] {
+                bail!("catalog install retry returned {rows:?}, expected [300000]");
+            }
+            // Asserted on the one backend the failure was injected into, because
+            // it is the only one whose cell was never built: the others took the
+            // whole-set ready fast path on the retry and correctly rebuild
+            // nothing. A cluster-wide count here would be asserting that.
+            wait_for_catalog_runtime_on_backend(
+                context,
+                &before_retry,
+                CATALOG_FAILURE_BACKEND,
+                CATALOG,
+                "observe the formerly failing Backend build this catalog's runtime on retry",
+            )?;
 
-        // A cold install that is released rather than cancelled: the runtime
-        // has to exist on a backend before that backend admits any task of the
-        // query that asked for it.
-        control
-            .query_drop(format!("DROP CATALOG {CATALOG}"))
-            .context("replace retried catalog before cold ready path")?;
-        create_catalog(&mut control, CATALOG, &warehouse)?;
-        let before_cold = backend_log_snapshots(context)?;
-        std::fs::write(&hold_file, "hold\n").with_context(|| {
-            format!("recreate catalog-install hold file {}", hold_file.display())
-        })?;
-        context.action("hold a cold catalog install until every installing Backend reports it");
-        let cold = start_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
-        let cold_connection_id = cold
-            .ready
-            .recv_timeout(context.remaining("receive cold catalog query connection id")?)
-            .context("cold catalog query terminated before publishing connection id")?;
-        let installing = wait_for_cold_catalog_install(
-            context,
-            &before_cold,
-            "observe the cold catalog install before releasing it",
-        )?;
-        assert_no_appended_catalog_runtime(
-            context,
-            &before_cold,
-            CATALOG,
-            "before the cold catalog install is released",
-        )?;
-        context.action("release the cold catalog install and require the runtime before any task");
-        release_catalog_install_hold(&hold_file)?;
-        let after_cold = wait_for_open_reader_on(
-            context,
-            &before_cold,
-            CATALOG,
-            &installing,
-            "observe a reader on every Backend that installed the cold catalog",
-        )?;
-        assert_catalog_runtime_precedes_task_create(
-            &before_cold,
-            &after_cold,
-            &installing,
-            CATALOG,
-        )?;
-        control
-            .query_drop(format!("KILL QUERY {cold_connection_id}"))
-            .context("cancel cold catalog reader after its runtime exists")?;
-        assert_cancelled_query(
-            &cold.done,
-            context.remaining("await cold catalog reader cancellation")?,
-        )?;
-        assert_target_connection_remains_usable(
-            &cold,
-            context.remaining("verify cold catalog KILL QUERY connection")?,
-        )?;
-        release_connector_read(&cold)?;
-        cold.thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("cold catalog reader thread panicked"))??;
+            // A cold install that is released rather than cancelled: the runtime
+            // has to exist on a backend before that backend admits any task of the
+            // query that asked for it.
+            control
+                .query_drop(format!("DROP CATALOG {CATALOG}"))
+                .context("replace retried catalog before cold ready path")?;
+            create_catalog(&mut control, CATALOG, &warehouse)?;
+            let before_cold = backend_log_snapshots(context)?;
+            let cold_selection = self.controls.take(3)?;
+            cold_selection.trigger(connector_control_plan::HOLD, "hold\n")?;
+            context.action("hold a cold catalog install until every installing Backend reports it");
+            let cold_owner = connector_control_plan::Reader::start_with_hold(
+                context,
+                &cold_selection,
+                &user,
+                port,
+            )?;
+            let cold = &cold_owner.read;
+            let phase = (|| -> Result<()> {
+                let cold_connection_id = cold
+                    .ready
+                    .recv_timeout(context.remaining("receive cold catalog query connection id")?)
+                    .context("cold catalog query terminated before publishing connection id")?;
+                let installing = wait_for_cold_catalog_install(
+                    context,
+                    &before_cold,
+                    "observe the cold catalog install before releasing it",
+                )?;
+                assert_no_appended_catalog_runtime(
+                    context,
+                    &before_cold,
+                    CATALOG,
+                    "before the cold catalog install is released",
+                )?;
+                context.action(
+                    "release the cold catalog install and require the runtime before any task",
+                );
+                cold_selection.release(connector_control_plan::HOLD)?;
+                let after_cold = wait_for_open_reader_on(
+                    context,
+                    &before_cold,
+                    CATALOG,
+                    &installing,
+                    "observe a reader on every Backend that installed the cold catalog",
+                )?;
+                assert_catalog_runtime_precedes_task_create(
+                    &before_cold,
+                    &after_cold,
+                    &installing,
+                    CATALOG,
+                )?;
+                control
+                    .query_drop(format!("KILL QUERY {cold_connection_id}"))
+                    .context("cancel cold catalog reader after its runtime exists")?;
+                assert_cancelled_query(
+                    &cold.done,
+                    context.remaining("await cold catalog reader cancellation")?,
+                )?;
+                assert_target_connection_remains_usable(
+                    &cold,
+                    context.remaining("verify cold catalog KILL QUERY connection")?,
+                )?;
+                release_connector_read(&cold)?;
+                Ok(())
+            })();
+            cold_owner.finish_after(context, &mut control, phase)?;
 
-        // A warm query reuses the runtime the cold one built.
-        let before_warm = backend_log_snapshots(context)?;
-        context.action("execute a warm query without another catalog install");
-        let rows: Vec<i64> = control
-            .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+            // A warm query reuses the runtime the cold one built.
+            let before_warm = backend_log_snapshots(context)?;
+            context.action("execute a warm query without another catalog install");
+            let rows: Vec<i64> = connector_control_plan::query(
+                context,
+                &self.controls.take(4)?,
+                &mut control,
+                &format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"),
+            )
             .context("run warm catalog query")?;
-        if rows != [300_000] {
-            bail!("warm catalog query returned {rows:?}, expected [300000]");
-        }
-        let after_warm = backend_log_snapshots(context)?;
-        assert_no_appended_marker(
-            &before_warm,
-            &after_warm,
-            CATALOG_INSTALL_STARTED,
-            "during a warm catalog query",
-        )?;
-        assert_no_appended_catalog_runtime(
-            context,
-            &before_warm,
-            CATALOG,
-            "during a warm catalog query",
-        )?;
+            if rows != [300_000] {
+                bail!("warm catalog query returned {rows:?}, expected [300000]");
+            }
+            let after_warm = backend_log_snapshots(context)?;
+            assert_no_appended_marker(
+                &before_warm,
+                &after_warm,
+                CATALOG_INSTALL_STARTED,
+                "during a warm catalog query",
+            )?;
+            assert_no_appended_catalog_runtime(
+                context,
+                &before_warm,
+                CATALOG,
+                "during a warm catalog query",
+            )?;
 
-        // A dropped establish acknowledgement is recovered by replaying the
-        // exact establish, and the replay must not build a second runtime.
-        //
-        // This replaced the retired InitAck drop: `EstablishQueryContext` is
-        // where the task protocol carries a query's catalog bindings, so it is
-        // the operation whose lost answer can make a backend install twice.
-        control
-            .query_drop(format!("DROP CATALOG {CATALOG}"))
-            .context("replace warm catalog before establish-replay coverage")?;
-        create_catalog(&mut control, CATALOG, &warehouse)?;
-        let before_replay = backend_log_snapshots(context)?;
-        context
-            .handle()
-            .arm_query_lifecycle_fault(CATALOG_FAILURE_BACKEND, ESTABLISH_CONTEXT_ACK_DROP)
-            .context("arm the establish acknowledgement drop for the cold catalog replay")?;
-        context.action("retry the exact cold establish after its acknowledgement is dropped");
-        let rows: Vec<i64> = control
-            .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+            // A dropped establish acknowledgement is recovered by replaying the
+            // exact establish, and the replay must not build a second runtime.
+            //
+            // This replaced the retired InitAck drop: `EstablishQueryContext` is
+            // where the task protocol carries a query's catalog bindings, so it is
+            // the operation whose lost answer can make a backend install twice.
+            control
+                .query_drop(format!("DROP CATALOG {CATALOG}"))
+                .context("replace warm catalog before establish-replay coverage")?;
+            create_catalog(&mut control, CATALOG, &warehouse)?;
+            let before_replay = backend_log_snapshots(context)?;
+            context.action("retry the exact cold establish after its acknowledgement is dropped");
+            let rows: Vec<i64> = connector_control_plan::query(
+                context,
+                &self.controls.take(5)?,
+                &mut control,
+                &format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"),
+            )
             .context("execute cold catalog query with a dropped establish acknowledgement")?;
-        context
-            .handle()
-            .clear_query_lifecycle_faults()
-            .context("clear the establish acknowledgement drop")?;
-        if rows != [300_000] {
-            bail!("establish replay catalog query returned {rows:?}, expected [300000]");
-        }
-        let after_replay = backend_log_snapshots(context)?;
-        // The fault has to have fired. Without this the phase passes on a
-        // query whose acknowledgement was never dropped, which is the shape a
-        // retired fault leaves behind.
-        assert_appended_marker_on_backend(
-            &before_replay,
-            &after_replay,
-            CATALOG_FAILURE_BACKEND,
-            ESTABLISH_CONTEXT_ACK_DROPPED_MARKER,
-        )?;
-        assert_catalog_runtime_built_at_most_once(&before_replay, &after_replay, CATALOG)?;
-        // A prepared task with no registered fragment must release its query
-        // context at terminal settlement, not wait for the 300-second query
-        // timeout. Allow ample scheduling slack while enforcing that owner.
-        let release_deadline = context
-            .deadline()
-            .min(std::time::Instant::now() + Duration::from_secs(30));
-        context.action("await catalog ready lifecycle resource release within 30 seconds");
-        context
-            .handle()
-            .await_query_execution_resource_convergence(&baseline, release_deadline)
-            .context("catalog ready lifecycle resource release")?;
-        // This scenario never kills a Backend. Resource convergence alone
-        // treats process exit as release, so also require every process to
-        // survive the complete catalog lifecycle.
-        let final_resources = resource_baseline(context)?;
-        if !final_resources.fe_running
-            || final_resources
-                .backends
-                .iter()
-                .any(|backend| !backend.process_running)
-        {
-            bail!("catalog ready lifecycle lost a native process: {final_resources:?}");
-        }
-        Ok(())
+            context
+                .handle()
+                .clear_query_lifecycle_faults()
+                .context("clear the establish acknowledgement drop")?;
+            if rows != [300_000] {
+                bail!("establish replay catalog query returned {rows:?}, expected [300000]");
+            }
+            let after_replay = backend_log_snapshots(context)?;
+            // The fault has to have fired. Without this the phase passes on a
+            // query whose acknowledgement was never dropped, which is the shape a
+            // retired fault leaves behind.
+            assert_appended_marker_on_backend(
+                &before_replay,
+                &after_replay,
+                CATALOG_FAILURE_BACKEND,
+                ESTABLISH_CONTEXT_ACK_DROPPED_MARKER,
+            )?;
+            assert_catalog_runtime_built_at_most_once(&before_replay, &after_replay, CATALOG)?;
+            // A prepared task with no registered fragment must release its query
+            // context at terminal settlement, not wait for the 300-second query
+            // timeout. Allow ample scheduling slack while enforcing that owner.
+            let release_deadline = context
+                .deadline()
+                .min(std::time::Instant::now() + Duration::from_secs(30));
+            context.action("await catalog ready lifecycle resource release within 30 seconds");
+            context
+                .handle()
+                .await_query_execution_resource_convergence(&baseline, release_deadline)
+                .context("catalog ready lifecycle resource release")?;
+            // This scenario never kills a Backend. Resource convergence alone
+            // treats process exit as release, so also require every process to
+            // survive the complete catalog lifecycle.
+            let final_resources = resource_baseline(context)?;
+            if !final_resources.fe_running
+                || final_resources
+                    .backends
+                    .iter()
+                    .any(|backend| !backend.process_running)
+            {
+                bail!("catalog ready lifecycle lost a native process: {final_resources:?}");
+            }
+            Ok(())
+        })();
+        connector_control_plan::with_cleanup(control_phase, control.finish())
     }
 }
 
 /// Exercises distributed writes and reads through one exact catalog runtime,
 /// then proves a replacement Backend can rebuild that runtime from the frozen
 /// catalog properties.
-struct CatalogReadWriteRuntime;
+#[derive(Default)]
+struct CatalogReadWriteRuntime {
+    controls: connector_control_plan::Owner,
+}
 
 impl Scenario for CatalogReadWriteRuntime {
     fn name(&self) -> &'static str {
@@ -1039,92 +1145,137 @@ impl Scenario for CatalogReadWriteRuntime {
     }
 
     fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
+        CrossProcessChildEnvironment::default()
     }
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
+        Ok(connector_control_plan::launch_config())
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: std::time::Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
+        self.controls
+            .freeze(
+                specs,
+                fe_restart,
+                &be_restarts,
+                cluster_size,
+                ordinary_binary,
+                controlled_binary,
+                original_deadline,
+            )
+            .map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
         let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect catalog read-write control session")?,
-        )?;
-
-        const CATALOG: &str = "catalog_read_write_runtime";
-        const DATABASE: &str = "catalog_read_write_db";
-        const TABLE: &str = "catalog_read_write_data";
-        let warehouse = create_warehouse(context, "catalog-read-write-runtime")?;
-        create_catalog(&mut control, CATALOG, &warehouse)?;
-        control
-            .query_drop(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))
-            .context("create catalog read-write database")?;
-        control
-            .query_drop(format!(
-                "CREATE TABLE {CATALOG}.{DATABASE}.{TABLE} (v BIGINT)"
-            ))
-            .context("create catalog read-write table")?;
-
-        context.action("write and read through the catalog runtime on every Backend");
-        for range in ["1, 1000", "1001, 2000", "2001, 3000"] {
+        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
+        let control_phase = (|| -> Result<()> {
+            const CATALOG: &str = "catalog_read_write_runtime";
+            const DATABASE: &str = "catalog_read_write_db";
+            const TABLE: &str = "catalog_read_write_data";
+            let warehouse = create_warehouse(context, "catalog-read-write-runtime")?;
+            create_catalog(&mut control, CATALOG, &warehouse)?;
+            control
+                .query_drop(format!("CREATE DATABASE {CATALOG}.{DATABASE}"))
+                .context("create catalog read-write database")?;
             control
                 .query_drop(format!(
-                    "INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series({range}))"
+                    "CREATE TABLE {CATALOG}.{DATABASE}.{TABLE} (v BIGINT)"
                 ))
+                .context("create catalog read-write table")?;
+
+            context.action("write and read through the catalog runtime on every Backend");
+            for (index, range) in ["1, 1000", "1001, 2000", "2001, 3000"]
+                .into_iter()
+                .enumerate()
+            {
+                connector_control_plan::execute(context, &self.controls.take(index)?, &mut control,
+                &format!("INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series({range}))"))
                 .with_context(|| format!("distributed insert range {range} through catalog writer runtime"))?;
-        }
-        assert_catalog_read_summary(&mut control, CATALOG, DATABASE, TABLE, 3_000, 4_501_500)?;
-        let before_restart_logs = wait_for_open_reader_on_every_backend(
-            context,
-            CATALOG,
-            "observe catalog readers after distributed write",
-        )?;
-        let before_restart_versions = reader_catalog_versions(&before_restart_logs, CATALOG)?;
-        let before_restart_materializations = catalog_materialization_counts(&before_restart_logs);
-
-        context
-            .action("replace one Backend and rebuild its catalog runtime from CatalogProperties");
-        let original_process = context.handle().backend_process_id(0)?;
-        let deadline = context.deadline();
-        context
-            .handle()
-            .restart_be_until(0, deadline)
-            .context("restart BE[0] for catalog runtime reconstruction")?;
-        let replacement_process = context.handle().backend_process_id(0)?;
-        if replacement_process == original_process {
-            bail!("replacement BE[0] retained its previous process identity");
-        }
-
-        control
-            .query_drop(format!(
-                "INSERT INTO {CATALOG}.{DATABASE}.{TABLE} VALUES (1001)"
-            ))
-            .context("distributed insert after BE replacement")?;
-        assert_catalog_read_summary(&mut control, CATALOG, DATABASE, TABLE, 3_001, 4_502_501)?;
-        let after_restart_logs = wait_for_backend_logs(
-            context,
-            "observe rebuilt catalog runtime after BE replacement",
-            |logs| {
-                let counts = catalog_materialization_counts(logs);
-                counts[0] > 0
-                    && counts[1] == before_restart_materializations[1]
-                    && counts[2] == before_restart_materializations[2]
-            },
-        )?;
-        let after_restart_versions = reader_catalog_versions(&after_restart_logs, CATALOG)?;
-        if after_restart_versions != before_restart_versions {
-            bail!(
-                "BE replacement changed catalog versions: before={before_restart_versions:?}, after={after_restart_versions:?}"
+            }
+            let rows: Vec<(i64, i64)> = connector_control_plan::query(
+                context,
+                &self.controls.take(3)?,
+                &mut control,
+                &format!("SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"),
+            )?;
+            ensure!(
+                rows == [(3_000, 4_501_500)],
+                "catalog read-write summary returned {rows:?}, expected [(3000,4501500)]"
             );
-        }
+            let before_restart_logs = wait_for_open_reader_on_every_backend(
+                context,
+                CATALOG,
+                "observe catalog readers after distributed write",
+            )?;
+            let before_restart_versions = reader_catalog_versions(&before_restart_logs, CATALOG)?;
+            let before_restart_materializations =
+                catalog_materialization_counts(&before_restart_logs);
 
-        await_resource_convergence(context, &baseline, "catalog read-write runtime")?;
-        Ok(())
+            context.action(
+                "replace one Backend and rebuild its catalog runtime from CatalogProperties",
+            );
+            let original_process = context.handle().backend_process_id(0)?;
+            let deadline = context.deadline();
+            context
+                .handle()
+                .restart_be_until(0, deadline)
+                .context("restart BE[0] for catalog runtime reconstruction")?;
+            let replacement_process = context.handle().backend_process_id(0)?;
+            if replacement_process == original_process {
+                bail!("replacement BE[0] retained its previous process identity");
+            }
+
+            connector_control_plan::execute(
+                context,
+                &self.controls.take(4)?,
+                &mut control,
+                &format!("INSERT INTO {CATALOG}.{DATABASE}.{TABLE} VALUES (1001)"),
+            )
+            .context("distributed insert after BE replacement")?;
+            let rows: Vec<(i64, i64)> = connector_control_plan::query(
+                context,
+                &self.controls.take(5)?,
+                &mut control,
+                &format!("SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"),
+            )?;
+            ensure!(
+                rows == [(3_001, 4_502_501)],
+                "catalog read-write summary returned {rows:?}, expected [(3001,4502501)]"
+            );
+            let after_restart_logs = wait_for_backend_logs(
+                context,
+                "observe rebuilt catalog runtime after BE replacement",
+                |logs| {
+                    let counts = catalog_materialization_counts(logs);
+                    counts[0] > 0
+                        && counts[1] == before_restart_materializations[1]
+                        && counts[2] == before_restart_materializations[2]
+                },
+            )?;
+            let after_restart_versions = reader_catalog_versions(&after_restart_logs, CATALOG)?;
+            if after_restart_versions != before_restart_versions {
+                bail!(
+                    "BE replacement changed catalog versions: before={before_restart_versions:?}, after={after_restart_versions:?}"
+                );
+            }
+
+            await_resource_convergence(context, &baseline, "catalog read-write runtime")?;
+            Ok(())
+        })();
+        connector_control_plan::with_cleanup(control_phase, control.finish())
     }
 }
 
@@ -1135,6 +1286,7 @@ impl Scenario for CatalogReadWriteRuntime {
 #[derive(Default)]
 struct VendedRestReadWritePem {
     fixture: Mutex<Option<VendedRestSystemFixture>>,
+    controls: connector_control_plan::Owner,
 }
 
 struct VendedRestSystemFixture {
@@ -1152,7 +1304,7 @@ impl Scenario for VendedRestReadWritePem {
     }
 
     fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
+        CrossProcessChildEnvironment::default()
     }
 
     fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
@@ -1207,13 +1359,37 @@ impl Scenario for VendedRestReadWritePem {
         }
         *fixture = Some(VendedRestSystemFixture { rest, proxy });
 
-        let mut config = connector_launch_config();
+        let mut config = connector_control_plan::launch_config();
         configure_vended_metadata_access(&mut config, metadata_identity);
         // Vended lease envelopes are confidential lifecycle payloads. The
         // scenario must therefore exercise the native TLS branch, never the
         // default authenticated h2c fixture.
         config.native_trust_fixture = NativeTrustFixture::pem_ip();
         Ok(config)
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: std::time::Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
+        self.controls
+            .freeze(
+                specs,
+                fe_restart,
+                &be_restarts,
+                cluster_size,
+                ordinary_binary,
+                controlled_binary,
+                original_deadline,
+            )
+            .map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -1233,48 +1409,46 @@ impl Scenario for VendedRestReadWritePem {
             )
         };
         let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect vended REST read/write control session")?,
-        )?;
-
-        const CATALOG: &str = "vended_rest_catalog";
-        const DATABASE: &str = "vended_rest_db";
-        const TABLE: &str = "vended_rest_data";
-        const CTAS: &str = "vended_rest_ctas";
-        context.action("create REST catalog with an explicit vended data binding");
-        control
+        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
+        let control_phase = (|| -> Result<()> {
+            const CATALOG: &str = "vended_rest_catalog";
+            const DATABASE: &str = "vended_rest_db";
+            const TABLE: &str = "vended_rest_data";
+            const CTAS: &str = "vended_rest_ctas";
+            context.action("create REST catalog with an explicit vended data binding");
+            control
             .query_drop(format!(
                 "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")",
                 self.vended_minio_endpoint()?
             ))
             .context("create vended REST catalog")?;
-        context.action("write three vended REST data files through the native 1FE+3BE path");
-        // Three committed files give the three-backend read enough independent
-        // work to prove that every Backend uses the vended data-plane lease.
-        for range in ["1, 1000", "1001, 2000", "2001, 3000"] {
-            control
+            context.action("write three vended REST data files through the native 1FE+3BE path");
+            // Three committed files give the three-backend read enough independent
+            // work to prove that every Backend uses the vended data-plane lease.
+            for range in ["1, 1000", "1001, 2000", "2001, 3000"] {
+                control
                 .query_drop(format!(
                     "INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series({range}))"
                 ))
                 .with_context(|| format!("insert vended REST data range {range}"))?;
-        }
-        let rows: Vec<(i64, i64)> = control
-            .query(format!(
-                "SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"
-            ))
+            }
+            let rows: Vec<(i64, i64)> = connector_control_plan::query(
+                context,
+                &self.controls.take(0)?,
+                &mut control,
+                &format!("SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{TABLE}"),
+            )
             .context("read vended REST data")?;
-        if rows != [(3_000, 4_501_500)] {
-            bail!("vended REST read returned {rows:?}, expected [(3000, 4501500)]");
-        }
-        wait_for_open_reader_on_every_backend(
-            context,
-            CATALOG,
-            "observe a vended REST reader on every Backend",
-        )?;
-        context.action("create a vended REST CTAS target through staged publication");
-        control
+            if rows != [(3_000, 4_501_500)] {
+                bail!("vended REST read returned {rows:?}, expected [(3000, 4501500)]");
+            }
+            wait_for_open_reader_on_every_backend(
+                context,
+                CATALOG,
+                "observe a vended REST reader on every Backend",
+            )?;
+            context.action("create a vended REST CTAS target through staged publication");
+            control
             .query_drop(format!(
                 "CREATE TABLE {CATALOG}.{DATABASE}.{CTAS} AS SELECT v FROM {CATALOG}.{DATABASE}.{TABLE} WHERE v <= 1000"
             ))
@@ -1285,41 +1459,43 @@ impl Scenario for VendedRestReadWritePem {
                         format!("create vended REST CTAS target; read proxy audit: {error}")
                     })
             })?;
-        let ctas_rows: Vec<(i64, i64)> = control
-            .query(format!(
-                "SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{CTAS}"
-            ))
-            .context("read vended REST CTAS target")?;
-        if ctas_rows != [(1_000, 500_500)] {
-            bail!("vended REST CTAS returned {ctas_rows:?}, expected [(1000, 500500)]");
-        }
-        let audit = self.vended_proxy_audit()?;
-        if audit.table_loads == 0 || audit.staged_creates < 1 {
-            bail!(
-                "vended REST fixture did not observe expected table-load/staged-create calls: {audit:?}"
+            let ctas_rows: Vec<(i64, i64)> = control
+                .query(format!(
+                    "SELECT count(*), sum(v) FROM {CATALOG}.{DATABASE}.{CTAS}"
+                ))
+                .context("read vended REST CTAS target")?;
+            if ctas_rows != [(1_000, 500_500)] {
+                bail!("vended REST CTAS returned {ctas_rows:?}, expected [(1000, 500500)]");
+            }
+            let audit = self.vended_proxy_audit()?;
+            if audit.table_loads == 0 || audit.staged_creates < 1 {
+                bail!(
+                    "vended REST fixture did not observe expected table-load/staged-create calls: {audit:?}"
+                );
+            }
+            // A normal read/write acquires rather than being handed material: each
+            // consumer asks the catalog for itself now (CAD-1 D1), so "the quiet
+            // path never calls the credentials endpoint" is no longer the
+            // invariant. What still holds is that nothing asks more than the
+            // consumers that ran: one authority per (catalog, prefix) per process,
+            // so at most the coordinator plus each backend.
+            let ceiling =
+                u64::try_from(context.handle().be_count().saturating_add(1)).unwrap_or(u64::MAX);
+            if audit.refreshes == 0 || audit.refreshes > ceiling {
+                bail!(
+                    "a normal vended read/write must acquire once per consumer and no more; ceiling={ceiling}, audit={audit:?}"
+                );
+            }
+            if audit.refresh_failures != 0 {
+                bail!("a normal vended read/write must not be refused: {audit:?}");
+            }
+            context.action(
+                "verify every consumer acquired its own vended credential in normal read/write",
             );
-        }
-        // A normal read/write acquires rather than being handed material: each
-        // consumer asks the catalog for itself now (CAD-1 D1), so "the quiet
-        // path never calls the credentials endpoint" is no longer the
-        // invariant. What still holds is that nothing asks more than the
-        // consumers that ran: one authority per (catalog, prefix) per process,
-        // so at most the coordinator plus each backend.
-        let ceiling =
-            u64::try_from(context.handle().be_count().saturating_add(1)).unwrap_or(u64::MAX);
-        if audit.refreshes == 0 || audit.refreshes > ceiling {
-            bail!(
-                "a normal vended read/write must acquire once per consumer and no more; ceiling={ceiling}, audit={audit:?}"
-            );
-        }
-        if audit.refresh_failures != 0 {
-            bail!("a normal vended read/write must not be refused: {audit:?}");
-        }
-        context.action(
-            "verify every consumer acquired its own vended credential in normal read/write",
-        );
-        await_resource_convergence(context, &baseline, "vended REST read/write")?;
-        Ok(())
+            await_resource_convergence(context, &baseline, "vended REST read/write")?;
+            Ok(())
+        })();
+        connector_control_plan::with_cleanup(control_phase, control.finish())
     }
 
     fn teardown(&self) -> Result<()> {
@@ -1378,7 +1554,7 @@ impl Scenario for VendedRestWriteOutcomePem {
     }
 
     fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
+        CrossProcessChildEnvironment::default()
     }
 
     fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
@@ -1423,7 +1599,7 @@ impl Scenario for VendedRestWriteOutcomePem {
         }
         *fixture = Some(VendedRestSystemFixture { rest, proxy });
 
-        let mut config = connector_launch_config();
+        let mut config = connector_control_plan::launch_config();
         configure_vended_metadata_access(&mut config, metadata_identity);
         config.native_trust_fixture = NativeTrustFixture::pem_ip();
         Ok(config)
@@ -1434,61 +1610,67 @@ impl Scenario for VendedRestWriteOutcomePem {
         let baseline = resource_baseline(context)?;
         let (proxy_uri, warehouse, minio_endpoint) = self.fixture_endpoints()?;
         let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect vended write-outcome control session")?,
-        )?;
-        const CATALOG: &str = "vended_write_outcome_catalog";
-        const DATABASE: &str = "vended_write_outcome_db";
-        const TABLE: &str = "vended_write_outcome_data";
-        control
+        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
+        let control_phase = (|| -> Result<()> {
+            const CATALOG: &str = "vended_write_outcome_catalog";
+            const DATABASE: &str = "vended_write_outcome_db";
+            const TABLE: &str = "vended_write_outcome_data";
+            control
             .query_drop(format!(
                 "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")"
             ))
             .context("create response-loss REST vended catalog")?;
 
-        let (done_tx, done) = mpsc::sync_channel(1);
-        let query_user = user.clone();
-        let insert = format!("INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT 1 AS v");
-        let writer = thread::spawn(move || {
-            let mut connection = mysql_actor::connect(&query_user, port, Duration::from_secs(10))
-                .context("connect vended write-outcome writer")?;
-            let result = connection.query_drop(insert);
-            done_tx
-                .send(result.map_err(anyhow::Error::from))
-                .context("publish vended write-outcome result")
-        });
+            let (done_tx, done) = mpsc::sync_channel(1);
+            let query_user = user.clone();
+            let insert = format!("INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT 1 AS v");
+            let deadline = context.deadline();
+            let writer = thread::spawn(move || {
+                let mut connection = mysql_actor::connect_until(&query_user, port, deadline)
+                    .context("connect vended write-outcome writer")?;
+                let result = connection.query_drop(insert);
+                let published = done_tx
+                    .send(result.map_err(anyhow::Error::from))
+                    .context("publish vended write-outcome result");
+                connector_control_plan::with_cleanup(published, connection.finish())
+            });
 
-        context.action("inject catalog response loss after one durable vended table commit");
-        let outcome = done
-            .recv_timeout(context.remaining("await failed write after held response release")?)
-            .context("vended write-outcome writer did not finish")?;
-        writer
-            .join()
-            .map_err(|_| anyhow::anyhow!("vended write-outcome writer panicked"))??;
-        ensure!(
-            outcome.is_ok(),
-            "response-lost vended write must reconcile the already-committed outcome: {outcome:?}"
-        );
-        let audit = self.vended_proxy_audit()?;
-        ensure!(
-            audit.table_commits == 1,
-            "vended write must not replay the catalog commit after response loss; audit={audit:?}"
-        );
-        ensure!(
-            audit.refresh_failures == 0,
-            "response-loss write must not manufacture a refused refresh; audit={audit:?}"
-        );
-        let rows: Vec<i64> = control
-            .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
-            .context("read the already-applied vended write outcome")?;
-        ensure!(
-            rows == vec![1],
-            "response-loss write side effect must be visible exactly once, got {rows:?}"
-        );
-        await_resource_convergence(context, &baseline, "vended write-outcome failure")?;
-        Ok(())
+            context.action("inject catalog response loss after one durable vended table commit");
+            let received = (|| {
+                done.recv_timeout(
+                    context.remaining("await failed write after held response release")?,
+                )
+                .context("vended write-outcome writer did not finish")
+            })();
+            let joined = writer
+                .join()
+                .map_err(|_| anyhow::anyhow!("vended write-outcome writer panicked"))
+                .and_then(|result| result);
+            let outcome = connector_control_plan::with_cleanup(received, joined)?;
+            ensure!(
+                outcome.is_ok(),
+                "response-lost vended write must reconcile the already-committed outcome: {outcome:?}"
+            );
+            let audit = self.vended_proxy_audit()?;
+            ensure!(
+                audit.table_commits == 1,
+                "vended write must not replay the catalog commit after response loss; audit={audit:?}"
+            );
+            ensure!(
+                audit.refresh_failures == 0,
+                "response-loss write must not manufacture a refused refresh; audit={audit:?}"
+            );
+            let rows: Vec<i64> = control
+                .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+                .context("read the already-applied vended write outcome")?;
+            ensure!(
+                rows == vec![1],
+                "response-loss write side effect must be visible exactly once, got {rows:?}"
+            );
+            await_resource_convergence(context, &baseline, "vended write-outcome failure")?;
+            Ok(())
+        })();
+        connector_control_plan::with_cleanup(control_phase, control.finish())
     }
 
     fn teardown(&self) -> Result<()> {
@@ -1541,6 +1723,7 @@ impl VendedRestWriteOutcomePem {
 #[derive(Default)]
 struct VendedRestRefreshPem {
     fixture: Mutex<Option<VendedRestSystemFixture>>,
+    controls: Mutex<Option<storage_control_plan::Inputs>>,
 }
 
 impl Scenario for VendedRestRefreshPem {
@@ -1553,7 +1736,7 @@ impl Scenario for VendedRestRefreshPem {
     }
 
     fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
+        CrossProcessChildEnvironment::default()
     }
 
     fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
@@ -1607,22 +1790,81 @@ impl Scenario for VendedRestRefreshPem {
         *fixture = Some(VendedRestSystemFixture { rest, proxy });
 
         let mut config = connector_launch_config();
+        // Preserve normal credentials/config while removing inherited marker activation.
+        config.child_environment = CrossProcessChildEnvironment::default();
         configure_vended_metadata_access(&mut config, metadata_identity);
-        config
-            .child_environment
-            .be_by_index
-            .entry(0)
-            .or_default()
-            .insert(
-                "NOVAROCKS_SQL_TEST_STORAGE_AUTHORITY_CLOSE_ENABLE".to_string(),
-                "1".to_string(),
-            );
         config.native_trust_fixture = NativeTrustFixture::pem_ip();
         Ok(config)
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _scenario_root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: std::time::Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let (scope, endpoint) = {
+            let fixture = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("vended refresh fixture lock poisoned"))?;
+            let fixture = fixture
+                .as_ref()
+                .context("vended refresh fixture not prepared")?;
+            (
+                format!(
+                    "{}/",
+                    fixture
+                        .rest
+                        .endpoints()
+                        .rest_warehouse
+                        .trim_end_matches('/')
+                ),
+                format!(
+                    "{}/_fixture/vended-credentials/refresh",
+                    fixture.proxy.uri()
+                ),
+            )
+        };
+        let authority = storage_control_plan::AuthorityIntent {
+            catalog: "vended_refresh_catalog".into(),
+            scope,
+            endpoint,
+            close: false,
+        };
+        let queries = vec![storage_control_plan::QueryIntent {
+            run_token: storage_control_plan::REFRESH_HELD_TOKEN,
+            sql: storage_control_plan::held_sql(
+                "vended_refresh_catalog",
+                "vended_refresh_db",
+                "vended_refresh_data",
+            ),
+            lease_markers: true,
+        }];
+        let (plan, inputs) = storage_control_plan::plan(
+            cluster_size,
+            ordinary_binary,
+            controlled_binary,
+            original_deadline,
+            authority,
+            &queries,
+        )?;
+        let mut controls = self
+            .controls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Storage consumer input lock poisoned"))?;
+        ensure!(controls.is_none(), "Storage consumer input prepared twice");
+        *controls = Some(inputs);
+        Ok(Some(plan))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
+        let storage_inputs = self.control_inputs()?;
         let baseline = resource_baseline(context)?;
         let (proxy_uri, warehouse, minio_endpoint) = {
             let fixture = self
@@ -1686,7 +1928,7 @@ impl Scenario for VendedRestRefreshPem {
             "unexpected target priming result: {primed:?}"
         );
         let scope = format!("{}/", warehouse.trim_end_matches('/'));
-        let identity = wait_for_debug_authority_identity(context, 0, CATALOG, &scope)?;
+        let identity = storage_control_plan::identity(context, &storage_inputs)?;
         context.action(format!(
             "BE[0] authority {} at catalog generation {} primed by one-file read",
             identity.key, identity.version
@@ -1714,45 +1956,62 @@ impl Scenario for VendedRestRefreshPem {
                 VendedRefreshBehavior::IssueRotatedCredential,
             )?;
         }
-        let (renewed_result, renewed_thread) =
-            start_simple_vended_read(user.clone(), port, target_sql);
-        let observed = {
+        let renewal =
+            storage_control_plan::SimpleRead::start_ordinary(context, &user, port, &target_sql)?;
+        let phase =
+            (|| -> Result<()> {
+                let observed = {
+                    let slot = self.fixture.lock().map_err(|_| {
+                        anyhow::anyhow!("vended refresh REST fixture lock poisoned")
+                    })?;
+                    let fixture = slot.as_ref().context("vended refresh fixture missing")?;
+                    fixture.proxy.wait_for_targeted_refresh(
+                        context.remaining("observe identified BE consumer acquisition")?,
+                    )?
+                };
+                ensure!(
+                    observed.be_index == 0
+                        && observed.authority_id == identity.key
+                        && observed.catalog_generation == identity.version
+                        && observed.request_sequence.is_some()
+                        && observed.mismatched_requests == 0
+                        && observed.ambiguous_requests == 0,
+                    "vended renewal was not attributable to the selected consumer: {observed:?}"
+                );
+                {
+                    let slot = self.fixture.lock().map_err(|_| {
+                        anyhow::anyhow!("vended refresh REST fixture lock poisoned")
+                    })?;
+                    slot.as_ref()
+                        .context("vended refresh fixture missing")?
+                        .proxy
+                        .release_targeted_refresh()?;
+                }
+                let renewed = renewal
+                    .result
+                    .recv_timeout(context.remaining("await target BE renewed data read")?)
+                    .context("target BE renewed read did not finish")?
+                    .context("target BE renewed read failed")?;
+                ensure!(renewed == [10], "renewed target read returned {renewed:?}");
+                Ok(())
+            })();
+        let released = {
             let slot = self
                 .fixture
                 .lock()
-                .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?;
-            let fixture = slot.as_ref().context("vended refresh fixture missing")?;
-            fixture.proxy.wait_for_targeted_refresh(
-                context.remaining("observe identified BE consumer acquisition")?,
-            )?
+                .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"));
+            slot.and_then(|slot| {
+                slot.as_ref()
+                    .context("vended refresh fixture missing")?
+                    .proxy
+                    .release_targeted_refresh()
+            })
         };
-        ensure!(
-            observed.be_index == 0
-                && observed.authority_id == identity.key
-                && observed.catalog_generation == identity.version
-                && observed.request_sequence.is_some()
-                && observed.mismatched_requests == 0
-                && observed.ambiguous_requests == 0,
-            "vended renewal was not attributable to the selected consumer: {observed:?}"
-        );
-        {
-            let slot = self
-                .fixture
-                .lock()
-                .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?;
-            slot.as_ref()
-                .context("vended refresh fixture missing")?
-                .proxy
-                .release_targeted_refresh()?;
-        }
-        let renewed = renewed_result
-            .recv_timeout(context.remaining("await target BE renewed data read")?)
-            .context("target BE renewed read did not finish")?
-            .context("target BE renewed read failed")?;
-        ensure!(renewed == [10], "renewed target read returned {renewed:?}");
-        renewed_thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("target renewal read thread panicked"))??;
+        renewal.finish_after(
+            context,
+            &mut control,
+            storage_control_plan::with_cleanup(phase, released),
+        )?;
         let targeted = {
             let slot = self
                 .fixture
@@ -1797,48 +2056,57 @@ impl Scenario for VendedRestRefreshPem {
         // each BE may reuse or refresh its own process-lived authority.
         context.action("start one long-running vended read on all three Backends");
         let read_baseline_logs = backend_log_snapshots(context)?;
-        let target = start_held_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
-        let connection_id = target
-            .ready
-            .recv_timeout(context.remaining("receive vended read connection id")?)
-            .context("vended read ended before publishing its connection id")?;
-        wait_for_new_reader_on_every_backend(
+        let held_sql = storage_control_plan::held_sql(CATALOG, DATABASE, TABLE);
+        let observed_read = storage_control_plan::HeldRead::start(
             context,
-            CATALOG,
-            "observe a vended unit reader on every Backend",
-            &read_baseline_logs,
-            AwaitedRead::new(&target, "the three-BE vended read"),
+            &storage_inputs,
+            &user,
+            port,
+            storage_control_plan::REFRESH_HELD_TOKEN,
+            &held_sql,
         )?;
-        let lease_baseline_logs = backend_log_snapshots(context)?;
-        wait_for_lease_renewal_on_every_backend(
-            context,
-            "verify every Backend continues the same vended read",
-            &lease_baseline_logs,
-            AwaitedRead::new(&target, "the three-BE vended read"),
-        )?;
-        if let Ok(result) = target.done.try_recv() {
-            bail!("three-BE vended read terminated before cancellation: {result:?}");
-        }
-        context.action(format!(
-            "cancel the long vended read through KILL QUERY {connection_id}"
-        ));
-        control
-            .query_drop(format!("KILL QUERY {connection_id}"))
-            .context("cancel three-BE vended reader")?;
-        assert_cancelled_query(
-            &target.done,
-            context.remaining("await three-BE vended read cancellation")?,
-        )?;
-        assert_target_connection_remains_usable(
-            &target,
-            context.remaining("verify post-cancellation connection behavior")?,
-        )?;
-        assert_idle_query(&mut control, connection_id)?;
-        release_connector_read(&target)?;
-        target
-            .thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("vended reader thread panicked"))??;
+        let target = &observed_read.read;
+        let phase = (|| -> Result<()> {
+            let connection_id = target
+                .ready
+                .recv_timeout(context.remaining("receive vended read connection id")?)
+                .context("vended read ended before publishing its connection id")?;
+            wait_for_new_reader_on_every_backend(
+                context,
+                CATALOG,
+                "observe a vended unit reader on every Backend",
+                &read_baseline_logs,
+                AwaitedRead::new(target, "the three-BE vended read"),
+            )?;
+            let lease_baseline_logs = backend_log_snapshots(context)?;
+            wait_for_lease_renewal_on_every_backend(
+                context,
+                "verify every Backend continues the same vended read",
+                &lease_baseline_logs,
+                AwaitedRead::new(target, "the three-BE vended read"),
+            )?;
+            if let Ok(result) = target.done.try_recv() {
+                bail!("three-BE vended read terminated before cancellation: {result:?}");
+            }
+            context.action(format!(
+                "cancel the long vended read through KILL QUERY {connection_id}"
+            ));
+            control
+                .query_drop(format!("KILL QUERY {connection_id}"))
+                .context("cancel three-BE vended reader")?;
+            assert_cancelled_query(
+                &target.done,
+                context.remaining("await three-BE vended read cancellation")?,
+            )?;
+            assert_target_connection_remains_usable(
+                target,
+                context.remaining("verify post-cancellation connection behavior")?,
+            )?;
+            assert_idle_query(&mut control, connection_id)?;
+            release_connector_read(target)?;
+            Ok(())
+        })();
+        observed_read.finish_after(context, &mut control, phase)?;
         let reader_logs = wait_for_balanced_reader_lifecycle(
             context,
             "wait for three-BE vended reader close after cancellation",
@@ -1864,6 +2132,14 @@ impl Scenario for VendedRestRefreshPem {
 }
 
 impl VendedRestRefreshPem {
+    fn control_inputs(&self) -> Result<storage_control_plan::Inputs> {
+        self.controls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Storage consumer input lock poisoned"))?
+            .clone()
+            .context("Storage consumer plan was not prepared before launch")
+    }
+
     fn vended_proxy_audit(
         &self,
     ) -> Result<novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit> {
@@ -1886,6 +2162,8 @@ enum VendedCredentialFault {
 struct VendedCredentialFaultPem {
     kind: VendedCredentialFault,
     fixture: Mutex<Option<VendedRestSystemFixture>>,
+    controls: Mutex<Option<storage_control_plan::Inputs>>,
+    unreachable: Mutex<Option<storage_control_plan::UnreachableEndpoint>>,
 }
 
 impl VendedCredentialFaultPem {
@@ -1893,7 +2171,17 @@ impl VendedCredentialFaultPem {
         Self {
             kind,
             fixture: Mutex::new(None),
+            controls: Mutex::new(None),
+            unreachable: Mutex::new(None),
         }
+    }
+
+    fn control_inputs(&self) -> Result<storage_control_plan::Inputs> {
+        self.controls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Storage consumer input lock poisoned"))?
+            .clone()
+            .context("Storage consumer plan was not prepared before launch")
     }
 
     fn with_fixture<T>(
@@ -1926,7 +2214,7 @@ impl Scenario for VendedCredentialFaultPem {
     }
 
     fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
+        CrossProcessChildEnvironment::default()
     }
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
@@ -1970,23 +2258,106 @@ impl Scenario for VendedCredentialFaultPem {
         );
         *slot = Some(VendedRestSystemFixture { rest, proxy });
 
+        if matches!(self.kind, VendedCredentialFault::Unreachable) {
+            let mut endpoint = self
+                .unreachable
+                .lock()
+                .map_err(|_| anyhow::anyhow!("unreachable endpoint input lock poisoned"))?;
+            ensure!(endpoint.is_none(), "unreachable endpoint prepared twice");
+            *endpoint = Some(storage_control_plan::UnreachableEndpoint::prepare()?);
+        }
+
         let mut config = connector_launch_config();
+        // Preserve normal credentials/config while removing inherited marker activation.
+        config.child_environment = CrossProcessChildEnvironment::default();
         configure_vended_metadata_access(&mut config, metadata_identity);
-        config
-            .child_environment
-            .be_by_index
-            .entry(0)
-            .or_default()
-            .insert(
-                "NOVAROCKS_SQL_TEST_STORAGE_AUTHORITY_CLOSE_ENABLE".to_string(),
-                "1".to_string(),
-            );
         config.native_trust_fixture = NativeTrustFixture::pem_ip();
         Ok(config)
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _scenario_root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: std::time::Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let (scope, mut endpoint) = self.with_fixture(|fixture| {
+            Ok((
+                format!(
+                    "{}/",
+                    fixture
+                        .rest
+                        .endpoints()
+                        .rest_warehouse
+                        .trim_end_matches('/')
+                ),
+                format!(
+                    "{}/_fixture/vended-credentials/refresh",
+                    fixture.proxy.uri()
+                ),
+            ))
+        })?;
+        if matches!(self.kind, VendedCredentialFault::Unreachable) {
+            endpoint = self
+                .unreachable
+                .lock()
+                .map_err(|_| anyhow::anyhow!("unreachable endpoint input lock poisoned"))?
+                .as_ref()
+                .context("unreachable endpoint was not prepared before launch")?
+                .endpoint
+                .clone();
+        }
+        let authority = storage_control_plan::AuthorityIntent {
+            catalog: "cad2_vended_catalog".into(),
+            scope,
+            endpoint,
+            close: matches!(self.kind, VendedCredentialFault::LateClose),
+        };
+        let sql = "SELECT count(*) FROM cad2_vended_catalog.cad2_vended_db.cad2_vended_data WHERE v % 100 = 0".to_string();
+        let mut queries = Vec::new();
+        if !matches!(self.kind, VendedCredentialFault::Unreachable) {
+            queries.push(storage_control_plan::QueryIntent {
+                run_token: storage_control_plan::FAULT_PRIME_TOKEN,
+                sql: sql.clone(),
+                lease_markers: false,
+            });
+        }
+        queries.push(storage_control_plan::QueryIntent {
+            run_token: storage_control_plan::FAULT_READ_TOKEN,
+            sql: sql.clone(),
+            lease_markers: false,
+        });
+        if matches!(self.kind, VendedCredentialFault::LateClose) {
+            queries.push(storage_control_plan::QueryIntent {
+                run_token: storage_control_plan::FAULT_FOLLOWUP_TOKEN,
+                sql,
+                lease_markers: false,
+            });
+        }
+        let (plan, inputs) = storage_control_plan::plan(
+            cluster_size,
+            ordinary_binary,
+            controlled_binary,
+            original_deadline,
+            authority,
+            &queries,
+        )?;
+        let mut controls = self
+            .controls
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Storage consumer input lock poisoned"))?;
+        ensure!(controls.is_none(), "Storage consumer input prepared twice");
+        *controls = Some(inputs);
+        Ok(Some(plan))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
+        let storage_inputs = self.control_inputs()?;
         let baseline = resource_baseline(context)?;
         let (proxy_uri, warehouse, minio_endpoint, scope) = self.with_fixture(|fixture| {
             Ok((
@@ -2035,18 +2406,16 @@ impl Scenario for VendedCredentialFaultPem {
         let read_sql =
             format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE} WHERE v % 100 = 0");
         if matches!(self.kind, VendedCredentialFault::Unreachable) {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0")
-                .context("reserve a loopback port for connect refusal")?;
-            let address = listener
-                .local_addr()
-                .context("read reserved loopback port")?;
-            let endpoint = format!("http://{address}/_fixture/vended-credentials/refresh");
-            drop(listener);
-            let refusal = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1))
-                .expect_err("closed fixture endpoint must refuse connections");
+            let endpoint = self
+                .unreachable
+                .lock()
+                .map_err(|_| anyhow::anyhow!("unreachable endpoint input lock poisoned"))?
+                .take()
+                .context("unreachable endpoint reservation was already consumed")?
+                .release_and_verify(context)?;
             ensure!(
-                refusal.kind() == std::io::ErrorKind::ConnectionRefused,
-                "closed fixture endpoint did not refuse connections: {refusal}"
+                endpoint == storage_inputs.intent.endpoint,
+                "runtime endpoint differs from frozen Storage intent"
             );
             self.with_fixture(|fixture| {
                 fixture
@@ -2060,10 +2429,16 @@ impl Scenario for VendedCredentialFaultPem {
                 "target catalog announces an unavailable loopback endpoint {endpoint}"
             ));
             let before = self.with_fixture(|fixture| Ok(fixture.proxy.audit()))?;
-            let error = control
-                .query::<i64, _>(&read_sql)
-                .expect_err("target BE cannot connect to its advertised endpoint");
-            let identity = wait_for_debug_authority_identity(context, 0, CATALOG, &scope)?;
+            let error = storage_control_plan::outcome::<i64>(
+                context,
+                &storage_inputs,
+                &mut control,
+                storage_control_plan::FAULT_READ_TOKEN,
+                &read_sql,
+            )?
+            .err()
+            .context("target BE cannot connect to its advertised endpoint")?;
+            let identity = storage_control_plan::identity(context, &storage_inputs)?;
             context.action(format!(
                 "BE[0] authority {} uses the target catalog generation {}",
                 identity.key, identity.version
@@ -2109,11 +2484,16 @@ impl Scenario for VendedCredentialFaultPem {
             )?;
             return Ok(());
         }
-        let first: Vec<i64> = control
-            .query(&read_sql)
-            .context("prime BE authority with one real file read")?;
+        let first: Vec<i64> = storage_control_plan::query(
+            context,
+            &storage_inputs,
+            &mut control,
+            storage_control_plan::FAULT_PRIME_TOKEN,
+            &read_sql,
+        )
+        .context("prime BE authority with one real file read")?;
         ensure!(first == [10], "unexpected priming read result: {first:?}");
-        let identity = wait_for_debug_authority_identity(context, 0, CATALOG, &scope)?;
+        let identity = storage_control_plan::identity(context, &storage_inputs)?;
         context.action(format!(
             "target BE[0] authority {} catalog generation {}",
             identity.key, identity.version
@@ -2143,117 +2523,137 @@ impl Scenario for VendedCredentialFaultPem {
         })?;
 
         let started = std::time::Instant::now();
-        let (read_result, read_thread) = start_simple_vended_read(user, port, read_sql.clone());
-        let observed = self.with_fixture(|fixture| {
-            fixture
-                .proxy
-                .wait_for_targeted_refresh(context.remaining("observe BE[0] acquisition")?)
-        })?;
-        ensure!(
-            observed.be_index == 0
-                && observed.authority_id == identity.key
-                && observed.catalog_generation == identity.version
-                && observed.request_sequence.is_some()
-                && observed.mismatched_requests == 0
-                && observed.ambiguous_requests == 0,
-            "targeted fixture request was not attributable to BE[0]: {observed:?}"
-        );
-        context.action(format!(
-            "BE[0] targeted refresh request sequence {} entered",
-            observed.request_sequence.expect("checked")
-        ));
+        let read = storage_control_plan::SimpleRead::start(
+            context,
+            &storage_inputs,
+            &user,
+            port,
+            storage_control_plan::FAULT_READ_TOKEN,
+            &read_sql,
+        )?;
+        let read_result = &read.result;
+        let phase = (|| {
+            let observed = self.with_fixture(|fixture| {
+                fixture
+                    .proxy
+                    .wait_for_targeted_refresh(context.remaining("observe BE[0] acquisition")?)
+            })?;
+            ensure!(
+                observed.be_index == 0
+                    && observed.authority_id == identity.key
+                    && observed.catalog_generation == identity.version
+                    && observed.request_sequence.is_some()
+                    && observed.mismatched_requests == 0
+                    && observed.ambiguous_requests == 0,
+                "targeted fixture request was not attributable to BE[0]: {observed:?}"
+            );
+            context.action(format!(
+                "BE[0] targeted refresh request sequence {} entered",
+                observed.request_sequence.expect("checked")
+            ));
 
-        match self.kind {
-            VendedCredentialFault::TargetedDeadline => {
-                let error = read_result
-                    .recv_timeout(context.remaining("await bounded BE acquisition failure")?)
-                    .context("held acquisition did not return within scenario budget")?
-                    .expect_err("held acquisition must fail its own deadline");
-                let message = error.to_string().to_lowercase();
-                ensure!(
-                    (message.contains("credential") || message.contains("storage authority"))
-                        && !message.contains("exchange idle"),
-                    "targeted acquisition failed without its catalog/credential cause: {error}"
-                );
-                ensure!(
-                    started.elapsed() < Duration::from_secs(50),
-                    "targeted acquisition exceeded its D5 combined bound"
-                );
-                self.with_fixture(|fixture| fixture.proxy.release_targeted_refresh())?;
-                context.record_phase_observation(
-                    "targeted_provider_deadline",
-                    1,
-                    1,
-                    1,
-                    "credentials-endpoint",
-                    observed.request_sequence.expect("checked"),
-                    "bounded-failure",
-                    BTreeMap::from([
-                        ("target_be_index", 0),
-                        (
-                            "target_request_sequence",
-                            observed.request_sequence.expect("checked"),
-                        ),
-                    ]),
-                )?;
+            match self.kind {
+                VendedCredentialFault::TargetedDeadline => {
+                    let error = read_result
+                        .recv_timeout(context.remaining("await bounded BE acquisition failure")?)
+                        .context("held acquisition did not return within scenario budget")?
+                        .err()
+                        .context("held acquisition must fail its own deadline")?;
+                    let message = error.to_string().to_lowercase();
+                    ensure!(
+                        (message.contains("credential") || message.contains("storage authority"))
+                            && !message.contains("exchange idle"),
+                        "targeted acquisition failed without its catalog/credential cause: {error}"
+                    );
+                    ensure!(
+                        started.elapsed() < Duration::from_secs(50),
+                        "targeted acquisition exceeded its D5 combined bound"
+                    );
+                    self.with_fixture(|fixture| fixture.proxy.release_targeted_refresh())?;
+                    context.record_phase_observation(
+                        "targeted_provider_deadline",
+                        1,
+                        1,
+                        1,
+                        "credentials-endpoint",
+                        observed.request_sequence.expect("checked"),
+                        "bounded-failure",
+                        BTreeMap::from([
+                            ("target_be_index", 0),
+                            (
+                                "target_request_sequence",
+                                observed.request_sequence.expect("checked"),
+                            ),
+                        ]),
+                    )?;
+                }
+                VendedCredentialFault::LateClose => {
+                    let closed =
+                        storage_control_plan::close(context, &storage_inputs, &identity.key)?;
+                    self.with_fixture(|fixture| fixture.proxy.release_targeted_refresh())?;
+                    let late = storage_control_plan::late(context, &storage_inputs, &identity.key)?;
+                    let applied_before = debug_close_counter(&closed, "refreshes_applied")?;
+                    let applied_after = debug_close_counter(&late, "refreshes_applied")?;
+                    let discarded_before = debug_close_counter(&closed, "late_results_discarded")?;
+                    let discarded_after = debug_close_counter(&late, "late_results_discarded")?;
+                    ensure!(
+                        applied_after == applied_before && discarded_after > discarded_before,
+                        "closed authority did not fence its late provider result: closed={closed:?}, late={late:?}"
+                    );
+                    let error = read_result
+                        .recv_timeout(context.remaining("await closed authority waiter")?)
+                        .context("closed authority waiter did not return")?
+                        .err()
+                        .context("closed authority waiter must not use late success")?;
+                    ensure!(
+                        error.to_string().to_lowercase().contains("denied"),
+                        "closed authority waiter lost its denial reason: {error}"
+                    );
+                    let subsequent = storage_control_plan::outcome::<i64>(
+                        context,
+                        &storage_inputs,
+                        &mut control,
+                        storage_control_plan::FAULT_FOLLOWUP_TOKEN,
+                        &read_sql,
+                    )?
+                    .err()
+                    .context("closed authority must reject a later read")?;
+                    ensure!(
+                        subsequent.to_string().to_lowercase().contains("denied"),
+                        "later request lost the closed authority cause: {subsequent}"
+                    );
+                    context.record_phase_observation(
+                        "late_success_after_close",
+                        1,
+                        1,
+                        1,
+                        "credentials-endpoint",
+                        observed.request_sequence.expect("checked"),
+                        "discarded",
+                        BTreeMap::from([
+                            ("target_be_index", 0),
+                            (
+                                "target_request_sequence",
+                                observed.request_sequence.expect("checked"),
+                            ),
+                            (
+                                "refreshes_applied_after_close",
+                                applied_after - applied_before,
+                            ),
+                            (
+                                "late_results_discarded_delta",
+                                discarded_after - discarded_before,
+                            ),
+                        ]),
+                    )?;
+                }
+                VendedCredentialFault::Unreachable => unreachable!("handled before targeted hold"),
             }
-            VendedCredentialFault::LateClose => {
-                let closed = trigger_debug_authority_close(context, 0, &identity.key)?;
-                self.with_fixture(|fixture| fixture.proxy.release_targeted_refresh())?;
-                let late = wait_for_debug_authority_late_discard(context, 0, &identity.key)?;
-                let applied_before = debug_close_counter(&closed, "refreshes_applied")?;
-                let applied_after = debug_close_counter(&late, "refreshes_applied")?;
-                let discarded_before = debug_close_counter(&closed, "late_results_discarded")?;
-                let discarded_after = debug_close_counter(&late, "late_results_discarded")?;
-                ensure!(
-                    applied_after == applied_before && discarded_after > discarded_before,
-                    "closed authority did not fence its late provider result: closed={closed:?}, late={late:?}"
-                );
-                let error = read_result
-                    .recv_timeout(context.remaining("await closed authority waiter")?)
-                    .context("closed authority waiter did not return")?
-                    .expect_err("closed authority waiter must not use late success");
-                ensure!(
-                    error.to_string().to_lowercase().contains("denied"),
-                    "closed authority waiter lost its denial reason: {error}"
-                );
-                let subsequent = control
-                    .query::<i64, _>(&read_sql)
-                    .expect_err("closed authority must reject a later read");
-                ensure!(
-                    subsequent.to_string().to_lowercase().contains("denied"),
-                    "later request lost the closed authority cause: {subsequent}"
-                );
-                context.record_phase_observation(
-                    "late_success_after_close",
-                    1,
-                    1,
-                    1,
-                    "credentials-endpoint",
-                    observed.request_sequence.expect("checked"),
-                    "discarded",
-                    BTreeMap::from([
-                        ("target_be_index", 0),
-                        (
-                            "target_request_sequence",
-                            observed.request_sequence.expect("checked"),
-                        ),
-                        (
-                            "refreshes_applied_after_close",
-                            applied_after - applied_before,
-                        ),
-                        (
-                            "late_results_discarded_delta",
-                            discarded_after - discarded_before,
-                        ),
-                    ]),
-                )?;
-            }
-            VendedCredentialFault::Unreachable => unreachable!("handled before targeted hold"),
-        }
-        read_thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("credential fault read thread panicked"))??;
+            Ok(observed)
+        })();
+        let released = self.with_fixture(|fixture| fixture.proxy.release_targeted_refresh());
+        let phase = storage_control_plan::with_cleanup(phase, released);
+        let observed = read.finish_after(context, &mut control, phase)?;
         let final_audit = self.with_fixture(|fixture| {
             fixture
                 .proxy
@@ -2291,6 +2691,11 @@ impl Scenario for VendedCredentialFaultPem {
     }
 
     fn teardown(&self) -> Result<()> {
+        // Release a prelaunch-only reservation even if startup/run failed.
+        self.unreachable
+            .lock()
+            .map_err(|_| anyhow::anyhow!("unreachable endpoint input lock poisoned"))?
+            .take();
         let fixture = self
             .fixture
             .lock()
@@ -2457,7 +2862,10 @@ fn wait_for_debug_close_record(
 
 /// Proves a Frontend restart reconstructs its durable catalog projection
 /// without invalidating catalog runtimes retained by the live Backends.
-struct CatalogFeRestartCache;
+#[derive(Default)]
+struct CatalogFeRestartCache {
+    controls: connector_control_plan::Owner,
+}
 
 impl Scenario for CatalogFeRestartCache {
     fn name(&self) -> &'static str {
@@ -2465,113 +2873,163 @@ impl Scenario for CatalogFeRestartCache {
     }
 
     fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
+        CrossProcessChildEnvironment::default()
     }
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
+        Ok(connector_control_plan::launch_config())
+    }
+
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: std::time::Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
+        self.controls
+            .freeze(
+                specs,
+                fe_restart,
+                &be_restarts,
+                cluster_size,
+                ordinary_binary,
+                controlled_binary,
+                original_deadline,
+            )
+            .map(Some)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
         let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect FE restart cache control session")?,
-        )?;
+        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
+        let control_phase = (|| -> Result<()> {
+            const CATALOG: &str = "catalog_fe_restart_cache";
+            const DATABASE: &str = "catalog_fe_restart_db";
+            const TABLE: &str = "catalog_fe_restart_data";
+            let warehouse = create_warehouse(context, "catalog-fe-restart-cache")?;
+            connector_control_plan::observed_fixture(
+                context,
+                &self.controls,
+                &mut control,
+                CATALOG,
+                DATABASE,
+                TABLE,
+                &warehouse,
+            )?;
 
-        const CATALOG: &str = "catalog_fe_restart_cache";
-        const DATABASE: &str = "catalog_fe_restart_db";
-        const TABLE: &str = "catalog_fe_restart_data";
-        let warehouse = create_warehouse(context, "catalog-fe-restart-cache")?;
-        create_catalog_table_and_data(&mut control, CATALOG, DATABASE, TABLE, &warehouse)?;
-
-        context.action("warm the exact catalog runtime on every Backend");
-        let warm_rows: Vec<i64> = control
-            .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
+            context.action("warm the exact catalog runtime on every Backend");
+            let warm_rows: Vec<i64> = connector_control_plan::query(
+                context,
+                &self.controls.take(3)?,
+                &mut control,
+                &format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"),
+            )
             .context("warm catalog runtime before FE restart")?;
-        if warm_rows != [300_000] {
-            bail!("warm catalog read returned {warm_rows:?}, expected [300000]");
-        }
-        let warm_logs = wait_for_open_reader_on_every_backend(
-            context,
-            CATALOG,
-            "observe warm catalog readers on every Backend",
-        )?;
-        let warm_versions = reader_catalog_versions(&warm_logs, CATALOG)?;
-        let materializations_before = catalog_materialization_counts(&warm_logs);
+            if warm_rows != [300_000] {
+                bail!("warm catalog read returned {warm_rows:?}, expected [300000]");
+            }
+            let warm_logs = wait_for_open_reader_on_every_backend(
+                context,
+                CATALOG,
+                "observe warm catalog readers on every Backend",
+            )?;
+            let warm_versions = reader_catalog_versions(&warm_logs, CATALOG)?;
+            let materializations_before = catalog_materialization_counts(&warm_logs);
 
-        context.action("start an in-flight query before the Frontend restart");
-        let target = start_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
-        target
-            .ready
-            .recv_timeout(context.remaining("receive in-flight reader connection id")?)
-            .context("in-flight reader terminated before FE restart")?;
-        wait_for_open_reader_on_every_backend(
-            context,
-            CATALOG,
-            "observe in-flight readers before FE restart",
-        )?;
+            context.action("start an in-flight query before the Frontend restart");
+            let selected = self.controls.take(4)?;
+            let owned =
+                connector_control_plan::Reader::start(context, &selected, &user, port, None)?;
+            let target = &owned.read;
+            let mut fe_exited = false;
+            let phase = (|| -> Result<()> {
+                target
+                    .ready
+                    .recv_timeout(context.remaining("receive in-flight reader connection id")?)
+                    .context("in-flight reader terminated before FE restart")?;
+                wait_for_new_reader_on_every_backend(
+                    context,
+                    CATALOG,
+                    "observe in-flight readers before FE restart",
+                    &warm_logs,
+                    AwaitedRead::new(target, "the in-flight FE restart reader"),
+                )?;
 
-        context.action("restart the Frontend and require its in-flight client query to fail");
-        let deadline = context.deadline();
-        context
-            .handle()
-            .restart_fe_until(deadline)
-            .context("restart FE while catalog reader is in flight")?;
-        assert_connection_killed_query(
-            &target.done,
-            context.remaining("await in-flight query failure after FE restart")?,
-        )?;
-        assert_target_connection_is_closed(
-            &target,
-            context.remaining("verify FE restart closed in-flight client connection")?,
-        )?;
-        release_connector_read(&target)?;
-        target
-            .thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("FE restart reader thread panicked"))??;
+                context
+                    .action("restart the Frontend and require its in-flight client query to fail");
+                let deadline = context.deadline();
+                context
+                    .handle()
+                    .restart_fe_until(deadline)
+                    .context("restart FE while catalog reader is in flight")?;
+                fe_exited = true;
+                assert_connection_killed_query(
+                    &target.done,
+                    context.remaining("await in-flight query failure after FE restart")?,
+                )?;
+                assert_target_connection_is_closed(
+                    &target,
+                    context.remaining("verify FE restart closed in-flight client connection")?,
+                )?;
+                release_connector_read(&target)?;
+                Ok(())
+            })();
+            if fe_exited {
+                owned.finish_after_fe_exit(context, &mut control, phase)?;
+            } else {
+                owned.finish_after(context, &mut control, phase)?;
+            }
 
-        context.action("read through the restored Frontend catalog projection");
-        let mut restored = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect restored FE catalog control session")?,
-        )?;
-        let restored_rows: Vec<i64> = restored
-            .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
-            .context("read catalog after FE restart")?;
-        if restored_rows != [300_000] {
-            bail!("restored catalog read returned {restored_rows:?}, expected [300000]");
-        }
-        let restored_logs = wait_for_backend_logs(
-            context,
-            "observe post-restart readers on every Backend",
-            |logs| {
-                logs.iter().zip(&warm_logs).all(|(current, previous)| {
-                    reader_open_lines(current, CATALOG).count()
-                        > reader_open_lines(previous, CATALOG).count()
-                })
-            },
-        )?;
-        let restored_versions = reader_catalog_versions_after(&restored_logs, &warm_logs, CATALOG)?;
-        if restored_versions != warm_versions {
-            bail!(
-                "FE restart changed retained catalog versions: before={warm_versions:?}, after={restored_versions:?}"
-            );
-        }
-        let materializations_after = catalog_materialization_counts(&restored_logs);
-        if materializations_after != materializations_before {
-            bail!(
-                "FE restart rematerialized retained catalog runtimes: before={materializations_before:?}, after={materializations_after:?}"
-            );
-        }
+            context.action("read through the restored Frontend catalog projection");
+            let mut restored = mysql_actor::connect_until(&user, port, context.deadline())?;
+            let restored_phase = (|| -> Result<()> {
+                let restored_rows: Vec<i64> = connector_control_plan::query(
+                    context,
+                    &self.controls.take(5)?,
+                    &mut restored,
+                    &format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"),
+                )
+                .context("read catalog after FE restart")?;
+                if restored_rows != [300_000] {
+                    bail!("restored catalog read returned {restored_rows:?}, expected [300000]");
+                }
+                let restored_logs = wait_for_backend_logs(
+                    context,
+                    "observe post-restart readers on every Backend",
+                    |logs| {
+                        logs.iter().zip(&warm_logs).all(|(current, previous)| {
+                            reader_open_lines(current, CATALOG).count()
+                                > reader_open_lines(previous, CATALOG).count()
+                        })
+                    },
+                )?;
+                let restored_versions =
+                    reader_catalog_versions_after(&restored_logs, &warm_logs, CATALOG)?;
+                if restored_versions != warm_versions {
+                    bail!(
+                        "FE restart changed retained catalog versions: before={warm_versions:?}, after={restored_versions:?}"
+                    );
+                }
+                let materializations_after = catalog_materialization_counts(&restored_logs);
+                if materializations_after != materializations_before {
+                    bail!(
+                        "FE restart rematerialized retained catalog runtimes: before={materializations_before:?}, after={materializations_after:?}"
+                    );
+                }
 
-        await_resource_convergence(context, &baseline, "FE restart catalog cache")?;
-        Ok(())
+                await_resource_convergence(context, &baseline, "FE restart catalog cache")?;
+                Ok(())
+            })();
+            connector_control_plan::with_cleanup(restored_phase, restored.finish())
+        })();
+        connector_control_plan::with_cleanup(control_phase, control.finish())
     }
 }
 
@@ -2582,6 +3040,7 @@ impl Scenario for CatalogFeRestartCache {
 #[derive(Default)]
 struct StaticCredentialGeneration {
     fixtures: Mutex<Option<StaticCredentialFixtures>>,
+    controls: connector_control_plan::Owner,
 }
 
 /// Exercises the cache key boundary on the same native topology as static
@@ -2589,6 +3048,7 @@ struct StaticCredentialGeneration {
 #[derive(Default)]
 struct AccessDomainCacheIsolation {
     fixtures: Mutex<Option<StaticCredentialFixtures>>,
+    controls: connector_control_plan::Owner,
 }
 
 struct StaticCredentialFixtures {
@@ -2618,26 +3078,53 @@ impl Scenario for StaticCredentialGeneration {
     }
 
     fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
+        CrossProcessChildEnvironment::default()
     }
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
         static_credential_launch_config(&self.fixtures, scenario_root)
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: std::time::Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
+        self.controls
+            .freeze(
+                specs,
+                fe_restart,
+                &be_restarts,
+                cluster_size,
+                ordinary_binary,
+                controlled_binary,
+                original_deadline,
+            )
+            .map(Some)
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
         let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect static credential control session")?,
-        )?;
-
-        run_static_credential_generation(context, &mut control, &self.fixtures)?;
-        await_resource_convergence(context, &baseline, "static credential generation reads")?;
-        Ok(())
+        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
+        let control_phase = (|| -> Result<()> {
+            run_static_credential_generation(
+                context,
+                &mut control,
+                &self.controls,
+                &self.fixtures,
+            )?;
+            await_resource_convergence(context, &baseline, "static credential generation reads")?;
+            Ok(())
+        })();
+        connector_control_plan::with_cleanup(control_phase, control.finish())
     }
 }
 
@@ -2647,35 +3134,63 @@ impl Scenario for AccessDomainCacheIsolation {
     }
 
     fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
+        CrossProcessChildEnvironment::default()
     }
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
         access_domain_collision_launch_config(&self.fixtures, scenario_root)
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: std::time::Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
+        self.controls
+            .freeze(
+                specs,
+                fe_restart,
+                &be_restarts,
+                cluster_size,
+                ordinary_binary,
+                controlled_binary,
+                original_deadline,
+            )
+            .map(Some)
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
         let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect access-domain cache control session")?,
-        )?;
-        // Cache policy is a query-scoped FE-to-BE contract. The process-level
-        // cache service configured by this scenario is intentionally inert
-        // until the client opts this session into both reads and population.
-        control
-            .query_drop("SET enable_scan_datacache = true")
-            .context("enable cache reads for access-domain isolation")?;
-        control
-            .query_drop("SET enable_populate_datacache = true")
-            .context("enable cache population for access-domain isolation")?;
+        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
+        let control_phase = (|| -> Result<()> {
+            // Cache policy is a query-scoped FE-to-BE contract. The process-level
+            // cache service configured by this scenario is intentionally inert
+            // until the client opts this session into both reads and population.
+            control
+                .query_drop("SET enable_scan_datacache = true")
+                .context("enable cache reads for access-domain isolation")?;
+            control
+                .query_drop("SET enable_populate_datacache = true")
+                .context("enable cache population for access-domain isolation")?;
 
-        run_access_domain_cache_isolation(context, &mut control, &self.fixtures)?;
-        await_resource_convergence(context, &baseline, "access-domain cache isolation")?;
-        Ok(())
+            run_access_domain_cache_isolation(
+                context,
+                &mut control,
+                &self.controls,
+                &self.fixtures,
+            )?;
+            await_resource_convergence(context, &baseline, "access-domain cache isolation")?;
+            Ok(())
+        })();
+        connector_control_plan::with_cleanup(control_phase, control.finish())
     }
 }
 
@@ -2698,7 +3213,7 @@ fn static_credential_launch_config(
     *fixtures = Some(StaticCredentialFixtures { blue, green });
 
     Ok(ScenarioLaunchConfig {
-        child_environment: connector_reader_environment(),
+        child_environment: CrossProcessChildEnvironment::default(),
         config_overlay: static_credential_launch_overlay(&snapshot),
         ..Default::default()
     })
@@ -2723,7 +3238,7 @@ fn access_domain_collision_launch_config(
     *fixtures = Some(StaticCredentialFixtures { blue, green });
 
     Ok(ScenarioLaunchConfig {
-        child_environment: connector_reader_environment(),
+        child_environment: CrossProcessChildEnvironment::default(),
         config_overlay: static_credential_launch_overlay(&snapshot),
         ..Default::default()
     })
@@ -2741,6 +3256,7 @@ fn collision_loopback_s3_config(access_key_id: &str) -> LoopbackS3Config {
 fn run_static_credential_generation(
     context: &mut ScenarioContext,
     control: &mut mysql::Conn,
+    controls: &connector_control_plan::Owner,
     fixtures: &Mutex<Option<StaticCredentialFixtures>>,
 ) -> Result<()> {
     context.action("write three blue and three green S3 Iceberg files through StaticFile catalogs");
@@ -2766,13 +3282,16 @@ fn run_static_credential_generation(
         "static_blue_db",
         "static_blue_data",
     )?;
-    assert_static_catalog_sum(
+    let rows: Vec<i64> = connector_control_plan::query(
+        context,
+        &controls.take(0)?,
         control,
-        STATIC_BLUE_CATALOG,
-        "static_blue_db",
-        "static_blue_data",
-        45_000_150_000,
+        &connector_control_plan::sum_sql(STATIC_BLUE_CATALOG, "static_blue_db", "static_blue_data"),
     )?;
+    ensure!(
+        rows == [45_000_150_000],
+        "static credential catalog sum returned {rows:?}, expected [45_000_150_000]"
+    );
     let blue_logs = wait_for_open_reader_on_every_backend(
         context,
         STATIC_BLUE_CATALOG,
@@ -2787,13 +3306,20 @@ fn run_static_credential_generation(
         "static_green_db",
         "static_green_data",
     )?;
-    assert_static_catalog_sum(
+    let rows: Vec<i64> = connector_control_plan::query(
+        context,
+        &controls.take(1)?,
         control,
-        STATIC_GREEN_CATALOG,
-        "static_green_db",
-        "static_green_data",
-        135_000_150_000,
+        &connector_control_plan::sum_sql(
+            STATIC_GREEN_CATALOG,
+            "static_green_db",
+            "static_green_data",
+        ),
     )?;
+    ensure!(
+        rows == [135_000_150_000],
+        "static credential catalog sum returned {rows:?}, expected [135_000_150_000]"
+    );
     let green_logs = wait_for_open_reader_on_every_backend(
         context,
         STATIC_GREEN_CATALOG,
@@ -2824,6 +3350,7 @@ fn run_static_credential_generation(
 fn run_access_domain_cache_isolation(
     context: &mut ScenarioContext,
     control: &mut mysql::Conn,
+    controls: &connector_control_plan::Owner,
     fixtures: &Mutex<Option<StaticCredentialFixtures>>,
 ) -> Result<()> {
     context.action("write colliding blue and green Iceberg corpora at one S3 URI");
@@ -2858,13 +3385,20 @@ fn run_access_domain_cache_isolation(
         COLLISION_TABLE,
     )?;
     assert_positive_profile_counter(&blue_profile, "ConnectorFileCacheMisses")?;
-    assert_static_catalog_sum(
+    let rows: Vec<i64> = connector_control_plan::query(
+        context,
+        &controls.take(0)?,
         control,
-        COLLISION_BLUE_CATALOG,
-        COLLISION_DATABASE,
-        COLLISION_TABLE,
-        75_000_150_000,
+        &connector_control_plan::sum_sql(
+            COLLISION_BLUE_CATALOG,
+            COLLISION_DATABASE,
+            COLLISION_TABLE,
+        ),
     )?;
+    ensure!(
+        rows == [75_000_150_000],
+        "static credential catalog sum returned {rows:?}, expected [75_000_150_000]"
+    );
     let blue_logs = wait_for_open_reader_on_every_backend(
         context,
         COLLISION_BLUE_CATALOG,
@@ -2891,13 +3425,20 @@ fn run_access_domain_cache_isolation(
         COLLISION_TABLE,
     )?;
     assert_positive_profile_counter(&green_profile, "ConnectorFileCacheMisses")?;
-    assert_static_catalog_sum(
+    let rows: Vec<i64> = connector_control_plan::query(
+        context,
+        &controls.take(1)?,
         control,
-        COLLISION_GREEN_CATALOG,
-        COLLISION_DATABASE,
-        COLLISION_TABLE,
-        75_000_450_000,
+        &connector_control_plan::sum_sql(
+            COLLISION_GREEN_CATALOG,
+            COLLISION_DATABASE,
+            COLLISION_TABLE,
+        ),
     )?;
+    ensure!(
+        rows == [75_000_450_000],
+        "static credential catalog sum returned {rows:?}, expected [75_000_450_000]"
+    );
     let green_data_reads_after =
         successful_gets_for_paths(&fixtures.green.request_log(), &canonical_data_paths);
     if green_data_reads_after <= green_data_reads_before {
@@ -3101,58 +3642,66 @@ impl Scenario for PredicatePageIndexPruning {
     }
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        Ok(connector_launch_config())
+        Ok(connector_control_plan::launch_config())
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect page-index control session")?,
-        )?;
-        let warehouse = create_warehouse(context, "predicate-page-index-pruning")?;
-        const CATALOG: &str = "page_index_catalog";
-        const DATABASE: &str = "page_index_db";
-        const TABLE: &str = "page_index_data";
-        const PREDICATE: &str = "v >= 199000";
+        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
+        let control_phase = (|| -> Result<()> {
+            let warehouse = create_warehouse(context, "predicate-page-index-pruning")?;
+            const CATALOG: &str = "page_index_catalog";
+            const DATABASE: &str = "page_index_db";
+            const TABLE: &str = "page_index_data";
+            const PREDICATE: &str = "v >= 199000";
 
-        context.action("create three dense Iceberg files that each require page-level pruning");
-        create_catalog_table_and_dense_data(&mut control, CATALOG, DATABASE, TABLE, &warehouse)?;
+            context.action("create three dense Iceberg files that each require page-level pruning");
+            create_catalog_table_and_dense_data(
+                &mut control,
+                CATALOG,
+                DATABASE,
+                TABLE,
+                &warehouse,
+            )?;
 
-        let select = format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE} WHERE {PREDICATE}");
-        context.action("run the static predicate with page-index reader disabled");
-        control
-            .query_drop("SET enable_parquet_reader_page_index = false")
-            .context("disable predicate-driven page-index pruning")?;
-        let disabled: Vec<i64> = control
-            .query(&select)
-            .context("query dense Iceberg files with page-index disabled")?;
+            let select =
+                format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE} WHERE {PREDICATE}");
+            context.action("run the static predicate with page-index reader disabled");
+            control
+                .query_drop("SET enable_parquet_reader_page_index = false")
+                .context("disable predicate-driven page-index pruning")?;
+            let disabled: Vec<i64> = control
+                .query(&select)
+                .context("query dense Iceberg files with page-index disabled")?;
 
-        context.action("run the same static predicate with page-index reader enabled");
-        control
-            .query_drop("SET enable_parquet_reader_page_index = true")
-            .context("enable predicate-driven page-index pruning")?;
-        let enabled: Vec<i64> = control
-            .query(&select)
-            .context("query dense Iceberg files with page-index enabled")?;
-        if enabled != disabled || enabled != [3_003] {
-            bail!(
-                "page-index toggle changed query correctness: disabled={disabled:?}, enabled={enabled:?}, expected=[3003]"
-            );
-        }
+            context.action("run the same static predicate with page-index reader enabled");
+            control
+                .query_drop("SET enable_parquet_reader_page_index = true")
+                .context("enable predicate-driven page-index pruning")?;
+            let enabled: Vec<i64> = control
+                .query(&select)
+                .context("query dense Iceberg files with page-index enabled")?;
+            if enabled != disabled || enabled != [3_003] {
+                bail!(
+                    "page-index toggle changed query correctness: disabled={disabled:?}, enabled={enabled:?}, expected=[3003]"
+                );
+            }
 
-        context.action("assert EXPLAIN ANALYZE surfaces typed connector scan activity");
-        let explain: Vec<String> = control
-            .query(format!("EXPLAIN ANALYZE {select}"))
-            .context("collect typed connector EXPLAIN ANALYZE profile")?;
-        let explain = explain.join("\n");
-        if !explain.contains("TypedConnectorMetrics:") {
-            bail!("page-index EXPLAIN ANALYZE has no typed connector metrics; profile={explain}");
-        }
-        assert_positive_profile_counter(&explain, "TypedConnectorPageSourcesOpened")?;
-        Ok(())
+            context.action("assert EXPLAIN ANALYZE surfaces typed connector scan activity");
+            let explain: Vec<String> = control
+                .query(format!("EXPLAIN ANALYZE {select}"))
+                .context("collect typed connector EXPLAIN ANALYZE profile")?;
+            let explain = explain.join("\n");
+            if !explain.contains("TypedConnectorMetrics:") {
+                bail!(
+                    "page-index EXPLAIN ANALYZE has no typed connector metrics; profile={explain}"
+                );
+            }
+            assert_positive_profile_counter(&explain, "TypedConnectorPageSourcesOpened")?;
+            Ok(())
+        })();
+        connector_control_plan::with_cleanup(control_phase, control.finish())
     }
 }
 
@@ -3162,11 +3711,11 @@ impl Scenario for CatalogVersionDrain {
     }
 
     fn child_environment(&self) -> CrossProcessChildEnvironment {
-        connector_reader_environment()
+        CrossProcessChildEnvironment::default()
     }
 
     fn launch_config(&self, _scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
-        let mut launch = connector_launch_config();
+        let mut launch = connector_control_plan::launch_config();
         // The old reader's scan-side filter holds its pipeline driver in SLEEP.
         // Reserve a second driver worker so the replacement query can run before
         // cancellation; this scenario verifies concurrent catalog versions.
@@ -3183,114 +3732,139 @@ impl Scenario for CatalogVersionDrain {
         Ok(launch)
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary_binary: &Path,
+        ordinary_binary: &Path,
+        controlled_binary: Option<&Path>,
+        original_deadline: std::time::Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let (specs, fe_restart, be_restarts) = connector_control_plan::specs(self.name())?;
+        self.controls
+            .freeze(
+                specs,
+                fe_restart,
+                &be_restarts,
+                cluster_size,
+                ordinary_binary,
+                controlled_binary,
+                original_deadline,
+            )
+            .map(Some)
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let baseline = resource_baseline(context)?;
         let (user, port) = mysql_endpoint(context);
-        let mut control = mysql_actor::connect(
-            &user,
-            port,
-            context.remaining("connect catalog version drain control session")?,
-        )?;
+        let mut control = mysql_actor::connect_until(&user, port, context.deadline())?;
+        let control_phase = (|| -> Result<()> {
+            control
+                .query_drop("SET pipeline_dop = 1")
+                .context("bound catalog version drain control driver parallelism")?;
 
-        control
-            .query_drop("SET pipeline_dop = 1")
-            .context("bound catalog version drain control driver parallelism")?;
+            let warehouse = create_warehouse(context, "catalog-version-drain")?;
+            context.action("create the first Iceberg catalog version and three data files");
+            create_catalog_table_and_data(
+                &mut control,
+                "connector_generation_catalog",
+                "connector_generation_db",
+                "connector_generation_data",
+                &warehouse,
+            )?;
 
-        let warehouse = create_warehouse(context, "catalog-version-drain")?;
-        context.action("create the first Iceberg catalog version and three data files");
-        create_catalog_table_and_data(
-            &mut control,
-            "connector_generation_catalog",
-            "connector_generation_db",
-            "connector_generation_data",
-            &warehouse,
-        )?;
+            context.action("start a read pinned to the first catalog version");
+            let baseline_logs = backend_log_snapshots(context)?;
+            let selected = self.controls.take(0)?;
+            let owned = connector_control_plan::Reader::start(
+                context,
+                &selected,
+                &user,
+                port,
+                Some(NonZeroU32::new(1).expect("nonzero reader DOP")),
+            )?;
+            let target = &owned.read;
+            let phase = (|| -> Result<Vec<String>> {
+                let connection_id = target
+                    .ready
+                    .recv_timeout(context.remaining("receive old-version connection id")?)
+                    .context(
+                        "old-version connector read terminated before publishing its connection id",
+                    )?;
+                let old_logs = wait_for_new_reader_on_every_backend(
+                    context,
+                    "connector_generation_catalog",
+                    "wait for every BE to open an old-version connector reader",
+                    &baseline_logs,
+                    AwaitedRead::new(&target, "the old-version connector read"),
+                )?;
+                let old_versions =
+                    reader_catalog_versions(&old_logs, "connector_generation_catalog")?;
+                if let Ok(result) = target.done.try_recv() {
+                    bail!(
+                        "old-version connector read completed before replacement was published: {result:?}"
+                    );
+                }
 
-        context.action("start a read pinned to the first catalog version");
-        let baseline_logs = backend_log_snapshots(context)?;
-        let target = start_connector_read_on(
-            &user,
-            port,
-            "connector_generation_catalog",
-            "connector_generation_db",
-            "connector_generation_data",
-            ReaderConnection::SocketBounded,
-            Some(NonZeroU32::new(1).expect("nonzero reader DOP")),
-        )?;
-        let connection_id = target
-            .ready
-            .recv_timeout(context.remaining("receive old-version connection id")?)
-            .context("old-version connector read terminated before publishing its connection id")?;
-        let old_logs = wait_for_new_reader_on_every_backend(
-            context,
-            "connector_generation_catalog",
-            "wait for every BE to open an old-version connector reader",
-            &baseline_logs,
-            AwaitedRead::new(&target, "the old-version connector read"),
-        )?;
-        let old_versions = reader_catalog_versions(&old_logs, "connector_generation_catalog")?;
-        if let Ok(result) = target.done.try_recv() {
-            bail!(
-                "old-version connector read completed before replacement was published: {result:?}"
-            );
-        }
+                context.action("drop and recreate the catalog while old readers remain in flight");
+                control
+                    .query_drop("DROP CATALOG connector_generation_catalog")
+                    .context("retire first catalog version")?;
+                create_catalog(&mut control, "connector_generation_catalog", &warehouse)?;
 
-        context.action("drop and recreate the catalog while old readers remain in flight");
-        control
-            .query_drop("DROP CATALOG connector_generation_catalog")
-            .context("retire first catalog version")?;
-        create_catalog(&mut control, "connector_generation_catalog", &warehouse)?;
-
-        context.action("read the replacement catalog version while the old version is leased");
-        let replacement_rows: Vec<i64> = control
-            .query(
-                "SELECT count(*) FROM connector_generation_catalog.connector_generation_db.connector_generation_data",
-            )
+                context
+                    .action("read the replacement catalog version while the old version is leased");
+                let replacement_rows: Vec<i64> = connector_control_plan::query(context, &self.controls.take(1)?, &mut control, "SELECT count(*) FROM connector_generation_catalog.connector_generation_db.connector_generation_data")
             .context("read table through replacement catalog version while old version is leased")?;
-        if replacement_rows != [300_000] {
-            bail!("replacement catalog version returned {replacement_rows:?}, expected [300000]");
-        }
-        wait_for_replacement_reader_on_every_backend(
-            context,
-            "connector_generation_catalog",
-            &old_versions,
-        )?;
-        if let Ok(result) = target.done.try_recv() {
-            bail!(
-                "old-version connector read completed while replacement was being verified: {result:?}"
-            );
-        }
+                if replacement_rows != [300_000] {
+                    bail!(
+                        "replacement catalog version returned {replacement_rows:?}, expected [300000]"
+                    );
+                }
+                wait_for_replacement_reader_on_every_backend(
+                    context,
+                    "connector_generation_catalog",
+                    &old_versions,
+                )?;
+                if let Ok(result) = target.done.try_recv() {
+                    bail!(
+                        "old-version connector read completed while replacement was being verified: {result:?}"
+                    );
+                }
 
-        context.action(format!(
-            "cancel old-version reader through KILL QUERY {connection_id}"
-        ));
-        control
-            .query_drop(format!("KILL QUERY {connection_id}"))
-            .context("issue public MySQL KILL QUERY for old-generation reader")?;
-        assert_cancelled_query(
-            &target.done,
-            context.remaining("await old-version reader cancellation")?,
-        )?;
-        assert_target_connection_remains_usable(
-            &target,
-            context.remaining("verify old-generation KILL QUERY target remains usable")?,
-        )?;
-        assert_idle_query(&mut control, connection_id)?;
-        release_connector_read(&target)?;
-        target
-            .thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("old-generation connector read thread panicked"))??;
+                context.action(format!(
+                    "cancel old-version reader through KILL QUERY {connection_id}"
+                ));
+                control
+                    .query_drop(format!("KILL QUERY {connection_id}"))
+                    .context("issue public MySQL KILL QUERY for old-generation reader")?;
+                assert_cancelled_query(
+                    &target.done,
+                    context.remaining("await old-version reader cancellation")?,
+                )?;
+                assert_target_connection_remains_usable(
+                    &target,
+                    context.remaining("verify old-generation KILL QUERY target remains usable")?,
+                )?;
+                assert_idle_query(&mut control, connection_id)?;
+                release_connector_read(&target)?;
+                Ok(old_versions)
+            })();
+            let old_versions = owned.finish_after(context, &mut control, phase)?;
 
-        wait_for_retired_catalog_version_close(
-            context,
-            "connector_generation_catalog",
-            &old_versions,
-        )?;
+            wait_for_retired_catalog_version_close(
+                context,
+                "connector_generation_catalog",
+                &old_versions,
+            )?;
 
-        await_resource_convergence(context, &baseline, "catalog version drain")?;
-        Ok(())
+            await_resource_convergence(context, &baseline, "catalog version drain")?;
+            Ok(())
+        })();
+        connector_control_plan::with_cleanup(control_phase, control.finish())
     }
 }
 
@@ -3311,28 +3885,12 @@ struct IdleMysqlConnection {
 }
 
 pub(super) fn connector_reader_environment() -> CrossProcessChildEnvironment {
-    let mut environment = CrossProcessChildEnvironment::default();
-    // This is a generic child launch input, not a connector-specific harness
-    // API. The runner uses the marker only to establish the observable
-    // in-flight reader/retirement boundary for these scenarios.
-    environment.be.insert(
-        "NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER".to_string(),
-        "1".to_string(),
-    );
-    environment.be.insert(
-        "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER".to_string(),
-        "1".to_string(),
-    );
-    environment.be.insert(
-        "NOVAROCKS_SQL_TEST_EMIT_CATALOG_MATERIALIZATION_MARKER".to_string(),
-        "1".to_string(),
-    );
-    environment
+    CrossProcessChildEnvironment::default()
 }
 
 pub(super) fn connector_launch_config() -> ScenarioLaunchConfig {
     ScenarioLaunchConfig {
-        child_environment: connector_reader_environment(),
+        child_environment: CrossProcessChildEnvironment::default(),
         config_overlay: CrossProcessConfigOverlay {
             fe: Some(READER_CACHE_OVERLAY.to_string()),
             be: Some(format!(

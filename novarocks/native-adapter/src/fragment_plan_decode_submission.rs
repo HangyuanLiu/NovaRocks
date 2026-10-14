@@ -75,6 +75,12 @@ pub(crate) fn decode_fragment_submission(
     exchange_wait: Duration,
     typed_scan_runtime: Option<novarocks_worker::TypedScanRuntime>,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
+    #[cfg(feature = "test-controls")] test_controls: Option<
+        Arc<crate::test_controls::NativeTestControls>,
+    >,
+    #[cfg(feature = "test-controls")] observation_controls: Option<
+        Arc<crate::test_observation_controls::NativeObservationControls>,
+    >,
 ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
     let root_path = FieldPath::root("plan_fragment").field("root");
     let root = require_root(fragment).map_err(NativeFragmentDecodeError::from)?;
@@ -119,6 +125,10 @@ pub(crate) fn decode_fragment_submission(
     .with_backend_process_id(instance.backend_process_id)
     .with_typed_scan_runtime(typed_scan_runtime)
     .with_function_catalog(function_catalog);
+    #[cfg(feature = "test-controls")]
+    let context = context
+        .with_test_controls(test_controls)
+        .with_observation_controls(observation_controls);
     let mut ledger = NativeRuntimeFilterDecodeLedger::decode(
         fragment.fragment_id,
         fragment.runtime_filter_bindings.as_ref(),
@@ -368,6 +378,10 @@ mod tests {
                 novarocks_sql::compiler::build_builtin_engine_function_catalog()
                     .expect("builtin function catalog"),
             ),
+            #[cfg(feature = "test-controls")]
+            None,
+            #[cfg(feature = "test-controls")]
+            None,
         )
     }
 

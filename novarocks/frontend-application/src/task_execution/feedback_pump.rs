@@ -213,7 +213,6 @@ impl DynamicFilterFeedbackPump {
         }
         self.cursors.insert(task_id, version);
         self.ingested += 1;
-        emit_ingested_marker(identity, version, read.feedback().len());
         Ok(1)
     }
 
@@ -254,28 +253,4 @@ impl TurnPump for DynamicFilterFeedbackPump {
         }
         Ok(moved)
     }
-}
-
-/// Stable evidence that a fetched version reached the attempt's feedback state.
-///
-/// It fires where the loop does its work -- after admission, not where the
-/// reader is constructed -- because a marker emitted at construction would say
-/// only that the reader exists, which is exactly the defect this loop had.
-fn emit_ingested_marker(identity: TaskIdentity, version: DomainVersion, domains: usize) {
-    if !(cfg!(debug_assertions)
-        && std::env::var_os("NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER").is_some())
-    {
-        return;
-    }
-    let execution = identity.query_execution_id();
-    eprintln!(
-        "NOVAROCKS_TASK_DYNAMIC_FILTER_INGESTED execution_id={}:{}:{} stage={} task={} version={} domains={}",
-        execution.query_id().high(),
-        execution.query_id().low(),
-        execution.attempt_id().get(),
-        identity.stage_id().get(),
-        identity.task_id().get(),
-        version.get(),
-        domains,
-    );
 }

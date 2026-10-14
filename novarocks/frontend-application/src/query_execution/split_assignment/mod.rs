@@ -36,7 +36,7 @@ pub(crate) use driver::{
 pub(crate) use round::{
     DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP, DEFAULT_PUMP_BATCH_SIZE, RoundSplitAssignment,
     RoundSplitAssignmentStop, RoundSplitEnumeration, RoundSplitEnumerationRequest,
-    RoundSplitEnumerationResult, RoundSplitSource, emit_split_source_close_marker,
+    RoundSplitEnumerationResult, RoundSplitSource,
 };
 pub(crate) use transport::{
     AcceptedPlanNode, TaskUpdateOutcome, TaskUpdateTicket, TaskUpdateTransport,

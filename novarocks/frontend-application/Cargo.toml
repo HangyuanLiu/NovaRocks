@@ -11,6 +11,8 @@ workspace = true
 doctest = false
 
 [features]
+normal-build = ["novarocks-execution/normal-build", "novarocks-failpoint/normal-build", "novarocks-fs/normal-build", "novarocks-mv-application/normal-build", "novarocks-mysql-adapter/normal-build", "novarocks-native-adapter/normal-build", "novarocks-query-application/normal-build", "novarocks-version/normal-build"]
+test-controls = ["novarocks-execution/test-controls", "novarocks-failpoint/test-controls", "novarocks-fs/test-controls", "novarocks-mv-application/test-controls", "novarocks-mysql-adapter/test-controls", "novarocks-native-adapter/test-controls", "novarocks-query-application/test-controls", "novarocks-version/test-controls"]
 mem-1-m07-hms-listing-observe = []
 mem-1-m07-closing-pressure = ["novarocks-mysql-adapter/mem-1-m07-closing-pressure"]
 mem-1-m07-root-observation = []

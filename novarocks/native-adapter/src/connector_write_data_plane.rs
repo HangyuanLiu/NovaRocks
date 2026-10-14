@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use novarocks_execution::exec::node::table_write_relation::{
     ConnectorCommitFragmentCarrierValidator, ConnectorCommitFragmentEncoder,
 };
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 use novarocks_execution::exec::node::table_write_relation::{
     TableWriteAggregateBoundary, TableWriteAggregateGuard,
 };
@@ -52,34 +52,48 @@ const WRITE_EVENT_TARGET: &str = "novarocks::connector_write";
 /// It cannot open a writer or change its result.
 #[derive(Debug)]
 pub struct NativeConnectorWriteObservationPort {
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     process_id: BackendProcessId,
+    #[cfg(feature = "test-controls")]
+    test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
 }
 
 impl NativeConnectorWriteObservationPort {
     pub fn new(process_id: BackendProcessId) -> Self {
-        #[cfg(not(debug_assertions))]
+        #[cfg(not(feature = "test-controls"))]
         let _ = process_id;
         Self {
-            #[cfg(debug_assertions)]
+            #[cfg(feature = "test-controls")]
             process_id,
+            #[cfg(feature = "test-controls")]
+            test_controls: None,
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
+    pub fn with_test_controls(
+        mut self,
+        controls: Arc<crate::test_controls::NativeTestControls>,
+    ) -> Self {
+        self.test_controls = Some(controls);
+        self
+    }
+    #[cfg(feature = "test-controls")]
     fn claim_append_hold(
         &self,
-        root: &std::path::Path,
         execution_id: QueryExecutionId,
-    ) -> Option<novarocks_failpoint::QueryLifecycleFaultScope> {
-        novarocks_failpoint::claim_matching_fault_for_process(
-            root,
-            novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWriteAppendHold,
-            execution_id,
-            self.process_id,
-        )
-        .ok()
-        .flatten()
+    ) -> Result<Option<crate::test_controls::NativeFaultClaim>, ConnectorError> {
+        let Some(controls) = self.test_controls.as_ref() else {
+            return Ok(None);
+        };
+        controls
+            .claim(
+                novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWriteAppendHold,
+                execution_id,
+                self.process_id,
+                false,
+            )
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))
     }
 }
 
@@ -195,38 +209,25 @@ impl ConnectorWriteObservationPort for NativeConnectorWriteObservationPort {
         }
     }
 
-    fn hold_append(&self, writer: ConnectorWriterObservation) -> bool {
-        #[cfg(debug_assertions)]
-        {
-            let Some(root) = novarocks_failpoint::configured_root() else {
-                return false;
-            };
-            let Some(scope) = self.claim_append_hold(&root, writer.execution_id()) else {
-                return false;
-            };
-            crate::backend_metrics::record_connector_write_debug_fault("append_hold");
-            tracing::info!(
-                target: WRITE_EVENT_TARGET,
-                role = "be",
-                event = "connector_write_append_hold",
-                query_id = %writer.execution_id().query_id(),
-                attempt_id = writer.execution_id().attempt_id().get(),
-                node_id = writer.node_id(),
-                write_target_ordinal = writer.target().get(),
-                token = %scope.token,
-                backend_process_id = %self.process_id,
-                "holding a driver-local writer append until query cancellation"
-            );
-            true
-        }
-        #[cfg(not(debug_assertions))]
-        {
-            let _ = writer;
-            false
-        }
+    #[cfg(feature = "test-controls")]
+    fn hold_append(
+        &self,
+        writer: ConnectorWriterObservation,
+    ) -> Result<Option<novarocks_failpoint::scope::ControlCancellation>, ConnectorError> {
+        let Some(scope) = self.claim_append_hold(writer.execution_id())? else {
+            return Ok(None);
+        };
+        scope
+            .record_hit()
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
+        crate::backend_metrics::record_connector_write_debug_fault("append_hold");
+        tracing::info!(target:WRITE_EVENT_TARGET,role="be",event="connector_write_append_hold",query_id=%writer.execution_id().query_id(),attempt_id=writer.execution_id().attempt_id().get(),node_id=writer.node_id(),write_target_ordinal=writer.target().get(),token=%scope.token,backend_process_id=%self.process_id,"holding a driver-local writer append until query or test-session cancellation");
+        Ok(Some(scope.cancellation()))
     }
 }
 pub struct RoleBoundCommitFragmentEncoder {
+    #[cfg(feature = "test-controls")]
+    test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
     encoder: Arc<dyn ConnectorWriteFragmentWireEncoder>,
     execution_id: QueryExecutionId,
     node_id: i32,
@@ -239,10 +240,20 @@ impl RoleBoundCommitFragmentEncoder {
         node_id: i32,
     ) -> Self {
         Self {
+            #[cfg(feature = "test-controls")]
+            test_controls: None,
             encoder,
             execution_id,
             node_id,
         }
+    }
+    #[cfg(feature = "test-controls")]
+    pub fn with_test_controls(
+        mut self,
+        controls: Arc<crate::test_controls::NativeTestControls>,
+    ) -> Self {
+        self.test_controls = Some(controls);
+        self
     }
 }
 
@@ -252,7 +263,10 @@ impl ConnectorCommitFragmentEncoder for RoleBoundCommitFragmentEncoder {
         target: WriteTargetOrdinal,
         fragment: &ConnectorCommitFragment,
     ) -> Result<Vec<u8>, ConnectorError> {
-        writer_failpoint(self.execution_id, self.node_id, target)?;
+        #[cfg(feature = "test-controls")]
+        if let Some(controls) = self.test_controls.as_ref() {
+            writer_failpoint(controls, self.execution_id, self.node_id, target)?;
+        }
         self.encoder
             .canonical_commit_fragment_bytes(fragment)
             .map_err(|error| {
@@ -274,6 +288,8 @@ impl ConnectorCommitFragmentEncoder for RoleBoundCommitFragmentEncoder {
 /// provider value, and it holds no provider binding that could produce one.
 // Design: ADR-0133 (docs/adr/ADR-0133-dataflow-connector-writer-and-frontend-commit.md)
 pub struct RootCommitFragmentCarrierValidator {
+    #[cfg(feature = "test-controls")]
+    test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
     execution_id: QueryExecutionId,
     node_id: i32,
     /// The prepared set this root has accepted so far. It only grows within one
@@ -285,11 +301,22 @@ pub struct RootCommitFragmentCarrierValidator {
 impl RootCommitFragmentCarrierValidator {
     pub const fn new(execution_id: QueryExecutionId, node_id: i32) -> Self {
         Self {
+            #[cfg(feature = "test-controls")]
+            test_controls: None,
             execution_id,
             node_id,
             accepted_bytes: AtomicU64::new(0),
             accepted_entries: AtomicU64::new(0),
         }
+    }
+
+    #[cfg(feature = "test-controls")]
+    pub fn with_test_controls(
+        mut self,
+        controls: Arc<crate::test_controls::NativeTestControls>,
+    ) -> Self {
+        self.test_controls = Some(controls);
+        self
     }
 
     pub fn accepted_counts(&self) -> (u64, u64) {
@@ -302,7 +329,10 @@ impl RootCommitFragmentCarrierValidator {
 
 impl ConnectorCommitFragmentCarrierValidator for RootCommitFragmentCarrierValidator {
     fn validate(&self, target: WriteTargetOrdinal, encoded: &[u8]) -> Result<(), ConnectorError> {
-        root_failpoint(self.execution_id, self.node_id, target)?;
+        #[cfg(feature = "test-controls")]
+        if let Some(controls) = self.test_controls.as_ref() {
+            root_failpoint(controls, self.execution_id, self.node_id, target)?;
+        }
         let raw = dto::ConnectorCommitFragment::decode(encoded).map_err(|error| {
             carrier_error(
                 target,
@@ -368,23 +398,29 @@ impl ConnectorCommitFragmentCarrierValidator for RootCommitFragmentCarrierValida
 /// write aggregate. The backend owns binding a runner token to an exact native
 /// attempt; Execution sees only a typed boundary and can neither inspect the
 /// token protocol nor fabricate replacement aggregate data.
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 pub struct QueryScopedTableWriteAggregateGuard {
+    controls: Arc<crate::test_controls::NativeTestControls>,
     execution_id: QueryExecutionId,
     node_id: i32,
 }
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 impl QueryScopedTableWriteAggregateGuard {
-    pub const fn new(execution_id: QueryExecutionId, node_id: i32) -> Self {
+    pub fn new(
+        execution_id: QueryExecutionId,
+        node_id: i32,
+        controls: Arc<crate::test_controls::NativeTestControls>,
+    ) -> Self {
         Self {
             execution_id,
             node_id,
+            controls,
         }
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 impl TableWriteAggregateGuard for QueryScopedTableWriteAggregateGuard {
     fn check(&self, boundary: TableWriteAggregateBoundary) -> Result<(), ConnectorError> {
         let kind = match boundary {
@@ -401,7 +437,7 @@ impl TableWriteAggregateGuard for QueryScopedTableWriteAggregateGuard {
                 novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWriteFinalFinalizeFailure
             }
         };
-        claim_write_fault(self.execution_id, kind).map_or(Ok(()), |token| {
+        claim_write_fault(&self.controls, self.execution_id, kind)?.map_or(Ok(()), |token| {
             Err(ConnectorError::new(
                 ConnectorErrorKind::Internal,
                 format!(
@@ -423,16 +459,18 @@ fn carrier_error(target: WriteTargetOrdinal, detail: String) -> ConnectorError {
         ),
     )
 }
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 fn writer_failpoint(
+    controls: &crate::test_controls::NativeTestControls,
     execution_id: QueryExecutionId,
     node_id: i32,
     target: WriteTargetOrdinal,
 ) -> Result<(), ConnectorError> {
     claim_write_fault(
+        controls,
         execution_id,
         novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWriteWriterFailure,
-    )
+    )?
     .map_or(Ok(()), |token| {
         Err(ConnectorError::new(
             ConnectorErrorKind::Internal,
@@ -444,26 +482,19 @@ fn writer_failpoint(
     })
 }
 
-#[cfg(not(debug_assertions))]
-fn writer_failpoint(
-    _execution_id: QueryExecutionId,
-    _node_id: i32,
-    _target: WriteTargetOrdinal,
-) -> Result<(), ConnectorError> {
-    Ok(())
-}
-
 /// Test-only root-aggregation fault. Like the writer fault it only rejects.
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 fn root_failpoint(
+    controls: &crate::test_controls::NativeTestControls,
     execution_id: QueryExecutionId,
     node_id: i32,
     target: WriteTargetOrdinal,
 ) -> Result<(), ConnectorError> {
     claim_write_fault(
+        controls,
         execution_id,
         novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWriteRootFailure,
-    )
+    )?
     .map_or(Ok(()), |token| {
         Err(ConnectorError::new(
             ConnectorErrorKind::CorruptData,
@@ -475,15 +506,6 @@ fn root_failpoint(
     })
 }
 
-#[cfg(not(debug_assertions))]
-fn root_failpoint(
-    _execution_id: QueryExecutionId,
-    _node_id: i32,
-    _target: WriteTargetOrdinal,
-) -> Result<(), ConnectorError> {
-    Ok(())
-}
-
 /// Claim one armed fault for this exact attempt through the single existing
 /// query-lifecycle fault channel.
 ///
@@ -493,16 +515,22 @@ fn root_failpoint(
 /// below consumes it. A kind the frontend's bind list does not name therefore
 /// stays inert rather than firing on the wrong attempt, which is the correct
 /// failure mode for a fault that is not fully wired.
-#[cfg(debug_assertions)]
+#[cfg(feature = "test-controls")]
 pub fn claim_write_fault(
+    controls: &crate::test_controls::NativeTestControls,
     execution_id: QueryExecutionId,
     kind: novarocks_failpoint::QueryLifecycleFaultKind,
-) -> Option<String> {
-    let root = novarocks_failpoint::configured_root()?;
-    match novarocks_failpoint::claim_matching_receiver_agnostic_fault(&root, kind, execution_id) {
-        Ok(Some(scope)) => Some(scope.token),
-        Ok(None) | Err(_) => None,
-    }
+) -> Result<Option<String>, ConnectorError> {
+    let Some(scope) = controls
+        .claim_receiver(kind, execution_id)
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?
+    else {
+        return Ok(None);
+    };
+    scope
+        .record_hit()
+        .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
+    Ok(Some(scope.token.clone()))
 }
 
 #[cfg(test)]
@@ -524,42 +552,51 @@ mod tests {
 
     use super::*;
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     #[test]
     fn append_holds_belong_to_the_exact_admitted_backend_process_and_attempt() {
-        use novarocks_failpoint::{QueryLifecycleFaultKind, arm_path, bind_armed_fault};
-
-        let processes = std::array::from_fn::<_, 3, _>(|_| BackendProcessId::new_v7());
-        let execution =
-            QueryExecutionId::new(QueryId::new(17, 19), AttemptId::new(1).unwrap()).unwrap();
-        let next_attempt =
-            QueryExecutionId::new(QueryId::new(17, 19), AttemptId::new(2).unwrap()).unwrap();
-        let root = std::env::temp_dir().join(format!("novarocks-append-hold-{}", processes[0]));
-        std::fs::create_dir_all(&root).unwrap();
-        let kind = QueryLifecycleFaultKind::ConnectorWriteAppendHold;
-        for (index, process) in processes.into_iter().enumerate() {
-            std::fs::write(
-                arm_path(&root, index, kind),
-                format!("token=hold-{index}\nbackend_index={index}\n"),
-            )
-            .unwrap();
-            bind_armed_fault(&root, kind, execution, index, process)
+        let fixture = crate::test_controls::tests::controlled("connector-write-append-hold");
+        let kind = novarocks_failpoint::QueryLifecycleFaultKind::ConnectorWriteAppendHold;
+        novarocks_failpoint::target_binding::StatementExecutionBinding::new(
+            "native-tests".into(),
+            fixture.token.clone(),
+            0,
+            fixture.process,
+            fixture.execution,
+        )
+        .unwrap()
+        .write_private(&crate::test_controls::fault_binding_path(
+            fixture.directory.path(),
+            kind,
+            0,
+            &fixture.token,
+        ))
+        .unwrap();
+        let replaced = NativeConnectorWriteObservationPort::new(BackendProcessId::new_v7())
+            .with_test_controls(Arc::clone(&fixture.controls));
+        assert!(
+            replaced
+                .claim_append_hold(fixture.execution)
                 .unwrap()
-                .unwrap();
-        }
-        let replaced = NativeConnectorWriteObservationPort::new(BackendProcessId::new_v7());
-        assert!(replaced.claim_append_hold(&root, execution).is_none());
-        // Visit the middle BE first: directory order must never select its peer's token.
-        for index in [1, 2, 0] {
-            let observer = NativeConnectorWriteObservationPort::new(processes[index]);
-            assert!(observer.claim_append_hold(&root, next_attempt).is_none());
-            let scope = observer.claim_append_hold(&root, execution).unwrap();
-            assert_eq!(scope.backend_index, index);
-            assert_eq!(scope.process_id, processes[index]);
-            assert_eq!(scope.token, format!("hold-{index}"));
-            assert!(observer.claim_append_hold(&root, execution).is_none());
-        }
-        std::fs::remove_dir_all(root).unwrap();
+                .is_none()
+        );
+        let observer = NativeConnectorWriteObservationPort::new(fixture.process)
+            .with_test_controls(Arc::clone(&fixture.controls));
+        let next = QueryExecutionId::new(fixture.execution.query_id(), AttemptId::new(2).unwrap())
+            .unwrap();
+        assert!(observer.claim_append_hold(next).unwrap().is_none());
+        let scope = observer
+            .claim_append_hold(fixture.execution)
+            .unwrap()
+            .unwrap();
+        assert_eq!(scope.process_id, fixture.process);
+        assert_eq!(scope.token, fixture.token);
+        assert!(
+            observer
+                .claim_append_hold(fixture.execution)
+                .unwrap()
+                .is_none()
+        );
     }
 
     fn catalog_handle() -> novarocks_spi::connector::CatalogHandle {

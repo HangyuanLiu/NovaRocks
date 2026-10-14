@@ -23,6 +23,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 source "$REPO_ROOT/tools/ci/local-full-ci.sh" --source-only
 
 tmpdir="$(mktemp -d)"
+tmpdir="$(cd "$tmpdir" && pwd -P)"
 trap 'rm -rf "$tmpdir"' EXIT
 
 if (
@@ -255,6 +256,8 @@ for mv_failure in contract environment missing-uri missing-manifest; do
 done
 
 stage_capture="$tmpdir/cargo-gates"
+skip_stage_capture="$tmpdir/cargo-gates-skips"
+CI_RUN_DIR="$tmpdir/cargo-gate-run"
 (
   SKIP_CARGO_TEST="true"
   run_fail_fast_stage() {
@@ -262,13 +265,13 @@ stage_capture="$tmpdir/cargo-gates"
     shift 2
     printf '%s\n' "$*" >>"$stage_capture"
   }
-  ci_record_stage() { :; }
+  ci_record_stage() { printf '%s|%s\n' "$1" "$2" >>"$skip_stage_capture"; }
   ci_render_summary() { :; }
   run_cargo_gates
 )
 
 if ! grep -Fx \
-  "locked Cargo metadata|cargo-metadata.log|cargo metadata --locked --format-version 1 --no-deps" \
+  "locked Cargo metadata|cargo-metadata.log|cargo metadata --locked --format-version 1" \
   "$stage_capture" >/dev/null; then
   echo "local full CI must validate locked Cargo metadata" >&2
   exit 1
@@ -280,7 +283,7 @@ if ! grep -Fx \
   exit 1
 fi
 if ! grep -Fx \
-  "cargo check all targets|cargo-check-all-targets.log|cargo check --workspace --all-targets --locked" \
+  "cargo check all targets|cargo-check-all-targets.log|env NOVAROCKS_BUILD_PROFILE=$NOVA_CI_CARGO_PROFILE cargo check --workspace --all-targets --locked --profile $NOVA_CI_CARGO_PROFILE --target-dir $(ci_target_directory normal)" \
   "$stage_capture" >/dev/null; then
   echo "local full CI must check every workspace target with the committed lock" >&2
   exit 1
@@ -307,6 +310,93 @@ if ! grep -Fx \
   "NCP-8 statistics boundary mutations|ncp8-statistics-boundary-test.log|tools/ci/tests/ncp8-statistics-boundary-test.sh" \
   "$stage_capture" >/dev/null; then
   echo "local full CI must run the NCP-8 statistics boundary mutation stage" >&2
+  exit 1
+fi
+
+# Control-owner tests use only the explicit owner graph, independent of Server.
+if ! grep -Fx "test-control owner tests|SKIP" "$skip_stage_capture" >/dev/null; then
+  echo "--skip-cargo-test must record the control-owner stage as SKIP" >&2
+  exit 1
+fi
+if grep -q '^test-control owner tests|' "$stage_capture"; then
+  echo "--skip-cargo-test must not invoke the control-owner stage" >&2
+  exit 1
+fi
+
+control_owner_argv="$tmpdir/control-owner.args"
+control_stage_capture="$tmpdir/control-owner-stages"
+control_target="$tmpdir/explicit-control-target"
+(
+  SKIP_CARGO_TEST="false"
+  NOVA_CI_CONTROL_TARGET_DIR="$control_target"
+  run_fail_fast_stage() {
+    printf '%s\n' "$1" >>"$control_stage_capture"
+    if [ "$1" = "test-control owner tests" ]; then
+      [ "$2" = "cargo-test-control-owners.log" ] || exit 1
+      shift 2
+      printf '%s\n' "$@" >"$control_owner_argv"
+    fi
+  }
+  ci_record_stage() { :; }
+  ci_render_summary() { :; }
+  run_cargo_gates
+)
+python3 - "$control_owner_argv" "$NOVA_CI_CARGO_PROFILE" "$control_target" "$control_stage_capture" <<'CONTROLARGV'
+import sys
+args = open(sys.argv[1]).read().splitlines()
+profile, target = sys.argv[2:4]
+assert args[:4] == ["env", "NOVAROCKS_BUILD_PROFILE=" + profile, "cargo", "test"]
+owners = {"novarocks-failpoint", "novarocks-mv-application", "novarocks-frontend-application",
+          "novarocks-native-adapter", "novarocks-worker", "novarocks-fs", "novarocks-execution"}
+packages = [args[i + 1] for i, arg in enumerate(args) if arg == "-p"]
+assert len(packages) == len(owners) and set(packages) == owners
+features = args[args.index("--features") + 1].split(",")
+expected = {owner + "/test-controls" for owner in owners} | {"novarocks-failpoint/typed"}
+assert len(features) == len(expected) and set(features) == expected
+assert args.count("--lib") == 1 and args.count("--locked") == 1
+assert args[args.index("--profile") + 1] == profile
+assert args[args.index("--target-dir") + 1] == target
+assert args[args.index("--") + 1:] == ["--test-threads=1"]
+assert "--workspace" not in args and "novarocks-server" not in args
+stages = open(sys.argv[4]).read().splitlines()
+assert stages.count("test-control owner tests") == 1
+assert stages.index("test-control owner tests") < stages.index("workspace component tests")
+CONTROLARGV
+
+# Use the real fail-fast wrapper with the existing logged-command stub seam.
+# The stub never invokes Cargo, guards, build-info binaries or product processes.
+control_failure_capture="$tmpdir/control-owner-failure-stages"
+control_failure_rows="$tmpdir/control-owner-failure-rows"
+control_failure_summary="$tmpdir/control-owner-failure-summary"
+control_failure_code=0
+(
+  set +e
+  SKIP_CARGO_TEST="false"
+  CI_RUN_DIR="$tmpdir/control-owner-failure"
+  mkdir -p "$CI_RUN_DIR"
+  ci_run_logged() {
+    local log_path="$1"
+    printf '%s\n' "$(basename "$log_path")" >>"$control_failure_capture"
+    if [ "$(basename "$log_path")" = cargo-test-control-owners.log ]; then
+      printf '%s\n' 'synthetic control-owner test failure' >"$log_path"
+      return 23
+    fi
+    return 0
+  }
+  ci_record_stage() { printf '%s|%s\n' "$1" "$2" >>"$control_failure_rows"; }
+  ci_mark_failure_tail() { printf '%s\n' "$1" >>"$control_failure_summary"; }
+  ci_render_summary() { printf '%s\n' "$1" >>"$control_failure_summary"; }
+  run_cargo_gates
+) || control_failure_code=$?
+if [ "$control_failure_code" -ne 23 ]; then
+  echo "control-owner stage must preserve its original failure exit" >&2
+  exit 1
+fi
+grep -Fx 'test-control owner tests|FAIL' "$control_failure_rows" >/dev/null
+grep -Fx 'test-control owner tests failed' "$control_failure_summary" >/dev/null
+grep -Fx FAIL "$control_failure_summary" >/dev/null
+if grep -Eq '^cargo-test-(component|server-owner|server-smoke)\.log$' "$control_failure_capture"; then
+  echo "control-owner failure must stop before ordinary Rust test stages" >&2
   exit 1
 fi
 
@@ -628,6 +718,16 @@ for round in primary additional; do
       exit 1
     fi
   done
+done
+
+for capture in "$launcher_capture" "$native_launcher_capture"; do
+  grep -Fx "NOVAROCKS_BIN=$tmpdir/current-worktree/target/normal/$NOVA_CI_CARGO_PROFILE/novarocks" "$capture" >/dev/null || { echo "SQL ordinary target lost" >&2; exit 1; }
+  grep -Fx "NOVAROCKS_TEST_CONTROL_BIN=$tmpdir/current-worktree/target/test-controls/$NOVA_CI_CARGO_PROFILE/novarocks" "$capture" >/dev/null || { echo "SQL control target lost" >&2; exit 1; }
+  grep -Fx "NOVAROCKS_BUILD_PROFILE=$NOVA_CI_CARGO_PROFILE" "$capture" >/dev/null
+  grep -Fx "NOVAROCKS_WORKSPACE_ROOT=$tmpdir/current-worktree" "$capture" >/dev/null
+  grep -Fx -- --locked "$capture" >/dev/null
+  grep -Fx "$tmpdir/current-worktree/target/normal" "$capture" >/dev/null
+  grep -Fx novarocks-sql-test "$capture" >/dev/null
 done
 
 echo "local-full-ci-classification-test: PASS"

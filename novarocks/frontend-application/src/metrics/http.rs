@@ -84,6 +84,9 @@ impl MetricsHttpServer {
         island_reader: Arc<dyn BackendIslandSnapshotReader>,
         convergence_reader: Option<Arc<dyn QueryLifecycleConvergenceReader>>,
         memory_authority: Arc<novarocks_memory::MemoryAuthority>,
+        #[cfg(feature = "test-controls")] statement_observation: Option<
+            Arc<crate::preparation_diagnostics::StatementObservationOwner>,
+        >,
         #[cfg(feature = "mem-1-m07-hms-listing-observe")] hms_listing_observation: Option<
             crate::server::HmsListingObservationHandler,
         >,
@@ -122,7 +125,9 @@ impl MetricsHttpServer {
                         island_reader,
                         convergence_reader,
                         memory_authority,
-                        crate::native::report_server::lifecycle_convergence_debug_enabled(),
+                        cfg!(feature = "test-controls"),
+                        #[cfg(feature = "test-controls")]
+                        statement_observation,
                     );
                     #[cfg(feature = "mem-1-m07-hms-listing-observe")]
                     let app = app.merge(super::hms_listing_observation::router(

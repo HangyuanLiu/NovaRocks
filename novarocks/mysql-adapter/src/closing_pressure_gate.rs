@@ -156,6 +156,8 @@ struct Slot {
     inner_poll: AtomicBool,
 }
 struct Core {
+    action_observation:
+        Mutex<Option<Arc<crate::test_fixture_authorization::FixtureActionObservation>>>,
     frontend: FrontendProcessId,
     deadline: Instant,
     arm_consumed: AtomicBool,
@@ -240,6 +242,17 @@ impl Core {
     }
 }
 impl PressureOwner {
+    pub(crate) fn install_action_observation(
+        &self,
+        observation: Arc<crate::test_fixture_authorization::FixtureActionObservation>,
+    ) {
+        *self
+            .core
+            .action_observation
+            .lock()
+            .expect("original pressure observation lock") = Some(observation);
+    }
+
     pub(crate) fn new(
         actual_frontend: FrontendProcessId,
         original_deadline: Instant,
@@ -292,6 +305,7 @@ impl PressureOwner {
             inner_poll: AtomicBool::new(false),
         }));
         let core = Arc::new(Core {
+            action_observation: Mutex::new(None),
             frontend: actual_frontend,
             deadline: original_deadline,
             arm_consumed: AtomicBool::new(false),
@@ -930,9 +944,25 @@ impl<W> ClosingPressureGate<W> {
             };
             *waiter = Some(cx.waker().clone());
             drop(waiter);
+            let actual_closing_hold =
+                phase == Phase::ClosingHeld && state.facts.real_closing_observed;
             drop(state);
             // Register first, then recheck Stop/failure so racing teardown cannot miss this waker.
             self.scope.core.check()?;
+            if actual_closing_hold {
+                if let Some(observation) = self
+                    .scope
+                    .core
+                    .action_observation
+                    .lock()
+                    .map_err(|_| self.scope.core.fail(Failure::Poison))?
+                    .as_ref()
+                {
+                    observation
+                        .record_hit()
+                        .map_err(|_| self.scope.core.fail(Failure::Transition))?;
+                }
+            }
             self.scope.core.changed.notify_waiters();
             return Ok(None);
         }

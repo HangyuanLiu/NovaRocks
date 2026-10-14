@@ -14,7 +14,6 @@
 // under the License.
 
 use super::*;
-use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -22,7 +21,10 @@ use std::time::Instant;
 const FAULT: &str = "create-task-before-worker-hold";
 const QUERY: &str = "SELECT v FROM cbw_catalog.cbw_db.cbw_data LIMIT 0";
 
-pub(super) struct LimitZeroUnknownSender;
+#[derive(Default)]
+pub(super) struct LimitZeroUnknownSender {
+    intent: SqlIntentOwner,
+}
 
 impl Scenario for LimitZeroUnknownSender {
     fn name(&self) -> &'static str {
@@ -44,21 +46,45 @@ impl Scenario for LimitZeroUnknownSender {
         })
     }
 
+    fn test_session_plan(
+        &self,
+        _launch: &ScenarioLaunchConfig,
+        _root: &Path,
+        cluster_size: usize,
+        _primary: &Path,
+        ordinary: &Path,
+        controlled: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<novarocks_cluster_harness::test_sessions::ClusterTestSessionPlan>> {
+        let mut statement = fault_statement(QUERY, FAULT);
+        statement.observations = (0..REQUIRED_BACKENDS)
+            .map(|index| (index, "grpc-fragment", None))
+            .collect();
+        Ok(Some(self.intent.freeze(
+            vec![statement],
+            &[],
+            cluster_size,
+            ordinary,
+            controlled,
+            deadline,
+        )?))
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        let result = run_fixture(context);
+        let result = run_fixture(context, &self.intent.take(0)?);
         let cleared = context.handle().clear_query_lifecycle_faults();
-        result.and(cleared)
+        crate::scenarios::paimon::scan_statement_actor::combine(result, cleared)
     }
 }
 
-fn run_fixture(context: &mut ScenarioContext) -> Result<()> {
+fn run_fixture(context: &mut ScenarioContext, selected: &SelectedStatement) -> Result<()> {
     require_three_backends(context)?;
     let warehouse =
         crate::scenarios::connector::create_warehouse(context, "limit-zero-unknown-sender")?;
-    let mut control = mysql_actor::connect(
+    let mut control = mysql_actor::connect_until(
         context.mysql_user(),
         context.mysql_port(),
-        bounded_io_timeout(context, "connect LIMIT 0 fixture setup")?,
+        context.deadline(),
     )?;
     crate::scenarios::connector::create_catalog(&mut control, "cbw_catalog", &warehouse)?;
     control.query_drop("CREATE DATABASE cbw_catalog.cbw_db")?;
@@ -68,31 +94,29 @@ fn run_fixture(context: &mut ScenarioContext) -> Result<()> {
             "INSERT INTO cbw_catalog.cbw_db.cbw_data VALUES ({value})"
         ))?;
     }
+    control.finish()?;
     context.action("created three independent Iceberg scan files before arming exact Create holds");
     let baseline = resource_snapshot(context)?;
-    let before = latest_execution_id(context)?;
-    let tokens = arm_on_every_backend(context, FAULT)?;
-    let listeners = tokens
-        .iter()
-        .map(|token| HoldListener::bind(token))
-        .collect::<Result<Vec<_>>>()?;
-    let user = context.mysql_user().to_owned();
-    let port = context.mysql_port();
-    let connect_timeout = bounded_io_timeout(context, "connect LIMIT 0 read")?;
+    let listener = HoldListener::bind(&selected.token)?;
+    let connection = mysql_actor::connect_until(
+        context.mysql_user(),
+        context.mysql_port(),
+        context.deadline(),
+    )?;
+    let observation = selected.arm(context, connection.connection_id(), QUERY)?;
     let (done_tx, done) = mpsc::sync_channel(1);
     let query = QueryRead(Some(thread::spawn(move || -> Result<()> {
-        let mut connection = mysql_actor::connect(&user, port, connect_timeout)?;
-        let rows = connection.query::<i64, _>(QUERY);
-        done_tx.send(rows).context("publish LIMIT 0 result")
+        connection.run(|connection| {
+            let rows = connection.query::<i64, _>(QUERY);
+            done_tx.send(rows).context("publish LIMIT 0 result")
+        })
     })));
     let mut held = Vec::<HeldCreate>::new();
     let result = (|| -> Result<String> {
         let (root_backend, target_index) = loop {
-            for (backend, listener) in listeners.iter().enumerate() {
-                while let Some(create) = listener.try_receive(backend, &tokens[backend])? {
-                    context.action(format!("held exact pre-Worker Create: {}", create.payload));
-                    held.push(create);
-                }
+            while let Some(create) = listener.try_receive(&selected.token, context.deadline())? {
+                context.action(format!("held exact pre-Worker Create: {}", create.payload));
+                held.push(create);
             }
             if let Some(root) = held.iter().find(|create| create.outbound_edges == 0)
                 && let Some(target) = held.iter().position(|create| {
@@ -166,8 +190,8 @@ fn run_fixture(context: &mut ScenarioContext) -> Result<()> {
                 create.release()?;
             }
         }
-        let deadline = Instant::now()
-            + context.remaining("receive complete LIMIT 0 result with unknown sender")?;
+        context.remaining("receive complete LIMIT 0 result with unknown sender")?;
+        let deadline = context.deadline();
         let rows = loop {
             match done.try_recv() {
                 Ok(rows) => {
@@ -177,13 +201,13 @@ fn run_fixture(context: &mut ScenarioContext) -> Result<()> {
                 Err(mpsc::TryRecvError::Disconnected) => bail!("LIMIT 0 client actor disconnected"),
                 Err(mpsc::TryRecvError::Empty) => {}
             }
-            for (backend, listener) in listeners.iter().enumerate() {
-                while let Some(mut create) = listener.try_receive(backend, &tokens[backend])? {
-                    if backend != target {
-                        create.release()?;
-                    }
-                    held.push(create);
+            while let Some(mut create) =
+                listener.try_receive(&selected.token, context.deadline())?
+            {
+                if create.backend != target {
+                    create.release()?;
                 }
+                held.push(create);
             }
             ensure!(
                 Instant::now() < deadline,
@@ -232,24 +256,27 @@ fn run_fixture(context: &mut ScenarioContext) -> Result<()> {
     // drop also releases pending connections and unlinks the socket, so a
     // late hook cannot remain parked while the bounded client is joined.
     let cleared = context.handle().clear_query_lifecycle_faults();
-    let mut release_error = None;
+    let mut released = Ok(());
     for create in &mut held {
-        if let Err(error) = create.release() {
-            release_error.get_or_insert(error);
-        }
+        released =
+            crate::scenarios::paimon::scan_statement_actor::combine(released, create.release());
     }
-    drop(listeners);
+    drop(listener);
     let joined = query.join();
-    let execution = result?;
-    cleared?;
-    if let Some(error) = release_error {
-        return Err(error);
-    }
-    joined?;
+    let cleanup = crate::scenarios::paimon::scan_statement_actor::combine(
+        crate::scenarios::paimon::scan_statement_actor::combine(cleared, released),
+        joined,
+    );
+    let execution = crate::scenarios::paimon::scan_statement_actor::combine(result, cleanup)?;
     // The public answer above is the seal witness. Full background cleanup
     // evidence is read only after restoring transport and releasing every
     // pre-Worker hold, including requests that arrived after the root EOS.
-    let terminal = await_terminal_snapshot(context, before.as_deref())?;
+    let terminal = context
+        .handle()
+        .await_query_lifecycle_statement_observation(&observation, true, selected.deadline)?;
+    context
+        .handle()
+        .drain_query_lifecycle_statement_observation(&observation)?;
     ensure!(
         terminal.execution_id.as_deref() == Some(execution.as_str()) && terminal.attempt_id == 1,
         "LIMIT 0 cleanup must belong to the same frozen attempt: {terminal:?}"
@@ -300,15 +327,16 @@ impl HoldListener {
         listener.set_nonblocking(true)?;
         Ok(Self { path, listener })
     }
-    fn try_receive(&self, backend: usize, token: &str) -> Result<Option<HeldCreate>> {
+    fn try_receive(&self, token: &str, deadline: Instant) -> Result<Option<HeldCreate>> {
         let (mut stream, _) = match self.listener.accept() {
             Ok(value) => value,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-        let mut payload = String::new();
-        stream.read_to_string(&mut payload)?;
+        let payload = crate::scenarios::native_direct_controls::read_marker(
+            &mut stream,
+            deadline.min(Instant::now() + Duration::from_secs(1)),
+        )?;
         let field = |name: &str| -> Result<String> {
             payload
                 .split_whitespace()
@@ -316,12 +344,14 @@ impl HoldListener {
                 .map(str::to_owned)
                 .with_context(|| format!("missing {name} in held Create {payload:?}"))
         };
+        let backend = field("backend_index")?.parse::<usize>()?;
         ensure!(
-            field("token")? == token && field("backend_index")?.parse::<usize>()? == backend,
+            field("token")? == token && backend < REQUIRED_BACKENDS,
             "held Create rendezvous identity differs from arming: {payload}"
         );
         let create = HeldCreate {
             backend,
+            deadline,
             execution: field("execution_id")?,
             stage: field("stage")?,
             process: field("process_id")?,
@@ -338,15 +368,13 @@ impl Drop for HoldListener {
         // Any connection that the main loop has not yet observed still owns
         // an exact parked Native request. Release it before unlinking.
         while let Ok((mut stream, _)) = self.listener.accept() {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-            let mut payload = Vec::new();
-            let _ = stream.read_to_end(&mut payload);
-            let _ = stream.write_all(b"R");
+            crate::scenarios::native_direct_controls::close_hold(&mut stream);
         }
         let _ = std::fs::remove_file(&self.path);
     }
 }
 struct HeldCreate {
+    deadline: Instant,
     backend: usize,
     execution: String,
     stage: String,
@@ -365,20 +393,23 @@ impl HeldCreate {
     }
     fn release(&mut self) -> Result<()> {
         if let Some(mut stream) = self.stream.take() {
-            stream.write_all(b"R")?;
+            crate::scenarios::native_direct_controls::release_hold(&mut stream, self.deadline)?;
         }
         Ok(())
     }
 }
 impl Drop for HeldCreate {
     fn drop(&mut self) {
-        let _ = self.release();
+        if let Some(mut stream) = self.stream.take() {
+            crate::scenarios::native_direct_controls::close_hold(&mut stream);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
     use std::net::Shutdown;
 
     #[test]
@@ -419,7 +450,10 @@ mod tests {
             "token={token} execution_id=10:20:1 stage=2 task=3 backend_index=1 process_id=exact-process outbound_edges=1\n"
         ).as_bytes()).unwrap();
         backend.shutdown(Shutdown::Write).unwrap();
-        let mut create = listener.try_receive(1, &token).unwrap().unwrap();
+        let mut create = listener
+            .try_receive(&token, Instant::now() + Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
         assert_eq!(
             create.identity_marker(),
             "execution_id=10:20:1 stage=2 task=3"
