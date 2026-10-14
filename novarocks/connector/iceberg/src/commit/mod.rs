@@ -24,6 +24,7 @@ mod action;
 pub(crate) mod attempt;
 mod data_file;
 pub mod data_writer;
+pub(crate) mod existing_commit;
 pub(crate) mod dependency;
 pub mod equality_delete_writer;
 pub(crate) mod fast_append;

@@ -66,6 +66,10 @@ pub mod read_snapshot;
 pub mod reconcile_payload;
 pub mod ref_snapshot;
 pub mod resources;
+// Wired into the REST owner incrementally across IRU-13a; the allowance is
+// removed once every part has a production caller.
+#[allow(dead_code)]
+pub(crate) mod rest_protocol;
 /// Iceberg virtual-column and row-lineage facts. These names and reserved
 /// field IDs are defined by the table format, not by the execution engine.
 pub mod row_lineage_synth;
