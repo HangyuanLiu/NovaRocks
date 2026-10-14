@@ -45,11 +45,10 @@ use std::sync::Arc;
 
 use novarocks_connector_iceberg::iceberg::io::FileIO;
 use novarocks_connector_iceberg::iceberg::spec::{Snapshot, TableMetadata};
-use novarocks_connector_iceberg::iceberg::{
-    Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate,
-};
+use novarocks_connector_iceberg::iceberg::{Catalog, TableIdent, TableRequirement, TableUpdate};
 
 use novarocks_connector_iceberg::commit::commit_with_retry;
+use novarocks_connector_iceberg::commit::existing_commit::existing_table_commit;
 use novarocks_connector_iceberg::commit::{
     FileSet, enumerate_files_for_snapshots, puffin_half_reference_protection,
 };
@@ -221,6 +220,8 @@ async fn run_expire_with_table(
     //   - RefSnapshotIdMatch on "main": ensures the main branch has not advanced
     //     (a concurrent EXPIRE or append could have changed it).
     //     Tables without a "main" ref (empty / branch-only tables) pin schema-id alone.
+    //   - The commit entry freezes the table UUID of this metadata, so a
+    //     dropped-and-recreated table rejects the commit.
     let mut requirements = vec![TableRequirement::CurrentSchemaIdMatch {
         current_schema_id: metadata.current_schema_id(),
     }];
@@ -243,11 +244,13 @@ async fn run_expire_with_table(
             .collect(),
         });
     }
-    let commit = TableCommit::builder()
-        .ident(table.identifier().clone())
-        .updates(updates)
-        .requirements(requirements)
-        .build();
+    let commit = existing_table_commit(table.identifier().clone(), metadata, requirements, updates)
+        .map_err(|error| {
+            novarocks_connector_iceberg::iceberg::Error::new(
+                novarocks_connector_iceberg::iceberg::ErrorKind::Unexpected,
+                error.to_string(),
+            )
+        })?;
     catalog.update_table(commit).await?;
 
     // Best-effort physical delete (algorithm step 8).
@@ -817,6 +820,31 @@ mod tests {
         .expect("run_expire_snapshots on empty table should succeed");
         assert_eq!(outcome.expired_snapshot_count, 0);
         assert_eq!(outcome.deleted_file_count, 0);
+    }
+
+    #[tokio::test]
+    async fn expire_commit_freezes_the_uuid_of_the_expired_metadata() {
+        let fixture = crate::commit::existing_commit::test_support::local_table().await;
+        fixture.append("first").await;
+        fixture.append("second").await;
+        let loaded = fixture.load().await;
+
+        let outcome = run_expire_snapshots(
+            fixture.catalog.clone(),
+            fixture.ident.clone(),
+            ExpireParams {
+                older_than_ms: Some(i64::MAX),
+                retain_last: None,
+            },
+        )
+        .await
+        .expect("run expire snapshots");
+
+        assert_eq!(outcome.expired_snapshot_count, 1);
+        assert_eq!(
+            fixture.catalog.take_single_commit_uuids(),
+            vec![loaded.metadata().uuid()]
+        );
     }
 
     // Graph-shape correctness covers protected refs, main-chain retention, and

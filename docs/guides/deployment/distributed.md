@@ -52,7 +52,8 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
 - 所有 FE/BE 配置必须有完全相同的 `[native_trust].deployment_id`、shared
   secret 与 transport mode；Native JWT 是 mandatory，TLS 只是在其上增加的可选层。
 - 所有 BE 节点都能访问相同的数据源、对象存储和 catalog。
-- 如果使用静态对象存储绑定，相关 FE/BE 节点须配置覆盖各自用途的访问域、endpoint 和 path-style；REST Catalog 的 vended 执行材料由实际签请求的 BE 按需取得。
+- 如果使用静态对象存储绑定，相关 FE/BE 节点须配置覆盖各自用途的访问域、endpoint 和 path-style；REST Catalog 的 vended 执行材料由实际签请求的 BE 按需取得：
+  BE 用 catalog 定义中 `DataCredentialVending` 绑定所指的本地身份认证，按 FE 冻结的公开路由上下文（完整请求地址与公开路由请求头）发出请求，因此每个 BE 都须能访问 FE 会话实际使用的 REST 地址（含 `/v1/config` 的 `overrides.uri`）与服务端给出的凭证端点，且不经重定向。
 - `role=fe` 必须显式选择 `[catalog_source]`。StaticFile 从一份挂载的完整 snapshot 启动；
   DynamicStateStore 才要求可用的 SQLite `[state_store]` 并允许 SQL catalog mutation。StateStore
   不是 backend membership source。backend desired lifecycle 属于外部 orchestrator，FE 的 observed
@@ -181,10 +182,18 @@ MySQL 端口，`--port` 参数对 BE 无效。
 `[connector.object_store]` 是 native connector 读取 Iceberg 或 Paimon/S3 数据时使用的
 role-local 静态启动配置。静态绑定须使 FE metadata 用途和 BE execution 用途分别获得
 覆盖所需资源的访问权；这不要求两种用途共享 secret。REST Catalog 的 vended 材料
-由签请求的 BE 本地 `StorageAuthority` 按需取得和续期。native fragment 只携带文件、
-split 和 catalog 标识，不携带 endpoint 或凭据；不能把只存在于 FE 内存中的
+由签请求的 BE 本地 `StorageAuthority` 按需取得和续期。FE 随凭证租约公告取得路径：
+两条路径（凭证端点、load-table）都携带 FE 从自己唯一的 catalog 会话冻结的公开路由上下文，
+即完整请求地址与公开路由请求头（catalog 定义的 `header.*`，以及
+`iceberg.rest.server-routing-headers` 声明过的服务端下发请求头），load-table 路径另带表身份与
+期望的表 UUID；其中从不包含令牌、client secret 或任何其他认证材料。BE 用自己的
+`DataCredentialVending` 身份认证，不建立自己的 catalog 会话，也不请求 `/v1/config`。
+FE 无法形成路由上下文时（缺少 `DataCredentialVending` 绑定、服务端下发了未声明的请求头、
+超出数量或字节上限）在派发之前拒绝查询。native fragment 只携带文件、
+split 和 catalog 标识，不携带凭据；不能把只存在于 FE 内存中的
 catalog 配置或 FE metadata secret 当作 BE 的执行材料。见
-[ADR-0151](../../adr/ADR-0151-credential-renewal-is-driven-by-the-consumer.md)。
+[ADR-0151](../../adr/ADR-0151-credential-renewal-is-driven-by-the-consumer.md) 与
+[ADR-0175](../../adr/ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md)。
 
 Secret-bearing startup scalars accept literals or only exact `${ENV:VAR}` references. Every
 FE and BE resolves its own startup snapshot once; changing a secret requires restarting the

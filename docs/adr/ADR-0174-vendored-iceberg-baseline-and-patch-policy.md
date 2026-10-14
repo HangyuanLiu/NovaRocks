@@ -5,6 +5,10 @@ domain: [crate-boundary]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0175
+    scope: "REST crate patch inventory (U1r, R1-R3, R5-R8, R10) and its deletion; ruling 4 temporary REST outcome narrowing; the compromise that authentication uses the SDK session and merged properties"
+    link: "ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md"
 partially-supersedes:
   - id: ADR-0170
     scope: "Patch allowlist: add iceberg-property-macro; current Iceberg baseline and vendor code anchors"
@@ -14,8 +18,6 @@ provenance:
 code-anchors:
   - "Cargo.toml ([patch.crates-io])"
   - "novarocks/connector/iceberg/src/resources.rs (IcebergCatalogRuntime::new)"
-  - "novarocks/connector/iceberg/src/catalog/mod.rs (NovaRocksCatalog::admits_uncommitted_proof)"
-  - "novarocks/connector/iceberg/src/catalog/error.rs (proves_received_conflict)"
   - "novarocks/connector/iceberg/src/manifest.rs (load_manifest_list, load_manifest)"
 ---
 

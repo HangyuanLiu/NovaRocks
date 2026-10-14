@@ -203,8 +203,8 @@ codegen-units = 256
 iceberg = { path = "vendor/iceberg-0.11.0" }
 # The 0.11 source-package macro is vendored without local source patches.
 iceberg-property-macro = { path = "vendor/iceberg-property-macro-0.11.0" }
-# Vendored to add Iceberg view REST endpoints (create/load/commit/drop/
-# exists/list), delegated credential handoff and staged publication. See
+# The 0.11 source package is vendored without local source patches; NovaRocks
+# extends it only through its public builder hooks. See
 # vendor/iceberg-catalog-rest-0.11.0/PATCH.md.
 iceberg-catalog-rest = { path = "vendor/iceberg-catalog-rest-0.11.0" }
 # Preserve typed missing-table errors and entity-based table classification.

@@ -466,6 +466,9 @@ impl PublicationCatalogAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PublicationCatalogFault {
     BeforeDispatch,
+    /// Answer the matching REST request with HTTP 403 without forwarding it,
+    /// so the server definitely rejected it before any side effect.
+    BeforeDispatchForbidden,
     /// Hold before forwarding the matching REST request, run the SQL case's
     /// cross-engine companion, then forward the original request. This freezes
     /// the NovaRocks attempt before the companion advances the Iceberg table.
@@ -488,6 +491,7 @@ impl PublicationCatalogFault {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::BeforeDispatch => "before-dispatch",
+            Self::BeforeDispatchForbidden => "before-dispatch-forbidden",
             Self::BeforeDispatchHoldForConcurrentShell => {
                 "before-dispatch-hold-for-concurrent-shell"
             }

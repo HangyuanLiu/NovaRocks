@@ -18,14 +18,10 @@
 //! Request and response types for the Iceberg REST API.
 
 use std::collections::HashMap;
-use std::fmt::{Debug, Formatter};
 
-use iceberg::spec::{
-    Schema, SortOrder, TableMetadata, UnboundPartitionSpec, ViewMetadata, ViewVersion,
-};
+use iceberg::spec::{Schema, SortOrder, TableMetadata, UnboundPartitionSpec};
 use iceberg::{
     Error, ErrorKind, Namespace, NamespaceIdent, TableIdent, TableRequirement, TableUpdate,
-    ViewRequirement, ViewUpdate,
 };
 use serde_derive::{Deserialize, Serialize};
 
@@ -40,18 +36,10 @@ pub(super) struct CatalogConfig {
     pub(super) endpoints: Option<Vec<Endpoint>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 /// Wrapper for all non-2xx error responses from the REST API
 pub struct ErrorResponse {
     error: ErrorModel,
-}
-
-impl Debug for ErrorResponse {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ErrorResponse")
-            .field("error", &self.error)
-            .finish()
-    }
 }
 
 impl From<ErrorResponse> for Error {
@@ -60,7 +48,7 @@ impl From<ErrorResponse> for Error {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 /// Error payload returned in a response with further details on the error
 pub struct ErrorModel {
     /// Human-readable error message
@@ -73,25 +61,14 @@ pub struct ErrorModel {
     pub stack: Option<Vec<String>>,
 }
 
-impl Debug for ErrorModel {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ErrorModel")
-            .field("message", &"[REDACTED]")
-            .field("type", &self.r#type)
-            .field("code", &self.code)
-            .field("stack_depth", &self.stack.as_ref().map_or(0, Vec::len))
-            .finish()
-    }
-}
-
 impl From<ErrorModel> for Error {
     fn from(value: ErrorModel) -> Self {
-        let mut error = Error::new(ErrorKind::DataInvalid, "REST catalog returned an error")
+        let mut error = Error::new(ErrorKind::DataInvalid, value.message)
             .with_context("type", value.r#type)
             .with_context("code", format!("{}", value.code));
 
         if let Some(stack) = value.stack {
-            error = error.with_context("stack_depth", stack.len().to_string());
+            error = error.with_context("stack", stack.join("\n"));
         }
 
         error
@@ -228,7 +205,7 @@ pub struct RenameTableRequest {
     pub destination: TableIdent,
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 /// Result returned when a table is successfully loaded or created.
 ///
@@ -254,24 +231,7 @@ pub struct LoadTableResult {
     pub storage_credentials: Option<Vec<StorageCredential>>,
 }
 
-impl Debug for LoadTableResult {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LoadTableResult")
-            .field("metadata_location", &self.metadata_location)
-            .field("metadata", &self.metadata)
-            .field("config_keys", &self.config.keys().collect::<Vec<_>>())
-            .field(
-                "storage_credentials",
-                &self
-                    .storage_credentials
-                    .as_ref()
-                    .map(|credentials| credentials.len()),
-            )
-            .finish()
-    }
-}
-
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 /// Storage credential for a specific location prefix.
 ///
 /// Indicates a storage location prefix where the credential is relevant. Clients should
@@ -282,15 +242,6 @@ pub struct StorageCredential {
     pub prefix: String,
     /// Configuration map containing credential information
     pub config: HashMap<String, String>,
-}
-
-impl Debug for StorageCredential {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StorageCredential")
-            .field("prefix", &self.prefix)
-            .field("config_keys", &self.config.keys().collect::<Vec<_>>())
-            .finish()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -369,85 +320,8 @@ pub struct RegisterTableRequest {
     pub overwrite: Option<bool>,
 }
 
-/// Result returned by a REST credentials-refresh endpoint.
-///
-/// The Iceberg REST protocol uses the same prefix-scoped credential shape as
-/// a table-load response, but a refresh has no table metadata or FileIO
-/// configuration. Keep it as a separate closed response so callers cannot
-/// accidentally treat a refresh as a second table observation.
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub struct LoadCredentialsResult {
-    /// Refreshed storage credentials for the already-admitted scope.
-    pub storage_credentials: Option<Vec<StorageCredential>>,
-}
-
-impl Debug for LoadCredentialsResult {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LoadCredentialsResult")
-            .field(
-                "storage_credentials",
-                &self
-                    .storage_credentials
-                    .as_ref()
-                    .map(|credentials| credentials.len()),
-            )
-            .finish()
-    }
-}
-
-/// Request body for `POST .../namespaces/{ns}/views`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub struct CreateViewRequest {
-    /// Name of the view to create
-    pub name: String,
-    /// Optional view location. If not provided, the server will choose a location.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub location: Option<String>,
-    /// View schema
-    pub schema: Schema,
-    /// Initial view version describing the view definition
-    pub view_version: ViewVersion,
-    /// Properties to set on the view
-    pub properties: HashMap<String, String>,
-}
-
-/// Response body shared by view create / load / commit.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub struct LoadViewResult {
-    /// Location of the view metadata file
-    pub metadata_location: String,
-    /// The view's full metadata
-    pub metadata: ViewMetadata,
-    /// View-specific configuration overriding catalog configuration
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub config: HashMap<String, String>,
-}
-
-/// Request body for `POST .../namespaces/{ns}/views/{view}` (view commit).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CommitViewRequest {
-    /// View identifier to update
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub identifier: Option<TableIdent>,
-    /// List of requirements that must be satisfied before committing changes
-    pub requirements: Vec<ViewRequirement>,
-    /// List of updates to apply to the view metadata
-    pub updates: Vec<ViewUpdate>,
-}
-
-/// `GET .../namespaces/{ns}/views` shares the list-tables wire shape.
-pub type ListViewsResponse = ListTablesResponse;
-
 #[cfg(test)]
 mod tests {
-    //! R10 correctness: parsed protocol category/status survive while response
-    //! messages, stacks and credential values stay private. The original
-    //! error canary is retained; DTO Debug needed direct config-value coverage.
-    //! These isolated in-memory tests run with the REST crate suite and remain
-    //! owned by the NovaRocks connector maintainer until IRU-13a replaces R10.
     use super::*;
 
     #[test]
@@ -630,38 +504,5 @@ mod tests {
         // than silently dropping it).
         let json = r#"{"overrides":{},"defaults":{},"endpoints":["GET_v1/namespaces"]}"#;
         assert!(serde_json::from_str::<CatalogConfig>(json).is_err());
-    }
-    #[test]
-    fn rest_error_response_redacts_secret_canary() {
-        let response: ErrorResponse = serde_json::from_value(serde_json::json!({
-            "error": {
-                "message": "storage-secret-canary",
-                "type": "ServerError",
-                "code": 500,
-                "stack": ["storage-secret-canary"]
-            }
-        }))
-        .unwrap();
-        assert!(!format!("{response:?}").contains("storage-secret-canary"));
-        let error: Error = response.into();
-        assert!(!format!("{error:?}").contains("storage-secret-canary"));
-        assert!(format!("{error:?}").contains("ServerError"));
-    }
-
-    #[test]
-    fn table_response_and_storage_credential_debug_keep_only_config_keys() {
-        let mut response: serde_json::Value =
-            serde_json::from_str(include_str!("../testdata/load_table_response.json")).unwrap();
-        response["config"] = serde_json::json!({"opaque.credential": "response-secret-canary"});
-        response["storage-credentials"] = serde_json::json!([{
-            "prefix": "s3://warehouse/data/",
-            "config": {"s3.secret-access-key": "response-secret-canary"}
-        }]);
-        let table: LoadTableResult = serde_json::from_value(response).unwrap();
-        assert!(!format!("{table:?}").contains("response-secret-canary"));
-        let credential = &table.storage_credentials.as_ref().unwrap()[0];
-        let debug = format!("{credential:?}");
-        assert!(!debug.contains("response-secret-canary"));
-        assert!(debug.contains("s3.secret-access-key"));
     }
 }

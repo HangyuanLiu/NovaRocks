@@ -45,11 +45,8 @@ use novarocks_types::naming::normalize_identifier;
 
 use crate::iceberg::{Catalog, NamespaceIdent, TableIdent};
 
-use super::error::{CatalogCommitEvidence, CatalogOutcome, map_read_error, proves_uncommitted};
-use super::{
-    CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName,
-    error::uncommitted_failure_kind,
-};
+use super::error::{CatalogCommitEvidence, CatalogOutcome, map_read_error};
+use super::{CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName};
 
 fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
@@ -77,14 +74,11 @@ pub(super) fn sorted_unique(mut names: Vec<String>) -> Vec<String> {
 }
 
 /// An owner-selected rule for accepting dispatched-error proof.
-pub(super) type UncommittedProofRule = fn(&crate::iceberg::Error) -> bool;
-
 /// Delegation onto one concrete catalog client.
 #[derive(Debug)]
 pub(super) struct CatalogDelegate {
     client: Arc<dyn Catalog>,
     pub(super) listing: Arc<super::listing_admission::ListingAdmission>,
-    pub(super) admits: UncommittedProofRule,
 }
 
 impl CatalogDelegate {
@@ -92,13 +86,7 @@ impl CatalogDelegate {
         Self {
             client,
             listing: Default::default(),
-            admits: |_| true,
         }
-    }
-
-    pub(super) fn with_uncommitted_proof_rule(mut self, rule: UncommittedProofRule) -> Self {
-        self.admits = rule;
-        self
     }
 
     pub(super) fn client(&self) -> &Arc<dyn Catalog> {
@@ -440,53 +428,8 @@ impl CatalogDelegate {
         error: &crate::iceberg::Error,
         evidence: impl FnOnce() -> CatalogCommitEvidence,
     ) -> CatalogOutcome<T> {
-        if (self.admits)(error) && proves_uncommitted(error) {
-            return CatalogOutcome::uncommitted(uncommitted_failure_kind(error), error.to_string());
-        }
-        CatalogOutcome::unknown(error.to_string(), evidence())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    //! Local correctness oracle: default filesystem owners retain their
-    //! definite-rejection semantics while REST evidence cannot authorize
-    //! cleanup for post-dispatch non-conflicts. No external fixture is needed;
-    //! the connector test invocation maintains this coverage until IRU-13a.
-    use super::*;
-    use crate::commit::model::ArtifactWriter;
-    use crate::commit::overwrite::preparer_tests::Fixture;
-    use crate::iceberg::{Error, ErrorKind};
-
-    #[tokio::test]
-    async fn default_hadoop_owner_and_delegate_keep_definite_rejection_proofs() {
-        let fixture = Fixture::new();
-        let attempt = fixture.operation.begin_attempt().unwrap();
-        let client = Arc::new(crate::hadoop_catalog::HadoopFileSystemCatalog::new(
-            attempt.file_io().clone(),
-            format!("file://{}", fixture.directory.path().display()),
-            crate::iceberg::Runtime::try_current().expect("test runtime"),
-        ));
-        let owner = super::super::hadoop::NovaRocksHadoopCatalog::new(client.clone());
-        let default = CatalogDelegate::new(client.clone());
-        let rest = CatalogDelegate::new(client)
-            .with_uncommitted_proof_rule(super::super::error::proves_received_conflict);
-        for kind in [
-            ErrorKind::TableNotFound,
-            ErrorKind::DataInvalid,
-            ErrorKind::FeatureUnsupported,
-        ] {
-            let error = Error::new(kind, "dispatched failure");
-            assert!(super::super::NovaRocksCatalog::admits_uncommitted_proof(
-                &owner, &error
-            ));
-            let outcome: CatalogOutcome<()> =
-                default.classify(&error, || panic!("definite rejection"));
-            assert!(outcome.permits_cleanup());
-            let outcome: CatalogOutcome<()> =
-                rest.classify(&error, || CatalogCommitEvidence::for_target("db.t"));
-            assert!(!outcome.permits_cleanup());
-            assert!(matches!(outcome, CatalogOutcome::CommitUnknown { .. }));
-        }
+        // REST failures carry typed evidence, which the shared judgment reads
+        // first (L14).
+        super::error::classify_dispatched_error(error, evidence)
     }
 }

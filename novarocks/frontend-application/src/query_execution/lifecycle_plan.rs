@@ -242,9 +242,10 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
             .iter()
             .map(|property| CatalogNonSecretProperty::try_new(property.key(), property.value()))
             .collect::<Result<Vec<_>, _>>()?;
-        // The endpoint was parsed and then dropped here. It is non-secret, and
-        // it is the one fact a consumer needs to acquire for itself, so it now
-        // rides the descriptor beside the scope it applies to (CAD-1 D1, D2).
+        // The acquisition path is non-secret -- the coordinator's frozen
+        // routing context and, for load-table, the table identity -- and it is
+        // the one fact a consumer needs to acquire for itself, so it rides the
+        // descriptor beside the scope it applies to (CAD-1 D1, D2; IRU-13a L15).
         let (entries, renewal_path, provider_refresher) = contribution.into_parts_with_refresher();
         let mut state = self
             .state

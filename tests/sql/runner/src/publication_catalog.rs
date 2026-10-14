@@ -165,6 +165,7 @@ impl PublicationAction {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum PublicationFault {
     BeforeDispatch,
+    BeforeDispatchForbidden,
     BeforeDispatchHoldForConcurrentShell,
     BeforeRequirementCheckHoldForConcurrentShell,
     AfterCommitBeforeResponse,
@@ -177,6 +178,7 @@ impl PublicationFault {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::BeforeDispatch => "before-dispatch",
+            Self::BeforeDispatchForbidden => "before-dispatch-forbidden",
             Self::BeforeDispatchHoldForConcurrentShell => {
                 "before-dispatch-hold-for-concurrent-shell"
             }
@@ -431,6 +433,7 @@ fn parse_action(value: &str) -> Result<PublicationAction> {
 fn parse_fault(value: &str) -> Result<PublicationFault> {
     match value {
         "before-dispatch" => Ok(PublicationFault::BeforeDispatch),
+        "before-dispatch-forbidden" => Ok(PublicationFault::BeforeDispatchForbidden),
         "before-dispatch-hold-for-concurrent-shell" => {
             Ok(PublicationFault::BeforeDispatchHoldForConcurrentShell)
         }
@@ -479,6 +482,7 @@ impl FixtureFaultGuard {
         }
         let terminal_event = match self.fault {
             PublicationFault::BeforeDispatch => "known-not-dispatched",
+            PublicationFault::BeforeDispatchForbidden => "forbidden-not-dispatched",
             PublicationFault::BeforeDispatchHoldForConcurrentShell
             | PublicationFault::BeforeRequirementCheckHoldForConcurrentShell => {
                 "downstream-response"
@@ -647,6 +651,15 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
         return known_not_dispatched("publication REST request rejected before dispatch");
     }
     if let Some(armed) = fault.as_ref()
+        && armed.fault == PublicationFault::BeforeDispatchForbidden
+    {
+        // A standard REST 403 is a definite authorization rejection: the
+        // server refused the request before any catalog side effect, and the
+        // fixture proves it by never forwarding the request.
+        record_fault_event(&state, armed, "forbidden-not-dispatched");
+        return forbidden_not_dispatched("publication REST request forbidden before dispatch");
+    }
+    if let Some(armed) = fault.as_ref()
         && matches!(
             armed.fault,
             PublicationFault::BeforeDispatchHoldForConcurrentShell
@@ -723,7 +736,9 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
                     Bytes::from_static(b"{corrupt-package"),
                 );
             }
-            PublicationFault::BeforeDispatch => unreachable!("returned before dispatch"),
+            PublicationFault::BeforeDispatch | PublicationFault::BeforeDispatchForbidden => {
+                unreachable!("returned before dispatch")
+            }
             PublicationFault::BeforeDispatchHoldForConcurrentShell
             | PublicationFault::BeforeRequirementCheckHoldForConcurrentShell => {}
         }
@@ -976,6 +991,20 @@ fn known_not_dispatched(message: impl Into<String>) -> Response {
     wire_error(StatusCode::BAD_REQUEST, "known-not-dispatched", message)
 }
 
+/// A standard Iceberg REST `ErrorModel` 403 for a request never forwarded.
+fn forbidden_not_dispatched(message: impl Into<String>) -> Response {
+    json_response(
+        StatusCode::FORBIDDEN,
+        json!({
+            "error": {
+                "message": message.into(),
+                "type": "ForbiddenException",
+                "code": StatusCode::FORBIDDEN.as_u16(),
+            }
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1141,5 +1170,116 @@ mod tests {
             "armed -> matched -> request-forwarded -> downstream-response -> downstream-success -> response-dropped-after-downstream-success -> control-release"
         );
         downstream.join().unwrap();
+    }
+
+    #[test]
+    fn parses_forbidden_before_dispatch_fault() {
+        let fault = parse_fault("before-dispatch-forbidden").unwrap();
+        assert_eq!(fault, PublicationFault::BeforeDispatchForbidden);
+        assert_eq!(fault.as_str(), "before-dispatch-forbidden");
+        assert_eq!(
+            parse_fault("before-dispatch").unwrap(),
+            PublicationFault::BeforeDispatch
+        );
+    }
+
+    /// Arms one before-dispatch fault, sends one matching request and
+    /// returns its status, decoded body and the fault trace. The downstream
+    /// listener never accepts, so any forwarded request would be observable.
+    fn answer_before_dispatch(
+        action: &str,
+        fault: &str,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, Value, String, TrafficCounters, MutationCounts) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let downstream_address = listener.local_addr().unwrap();
+        let fixture = FixtureHandle::start(format!("http://{downstream_address}")).unwrap();
+        let control = fixture.control().unwrap();
+        let guard = control.arm_next(action, fault).unwrap();
+        let response = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("{}{path}", fixture.uri()))
+            .json(&body)
+            .send()
+            .unwrap();
+        let status = response.status();
+        let body: Value = response.json().unwrap();
+        let evidence = guard.finish().unwrap();
+        assert!(
+            matches!(
+                listener.accept(),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "a before-dispatch fault must not open a downstream connection"
+        );
+        (
+            status,
+            body,
+            evidence.summary(),
+            control.traffic_snapshot(),
+            control.mutation_counts("ns", "t"),
+        )
+    }
+
+    #[test]
+    fn forbidden_fault_answers_403_without_forwarding_the_mutation() {
+        for (action, path, body) in [
+            (
+                "table-commit",
+                "/v1/namespaces/ns/tables/t",
+                json!({"requirements": [], "updates": []}),
+            ),
+            (
+                "stage-create",
+                "/v1/namespaces/ns/tables",
+                json!({"name": "t", "stage-create": true}),
+            ),
+        ] {
+            let (status, body, trace, traffic, counts) =
+                answer_before_dispatch(action, "before-dispatch-forbidden", path, body);
+            assert_eq!(status, StatusCode::FORBIDDEN, "{action}");
+            assert_eq!(body.pointer("/error/code"), Some(&json!(403)), "{body}");
+            assert_eq!(
+                body.pointer("/error/type"),
+                Some(&json!("ForbiddenException")),
+                "{body}"
+            );
+            assert!(
+                body.pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|message| !message.is_empty())
+            );
+            assert_eq!(
+                trace,
+                "armed -> matched -> forbidden-not-dispatched -> control-release"
+            );
+            assert_eq!(traffic, TrafficCounters::default());
+            assert_eq!(counts, MutationCounts::default());
+        }
+    }
+
+    #[test]
+    fn before_dispatch_fault_still_answers_400_without_forwarding() {
+        let (status, body, trace, traffic, counts) = answer_before_dispatch(
+            "stage-create",
+            "before-dispatch",
+            "/v1/namespaces/ns/tables",
+            json!({"name": "t", "stage-create": true}),
+        );
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.pointer("/error/kind"),
+            Some(&json!("known-not-dispatched"))
+        );
+        assert_eq!(
+            trace,
+            "armed -> matched -> known-not-dispatched -> control-release"
+        );
+        assert_eq!(traffic, TrafficCounters::default());
+        assert_eq!(counts, MutationCounts::default());
     }
 }

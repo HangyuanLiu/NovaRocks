@@ -22,41 +22,39 @@
 //! exchanges that identity for storage credentials, instead of waiting for a
 //! coordinator to push material it cannot renew.
 //!
-//! Everything here is one adapter over the existing REST catalog client. The
-//! acquisition budget, retry shape and failure classification are deliberately
-//! *not* duplicated: they belong to [`crate::authority_source`], which wraps
-//! this refresher.
+//! The node never opens a catalog session of its own (D15): it sends exactly
+//! the request the coordinator froze into the routing context, with only its
+//! own `Authorization` added. The acquisition budget, retry shape and failure
+//! classification are deliberately *not* duplicated: they belong to
+//! [`crate::authority_source`], which wraps this refresher.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorVendedS3CredentialLeaseRefresher,
-    VendedS3CredentialLeaseRefresh, VendedS3CredentialRefreshCallPolicy,
+    CredentialRoutingContext, VendedS3CredentialLeaseRefresh, VendedS3CredentialRefreshCallPolicy,
 };
 
 use crate::access_binding::IcebergRestAuthMaterial;
 use crate::catalog_config::{IcebergCatalogKind, parse_catalog_configuration};
-use crate::catalog_runtime::RestAccessDelegationMode;
-use crate::loaded_table::{IcebergAccessDelegation, parse_vended_access_delegation};
+use crate::loaded_table::{IcebergAccessDelegation, parse_rest_delegation};
 use crate::resources::IcebergCatalogRuntime;
-
-/// REST property carrying an OAuth2 client credential pair.
-const REST_PROP_CREDENTIAL: &str = "credential";
-/// REST property carrying a bearer token.
-const REST_PROP_TOKEN: &str = "token";
+use crate::rest_protocol::auth::{PersistentRestConfig, RestAuthOwner};
 
 /// Which of the two advertised shapes this node acquires along.
 ///
 /// A consumer selects one and never probes the other after a failure: the
 /// catalog stated which path it serves, and trying the other would assert a
-/// capability the deployment may not have (CAD-1 D2).
+/// capability the deployment may not have (CAD-1 D2). Both carry the routing
+/// context the coordinator froze.
 #[derive(Clone, Debug)]
 pub(crate) enum ExecutionNodeAcquisitionPath {
     /// The scope's credentials are served from this address.
-    CredentialsEndpoint(Arc<str>),
+    CredentialsEndpoint { routing: CredentialRoutingContext },
     /// The catalog vends only inside a load-table response for this table.
     LoadTableDelegation {
+        routing: CredentialRoutingContext,
         table: crate::iceberg::TableIdent,
         expected_table_uuid: uuid::Uuid,
     },
@@ -72,11 +70,27 @@ impl ExecutionNodeAcquisitionPath {
     pub(crate) fn project(
         announced: &novarocks_spi::connector::CredentialRenewalPath,
     ) -> Result<Self, ConnectorError> {
+        let routing = announced.routing().clone();
+        // The coordinator validated the address; an address this node would
+        // not send is refused rather than repaired.
+        crate::rest_protocol::routing::canonical_route_url(routing.url()).and_then(
+            |canonical| {
+                (canonical == routing.url()).then_some(()).ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "announced routing address is not in canonical form",
+                    )
+                })
+            },
+        )?;
         match announced {
-            novarocks_spi::connector::CredentialRenewalPath::CredentialsEndpoint(endpoint) => {
-                Ok(Self::CredentialsEndpoint(Arc::clone(endpoint)))
+            novarocks_spi::connector::CredentialRenewalPath::CredentialsEndpoint(_) => {
+                Ok(Self::CredentialsEndpoint { routing })
             }
-            novarocks_spi::connector::CredentialRenewalPath::LoadTableDelegation(delegation) => {
+            novarocks_spi::connector::CredentialRenewalPath::LoadTableDelegation {
+                table: delegation,
+                ..
+            } => {
                 let namespace = crate::iceberg::NamespaceIdent::from_vec(
                     delegation
                         .namespace()
@@ -98,6 +112,7 @@ impl ExecutionNodeAcquisitionPath {
                         )
                     })?;
                 Ok(Self::LoadTableDelegation {
+                    routing,
                     table: crate::iceberg::TableIdent::new(
                         namespace,
                         delegation.table().to_string(),
@@ -107,21 +122,29 @@ impl ExecutionNodeAcquisitionPath {
             }
         }
     }
+
+    pub(crate) fn routing(&self) -> &CredentialRoutingContext {
+        match self {
+            Self::CredentialsEndpoint { routing } | Self::LoadTableDelegation { routing, .. } => {
+                routing
+            }
+        }
+    }
 }
 
 /// Acquires data credentials along one advertised path using this process's
 /// own catalog principal.
 ///
-/// The client is built once and retained: a process-lived authority that
-/// rebuilt its client on every renewal would also rebuild its OAuth2 token
-/// exchange, turning one storage refresh into two remote round trips.
+/// The auth owner is built once and retained: a process-lived authority that
+/// rebuilt it on every renewal would also repeat its OAuth2 token exchange,
+/// turning one storage refresh into two remote round trips.
 pub(crate) struct ExecutionNodeCredentialsEndpointRefresher {
     catalog_name: String,
     non_secret_properties: Vec<(String, String)>,
     principal: IcebergRestAuthMaterial,
     runtime: IcebergCatalogRuntime,
     path: ExecutionNodeAcquisitionPath,
-    client: Mutex<Option<Arc<crate::iceberg_catalog_rest::RestCatalog>>>,
+    owner: Mutex<Option<Arc<RestAuthOwner>>>,
 }
 
 impl std::fmt::Debug for ExecutionNodeCredentialsEndpointRefresher {
@@ -129,10 +152,11 @@ impl std::fmt::Debug for ExecutionNodeCredentialsEndpointRefresher {
         let mut rendered = formatter.debug_struct("ExecutionNodeCredentialsEndpointRefresher");
         rendered.field("catalog_name", &self.catalog_name);
         match &self.path {
-            ExecutionNodeAcquisitionPath::CredentialsEndpoint(endpoint) => {
-                rendered.field("endpoint", &endpoint.as_ref());
+            ExecutionNodeAcquisitionPath::CredentialsEndpoint { routing } => {
+                rendered.field("routing", routing);
             }
-            ExecutionNodeAcquisitionPath::LoadTableDelegation { table, .. } => {
+            ExecutionNodeAcquisitionPath::LoadTableDelegation { routing, table, .. } => {
+                rendered.field("routing", routing);
                 rendered.field("load_table", &table.name());
             }
         }
@@ -154,16 +178,13 @@ impl ExecutionNodeCredentialsEndpointRefresher {
             principal,
             runtime,
             path,
-            client: Mutex::new(None),
+            owner: Mutex::new(None),
         }
     }
 
-    /// The frozen catalog definition with this node's own identity added.
-    ///
-    /// The definition that crossed the wire is non-secret by construction, so
-    /// the principal is never read from it; it comes from the role-local
-    /// registry and is joined here, in the one place that builds a client.
-    fn client_properties(&self) -> Result<HashMap<String, String>, ConnectorError> {
+    /// The persistent, non-secret catalog definition the token request is
+    /// derived from (L16). The principal never comes from it.
+    fn persistent_properties(&self) -> Result<HashMap<String, String>, ConnectorError> {
         let configuration = parse_catalog_configuration(
             &self.catalog_name,
             &self.non_secret_properties,
@@ -196,66 +217,22 @@ impl ExecutionNodeCredentialsEndpointRefresher {
             crate::iceberg_catalog_rest::REST_CATALOG_PROP_URI.to_string(),
             uri,
         );
-        if !configuration.warehouse_uri.is_empty() {
-            properties.insert(
-                crate::iceberg_catalog_rest::REST_CATALOG_PROP_WAREHOUSE.to_string(),
-                configuration.warehouse_uri.clone(),
-            );
-        }
-        match &self.principal {
-            IcebergRestAuthMaterial::Oauth2 {
-                client_id,
-                client_secret,
-            } => {
-                properties.remove(REST_PROP_TOKEN);
-                properties.insert(
-                    REST_PROP_CREDENTIAL.to_string(),
-                    format!("{client_id}:{}", client_secret.expose_secret()),
-                );
-            }
-            IcebergRestAuthMaterial::Bearer { token } => {
-                properties.remove(REST_PROP_CREDENTIAL);
-                properties.insert(
-                    REST_PROP_TOKEN.to_string(),
-                    token.expose_secret().to_string(),
-                );
-            }
-        }
         Ok(properties)
     }
 
-    fn client(&self) -> Result<Arc<crate::iceberg_catalog_rest::RestCatalog>, ConnectorError> {
-        let mut slot = self
-            .client
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some(client) = slot.as_ref() {
-            return Ok(Arc::clone(client));
+    fn owner(&self) -> Result<Arc<RestAuthOwner>, ConnectorError> {
+        let mut slot = self.owner.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(owner) = slot.as_ref() {
+            return Ok(Arc::clone(owner));
         }
-        let properties = self.client_properties()?;
-        // `Vended` deliberately installs no warehouse storage factory: this
-        // client speaks to the control plane only, and the material it returns
-        // is installed into the authority rather than into a FileIO.
-        let built = self
-            .runtime
-            .block_on(crate::catalog_runtime::build_rest_catalog_from_properties(
-                properties,
-                RestAccessDelegationMode::Vended,
-                self.runtime.iceberg_runtime().clone(),
-            ))
-            .map_err(|error| {
-                ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    format!("run Iceberg credential-acquisition client build: {error}"),
-                )
-            })?
-            .map_err(|error| {
-                ConnectorError::new(ConnectorErrorKind::Unavailable, error)
-                    .with_retryable_before_progress()
-            })?;
-        let client = Arc::new(built);
-        *slot = Some(Arc::clone(&client));
-        Ok(client)
+        let persistent = PersistentRestConfig::from_properties(&self.persistent_properties()?)
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?;
+        let http = crate::rest_protocol::http::RestHttpClient::new()
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error))?;
+        let owner = RestAuthOwner::backend(Some(self.principal.clone()), persistent, http)
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::InvalidRequest, error))?;
+        *slot = Some(Arc::clone(&owner));
+        Ok(owner)
     }
 }
 
@@ -264,67 +241,54 @@ impl ConnectorVendedS3CredentialLeaseRefresher for ExecutionNodeCredentialsEndpo
         &self,
         policy: VendedS3CredentialRefreshCallPolicy,
     ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
-        let client = self.client()?;
-        let delegation = match &self.path {
-            ExecutionNodeAcquisitionPath::CredentialsEndpoint(endpoint) => {
-                let endpoint = Arc::clone(endpoint);
-                crate::loaded_table::run_vended_refresh_with_policy(
-                    &self.runtime,
-                    policy,
-                    "Iceberg execution-node credential acquisition",
-                    move || {
-                        let client = Arc::clone(&client);
-                        let endpoint = Arc::clone(&endpoint);
-                        async move {
-                            client
-                                .load_credentials_with_access_delegation(endpoint.as_ref())
-                                .await
-                        }
-                    },
-                )?
-            }
-            ExecutionNodeAcquisitionPath::LoadTableDelegation {
-                table,
-                expected_table_uuid,
-            } => {
-                let table_ident = table.clone();
-                let response = crate::loaded_table::run_vended_refresh_with_policy(
-                    &self.runtime,
-                    policy,
-                    "Iceberg execution-node load-table credential acquisition",
-                    move || {
-                        let client = Arc::clone(&client);
-                        let table = table_ident.clone();
-                        async move {
-                            client
-                                .load_table_deferred_with_access_delegation(&table)
-                                .await
-                        }
-                    },
-                )?;
-                // D11b: the response's metadata is destructured here and never
-                // leaves this expression. Only the identity check reads it, and
-                // it reads exactly one field; the materialization is dropped at
-                // the end of this block, so no plan, cache or table state on
-                // this node can observe the coordinator's frozen snapshot being
-                // overtaken.
-                let (materialization, delegation) = response.into_parts();
-                let observed = crate::loaded_table::table_uuid_for_identity_check(materialization)?;
-                if observed != *expected_table_uuid {
-                    return Err(ConnectorError::new(
-                        ConnectorErrorKind::PermissionDenied,
-                        "load-table credential acquisition answered for a different table",
-                    ));
+        let owner = self.owner()?;
+        let routing = self.path.routing().clone();
+        let load_table = matches!(
+            self.path,
+            ExecutionNodeAcquisitionPath::LoadTableDelegation { .. }
+        );
+        let (observed_uuid, delegation) = crate::loaded_table::run_vended_renewal_with_policy(
+            &self.runtime,
+            policy,
+            "Iceberg execution-node credential acquisition",
+            move || {
+                let owner = Arc::clone(&owner);
+                let routing = routing.clone();
+                async move {
+                    crate::rest_protocol::endpoints::acquire_routed(&owner, &routing, load_table)
+                        .await
                 }
-                delegation
+            },
+        )?;
+        // D11b: only the table identity is read from the response, and only to
+        // compare it; no metadata reaches any plan, cache or table state here.
+        if let ExecutionNodeAcquisitionPath::LoadTableDelegation {
+            expected_table_uuid,
+            ..
+        } = &self.path
+        {
+            let observed = observed_uuid
+                .as_deref()
+                .and_then(|uuid| uuid::Uuid::parse_str(uuid).ok());
+            if observed != Some(*expected_table_uuid) {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::PermissionDenied,
+                    "load-table credential acquisition answered for a different table",
+                ));
             }
-        };
+        }
+        if !delegation.is_present() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::PermissionDenied,
+                "credential acquisition returned static access delegation",
+            ));
+        }
         // No prefix-scope equality check here, unlike the coordinator's
         // refresher. That check exists to keep one admitted attempt's authority
         // from being widened mid-flight; this node holds one authority per
         // scope and `IcebergAuthorityMaterialSource` already refuses a response
         // that does not cover the exact scope it owns (CAD-1 D7).
-        let seed = match parse_vended_access_delegation(&delegation)? {
+        let seed = match parse_rest_delegation(delegation)? {
             IcebergAccessDelegation::Vended(seed) => seed,
             IcebergAccessDelegation::Static => {
                 return Err(ConnectorError::new(
@@ -342,20 +306,23 @@ impl ConnectorVendedS3CredentialLeaseRefresher for ExecutionNodeCredentialsEndpo
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpListener, TcpStream};
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    //! The execution node's acquisition along a frozen routing context
+    //! (spec 5.4, L17): its own identity, the coordinator's exact route, no
+    //! `/v1/config`, only the UUID and credentials decoded. Each test owns a
+    //! loopback scripted server; Drop joins it.
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use novarocks_spi::connector::{
-        CredentialLoadTableDelegation, CredentialRenewalPath, VendedS3CredentialRefreshDispatch,
-        VendedS3CredentialRefreshDispatchGuard,
+        CredentialLoadTableDelegation, CredentialRenewalPath, CredentialRoutingContext,
+        VendedS3CredentialRefreshDispatch, VendedS3CredentialRefreshDispatchGuard,
     };
 
     use super::*;
+    use crate::rest_protocol::test_server::{Reply, Script, TestServer};
 
     const TABLE_UUID: &str = "8f1d0c6e-0000-4000-8000-000000000001";
     const OTHER_TABLE_UUID: &str = "8f1d0c6e-0000-4000-8000-0000000000ff";
+    const TABLE_PATH: &str = "/v1/p1/namespaces/sales/tables/orders";
 
     struct PermittedDispatch;
 
@@ -365,325 +332,258 @@ mod tests {
         }
     }
 
-    /// One Iceberg format-2 table, the smallest a REST response may carry.
-    fn table_metadata(uuid: &str) -> String {
-        format!(
-            r#"{{
-              "format-version": 2,
-              "table-uuid": "{uuid}",
-              "location": "s3://warehouse/sales/orders",
-              "last-sequence-number": 1,
-              "last-updated-ms": 1700000000000,
-              "last-column-id": 1,
-              "current-schema-id": 0,
-              "schemas": [{{"type":"struct","schema-id":0,"fields":[
-                {{"id":1,"name":"id","required":false,"type":"long"}}
-              ]}}],
-              "default-spec-id": 0,
-              "partition-specs": [{{"spec-id":0,"fields":[]}}],
-              "last-partition-id": 999,
-              "default-sort-order-id": 0,
-              "sort-orders": [{{"order-id":0,"fields":[]}}],
-              "properties": {{}},
-              "current-snapshot-id": -1,
-              "snapshots": [],
-              "snapshot-log": [],
-              "metadata-log": []
-            }}"#
+    fn not_after() -> String {
+        (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("wall clock")
+            .as_millis()
+            + 3_600_000)
+            .to_string()
+    }
+
+    fn credentials() -> serde_json::Value {
+        serde_json::json!([{
+            "prefix": "s3://warehouse/sales/orders",
+            "config": {
+                "s3.access-key-id": "AKIA-node",
+                "s3.secret-access-key": "secret",
+                "s3.session-token": "session",
+                "s3.session-token-expires-at-ms": not_after(),
+            },
+        }])
+    }
+
+    fn load_response(uuid: &str) -> Reply {
+        Reply::json(
+            200,
+            &serde_json::json!({
+                "metadata-location": "s3://warehouse/sales/orders/metadata/1.json",
+                "metadata": {"table-uuid": uuid, "snapshots": []},
+                "storage-credentials": credentials(),
+            }),
         )
     }
 
-    fn storage_credentials(prefix: &str, not_after_unix_ms: u64) -> String {
-        format!(
-            r#""storage-credentials": [{{
-              "prefix": "{prefix}",
-              "config": {{
-                "s3.access-key-id": "vended-access",
-                "s3.secret-access-key": "vended-secret",
-                "s3.session-token": "vended-token",
-                "s3.session-token-expires-at-ms": "{not_after_unix_ms}"
-              }}
-            }}]"#
+    fn routing(server: &TestServer, path: &str) -> CredentialRoutingContext {
+        CredentialRoutingContext::try_new(
+            format!("{}{path}", server.url()),
+            [(Arc::from("x-tenant"), Arc::from("t1"))],
         )
+        .expect("routing context")
     }
 
-    /// A REST catalog that answers exactly the two calls an acquisition makes.
-    ///
-    /// It records the Authorization header of every request, which is how the
-    /// test observes *whose* identity the acquisition used — the point of D1,
-    /// and the thing an implementation could silently get wrong while still
-    /// returning material.
-    struct ScriptedRestCatalog {
-        address: SocketAddr,
-        shutdown: Arc<AtomicBool>,
-        authorizations: Arc<Mutex<Vec<String>>>,
-        thread: Option<std::thread::JoinHandle<()>>,
+    fn load_table_path(server: &TestServer, uuid: &str) -> ExecutionNodeAcquisitionPath {
+        ExecutionNodeAcquisitionPath::project(&CredentialRenewalPath::LoadTableDelegation {
+            routing: routing(server, TABLE_PATH),
+            table: CredentialLoadTableDelegation::try_new(
+                vec![Arc::from("sales")],
+                Arc::from("orders"),
+                Arc::from(uuid),
+            )
+            .expect("delegation"),
+        })
+        .expect("projected path")
     }
 
-    impl ScriptedRestCatalog {
-        fn start(table_uuid: String, not_after_unix_ms: u64) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind scripted REST catalog");
-            listener
-                .set_nonblocking(true)
-                .expect("make scripted REST catalog nonblocking");
-            let address = listener.local_addr().expect("read scripted REST address");
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let authorizations = Arc::new(Mutex::new(Vec::new()));
-            let thread_shutdown = Arc::clone(&shutdown);
-            let thread_authorizations = Arc::clone(&authorizations);
-            let thread = std::thread::spawn(move || {
-                while !thread_shutdown.load(Ordering::SeqCst) {
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            let _ = stream.set_nonblocking(false);
-                            let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-                            let mut buffer = [0_u8; 4096];
-                            let read = stream.read(&mut buffer).unwrap_or(0);
-                            if read == 0 {
-                                continue;
-                            }
-                            let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-                            for line in request.lines() {
-                                if let Some(value) = line
-                                    .strip_prefix("authorization: ")
-                                    .or_else(|| line.strip_prefix("Authorization: "))
-                                {
-                                    thread_authorizations
-                                        .lock()
-                                        .unwrap_or_else(|error| error.into_inner())
-                                        .push(value.trim().to_string());
-                                }
-                            }
-                            let body = if request.contains("/v1/config") {
-                                r#"{"defaults":{},"overrides":{}}"#.to_string()
-                            } else if request.contains("/credentials") {
-                                format!(
-                                    "{{{}}}",
-                                    storage_credentials(
-                                        "s3://warehouse/sales/orders",
-                                        not_after_unix_ms
-                                    )
-                                )
-                            } else {
-                                format!(
-                                    r#"{{"metadata-location":"s3://warehouse/sales/orders/metadata/v1.json","metadata":{},{}}}"#,
-                                    table_metadata(&table_uuid),
-                                    storage_credentials(
-                                        "s3://warehouse/sales/orders",
-                                        not_after_unix_ms
-                                    )
-                                )
-                            };
-                            let response = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                                body.len()
-                            );
-                            let _ = stream.write_all(response.as_bytes());
-                        }
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
-                        Err(error) => panic!("accept scripted REST connection: {error}"),
-                    }
-                }
-            });
-            Self {
-                address,
-                shutdown,
-                authorizations,
-                thread: Some(thread),
-            }
-        }
-
-        fn uri(&self) -> String {
-            format!("http://{}", self.address)
-        }
-
-        fn authorizations(&self) -> Vec<String> {
-            self.authorizations
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .clone()
-        }
-    }
-
-    impl Drop for ScriptedRestCatalog {
-        fn drop(&mut self) {
-            self.shutdown.store(true, Ordering::SeqCst);
-            let _ = TcpStream::connect(self.address);
-            if let Some(thread) = self.thread.take() {
-                // Never raise from a destructor that is already unwinding: Rust
-                // turns that into an abort, which destroys every other test's
-                // result and buries the failure being reported.
-                assert!(
-                    thread.join().is_ok() || std::thread::panicking(),
-                    "join scripted REST catalog"
-                );
-            }
-        }
-    }
-
-    fn not_after() -> u64 {
-        u64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("wall clock")
-                .as_millis(),
-        )
-        .expect("wall clock fits")
-            + 3_600_000
+    fn endpoint_path(server: &TestServer) -> ExecutionNodeAcquisitionPath {
+        ExecutionNodeAcquisitionPath::project(&CredentialRenewalPath::CredentialsEndpoint(routing(
+            server,
+            "/credentials",
+        )))
+        .expect("projected path")
     }
 
     fn refresher(
-        server: &ScriptedRestCatalog,
+        server: &TestServer,
         runtime: &tokio::runtime::Runtime,
+        principal: IcebergRestAuthMaterial,
         path: ExecutionNodeAcquisitionPath,
     ) -> ExecutionNodeCredentialsEndpointRefresher {
         ExecutionNodeCredentialsEndpointRefresher::new(
             "warehouse".to_string(),
             vec![
                 ("iceberg.catalog.type".to_string(), "rest".to_string()),
-                ("uri".to_string(), server.uri()),
+                ("uri".to_string(), server.url()),
             ],
-            IcebergRestAuthMaterial::Bearer {
-                token: novarocks_fs::SecretValue::new("execution-node-token"),
-            },
+            principal,
             IcebergCatalogRuntime::new(runtime.handle().clone()),
             path,
         )
     }
 
-    fn policy() -> VendedS3CredentialRefreshCallPolicy {
+    fn bearer() -> IcebergRestAuthMaterial {
+        IcebergRestAuthMaterial::Bearer {
+            token: novarocks_fs::SecretValue::new("execution-node-token"),
+        }
+    }
+
+    fn policy(attempts: u8) -> VendedS3CredentialRefreshCallPolicy {
         VendedS3CredentialRefreshCallPolicy::try_new(
             Duration::from_secs(10),
-            std::num::NonZeroU8::new(1).expect("attempts"),
-            Duration::from_millis(10),
+            std::num::NonZeroU8::new(attempts).expect("attempts"),
+            Duration::from_millis(1),
             Arc::new(PermittedDispatch),
         )
         .expect("policy")
     }
 
-    fn load_table_path(uuid: &str) -> ExecutionNodeAcquisitionPath {
-        ExecutionNodeAcquisitionPath::project(&CredentialRenewalPath::LoadTableDelegation(
-            CredentialLoadTableDelegation::try_new(
-                vec![Arc::from("sales")],
-                Arc::from("orders"),
-                Arc::from(uuid),
-            )
-            .expect("delegation"),
-        ))
-        .expect("projected path")
-    }
-
     #[test]
-    fn an_execution_node_acquires_along_the_endpoint_path_under_its_own_identity() {
-        // CAD-1 D1 and C11: the acquisition authenticates as this node, not as
-        // whoever seeded the material. Returning credentials is not evidence of
-        // that — the Authorization header is.
+    fn a_cold_node_acquires_along_the_frozen_load_table_route_without_a_session() {
+        // `/v1/config` would now name another prefix; the node never asks.
+        let server = TestServer::start(
+            Script::new()
+                .on(
+                    "GET",
+                    "/v1/config",
+                    Reply::config(&[("prefix", "p2")], &[], None),
+                )
+                .on("GET", TABLE_PATH, load_response(TABLE_UUID)),
+        );
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let server = ScriptedRestCatalog::start(TABLE_UUID.to_string(), not_after());
-        let endpoint = format!("{}/v1/credentials", server.uri());
         let refresher = refresher(
             &server,
             &runtime,
-            ExecutionNodeAcquisitionPath::CredentialsEndpoint(Arc::from(endpoint.as_str())),
+            bearer(),
+            load_table_path(&server, TABLE_UUID),
         );
 
-        let refreshed = refresher
-            .refresh_vended_s3_credentials(policy())
-            .expect("acquisition");
-        let entries = refreshed.into_entries();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].prefix().as_str(), "s3://warehouse/sales/orders");
-
-        let authorizations = server.authorizations();
-        assert!(!authorizations.is_empty());
-        assert!(
-            authorizations
-                .iter()
-                .all(|value| value == "Bearer execution-node-token"),
-            "every catalog call must carry this node's own identity, saw {authorizations:?}"
-        );
-    }
-
-    #[test]
-    fn an_execution_node_acquires_along_the_load_table_path_and_keeps_only_the_material() {
-        // CAD-1 acceptance 9 and 17. A catalog with no credentials endpoint
-        // still renews, and the response's metadata reaches nothing: the only
-        // value that survives the call is the credential entry set.
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let server = ScriptedRestCatalog::start(TABLE_UUID.to_string(), not_after());
-        let refresher = refresher(&server, &runtime, load_table_path(TABLE_UUID));
-
-        let refreshed = refresher
-            .refresh_vended_s3_credentials(policy())
-            .expect("acquisition");
-        let entries = refreshed.into_entries();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].prefix().as_str(), "s3://warehouse/sales/orders");
-    }
-
-    #[test]
-    fn a_node_that_cannot_reach_its_catalog_says_so_rather_than_reporting_a_denial() {
-        // CAD-1 D12 / acceptance 18, exercised through the real client rather
-        // than a synthetic error. Executor-to-catalog reachability is a new
-        // deployment requirement, and an operator told "denied" would go read
-        // policy documents while the actual fact is that this node has no route
-        // to the catalog at all.
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        // A port nothing is listening on: bind it, read the address, drop it.
-        let closed = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("reserve a closed port");
-            listener.local_addr().expect("read reserved address")
+        let Ok(refresh) = refresher.refresh_vended_s3_credentials(policy(1)) else {
+            panic!("the node acquires on first use");
         };
-        let source = crate::authority_source::IcebergAuthorityMaterialSource::new(
-            Arc::new(ExecutionNodeCredentialsEndpointRefresher::new(
-                "warehouse".to_string(),
-                vec![
-                    ("iceberg.catalog.type".to_string(), "rest".to_string()),
-                    ("uri".to_string(), format!("http://{closed}")),
-                ],
-                IcebergRestAuthMaterial::Bearer {
-                    token: novarocks_fs::SecretValue::new("execution-node-token"),
-                },
-                IcebergCatalogRuntime::new(runtime.handle().clone()),
-                ExecutionNodeAcquisitionPath::CredentialsEndpoint(Arc::from(
-                    format!("http://{closed}/v1/credentials").as_str(),
-                )),
-            )),
-            novarocks_spi::connector::StorageCredentialScopePrefix::try_from_normalized(
-                "s3://warehouse/sales/orders",
-            )
-            .expect("prefix"),
-        );
+        drop(refresh);
 
-        let failure = novarocks_fs::AuthorityMaterialSource::acquire(
-            &source,
-            Instant::now() + Duration::from_secs(5),
-        )
-        .expect_err("an unreachable catalog cannot vend");
-        assert!(
-            matches!(
-                failure,
-                novarocks_fs::AcquisitionFailure::CatalogUnreachable(_)
+        assert_eq!(server.count("GET", "/v1/config"), 0);
+        let loads = server.requests_to("GET", TABLE_PATH);
+        assert_eq!(loads.len(), 1);
+        assert_eq!(
+            loads[0].header("authorization"),
+            Some("Bearer execution-node-token")
+        );
+        assert_eq!(loads[0].header("x-tenant"), Some("t1"));
+        assert_eq!(
+            loads[0].header("x-iceberg-access-delegation"),
+            Some("vended-credentials")
+        );
+    }
+
+    #[test]
+    fn the_endpoint_route_uses_an_exchanged_token_and_no_delegation_header() {
+        let server = TestServer::start(
+            Script::new()
+                .on("POST", "/v1/oauth/tokens", Reply::token("node-token"))
+                .on(
+                    "GET",
+                    "/credentials",
+                    Reply::json(
+                        200,
+                        &serde_json::json!({"storage-credentials": credentials()}),
+                    ),
+                ),
+        );
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let principal = IcebergRestAuthMaterial::Oauth2 {
+            client_id: "executor".to_string(),
+            client_secret: novarocks_fs::SecretValue::new("secret"),
+        };
+        let refresher = refresher(&server, &runtime, principal, endpoint_path(&server));
+
+        assert!(refresher.refresh_vended_s3_credentials(policy(1)).is_ok());
+        assert!(refresher.refresh_vended_s3_credentials(policy(1)).is_ok());
+
+        assert_eq!(server.count("POST", "/v1/oauth/tokens"), 1, "token kept");
+        let renewals = server.requests_to("GET", "/credentials");
+        assert_eq!(renewals.len(), 2);
+        assert!(renewals.iter().all(|request| {
+            request.header("authorization") == Some("Bearer node-token")
+                && request.header("x-iceberg-access-delegation").is_none()
+        }));
+    }
+
+    #[test]
+    fn a_response_for_another_table_or_without_credentials_is_refused() {
+        for (reply, expected) in [
+            (load_response(OTHER_TABLE_UUID), "different table"),
+            (
+                Reply::json(
+                    200,
+                    &serde_json::json!({
+                        "metadata-location": "s3://warehouse/sales/orders/metadata/1.json",
+                        "metadata": {"table-uuid": TABLE_UUID},
+                    }),
+                ),
+                "static access delegation",
             ),
-            "expected an unreachable classification, got {failure:?}"
-        );
+        ] {
+            let server = TestServer::start(Script::new().on("GET", TABLE_PATH, reply));
+            let runtime = tokio::runtime::Runtime::new().expect("runtime");
+            let refresher = refresher(
+                &server,
+                &runtime,
+                bearer(),
+                load_table_path(&server, TABLE_UUID),
+            );
+            let Err(error) = refresher.refresh_vended_s3_credentials(policy(1)) else {
+                panic!("{expected} must be refused");
+            };
+            assert_eq!(
+                error.kind(),
+                ConnectorErrorKind::PermissionDenied,
+                "{expected}"
+            );
+            assert!(error.message().contains(expected), "{}", error.message());
+        }
     }
 
     #[test]
-    fn a_load_table_acquisition_refuses_a_response_for_another_table() {
-        // The identity check is the whole protection against installing
-        // material under an authority it was not issued for.
+    fn request_layer_failures_are_retryable_and_never_a_denial() {
+        // A 401 after the node's token expired must not close the authority
+        // while its material is still valid (L17).
+        let server = TestServer::start(Script::new().on("GET", TABLE_PATH, Reply::status(401)));
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let server = ScriptedRestCatalog::start(OTHER_TABLE_UUID.to_string(), not_after());
-        let refresher = refresher(&server, &runtime, load_table_path(TABLE_UUID));
-
-        let error = match refresher.refresh_vended_s3_credentials(policy()) {
-            Err(error) => error,
-            Ok(_) => panic!("a response for another table is not this authority's material"),
+        let refresher = refresher(
+            &server,
+            &runtime,
+            bearer(),
+            load_table_path(&server, TABLE_UUID),
+        );
+        let Err(error) = refresher.refresh_vended_s3_credentials(policy(2)) else {
+            panic!("a 401 is not material");
         };
-        assert_eq!(error.kind(), ConnectorErrorKind::PermissionDenied);
-        assert!(error.message().contains("different table"));
+        assert_eq!(error.kind(), ConnectorErrorKind::Unavailable);
+        assert!(error.retryable_before_progress());
+        assert_eq!(server.requests_to("GET", TABLE_PATH).len(), 2, "retried");
+
+        let closed = TestServer::start(Script::new());
+        let unreachable = load_table_path(&closed, TABLE_UUID);
+        drop(closed.shut_down());
+        let refresher = ExecutionNodeCredentialsEndpointRefresher::new(
+            "warehouse".to_string(),
+            vec![
+                ("iceberg.catalog.type".to_string(), "rest".to_string()),
+                ("uri".to_string(), "http://127.0.0.1:9".to_string()),
+            ],
+            bearer(),
+            IcebergCatalogRuntime::new(runtime.handle().clone()),
+            unreachable,
+        );
+        let Err(error) = refresher.refresh_vended_s3_credentials(policy(1)) else {
+            panic!("an unreachable catalog yields no material");
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::Unavailable);
+        assert!(error.retryable_before_progress());
+    }
+
+    #[test]
+    fn a_non_canonical_announced_address_is_refused() {
+        let routing = CredentialRoutingContext::try_new(
+            "http://127.0.0.1:1/v1/namespaces/a/tables/b?x=1",
+            std::iter::empty(),
+        )
+        .expect("syntactically valid");
+        let error = ExecutionNodeAcquisitionPath::project(
+            &CredentialRenewalPath::CredentialsEndpoint(routing),
+        )
+        .expect_err("a query string is not a route");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }
 }

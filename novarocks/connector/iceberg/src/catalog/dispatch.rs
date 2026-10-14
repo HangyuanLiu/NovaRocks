@@ -27,7 +27,7 @@ use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 use crate::commit::model::FrozenRequest;
 use crate::iceberg::{Catalog, TableIdent};
 
-use super::transaction::{CatalogCommitDispatch, CommitProof};
+use super::transaction::{CatalogCommitDispatch, CommitDispatchResult, CommitProof};
 
 /// Publishes to an existing table with exactly one `update_table`.
 ///
@@ -74,9 +74,8 @@ impl UpdateTableDispatch {
     }
 }
 
-#[async_trait]
-impl CatalogCommitDispatch for UpdateTableDispatch {
-    async fn dispatch_once(
+impl UpdateTableDispatch {
+    async fn dispatch_inner(
         &self,
         staged: Option<&FrozenRequest>,
     ) -> Result<CommitProof, crate::iceberg::Error> {
@@ -99,6 +98,13 @@ impl CatalogCommitDispatch for UpdateTableDispatch {
         let snapshot_id =
             committed_snapshot_id(table.metadata(), &self.target_ref, expected_snapshot_id)?;
         Ok(CommitProof::applied(snapshot_id).with_table_uuid(table.metadata().uuid().to_string()))
+    }
+}
+
+#[async_trait]
+impl CatalogCommitDispatch for UpdateTableDispatch {
+    async fn dispatch_once(&self, staged: Option<&FrozenRequest>) -> CommitDispatchResult {
+        CommitDispatchResult::from_catalog_result(self.dispatch_inner(staged).await)
     }
 
     async fn adjudicate(&self) -> Result<Option<CommitProof>, ConnectorError> {
@@ -202,9 +208,8 @@ impl CreateTableDispatch {
     }
 }
 
-#[async_trait]
-impl CatalogCommitDispatch for CreateTableDispatch {
-    async fn dispatch_once(
+impl CreateTableDispatch {
+    async fn dispatch_inner(
         &self,
         _staged: Option<&FrozenRequest>,
     ) -> Result<CommitProof, crate::iceberg::Error> {
@@ -234,6 +239,13 @@ impl CatalogCommitDispatch for CreateTableDispatch {
                 .map(|snapshot| snapshot.snapshot_id()),
         )
         .with_table_uuid(table.metadata().uuid().to_string()))
+    }
+}
+
+#[async_trait]
+impl CatalogCommitDispatch for CreateTableDispatch {
+    async fn dispatch_once(&self, staged: Option<&FrozenRequest>) -> CommitDispatchResult {
+        CommitDispatchResult::from_catalog_result(self.dispatch_inner(staged).await)
     }
 
     async fn adjudicate(&self) -> Result<Option<CommitProof>, ConnectorError> {
@@ -292,9 +304,8 @@ impl ConditionalCreateDispatch {
     }
 }
 
-#[async_trait]
-impl CatalogCommitDispatch for ConditionalCreateDispatch {
-    async fn dispatch_once(
+impl ConditionalCreateDispatch {
+    async fn dispatch_inner(
         &self,
         _staged: Option<&FrozenRequest>,
     ) -> Result<CommitProof, crate::iceberg::Error> {
@@ -365,6 +376,13 @@ impl CatalogCommitDispatch for ConditionalCreateDispatch {
                 }
             }),
         }
+    }
+}
+
+#[async_trait]
+impl CatalogCommitDispatch for ConditionalCreateDispatch {
+    async fn dispatch_once(&self, staged: Option<&FrozenRequest>) -> CommitDispatchResult {
+        CommitDispatchResult::from_catalog_result(self.dispatch_inner(staged).await)
     }
 
     async fn adjudicate(&self) -> Result<Option<CommitProof>, ConnectorError> {

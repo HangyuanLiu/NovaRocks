@@ -38,6 +38,10 @@ pub const MAX_CREDENTIAL_LEASE_PREFIXES: usize = 64;
 /// Bounded like every other wire string here: an address a server advertises
 /// is still input, and an unbounded one is a way to make a descriptor large.
 pub const MAX_CREDENTIALS_ENDPOINT_BYTES: usize = 2 * 1024;
+/// Upper bound on the public routing headers one acquisition path carries.
+pub const MAX_CREDENTIAL_ROUTING_HEADERS: usize = 16;
+/// Upper bound on the summed bytes of routing header names and values.
+pub const MAX_CREDENTIAL_ROUTING_HEADER_BYTES: usize = 4 * 1024;
 /// Namespace depth a load-table acquisition path may name.
 pub const MAX_CREDENTIAL_NAMESPACE_LEVELS: usize = 16;
 /// Byte bound on one namespace level, table name or table uuid.
@@ -168,11 +172,6 @@ impl VendedS3CredentialLeaseContribution {
         {
             return Err(invalid("duplicate vended S3 credential prefix"));
         }
-        if let Some(CredentialRenewalPath::CredentialsEndpoint(endpoint)) = &renewal_path
-            && endpoint.is_empty()
-        {
-            return Err(invalid("vended S3 credential refresh endpoint"));
-        }
         Ok(Self {
             entries,
             renewal_path,
@@ -202,7 +201,7 @@ impl VendedS3CredentialLeaseContribution {
 
     pub fn refresh_endpoint(&self) -> Option<&str> {
         match &self.renewal_path {
-            Some(CredentialRenewalPath::CredentialsEndpoint(endpoint)) => Some(endpoint),
+            Some(CredentialRenewalPath::CredentialsEndpoint(routing)) => Some(routing.url()),
             _ => None,
         }
     }
@@ -570,10 +569,148 @@ pub struct CredentialLeaseDescriptor {
 /// scope's credentials from its own address, or it may vend them only inside a
 /// load-table response. A consumer selects one and never probes the other
 /// after a failure (CAD-1 D2, D11).
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// Both carry the public routing context the coordinator froze from its one
+/// catalog session, so a consumer reaches exactly the service and catalog the
+/// coordinator observed, never a session of its own (IRU-13a D15).
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum CredentialRenewalPath {
-    CredentialsEndpoint(Arc<str>),
-    LoadTableDelegation(CredentialLoadTableDelegation),
+    CredentialsEndpoint(CredentialRoutingContext),
+    LoadTableDelegation {
+        routing: CredentialRoutingContext,
+        table: CredentialLoadTableDelegation,
+    },
+}
+
+impl CredentialRenewalPath {
+    /// Where and with which public headers a consumer sends its acquisition.
+    pub fn routing(&self) -> &CredentialRoutingContext {
+        match self {
+            Self::CredentialsEndpoint(routing) | Self::LoadTableDelegation { routing, .. } => {
+                routing
+            }
+        }
+    }
+}
+
+/// One public request header an acquisition sends to reach its catalog.
+///
+/// Public by construction (a persistent catalog header or an explicitly
+/// declared server-supplied one), yet still request data rather than a
+/// diagnostic: `Debug` prints the name only.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CredentialRoutingHeader {
+    name: Arc<str>,
+    value: Arc<str>,
+}
+
+impl CredentialRoutingHeader {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl std::fmt::Debug for CredentialRoutingHeader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialRoutingHeader")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The public facts that decide which service and catalog an acquisition
+/// reaches: the complete request address and the public routing headers. It
+/// never carries authentication material; each node authenticates with its
+/// own identity.
+///
+/// Headers are kept in canonical order (by lowercase name, names unique) so
+/// that equal contexts encode identically and key the same authority.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct CredentialRoutingContext {
+    url: Arc<str>,
+    headers: Arc<[CredentialRoutingHeader]>,
+}
+
+impl CredentialRoutingContext {
+    pub fn try_new(
+        url: impl Into<Arc<str>>,
+        headers: impl IntoIterator<Item = (Arc<str>, Arc<str>)>,
+    ) -> Result<Self, ConnectorError> {
+        let url = url.into();
+        if url.is_empty()
+            || url.len() > MAX_CREDENTIALS_ENDPOINT_BYTES
+            || !(url.starts_with("https://") || url.starts_with("http://"))
+            || url.bytes().any(|byte| {
+                byte.is_ascii_control() || byte.is_ascii_whitespace() || !byte.is_ascii()
+            })
+        {
+            return Err(invalid("credential routing address"));
+        }
+        let mut headers = headers
+            .into_iter()
+            .map(|(name, value)| CredentialRoutingHeader { name, value })
+            .collect::<Vec<_>>();
+        if headers.len() > MAX_CREDENTIAL_ROUTING_HEADERS {
+            return Err(exhausted("credential routing header set"));
+        }
+        let mut total = 0_usize;
+        for header in &headers {
+            if !is_routing_header_name(&header.name) || !is_routing_header_value(&header.value) {
+                return Err(invalid("credential routing header"));
+            }
+            total = total.saturating_add(header.name.len() + header.value.len());
+        }
+        if total > MAX_CREDENTIAL_ROUTING_HEADER_BYTES {
+            return Err(exhausted("credential routing header bytes"));
+        }
+        headers.sort();
+        if headers.windows(2).any(|pair| pair[0].name == pair[1].name) {
+            return Err(invalid("duplicate credential routing header"));
+        }
+        Ok(Self {
+            url,
+            headers: headers.into(),
+        })
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn headers(&self) -> &[CredentialRoutingHeader] {
+        &self.headers
+    }
+}
+
+impl std::fmt::Debug for CredentialRoutingContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialRoutingContext")
+            .field("url", &self.url)
+            .field("headers", &self.headers)
+            .finish()
+    }
+}
+
+/// A lowercase HTTP token (RFC 9110 `tchar`).
+fn is_routing_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"!#$%&'*+-.^_`|~".contains(&byte)
+        })
+}
+
+/// Visible ASCII, spaces and tabs only: no control character can split a
+/// header (RFC 9110 field value, ASCII subset).
+fn is_routing_header_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte == b'\t' || (b' '..=b'~').contains(&byte))
 }
 
 /// The exact table a load-table acquisition names.
@@ -581,7 +718,7 @@ pub enum CredentialRenewalPath {
 /// The uuid travels with the identity rather than being re-derived: a later
 /// response that answered for a different table would otherwise install
 /// material for the wrong authority (CAD-1 D11b).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CredentialLoadTableDelegation {
     namespace: Vec<Arc<str>>,
     table: Arc<str>,
@@ -655,11 +792,6 @@ impl CredentialLeaseDescriptor {
         if not_after_unix_ms == 0 {
             return Err(invalid("credential lease expiration"));
         }
-        if let Some(CredentialRenewalPath::CredentialsEndpoint(endpoint)) = &renewal_path
-            && (endpoint.is_empty() || endpoint.len() > MAX_CREDENTIALS_ENDPOINT_BYTES)
-        {
-            return Err(invalid("credential lease credentials endpoint"));
-        }
         Ok(Self {
             lease_id,
             epoch,
@@ -686,7 +818,7 @@ impl CredentialLeaseDescriptor {
     /// carries.
     pub fn credentials_endpoint(&self) -> Option<&str> {
         match &self.renewal_path {
-            Some(CredentialRenewalPath::CredentialsEndpoint(endpoint)) => Some(endpoint),
+            Some(CredentialRenewalPath::CredentialsEndpoint(routing)) => Some(routing.url()),
             _ => None,
         }
     }
@@ -765,10 +897,13 @@ mod tests {
     use super::{
         ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
         ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseDescriptor, CredentialLeaseId,
-        CredentialLeaseProvider, CredentialRenewalPath, MAX_CREDENTIAL_LEASE_PREFIXES,
-        VendedS3CredentialLeaseContribution, VendedS3CredentialLeaseEntry,
-        VendedS3CredentialLeaseRefresh, VendedS3CredentialRefreshCallPolicy,
-        VendedS3CredentialRefreshDispatch, VendedS3CredentialRefreshDispatchGuard,
+        CredentialLeaseProvider, CredentialLoadTableDelegation, CredentialRenewalPath,
+        CredentialRoutingContext, MAX_CREDENTIAL_LEASE_PREFIXES,
+        MAX_CREDENTIAL_ROUTING_HEADER_BYTES, MAX_CREDENTIAL_ROUTING_HEADERS,
+        MAX_CREDENTIALS_ENDPOINT_BYTES, VendedS3CredentialLeaseContribution,
+        VendedS3CredentialLeaseEntry, VendedS3CredentialLeaseRefresh,
+        VendedS3CredentialRefreshCallPolicy, VendedS3CredentialRefreshDispatch,
+        VendedS3CredentialRefreshDispatchGuard,
     };
     use crate::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
@@ -963,11 +1098,11 @@ mod tests {
                 catalog_properties.handle().clone(),
                 entries.len(),
                 match renewal_path {
-                    Some(CredentialRenewalPath::CredentialsEndpoint(endpoint)) => {
-                        Some(endpoint.to_string())
+                    Some(CredentialRenewalPath::CredentialsEndpoint(routing)) => {
+                        Some(routing.url().to_string())
                     }
-                    Some(CredentialRenewalPath::LoadTableDelegation(delegation)) => {
-                        Some(format!("load-table:{}", delegation.table()))
+                    Some(CredentialRenewalPath::LoadTableDelegation { table, .. }) => {
+                        Some(format!("load-table:{}", table.table()))
                     }
                     None => None,
                 },
@@ -1014,8 +1149,9 @@ mod tests {
                 )
                 .expect("entry"),
             ],
-            Some(CredentialRenewalPath::CredentialsEndpoint(Arc::from(
+            Some(CredentialRenewalPath::CredentialsEndpoint(routing(
                 "https://catalog.example.test/v1/credentials",
+                &[],
             ))),
         )
         .expect("contribution");
@@ -1029,6 +1165,221 @@ mod tests {
         assert_eq!(seen[0].1, 1);
         assert_eq!(
             seen[0].2.as_deref(),
+            Some("https://catalog.example.test/v1/credentials")
+        );
+    }
+
+    fn header(name: &str, value: &str) -> (Arc<str>, Arc<str>) {
+        (Arc::from(name), Arc::from(value))
+    }
+
+    fn routing(url: &str, headers: &[(&str, &str)]) -> CredentialRoutingContext {
+        CredentialRoutingContext::try_new(
+            url,
+            headers.iter().map(|(name, value)| header(name, value)),
+        )
+        .expect("routing context")
+    }
+
+    #[test]
+    fn routing_headers_are_kept_in_canonical_order_so_equal_contexts_compare_equal() {
+        let first = routing(
+            "https://catalog.example.test/v1/p1/credentials",
+            &[("x-project-id", "p1"), ("polaris-realm", "r1")],
+        );
+        let second = routing(
+            "https://catalog.example.test/v1/p1/credentials",
+            &[("polaris-realm", "r1"), ("x-project-id", "p1")],
+        );
+        let names = first
+            .headers()
+            .iter()
+            .map(|header| header.name())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["polaris-realm", "x-project-id"]);
+        assert_eq!(first.headers()[0].value(), "r1");
+        assert_eq!(first, second);
+        assert_eq!(
+            first.url(),
+            "https://catalog.example.test/v1/p1/credentials"
+        );
+
+        // Any single routing fact makes a different acquisition.
+        assert_ne!(
+            first,
+            routing(
+                "https://catalog.example.test/v1/p1/credentials",
+                &[("x-project-id", "p2"), ("polaris-realm", "r1")],
+            )
+        );
+        assert_ne!(
+            first,
+            routing(
+                "https://catalog.example.test/v1/p2/credentials",
+                &[("x-project-id", "p1"), ("polaris-realm", "r1")],
+            )
+        );
+    }
+
+    #[test]
+    fn routing_context_refuses_malformed_and_duplicate_headers() {
+        let url = "https://catalog.example.test/v1/credentials";
+        for (name, value) in [
+            ("", "v"),
+            ("X-Project-Id", "v"),
+            ("x project", "v"),
+            ("x-project:", "v"),
+            ("x-project", "line\r\nbreak"),
+            ("x-project", "caf\u{e9}"),
+        ] {
+            assert!(
+                CredentialRoutingContext::try_new(url, [header(name, value)]).is_err(),
+                "header {name:?} must be refused"
+            );
+        }
+        assert!(
+            CredentialRoutingContext::try_new(
+                url,
+                [header("x-project-id", "a"), header("x-project-id", "b")],
+            )
+            .is_err()
+        );
+        // A tab and a space are legal inside a field value.
+        assert!(CredentialRoutingContext::try_new(url, [header("x-tag", "a b\tc")]).is_ok());
+    }
+
+    #[test]
+    fn routing_context_bounds_header_count_and_bytes() {
+        let url = "https://catalog.example.test/v1/credentials";
+        let at_bound = (0..MAX_CREDENTIAL_ROUTING_HEADERS)
+            .map(|index| header(&format!("x-h{index}"), "v"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            CredentialRoutingContext::try_new(url, at_bound)
+                .expect("count bound is inclusive")
+                .headers()
+                .len(),
+            MAX_CREDENTIAL_ROUTING_HEADERS
+        );
+        let over_count = (0..=MAX_CREDENTIAL_ROUTING_HEADERS)
+            .map(|index| header(&format!("x-h{index}"), "v"))
+            .collect::<Vec<_>>();
+        assert!(CredentialRoutingContext::try_new(url, over_count).is_err());
+
+        // Names and values are summed together.
+        let name = "x-big";
+        let fits = "v".repeat(MAX_CREDENTIAL_ROUTING_HEADER_BYTES - name.len());
+        assert!(CredentialRoutingContext::try_new(url, [header(name, &fits)]).is_ok());
+        let over = "v".repeat(MAX_CREDENTIAL_ROUTING_HEADER_BYTES - name.len() + 1);
+        assert!(CredentialRoutingContext::try_new(url, [header(name, &over)]).is_err());
+        let half = "v".repeat(MAX_CREDENTIAL_ROUTING_HEADER_BYTES / 2);
+        assert!(
+            CredentialRoutingContext::try_new(url, [header("x-a", &half), header("x-b", &half)])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn routing_address_must_be_a_bounded_http_url() {
+        for url in [
+            "",
+            "catalog.example.test/v1/credentials",
+            "ftp://catalog.example.test/v1/credentials",
+            "https://catalog.example.test/v1/cred entials",
+            "https://catalog.example.test/v1/\ncredentials",
+            "https://catalog.example.test/v1/cr\u{e9}dentials",
+        ] {
+            assert!(
+                CredentialRoutingContext::try_new(url, []).is_err(),
+                "address {url:?} must be refused"
+            );
+        }
+        assert!(
+            CredentialRoutingContext::try_new("http://127.0.0.1:8181/v1/credentials", []).is_ok()
+        );
+
+        let base = "https://catalog.example.test/";
+        let at_bound = format!(
+            "{base}{}",
+            "a".repeat(MAX_CREDENTIALS_ENDPOINT_BYTES - base.len())
+        );
+        assert!(CredentialRoutingContext::try_new(at_bound.as_str(), []).is_ok());
+        let over = format!("{at_bound}a");
+        assert!(CredentialRoutingContext::try_new(over.as_str(), []).is_err());
+    }
+
+    #[test]
+    fn debug_of_a_renewal_path_never_prints_a_routing_header_value() {
+        let routing = routing(
+            "https://catalog.example.test/v1/credentials",
+            &[("x-project-id", "value-canary")],
+        );
+        let delegation = CredentialRenewalPath::LoadTableDelegation {
+            routing: routing.clone(),
+            table: CredentialLoadTableDelegation::try_new(
+                vec![Arc::from("sales")],
+                Arc::from("orders"),
+                Arc::from("8f1d0c6e-0000-4000-8000-000000000001"),
+            )
+            .expect("delegation"),
+        };
+        for rendered in [
+            format!("{routing:?}"),
+            format!("{:?}", routing.headers()[0]),
+            format!("{delegation:?}"),
+            format!(
+                "{:?}",
+                CredentialRenewalPath::CredentialsEndpoint(routing.clone())
+            ),
+        ] {
+            assert!(rendered.contains("x-project-id"), "{rendered}");
+            assert!(!rendered.contains("value-canary"), "{rendered}");
+        }
+        assert_eq!(delegation.routing(), &routing);
+    }
+
+    #[test]
+    fn the_endpoint_accessors_answer_only_for_the_credentials_endpoint_path() {
+        let endpoint = routing("https://catalog.example.test/v1/credentials", &[]);
+        let announced = CredentialLeaseDescriptor::try_new(
+            CredentialLeaseId::try_from_bytes([1; 16]).expect("lease"),
+            1,
+            owner(),
+            CredentialLeaseProvider::S3,
+            vec![prefix("s3://bucket/a")],
+            10,
+            true,
+            Some(CredentialRenewalPath::CredentialsEndpoint(endpoint.clone())),
+            StorageAccessDomainId::from_bytes([9; 32]),
+        )
+        .expect("descriptor");
+        assert_eq!(
+            announced.credentials_endpoint(),
+            Some("https://catalog.example.test/v1/credentials")
+        );
+        let delegated = CredentialLeaseDescriptor::try_new(
+            CredentialLeaseId::try_from_bytes([1; 16]).expect("lease"),
+            1,
+            owner(),
+            CredentialLeaseProvider::S3,
+            vec![prefix("s3://bucket/a")],
+            10,
+            true,
+            Some(CredentialRenewalPath::LoadTableDelegation {
+                routing: endpoint,
+                table: CredentialLoadTableDelegation::try_new(
+                    vec![Arc::from("sales")],
+                    Arc::from("orders"),
+                    Arc::from("8f1d0c6e-0000-4000-8000-000000000001"),
+                )
+                .expect("delegation"),
+            }),
+            StorageAccessDomainId::from_bytes([9; 32]),
+        )
+        .expect("descriptor");
+        assert_eq!(delegated.credentials_endpoint(), None);
+        assert_eq!(
+            delegated.renewal_path().map(|path| path.routing().url()),
             Some("https://catalog.example.test/v1/credentials")
         );
     }

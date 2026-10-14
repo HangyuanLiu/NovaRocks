@@ -41,8 +41,35 @@ pub(crate) fn all_admitted(inner: Arc<dyn NovaRocksCatalog>) -> Arc<dyn NovaRock
 
 #[async_trait]
 impl NovaRocksCatalog for AdmittedCatalog {
-    fn admits_uncommitted_proof(&self, error: &crate::iceberg::Error) -> bool {
-        self.inner.admits_uncommitted_proof(error)
+    fn commit_dispatch(
+        &self,
+        ident: crate::iceberg::TableIdent,
+        target_ref: Arc<str>,
+        marker: Option<(Arc<str>, Arc<str>)>,
+    ) -> Arc<dyn super::transaction::CatalogCommitDispatch> {
+        self.inner.commit_dispatch(ident, target_ref, marker)
+    }
+
+    async fn create_view(
+        &self,
+        namespace: super::CatalogNamespaceName,
+        creation: crate::iceberg::ViewCreation,
+    ) -> CatalogOutcome<super::CatalogTableName> {
+        self.inner.create_view(namespace, creation).await
+    }
+
+    async fn replace_view(
+        &self,
+        commit: crate::iceberg::ViewCommit,
+    ) -> CatalogOutcome<super::CatalogTableName> {
+        self.inner.replace_view(commit).await
+    }
+
+    async fn drop_view(
+        &self,
+        view: super::CatalogTableName,
+    ) -> CatalogOutcome<super::CatalogTableName> {
+        self.inner.drop_view(view).await
     }
 
     fn implementation_name(&self) -> &'static str {
@@ -155,11 +182,9 @@ impl NovaRocksCatalog for AdmittedCatalog {
     async fn commit_staged_table(
         &self,
         _commit: crate::iceberg::TableCommit,
-        _request_file_io: crate::iceberg::io::FileIO,
+        expectation: super::StagedPublicationExpectation,
     ) -> super::StagedCommitResult {
-        self.inner
-            .commit_staged_table(_commit, _request_file_io)
-            .await
+        self.inner.commit_staged_table(_commit, expectation).await
     }
 
     async fn prepare_conditional_create(

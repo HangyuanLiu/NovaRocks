@@ -32,7 +32,7 @@ under the License.
 | --- | --- | --- |
 | Hadoop catalog（`metadata.json` + commit lock） | ✅ | `src/connector/iceberg/catalog/hadoop_catalog.rs` |
 | In-memory catalog（仅测试） | ✅ | |
-| REST catalog（spec 主推） | 🚧 | 客户端基础已落（PR #82）：属性解析 + config handshake + dispatcher；engine flow 路由 / OAuth2 / SigV4 / Bearer 鉴权 / 端到端 fixture 待补 |
+| REST catalog（spec 主推） | ✅ | 上游 REST 客户端负责会话，NovaRocks 发出全部变更请求并给出证据；鉴权只经角色本地身份（FE 用 `CatalogControl`，BE 用 `DataCredentialVending`，OAuth2 client credentials 或 Bearer）；SigV4、API key 等其他方式不支持。见 [Catalog 接入](../catalog.md) 与 ADR-0175 |
 | AWS Glue catalog | ❌ | |
 | Hive Metastore（HMS）只读兼容入口 | ✅ 读 / ❌ 写 | 读取外部写入的表、元数据表与时间旅行；DDL、DML、维护、ANALYZE、OPTIMIZE 和 MV 管理在副作用前拒绝。写入请使用 REST 或 Hadoop catalog，见 [Catalog 接入](../catalog.md)。 |
 | Nessie catalog | ❌ | |

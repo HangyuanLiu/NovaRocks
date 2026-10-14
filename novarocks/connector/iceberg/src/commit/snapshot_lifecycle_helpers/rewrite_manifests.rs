@@ -40,9 +40,10 @@ use crate::iceberg::spec::{
     ManifestListWriter, ManifestStatus, ManifestWriterBuilder, Operation, SnapshotReference,
     SnapshotRetention, Summary,
 };
-use crate::iceberg::{Catalog, TableCommit, TableIdent, TableRequirement, TableUpdate};
+use crate::iceberg::{Catalog, TableIdent, TableRequirement, TableUpdate};
 
 use crate::commit::commit_with_retry;
+use crate::commit::existing_commit::existing_table_commit;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RewriteManifestsOutcome {
@@ -364,11 +365,10 @@ async fn run_rewrite_manifests_with_table(
             snapshot_id: Some(current.snapshot_id()),
         },
     ];
-    let commit = TableCommit::builder()
-        .ident(table.identifier().clone())
-        .updates(updates)
-        .requirements(requirements)
-        .build();
+    let commit = existing_table_commit(table.identifier().clone(), metadata, requirements, updates)
+        .map_err(|error| {
+            crate::iceberg::Error::new(crate::iceberg::ErrorKind::Unexpected, error.to_string())
+        })?;
     catalog.update_table(commit).await?;
 
     Ok(outcome)
@@ -698,6 +698,30 @@ async fn merge_manifest_group(
     }
 
     writer.write_manifest_file().await
+}
+
+#[cfg(test)]
+mod existing_table_commit_tests {
+    use super::*;
+    use crate::commit::existing_commit::test_support::local_table;
+
+    #[tokio::test]
+    async fn rewrite_commit_freezes_the_uuid_of_the_rewritten_metadata() {
+        let fixture = local_table().await;
+        fixture.append("first").await;
+        fixture.append("second").await;
+        let loaded = fixture.load().await;
+
+        let outcome = run_rewrite_manifests(fixture.catalog.clone(), fixture.ident.clone())
+            .await
+            .expect("rewrite manifests");
+
+        assert_eq!(outcome.rewritten_manifests_count, 2);
+        assert_eq!(
+            fixture.catalog.take_single_commit_uuids(),
+            vec![loaded.metadata().uuid()]
+        );
+    }
 }
 
 #[cfg(test)]

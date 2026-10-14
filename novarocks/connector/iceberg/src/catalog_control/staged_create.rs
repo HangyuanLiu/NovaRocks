@@ -104,7 +104,11 @@ pub(crate) enum RestStagedPrepareFailure {
     /// option and the only honest answers are the two below.
     Unsupported(String),
     Conflict(String),
+    /// A local check refused before any request.
     KnownUncommitted(String),
+    /// The stage itself was never dispatched or was rejected before
+    /// publication (D13); its failure keeps its kind.
+    StageUncommitted(ConnectorMutationFailure),
     CommitUnknown(String),
 }
 
@@ -234,6 +238,27 @@ pub(crate) fn prepare_rest_staged_table(
     } else {
         creation.build()
     };
+    // A vended generation must be able to hand execution nodes a route before
+    // anything is staged: a configuration an execution node cannot acquire
+    // under is refused here, with no side effect, rather than after the stage
+    // as an unknown outcome (L25).
+    if let Some(endpoints) = owner.vended_credential_refresh_catalog()
+        && endpoints.is_vended()
+    {
+        let session_endpoints = Arc::clone(&endpoints);
+        let binding = runtime
+            .resources()
+            .catalog_runtime()
+            .block_on(async move { session_endpoints.binding().await })
+            .map_err(|error| {
+                RestStagedPrepareFailure::KnownUncommitted(format!(
+                    "establish REST session runtime: {error}"
+                ))
+            })?
+            .map_err(|error| RestStagedPrepareFailure::KnownUncommitted(error.to_string()))?;
+        crate::rest_protocol::routing::preflight_route(&binding, &endpoints.route_admission())
+            .map_err(|error| RestStagedPrepareFailure::Unsupported(error.message().to_string()))?;
+    }
     let staging_owner = Arc::clone(&owner);
     let staging_namespace = crate::catalog::CatalogNamespaceName::new(namespace_name.clone());
     let staged = runtime
@@ -286,9 +311,35 @@ pub(crate) fn prepare_rest_staged_table(
                 let refresh_scope = seed
                     .staged_refresh_scope()
                     .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?;
+                let endpoints = runtime
+                    .novarocks_catalog()
+                    .vended_credential_refresh_catalog()
+                    .ok_or_else(|| {
+                        RestStagedPrepareFailure::CommitUnknown(
+                            "REST staged create vended refresh has no catalog owner".to_string(),
+                        )
+                    })?;
+                let binding = endpoints.established_binding().ok_or_else(|| {
+                    RestStagedPrepareFailure::CommitUnknown(
+                        "REST staged create has no established session".to_string(),
+                    )
+                })?;
+                let announcement = crate::rest_protocol::routing::route_for_lease(
+                    &binding,
+                    &endpoints.route_admission(),
+                    crate::rest_protocol::routing::RouteTarget::CredentialsEndpoint(
+                        refresh_scope.endpoint(),
+                    ),
+                )
+                .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?;
                 let contribution = seed
                     .into_vended_s3_credential_lease_contribution()
-                    .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?;
+                    .map_err(|error| RestStagedPrepareFailure::CommitUnknown(error.to_string()))?
+                    .with_renewal_path(
+                        novarocks_spi::connector::CredentialRenewalPath::CredentialsEndpoint(
+                            announcement,
+                        ),
+                    );
                 let contribution = contribution
                     .with_refresher(Arc::new(IcebergRestVendedS3LeaseRefresher::new(
                         runtime
@@ -329,10 +380,13 @@ pub(crate) fn prepare_rest_staged_table(
                 "prepare staged REST table: {error}"
             )));
         }
-        crate::catalog::StagedCreateStart::KnownUncommitted(error) => {
-            return Err(RestStagedPrepareFailure::KnownUncommitted(format!(
-                "prepare staged REST table: {error}"
-            )));
+        crate::catalog::StagedCreateStart::KnownUncommitted(failure) => {
+            return Err(RestStagedPrepareFailure::StageUncommitted(
+                ConnectorMutationFailure::new(
+                    failure.kind(),
+                    format!("prepare staged REST table: {}", failure.message()),
+                ),
+            ));
         }
         crate::catalog::StagedCreateStart::CommitUnknown(error) => {
             return Err(RestStagedPrepareFailure::CommitUnknown(format!(
@@ -1005,6 +1059,13 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                     ),
                 })
             }
+            Err(RestStagedPrepareFailure::StageUncommitted(failure)) => {
+                self.operations
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&request.operation_id);
+                Ok(ConnectorStagedCreatePrepareOutcome::KnownUncommitted { failure })
+            }
             Err(RestStagedPrepareFailure::CommitUnknown(message)) => {
                 self.prepare_commit_unknown(request.operation_id, message)
             }
@@ -1441,6 +1502,32 @@ fn validate_publish_evidence(
         ));
     }
     Ok(())
+}
+
+/// What the final publication must show to belong to this operation: the
+/// staged UUID, this attempt's snapshot, the operation marker and the document
+/// properties, all named by NovaRocks (spec 5.7 items 4-6).
+fn publication_expectation(
+    prepared: &PreparedOperation,
+    expected_snapshot_id: Option<i64>,
+) -> crate::catalog::StagedPublicationExpectation {
+    let mut properties = vec![(
+        CTAS_OPERATION_MARKER.to_string(),
+        publication_marker(prepared.publication_id),
+    )];
+    if let Some(document) = &prepared.document_properties {
+        let mut document = document
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<Vec<_>>();
+        document.sort();
+        properties.extend(document);
+    }
+    crate::catalog::StagedPublicationExpectation {
+        staged_table_uuid: prepared.staged.table.metadata().uuid(),
+        snapshot_id: expected_snapshot_id,
+        properties,
+    }
 }
 
 fn publication_matches(
@@ -2018,6 +2105,98 @@ mod tests {
             IcebergMetadataResources::new(binding, handle),
         )
         .expect("control runtime")
+    }
+
+    /// A vended CTAS whose route an execution node could not follow is refused
+    /// before the stage request (L25): the server's `/v1/config` adds a
+    /// routing header the catalog never declared, so nothing is staged.
+    #[test]
+    fn an_undeclared_routing_header_refuses_a_vended_ctas_before_staging() {
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+
+        let server = TestServer::start(
+            Script::new()
+                .on(
+                    "GET",
+                    "/v1/config",
+                    Reply::config(&[("header.x-region", "r1")], &[], None),
+                )
+                // No advertised endpoints: the existence probe is a plain GET.
+                .on(
+                    "GET",
+                    "/v1/namespaces/db",
+                    Reply::json(
+                        200,
+                        &serde_json::json!({"namespace": ["db"], "properties": {}}),
+                    ),
+                ),
+        );
+        let executor = tokio::runtime::Runtime::new().expect("runtime");
+        let handle = executor.handle().clone();
+        let (_upstream, endpoints) = executor
+            .block_on(async {
+                crate::catalog_runtime::build_vended_rest_generation_for_test(
+                    HashMap::from([("uri".to_string(), server.url())]),
+                    None,
+                    crate::iceberg::Runtime::try_current().expect("test runtime"),
+                )
+                .await
+            })
+            .expect("REST generation");
+        let configuration = crate::catalog_config::parse_catalog_configuration(
+            "ice",
+            &[
+                ("iceberg.catalog.type".to_string(), "rest".to_string()),
+                ("uri".to_string(), server.url()),
+                ("warehouse".to_string(), "s3://warehouse".to_string()),
+            ],
+        )
+        .expect("configuration");
+        let binding = IcebergReadBinding::new(
+            None,
+            novarocks_fs::FsAccessResolver::new(),
+            Arc::new(novarocks_fs::TokioFileIoRuntime::new(handle.clone())),
+            Arc::new(novarocks_fs::TokioFileTaskSpawner::new(handle.clone())),
+        );
+        let runtime = IcebergMetadataContext::with_catalog_for_test(
+            IcebergCatalogControlState::new(configuration),
+            IcebergMetadataResources::new(binding, handle),
+            crate::catalog::factory::NovaRocksCatalogFactory::adopt_vended_rest_for_test(
+                endpoints,
+                "s3://warehouse",
+            ),
+        );
+
+        let failure = match prepare_rest_staged_table(
+            &runtime,
+            None,
+            ConnectorMutationOperationId::new(),
+            novarocks_spi::connector::LakePublicationId::new_v7(),
+            "db",
+            "t",
+            &[],
+            &[],
+            &[],
+        ) {
+            Ok(_) => panic!("an undeclared routing header must refuse the vended CTAS"),
+            Err(failure) => failure,
+        };
+        assert!(
+            matches!(
+                &failure,
+                RestStagedPrepareFailure::Unsupported(message)
+                    if message.contains("x-region")
+                        && message.contains("iceberg.rest.server-routing-headers")
+                        && !message.contains("r1")
+            ),
+            "{failure:?}"
+        );
+        assert_eq!(server.count("GET", "/v1/namespaces/db"), 1);
+        assert_eq!(
+            server.count("POST", "/v1/namespaces/db/tables"),
+            0,
+            "nothing is staged"
+        );
     }
 
     #[test]

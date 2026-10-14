@@ -80,7 +80,7 @@ pub(crate) struct IcebergLoadedTable {
 /// leak into a physical-table cache.
 pub(crate) enum IcebergLoadedTableMaterialization {
     Materialized(crate::iceberg::table::Table),
-    DeferredRest(crate::iceberg_catalog_rest::DeferredRestTableMaterialization),
+    DeferredRest(crate::rest_protocol::deferred::FrozenLoadTable),
 }
 
 impl IcebergLoadedTable {
@@ -95,7 +95,7 @@ impl IcebergLoadedTable {
     }
 
     pub(crate) fn deferred_rest(
-        materialization: crate::iceberg_catalog_rest::DeferredRestTableMaterialization,
+        materialization: crate::rest_protocol::deferred::FrozenLoadTable,
         access_delegation: IcebergAccessDelegation,
     ) -> Self {
         Self {
@@ -136,8 +136,8 @@ impl IcebergLoadedTableMaterialization {
     ) -> Result<crate::iceberg::table::Table, ConnectorError> {
         match self {
             Self::Materialized(table) => Ok(table),
-            Self::DeferredRest(materialization) => materialization
-                .materialize_with_file_io(crate::fs_io::build_file_io_for_location("", binding))
+            Self::DeferredRest(frozen) => frozen
+                .materialize(crate::fs_io::build_file_io_for_location("", binding))
                 .map_err(|error| {
                     ConnectorError::new(
                         ConnectorErrorKind::InvalidRequest,
@@ -158,38 +158,6 @@ impl IcebergLoadedTableMaterialization {
             )),
         }
     }
-
-    /// Inspect only the immutable object identity from a fresh Catalog
-    /// response. The placeholder FileIO is never used for data or metadata I/O;
-    /// it lets the vendored value complete its move-only table construction
-    /// without retaining an admitted request's resolver in a lease refresher.
-    fn into_table_uuid_for_identity_check(self) -> Result<uuid::Uuid, ConnectorError> {
-        match self {
-            Self::Materialized(table) => Ok(table.metadata().uuid()),
-            Self::DeferredRest(materialization) => materialization
-                .materialize_with_file_io(crate::iceberg::io::FileIO::new_with_memory())
-                .map(|table| table.metadata().uuid())
-                .map_err(|error| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::InvalidRequest,
-                        format!("inspect REST Iceberg table identity: {error}"),
-                    )
-                }),
-        }
-    }
-}
-
-/// Read one load-table response's table identity and nothing else.
-///
-/// The materialization is consumed here so the caller cannot keep it: CAD-1
-/// D11b requires that a renewal's metadata reaches no plan, cache or table
-/// state, and the narrowest way to enforce that is to make the uuid the only
-/// thing this boundary can hand back.
-pub(crate) fn table_uuid_for_identity_check(
-    materialization: crate::iceberg_catalog_rest::DeferredRestTableMaterialization,
-) -> Result<uuid::Uuid, ConnectorError> {
-    IcebergLoadedTableMaterialization::DeferredRest(materialization)
-        .into_table_uuid_for_identity_check()
 }
 
 /// Provider-private, redacted source for one vended S3 query lease.
@@ -256,11 +224,10 @@ impl IcebergVendedCredentialLeaseSeed {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        VendedS3CredentialLeaseContribution::try_new(
-            entries,
-            self.refresh_endpoint
-                .map(novarocks_spi::connector::CredentialRenewalPath::CredentialsEndpoint),
-        )
+        // The announced path is routed through the generation's session
+        // binding by the caller that forms the lease (L15); the bare endpoint
+        // is not a path an execution node may use on its own.
+        VendedS3CredentialLeaseContribution::try_new(entries, None)
     }
 
     /// Preserve exactly the provider-neutral facts against which a later
@@ -463,23 +430,23 @@ impl IcebergVendedS3LoadTableScope {
 }
 
 /// FE-local source for refreshing one already-admitted REST vended scope.
-/// It retains the same catalog client allocation and explicit runtime that
-/// observed the initial response; no Backend, table cache, or native message
-/// can recover either capability.
+/// It retains the generation's REST endpoints, which share the session that
+/// observed the initial response, and the explicit runtime; no Backend, table
+/// cache, or native message can recover either capability.
 pub(crate) struct IcebergRestVendedS3LeaseRefresher {
-    catalog: Arc<crate::iceberg_catalog_rest::RestCatalog>,
+    endpoints: Arc<crate::rest_protocol::endpoints::RestEndpoints>,
     runtime: crate::resources::IcebergCatalogRuntime,
     scope: IcebergVendedS3RefreshScope,
 }
 
 impl IcebergRestVendedS3LeaseRefresher {
     pub(crate) fn new(
-        catalog: Arc<crate::iceberg_catalog_rest::RestCatalog>,
+        endpoints: Arc<crate::rest_protocol::endpoints::RestEndpoints>,
         runtime: crate::resources::IcebergCatalogRuntime,
         scope: IcebergVendedS3RefreshScope,
     ) -> Self {
         Self {
-            catalog,
+            endpoints,
             runtime,
             scope,
         }
@@ -491,23 +458,19 @@ impl ConnectorVendedS3CredentialLeaseRefresher for IcebergRestVendedS3LeaseRefre
         &self,
         policy: VendedS3CredentialRefreshCallPolicy,
     ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
-        let catalog = Arc::clone(&self.catalog);
+        let endpoints = Arc::clone(&self.endpoints);
         let endpoint = Arc::clone(&self.scope.endpoint);
-        let delegation = run_vended_refresh_with_policy(
+        let delegation = run_vended_renewal_with_policy(
             &self.runtime,
             policy,
             "Iceberg REST credential refresh",
             move || {
-                let catalog = Arc::clone(&catalog);
+                let endpoints = Arc::clone(&endpoints);
                 let endpoint = Arc::clone(&endpoint);
-                async move {
-                    catalog
-                        .load_credentials_with_access_delegation(endpoint.as_ref())
-                        .await
-                }
+                async move { endpoints.load_credentials(endpoint.as_ref()).await }
             },
         )?;
-        let refreshed = match parse_vended_access_delegation(&delegation)? {
+        let refreshed = match parse_rest_delegation(delegation)? {
             IcebergAccessDelegation::Vended(seed) => seed,
             IcebergAccessDelegation::Static => {
                 return Err(invalid(
@@ -530,11 +493,11 @@ impl ConnectorVendedS3CredentialLeaseRefresher for IcebergRestVendedS3LeaseRefre
 /// FE-local renewal path for REST catalogs that vend credentials only from
 /// `load_table` responses.
 ///
-/// The response table is used solely to verify the exact object identity. Its
-/// metadata location and snapshot never replace the logical execution's
-/// frozen binding.
+/// Only the table UUID and the credentials are decoded from the response, and
+/// the UUID serves solely to verify the exact object identity. No metadata
+/// location or snapshot ever replaces the logical execution's frozen binding.
 pub(crate) struct IcebergRestLoadTableVendedS3LeaseRefresher {
-    catalog: Arc<crate::iceberg_catalog_rest::RestCatalog>,
+    endpoints: Arc<crate::rest_protocol::endpoints::RestEndpoints>,
     runtime: crate::resources::IcebergCatalogRuntime,
     table: crate::iceberg::TableIdent,
     expected_table_uuid: uuid::Uuid,
@@ -543,14 +506,14 @@ pub(crate) struct IcebergRestLoadTableVendedS3LeaseRefresher {
 
 impl IcebergRestLoadTableVendedS3LeaseRefresher {
     pub(crate) fn new(
-        catalog: Arc<crate::iceberg_catalog_rest::RestCatalog>,
+        endpoints: Arc<crate::rest_protocol::endpoints::RestEndpoints>,
         runtime: crate::resources::IcebergCatalogRuntime,
         table: crate::iceberg::TableIdent,
         expected_table_uuid: uuid::Uuid,
         scope: IcebergVendedS3LoadTableScope,
     ) -> Self {
         Self {
-            catalog,
+            endpoints,
             runtime,
             table,
             expected_table_uuid,
@@ -564,24 +527,28 @@ impl ConnectorVendedS3CredentialLeaseRefresher for IcebergRestLoadTableVendedS3L
         &self,
         policy: VendedS3CredentialRefreshCallPolicy,
     ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
-        let catalog = Arc::clone(&self.catalog);
+        let endpoints = Arc::clone(&self.endpoints);
         let table = self.table.clone();
-        let response = run_vended_refresh_with_policy(
+        let (observed_uuid, delegation) = run_vended_renewal_with_policy(
             &self.runtime,
             policy,
             "Iceberg REST load-table credential refresh",
             move || {
-                let catalog = Arc::clone(&catalog);
+                let endpoints = Arc::clone(&endpoints);
                 let table = table.clone();
-                async move {
-                    catalog
-                        .load_table_deferred_with_access_delegation(&table)
-                        .await
-                }
+                async move { endpoints.load_table_credentials(&table).await }
             },
         )?;
-        let (materialization, delegation) = response.into_parts();
-        let refreshed = match parse_vended_access_delegation(&delegation)? {
+        let observed_uuid = observed_uuid
+            .as_deref()
+            .and_then(|uuid| uuid::Uuid::parse_str(uuid).ok())
+            .ok_or_else(|| invalid("vended REST load-table refresh returned no table UUID"))?;
+        if observed_uuid != self.expected_table_uuid {
+            return Err(invalid(
+                "vended REST load-table refresh returned a different table UUID",
+            ));
+        }
+        let refreshed = match parse_rest_delegation(delegation)? {
             IcebergAccessDelegation::Vended(seed) => seed,
             IcebergAccessDelegation::Static => {
                 return Err(invalid(
@@ -594,13 +561,6 @@ impl ConnectorVendedS3CredentialLeaseRefresher for IcebergRestLoadTableVendedS3L
                 "vended REST load-table refresh changed prefix scope or acquisition path",
             ));
         }
-        let observed_uuid = IcebergLoadedTableMaterialization::DeferredRest(materialization)
-            .into_table_uuid_for_identity_check()?;
-        if observed_uuid != self.expected_table_uuid {
-            return Err(invalid(
-                "vended REST load-table refresh returned a different table UUID",
-            ));
-        }
         let (entries, _) = refreshed
             .into_vended_s3_credential_lease_contribution()?
             .into_parts();
@@ -608,12 +568,14 @@ impl ConnectorVendedS3CredentialLeaseRefresher for IcebergRestLoadTableVendedS3L
     }
 }
 
-/// Execute an idempotent provider GET under one call-local deadline.
+/// Execute an idempotent provider call under one call-local deadline.
 ///
-/// The timeout owns the actual REST future, rather than an outer blocking-job
+/// The timeout owns the actual future, rather than an outer blocking-job
 /// handle. Dropping that future therefore stops waiting for its request and
 /// response body before the synchronous bridge returns its Connector permit.
-pub(crate) fn run_vended_refresh_with_policy<T, F, Fut>(
+/// The call classifies its own failures: only an error marked retryable before
+/// progress is retried.
+pub(crate) fn run_vended_renewal_with_policy<T, F, Fut>(
     runtime: &crate::resources::IcebergCatalogRuntime,
     policy: VendedS3CredentialRefreshCallPolicy,
     operation: &'static str,
@@ -622,7 +584,7 @@ pub(crate) fn run_vended_refresh_with_policy<T, F, Fut>(
 where
     T: Send + 'static,
     F: Fn() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = crate::iceberg::Result<T>> + Send,
+    Fut: std::future::Future<Output = Result<T, ConnectorError>> + Send,
 {
     runtime
         .block_on(async move {
@@ -642,7 +604,6 @@ where
                     Err(_) => return Err(refresh_deadline_exhausted(operation)),
                     Ok(Ok(value)) => return Ok(value),
                     Ok(Err(error)) => {
-                        let error = vended_refresh_read_error(operation, error);
                         if !error.retryable_before_progress()
                             || attempts >= policy.max_attempts().get()
                         {
@@ -662,19 +623,6 @@ where
             }
         })
         .map_err(|error| unavailable(format!("run {operation}: {error}")))?
-}
-
-fn vended_refresh_read_error(
-    operation: &'static str,
-    error: crate::iceberg::Error,
-) -> ConnectorError {
-    let retryable = matches!(error.kind(), crate::iceberg::ErrorKind::Unexpected);
-    let error = unavailable(format!("{operation}: {error}"));
-    if retryable {
-        error.with_retryable_before_progress()
-    } else {
-        error
-    }
 }
 
 fn refresh_deadline_exhausted(operation: &'static str) -> ConnectorError {
@@ -711,47 +659,40 @@ impl IcebergVendedS3Credential {
     }
 }
 
-/// Translate the vendor's redacted views directly into the provider's closed
-/// S3 schema.  This is the only adapter allowed to read REST config values.
-pub(crate) fn parse_vended_access_delegation(
-    delegation: &crate::iceberg_catalog_rest::RestAccessDelegation,
+/// Translate a NovaRocks-decoded delegation into the provider's closed S3
+/// schema. The raw values live only inside this adapter.
+pub(crate) fn parse_rest_delegation(
+    delegation: crate::rest_protocol::deferred::RestDelegation,
 ) -> Result<IcebergAccessDelegation, ConnectorError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|_| invalid("system clock before Unix epoch"))?
         .as_millis();
     let now = u64::try_from(now).map_err(|_| invalid("system clock exceeds Unix milliseconds"))?;
-    parse_vended_access_delegation_at(delegation, now)
+    parse_rest_delegation_at(delegation, now)
 }
 
-fn parse_vended_access_delegation_at(
-    delegation: &crate::iceberg_catalog_rest::RestAccessDelegation,
+fn parse_rest_delegation_at(
+    delegation: crate::rest_protocol::deferred::RestDelegation,
     now_unix_ms: u64,
 ) -> Result<IcebergAccessDelegation, ConnectorError> {
-    if !delegation.is_present() || delegation.is_empty() {
-        return Err(invalid(
-            "vended REST Iceberg response has no storage credentials",
-        ));
-    }
-
-    let mut credentials = Vec::new();
-    for credential in delegation.credentials() {
-        let mut config = std::collections::BTreeMap::new();
-        for key in credential.config_keys() {
-            // Keep the vendor's raw view in this short-lived adapter only.
-            // A missing value violates that view's contract and is refused,
-            // rather than silently becoming an empty credential field.
-            let value = credential
-                .config_value(key)
-                .ok_or_else(|| invalid("vended REST credential config value"))?;
-            config.insert(key.to_string(), value.to_string());
+    use crate::rest_protocol::minimal_view::StorageCredentials;
+    let credentials = match delegation.into_credentials() {
+        StorageCredentials::Present(credentials) if !credentials.is_empty() => credentials,
+        _ => {
+            return Err(invalid(
+                "vended REST Iceberg response has no storage credentials",
+            ));
         }
-        credentials.push(RestCredentialInput {
-            prefix: credential.prefix().to_string(),
-            config,
-        });
-    }
-    parse_vended_s3_credentials_at(credentials, now_unix_ms)
+    };
+    let inputs = credentials
+        .into_iter()
+        .map(|credential| {
+            let (prefix, config) = credential.into_parts();
+            RestCredentialInput { prefix, config }
+        })
+        .collect();
+    parse_vended_s3_credentials_at(inputs, now_unix_ms)
 }
 
 /// Raw REST values exist only while this adapter translates them into the
@@ -1324,12 +1265,43 @@ mod tests {
         CLIENT_REFRESH_CREDENTIALS_ENABLED, CLIENT_REFRESH_CREDENTIALS_ENDPOINT,
         IcebergAccessDelegation, RestCredentialInput, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY,
         S3_SESSION_TOKEN, S3_SESSION_TOKEN_EXPIRES_AT_MS, parse_vended_s3_credentials_at,
-        run_vended_refresh_with_policy,
+        run_vended_renewal_with_policy, unavailable,
     };
+    use novarocks_spi::connector::ConnectorError;
     use novarocks_spi::connector::{
         ConnectorErrorKind, VendedS3CredentialRefreshCallPolicy, VendedS3CredentialRefreshDispatch,
         VendedS3CredentialRefreshDispatchGuard,
     };
+
+    /// Drive the renewal policy loop with an upstream-client call, the way
+    /// the loop's deadline and retry behavior is easiest to exercise: an
+    /// `Unexpected` (request-layer) error is retryable before progress.
+    fn run_vended_refresh_with_policy<T, F, Fut>(
+        runtime: &crate::resources::IcebergCatalogRuntime,
+        policy: VendedS3CredentialRefreshCallPolicy,
+        operation: &'static str,
+        call: F,
+    ) -> Result<T, ConnectorError>
+    where
+        T: Send + 'static,
+        F: Fn() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = crate::iceberg::Result<T>> + Send,
+    {
+        run_vended_renewal_with_policy(runtime, policy, operation, move || {
+            let call = call();
+            async move {
+                call.await.map_err(|error| {
+                    let retryable = matches!(error.kind(), crate::iceberg::ErrorKind::Unexpected);
+                    let error = unavailable(format!("{operation}: {error}"));
+                    if retryable {
+                        error.with_retryable_before_progress()
+                    } else {
+                        error
+                    }
+                })
+            }
+        })
+    }
 
     struct PermittedDispatch;
 
@@ -2101,13 +2073,226 @@ mod tests {
         .expect("contribution");
 
         assert_eq!(contribution.entries().len(), 2);
-        assert_eq!(
-            contribution.refresh_endpoint(),
-            Some("https://catalog.example.test/v1/credentials")
-        );
+        // The renewal path is routed through the generation's session by the
+        // lease former (L15); a bare endpoint is never announced.
+        assert_eq!(contribution.renewal_path(), None);
         // The only consuming API moves every secret scalar into the collector;
         // there is no Clone, Debug, or serialization path for this payload.
         let (entries, _) = contribution.into_parts();
         assert_eq!(entries.len(), 2);
+    }
+
+    /// FE renewal through the generation's REST endpoints (L27): both paths
+    /// acquire with NovaRocks requests on the generation's one session, and
+    /// a 401 stays a retryable request-layer failure (L17).
+    mod rest_renewal {
+        use std::collections::{BTreeMap, HashMap};
+        use std::num::NonZeroU8;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use novarocks_spi::connector::{
+            ConnectorErrorKind, ConnectorVendedS3CredentialLeaseRefresher,
+            VendedS3CredentialRefreshCallPolicy,
+        };
+
+        use super::PermittedDispatch;
+        use crate::loaded_table::{
+            IcebergAccessDelegation, IcebergRestLoadTableVendedS3LeaseRefresher,
+            IcebergRestVendedS3LeaseRefresher, parse_rest_delegation,
+        };
+        use crate::rest_protocol::deferred::RestDelegation;
+        use crate::rest_protocol::endpoints::RestEndpoints;
+        use crate::rest_protocol::minimal_view::{RawStorageCredential, StorageCredentials};
+        use crate::rest_protocol::test_server::{Reply, Script, TestServer};
+
+        const PREFIX: &str = "s3://warehouse/db/t";
+        const TABLE_UUID: &str = "6f0b1b2e-9c4a-4d2e-8f6a-0a1b2c3d4e5f";
+
+        fn far_future_ms() -> String {
+            (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                + 3_600_000)
+                .to_string()
+        }
+
+        fn credential_config(refresh_endpoint: Option<&str>) -> BTreeMap<String, String> {
+            let mut config = BTreeMap::from([
+                ("s3.access-key-id".to_string(), "AKIA-renewed".to_string()),
+                ("s3.secret-access-key".to_string(), "secret".to_string()),
+                ("s3.session-token".to_string(), "session".to_string()),
+                (
+                    "s3.session-token-expires-at-ms".to_string(),
+                    far_future_ms(),
+                ),
+            ]);
+            if let Some(endpoint) = refresh_endpoint {
+                config.insert(
+                    "client.refresh-credentials-endpoint".to_string(),
+                    endpoint.to_string(),
+                );
+            }
+            config
+        }
+
+        fn seed(
+            refresh_endpoint: Option<&str>,
+        ) -> crate::loaded_table::IcebergVendedCredentialLeaseSeed {
+            let delegation = RestDelegation::new(StorageCredentials::Present(vec![
+                RawStorageCredential::from_decoded(
+                    PREFIX.to_string(),
+                    credential_config(refresh_endpoint),
+                ),
+            ]));
+            match parse_rest_delegation(delegation).expect("vended seed") {
+                IcebergAccessDelegation::Vended(seed) => seed,
+                IcebergAccessDelegation::Static => panic!("static delegation"),
+            }
+        }
+
+        fn credentials_json(refresh_endpoint: Option<&str>) -> serde_json::Value {
+            serde_json::json!([{"prefix": PREFIX, "config": credential_config(refresh_endpoint)}])
+        }
+
+        fn policy() -> VendedS3CredentialRefreshCallPolicy {
+            VendedS3CredentialRefreshCallPolicy::try_new(
+                Duration::from_secs(5),
+                NonZeroU8::new(2).expect("nonzero attempts"),
+                Duration::from_millis(1),
+                Arc::new(PermittedDispatch),
+            )
+            .expect("bounded policy")
+        }
+
+        fn generation(owner: &tokio::runtime::Runtime, server: &TestServer) -> Arc<RestEndpoints> {
+            owner.block_on(async {
+                crate::catalog_runtime::build_vended_rest_generation_for_test(
+                    HashMap::from([("uri".to_string(), server.url())]),
+                    None,
+                    crate::iceberg::Runtime::try_current().expect("runtime"),
+                )
+                .await
+                .expect("REST generation")
+                .1
+            })
+        }
+
+        #[test]
+        fn credentials_endpoint_renewal_uses_the_generation_session() {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/credentials",
+                        Reply::json(
+                            200,
+                            &serde_json::json!({"storage-credentials": credentials_json(None)}),
+                        ),
+                    ),
+            );
+            let endpoint = format!("{}/credentials", server.url());
+            let (owner, runtime) = super::catalog_runtime();
+            let endpoints = generation(&owner, &server);
+            let scope = seed(Some(&endpoint))
+                .refresh_scope()
+                .expect("refresh scope");
+            let refresher = IcebergRestVendedS3LeaseRefresher::new(endpoints, runtime, scope);
+
+            refresher
+                .refresh_vended_s3_credentials(policy())
+                .expect("renewed");
+
+            let renewals = server.requests_to("GET", "/credentials");
+            assert_eq!(renewals.len(), 1);
+            assert_eq!(renewals[0].header("x-iceberg-access-delegation"), None);
+            assert_eq!(server.count("GET", "/v1/config"), 1);
+        }
+
+        #[test]
+        fn load_table_renewal_checks_the_uuid_from_the_minimal_view() {
+            let metadata = serde_json::json!({"table-uuid": TABLE_UUID, "snapshots": []});
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on(
+                        "GET",
+                        "/v1/namespaces/db/tables/t",
+                        Reply::json(
+                            200,
+                            &serde_json::json!({
+                                "metadata-location": "s3://warehouse/db/t/metadata/1.json",
+                                "metadata": metadata,
+                                "storage-credentials": credentials_json(None),
+                            }),
+                        ),
+                    ),
+            );
+            let (owner, runtime) = super::catalog_runtime();
+            let endpoints = generation(&owner, &server);
+            let table = crate::iceberg::TableIdent::new(
+                crate::iceberg::NamespaceIdent::new("db".to_string()),
+                "t".to_string(),
+            );
+            let scope = seed(None).load_table_refresh_scope();
+
+            IcebergRestLoadTableVendedS3LeaseRefresher::new(
+                Arc::clone(&endpoints),
+                runtime.clone(),
+                table.clone(),
+                uuid::Uuid::parse_str(TABLE_UUID).unwrap(),
+                scope,
+            )
+            .refresh_vended_s3_credentials(policy())
+            .expect("renewed");
+            let Err(other) = IcebergRestLoadTableVendedS3LeaseRefresher::new(
+                endpoints,
+                runtime,
+                table,
+                uuid::Uuid::new_v4(),
+                seed(None).load_table_refresh_scope(),
+            )
+            .refresh_vended_s3_credentials(policy()) else {
+                panic!("another table incarnation must be refused");
+            };
+            assert!(!other.retryable_before_progress());
+
+            let loads = server.requests_to("GET", "/v1/namespaces/db/tables/t");
+            assert_eq!(loads.len(), 2);
+            assert!(loads.iter().all(|request| {
+                request.header("x-iceberg-access-delegation") == Some("vended-credentials")
+            }));
+        }
+
+        #[test]
+        fn a_401_renewal_is_retried_and_stays_a_request_layer_failure() {
+            let server = TestServer::start(
+                Script::new()
+                    .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                    .on("GET", "/credentials", Reply::status(401)),
+            );
+            let endpoint = format!("{}/credentials", server.url());
+            let (owner, runtime) = super::catalog_runtime();
+            let endpoints = generation(&owner, &server);
+            let scope = seed(Some(&endpoint))
+                .refresh_scope()
+                .expect("refresh scope");
+
+            let Err(error) = IcebergRestVendedS3LeaseRefresher::new(endpoints, runtime, scope)
+                .refresh_vended_s3_credentials(policy())
+            else {
+                panic!("a 401 renewal must fail");
+            };
+
+            assert_eq!(error.kind(), ConnectorErrorKind::Unavailable);
+            assert!(error.retryable_before_progress());
+            assert_eq!(
+                server.count("GET", "/credentials"),
+                2,
+                "retried within the policy"
+            );
+        }
     }
 }

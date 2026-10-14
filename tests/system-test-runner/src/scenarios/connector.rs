@@ -15,7 +15,8 @@ use novarocks_cluster_harness::loopback_s3::{
     LoopbackS3Config, LoopbackS3Fixture, LoopbackS3Object, LoopbackS3Request,
 };
 use novarocks_cluster_harness::vended_rest_catalog::{
-    VendedRefreshBehavior, VendedRefreshTarget, VendedRestCatalogConfig, VendedRestCatalogFixture,
+    VendedMutationRequest, VendedRefreshBehavior, VendedRefreshTarget, VendedReplacementAnswer,
+    VendedResponseReplacement, VendedRestCatalogConfig, VendedRestCatalogFixture,
     VendedS3Credential, VendedTableCommitResponseBehavior,
 };
 use novarocks_cluster_harness::{
@@ -124,6 +125,15 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
             VendedCredentialFault::Unreachable,
         )),
         Box::new(VendedRestWriteOutcomePem::default()),
+        Box::new(VendedRestPostPublishAnswerPem::new(
+            PostPublishAnswerCase::InsertNotFound,
+        )),
+        Box::new(VendedRestPostPublishAnswerPem::new(
+            PostPublishAnswerCase::InsertBadRequest,
+        )),
+        Box::new(VendedRestPostPublishAnswerPem::new(
+            PostPublishAnswerCase::CreateDatabaseNotFound,
+        )),
         Box::new(CatalogVersionDrain::default()),
         Box::new(StaticCredentialGeneration::default()),
         Box::new(AccessDomainCacheIsolation::default()),
@@ -1714,6 +1724,406 @@ impl VendedRestWriteOutcomePem {
             .map(|fixture| fixture.proxy.audit())
             .ok_or_else(|| anyhow::anyhow!("vended write-outcome fixture is missing"))
     }
+}
+
+/// The statement and the replaced answer of one post-publish scenario.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PostPublishAnswerCase {
+    InsertNotFound,
+    InsertBadRequest,
+    CreateDatabaseNotFound,
+}
+
+impl PostPublishAnswerCase {
+    #[cfg(test)]
+    const ALL: [Self; 3] = [
+        Self::InsertNotFound,
+        Self::InsertBadRequest,
+        Self::CreateDatabaseNotFound,
+    ];
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::InsertNotFound => "connector/vended-credential-write-outcome-post-publish-404",
+            Self::InsertBadRequest => "connector/vended-credential-write-outcome-post-publish-400",
+            Self::CreateDatabaseNotFound => {
+                "connector/vended-credential-create-database-post-publish-404"
+            }
+        }
+    }
+
+    const fn replacement(self) -> VendedResponseReplacement {
+        match self {
+            Self::InsertNotFound => VendedResponseReplacement {
+                request: VendedMutationRequest::TableCommit,
+                answer: VendedReplacementAnswer::NotFound,
+            },
+            Self::InsertBadRequest => VendedResponseReplacement {
+                request: VendedMutationRequest::TableCommit,
+                answer: VendedReplacementAnswer::BadRequest,
+            },
+            Self::CreateDatabaseNotFound => VendedResponseReplacement {
+                request: VendedMutationRequest::NamespaceCreate,
+                answer: VendedReplacementAnswer::NotFound,
+            },
+        }
+    }
+
+    const fn status(self) -> u16 {
+        match self {
+            Self::InsertNotFound | Self::CreateDatabaseNotFound => 404,
+            Self::InsertBadRequest => 400,
+        }
+    }
+}
+
+const POST_PUBLISH_CATALOG: &str = "vended_post_publish_catalog";
+const POST_PUBLISH_DATABASE: &str = "vended_post_publish_db";
+const POST_PUBLISH_TABLE: &str = "vended_post_publish_data";
+const POST_PUBLISH_CREATED_DATABASE: &str = "vended_post_publish_created_db";
+
+/// Exercises a 404 or 400 that arrives after the catalog already applied the
+/// mutation. A reference REST server commits first and then re-reads the
+/// object to build its answer, so a concurrent rename or drop turns an applied
+/// mutation into 404, and a failed re-read validation into 400. The fixture
+/// lets the real downstream catalog apply the request and only then replaces
+/// its answer. Neither status proves the mutation absent: an INSERT must
+/// verify its commit as applied and succeed without replaying it or deleting
+/// its data, and CREATE DATABASE must report an unknown outcome while the
+/// namespace exists downstream.
+struct VendedRestPostPublishAnswerPem {
+    case: PostPublishAnswerCase,
+    fixture: Mutex<Option<VendedRestSystemFixture>>,
+}
+
+impl VendedRestPostPublishAnswerPem {
+    fn new(case: PostPublishAnswerCase) -> Self {
+        Self {
+            case,
+            fixture: Mutex::new(None),
+        }
+    }
+}
+
+impl Scenario for VendedRestPostPublishAnswerPem {
+    fn name(&self) -> &'static str {
+        self.case.name()
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
+        let mut rest = IsolatedIcebergRestFixture::start(scenario_root)
+            .context("start isolated REST fixture for a post-publish answer")?;
+        rest.provision_empty_table(POST_PUBLISH_DATABASE, POST_PUBLISH_TABLE)
+            .context("provision isolated post-publish answer table")?;
+        let endpoints = rest.endpoints().clone();
+        let metadata_identity = rest.static_s3_identity();
+        let identities = rest
+            .provision_vended_s3_identities()
+            .context("provision isolated post-publish answer identities")?;
+        let proxy = VendedRestCatalogFixture::start(VendedRestCatalogConfig {
+            downstream: endpoints.rest_uri.clone(),
+            scope_prefix: format!("{}/", endpoints.rest_warehouse.trim_end_matches('/')),
+            initial: VendedS3Credential::new(
+                identities.initial.access_key_id,
+                SecretValue::new(identities.initial.secret_access_key),
+                SecretValue::new(identities.initial.session_token),
+            )
+            .context("build initial post-publish answer credential")?,
+            rotated: VendedS3Credential::new(
+                identities.rotated.access_key_id,
+                SecretValue::new(identities.rotated.secret_access_key),
+                SecretValue::new(identities.rotated.session_token),
+            )
+            .context("build rotated post-publish answer credential")?,
+            initial_ttl: Duration::from_secs(60),
+            refresh_ttl: Duration::from_secs(60),
+            refresh_behavior: Default::default(),
+            table_commit_response_behavior:
+                VendedTableCommitResponseBehavior::ReplaceAfterSideEffect(self.case.replacement()),
+            hold_first_table_commit_response: false,
+        })
+        .context("start post-publish answer vended REST catalog proxy")?;
+        let mut fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("post-publish answer fixture lock poisoned"))?;
+        if fixture.is_some() {
+            bail!("post-publish answer fixture was initialized more than once");
+        }
+        *fixture = Some(VendedRestSystemFixture { rest, proxy });
+
+        let mut config = connector_launch_config();
+        configure_vended_metadata_access(&mut config, metadata_identity);
+        config.native_trust_fixture = NativeTrustFixture::pem_ip();
+        Ok(config)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let endpoints = self.fixture_endpoints()?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect post-publish answer control session")?,
+        )?;
+        context.action("create a vended REST catalog behind the post-publish answer proxy");
+        control
+            .query_drop(format!(
+                "CREATE EXTERNAL CATALOG {POST_PUBLISH_CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{}\",\"iceberg.catalog.warehouse\"=\"{}\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")",
+                endpoints.proxy_uri, endpoints.warehouse, endpoints.minio_endpoint
+            ))
+            .context("create post-publish answer REST vended catalog")?;
+        match self.case {
+            PostPublishAnswerCase::InsertNotFound | PostPublishAnswerCase::InsertBadRequest => {
+                self.run_insert(context, &mut control, &user, port, &endpoints.rest_uri)?
+            }
+            PostPublishAnswerCase::CreateDatabaseNotFound => {
+                self.run_create_database(context, &user, port, &endpoints.rest_uri)?
+            }
+        }
+        await_resource_convergence(context, &baseline, self.case.name())?;
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("post-publish answer fixture lock poisoned"))?
+            .take();
+        let Some(VendedRestSystemFixture { mut rest, proxy }) = fixture else {
+            return Ok(());
+        };
+        drop(proxy);
+        rest.shutdown()
+            .context("shutdown isolated post-publish answer REST fixture")
+    }
+}
+
+/// Non-secret endpoints of one post-publish answer fixture.
+struct PostPublishEndpoints {
+    proxy_uri: String,
+    warehouse: String,
+    minio_endpoint: String,
+    /// The fixture's own REST Catalog, never the proxy: the independent oracle
+    /// for what the catalog actually holds.
+    rest_uri: String,
+}
+
+impl VendedRestPostPublishAnswerPem {
+    fn run_insert(
+        &self,
+        context: &mut ScenarioContext,
+        control: &mut mysql::Conn,
+        user: &str,
+        port: u16,
+        rest_uri: &str,
+    ) -> Result<()> {
+        let status = self.case.status();
+        let qualified =
+            format!("{POST_PUBLISH_CATALOG}.{POST_PUBLISH_DATABASE}.{POST_PUBLISH_TABLE}");
+        context.action(format!(
+            "insert one row; the proxy answers the applied table commit with HTTP {status}"
+        ));
+        let mut writer = mysql_actor::connect_with_io_timeout(
+            user,
+            port,
+            Duration::from_secs(10),
+            context.remaining("bound the post-publish answer INSERT")?,
+        )
+        .context("connect post-publish answer writer")?;
+        let outcome = writer.query_drop(format!("INSERT INTO {qualified} SELECT 1 AS v"));
+        let audit = self.vended_proxy_audit()?;
+        ensure!(
+            outcome.is_ok(),
+            "an applied INSERT whose commit was answered with HTTP {status} must be verified as \
+             committed and succeed: {outcome:?}; audit={audit:?}"
+        );
+        ensure!(
+            audit.replacement_class_requests == 1
+                && audit.replaced_responses == 1
+                && audit.table_commits == 1,
+            "the INSERT must dispatch its table commit exactly once and never replay it; \
+             audit={audit:?}"
+        );
+        ensure!(
+            audit.refresh_failures == 0,
+            "a post-publish answer must not manufacture a refused refresh; audit={audit:?}"
+        );
+
+        context
+            .action("verify the applied snapshot downstream and read its data through NovaRocks");
+        let (catalog_status, table) = downstream_catalog_get(
+            rest_uri,
+            &format!("/v1/namespaces/{POST_PUBLISH_DATABASE}/tables/{POST_PUBLISH_TABLE}"),
+        )?;
+        ensure!(
+            catalog_status == reqwest::StatusCode::OK,
+            "downstream catalog could not load the INSERT target: HTTP {catalog_status}"
+        );
+        let metadata = table
+            .as_ref()
+            .and_then(|table| table.get("metadata"))
+            .context("downstream load-table answer has no metadata")?;
+        let snapshots = metadata
+            .get("snapshots")
+            .and_then(serde_json::Value::as_array)
+            .context("downstream table metadata has no snapshots")?;
+        let [snapshot] = snapshots.as_slice() else {
+            bail!(
+                "downstream must hold exactly the one applied INSERT snapshot, found {}",
+                snapshots.len()
+            );
+        };
+        let snapshot_id = snapshot
+            .get("snapshot-id")
+            .and_then(serde_json::Value::as_i64)
+            .context("downstream snapshot has no snapshot-id")?;
+        ensure!(
+            metadata
+                .get("current-snapshot-id")
+                .and_then(serde_json::Value::as_i64)
+                == Some(snapshot_id),
+            "downstream current snapshot is not the applied INSERT snapshot {snapshot_id}"
+        );
+        ensure!(
+            snapshot
+                .pointer("/summary/operation")
+                .and_then(serde_json::Value::as_str)
+                == Some("append"),
+            "downstream snapshot {snapshot_id} is not the INSERT append"
+        );
+        // Reading the row opens the data file the applied snapshot references,
+        // so a successful read also proves no cleanup deleted that file.
+        let rows: Vec<(i64, i64)> = control
+            .query(format!("SELECT count(*), sum(v) FROM {qualified}"))
+            .context("read the applied post-publish answer INSERT")?;
+        ensure!(
+            rows == [(1, 1)],
+            "the applied INSERT must be readable exactly once under its snapshot, got {rows:?}"
+        );
+        Ok(())
+    }
+
+    fn run_create_database(
+        &self,
+        context: &mut ScenarioContext,
+        user: &str,
+        port: u16,
+        rest_uri: &str,
+    ) -> Result<()> {
+        let namespace_path = format!("/v1/namespaces/{POST_PUBLISH_CREATED_DATABASE}");
+        let (before, _) = downstream_catalog_get(rest_uri, &namespace_path)?;
+        ensure!(
+            before == reqwest::StatusCode::NOT_FOUND,
+            "post-publish answer namespace must not exist before CREATE DATABASE, got HTTP {before}"
+        );
+        context.action(format!(
+            "create a database; the proxy answers the applied namespace creation with HTTP {}",
+            self.case.status()
+        ));
+        let mut writer = mysql_actor::connect_with_io_timeout(
+            user,
+            port,
+            Duration::from_secs(10),
+            context.remaining("bound the post-publish answer CREATE DATABASE")?,
+        )
+        .context("connect post-publish answer DDL session")?;
+        let outcome = writer.query_drop(format!(
+            "CREATE DATABASE {POST_PUBLISH_CATALOG}.{POST_PUBLISH_CREATED_DATABASE}"
+        ));
+        let audit = self.vended_proxy_audit()?;
+        let error = match outcome {
+            Ok(()) => bail!(
+                "CREATE DATABASE answered with HTTP {} after it was applied must report an \
+                 unknown outcome, but it succeeded; audit={audit:?}",
+                self.case.status()
+            ),
+            Err(error) => error.to_string(),
+        };
+        let lowered = error.to_ascii_lowercase();
+        ensure!(
+            lowered.contains("unknown") || lowered.contains("cannot be attributed"),
+            "CREATE DATABASE answered with HTTP {} after it was applied must report an unknown \
+             outcome, got: {error}",
+            self.case.status()
+        );
+        ensure!(
+            audit.replacement_class_requests == 1 && audit.replaced_responses == 1,
+            "CREATE DATABASE must send exactly one namespace creation and never replay it; \
+             audit={audit:?}"
+        );
+        let (after, namespace) = downstream_catalog_get(rest_uri, &namespace_path)?;
+        ensure!(
+            after == reqwest::StatusCode::OK,
+            "the applied namespace must exist downstream, got HTTP {after}"
+        );
+        ensure!(
+            namespace.as_ref().and_then(|value| value.get("namespace"))
+                == Some(&serde_json::json!([POST_PUBLISH_CREATED_DATABASE])),
+            "downstream namespace answer does not name {POST_PUBLISH_CREATED_DATABASE}"
+        );
+        Ok(())
+    }
+
+    fn fixture_endpoints(&self) -> Result<PostPublishEndpoints> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("post-publish answer fixture lock poisoned"))?;
+        let fixture = fixture
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("post-publish answer fixture is missing"))?;
+        let endpoints = fixture.rest.endpoints();
+        Ok(PostPublishEndpoints {
+            proxy_uri: fixture.proxy.uri().to_owned(),
+            warehouse: endpoints.rest_warehouse.clone(),
+            minio_endpoint: endpoints.minio_endpoint.clone(),
+            rest_uri: endpoints.rest_uri.clone(),
+        })
+    }
+
+    fn vended_proxy_audit(
+        &self,
+    ) -> Result<novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit> {
+        self.fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("post-publish answer fixture lock poisoned"))?
+            .as_ref()
+            .map(|fixture| fixture.proxy.audit())
+            .ok_or_else(|| anyhow::anyhow!("post-publish answer fixture is missing"))
+    }
+}
+
+/// Reads one resource directly from the fixture's own REST Catalog. The body
+/// is decoded only when it is JSON; catalog answers carry no credentials.
+fn downstream_catalog_get(
+    rest_uri: &str,
+    path: &str,
+) -> Result<(reqwest::StatusCode, Option<serde_json::Value>)> {
+    let response = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build downstream catalog oracle client")?
+        .get(format!("{}{path}", rest_uri.trim_end_matches('/')))
+        .send()
+        .with_context(|| format!("read downstream catalog resource {path}"))?;
+    let status = response.status();
+    let bytes = response
+        .bytes()
+        .with_context(|| format!("read downstream catalog answer for {path}"))?;
+    Ok((status, serde_json::from_slice(&bytes).ok()))
 }
 
 /// Exercises consumer-driven renewal on one identified BE, then verifies
@@ -5492,6 +5902,43 @@ mod tests {
             _probe_result_tx: probe_result_tx,
             _release_rx: release_rx,
         }
+    }
+
+    #[test]
+    fn post_publish_answer_scenarios_are_distinct_explicit_cases() {
+        let registered = scenarios();
+        let mut replacements = Vec::new();
+        for case in PostPublishAnswerCase::ALL {
+            let matching = registered
+                .iter()
+                .filter(|scenario| scenario.name() == case.name())
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1, "{}", case.name());
+            assert!(matching[0].is_explicit_stage(), "{}", case.name());
+            assert!(!replacements.contains(&case.replacement()), "{case:?}");
+            replacements.push(case.replacement());
+        }
+        assert_eq!(
+            PostPublishAnswerCase::InsertNotFound.replacement(),
+            VendedResponseReplacement {
+                request: VendedMutationRequest::TableCommit,
+                answer: VendedReplacementAnswer::NotFound,
+            }
+        );
+        assert_eq!(
+            PostPublishAnswerCase::InsertBadRequest.replacement(),
+            VendedResponseReplacement {
+                request: VendedMutationRequest::TableCommit,
+                answer: VendedReplacementAnswer::BadRequest,
+            }
+        );
+        assert_eq!(
+            PostPublishAnswerCase::CreateDatabaseNotFound.replacement(),
+            VendedResponseReplacement {
+                request: VendedMutationRequest::NamespaceCreate,
+                answer: VendedReplacementAnswer::NotFound,
+            }
+        );
     }
 
     #[test]

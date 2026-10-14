@@ -1,14 +1,14 @@
--- query 5
+-- query 6
 id	value
 1	alpha
 2	beta
 3	gamma
 
--- query 7
+-- query 8
 n
 3
 
--- query 10
+-- query 11
 id	k
 2	20
 3	30

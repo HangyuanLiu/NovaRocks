@@ -1,0 +1,837 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! The per-role auth owner (L16): the only component that sets
+//! `Authorization` on a REST request of its role.
+//!
+//! The frontend owner is injected into upstream as its `AuthManager`: it
+//! provides the handshake session, validates the merged configuration and
+//! captures the session binding in `catalog_session` (5.3), and vetoes the
+//! session probe in `authenticate` (L28). The backend owner only authorizes
+//! its own requests. Both exchange the token from the persistent definition
+//! once per attempt and keep it; it is never refreshed.
+
+use std::collections::HashMap;
+use std::fmt;
+use std::str::FromStr;
+use std::sync::{Arc, Mutex, PoisonError};
+
+use async_trait::async_trait;
+use futures::FutureExt;
+use novarocks_fs::SecretValue;
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::{Method, Url};
+
+use super::attempt::{AttemptCell, AttemptFailure};
+use super::binding::{
+    SessionBinding, is_authentication_header, is_protocol_header, protocol_headers,
+};
+use super::boundary::probe_veto;
+use super::evidence::{BindingFailure, DispatchStage};
+use super::http::{RequestContext, RestHttpClient, RestRequest};
+use crate::access_binding::IcebergRestAuthMaterial;
+use crate::iceberg::{Error, ErrorKind, NamespaceIdent, Result as IcebergResult, TableIdent};
+use crate::iceberg_catalog_rest::{AuthManager, AuthSession, HttpClient, HttpRequest};
+
+const PROP_URI: &str = "uri";
+const PROP_OAUTH2_SERVER_URI: &str = "oauth2-server-uri";
+const PROP_SCOPE: &str = "scope";
+const PROP_AUDIENCE: &str = "audience";
+const PROP_RESOURCE: &str = "resource";
+const DEFAULT_SCOPE: &str = "catalog";
+const HEADER_PROPERTY_PREFIX: &str = "header.";
+/// Properties that carry or select authentication; the persistent
+/// definition never holds them (L5).
+const AUTHENTICATION_PROPERTIES: [&str; 3] = ["token", "credential", "rest.auth.type"];
+
+/// The persistent, non-secret REST catalog definition the owner derives every
+/// request from: the configured `uri`, its public `header.*` and the OAuth2
+/// token request. Server-sent configuration never changes these (L16).
+#[derive(Clone)]
+pub(crate) struct PersistentRestConfig {
+    uri: String,
+    headers: Vec<(HeaderName, HeaderValue)>,
+    token_endpoint: String,
+    scope: String,
+    audience: Option<String>,
+    resource: Option<String>,
+}
+
+impl fmt::Debug for PersistentRestConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PersistentRestConfig")
+            .field(
+                "header_names",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl PersistentRestConfig {
+    /// Projects the persistent catalog properties (as handed to upstream:
+    /// `uri` included, `type` excluded). Fails fast on authentication
+    /// material, authentication-class or protocol-class `header.*` (L5, L26)
+    /// and on an empty explicit token endpoint.
+    pub(crate) fn from_properties(properties: &HashMap<String, String>) -> Result<Self, String> {
+        let uri = properties
+            .get(PROP_URI)
+            .filter(|uri| !uri.is_empty())
+            .cloned()
+            .ok_or_else(|| "REST catalog definition is missing `uri`".to_string())?;
+        for key in AUTHENTICATION_PROPERTIES {
+            if properties.contains_key(key) {
+                return Err(format!(
+                    "REST catalog property `{key}` is not supported: authentication comes only \
+                     from the CatalogControl or DataCredentialVending identity"
+                ));
+            }
+        }
+        let mut headers = Vec::new();
+        for (key, value) in properties {
+            let Some(name) = key.strip_prefix(HEADER_PROPERTY_PREFIX) else {
+                continue;
+            };
+            if is_authentication_header(name) {
+                return Err(format!(
+                    "REST catalog header `{name}` is not supported: authentication comes only \
+                     from the CatalogControl or DataCredentialVending identity"
+                ));
+            }
+            if is_protocol_header(name) {
+                return Err(format!(
+                    "REST catalog header `{name}` is set by the client and cannot be configured"
+                ));
+            }
+            let name = HeaderName::from_str(name)
+                .map_err(|_| format!("REST catalog header name `{name}` is invalid"))?;
+            let value = HeaderValue::from_str(value)
+                .map_err(|_| format!("REST catalog header `{name}` has an invalid value"))?;
+            if headers.iter().any(|(existing, _)| *existing == name) {
+                return Err(format!(
+                    "REST catalog header `{name}` is configured more than once"
+                ));
+            }
+            headers.push((name, value));
+        }
+        headers.sort_by(|(left, _), (right, _)| left.as_str().cmp(right.as_str()));
+        let token_endpoint = match properties.get(PROP_OAUTH2_SERVER_URI) {
+            Some(endpoint) if endpoint.is_empty() => {
+                return Err("REST catalog property `oauth2-server-uri` is empty".to_string());
+            }
+            Some(endpoint) => endpoint.clone(),
+            None => [uri.as_str(), "v1", "oauth", "tokens"].join("/"),
+        };
+        Ok(Self {
+            uri,
+            headers,
+            token_endpoint,
+            scope: properties
+                .get(PROP_SCOPE)
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_SCOPE.to_string()),
+            audience: properties.get(PROP_AUDIENCE).cloned(),
+            resource: properties.get(PROP_RESOURCE).cloned(),
+        })
+    }
+
+    pub(crate) fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    /// The persistent public headers, sorted by name.
+    pub(crate) fn headers(&self) -> &[(HeaderName, HeaderValue)] {
+        &self.headers
+    }
+
+    /// The persistent value of an OAuth2 token-request property, used to
+    /// report which server-sent values were ignored.
+    pub(crate) fn token_property(&self, key: &str) -> Option<&str> {
+        match key {
+            PROP_OAUTH2_SERVER_URI => Some(&self.token_endpoint),
+            PROP_SCOPE => Some(&self.scope),
+            PROP_AUDIENCE => self.audience.as_deref(),
+            PROP_RESOURCE => self.resource.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Headers of the token request: the protocol headers upstream sends
+    /// with a form content type, plus the persistent public `header.*`.
+    fn token_request_headers(&self) -> HeaderMap {
+        let mut headers = protocol_headers();
+        for (name, value) in &self.headers {
+            headers.insert(name.clone(), value.clone());
+        }
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        headers
+    }
+}
+
+/// The OAuth2 `client_credentials` token response; only `access_token` is
+/// used. Deliberately no `Debug`.
+#[derive(serde::Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    #[allow(dead_code)]
+    token_type: String,
+    #[allow(dead_code)]
+    expires_in: Option<u64>,
+    #[allow(dead_code)]
+    issued_token_type: Option<String>,
+}
+
+/// Exchanges the role's client credential at the persistent token endpoint,
+/// with the same form and headers upstream's `OAuth2Manager` sends.
+async fn exchange_token(
+    http: RestHttpClient,
+    persistent: Arc<PersistentRestConfig>,
+    client_id: String,
+    client_secret: SecretValue,
+) -> Result<HeaderValue, BindingFailure> {
+    let mut form = vec![
+        ("grant_type", "client_credentials"),
+        ("client_id", client_id.as_str()),
+        ("client_secret", client_secret.expose_secret()),
+        ("scope", persistent.scope.as_str()),
+    ];
+    if let Some(audience) = &persistent.audience {
+        form.push(("audience", audience));
+    }
+    if let Some(resource) = &persistent.resource {
+        form.push(("resource", resource));
+    }
+    let request = RestRequest::new(
+        Method::POST,
+        persistent.token_endpoint.clone(),
+        persistent.token_request_headers(),
+    )
+    .with_form_body(form);
+    let (stage, body) = http
+        .send_once(Ok(request), &[200], &RequestContext::default())
+        .await;
+    match (stage, body) {
+        (DispatchStage::Status { .. }, Some(body)) => {
+            let bytes = body
+                .read_to_end()
+                .await
+                .map_err(|_| BindingFailure::TokenUnavailable)?;
+            let response: TokenResponse =
+                serde_json::from_slice(&bytes).map_err(|_| BindingFailure::TokenUnavailable)?;
+            bearer_value(response.access_token.as_str()).ok_or(BindingFailure::TokenUnavailable)
+        }
+        (DispatchStage::Status { code, .. }, None) if (400..500).contains(&code) => {
+            Err(BindingFailure::TokenRejected)
+        }
+        _ => Err(BindingFailure::TokenUnavailable),
+    }
+}
+
+/// What establishment attempts captured from upstream's callbacks.
+#[derive(Default)]
+struct Establishment {
+    /// The binding `catalog_session` captured. Once captured it outlives the
+    /// attempt: upstream caches its session right after that callback, so a
+    /// later attempt can only re-observe it, never replace it.
+    bound: Option<SessionBinding>,
+    /// The step that failed in the current attempt.
+    failed: Option<BindingFailure>,
+    probe_namespace: Option<NamespaceIdent>,
+    /// The probe request's exact URL, known once the binding is.
+    probe_url: Option<Url>,
+    probe_method: Option<Method>,
+}
+
+impl Establishment {
+    fn arm_probe(&mut self) {
+        self.probe_url = match (&self.bound, &self.probe_namespace) {
+            (Some(binding), Some(namespace)) => {
+                Url::parse(&binding.table_url(&TableIdent::new(namespace.clone(), "t".to_string())))
+                    .ok()
+            }
+            _ => None,
+        };
+    }
+}
+
+/// The role identity as the owner uses it.
+enum Credential {
+    /// No identity: requests carry no `Authorization`.
+    Anonymous,
+    /// A configured bearer token, already a sensitive header value.
+    Bearer(HeaderValue),
+    /// An OAuth2 client credential exchanged at the token endpoint.
+    ClientCredentials {
+        client_id: String,
+        client_secret: SecretValue,
+    },
+}
+
+/// The auth owner of one role.
+pub(crate) struct RestAuthOwner {
+    credential: Credential,
+    persistent: Arc<PersistentRestConfig>,
+    http: RestHttpClient,
+    /// The exchanged `Authorization` value: one exchange per attempt, kept
+    /// after the first success and never refreshed.
+    token: AttemptCell<HeaderValue, AttemptFailure>,
+    /// Frontend only: state of the current establishment attempt.
+    establishment: Option<Mutex<Establishment>>,
+}
+
+impl fmt::Debug for RestAuthOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let identity = match &self.credential {
+            Credential::Anonymous => "none",
+            Credential::Bearer(_) => "bearer",
+            Credential::ClientCredentials { .. } => "oauth2",
+        };
+        let role = if self.establishment.is_some() {
+            "frontend"
+        } else {
+            "backend"
+        };
+        formatter
+            .debug_struct("RestAuthOwner")
+            .field("role", &role)
+            .field("identity", &identity)
+            .field("persistent", &self.persistent)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RestAuthOwner {
+    /// The frontend owner, plus the manager to inject into upstream with
+    /// `RestCatalogBuilder::with_auth_manager`. `http` must be the instance
+    /// handed to upstream with `with_client`.
+    pub(crate) fn frontend(
+        identity: Option<IcebergRestAuthMaterial>,
+        persistent: PersistentRestConfig,
+        http: RestHttpClient,
+    ) -> Result<(Arc<Self>, RestAuthManager), String> {
+        let owner = Arc::new(Self::new(identity, persistent, http, true)?);
+        let manager = RestAuthManager {
+            owner: Arc::clone(&owner),
+        };
+        Ok((owner, manager))
+    }
+
+    /// The backend owner; it never builds an upstream client.
+    pub(crate) fn backend(
+        identity: Option<IcebergRestAuthMaterial>,
+        persistent: PersistentRestConfig,
+        http: RestHttpClient,
+    ) -> Result<Arc<Self>, String> {
+        Ok(Arc::new(Self::new(identity, persistent, http, false)?))
+    }
+
+    fn new(
+        identity: Option<IcebergRestAuthMaterial>,
+        persistent: PersistentRestConfig,
+        http: RestHttpClient,
+        frontend: bool,
+    ) -> Result<Self, String> {
+        let credential = match identity {
+            None => Credential::Anonymous,
+            Some(IcebergRestAuthMaterial::Bearer { token }) => Credential::Bearer(
+                bearer_value(token.expose_secret())
+                    .ok_or_else(|| "REST bearer token is not a valid header value".to_string())?,
+            ),
+            Some(IcebergRestAuthMaterial::Oauth2 {
+                client_id,
+                client_secret,
+            }) => Credential::ClientCredentials {
+                client_id,
+                client_secret,
+            },
+        };
+        Ok(Self {
+            credential,
+            persistent: Arc::new(persistent),
+            http,
+            token: AttemptCell::default(),
+            establishment: frontend.then(|| Mutex::new(Establishment::default())),
+        })
+    }
+
+    pub(crate) fn http(&self) -> &RestHttpClient {
+        &self.http
+    }
+
+    pub(crate) fn persistent(&self) -> &PersistentRestConfig {
+        &self.persistent
+    }
+
+    /// The role's `Authorization` value: `None` without an identity, the
+    /// configured token for a bearer identity, otherwise the exchanged token.
+    /// Concurrent callers share one exchange; a failure is not kept.
+    pub(crate) async fn authorization(&self) -> Result<Option<HeaderValue>, AttemptFailure> {
+        let (client_id, client_secret) = match &self.credential {
+            Credential::Anonymous => return Ok(None),
+            Credential::Bearer(value) => return Ok(Some(value.clone())),
+            Credential::ClientCredentials {
+                client_id,
+                client_secret,
+            } => (client_id, client_secret),
+        };
+        self.token
+            .get_or_attempt(|attempt| {
+                let http = self.http.clone();
+                let persistent = Arc::clone(&self.persistent);
+                let client_id = client_id.clone();
+                let client_secret = client_secret.clone();
+                async move {
+                    exchange_token(http, persistent, client_id, client_secret)
+                        .await
+                        .map_err(|step| AttemptFailure { attempt, step })
+                }
+                .boxed()
+            })
+            .await
+            .map(Some)
+    }
+
+    /// Writes `Authorization` for a NovaRocks request of this role.
+    pub(crate) async fn authorize(&self, headers: &mut HeaderMap) -> Result<(), AttemptFailure> {
+        if let Some(value) = self.authorization().await? {
+            headers.insert(AUTHORIZATION, value);
+        }
+        Ok(())
+    }
+
+    /// Starts one establishment attempt: clears the failed step and probe
+    /// observation of an earlier attempt and arms a fresh probe. Returns the
+    /// probe namespace.
+    pub(crate) fn begin_establishment(&self) -> NamespaceIdent {
+        let namespace =
+            NamespaceIdent::new(format!("__novarocks_probe_{:016x}", rand::random::<u64>()));
+        let mut establishment = self.establishment();
+        establishment.failed = None;
+        establishment.probe_method = None;
+        establishment.probe_namespace = Some(namespace.clone());
+        establishment.arm_probe();
+        namespace
+    }
+
+    /// Ends the establishment attempt: the captured binding, else the failed
+    /// step of this attempt, plus the method of the vetoed probe request.
+    pub(crate) fn finish_establishment(
+        &self,
+    ) -> (
+        Option<Result<SessionBinding, BindingFailure>>,
+        Option<Method>,
+    ) {
+        let mut establishment = self.establishment();
+        let failed = establishment.failed.take();
+        let captured = match (&establishment.bound, failed) {
+            (Some(binding), _) => Some(Ok(binding.clone())),
+            (None, Some(step)) => Some(Err(step)),
+            (None, None) => None,
+        };
+        establishment.probe_namespace = None;
+        establishment.probe_url = None;
+        (captured, establishment.probe_method.take())
+    }
+
+    fn establishment(&self) -> std::sync::MutexGuard<'_, Establishment> {
+        self.establishment
+            .as_ref()
+            .expect("only the frontend auth owner establishes sessions")
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records the method of the probe request and reports whether `url` is
+    /// the armed probe.
+    fn veto_probe(&self, method: &Method, url: &str) -> bool {
+        let mut establishment = self.establishment();
+        let is_probe = establishment
+            .probe_url
+            .as_ref()
+            .is_some_and(|probe| probe.as_str() == url);
+        if is_probe {
+            establishment.probe_method = Some(method.clone());
+        }
+        is_probe
+    }
+}
+
+fn bearer_value(token: &str) -> Option<HeaderValue> {
+    let mut value = HeaderValue::from_str(&format!("Bearer {token}")).ok()?;
+    value.set_sensitive(true);
+    Some(value)
+}
+
+fn upstream_auth_error(text: &'static str) -> Error {
+    Error::new(ErrorKind::Unexpected, text)
+}
+
+/// The frontend auth owner as upstream's `AuthManager`.
+pub(crate) struct RestAuthManager {
+    owner: Arc<RestAuthOwner>,
+}
+
+impl fmt::Debug for RestAuthManager {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RestAuthManager")
+            .field("owner", &self.owner)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl AuthManager for RestAuthManager {
+    async fn init_session(
+        &self,
+        _client: &HttpClient,
+        _props: &HashMap<String, String>,
+    ) -> IcebergResult<Box<dyn AuthSession>> {
+        if let Err(failure) = self.owner.authorization().await {
+            // The failed step belongs to the current establishment attempt.
+            self.owner.establishment().failed = Some(failure.step);
+            return Err(upstream_auth_error("REST catalog token acquisition failed"));
+        }
+        Ok(Box::new(RestAuthSession {
+            owner: Arc::clone(&self.owner),
+            vetoes_probe: false,
+        }))
+    }
+
+    async fn catalog_session(
+        &self,
+        _client: &HttpClient,
+        props: &HashMap<String, String>,
+    ) -> IcebergResult<Arc<dyn AuthSession>> {
+        let binding = SessionBinding::from_merged_properties(props, &self.owner.persistent);
+        let mut establishment = self.owner.establishment();
+        let binding = match binding {
+            Ok(binding) => binding,
+            Err(step) => {
+                establishment.failed = Some(step);
+                return Err(upstream_auth_error(
+                    "REST catalog configuration carries authentication material",
+                ));
+            }
+        };
+        let session: Arc<dyn AuthSession> = Arc::new(RestAuthSession {
+            owner: Arc::clone(&self.owner),
+            vetoes_probe: true,
+        });
+        // The last step before returning: upstream caches the session right
+        // after this callback succeeds and has no failing step left.
+        establishment.bound = Some(binding);
+        establishment.arm_probe();
+        Ok(session)
+    }
+}
+
+/// The session upstream authenticates its requests with.
+struct RestAuthSession {
+    owner: Arc<RestAuthOwner>,
+    /// The handshake session only authenticates `/v1/config`; the catalog
+    /// session also recognizes the probe.
+    vetoes_probe: bool,
+}
+
+impl fmt::Debug for RestAuthSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RestAuthSession")
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait]
+impl AuthSession for RestAuthSession {
+    async fn authenticate(&self, request: &mut HttpRequest) -> IcebergResult<()> {
+        if self.vetoes_probe && self.owner.veto_probe(request.method(), request.url_str()) {
+            return Err(probe_veto());
+        }
+        let authorization = self
+            .owner
+            .authorization()
+            .await
+            .map_err(|_| upstream_auth_error("REST catalog token acquisition failed"))?;
+        if let Some(value) = authorization {
+            request.headers_mut().insert(AUTHORIZATION, value);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::iceberg::{Catalog, CatalogBuilder};
+    use crate::rest_protocol::test_server::{
+        Reply, Script, TestServer, bearer_identity, oauth2_identity,
+    };
+
+    fn client() -> RestHttpClient {
+        RestHttpClient::with_timeouts(Duration::from_secs(2), Duration::from_secs(5)).unwrap()
+    }
+
+    fn properties(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    fn backend(
+        server: &TestServer,
+        extra: &[(&str, &str)],
+        identity: Option<IcebergRestAuthMaterial>,
+    ) -> Arc<RestAuthOwner> {
+        let mut definition = properties(extra);
+        definition.insert("uri".to_string(), server.url());
+        let persistent = PersistentRestConfig::from_properties(&definition).unwrap();
+        RestAuthOwner::backend(identity, persistent, client()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_token_request_equals_upstream_oauth2_manager() {
+        let server = TestServer::start(
+            Script::new()
+                .on("POST", "/v1/oauth/tokens", Reply::token("exchanged-token"))
+                .on("GET", "/v1/config", Reply::config(&[], &[], None))
+                .on("GET", "/v1/namespaces/db", Reply::status(404)),
+        );
+        let shared = [
+            ("scope", "catalog:read"),
+            ("audience", "the-audience"),
+            ("resource", "urn:the-resource"),
+            ("header.x-tenant", "tenant-1"),
+        ];
+        // Upstream's own OAuth2Manager, selected from the same configuration.
+        let mut upstream_properties = properties(&shared);
+        upstream_properties.insert("uri".to_string(), server.url());
+        upstream_properties.insert(
+            "credential".to_string(),
+            "client-id:client-secret".to_string(),
+        );
+        let upstream = crate::iceberg_catalog_rest::RestCatalogBuilder::default()
+            .with_client(client().reqwest_client().clone())
+            .load("rest", upstream_properties)
+            .await
+            .unwrap();
+        let namespace = NamespaceIdent::new("db".to_string());
+        assert!(!upstream.namespace_exists(&namespace).await.unwrap());
+        let upstream_request = server.requests_to("POST", "/v1/oauth/tokens").remove(0);
+
+        let owner = backend(
+            &server,
+            &shared,
+            Some(oauth2_identity("client-id", "client-secret")),
+        );
+        let mut headers = HeaderMap::new();
+        owner.authorize(&mut headers).await.unwrap();
+        assert_eq!(headers[AUTHORIZATION], "Bearer exchanged-token");
+        let requests = server.requests_to("POST", "/v1/oauth/tokens");
+        assert_eq!(requests.len(), 2);
+        let ours = &requests[1];
+
+        assert_eq!(ours.target, upstream_request.target);
+        assert_eq!(ours.header_map(), upstream_request.header_map());
+        assert_eq!(ours.form(), upstream_request.form());
+        assert_eq!(
+            ours.form(),
+            vec![
+                ("audience".to_string(), "the-audience".to_string()),
+                ("client_id".to_string(), "client-id".to_string()),
+                ("client_secret".to_string(), "client-secret".to_string()),
+                ("grant_type".to_string(), "client_credentials".to_string()),
+                ("resource".to_string(), "urn:the-resource".to_string()),
+                ("scope".to_string(), "catalog:read".to_string()),
+            ]
+        );
+        assert_eq!(ours.header("authorization"), None);
+        assert_eq!(ours.header("x-tenant"), Some("tenant-1"));
+    }
+
+    #[tokio::test]
+    async fn an_explicit_token_endpoint_is_used_as_configured() {
+        let server =
+            TestServer::start(Script::new().on("POST", "/idp/token", Reply::token("idp-token")));
+        let endpoint = format!("{}/idp/token", server.url());
+        let owner = backend(
+            &server,
+            &[("oauth2-server-uri", &endpoint)],
+            Some(oauth2_identity("id", "secret")),
+        );
+        assert_eq!(
+            owner.authorization().await.unwrap().unwrap(),
+            "Bearer idp-token"
+        );
+        assert_eq!(server.count("POST", "/idp/token"), 1);
+        let form = server.requests_to("POST", "/idp/token")[0].form();
+        assert!(form.contains(&("scope".to_string(), "catalog".to_string())));
+    }
+
+    #[tokio::test]
+    async fn concurrent_backend_acquisitions_share_one_exchange_and_its_failure() {
+        let server = TestServer::start(Script::new().on_sequence(
+            "POST",
+            "/v1/oauth/tokens",
+            vec![
+                Reply::status(500).with_delay(Duration::from_millis(200)),
+                Reply::token("second-token"),
+            ],
+        ));
+        let owner = backend(&server, &[], Some(oauth2_identity("id", "secret")));
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let owner = Arc::clone(&owner);
+            tasks.push(tokio::spawn(async move {
+                let mut headers = HeaderMap::new();
+                owner.authorize(&mut headers).await
+            }));
+        }
+        let mut failures = Vec::new();
+        for task in tasks {
+            failures.push(task.await.unwrap().unwrap_err());
+        }
+        assert!(failures.iter().all(|failure| *failure == failures[0]));
+        assert_eq!(failures[0].step, BindingFailure::TokenUnavailable);
+        assert_eq!(server.count("POST", "/v1/oauth/tokens"), 1);
+
+        // Only a later call exchanges again; success is then kept.
+        for _ in 0..3 {
+            let mut headers = HeaderMap::new();
+            owner.authorize(&mut headers).await.unwrap();
+            assert_eq!(headers[AUTHORIZATION], "Bearer second-token");
+        }
+        assert_eq!(server.count("POST", "/v1/oauth/tokens"), 2);
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_failures_are_classified_by_status_only() {
+        for (reply, expected) in [
+            (Reply::status(401), BindingFailure::TokenRejected),
+            (Reply::status(400), BindingFailure::TokenRejected),
+            (Reply::status(503), BindingFailure::TokenUnavailable),
+            (Reply::status(201), BindingFailure::TokenUnavailable),
+            (
+                Reply::redirect(307, "http://127.0.0.1:9/elsewhere"),
+                BindingFailure::TokenUnavailable,
+            ),
+            (
+                Reply::bytes(200, b"not json".to_vec()),
+                BindingFailure::TokenUnavailable,
+            ),
+            (Reply::CloseAfterRequest, BindingFailure::TokenUnavailable),
+        ] {
+            let server = TestServer::start(Script::new().on("POST", "/v1/oauth/tokens", reply));
+            let owner = backend(&server, &[], Some(oauth2_identity("id", "secret")));
+            assert_eq!(owner.authorization().await.unwrap_err().step, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn bearer_and_anonymous_identities_exchange_nothing() {
+        let server = TestServer::start(Script::new());
+        let bearer = backend(&server, &[], Some(bearer_identity("configured-token")));
+        let mut headers = HeaderMap::new();
+        bearer.authorize(&mut headers).await.unwrap();
+        assert_eq!(headers[AUTHORIZATION], "Bearer configured-token");
+        assert!(headers[AUTHORIZATION].is_sensitive());
+
+        let anonymous = backend(&server, &[], None);
+        let mut headers = HeaderMap::new();
+        anonymous.authorize(&mut headers).await.unwrap();
+        assert!(headers.is_empty());
+        assert!(server.requests().is_empty());
+    }
+
+    #[test]
+    fn the_persistent_definition_rejects_authentication_and_protocol_headers() {
+        for (key, value) in [
+            ("header.Authorization", "Bearer x"),
+            ("header.x-api-token", "x"),
+            ("header.User-Agent", "custom"),
+            ("header.x-iceberg-access-delegation", "vended-credentials"),
+            ("rest.auth.type", "oauth2"),
+            ("token", "x"),
+            ("credential", "id:secret"),
+            ("oauth2-server-uri", ""),
+        ] {
+            let definition = properties(&[("uri", "http://catalog"), (key, value)]);
+            assert!(
+                PersistentRestConfig::from_properties(&definition).is_err(),
+                "{key}"
+            );
+        }
+        assert!(PersistentRestConfig::from_properties(&properties(&[])).is_err());
+        let definition = properties(&[("uri", "http://catalog/api"), ("header.x-tenant", "t")]);
+        let persistent = PersistentRestConfig::from_properties(&definition).unwrap();
+        assert_eq!(
+            persistent.token_property("oauth2-server-uri"),
+            Some("http://catalog/api/v1/oauth/tokens")
+        );
+        assert_eq!(persistent.token_property("scope"), Some("catalog"));
+    }
+
+    #[test]
+    fn debug_output_carries_no_principal_or_secret() {
+        let definition = properties(&[("uri", "http://catalog"), ("header.x-tenant", "t-canary")]);
+        let persistent = PersistentRestConfig::from_properties(&definition).unwrap();
+        let (owner, manager) = RestAuthOwner::frontend(
+            Some(oauth2_identity("principal-canary", "secret-canary")),
+            persistent.clone(),
+            client(),
+        )
+        .unwrap();
+        let bearer =
+            RestAuthOwner::backend(Some(bearer_identity("token-canary")), persistent, client())
+                .unwrap();
+        for debug in [
+            format!("{owner:?}"),
+            format!("{manager:?}"),
+            format!("{bearer:?}"),
+        ] {
+            for canary in [
+                "principal-canary",
+                "secret-canary",
+                "token-canary",
+                "t-canary",
+            ] {
+                assert!(!debug.contains(canary), "{debug}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_unusable_bearer_token_fails_construction() {
+        let definition = properties(&[("uri", "http://catalog")]);
+        let persistent = PersistentRestConfig::from_properties(&definition).unwrap();
+        assert!(
+            RestAuthOwner::backend(Some(bearer_identity("bad\ntoken")), persistent, client())
+                .is_err()
+        );
+    }
+}

@@ -448,7 +448,7 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
     async fn commit_staged_table(
         &self,
         _commit: crate::iceberg::TableCommit,
-        _request_file_io: crate::iceberg::io::FileIO,
+        _expectation: super::StagedPublicationExpectation,
     ) -> super::StagedCommitResult {
         super::StagedCommitResult::Unsupported(CatalogUnsupported::new(
             "Hadoop Iceberg catalog has no staged-create protocol",
@@ -576,7 +576,7 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         {
             return CatalogTransactionStart::Unsupported(reason);
         }
-        super::start_update_table_transaction(&self.delegate, request)
+        super::start_update_table_transaction(self, request)
     }
 
     async fn new_create_table_transaction(

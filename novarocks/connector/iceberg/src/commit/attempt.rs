@@ -109,35 +109,24 @@ impl Publisher for TransitionalPublisher {
                 novarocks_spi::connector::ExternalMutationEffect::NoOp,
             );
         }
-        let expected = request.ref_snapshot_after(&self.target_ref);
-        match self
-            .catalog
-            .vendored_client()
-            .update_table(request.into_table_commit())
-            .await
-        {
-            Ok(table) => {
-                match crate::catalog::dispatch::committed_snapshot_id(
-                    table.metadata(),
-                    &self.target_ref,
-                    expected,
-                ) {
-                    Ok(snapshot) => CatalogOutcome::committed(
-                        CommitProof::applied(snapshot)
-                            .with_table_uuid(table.metadata().uuid().to_string()),
-                        novarocks_spi::connector::ExternalMutationEffect::Applied,
-                    ),
-                    Err(error) => CatalogOutcome::unknown(error.to_string(), self.evidence.clone()),
-                }
+        // One dispatch through the owner's own mechanism: the REST owner's
+        // evidence-producing commit, or the shared single `update_table`
+        // (L12). The result is typed; nothing here infers from an error.
+        let dispatch = self.catalog.commit_dispatch(
+            self.ident.clone(),
+            std::sync::Arc::from(self.target_ref.as_str()),
+            None,
+        );
+        match dispatch.dispatch_once(Some(&request)).await {
+            crate::catalog::transaction::CommitDispatchResult::Applied(proof) => {
+                let effect = proof.effect;
+                CatalogOutcome::committed(proof, effect)
             }
-            Err(error) => {
-                if self.catalog.admits_uncommitted_proof(&error) {
-                    crate::catalog::error::classify_dispatched_error(&error, || {
-                        self.evidence.clone()
-                    })
-                } else {
-                    CatalogOutcome::unknown(error.to_string(), self.evidence.clone())
-                }
+            crate::catalog::transaction::CommitDispatchResult::Uncommitted { failure } => {
+                CatalogOutcome::KnownUncommitted { failure }
+            }
+            crate::catalog::transaction::CommitDispatchResult::Unknown { message } => {
+                CatalogOutcome::unknown(message, self.evidence.clone())
             }
         }
     }

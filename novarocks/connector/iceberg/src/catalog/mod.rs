@@ -72,7 +72,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use novarocks_spi::connector::{ConnectorError, ConnectorListingBound};
+use novarocks_spi::connector::{ConnectorError, ConnectorListingBound, ConnectorMutationFailure};
 
 use self::error::{CatalogOutcome, CatalogUnsupported};
 
@@ -357,17 +357,36 @@ pub(crate) enum StagedCreateStart {
         access_delegation: crate::loaded_table::IcebergAccessDelegation,
     },
     Conflict(String),
-    KnownUncommitted(String),
+    /// Proven not applied: never dispatched, or rejected before publication
+    /// (D13). The failure keeps its kind.
+    KnownUncommitted(ConnectorMutationFailure),
     CommitUnknown(String),
     /// This catalog has no staged-create protocol. Proven zero side effect.
     Unsupported(CatalogUnsupported),
 }
 
+/// What the final publication of a staged create must show to be attributed
+/// to this operation (spec 5.7 items 4-6).
+#[derive(Clone, Debug)]
+pub(crate) struct StagedPublicationExpectation {
+    /// The UUID the stage froze.
+    pub(crate) staged_table_uuid: uuid::Uuid,
+    /// The snapshot this publication adds to `main`, if it writes data.
+    pub(crate) snapshot_id: Option<i64>,
+    /// Properties NovaRocks itself names: the operation marker and any
+    /// document properties.
+    pub(crate) properties: Vec<(String, String)>,
+}
+
 /// What committing a staged create produced.
 #[derive(Debug)]
 pub(crate) enum StagedCommitResult {
-    Committed(crate::iceberg::table::Table),
-    Conflict(String),
+    /// The receipt: this publication's snapshot and the table UUID.
+    Committed(transaction::CommitProof),
+    /// A received 409: another table holds the name.
+    Conflict(ConnectorMutationFailure),
+    /// Proven not applied: never dispatched, or rejected before publication.
+    KnownUncommitted(ConnectorMutationFailure),
     CommitUnknown(String),
     Unsupported(CatalogUnsupported),
 }
@@ -394,14 +413,6 @@ pub(crate) enum StagedCommitResult {
 /// admission completes before the first side effect.
 #[async_trait]
 pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
-    /// Whether this owner accepts the client's error as evidence for a
-    /// dispatched mutation. This grants no proof by itself: callers must also
-    /// check the shared definite-rejection classifier.
-    // Design: ADR-0174 (docs/adr/ADR-0174-vendored-iceberg-baseline-and-patch-policy.md)
-    fn admits_uncommitted_proof(&self, _error: &crate::iceberg::Error) -> bool {
-        true
-    }
-
     /// Human-readable implementation name, for diagnostics and log lines only.
     ///
     /// This must never be consulted to decide whether an operation is
@@ -420,12 +431,30 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     /// other handle, for instance.
     fn vendored_client(&self) -> Arc<dyn crate::iceberg::Catalog>;
 
+    /// The single-dispatch mechanism for one existing-table publication.
+    ///
+    /// Every catalog shares the vendored `update_table` mechanism; the REST
+    /// owner replaces it with its evidence-producing commit (L12).
+    fn commit_dispatch(
+        &self,
+        ident: crate::iceberg::TableIdent,
+        target_ref: Arc<str>,
+        marker: Option<(Arc<str>, Arc<str>)>,
+    ) -> Arc<dyn transaction::CatalogCommitDispatch> {
+        Arc::new(dispatch::UpdateTableDispatch::new(
+            self.vendored_client(),
+            ident,
+            target_ref,
+            marker,
+        ))
+    }
+
     /// The provider-private REST client that may refresh an already-admitted
     /// vended credential scope. Only the REST implementation owns such a
     /// capability; callers never downcast or construct a second catalog.
     fn vended_credential_refresh_catalog(
         &self,
-    ) -> Option<Arc<crate::iceberg_catalog_rest::RestCatalog>> {
+    ) -> Option<Arc<crate::rest_protocol::endpoints::RestEndpoints>> {
         None
     }
 
@@ -582,6 +611,39 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
 
     // ---- B. Direct mutations -------------------------------------------
 
+    /// Create a view. A catalog without views answers `Unsupported`.
+    async fn create_view(
+        &self,
+        namespace: CatalogNamespaceName,
+        _creation: crate::iceberg::ViewCreation,
+    ) -> CatalogOutcome<CatalogTableName> {
+        CatalogOutcome::unsupported(format!(
+            "{} Iceberg catalog does not support views (namespace {})",
+            self.implementation_name(),
+            namespace.namespace
+        ))
+    }
+
+    /// Replace a view's definition; the commit freezes the view UUID.
+    async fn replace_view(
+        &self,
+        commit: crate::iceberg::ViewCommit,
+    ) -> CatalogOutcome<CatalogTableName> {
+        CatalogOutcome::unsupported(format!(
+            "{} Iceberg catalog does not support views ({})",
+            self.implementation_name(),
+            commit.identifier()
+        ))
+    }
+
+    /// Drop a view.
+    async fn drop_view(&self, view: CatalogTableName) -> CatalogOutcome<CatalogTableName> {
+        CatalogOutcome::unsupported(format!(
+            "{} Iceberg catalog does not support views ({view})",
+            self.implementation_name()
+        ))
+    }
+
     async fn create_namespace(
         &self,
         namespace: CatalogNamespaceName,
@@ -637,11 +699,12 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         creation: crate::iceberg::TableCreation,
     ) -> StagedCreateStart;
 
-    /// Publish a staged create with exactly one assert-create request.
+    /// Publish a staged create with exactly one assert-create request,
+    /// attributed against `expectation` before any evidence is reported.
     async fn commit_staged_table(
         &self,
         commit: crate::iceberg::TableCommit,
-        request_file_io: crate::iceberg::io::FileIO,
+        expectation: StagedPublicationExpectation,
     ) -> StagedCommitResult;
 
     /// Stage a conditional create against storage, without publishing it.
@@ -730,7 +793,7 @@ pub(crate) mod transaction;
 // No production caller yet: see the note on `new_transaction`.
 #[allow(dead_code)]
 fn start_update_table_transaction(
-    delegate: &delegate::CatalogDelegate,
+    owner: &(impl NovaRocksCatalog + ?Sized),
     request: transaction::TransactionRequest,
 ) -> CatalogTransactionStart {
     let ident = match delegate::table_ident(&request.target) {
@@ -750,22 +813,18 @@ fn start_update_table_transaction(
     if let Some(uuid) = &request.expected_table_uuid {
         evidence = evidence.with_target_uuid(Arc::clone(uuid));
     }
-    let dispatch = Arc::new(dispatch::UpdateTableDispatch::new(
-        Arc::clone(delegate.client()),
+    let dispatch = owner.commit_dispatch(
         ident,
         Arc::clone(&request.target_ref),
         request.marker.clone(),
-    ));
-    CatalogTransactionStart::Ready(Box::new(
-        transaction::Transaction::new(
-            request.identity,
-            request.target,
-            transaction::TransactionShape::Existing,
-            evidence,
-            dispatch,
-        )
-        .with_uncommitted_proof_rule(delegate.admits),
-    ))
+    );
+    CatalogTransactionStart::Ready(Box::new(transaction::Transaction::new(
+        request.identity,
+        request.target,
+        transaction::TransactionShape::Existing,
+        evidence,
+        dispatch,
+    )))
 }
 
 /// Begin a publication that creates a table through one catalog request.
@@ -803,16 +862,13 @@ fn start_create_table_transaction(
         request.creation,
         table_ident,
     ));
-    CatalogTransactionStart::Ready(Box::new(
-        transaction::Transaction::new(
-            request.identity,
-            request.target,
-            transaction::TransactionShape::Create(request.intent),
-            evidence,
-            dispatch,
-        )
-        .with_uncommitted_proof_rule(delegate.admits),
-    ))
+    CatalogTransactionStart::Ready(Box::new(transaction::Transaction::new(
+        request.identity,
+        request.target,
+        transaction::TransactionShape::Create(request.intent),
+        evidence,
+        dispatch,
+    )))
 }
 
 #[cfg(all(test, feature = "mem-1-m07-hms-listing-observe"))]

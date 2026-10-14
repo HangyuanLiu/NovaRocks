@@ -284,18 +284,6 @@ pub(crate) fn read_error_kind(kind: crate::iceberg::ErrorKind) -> ConnectorError
     }
 }
 
-/// REST conflict kinds produced by a received HTTP 409 response.
-/// Other SDK errors do not establish a safe cleanup frontier.
-pub(crate) fn proves_received_conflict(error: &crate::iceberg::Error) -> bool {
-    use crate::iceberg::ErrorKind;
-    matches!(
-        error.kind(),
-        ErrorKind::CatalogCommitConflicts
-            | ErrorKind::TableAlreadyExists
-            | ErrorKind::NamespaceAlreadyExists
-    )
-}
-
 /// Whether a vendored catalog error proves the mutation was **not** applied.
 ///
 /// This is the single place the dispatch question is answered, and it answers
@@ -309,6 +297,11 @@ pub(crate) fn proves_received_conflict(error: &crate::iceberg::Error) -> bool {
 /// this owner exists to prevent.
 pub(crate) fn proves_uncommitted(error: &crate::iceberg::Error) -> bool {
     use crate::iceberg::ErrorKind;
+    // A REST failure carries its typed evidence; only the evidence decides
+    // (L14). Kind inference remains for catalogs without evidence (Hadoop).
+    if let Some(evidence) = crate::rest_protocol::adapter::rest_evidence(error) {
+        return evidence_proves_uncommitted(evidence);
+    }
     matches!(
         error.kind(),
         ErrorKind::NamespaceNotFound
@@ -329,6 +322,11 @@ pub(crate) fn uncommitted_failure_kind(
     error: &crate::iceberg::Error,
 ) -> ConnectorMutationFailureKind {
     use crate::iceberg::ErrorKind;
+    if let Some(evidence) = crate::rest_protocol::adapter::rest_evidence(error)
+        && let Some(failure) = evidence.failure()
+    {
+        return failure.kind();
+    }
     match error.kind() {
         ErrorKind::NamespaceNotFound | ErrorKind::TableNotFound => {
             ConnectorMutationFailureKind::NotFound
@@ -343,6 +341,16 @@ pub(crate) fn uncommitted_failure_kind(
         ErrorKind::DataInvalid => ConnectorMutationFailureKind::InvalidRequest,
         _ => ConnectorMutationFailureKind::Unavailable,
     }
+}
+
+/// Whether REST evidence proves nothing was applied: never dispatched, or
+/// rejected with a status the server raises before publishing (D13).
+fn evidence_proves_uncommitted(evidence: &crate::rest_protocol::evidence::RestEvidence) -> bool {
+    matches!(
+        evidence,
+        crate::rest_protocol::evidence::RestEvidence::NotDispatched { .. }
+            | crate::rest_protocol::evidence::RestEvidence::Rejected { .. }
+    )
 }
 
 /// Classify a vendored catalog error raised by a request that **was already
@@ -477,24 +485,52 @@ mod tests {
     }
 
     #[test]
-    fn rest_proof_requires_a_received_conflict_kind() {
-        for kind in [
-            ErrorKind::CatalogCommitConflicts,
-            ErrorKind::TableAlreadyExists,
-            ErrorKind::NamespaceAlreadyExists,
-        ] {
-            assert!(proves_received_conflict(&err(kind)), "{kind:?}");
-        }
-        for kind in [
-            ErrorKind::TableNotFound,
-            ErrorKind::NamespaceNotFound,
-            ErrorKind::DataInvalid,
-            ErrorKind::PreconditionFailed,
-            ErrorKind::FeatureUnsupported,
+    fn rest_evidence_decides_before_the_error_kind() {
+        use crate::rest_protocol::adapter::RestEvidenceCarrier;
+        use crate::rest_protocol::evidence::{NotDispatchedCause, NotWrittenCause, RestEvidence};
+
+        let carried = |kind: ErrorKind, evidence: RestEvidence| {
+            crate::iceberg::Error::new(kind, "adapter failure")
+                .with_source(RestEvidenceCarrier::new(evidence))
+        };
+        // A typed rejection proves "not applied" whatever the kind says.
+        let rejected = carried(
             ErrorKind::Unexpected,
-        ] {
-            assert!(!proves_received_conflict(&err(kind)), "{kind:?}");
-        }
+            RestEvidence::Rejected {
+                status: 403,
+                kind: ConnectorMutationFailureKind::PermissionDenied,
+            },
+        );
+        assert!(proves_uncommitted(&rejected));
+        assert_eq!(
+            uncommitted_failure_kind(&rejected),
+            ConnectorMutationFailureKind::PermissionDenied
+        );
+        let not_dispatched = carried(
+            ErrorKind::Unexpected,
+            RestEvidence::NotDispatched {
+                kind: ConnectorMutationFailureKind::Unavailable,
+                cause: NotDispatchedCause::NotWritten(NotWrittenCause::Connect),
+            },
+        );
+        assert!(proves_uncommitted(&not_dispatched));
+        // Unknown evidence never proves "not applied", even under a kind the
+        // inference would accept.
+        let unknown = carried(
+            ErrorKind::TableNotFound,
+            crate::rest_protocol::evidence::classify(
+                &crate::rest_protocol::evidence::DispatchStage::Status {
+                    code: 404,
+                    header_names: Vec::new(),
+                },
+                crate::rest_protocol::evidence::BodyRead::NotRead,
+                &crate::rest_protocol::evidence::AttributionExpectation::drop_table(),
+            ),
+        );
+        assert!(!proves_uncommitted(&unknown));
+        let outcome: CatalogOutcome<()> =
+            classify_dispatched_error(&unknown, || CatalogCommitEvidence::for_target("db.t"));
+        assert!(matches!(outcome, CatalogOutcome::CommitUnknown { .. }));
     }
 
     #[test]

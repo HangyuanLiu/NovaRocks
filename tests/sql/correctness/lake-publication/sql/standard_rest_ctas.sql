@@ -33,14 +33,26 @@ INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows VALUES
   (1, 'alpha'), (2, 'beta'), (3, 'gamma');
 
 -- query 2
--- Frontier dispatch never occurred: the target must remain absent and the
--- statement must report a definite non-commit outcome.
+-- The proxy answers the stage with HTTP 400 without forwarding it. A 400 is
+-- not a pre-publication rejection (D13), so the connector keeps the staged
+-- operation unknown and cleans nothing up on its strength. A staged create
+-- publishes nothing visible, so the statement itself reports a definite
+-- non-commit: the target must remain absent.
 -- @publication_catalog_fault=stage-create,before-dispatch
 -- @expect_error_code=CommitKnownUncommitted
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.before_dispatch AS
   SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
 
 -- query 3
+-- The proxy rejects the stage with HTTP 403 without forwarding it. A 403 is a
+-- definite rejection before publication (D13): the statement reports a known
+-- non-commit outcome.
+-- @publication_catalog_fault=stage-create,before-dispatch-forbidden
+-- @expect_error_code=CommitKnownUncommitted
+CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.before_dispatch_forbidden AS
+  SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
+
+-- query 4
 -- The single standard NotExist table commit succeeded at the Catalog but its
 -- response was lost. The current statement may use its one same-session,
 -- read-only adjudication to observe the exact marker and report committed;
@@ -51,7 +63,7 @@ CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.before_dispatch AS
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.response_lost AS
   SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
 
--- query 4
+-- query 5
 -- The table commit has succeeded in the real Catalog, but the proxy keeps its
 -- response open. The runner must kill and restart the only FE while this SQL
 -- client is still blocked, then a later read proves there was no durable DML
@@ -61,13 +73,13 @@ CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.response_lost AS
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.inflight_fe_kill AS
   SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
 
--- query 5
+-- query 6
 -- The external-state observation is the authority, not the prior error text.
 -- @retry_count=30
 -- @retry_interval_ms=1000
 SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.inflight_fe_kill ORDER BY id;
 
--- query 6
+-- query 7
 -- Success followed by an FE restart exercises the finalization boundary. The
 -- restart must not resume a completed CTAS as a second Catalog mutation.
 -- @skip_result_check=true
@@ -75,11 +87,11 @@ SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.inflight_fe_ki
 CREATE TABLE lake_publication_${suite_uuid0}.ns_${uuid0}.restart_after_success AS
   SELECT id, value FROM lake_publication_${suite_uuid0}.ns_${uuid0}.source_rows;
 
--- query 7
+-- query 8
 SELECT COUNT(*) AS n
   FROM lake_publication_${suite_uuid0}.ns_${uuid0}.restart_after_success;
 
--- query 8
+-- query 9
 -- Seed a current-snapshot parent sketch. The held append below freezes this
 -- snapshot and its ordinary aggregate result before the cross-engine DELETE
 -- advances the table.
@@ -96,7 +108,7 @@ TBLPROPERTIES (
 INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.concurrent_append_mutation VALUES
   (1, 10), (2, 20);
 
--- query 9
+-- query 10
 -- The proxy stops this commit before dispatch. Spark then commits DELETE(1)
 -- directly through the real REST catalog. Releasing the request forces Nova
 -- to observe an actual OCC conflict and build a fresh eager attempt from the
@@ -107,14 +119,14 @@ INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.concurrent_append_mutati
 INSERT INTO lake_publication_${suite_uuid0}.ns_${uuid0}.concurrent_append_mutation VALUES
   (3, 30);
 
--- query 10
+-- query 11
 -- Both external mutations are visible exactly once. In particular, a fresh
 -- attempt must not replay the data file or resurrect the deleted row.
 SELECT id, k
 FROM lake_publication_${suite_uuid0}.ns_${uuid0}.concurrent_append_mutation
 ORDER BY id;
 
--- query 11
+-- query 12
 -- The current snapshot is the append rebased on top of Spark's DELETE. The
 -- mutation invalidates the original incremental parent: the fresh attempt must
 -- not relabel that sketch as current-snapshot evidence. The original ancestor
@@ -151,6 +163,6 @@ spark_out="$("${NOVAROCKS_WORKSPACE_ROOT:-.}/docker/iceberg-rest/spark-shell.sh"
 printf '%s\n' "$spark_out"
 printf '%s\n' "$spark_out" | grep -F "CONCURRENT_APPEND_MUTATION_OK"
 
--- query 12
+-- query 13
 -- @skip_result_check=true
 DROP DATABASE lake_publication_${suite_uuid0}.ns_${uuid0} FORCE;

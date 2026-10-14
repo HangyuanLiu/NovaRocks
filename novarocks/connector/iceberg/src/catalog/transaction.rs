@@ -154,6 +154,40 @@ impl CommitProof {
     }
 }
 
+/// What one dispatch established, decided by the mechanism that observed it.
+///
+/// The transaction advances on this directly (L12): nothing above the
+/// mechanism infers a definite rejection from an error type.
+#[derive(Debug)]
+pub(crate) enum CommitDispatchResult {
+    /// The publication is present.
+    Applied(CommitProof),
+    /// Proven that nothing was applied: never dispatched, or rejected before
+    /// publication.
+    Uncommitted { failure: ConnectorMutationFailure },
+    /// The request may have taken effect.
+    Unknown { message: String },
+}
+
+impl CommitDispatchResult {
+    /// Classify a vendored catalog result with the shared judgment, which reads
+    /// typed REST evidence first and infers from the kind only without it.
+    pub(crate) fn from_catalog_result(result: Result<CommitProof, crate::iceberg::Error>) -> Self {
+        match result {
+            Ok(proof) => Self::Applied(proof),
+            Err(error) if proves_uncommitted(&error) => Self::Uncommitted {
+                failure: ConnectorMutationFailure::new(
+                    uncommitted_failure_kind(&error),
+                    error.to_string(),
+                ),
+            },
+            Err(error) => Self::Unknown {
+                message: error.to_string(),
+            },
+        }
+    }
+}
+
 /// Performs the single external request behind one transaction, and can later
 /// re-read the catalog to prove whether that request landed.
 ///
@@ -165,12 +199,11 @@ pub(crate) trait CatalogCommitDispatch: std::fmt::Debug + Send + Sync {
     /// Issue **exactly one** external request.
     ///
     /// Implementations must not retry, must not fall back to a second request,
-    /// and must not consult `Error::retryable()`. Returning `Err` hands the
-    /// dispatch question to [`super::error::proves_uncommitted`].
+    /// and must not consult `Error::retryable()`.
     async fn dispatch_once(
         &self,
         staged: Option<&crate::commit::model::FrozenRequest>,
-    ) -> Result<CommitProof, crate::iceberg::Error>;
+    ) -> CommitDispatchResult;
 
     /// Re-read the catalog and report whether this exact publication is
     /// present.
@@ -261,7 +294,6 @@ pub(crate) struct Transaction {
     shape: TransactionShape,
     evidence: CatalogCommitEvidence,
     dispatch: Arc<dyn CatalogCommitDispatch>,
-    admits: super::delegate::UncommittedProofRule,
     staged: Option<crate::commit::model::FrozenRequest>,
     admission: AdmissionFacts,
     state: TransactionState,
@@ -281,19 +313,10 @@ impl Transaction {
             shape,
             evidence,
             dispatch,
-            admits: |_| true,
             staged: None,
             admission: AdmissionFacts::default(),
             state: TransactionState::Admitted,
         }
-    }
-
-    pub(super) fn with_uncommitted_proof_rule(
-        mut self,
-        rule: super::delegate::UncommittedProofRule,
-    ) -> Self {
-        self.admits = rule;
-        self
     }
 
     /// Record what admission observed. Set by the constructor that admitted
@@ -403,24 +426,19 @@ impl Transaction {
 
         let staged = self.staged.take();
         match self.dispatch.dispatch_once(staged.as_ref()).await {
-            Ok(proof) => {
+            CommitDispatchResult::Applied(proof) => {
                 self.state = TransactionState::Committed;
                 let effect = proof.effect;
                 CatalogOutcome::committed(proof, effect)
             }
-            Err(error) => {
-                if (self.admits)(&error) && proves_uncommitted(&error) {
-                    self.state = TransactionState::Uncommitted;
-                    return CatalogOutcome::KnownUncommitted {
-                        failure: ConnectorMutationFailure::new(
-                            uncommitted_failure_kind(&error),
-                            error.to_string(),
-                        ),
-                    };
-                }
+            CommitDispatchResult::Uncommitted { failure } => {
+                self.state = TransactionState::Uncommitted;
+                CatalogOutcome::KnownUncommitted { failure }
+            }
+            CommitDispatchResult::Unknown { message } => {
                 let evidence = self.evidence.clone();
                 self.state = TransactionState::Unknown(evidence.clone());
-                CatalogOutcome::unknown(error.to_string(), evidence)
+                CatalogOutcome::unknown(message, evidence)
             }
         }
     }
@@ -554,9 +572,9 @@ mod tests {
         async fn dispatch_once(
             &self,
             _staged: Option<&crate::commit::model::FrozenRequest>,
-        ) -> Result<CommitProof, IcebergError> {
+        ) -> CommitDispatchResult {
             self.dispatches.fetch_add(1, Ordering::SeqCst);
-            match self.behavior {
+            CommitDispatchResult::from_catalog_result(match self.behavior {
                 Behavior::Succeed => Ok(CommitProof::applied(Some(41))),
                 Behavior::RejectDefinitely => Err(IcebergError::new(
                     ErrorKind::CatalogCommitConflicts,
@@ -566,7 +584,7 @@ mod tests {
                     Err(IcebergError::new(ErrorKind::Unexpected, "connection reset"))
                 }
                 Behavior::Reject(kind) => Err(IcebergError::new(kind, "dispatched failure")),
-            }
+            })
         }
 
         async fn adjudicate(&self) -> Result<Option<CommitProof>, ConnectorError> {
@@ -581,7 +599,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_rule_preserves_default_rejections_but_closes_rest_authority() {
+    async fn the_transaction_advances_on_the_typed_dispatch_result() {
+        // Without typed evidence the shared judgment still infers from the
+        // kind, which is the non-REST behavior.
         for kind in [
             ErrorKind::TableNotFound,
             ErrorKind::NamespaceNotFound,
@@ -589,38 +609,25 @@ mod tests {
             ErrorKind::PreconditionFailed,
             ErrorKind::FeatureUnsupported,
         ] {
-            let default_dispatch = FakeDispatch::new(Behavior::Reject(kind));
-            let mut default = transaction(default_dispatch);
+            let mut default = transaction(FakeDispatch::new(Behavior::Reject(kind)));
             assert!(default.commit().await.permits_cleanup(), "{kind:?}");
             default.abort().await.unwrap();
-
-            let dispatch = FakeDispatch::new(Behavior::Reject(kind));
-            let mut rest = transaction(Arc::clone(&dispatch))
-                .with_uncommitted_proof_rule(super::super::error::proves_received_conflict);
-            let first = rest.commit().await;
-            assert!(
-                matches!(first, CatalogOutcome::CommitUnknown { .. }),
-                "{kind:?}"
-            );
-            assert!(!first.permits_cleanup());
-            assert!(rest.mutation_authority_closed());
-            assert!(matches!(
-                rest.commit().await,
-                CatalogOutcome::CommitUnknown { .. }
-            ));
-            rest.abort().await.expect_err("unknown cannot abort");
-            assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 1);
-            assert_eq!(dispatch.aborts.load(Ordering::SeqCst), 0);
         }
-        for kind in [
-            ErrorKind::CatalogCommitConflicts,
-            ErrorKind::TableAlreadyExists,
-            ErrorKind::NamespaceAlreadyExists,
-        ] {
-            let mut rest = transaction(FakeDispatch::new(Behavior::Reject(kind)))
-                .with_uncommitted_proof_rule(super::super::error::proves_received_conflict);
-            assert!(rest.commit().await.permits_cleanup(), "{kind:?}");
-        }
+        // REST failures carry evidence: a 404 is unknown even though its kind
+        // alone would have been inferred as a definite rejection.
+        let unknown = crate::rest_protocol::evidence::classify(
+            &crate::rest_protocol::evidence::DispatchStage::Status {
+                code: 404,
+                header_names: Vec::new(),
+            },
+            crate::rest_protocol::evidence::BodyRead::NotRead,
+            &crate::rest_protocol::evidence::AttributionExpectation::drop_table(),
+        );
+        let error = IcebergError::new(ErrorKind::TableNotFound, "adapter failure").with_source(
+            crate::rest_protocol::adapter::RestEvidenceCarrier::new(unknown),
+        );
+        let result = CommitDispatchResult::from_catalog_result(Err(error));
+        assert!(matches!(result, CommitDispatchResult::Unknown { .. }));
     }
 
     fn transaction(dispatch: Arc<FakeDispatch>) -> Transaction {

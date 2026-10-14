@@ -386,8 +386,9 @@ impl IcebergMetadataMaintenanceAdapter {
         self.runtime
             .control_state()
             .invalidate_table_cache(&payload.namespace, &payload.table);
-        let owner = self.runtime.novarocks_catalog();
-        let catalog = owner.vendored_client();
+        // A REST failure reaches this classifier through the transitional
+        // adapter, whose only definite-rejection kind is a received 409.
+        let catalog = self.runtime.novarocks_catalog().vendored_client();
         let loaded = self
             .runtime
             .load_table_for_request(&payload.namespace, &payload.table, context)
@@ -426,13 +427,7 @@ impl IcebergMetadataMaintenanceAdapter {
                             added_items: outcome.added_manifests_count as u64,
                             ..Default::default()
                         })
-                        .map_err(|error| {
-                            if owner.admits_uncommitted_proof(&error) {
-                                classify_iceberg_error(error)
-                            } else {
-                                ExecFailure::Unknown(unavailable(error.to_string()))
-                            }
-                        })
+                        .map_err(classify_iceberg_error)
                 }),
             novarocks_spi::connector::EXPIRE_TABLE_VERSIONS_KIND => self
                 .runtime
@@ -456,13 +451,7 @@ impl IcebergMetadataMaintenanceAdapter {
                             cleanup_succeeded: outcome.deleted_file_count as u64,
                             ..Default::default()
                         })
-                        .map_err(|error| {
-                            if owner.admits_uncommitted_proof(&error) {
-                                classify_iceberg_error(error)
-                            } else {
-                                ExecFailure::Unknown(unavailable(error.to_string()))
-                            }
-                        })
+                        .map_err(classify_iceberg_error)
                 }),
             _ => Err(ExecFailure::KnownUncommitted(invalid(
                 "unsupported metadata maintenance operation",
