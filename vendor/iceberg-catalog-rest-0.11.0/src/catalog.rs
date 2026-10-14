@@ -17,7 +17,6 @@
 
 //! This module contains the iceberg REST catalog implementation.
 
-mod extension;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::future::Future;
@@ -25,11 +24,6 @@ use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-pub use extension::{
-    DeferredRestTableMaterialization, DeferredRestTableWithAccessDelegation,
-    DeferredStagedTableCreateWithAccessDelegation, RestAccessDelegation,
-    StorageCredentialDelegation,
-};
 use iceberg::encryption::kms::{KeyManagementClient, KmsClientFactory};
 use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
 use iceberg::table::Table;

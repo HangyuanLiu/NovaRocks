@@ -56,57 +56,6 @@ source control; package content and dependency resolution remain reproducible.
 
 ## Patch inventory
 
-### R6: redacted storage-delegation handoff
-
-- Files: `src/catalog/extension.rs`, `src/catalog.rs`.
-- Purpose: retain `StorageCredentialDelegation` and `RestAccessDelegation` with
-  exact-key lookup and credential-free Debug output; no raw map or serialization.
-- Upstream status: no equivalent closed handoff surface at the pinned baseline.
-- Production dependency: NovaRocks credential parsing in `loaded_table.rs`.
-- Exit: IRU-13a replaces the vendored REST evidence and credential handoff.
-- Coverage: `catalog::extension::tests::storage_delegation_exposes_exact_keys_without_debug_secrets`.
-- Validation: standalone REST crate tests once the shared Cargo window is free.
-
-### R7: deferred table materialization bound to the loading owner
-
-- Files: `src/catalog/extension.rs`, `src/catalog.rs`.
-- Purpose: keep deferred table/staged-create response facts opaque until the
-  provider chooses an admitted FileIO; capture Runtime and KMS from the loading
-  RestSessionCatalog and pass them to TableBuilder without ambient discovery.
-- Upstream status: no equivalent deferred credential handoff at the baseline.
-- Production dependency: NovaRocks `loaded_table.rs`, `catalog/rest.rs`, and
-  execution credential acquisition materialize the response with their FileIO.
-- Exit: IRU-13a replaces the vendored materialization and evidence surface.
-- Coverage: `catalog::extension::tests::deferred_materialization_retains_loading_runtime_and_kms_without_ambient_runtime`;
-  deferred load/stage component tests migrate with R5 and R3.
-- Validation: standalone REST crate tests after the shared Cargo window is free.
-
-### R5: deferred delegated table load
-
-- Files: `src/catalog/extension.rs`.
-- Purpose: retain only `load_table_deferred_with_access_delegation`; issue one
-  delegated GET, accept 200/304, retain TableNotFound on 404, defer FileIO.
-  RestCatalog forwards its bound SessionContext to the session owner.
-- Upstream status: no equivalent deferred delegated table load at the baseline.
-- Production dependency: NovaRocks REST owner, loaded-table materialization and
-  execution credential acquisition. Unused eager delegated load/create APIs and
-  public header constants are intentionally not restored.
-- Exit: IRU-13a replaces the vendored deferred handoff.
-- Coverage: migrated `access_delegation_is_opt_in_and_preserves_redacted_facts`.
-- Validation: standalone REST crate tests after the shared Cargo window is free.
-
-### R8: authenticated credential renewal without table observation
-
-- Files: `src/catalog/extension.rs`, `src/types.rs`.
-- Purpose: retain the credential-only wire response and renewal GET through the
-  initialized authenticated client, without table metadata or FileIO selection.
-  Renewal is not gated by config endpoint declarations.
-- Upstream status: no equivalent closed renewal handoff at the baseline.
-- Production dependency: NovaRocks loaded-table and execution lease renewal.
-- Exit: IRU-13a replaces the vendored credential renewal protocol surface.
-- Coverage: migrated `credential_refresh_uses_catalog_authentication_and_redacts_values`.
-- Validation: standalone REST crate tests after the shared Cargo window is free.
-
 ### R10: response and credential diagnostics stay redacted
 
 - Files: `src/client.rs`, `src/auth/oauth2.rs`, `src/types.rs`.
