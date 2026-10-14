@@ -58,6 +58,8 @@ fn task_state(
         execution_runtime: Some(runtime),
         query_memory: memory,
         task_identity: Some(task),
+        #[cfg(feature = "test-controls")]
+        exchange_test_observer: None,
     })
 }
 fn control(state: &RuntimeState) -> RuntimeKernelControl {
