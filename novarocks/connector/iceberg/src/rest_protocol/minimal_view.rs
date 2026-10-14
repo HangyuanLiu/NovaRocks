@@ -801,6 +801,11 @@ pub(crate) struct RawStorageCredential {
 }
 
 impl RawStorageCredential {
+    /// Adopt one credential from a fully decoded response document.
+    pub(crate) fn from_decoded(prefix: String, config: BTreeMap<String, String>) -> Self {
+        Self { prefix, config }
+    }
+
     pub(crate) fn config_len(&self) -> usize {
         self.config.len()
     }

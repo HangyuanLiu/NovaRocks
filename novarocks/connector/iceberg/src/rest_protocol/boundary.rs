@@ -55,15 +55,31 @@ pub(crate) fn is_probe_veto(error: &Error) -> bool {
 /// fixed text `operation` (for example "load table"): no message, context or
 /// source of the upstream error survives.
 pub(crate) fn sanitize_upstream_error(error: &Error, operation: &'static str) -> Error {
-    Error::new(error.kind(), UpstreamFailure(operation).to_string())
+    Error::new(
+        error.kind(),
+        UpstreamFailure(operation, error.kind()).to_string(),
+    )
 }
 
-/// The fixed text of a sanitized upstream failure.
-struct UpstreamFailure(&'static str);
+/// The fixed text of a sanitized upstream failure. A not-found kind keeps a
+/// fixed statement of absence, which is all the error kind already says.
+struct UpstreamFailure(&'static str, ErrorKind);
 
 impl fmt::Display for UpstreamFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "REST catalog {} failed", self.0)
+        let absent = match self.1 {
+            ErrorKind::TableNotFound => Some("table"),
+            ErrorKind::NamespaceNotFound => Some("namespace"),
+            _ => None,
+        };
+        match absent {
+            Some(object) => write!(
+                formatter,
+                "REST catalog {} failed: the {object} does not exist",
+                self.0
+            ),
+            None => write!(formatter, "REST catalog {} failed", self.0),
+        }
     }
 }
 
@@ -121,5 +137,17 @@ mod tests {
             &probe_veto(),
             "probe"
         )));
+    }
+
+    #[test]
+    fn a_sanitized_not_found_states_absence_with_fixed_text() {
+        let upstream = Error::new(ErrorKind::TableNotFound, "server-message-canary");
+        let sanitized = sanitize_upstream_error(&upstream, "table load");
+        assert_eq!(sanitized.kind(), ErrorKind::TableNotFound);
+        assert_eq!(
+            sanitized.message(),
+            "REST catalog table load failed: the table does not exist"
+        );
+        assert_free_of_canaries(&sanitized);
     }
 }

@@ -425,7 +425,7 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
     /// capability; callers never downcast or construct a second catalog.
     fn vended_credential_refresh_catalog(
         &self,
-    ) -> Option<Arc<crate::iceberg_catalog_rest::RestCatalog>> {
+    ) -> Option<Arc<crate::rest_protocol::endpoints::RestEndpoints>> {
         None
     }
 

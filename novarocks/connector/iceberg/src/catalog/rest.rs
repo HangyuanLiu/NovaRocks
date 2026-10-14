@@ -38,8 +38,11 @@ use super::{
 };
 use crate::catalog_runtime::RestAccessDelegationMode;
 use crate::loaded_table::{
-    IcebergAccessDelegation, IcebergLoadedTable, parse_vended_access_delegation,
+    IcebergAccessDelegation, IcebergLoadedTable, parse_rest_delegation,
+    parse_vended_access_delegation,
 };
+use crate::rest_protocol::boundary::sanitize_upstream_error;
+use crate::rest_protocol::endpoints::RestEndpoints;
 
 /// A REST Iceberg catalog.
 ///
@@ -55,6 +58,8 @@ pub(super) struct NovaRocksRestCatalog {
     /// The REST client, for the staged-create protocol that has no equivalent
     /// on the generic catalog trait. It never leaves this module.
     client: Arc<crate::iceberg_catalog_rest::RestCatalog>,
+    /// NovaRocks requests sharing the upstream client's one session (L27).
+    endpoints: Arc<RestEndpoints>,
     warehouse: Option<Arc<str>>,
     access_delegation: RestAccessDelegationMode,
 }
@@ -62,6 +67,7 @@ pub(super) struct NovaRocksRestCatalog {
 impl NovaRocksRestCatalog {
     pub(super) fn new(
         client: Arc<crate::iceberg_catalog_rest::RestCatalog>,
+        endpoints: Arc<RestEndpoints>,
         warehouse: Option<Arc<str>>,
         access_delegation: RestAccessDelegationMode,
     ) -> Self {
@@ -69,6 +75,7 @@ impl NovaRocksRestCatalog {
             delegate: CatalogDelegate::new(client.clone())
                 .with_uncommitted_proof_rule(super::error::proves_received_conflict),
             client,
+            endpoints,
             warehouse,
             access_delegation,
         }
@@ -188,10 +195,8 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         Arc::clone(self.delegate.client())
     }
 
-    fn vended_credential_refresh_catalog(
-        &self,
-    ) -> Option<Arc<crate::iceberg_catalog_rest::RestCatalog>> {
-        Some(Arc::clone(&self.client))
+    fn vended_credential_refresh_catalog(&self) -> Option<Arc<RestEndpoints>> {
+        Some(Arc::clone(&self.endpoints))
     }
 
     fn admit_operation(
@@ -218,10 +223,9 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         let mut seen = std::collections::HashSet::new();
         loop {
             let page = self
-                .client
-                .list_namespaces_page(None, collector.continuation_token(), bound.page_entries)
-                .await
-                .map_err(|error| super::error::map_read_error(&error))?;
+                .endpoints
+                .list_namespaces_page(collector.continuation_token(), bound.page_entries)
+                .await?;
             preflight_rest_page(
                 &collector,
                 page.namespaces
@@ -300,7 +304,19 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         &self,
         namespace: CatalogNamespaceName,
     ) -> Result<bool, ConnectorError> {
-        self.delegate.namespace_exists(&namespace).await
+        let ident = super::delegate::namespace_ident(&namespace)?;
+        self.endpoints
+            .upstream()
+            .await
+            .map(|upstream| upstream as &dyn crate::iceberg::Catalog)?
+            .namespace_exists(&ident)
+            .await
+            .map_err(|error| {
+                super::error::map_read_error(&sanitize_upstream_error(
+                    &error,
+                    "namespace existence check",
+                ))
+            })
     }
 
     /// Request bounded REST pages, checking every response before retention
@@ -316,10 +332,9 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         let mut seen = std::collections::HashSet::new();
         loop {
             let page = self
-                .client
+                .endpoints
                 .list_tables_page(&ident, collector.continuation_token(), bound.page_entries)
-                .await
-                .map_err(|error| super::error::map_read_error(&error))?;
+                .await?;
             // The SDK owns this response. Validate every borrowed name and the
             // continuation before allocating any NovaRocks-owned page vector.
             preflight_rest_page(
@@ -358,10 +373,9 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     ) -> Result<CatalogTablePage, ConnectorError> {
         let ident = super::delegate::namespace_ident(&namespace)?;
         let page = self
-            .client
+            .endpoints
             .list_tables_page(&ident, page_token.as_deref(), page_size)
-            .await
-            .map_err(|error| super::error::map_read_error(&error))?;
+            .await?;
         // A server without pagination support may ignore pageSize and return
         // a complete listing. A continuing oversized page still violates the
         // page contract; every response must fit the frozen whole-listing bound.
@@ -429,26 +443,10 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     }
 
     async fn table_exists(&self, table: CatalogTableName) -> Result<bool, ConnectorError> {
-        match self.access_delegation {
-            RestAccessDelegationMode::Static => self.delegate.table_exists(&table).await,
-            RestAccessDelegationMode::Vended => {
-                let ident = super::delegate::table_ident(&table)?;
-                // An existence check needs metadata presence, not a storage
-                // capability. Do not materialize the deferred response before
-                // a query-attempt credential consumer has admitted its lease.
-                match self
-                    .client
-                    .load_table_deferred_with_access_delegation(&ident)
-                    .await
-                {
-                    Ok(_) => Ok(true),
-                    Err(error) if error.kind() == crate::iceberg::ErrorKind::TableNotFound => {
-                        Ok(false)
-                    }
-                    Err(error) => Err(super::error::map_read_error(&error)),
-                }
-            }
-        }
+        // Existence is a catalog fact in both modes (L27): never a storage
+        // capability, a FileIO, or a parse of the whole metadata.
+        let ident = super::delegate::table_ident(&table)?;
+        self.endpoints.table_exists(&ident).await
     }
 
     async fn load_table(
@@ -457,23 +455,23 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
     ) -> Result<IcebergLoadedTable, ConnectorError> {
         let ident = super::delegate::table_ident(&table)?;
         match self.access_delegation {
-            RestAccessDelegationMode::Static => {
-                self.delegate.load_table(&table).await.map(|table| {
+            RestAccessDelegationMode::Static => self
+                .endpoints
+                .upstream()
+                .await
+                .map(|upstream| upstream as &dyn crate::iceberg::Catalog)?
+                .load_table(&ident)
+                .await
+                .map(|table| {
                     IcebergLoadedTable::new(table, IcebergAccessDelegation::static_binding())
                 })
-            }
+                .map_err(|error| {
+                    super::error::map_read_error(&sanitize_upstream_error(&error, "table load"))
+                }),
             RestAccessDelegationMode::Vended => {
-                let response = self
-                    .client
-                    .load_table_deferred_with_access_delegation(&ident)
-                    .await
-                    .map_err(|error| super::error::map_read_error(&error))?;
-                let (materialization, delegation) = response.into_parts();
-                let access_delegation = parse_vended_access_delegation(&delegation)?;
-                Ok(IcebergLoadedTable::deferred_rest(
-                    materialization,
-                    access_delegation,
-                ))
+                let (frozen, delegation) = self.endpoints.load_table(&ident, true).await?;
+                let access_delegation = parse_rest_delegation(delegation)?;
+                Ok(IcebergLoadedTable::deferred_rest(frozen, access_delegation))
             }
         }
     }
@@ -487,18 +485,25 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
             crate::iceberg::Error::new(crate::iceberg::ErrorKind::DataInvalid, error.to_string())
                 .with_source(error)
         })?;
-        let response = self
-            .client
-            .load_table_deferred_with_access_delegation(&ident)
-            .await?;
-        let (materialization, _response_delegation) = response.into_parts();
+        let (frozen, _response_delegation) = self
+            .endpoints
+            .load_table(&ident, true)
+            .await
+            .map_err(|error| {
+                let kind = match error.kind() {
+                    ConnectorErrorKind::NotFound => crate::iceberg::ErrorKind::TableNotFound,
+                    _ => crate::iceberg::ErrorKind::Unexpected,
+                };
+                crate::iceberg::Error::new(kind, error.message().to_string())
+            })?;
         // This reload consumes metadata only. The already-admitted operation
         // retains its exact resolver and renews credentials through its owner.
-        super::CatalogCommitBase::from_table(materialization.materialize_with_file_io(file_io)?)
+        super::CatalogCommitBase::from_table(frozen.materialize(file_io)?)
     }
 
     async fn view_exists(&self, view: CatalogTableName) -> Result<bool, ConnectorError> {
-        self.delegate.view_exists(&view).await
+        let ident = super::delegate::table_ident(&view)?;
+        self.endpoints.view_exists(&ident).await
     }
 
     async fn list_views(
@@ -511,10 +516,9 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         let mut seen = std::collections::HashSet::new();
         loop {
             let page = self
-                .client
+                .endpoints
                 .list_views_page(&ident, collector.continuation_token(), bound.page_entries)
-                .await
-                .map_err(|error| super::error::map_read_error(&error))?;
+                .await?;
             if page
                 .identifiers
                 .iter()
@@ -551,7 +555,8 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         &self,
         view: CatalogTableName,
     ) -> Result<crate::iceberg::spec::ViewMetadata, ConnectorError> {
-        self.delegate.load_view(&view).await
+        let ident = super::delegate::table_ident(&view)?;
+        self.endpoints.load_view(&ident).await
     }
 
     async fn create_namespace(
@@ -647,7 +652,7 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
                     parse_vended_access_delegation(&delegation)
                         .map(|access_delegation| {
                             (
-                                crate::loaded_table::IcebergLoadedTableMaterialization::DeferredRest(
+                                crate::loaded_table::IcebergLoadedTableMaterialization::DeferredUpstream(
                                     materialization,
                                 ),
                                 initialization_updates,
@@ -860,7 +865,7 @@ mod tests {
     //! without declared HEAD endpoints or a StorageFactory. Expected NoOp facts
     //! come from create/drop policy; any FileIO materialization would fail.
     //! They share the listener isolation/exit owner and connector test cadence
-    //! above; IRU-13a replaces the temporary delegated-existence implementation.
+    //! above. Existence is a status-only GET without the delegation header.
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -972,17 +977,18 @@ mod tests {
         }
 
         async fn catalog(&self) -> NovaRocksRestCatalog {
-            let client = crate::catalog_runtime::build_rest_catalog_from_properties(
-                HashMap::from([(
-                    crate::iceberg_catalog_rest::REST_CATALOG_PROP_URI.to_string(),
-                    format!("http://{}", self.address),
-                )]),
-                RestAccessDelegationMode::Vended,
-                crate::iceberg::Runtime::try_current().expect("test runtime"),
-            )
-            .await
-            .expect("REST client");
-            NovaRocksRestCatalog::new(Arc::new(client), None, RestAccessDelegationMode::Vended)
+            let (client, endpoints) =
+                crate::catalog_runtime::build_vended_rest_generation_for_test(
+                    HashMap::from([(
+                        crate::iceberg_catalog_rest::REST_CATALOG_PROP_URI.to_string(),
+                        format!("http://{}", self.address),
+                    )]),
+                    None,
+                    crate::iceberg::Runtime::try_current().expect("test runtime"),
+                )
+                .await
+                .expect("REST client");
+            NovaRocksRestCatalog::new(client, endpoints, None, RestAccessDelegationMode::Vended)
         }
     }
 
@@ -2020,10 +2026,11 @@ mod tests {
                 request.starts_with("GET "),
                 "unexpected mutation: {request}"
             );
+            // Existence never asks the server to vend credentials (L27).
             assert!(
-                request
+                !request
                     .to_ascii_lowercase()
-                    .contains("x-iceberg-access-delegation: vended-credentials")
+                    .contains("x-iceberg-access-delegation")
             );
             if request.starts_with("GET /v1/namespaces/db/tables/present ") {
                 (200, response.clone())
