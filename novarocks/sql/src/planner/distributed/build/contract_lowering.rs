@@ -1162,6 +1162,10 @@ fn materialize_runtime_filter(
                 .get(usize::try_from(*group_key_ordinal).unwrap_or(usize::MAX))
                 .map(|(_, output)| *output)
                 .ok_or_else(|| invalid("producer aggregate group key is absent".to_string()))?;
+            #[cfg(test)]
+            eprintln!(
+                "C28_DIAGNOSTIC_PRODUCER fragment={fragment:?} aggregate={node:?} key_ordinal={group_key_ordinal} input={input_value:?} group_output={group_output:?} limit={limit} direction={direction:?} null_ordering={null_ordering:?}: {producer_fragment:#?}"
+            );
             let matching_topn = producer_fragment
                 .nodes()
                 .values()

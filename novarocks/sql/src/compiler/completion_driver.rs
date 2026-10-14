@@ -3156,6 +3156,54 @@ mod tests {
         )
     }
 
+    #[test]
+    fn ordered_aggregate_topn_sequence_diagnostic() {
+        let suite =
+            include_str!("../../../../tests/sql/correctness/aggregate/sql/compressed_key.sql");
+        let original = suite
+            .split("-- query 140\n")
+            .nth(1)
+            .expect("original query 140 is present")
+            .split("-- query 141\n")
+            .next()
+            .expect("original query 140 body is present")
+            .trim()
+            .strip_prefix("USE ${case_db};")
+            .expect("original query 140 selects its case namespace")
+            .trim();
+        for mode in [
+            super::super::SqlPhysicalEmissionMode::OriginalNativeV1,
+            super::super::SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
+        ] {
+            for (label, sql) in [
+                (
+                    "inner-140",
+                    "SELECT c9, COUNT(*) AS cnt FROM all_t0 GROUP BY c9 ORDER BY c9 LIMIT 100",
+                ),
+                ("original-140", original),
+            ] {
+                println!("C28_DIAGNOSTIC_INPUT {mode:?} {label}: {sql}");
+                match grouped_state_topn_sequence_fixture(sql, mode) {
+                    Ok(SqlCompileProgress::Complete(completed)) => {
+                        println!(
+                            "C28_DIAGNOSTIC_COMPLETE {mode:?} {label}: {:#?}",
+                            completed.into_plan().plan()
+                        );
+                    }
+                    Ok(SqlCompileProgress::Incomplete(progress)) => {
+                        panic!(
+                            "original fixture left unresolved completion needs for {mode:?} {label}: {:?}",
+                            progress.needs()
+                        );
+                    }
+                    Err(error) => {
+                        println!("C28_DIAGNOSTIC_REFUSAL {mode:?} {label}: {error:#?}");
+                    }
+                }
+            }
+        }
+    }
+
     fn assert_grouped_state_topn_sequence(mode: super::super::SqlPhysicalEmissionMode) {
         let queries = [
             (
