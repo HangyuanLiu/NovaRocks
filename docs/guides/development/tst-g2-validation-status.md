@@ -31,8 +31,15 @@ including the recorded 368-file modified overlay, on checkout HEAD
 The two later SQL capability-comment changes have a separate runtime-input
 bridge confirming that the compiled inputs remained unchanged. This record
 describes those run boundaries, rather than certification of a clean Git commit.
-Final README/status-document edits are documentation-only deltas from that
-frozen run boundary; they do not create a new build or test result.
+Implementation commit `797e075073f1e12cf64e36472e357661a7dc1e52` retained
+the recorded Source24 Rust/Cargo/shell bytes and added documentation-only
+deltas. The subsequent integration merges main at
+`78a8a461dc61a60d1722bca8983a74789642f652` (the vendored Iceberg SDK update and its preceding documentation
+change), resolves overlapping call-site formatting/control wiring, and
+renumbers the test-authorization ADR to ADR-0175 after the upstream collision.
+No build or test was run after this integration, as explicitly authorized by
+the user. Earlier evidence describes its recorded source boundary and does
+not qualify the integrated tree.
 
 The accepted design is revision 2 and the approved plan is revision 3. The
 original approval snapshot is `50438599edba9db7b2fe20ddc627383d85693105`.

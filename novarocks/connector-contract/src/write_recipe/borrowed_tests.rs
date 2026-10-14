@@ -405,9 +405,10 @@ fn borrowed_one_field_request_inventory_counts_actual_strings_once_and_rejects_b
         short_facts.allocation_requests
     );
     // Original role reserve and possible Vec-to-Box trim are two requests.
+    // An empty metadata namespace still requests its final Arc slice header.
     assert_eq!(
         short_facts.allocation_requests,
-        16 + 2 + 1 + 1 + 1 + 2 + 1 + 1
+        16 + 2 + 1 + 1 + 1 + 2 + 1 + 1 + 1
     );
     assert_eq!(
         short_facts.coexistence_bytes,

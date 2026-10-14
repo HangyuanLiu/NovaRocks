@@ -99,3 +99,12 @@ under the License.
   join 两侧都变的**完整查询**(`两支 telescoping UNION ALL → GROUP BY 身份 SUM(±1) → HAVING net≠0 → LEFT JOIN 取 _file/_pos`),
   逐段数据表 + 反面推演瞬态行为何必须**写前净化** → 聚合的**完整查询**(`delta 带符号状态 → LEFT JOIN mv_state state_merge → 产 __change_op 流`),
   退场看**计数态**非可见值 + 快照钉定为何尤其致命 → 两条 SQL 收敛为同一骨架(+ 主干 Mermaid)→ 收尾:把刷新做成一条关系查询、与普通查询同源。
+- [把物化视图写进 Iceberg 规范：一个指针，一份刷新记录](iceberg-materialized-view-spec.md)
+  —— 解读 Iceberg 物化视图规范（apache/iceberg#11041，评审中，开篇一句交代状态，正文以其当前文本为准）：
+  先按零基础补背景(同一张 `orders` 表走完:表=数据文件+元数据+catalog → 快照/父快照/时间旅行/合并与过期 →
+  原子换指针的提交与乐观并发 → 快照 summary 与流式进度 → main 分支与 uuid 身份 → view 的不可变版本与默认 namespace)→
+  再单列一节总结规范定义了什么(三样东西 + 关系图 + view/存储表/源状态字段表 + 七条规则 + 规范不规定的),之后各节只讲原理并引用该节 →
+  view 版本上的 `storage-table` 指针(MV = view 的超集,老读者安全退化)→ 刷新状态为何不写在 view 上 →
+  存储表快照 summary 里的 `refresh-state`(与数据同一次提交、uuid 认表、从未刷新 vs 空结果)→
+  「新鲜」的定义与读者三种判断手段(贯穿 `orders`→`daily_revenue` 六步数据表:过期 vs 作废)→
+  依赖记到哪一层(嵌套 MV 两种记法 + 其他记法 + 分支 ref)→ 收尾:统一的是可验证的事实,不是刷新算法。

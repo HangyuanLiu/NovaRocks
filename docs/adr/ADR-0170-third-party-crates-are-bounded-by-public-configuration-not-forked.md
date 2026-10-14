@@ -5,6 +5,9 @@ domain: [crate-boundary, memory-governance]
 status: active
 supersedes: []
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0174
+    scope: "Patch allowlist: add iceberg-property-macro; current Iceberg baseline and vendor code anchors"
 date: 2026-10-06
 provenance:
   - "discussion: 2026-10-06 rejection of a vendored Tokio/Hyper/H2/Tonic/Tower/HTTP/Bytes/Arrow stack for bounded result delivery"
@@ -19,8 +22,8 @@ code-anchors:
   - "novarocks/connector/iceberg/src/catalog/listing_admission.rs (ListingAdmission)"
   - "novarocks/fs/src/list_body_limit.rs (ListBodyLimitFetch)"
   - "novarocks/connector/iceberg/src/metadata.rs (frozen_copy_on_write_source_payload)"
-  - "vendor/iceberg-0.9.0/src/spec/table_metadata.rs (TableMetadata::serialize)"
-  - "vendor/iceberg-catalog-rest-0.9.0/PATCH.md (single-page REST protocol extension and upstream exit)"
+  - "vendor/iceberg-0.11.0/src/spec/table_metadata.rs (TableMetadata::serialize)"
+  - "vendor/iceberg-catalog-rest-0.11.0/PATCH.md (single-page REST protocol extension and upstream exit)"
 ---
 
 ## 问题

@@ -174,11 +174,6 @@ fn iceberg_primitive_to_arrow(primitive: &PrimitiveType) -> Result<DataType, Con
                 .map_err(|_| invalid(format!("iceberg fixed width {width} is out of range")))?,
         ),
         PrimitiveType::Binary => DataType::Binary,
-        PrimitiveType::Variant => {
-            return Err(unsupported(
-                "an iceberg variant is neither a partition value nor a metric bound",
-            ));
-        }
     })
 }
 
@@ -665,11 +660,6 @@ fn primitive_fields_by_id(schema: &Schema) -> Result<Vec<(i32, DataType)>, Conne
         let Type::Primitive(primitive) = field.field_type.as_ref() else {
             continue;
         };
-        // A variant has no comparable bound, so it simply contributes no
-        // bounds field rather than failing the whole relation.
-        if matches!(primitive, PrimitiveType::Variant) {
-            continue;
-        }
         fields.push((*field_id, iceberg_primitive_to_arrow(primitive)?));
     }
     fields.sort_by_key(|(field_id, _)| *field_id);
@@ -707,9 +697,6 @@ fn partitions_metrics_row_type(schema: &Schema) -> Result<Option<DataType>, Conn
         let Type::Primitive(primitive) = field.field_type.as_ref() else {
             continue;
         };
-        if matches!(primitive, PrimitiveType::Variant) {
-            continue;
-        }
         let value_type = iceberg_primitive_to_arrow(primitive)?;
         let metrics = DataType::Struct(Fields::from(vec![
             Arc::new(nullable("min", value_type.clone())),
@@ -3826,7 +3813,6 @@ mod tests {
         let mut writer = ManifestWriterBuilder::new(
             file_io.new_output(&live_path).expect("manifest output"),
             Some(SNAPSHOT_ID),
-            None,
             Arc::new(schema.clone()),
             spec.clone(),
         )
@@ -3846,7 +3832,6 @@ mod tests {
         let mut writer = ManifestWriterBuilder::new(
             file_io.new_output(&removed_path).expect("manifest output"),
             Some(SNAPSHOT_ID),
-            None,
             Arc::new(schema.clone()),
             spec.clone(),
         )
@@ -3863,7 +3848,10 @@ mod tests {
         let mut list_writer = ManifestListWriter::v2(
             file_io
                 .new_output(&manifest_list_path)
-                .expect("manifest list output"),
+                .expect("manifest list output")
+                .writer()
+                .await
+                .expect("manifest list writer"),
             SNAPSHOT_ID,
             None,
             SNAPSHOT_SEQUENCE_NUMBER,

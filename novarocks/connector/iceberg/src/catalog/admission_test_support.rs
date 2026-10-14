@@ -41,6 +41,10 @@ pub(crate) fn all_admitted(inner: Arc<dyn NovaRocksCatalog>) -> Arc<dyn NovaRock
 
 #[async_trait]
 impl NovaRocksCatalog for AdmittedCatalog {
+    fn admits_uncommitted_proof(&self, error: &crate::iceberg::Error) -> bool {
+        self.inner.admits_uncommitted_proof(error)
+    }
+
     fn implementation_name(&self) -> &'static str {
         "admitted-test-owner"
     }

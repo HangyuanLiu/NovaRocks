@@ -77,13 +77,28 @@ fn scope(limit: u64) -> (Scope, Arc<AtomicUsize>) {
         drops,
     )
 }
+// Keep each stock format lawful: only v3 can backfill old rows from a
+// non-null initial default; write defaults remain covered for every version.
+fn with_initial_default_for_version(
+    field: NestedField,
+    default: Literal,
+    version: FormatVersion,
+) -> NestedField {
+    if version == FormatVersion::V3 {
+        field.with_initial_default(default)
+    } else {
+        field
+    }
+}
+
 fn metadata(version: FormatVersion) -> TableMetadata {
     let map = Type::Map(MapType {
         key_field: Arc::new(NestedField::map_key_element(2, PrimitiveType::Int.into())),
-        value_field: Arc::new(
-            NestedField::map_value_element(3, PrimitiveType::String.into(), false)
-                .with_initial_default(Literal::string("synthetic map child")),
-        ),
+        value_field: Arc::new(with_initial_default_for_version(
+            NestedField::map_value_element(3, PrimitiveType::String.into(), false),
+            Literal::string("synthetic map child"),
+            version,
+        )),
     });
     let default = Literal::Map(Map::from([
         (
@@ -93,23 +108,25 @@ fn metadata(version: FormatVersion) -> TableMetadata {
         (Literal::int(1), None),
     ]));
     let list = Type::List(ListType {
-        element_field: Arc::new(
+        element_field: Arc::new(with_initial_default_for_version(
             NestedField::list_element(6, PrimitiveType::Long.into(), false)
-                .with_initial_default(Literal::long(7))
                 .with_write_default(Literal::long(8)),
-        ),
+            Literal::long(7),
+            version,
+        )),
     });
     let schema = Schema::builder()
         .with_fields(vec![
-            Arc::new(
-                NestedField::optional(1, "attrs", map)
-                    .with_initial_default(default.clone())
-                    .with_write_default(default),
-            ),
-            Arc::new(
-                NestedField::optional(4, "nan", PrimitiveType::Double.into())
-                    .with_initial_default(Literal::double(f64::NAN)),
-            ),
+            Arc::new(with_initial_default_for_version(
+                NestedField::optional(1, "attrs", map).with_write_default(default.clone()),
+                default,
+                version,
+            )),
+            Arc::new(with_initial_default_for_version(
+                NestedField::optional(4, "nan", PrimitiveType::Double.into()),
+                Literal::double(f64::NAN),
+                version,
+            )),
             Arc::new(NestedField::optional(5, "items", list)),
         ])
         .build()
@@ -185,7 +202,7 @@ fn cow_shared_schema_is_wire_transparent_and_reader_defaults_match_for_stock_ver
             recipe.input_schema().unwrap().fields[0].children[1]
                 .initial_default_json
                 .as_deref(),
-            Some("\"synthetic map child\"")
+            (version == FormatVersion::V3).then_some("\"synthetic map child\"")
         );
         assert_eq!(
             recipe.input_schema().unwrap().fields[2].children[0]

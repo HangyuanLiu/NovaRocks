@@ -439,7 +439,7 @@ fn encode_partition_data_json(
     })?;
     let expected = match partition_type {
         Type::Struct(struct_type) => struct_type.fields().len(),
-        Type::Primitive(_) | Type::List(_) | Type::Map(_) => {
+        Type::Primitive(_) | Type::Variant(_) | Type::List(_) | Type::Map(_) => {
             return Err(corrupt(
                 "iceberg partition type must be a struct".to_string(),
             ));

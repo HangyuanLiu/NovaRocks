@@ -351,12 +351,6 @@ fn validate_descriptor_payload_bytes(
         }
         crate::iceberg::spec::PrimitiveType::String
         | crate::iceberg::spec::PrimitiveType::Binary => {}
-        crate::iceberg::spec::PrimitiveType::Variant => {
-            return Err(IcebergWriteDescriptorError::DecodeFailed {
-                index,
-                message: "partition descriptor does not support variant payload".to_string(),
-            });
-        }
         crate::iceberg::spec::PrimitiveType::Fixed(len) => {
             let expected =
                 usize::try_from(*len).map_err(|_| IcebergWriteDescriptorError::DecodeFailed {

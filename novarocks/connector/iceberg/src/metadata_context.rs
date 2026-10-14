@@ -194,6 +194,7 @@ impl IcebergMetadataContext {
         let configuration = control_state.configuration().clone();
         let binding = resources.planning_binding().clone();
         let build_control = control.clone();
+        let iceberg_runtime = resources.catalog_runtime().iceberg_runtime().clone();
         let catalog = resources
             .catalog_runtime()
             .block_on(async move {
@@ -206,6 +207,7 @@ impl IcebergMetadataContext {
                         &configuration,
                         binding,
                         rest_access_delegation,
+                        iceberg_runtime,
                     )
                     .await?;
                 if let Some(control) = &build_control {
@@ -360,7 +362,10 @@ impl IcebergMetadataContext {
                 .planning_binding()
                 .for_request(request_context.clone());
             return access
-                .reacquired_request_scoped(request_binding)
+                .reacquired_request_scoped(
+                    request_binding,
+                    self.resources.catalog_runtime().iceberg_runtime().clone(),
+                )
                 .map_err(|error| (error.kind(), error.to_string()));
         };
         let frozen = access;
@@ -455,7 +460,10 @@ impl IcebergMetadataContext {
             .planning_binding()
             .for_request(request_context.clone());
         frozen
-            .reacquired_request_scoped(request_binding)
+            .reacquired_request_scoped(
+                request_binding,
+                self.resources.catalog_runtime().iceberg_runtime().clone(),
+            )
             .map_err(|error| (error.kind(), error.to_string()))
     }
 
@@ -513,8 +521,12 @@ impl IcebergMetadataContext {
             .resources
             .planning_binding()
             .for_request(request_context.clone());
-        let mut scoped = IcebergPhysicalTable::request_scoped(&loaded.table, binding)
-            .map_err(|error| (error.kind(), error.to_string()))?;
+        let mut scoped = IcebergPhysicalTable::request_scoped(
+            &loaded.table,
+            binding,
+            self.resources.catalog_runtime().iceberg_runtime().clone(),
+        )
+        .map_err(|error| (error.kind(), error.to_string()))?;
         if let Some(renewal) = renewal {
             scoped = scoped.with_attempt_access(renewal);
         }
@@ -583,6 +595,7 @@ impl IcebergMetadataContext {
                 self.resources
                     .planning_binding()
                     .for_request(request_context.clone()),
+                self.resources.catalog_runtime().iceberg_runtime().clone(),
             )
             .map_err(|error| (error.kind(), error.to_string()))
     }
@@ -997,6 +1010,7 @@ mod tests {
     fn scope_retaining_table(
         scope: ConnectorRequestScope,
         drops: Arc<AtomicUsize>,
+        runtime: crate::iceberg::Runtime,
     ) -> IcebergPhysicalTable {
         let schema = Schema::builder()
             .with_schema_id(1)
@@ -1025,6 +1039,7 @@ mod tests {
         .metadata;
         IcebergPhysicalTable::new(
             crate::iceberg::table::Table::builder()
+                .runtime(runtime)
                 .identifier(TableIdent::from_strs(["analytics", "frozen"]).expect("identity"))
                 .metadata(Arc::new(metadata))
                 .metadata_location("file:///tmp/attempt-cache/v1.metadata.json".to_string())
@@ -1040,6 +1055,8 @@ mod tests {
 
     #[test]
     fn successful_request_cache_releases_file_io_and_its_own_scope() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let sdk_runtime = crate::resources::IcebergCatalogRuntime::new(runtime.handle().clone());
         let scope = ConnectorRequestScope::new();
         let scope_drops = Arc::new(AtomicUsize::new(0));
         let file_io_drops = Arc::new(AtomicUsize::new(0));
@@ -1050,7 +1067,11 @@ mod tests {
             namespace: "analytics".to_string(),
             table: "frozen".to_string(),
         };
-        let table = scope_retaining_table(scope.clone(), Arc::clone(&file_io_drops));
+        let table = scope_retaining_table(
+            scope.clone(),
+            Arc::clone(&file_io_drops),
+            sdk_runtime.iceberg_runtime().clone(),
+        );
         let metadata = table.table.metadata_ref();
         let frozen = cache
             .get_or_load(key.clone(), || Ok(IcebergAttemptTableAccess::freeze(table)))
@@ -1065,14 +1086,15 @@ mod tests {
         assert!(std::ptr::eq(cached.metadata(), metadata.as_ref()));
         assert!(std::ptr::eq(frozen.metadata(), cached.metadata()));
 
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let binding = crate::access_binding::IcebergReadBinding::new(
             None,
             FsAccessResolver::new(),
             Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
-        let rebuilt = cached.reacquired_request_scoped(binding).expect("rebuild");
+        let rebuilt = cached
+            .reacquired_request_scoped(binding, sdk_runtime.iceberg_runtime().clone())
+            .expect("rebuild");
         assert!(Arc::ptr_eq(&metadata, &rebuilt.table.metadata_ref()));
         assert_eq!(rebuilt.table.identifier(), frozen.identifier());
         assert_eq!(
@@ -1084,6 +1106,8 @@ mod tests {
 
     #[test]
     fn successful_request_observation_is_single_flight_across_concurrent_readers() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let sdk_runtime = crate::resources::IcebergCatalogRuntime::new(runtime.handle().clone());
         let cache = AttemptMetadataTableCache::default();
         let key = AttemptMetadataTableKey {
             owner: 1,
@@ -1093,6 +1117,7 @@ mod tests {
         let frozen = IcebergAttemptTableAccess::freeze(scope_retaining_table(
             ConnectorRequestScope::new(),
             Arc::new(AtomicUsize::new(0)),
+            sdk_runtime.iceberg_runtime().clone(),
         ));
         let calls = AtomicUsize::new(0);
         let readers = std::sync::Barrier::new(8);

@@ -275,7 +275,7 @@ fn iceberg_write_target_type(
 
     let nested = iceberg_schema?.field_by_name(field_name)?;
     let write_type = match nested.field_type.as_ref() {
-        Type::Primitive(PrimitiveType::Variant) => ArrowDataType::LargeBinary,
+        Type::Variant(_) => ArrowDataType::LargeBinary,
         Type::Primitive(PrimitiveType::Binary) => ArrowDataType::Binary,
         _ => return None,
     };
@@ -702,7 +702,7 @@ mod tests {
         // failure keeps generic write admission from silently substituting NULL
         // for the value the table declares.
         let iceberg_schema = write_default_schema(
-            Type::Primitive(PrimitiveType::Variant),
+            Type::Variant(crate::iceberg::spec::VariantType),
             Literal::string("not-a-variant"),
         );
         let arrow_schema = Arc::new(Schema::new(vec![
@@ -748,7 +748,7 @@ mod tests {
                 Arc::new(NestedField::optional(
                     1,
                     "v",
-                    Type::Primitive(PrimitiveType::Variant),
+                    Type::Variant(crate::iceberg::spec::VariantType),
                 )),
                 Arc::new(NestedField::optional(
                     2,

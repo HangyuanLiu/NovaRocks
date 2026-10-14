@@ -257,6 +257,7 @@ impl IcebergDataStackWriter {
         })?;
         let binding = execution.binding.for_request(request.context.clone());
         let facts = FrozenDataWriteFacts {
+            format_version: handle.table().format_version(),
             table_location: handle.table().table_location().to_string(),
             data_location: handle.table().data_location().to_string(),
             target_partition_spec_id: handle.table().default_partition_spec_id(),

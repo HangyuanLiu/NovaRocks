@@ -71,7 +71,7 @@ code-anchors:
 
 领域哲学：普通产品通过真实依赖图排除测试控制；编入的能力仍须经每个实际角色启动的有限授权，准确绑定产品 owner 签发的工作身份。构建事实、权限、控制结束、helper join、角色退出与资源收敛分别取证。共享测试层只提供机械能力，领域解释和生命周期仍属于原 owner。
 
-- [ADR-0174](ADR-0174-test-capabilities-and-finite-role-authorization.md) — 测试控制为何分离编译能力、准确角色启动授权与实际退出（active）
+- [ADR-0175](ADR-0175-test-capabilities-and-finite-role-authorization.md) — 测试控制为何分离编译能力、准确角色启动授权与实际退出（active）
 
 ### runtime-filter
 
@@ -430,7 +430,7 @@ fallback 模糊 owner 和故障语义。
 - ADR-0162 — 查询中间计算状态为何保持内存内，并完整退出外溢能力（active；收敛 ADR-0148 的回收动作范围，不改变容量与谱系规则）
 - ADR-0156 — Connector FE 操作控制为何不授予容量，以及 BE 为何只接受准入后的真实资源（active；不改变 ADR-0148 的 BE 容量权威）
 - ADR-0163 — 进程为何由构建期选定的 jemalloc 分配，并从本进程的 cgroup 路径得知内存上限与用量（active；物理 allocator/cgroup 合同保留，外层归属由 ADR-0167 部分替换）
-- ADR-0168 — 为何只用公开配置、库外准入与测量约束第三方库内部，而不为资源计量 vendor/fork 第三方 crate（active）
+- ADR-0170 — 为何只用公开配置、库外准入与测量约束第三方库内部，而不为资源计量 vendor/fork 第三方 crate（active；patch allowlist 与 Iceberg vendor 基线/锚点由 ADR-0174 部分替代，其余规则保留）
 
 #### 历史
 
@@ -458,7 +458,8 @@ fallback 模糊 owner 和故障语义。
 - ADR-0142 — NovaRocks 自有 packages 为何共享一个 Cargo workspace、resolver 与 lock authority（active）
 - ADR-0150 — 概率结构为何精确锁定 registry DataSketches 正式版、并以版本无关的升级门管辖后续变化（active；守卫的版本/checksum 字面值规则由 ADR-0168 替换，格式所有权与五道升级门仍有效）
 - ADR-0168 — CI 依赖守卫为何从 Cargo 权威派生版本与 checksum、同时保护来源身份和封闭依赖面（active；部分替代 ADR-0150）
-- ADR-0170 — 为何只用公开配置、库外准入与测量约束第三方库内部，而不为资源计量 vendor/fork 第三方 crate（active）
+- ADR-0170 — 为何只用公开配置、库外准入与测量约束第三方库内部，而不为资源计量 vendor/fork 第三方 crate（active；patch allowlist 与 Iceberg vendor 基线/锚点由 ADR-0174 部分替代，其余规则保留）
+- [ADR-0174](ADR-0174-vendored-iceberg-baseline-and-patch-policy.md) — vendored Iceberg 的基线为何可重建、协议补丁为何由消费 owner 负责退出（active；部分替代 ADR-0170）
 
 #### 历史
 

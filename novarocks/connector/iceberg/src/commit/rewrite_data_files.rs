@@ -89,14 +89,12 @@ async fn enumerate_live_files(table: &Table, file_io: &FileIO) -> Result<LiveFil
         Some(s) => s,
         None => return Ok(out),
     };
-    let list = snapshot
-        .load_manifest_list(file_io, m)
+    let list = crate::manifest::load_manifest_list(&snapshot, file_io, m)
         .await
         .map_err(|e| format!("load manifest list failed: {e}"))?;
 
     for mf in list.entries() {
-        let manifest = mf
-            .load_manifest(file_io)
+        let manifest = crate::manifest::load_manifest(&mf, file_io)
             .await
             .map_err(|e| format!("load manifest {} failed: {e}", mf.manifest_path))?;
         for entry in manifest.entries() {
@@ -531,7 +529,6 @@ mod tests {
                 let mut writer = ManifestWriterBuilder::new(
                     output,
                     Some(SNAPSHOT_ID),
-                    None,
                     Arc::new(schema.clone()),
                     test_partition_spec(&schema, plan.partition_spec_id),
                 )
@@ -550,8 +547,12 @@ mod tests {
             let output = file_io
                 .new_output(&manifest_list_path)
                 .expect("manifest list output");
-            let mut list_writer =
-                ManifestListWriter::v2(output, SNAPSHOT_ID, None, SNAPSHOT_SEQUENCE_NUMBER);
+            let mut list_writer = ManifestListWriter::v2(
+                output.writer().await.unwrap(),
+                SNAPSHOT_ID,
+                None,
+                SNAPSHOT_SEQUENCE_NUMBER,
+            );
             list_writer
                 .add_manifests(manifests.into_iter())
                 .expect("add manifests");
@@ -587,6 +588,7 @@ mod tests {
                 .metadata
         };
         Table::builder()
+            .runtime(crate::iceberg::Runtime::try_current().expect("test runtime"))
             .identifier(TableIdent::from_strs(["db", "t"]).expect("table ident"))
             .file_io(file_io)
             .metadata(metadata)

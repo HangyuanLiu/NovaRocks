@@ -110,7 +110,7 @@ fn definition_type(data_type: &Type) -> ConnectorTableDefinitionType {
         Type::Primitive(PrimitiveType::Binary) => {
             ConnectorTableDefinitionType::Binary { fixed_length: None }
         }
-        Type::Primitive(PrimitiveType::Variant) => ConnectorTableDefinitionType::Variant,
+        Type::Variant(_) => ConnectorTableDefinitionType::Variant,
         Type::List(list) => ConnectorTableDefinitionType::Array(Box::new(definition_type(
             &list.element_field.field_type,
         ))),

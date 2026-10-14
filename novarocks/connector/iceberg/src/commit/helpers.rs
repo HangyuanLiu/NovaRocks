@@ -74,7 +74,7 @@ pub(super) fn snapshot_total_records(
 // Snapshot-summary `total-*` carry-forward (IV3-2).
 //
 // Canonical Iceberg summary key names. Mirrors the constants in
-// `vendor/iceberg-0.9.0/src/spec/snapshot_summary.rs`.
+// `vendor/iceberg-0.11.0/src/spec/snapshot_summary.rs`.
 // ---------------------------------------------------------------------------
 const TOTAL_DATA_FILES: &str = "total-data-files";
 const TOTAL_DELETE_FILES: &str = "total-delete-files";
@@ -111,8 +111,8 @@ const ENGINE_NAME_VALUE: &str = "novarocks";
 /// * First snapshot (`previous == None`): base 0, so `total == added`.
 /// * `previous` present but missing a given `total-*` (legacy / foreign
 ///   writer): that total is OMITTED — we never fabricate a total we cannot
-///   resume. (This intentionally differs from iceberg-rust 0.9.0
-///   `update_totals`, which treats a missing previous total as 0.)
+///   resume. This agrees with the adopted iceberg-rust 0.11
+///   `update_totals` behavior.
 /// * `truncate_full_table`: every `total-*` resets to 0.
 ///
 /// Engine identity (`engine-name`/`engine-version`) is always stamped.

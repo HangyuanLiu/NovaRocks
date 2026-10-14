@@ -388,12 +388,6 @@ impl EqualityFieldGroup {
                         "equality field is not a primitive field",
                     ));
                 };
-                if matches!(primitive, PrimitiveType::Variant) {
-                    return Err(Error::new(
-                        Kind::InvalidFieldBinding,
-                        "variant equality keys are not supported",
-                    ));
-                }
                 Ok((id, primitive.clone()))
             })
             .collect::<Result<Vec<_>>>()?;

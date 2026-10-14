@@ -618,7 +618,7 @@ struct Snapshot {
     byte_limit: usize,
 }
 
-fn scrape(context: &mut ScenarioContext, index: usize) -> Result<Snapshot> {
+fn scrape(context: &mut ScenarioContext, index: usize) -> Result<Option<Snapshot>> {
     let port = context.handle().runtime().be[index].http;
     let body = reqwest::blocking::Client::builder()
         .timeout(
@@ -631,10 +631,11 @@ fn scrape(context: &mut ScenarioContext, index: usize) -> Result<Snapshot> {
         .send()?
         .error_for_status()?
         .text()?;
-    let sample = |resource: &str, dimension: &str| -> Result<usize> {
-        let name = format!(
-            "novarocks_backend_task_preparation{{dimension=\"{dimension}\",resource=\"{resource}\"}}"
-        );
+    parse_snapshot(&body)
+}
+
+fn parse_snapshot(body: &str) -> Result<Option<Snapshot>> {
+    let metric_sample = |name: &str| -> Result<usize> {
         let value = body
             .lines()
             .find_map(|line| {
@@ -644,7 +645,25 @@ fn scrape(context: &mut ScenarioContext, index: usize) -> Result<Snapshot> {
             .with_context(|| format!("missing owner sample {name}"))?;
         Ok(value.trim().parse()?)
     };
-    Ok(Snapshot {
+    match metric_sample("novarocks_backend_task_preparation_snapshot_available")? {
+        0 => {
+            ensure!(
+                !body
+                    .lines()
+                    .any(|line| line.starts_with("novarocks_backend_task_preparation{")),
+                "unavailable preparation snapshot published owner samples"
+            );
+            return Ok(None);
+        }
+        1 => {}
+        value => bail!("invalid preparation snapshot availability: {value}"),
+    }
+    let sample = |resource: &str, dimension: &str| -> Result<usize> {
+        metric_sample(&format!(
+            "novarocks_backend_task_preparation{{dimension=\"{dimension}\",resource=\"{resource}\"}}"
+        ))
+    };
+    Ok(Some(Snapshot {
         positions: sample("positions", "used")?,
         position_limit: sample("positions", "limit")?,
         context_positions: sample("context_positions", "used")?,
@@ -654,7 +673,7 @@ fn scrape(context: &mut ScenarioContext, index: usize) -> Result<Snapshot> {
         worker_limit: sample("workers", "limit")?,
         bytes: sample("bytes", "used")?,
         byte_limit: sample("bytes", "limit")?,
-    })
+    }))
 }
 
 fn await_snapshot(
@@ -674,22 +693,25 @@ fn await_snapshot_at(
     workers: usize,
 ) -> Result<Snapshot> {
     loop {
-        let snapshot = scrape(context, index)?;
-        if (snapshot.positions, snapshot.queued, snapshot.workers) == (positions, queued, workers) {
-            ensure!(
-                snapshot.bytes <= snapshot.byte_limit
-                    && snapshot.positions <= snapshot.position_limit
-                    && snapshot.context_positions <= snapshot.context_limit
-                    && snapshot.workers <= snapshot.worker_limit,
-                "owner exceeded configured preparation charge limits: {snapshot:?}"
-            );
-            if positions == 0 {
+        if let Some(snapshot) = scrape(context, index)? {
+            if (snapshot.positions, snapshot.queued, snapshot.workers)
+                == (positions, queued, workers)
+            {
                 ensure!(
-                    snapshot.bytes == 0 && snapshot.context_positions == 0,
-                    "exited jobs leaked temporary byte/Context charges: {snapshot:?}"
+                    snapshot.bytes <= snapshot.byte_limit
+                        && snapshot.positions <= snapshot.position_limit
+                        && snapshot.context_positions <= snapshot.context_limit
+                        && snapshot.workers <= snapshot.worker_limit,
+                    "owner exceeded configured preparation charge limits: {snapshot:?}"
                 );
+                if positions == 0 {
+                    ensure!(
+                        snapshot.bytes == 0 && snapshot.context_positions == 0,
+                        "exited jobs leaked temporary byte/Context charges: {snapshot:?}"
+                    );
+                }
+                return Ok(snapshot);
             }
-            return Ok(snapshot);
         }
         thread::sleep(
             context
@@ -789,5 +811,74 @@ impl Drop for PreparationRendezvous {
             close_hold(stream);
         }
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::parse_snapshot;
+
+    #[test]
+    fn unavailable_owner_snapshot_is_explicitly_pending() {
+        assert!(
+            parse_snapshot("novarocks_backend_task_preparation_snapshot_available 0\n")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn available_owner_snapshot_requires_owner_samples() {
+        let error = parse_snapshot("novarocks_backend_task_preparation_snapshot_available 1\n")
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing owner sample novarocks_backend_task_preparation{")
+        );
+    }
+
+    #[test]
+    fn available_owner_snapshot_preserves_nonzero_samples_and_limits() {
+        let snapshot = parse_snapshot(concat!(
+            "novarocks_backend_task_preparation_snapshot_available 1\n",
+            "novarocks_backend_task_preparation{dimension=\"used\",resource=\"positions\"} 3\n",
+            "novarocks_backend_task_preparation{dimension=\"limit\",resource=\"positions\"} 7\n",
+            "novarocks_backend_task_preparation{dimension=\"used\",resource=\"context_positions\"} 2\n",
+            "novarocks_backend_task_preparation{dimension=\"limit\",resource=\"context_positions\"} 5\n",
+            "novarocks_backend_task_preparation{dimension=\"used\",resource=\"queued_positions\"} 2\n",
+            "novarocks_backend_task_preparation{dimension=\"used\",resource=\"workers\"} 1\n",
+            "novarocks_backend_task_preparation{dimension=\"limit\",resource=\"workers\"} 4\n",
+            "novarocks_backend_task_preparation{dimension=\"used\",resource=\"bytes\"} 1234\n",
+            "novarocks_backend_task_preparation{dimension=\"limit\",resource=\"bytes\"} 8192\n"
+        )).unwrap().expect("available exact owner snapshot");
+        assert_eq!(snapshot.positions, 3);
+        assert_eq!(snapshot.position_limit, 7);
+        assert_eq!(snapshot.context_positions, 2);
+        assert_eq!(snapshot.context_limit, 5);
+        assert_eq!(snapshot.queued, 2);
+        assert_eq!(snapshot.workers, 1);
+        assert_eq!(snapshot.worker_limit, 4);
+        assert_eq!(snapshot.bytes, 1234);
+        assert_eq!(snapshot.byte_limit, 8192);
+    }
+
+    #[test]
+    fn missing_or_invalid_availability_is_an_error() {
+        assert!(parse_snapshot("").is_err());
+        assert!(
+            parse_snapshot("novarocks_backend_task_preparation_snapshot_available 2\n").is_err()
+        );
+    }
+
+    #[test]
+    fn unavailable_owner_snapshot_rejects_stale_samples() {
+        assert!(
+            parse_snapshot(concat!(
+                "novarocks_backend_task_preparation_snapshot_available 0\n",
+                "novarocks_backend_task_preparation{dimension=\"used\",resource=\"positions\"} 0\n"
+            ))
+            .is_err()
+        );
     }
 }

@@ -93,6 +93,20 @@ fn table_free_sql(
     }
 }
 
+fn client_candidate(
+    source: novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
+) -> CompletedPhysicalPlanCandidate {
+    let candidate =
+        CompletedPhysicalPlanCandidate::for_sql_program(source, &SqlCompileControl::unbounded())
+            .unwrap();
+    let render = novarocks_sql::compiler::client_render_schema(candidate.plan(), 0).unwrap();
+    candidate
+        .freeze_root_output(novarocks_result_contract::FrozenRootOutput::ClientRows(
+            render,
+        ))
+        .unwrap()
+}
+
 fn freeze(
     candidate: CompletedPhysicalPlanCandidate,
     output: OutputContract,
@@ -183,11 +197,8 @@ fn numeric_unary_public_transport_same_original_source_and_all_consumers() {
                 .unwrap()
                 .original_port()
         ));
-        let candidate = CompletedPhysicalPlanCandidate::for_sql_program(
-            source,
-            &SqlCompileControl::unbounded(),
-        )
-        .unwrap();
+        drop(cloned);
+        let candidate = client_candidate(source);
         assert_eq!(
             candidate.sql_emission_mode(),
             Some(SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration)
@@ -243,11 +254,7 @@ fn numeric_unary_public_transport_original_and_unchanged_nested_types_use_actual
             if mode == SqlPhysicalEmissionMode::OriginalNativeV1 {
                 assert!(ptr::eq(original.original_port(), port));
             }
-            let candidate = CompletedPhysicalPlanCandidate::for_sql_program(
-                source,
-                &SqlCompileControl::unbounded(),
-            )
-            .unwrap();
+            let candidate = client_candidate(source);
             let out =
                 OutputContract::from_completed_candidate(QueryExecutionKind::Read, &candidate)
                     .unwrap();

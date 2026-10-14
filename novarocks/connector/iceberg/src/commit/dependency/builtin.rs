@@ -300,7 +300,6 @@ mod tests {
             let mut writer = ManifestWriterBuilder::new(
                 output,
                 Some(id),
-                None,
                 metadata.current_schema().clone(),
                 metadata.default_partition_spec().as_ref().clone(),
             )
@@ -314,7 +313,12 @@ mod tests {
                 .unwrap()
                 .to_owned();
             let mut list = ManifestListWriter::v2(
-                io.file_io().new_output(&list_path).unwrap(),
+                io.file_io()
+                    .new_output(&list_path)
+                    .unwrap()
+                    .writer()
+                    .await
+                    .unwrap(),
                 id,
                 (id == 12).then_some(11),
                 id - 10,
@@ -346,16 +350,17 @@ mod tests {
                 .unwrap()
                 .metadata;
             inherited_manifest = Some(
-                metadata
-                    .snapshot_by_id(id)
-                    .unwrap()
-                    .load_manifest_list(io.file_io(), &metadata)
-                    .await
-                    .unwrap()
-                    .entries()
-                    .last()
-                    .unwrap()
-                    .clone(),
+                crate::manifest::load_manifest_list(
+                    metadata.snapshot_by_id(id).unwrap(),
+                    io.file_io(),
+                    &metadata,
+                )
+                .await
+                .unwrap()
+                .entries()
+                .last()
+                .unwrap()
+                .clone(),
             );
         }
         let mut inputs = ValidationInputs::new(&metadata, Some(12), &io);

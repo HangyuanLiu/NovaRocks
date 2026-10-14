@@ -40,6 +40,8 @@ write_fixture() {
   write_package "$root" "novarocks/execution" "novarocks-execution"
   write_package "$root" "novarocks/type-contract" "novarocks-type-contract"
   write_package "$root" "novarocks/result-contract" "novarocks-result-contract"
+  write_package "$root" "novarocks/constant-contract" "novarocks-constant-contract"
+  write_package "$root" "novarocks/function-contract" "novarocks-function-contract"
   write_package "$root" "novarocks/functions" "novarocks-functions"
   write_package "$root" "novarocks/connector/iceberg-functions" "novarocks-connector-iceberg-functions"
   write_package "$root" "novarocks/connector/iceberg" "novarocks-connector-iceberg"
@@ -57,6 +59,8 @@ members = [
   "novarocks/execution",
   "novarocks/type-contract",
   "novarocks/result-contract",
+  "novarocks/constant-contract",
+  "novarocks/function-contract",
   "novarocks/functions",
   "novarocks/connector/iceberg-functions",
   "novarocks/connector/iceberg",
@@ -74,6 +78,7 @@ EOF
 
 [dependencies]
 datasketches = { workspace = true, features = ["hll"] }
+novarocks-functions = { path = "../functions" }
 
 [dev-dependencies]
 novarocks-connector-iceberg-functions = { path = "../connector/iceberg-functions" }
@@ -82,11 +87,25 @@ EOF
 
 [dependencies]
 novarocks-type-contract = { path = "../type-contract" }
+novarocks-constant-contract = { path = "../constant-contract" }
+novarocks-function-contract = { path = "../function-contract" }
+datasketches = { workspace = true, features = ["hll"] }
 EOF
   cat >>"$root/novarocks/type-contract/Cargo.toml" <<'EOF'
 
 [dependencies]
 novarocks-result-contract = { path = "../result-contract" }
+EOF
+  cat >>"$root/novarocks/constant-contract/Cargo.toml" <<'EOF'
+
+[dependencies]
+novarocks-type-contract = { path = "../type-contract" }
+EOF
+  cat >>"$root/novarocks/function-contract/Cargo.toml" <<'EOF'
+
+[dependencies]
+novarocks-type-contract = { path = "../type-contract" }
+novarocks-constant-contract = { path = "../constant-contract" }
 EOF
   cat >>"$root/novarocks/connector/iceberg-functions/Cargo.toml" <<'EOF'
 
@@ -194,6 +213,39 @@ replace_once "$execution_feature/novarocks/execution/Cargo.toml" \
   'features = ["hll"]' 'features = ["hll", "theta"]'
 assert_rejected "$execution_feature" "features must be exactly ['hll']"
 
+# The pure Functions HLL owner has the same narrow declaration as Execution.
+functions_feature="$fixture_root/functions-feature"
+cp -R "$valid" "$functions_feature"
+replace_once "$functions_feature/novarocks/functions/Cargo.toml" \
+  'features = ["hll"]' 'features = ["hll", "theta"]'
+assert_rejected "$functions_feature" "novarocks-functions datasketches features must be exactly ['hll']"
+
+functions_default="$fixture_root/functions-default"
+cp -R "$valid" "$functions_default"
+replace_once "$functions_default/novarocks/functions/Cargo.toml" \
+  'datasketches = { workspace = true, features = ["hll"] }' 'datasketches = { path = "../../datasketches", default-features = true, features = ["hll"] }'
+assert_rejected "$functions_default" "novarocks-functions datasketches must disable default features"
+
+functions_optional="$fixture_root/functions-optional"
+cp -R "$valid" "$functions_optional"
+replace_once "$functions_optional/novarocks/functions/Cargo.toml" \
+  'datasketches = { workspace = true, features = ["hll"] }' 'datasketches = { workspace = true, features = ["hll"], optional = true }'
+assert_rejected "$functions_optional" "novarocks-functions datasketches must not be optional"
+
+functions_renamed="$fixture_root/functions-renamed"
+cp -R "$valid" "$functions_renamed"
+replace_once "$functions_renamed/novarocks/functions/Cargo.toml" \
+  'datasketches = { workspace = true, features = ["hll"] }' 'sketches = { package = "datasketches", path = "../../datasketches", default-features = false, features = ["hll"] }'
+assert_rejected "$functions_renamed" "novarocks-functions must not rename datasketches"
+
+functions_dev="$fixture_root/functions-dev"
+cp -R "$valid" "$functions_dev"
+replace_once "$functions_dev/novarocks/functions/Cargo.toml" \
+  'datasketches = { workspace = true, features = ["hll"] }' ''
+printf '\n[dev-dependencies]\ndatasketches = { workspace = true, features = ["hll"] }\n' \
+  >>"$functions_dev/novarocks/functions/Cargo.toml"
+assert_rejected "$functions_dev" "novarocks-functions datasketches dependency kind must be normal, got dev"
+
 theta_feature="$fixture_root/theta-feature"
 cp -R "$valid" "$theta_feature"
 replace_once "$theta_feature/novarocks/connector/iceberg-functions/Cargo.toml" \
@@ -214,6 +266,23 @@ write_package "$extra_owner" "novarocks/unexpected-owner" "novarocks-unexpected-
 printf 'novarocks-unexpected-owner = { path = "../unexpected-owner" }\n' \
   >>"$extra_owner/novarocks/type-contract/Cargo.toml"
 assert_rejected "$extra_owner" "internal normal closure must be exactly"
+
+# Newly named vocabulary cannot acquire an unknown internal owner.
+function_contract_owner="$fixture_root/function-contract-owner"
+cp -R "$valid" "$function_contract_owner"
+write_package "$function_contract_owner" "novarocks/unexpected-owner" "novarocks-unexpected-owner"
+printf 'novarocks-unexpected-owner = { path = "../unexpected-owner" }\n' \
+  >>"$function_contract_owner/novarocks/function-contract/Cargo.toml"
+assert_rejected "$function_contract_owner" "internal normal closure must be exactly"
+
+# Keep the fixture acyclic while proving constants cannot acquire the provider.
+constant_contract_provider="$fixture_root/constant-contract-provider"
+cp -R "$valid" "$constant_contract_provider"
+replace_once "$constant_contract_provider/novarocks/connector/iceberg/Cargo.toml" \
+  $'novarocks-connector-iceberg-functions = { path = "../iceberg-functions" }\n' ''
+printf 'novarocks-connector-iceberg = { path = "../connector/iceberg" }\n' \
+  >>"$constant_contract_provider/novarocks/constant-contract/Cargo.toml"
+assert_rejected "$constant_contract_provider" "internal normal closure must be exactly"
 
 # Use a non-NovaRocks helper to prove dependency freedom independently of the
 # exact internal closure, including edges omitted by a normal resolved graph.
@@ -280,5 +349,20 @@ cat >>"$indirect_sketch/novarocks/execution/Cargo.toml" <<'EOF'
 path = "../../helper"
 EOF
 assert_rejected "$indirect_sketch" "normal closure has indirect datasketches owners"
+
+# An allowed scalar owner cannot delegate sketch ownership to an arbitrary helper.
+functions_indirect="$fixture_root/functions-indirect"
+cp -R "$valid" "$functions_indirect"
+write_package "$functions_indirect" "helper" "statistics-helper"
+replace_once "$functions_indirect/Cargo.toml" \
+  '  "datasketches",' '  "datasketches", "helper",'
+cat >>"$functions_indirect/helper/Cargo.toml" <<'EOF'
+
+[dependencies]
+datasketches = { workspace = true, features = ["hll"] }
+EOF
+printf 'statistics-helper = { path = "../../helper" }\n' \
+  >>"$functions_indirect/novarocks/functions/Cargo.toml"
+assert_rejected "$functions_indirect" "novarocks-functions normal closure has indirect datasketches owners"
 
 echo "ncp8-statistics-boundary-test: PASS"

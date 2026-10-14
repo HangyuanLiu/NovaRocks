@@ -701,9 +701,15 @@ mod tests {
             "old".to_string(),
         )]));
         runtime
-            .block_on(old.write_to(&file_io, &old_location))
+            .block_on(async {
+                file_io
+                    .new_output(&old_location)?
+                    .write(serde_json::to_vec(&old).unwrap().into())
+                    .await
+            })
             .expect("write old metadata");
         let old_table = crate::iceberg::table::Table::builder()
+            .runtime(crate::iceberg::Runtime::new(&runtime))
             .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
             .file_io(file_io.clone())
             .metadata(old.clone())

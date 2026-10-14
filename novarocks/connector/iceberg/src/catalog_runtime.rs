@@ -67,6 +67,7 @@ impl IcebergCatalogClient {
 pub fn build_hadoop_catalog(
     configuration: &IcebergCatalogConfiguration,
     binding: IcebergReadBinding,
+    runtime: crate::iceberg::Runtime,
 ) -> Result<crate::hadoop_catalog::HadoopFileSystemCatalog, String> {
     if configuration.kind != IcebergCatalogKind::Hadoop {
         return Err(format!(
@@ -81,6 +82,7 @@ pub fn build_hadoop_catalog(
             file_io,
             configuration.warehouse_uri.clone(),
             binding,
+            runtime,
         ),
     )
 }
@@ -109,11 +111,13 @@ fn rest_http_client() -> Result<reqwest::Client, String> {
 pub async fn build_rest_catalog(
     configuration: &IcebergCatalogConfiguration,
     binding: IcebergReadBinding,
+    runtime: crate::iceberg::Runtime,
 ) -> Result<crate::iceberg_catalog_rest::RestCatalog, String> {
     build_rest_catalog_with_access_delegation(
         configuration,
         binding,
         RestAccessDelegationMode::Static,
+        runtime,
     )
     .await
 }
@@ -129,6 +133,7 @@ async fn build_rest_catalog_with_access_delegation(
     configuration: &IcebergCatalogConfiguration,
     binding: IcebergReadBinding,
     rest_access_delegation: RestAccessDelegationMode,
+    runtime: crate::iceberg::Runtime,
 ) -> Result<crate::iceberg_catalog_rest::RestCatalog, String> {
     use crate::iceberg::CatalogBuilder;
     use crate::iceberg_catalog_rest::{
@@ -158,7 +163,9 @@ async fn build_rest_catalog_with_access_delegation(
             configuration.warehouse_uri.clone(),
         );
     }
-    let builder = RestCatalogBuilder::default().with_client(rest_http_client()?);
+    let builder = RestCatalogBuilder::default()
+        .with_runtime(runtime)
+        .with_client(rest_http_client()?);
     let builder = match rest_access_delegation {
         RestAccessDelegationMode::Static => {
             builder.with_storage_factory(storage_factory(&configuration.warehouse_uri, binding))
@@ -183,6 +190,7 @@ async fn build_rest_catalog_with_access_delegation(
 pub(crate) async fn build_rest_catalog_from_properties(
     properties: std::collections::HashMap<String, String>,
     rest_access_delegation: RestAccessDelegationMode,
+    runtime: crate::iceberg::Runtime,
 ) -> Result<crate::iceberg_catalog_rest::RestCatalog, String> {
     use crate::iceberg::CatalogBuilder;
     use crate::iceberg_catalog_rest::RestCatalogBuilder;
@@ -193,6 +201,7 @@ pub(crate) async fn build_rest_catalog_from_properties(
         );
     }
     RestCatalogBuilder::default()
+        .with_runtime(runtime)
         .with_client(rest_http_client()?)
         .load("rest".to_string(), properties)
         .await
@@ -202,6 +211,7 @@ pub(crate) async fn build_rest_catalog_from_properties(
 pub async fn build_hms_catalog(
     configuration: &IcebergCatalogConfiguration,
     binding: IcebergReadBinding,
+    runtime: crate::iceberg::Runtime,
 ) -> Result<crate::iceberg_catalog_hms::HmsCatalog, String> {
     use crate::iceberg::CatalogBuilder;
     use crate::iceberg_catalog_hms::{
@@ -246,6 +256,7 @@ pub async fn build_hms_catalog(
         },
     );
     HmsCatalogBuilder::default()
+        .with_runtime(runtime)
         .with_storage_factory(storage_factory(&configuration.warehouse_uri, binding))
         .load("hms".to_string(), properties)
         .await
@@ -256,11 +267,13 @@ pub async fn build_hms_catalog(
 pub async fn build_catalog_client(
     configuration: &IcebergCatalogConfiguration,
     binding: IcebergReadBinding,
+    runtime: crate::iceberg::Runtime,
 ) -> Result<IcebergCatalogClient, String> {
     build_catalog_client_with_rest_access_delegation(
         configuration,
         binding,
         RestAccessDelegationMode::Static,
+        runtime,
     )
     .await
 }
@@ -271,10 +284,11 @@ pub(crate) async fn build_catalog_client_with_rest_access_delegation(
     configuration: &IcebergCatalogConfiguration,
     binding: IcebergReadBinding,
     rest_access_delegation: RestAccessDelegationMode,
+    runtime: crate::iceberg::Runtime,
 ) -> Result<IcebergCatalogClient, String> {
     match configuration.kind {
         IcebergCatalogKind::Hadoop => {
-            let hadoop = Arc::new(build_hadoop_catalog(configuration, binding)?);
+            let hadoop = Arc::new(build_hadoop_catalog(configuration, binding, runtime)?);
             let generic: Arc<dyn crate::iceberg::Catalog> = hadoop.clone();
             Ok(IcebergCatalogClient {
                 generic,
@@ -289,6 +303,7 @@ pub(crate) async fn build_catalog_client_with_rest_access_delegation(
                     configuration,
                     binding,
                     rest_access_delegation,
+                    runtime,
                 )
                 .await?,
             );
@@ -301,7 +316,7 @@ pub(crate) async fn build_catalog_client_with_rest_access_delegation(
             })
         }
         IcebergCatalogKind::Hive => Ok(IcebergCatalogClient {
-            generic: Arc::new(build_hms_catalog(configuration, binding).await?),
+            generic: Arc::new(build_hms_catalog(configuration, binding, runtime).await?),
             hadoop: None,
             rest: None,
             rest_access_delegation: RestAccessDelegationMode::Static,
@@ -346,9 +361,13 @@ mod tests {
         )
         .expect("configuration");
 
-        let client = build_catalog_client(&configuration, local_binding())
-            .await
-            .expect("provider catalog");
+        let client = build_catalog_client(
+            &configuration,
+            local_binding(),
+            crate::iceberg::Runtime::try_current().expect("test runtime"),
+        )
+        .await
+        .expect("provider catalog");
         assert!(client.rest().is_none());
         assert!(client.hadoop().is_some());
         assert!(Arc::strong_count(client.generic()) >= 1);

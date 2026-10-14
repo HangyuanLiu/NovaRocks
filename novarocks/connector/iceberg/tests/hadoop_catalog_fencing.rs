@@ -130,8 +130,13 @@ fn hadoop_fencing_child_process_entry() {
     let child_index = required_env(CHILD_INDEX_ENV);
 
     let config = catalog_configuration(&warehouse);
-    let catalog = build_hadoop_catalog(&config, catalog_binding(&config))
-        .expect("build child Hadoop catalog");
+    let runtime = tokio::runtime::Runtime::new().expect("child runtime");
+    let catalog = build_hadoop_catalog(
+        &config,
+        catalog_binding(&config),
+        novarocks_connector_iceberg::iceberg::Runtime::new(&runtime),
+    )
+    .expect("build child Hadoop catalog");
     let namespace_ident = NamespaceIdent::new(namespace.clone());
     let table_ident = TableIdent::new(namespace_ident.clone(), table_name.clone());
 
@@ -139,7 +144,6 @@ fn hadoop_fencing_child_process_entry() {
         .expect("publish child barrier readiness");
     wait_for_both_children(&barrier);
 
-    let runtime = tokio::runtime::Runtime::new().expect("child runtime");
     let outcome = runtime.block_on(async {
         match catalog
             .create_table(&namespace_ident, table_creation(&table_name))
@@ -272,10 +276,14 @@ fn audit_prefix(
     namespace: &str,
     table_name: &str,
 ) -> PrefixAudit {
-    let catalog =
-        build_hadoop_catalog(config, catalog_binding(config)).expect("build audit Hadoop catalog");
-    let ident = TableIdent::from_strs([namespace, table_name]).expect("audit table identity");
     let runtime = tokio::runtime::Runtime::new().expect("audit runtime");
+    let catalog = build_hadoop_catalog(
+        config,
+        catalog_binding(config),
+        novarocks_connector_iceberg::iceberg::Runtime::new(&runtime),
+    )
+    .expect("build audit Hadoop catalog");
+    let ident = TableIdent::from_strs([namespace, table_name]).expect("audit table identity");
     let table = runtime
         .block_on(catalog.load_table(&ident))
         .expect("load authoritative table for audit");

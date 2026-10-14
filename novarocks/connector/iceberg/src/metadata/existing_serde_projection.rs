@@ -168,7 +168,7 @@ fn child_count(ty: &Type) -> usize {
         Type::Struct(ty) => ty.fields().len(),
         Type::List(_) => 1,
         Type::Map(_) => 2,
-        Type::Primitive(_) => 0,
+        Type::Primitive(_) | Type::Variant(_) => 0,
     }
 }
 fn for_children<E>(
@@ -186,7 +186,7 @@ fn for_children<E>(
             visit(&ty.key_field)?;
             visit(&ty.value_field)?;
         }
-        Type::Primitive(_) => {}
+        Type::Primitive(_) | Type::Variant(_) => {}
     }
     Ok(())
 }

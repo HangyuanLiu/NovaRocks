@@ -71,7 +71,7 @@ fn iceberg_type_children(ty: &Type) -> Vec<IcebergSchemaFieldDef> {
             iceberg_field_def(map_ty.key_field.as_ref()),
             iceberg_field_def(map_ty.value_field.as_ref()),
         ],
-        Type::Primitive(_) => Vec::new(),
+        Type::Primitive(_) | Type::Variant(_) => Vec::new(),
     }
 }
 

@@ -209,7 +209,35 @@ fn write_support_denial(
         return Some(invalid(error));
     }
 
-    if matches!(request.intent, ConnectorWriteIntent::Overwrite) {
+    insert_intent_support_denial(
+        metadata,
+        request.intent,
+        request.target_ref.as_str(),
+        target_fqn,
+    )
+}
+
+/// INSERT-only metadata/ref policy shared by preparation and ordinary data
+/// session admission. Generic writer support and equality-delete input policy
+/// stay at their existing call sites, with their own error kinds and ordering.
+pub(crate) fn insert_intent_support_denial(
+    metadata: &TableMetadata,
+    intent: ConnectorWriteIntent,
+    target_ref: &str,
+    target_fqn: &str,
+) -> Option<ConnectorError> {
+    if !matches!(
+        intent,
+        ConnectorWriteIntent::Append
+            | ConnectorWriteIntent::Overwrite
+            | ConnectorWriteIntent::PartitionOverwrite
+    ) {
+        return None;
+    }
+    let invalid =
+        |message: String| ConnectorError::new(ConnectorErrorKind::InvalidRequest, message);
+
+    if matches!(intent, ConnectorWriteIntent::Overwrite) {
         if let Err(error) = ensure_overwrite_single_partition_spec_from_metadata(metadata) {
             return Some(invalid(error));
         }
@@ -218,7 +246,7 @@ fn write_support_denial(
         }
     }
 
-    if matches!(request.intent, ConnectorWriteIntent::PartitionOverwrite)
+    if matches!(intent, ConnectorWriteIntent::PartitionOverwrite)
         && metadata.default_partition_spec().is_unpartitioned()
     {
         return Some(invalid(format!(
@@ -228,7 +256,7 @@ fn write_support_denial(
         )));
     }
 
-    if matches!(request.intent, ConnectorWriteIntent::PartitionOverwrite)
+    if matches!(intent, ConnectorWriteIntent::PartitionOverwrite)
         && metadata.format_version() != FormatVersion::V3
     {
         return Some(invalid(format!(
@@ -240,7 +268,7 @@ fn write_support_denial(
     }
 
     // Branch writes carry row-lineage semantics, which are Iceberg v3 only.
-    if request.target_ref.as_str() != "main" {
+    if target_ref != "main" {
         let format_version = metadata.format_version();
         if format_version != FormatVersion::V3 {
             return Some(invalid(format!(

@@ -273,21 +273,8 @@ impl Publisher for CreatePublisher {
             StagedCommitResult::Conflict(message) => {
                 CatalogOutcome::uncommitted(ConnectorMutationFailureKind::Conflict, message)
             }
-            StagedCommitResult::KnownUncommitted(message) => {
-                CatalogOutcome::uncommitted(ConnectorMutationFailureKind::Unavailable, message)
-            }
             StagedCommitResult::CommitUnknown(message) => {
                 CatalogOutcome::unknown(message, evidence())
-            }
-            StagedCommitResult::CommittedResponseInvalid(message) => {
-                CatalogOutcome::KnownCommitted {
-                    effect: ExternalMutationEffect::Applied,
-                    receipt: CommitProof::applied(expected_snapshot_id)
-                        .with_table_uuid(self.prepared.staged.table.metadata().uuid().to_string()),
-                    finalization: cleanup_failed(format!(
-                        "REST staged-create publication committed but response finalization failed: {message}"
-                    )),
-                }
             }
             StagedCommitResult::Unsupported(reason) => CatalogOutcome::uncommitted(
                 ConnectorMutationFailureKind::Unsupported,
@@ -441,7 +428,7 @@ mod tests {
                     instance_id: ConnectorInstanceId::parse("ice").unwrap(),
                 },
                 ProviderBindingEpoch::new(),
-                runtime,
+                runtime.clone(),
             )))
             .unwrap();
             let schema = Schema::builder()
@@ -518,6 +505,13 @@ mod tests {
             .unwrap();
             let initialization_updates = metadata.staged_create_initialization_updates().unwrap();
             let table = crate::iceberg::table::Table::builder()
+                .runtime(
+                    runtime
+                        .resources()
+                        .catalog_runtime()
+                        .iceberg_runtime()
+                        .clone(),
+                )
                 .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).unwrap())
                 .file_io(crate::fs_io::build_file_io_for_location(&location, binding))
                 .metadata(metadata)

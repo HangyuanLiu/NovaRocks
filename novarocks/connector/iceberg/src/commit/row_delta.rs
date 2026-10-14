@@ -116,13 +116,16 @@ impl crate::commit::staging::Preparer for RowDeltaPreparer {
         summary.insert("added-files-size".into(), size.to_string());
         let snapshot_id = crate::commit::staging::new_snapshot_id(view.metadata());
         let mut manifests = if let Some(parent) = parent {
-            view.metadata()
-                .snapshot_by_id(parent)
-                .ok_or_else(|| to_iceberg_unexpected("Target parent snapshot is absent".into()))?
-                .load_manifest_list(view.artifacts().file_io(), view.metadata())
-                .await?
-                .entries()
-                .to_vec()
+            crate::manifest::load_manifest_list(
+                view.metadata().snapshot_by_id(parent).ok_or_else(|| {
+                    to_iceberg_unexpected("Target parent snapshot is absent".into())
+                })?,
+                view.artifacts().file_io(),
+                view.metadata(),
+            )
+            .await?
+            .entries()
+            .to_vec()
         } else {
             vec![]
         };

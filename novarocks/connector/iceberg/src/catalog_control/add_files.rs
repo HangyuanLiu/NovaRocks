@@ -125,7 +125,7 @@ pub(crate) fn plan_manifest_for_table(
     let canonical_name_mapping = table
         .metadata()
         .properties()
-        .get(crate::iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
+        .get(crate::iceberg::spec::TableProperties::PROPERTY_DEFAULT_NAME_MAPPING)
         .map(|mapping| crate::schema_mapping::canonical_name_mapping(mapping))
         .transpose()
         .map_err(super::data_mutation::map_provider_error)?;
@@ -949,7 +949,7 @@ fn initial_default_ids(schema: &crate::iceberg::spec::StructType) -> HashSet<i32
                 visit(&map.key_field, ids);
                 visit(&map.value_field, ids);
             }
-            Type::Primitive(_) => {}
+            Type::Primitive(_) | Type::Variant(_) => {}
         }
     }
     let mut ids = HashSet::new();

@@ -1331,7 +1331,7 @@ fn validate_partition_transform(
         .field_by_id(source_id)
         .ok_or_else(|| format!("partition source field ID {source_id} is missing"))?;
     let data_type = source.field_type.as_ref();
-    if matches!(data_type, Type::Primitive(PrimitiveType::Variant)) {
+    if matches!(data_type, Type::Variant(_)) {
         return Err("variant columns cannot appear in the partition spec".to_string());
     }
     match field {

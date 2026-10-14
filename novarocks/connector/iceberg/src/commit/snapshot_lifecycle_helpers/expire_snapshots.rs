@@ -199,8 +199,8 @@ async fn run_expire_with_table(
         .collect();
 
     // Puffin half-reference protection (algorithm step 6).
-    // NOTE(R7 spike): `DataFile::referenced_data_file()` is pub in iceberg-0.9.0
-    // (`vendor/iceberg-0.9.0/src/spec/manifest/data_file.rs:276`), so the full
+    // NOTE(R7 spike): `DataFile::referenced_data_file()` is pub in iceberg-0.11.0
+    // (`vendor/iceberg-0.11.0/src/spec/manifest/data_file.rs:276`), so the full
     // DV index can be built. If it were absent, we would return an empty index
     // (puffin protection becomes no-op for non-puffin candidates).
     let dv_index = build_dv_index_from_metadata(metadata, &file_io, &all_snapshot_ids).await?;
@@ -325,7 +325,7 @@ fn main_ancestor_chain(metadata: &TableMetadata, n: usize) -> Vec<i64> {
 /// indexed (i.e., DV puffin delete files that track a specific data file).
 ///
 /// Spike result (R7): `DataFile::referenced_data_file()` is public in
-/// iceberg-0.9.0 (`vendor/iceberg-0.9.0/src/spec/manifest/data_file.rs:276`).
+/// iceberg-0.11.0 (`vendor/iceberg-0.11.0/src/spec/manifest/data_file.rs:276`).
 /// If a future upgrade hides this getter, return an empty HashMap and remove
 /// this call site — puffin protection degrades to no-op (conservative, not
 /// incorrect; DV puffins for non-live snapshots may linger but won't corrupt
@@ -340,9 +340,10 @@ async fn build_dv_index_from_metadata(
         let Some(snapshot) = metadata.snapshot_by_id(*sid) else {
             continue;
         };
-        let manifest_list = snapshot.load_manifest_list(file_io, metadata).await?;
+        let manifest_list =
+            crate::manifest::load_manifest_list(&snapshot, file_io, metadata).await?;
         for manifest_file in manifest_list.entries() {
-            let manifest = manifest_file.load_manifest(file_io).await?;
+            let manifest = crate::manifest::load_manifest(&manifest_file, file_io).await?;
             for entry in manifest.entries() {
                 let df = entry.data_file();
                 if let Some(ref_data_file) = df.referenced_data_file() {
@@ -482,6 +483,9 @@ mod tests {
                 ),
                 warehouse_uri,
                 binding,
+                crate::resources::IcebergCatalogRuntime::new(tokio::runtime::Handle::current())
+                    .iceberg_runtime()
+                    .clone(),
             ),
         );
         let namespace = NamespaceIdent::new("db".to_string());

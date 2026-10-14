@@ -31,7 +31,7 @@ fn lex_smoke_sql_suite_corpus_is_lossless() {
     let files = sql_suite_files(&repo_root);
     assert!(
         !files.is_empty(),
-        "no SQL corpus files found under the correctness and benchmark roots below {}",
+        "no SQL corpus files found under the correctness root below {}",
         repo_root.join("tests/sql").display()
     );
 
@@ -110,8 +110,7 @@ fn repo_root() -> PathBuf {
     manifest_dir
         .ancestors()
         .find(|ancestor| {
-            ancestor.join("tests/sql/correctness").is_dir()
-                && ancestor.join("tests/sql/benchmarks").is_dir()
+            ancestor.join("tests/sql/correctness").is_dir() && ancestor.join("Cargo.toml").is_file()
         })
         .map(Path::to_path_buf)
         .unwrap_or_else(|| {
@@ -125,7 +124,6 @@ fn repo_root() -> PathBuf {
 fn sql_suite_files(repo_root: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     collect_sql_files(&repo_root.join("tests/sql/correctness"), &mut files);
-    collect_sql_files(&repo_root.join("tests/sql/benchmarks"), &mut files);
     files.sort();
     files
 }

@@ -585,6 +585,9 @@ mod tests {
                 crate::fs_io::build_file_io_for_location(&warehouse_uri, binding.clone()),
                 warehouse_uri,
                 binding.clone(),
+                crate::resources::IcebergCatalogRuntime::new(tokio::runtime::Handle::current())
+                    .iceberg_runtime()
+                    .clone(),
             ),
         );
         let catalog: Arc<dyn Catalog> = concrete.clone();
@@ -788,16 +791,18 @@ mod tests {
         let Some(snapshot) = table.metadata().snapshot_for_ref(target_ref) else {
             return BTreeSet::new();
         };
-        let list = snapshot
-            .load_manifest_list(table.file_io(), table.metadata())
-            .await
-            .unwrap();
+        let list =
+            crate::manifest::load_manifest_list(&snapshot, table.file_io(), table.metadata())
+                .await
+                .unwrap();
         let mut paths = BTreeSet::new();
         for descriptor in list.entries() {
             if descriptor.content != ManifestContentType::Data {
                 continue;
             }
-            let manifest = descriptor.load_manifest(table.file_io()).await.unwrap();
+            let manifest = crate::manifest::load_manifest(&descriptor, table.file_io())
+                .await
+                .unwrap();
             paths.extend(
                 manifest
                     .entries()
@@ -1001,6 +1006,10 @@ pub(crate) mod preparer_tests {
     }
     impl Fixture {
         pub(crate) fn new() -> Self {
+            Self::new_with_limits(OperationLimits::default())
+        }
+
+        pub(crate) fn new_with_limits(limits: OperationLimits) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let location = format!("file://{}", directory.path().display());
             let runtime = tokio::runtime::Handle::current();
@@ -1023,7 +1032,7 @@ pub(crate) mod preparer_tests {
                 )
                 .unwrap(),
                 crate::resources::IcebergCatalogRuntime::new(runtime),
-                OperationLimits::default(),
+                limits,
             )
             .unwrap();
             Self {
@@ -1144,8 +1153,7 @@ pub(crate) mod preparer_tests {
     ) -> Vec<crate::iceberg::spec::ManifestEntry> {
         use crate::commit::model::ArtifactWriter;
         let snapshot = metadata.snapshot_for_ref(target_ref).unwrap();
-        let list = snapshot
-            .load_manifest_list(attempt.file_io(), metadata)
+        let list = crate::manifest::load_manifest_list(&snapshot, attempt.file_io(), metadata)
             .await
             .unwrap();
         let mut entries = Vec::new();

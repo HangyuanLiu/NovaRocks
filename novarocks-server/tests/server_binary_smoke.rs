@@ -138,6 +138,7 @@ cluster_id = "server-binary-smoke"
 path = "{}"
 
 [runtime.frontend_constant_policy]
+# Explicit author limits; these are not allocation grants or inferred defaults.
 max_rows = 1048576
 max_array_nodes = 1048576
 max_logical_elements = 16777216

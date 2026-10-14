@@ -1070,12 +1070,14 @@ impl IcebergAttemptTableAccess {
     pub(crate) fn reacquired_request_scoped(
         &self,
         binding: crate::access_binding::IcebergReadBinding,
+        runtime: crate::iceberg::Runtime,
     ) -> Result<IcebergPhysicalTable, ConnectorError> {
         let file_io_location = self
             .metadata_location
             .as_deref()
             .unwrap_or_else(|| self.metadata.location());
         let mut builder = crate::iceberg::table::Table::builder()
+            .runtime(runtime)
             .identifier(self.identifier.clone())
             .metadata(Arc::clone(&self.metadata))
             .readonly(self.readonly)
@@ -1207,12 +1209,14 @@ impl IcebergPhysicalTable {
     pub(crate) fn request_scoped(
         table: &crate::iceberg::table::Table,
         binding: crate::access_binding::IcebergReadBinding,
+        runtime: crate::iceberg::Runtime,
     ) -> Result<Self, ConnectorError> {
         let metadata_location = table.metadata_location().map(str::to_owned);
         let file_io_location = metadata_location
             .as_deref()
             .unwrap_or_else(|| table.metadata().location());
         let mut builder = crate::iceberg::table::Table::builder()
+            .runtime(runtime)
             .identifier(table.identifier().clone())
             .metadata(table.metadata_ref())
             .readonly(table.readonly())
@@ -1499,8 +1503,12 @@ mod tests {
         }
     }
 
-    fn physical_table(metadata_location: &str) -> super::IcebergPhysicalTable {
-        let binding = fresh_binding();
+    fn physical_table(
+        metadata_location: &str,
+        owner: &tokio::runtime::Runtime,
+        runtime: crate::iceberg::Runtime,
+    ) -> super::IcebergPhysicalTable {
+        let binding = fresh_binding(owner);
         let schema = crate::iceberg::spec::Schema::builder()
             .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
                 1,
@@ -1522,6 +1530,7 @@ mod tests {
         .expect("metadata")
         .metadata;
         let table = crate::iceberg::table::Table::builder()
+            .runtime(runtime)
             .identifier(crate::iceberg::TableIdent::from_strs(["db", "t"]).expect("identifier"))
             .file_io(crate::fs_io::build_file_io_for_location(
                 "s3://warehouse/data/table",
@@ -1534,8 +1543,9 @@ mod tests {
         super::IcebergPhysicalTable::new(table)
     }
 
-    fn fresh_binding() -> crate::access_binding::IcebergReadBinding {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    fn fresh_binding(
+        runtime: &tokio::runtime::Runtime,
+    ) -> crate::access_binding::IcebergReadBinding {
         let handle = runtime.handle().clone();
         crate::access_binding::IcebergReadBinding::new(
             None,
@@ -1548,8 +1558,10 @@ mod tests {
     fn table_with_metadata_location(
         source: &super::IcebergPhysicalTable,
         metadata_location: &str,
+        runtime: crate::iceberg::Runtime,
     ) -> crate::iceberg::table::Table {
         crate::iceberg::table::Table::builder()
+            .runtime(runtime)
             .identifier(source.table.identifier().clone())
             .file_io(source.table.file_io().clone())
             .metadata(source.table.metadata_ref())
@@ -1882,15 +1894,23 @@ mod tests {
 
     #[test]
     fn load_table_reacquisition_keeps_the_frozen_metadata_binding() {
+        let (owner, runtime) = catalog_runtime();
         let mut delegation = input("s3://warehouse/data", 600, "same-object");
         delegation
             .config
             .remove(CLIENT_REFRESH_CREDENTIALS_ENDPOINT);
         let delegation = seed(vec![delegation]);
-        let frozen = physical_table("s3://warehouse/data/table/metadata/v1.json")
-            .with_attempt_access(delegation.renewal_capability());
-        let observed =
-            table_with_metadata_location(&frozen, "s3://warehouse/data/table/metadata/v2.json");
+        let frozen = physical_table(
+            "s3://warehouse/data/table/metadata/v1.json",
+            &owner,
+            runtime.iceberg_runtime().clone(),
+        )
+        .with_attempt_access(delegation.renewal_capability());
+        let observed = table_with_metadata_location(
+            &frozen,
+            "s3://warehouse/data/table/metadata/v2.json",
+            runtime.iceberg_runtime().clone(),
+        );
         let access = super::IcebergAttemptTableAccess::freeze(frozen.clone());
 
         access
@@ -1901,7 +1921,11 @@ mod tests {
             Some("s3://warehouse/data/table/metadata/v1.json")
         );
 
-        let different_object = physical_table("s3://warehouse/data/table/metadata/v3.json");
+        let different_object = physical_table(
+            "s3://warehouse/data/table/metadata/v3.json",
+            &owner,
+            runtime.iceberg_runtime().clone(),
+        );
         let error = access
             .validate_attempt_reacquisition(&different_object.table, &delegation)
             .expect_err("a same-name table with a different UUID must be rejected");
@@ -1959,11 +1983,19 @@ mod tests {
 
     #[test]
     fn credentials_endpoint_attempt_acquisition_keeps_frozen_metadata() {
+        let (owner, runtime) = catalog_runtime();
         let initial = seed(vec![input("s3://warehouse/data/", 600, "initial")]);
-        let frozen = physical_table("s3://warehouse/data/table/metadata/v1.json")
-            .with_attempt_access(initial.renewal_capability());
-        let observed =
-            table_with_metadata_location(&frozen, "s3://warehouse/data/table/metadata/v2.json");
+        let frozen = physical_table(
+            "s3://warehouse/data/table/metadata/v1.json",
+            &owner,
+            runtime.iceberg_runtime().clone(),
+        )
+        .with_attempt_access(initial.renewal_capability());
+        let observed = table_with_metadata_location(
+            &frozen,
+            "s3://warehouse/data/table/metadata/v2.json",
+            runtime.iceberg_runtime().clone(),
+        );
         let access = super::IcebergAttemptTableAccess::freeze(frozen);
         let replacement = seed(vec![input("s3://warehouse/", 900, "replacement")]);
 
@@ -1972,7 +2004,11 @@ mod tests {
             .expect("the current attempt may acquire a broader lease for frozen metadata");
         assert!(scope.matches_seed(&replacement));
 
-        let different_table = physical_table("s3://warehouse/data/table/metadata/v3.json");
+        let different_table = physical_table(
+            "s3://warehouse/data/table/metadata/v3.json",
+            &owner,
+            runtime.iceberg_runtime().clone(),
+        );
         assert!(
             access
                 .validate_credentials_endpoint_attempt_acquisition(
@@ -1985,18 +2021,23 @@ mod tests {
 
     #[test]
     fn reacquired_request_scope_rebinds_access_without_changing_frozen_metadata() {
+        let (owner, runtime) = catalog_runtime();
         let mut delegation = input("s3://warehouse/data", 600, "first-attempt");
         delegation
             .config
             .remove(CLIENT_REFRESH_CREDENTIALS_ENDPOINT);
         let delegation = seed(vec![delegation]);
-        let frozen = physical_table("s3://warehouse/data/table/metadata/v1.json")
-            .with_attempt_access(delegation.renewal_capability());
+        let frozen = physical_table(
+            "s3://warehouse/data/table/metadata/v1.json",
+            &owner,
+            runtime.iceberg_runtime().clone(),
+        )
+        .with_attempt_access(delegation.renewal_capability());
         let old_file_io = frozen.table.file_io() as *const _;
         let access = super::IcebergAttemptTableAccess::freeze(frozen.clone());
 
         let reacquired = access
-            .reacquired_request_scoped(fresh_binding())
+            .reacquired_request_scoped(fresh_binding(&owner), runtime.iceberg_runtime().clone())
             .expect("a new request scope can bind the frozen object");
 
         assert_eq!(
