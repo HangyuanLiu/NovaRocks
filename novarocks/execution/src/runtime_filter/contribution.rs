@@ -749,9 +749,34 @@ impl RuntimeOrderKey {
         self.null_order
     }
 }
+#[derive(Clone)]
+enum RuntimeOrderKeys {
+    Legacy(Vec<RuntimeOrderKey>),
+    Owned(super::owned::OwnedOrderKeys),
+}
+impl RuntimeOrderKeys {
+    fn as_slice(&self) -> &[RuntimeOrderKey] {
+        match self {
+            Self::Legacy(keys) => keys,
+            Self::Owned(keys) => keys.as_slice(),
+        }
+    }
+}
+impl fmt::Debug for RuntimeOrderKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_slice().fmt(f)
+    }
+}
+impl PartialEq for RuntimeOrderKeys {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+impl Eq for RuntimeOrderKeys {}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeOrderContract {
-    keys: Vec<RuntimeOrderKey>,
+    keys: RuntimeOrderKeys,
     comparator_digest: [u8; 32],
     digest: [u8; 32],
 }
@@ -781,7 +806,19 @@ impl RuntimeOrderContract {
         order_contract_digest: [u8; 32],
     ) -> Self {
         Self {
-            keys: keys.into_iter().collect(),
+            keys: RuntimeOrderKeys::Legacy(keys.into_iter().collect()),
+            comparator_digest,
+            digest: order_contract_digest,
+        }
+    }
+
+    pub(crate) fn from_owned_keys(
+        keys: super::owned::OwnedOrderKeys,
+        comparator_digest: [u8; 32],
+        order_contract_digest: [u8; 32],
+    ) -> Self {
+        Self {
+            keys: RuntimeOrderKeys::Owned(keys),
             comparator_digest,
             digest: order_contract_digest,
         }
@@ -906,7 +943,7 @@ impl RuntimeOrderContract {
         Ok(())
     }
     pub fn keys(&self) -> &[RuntimeOrderKey] {
-        &self.keys
+        self.keys.as_slice()
     }
     pub const fn digest(&self) -> [u8; 32] {
         self.digest
@@ -922,10 +959,10 @@ impl RuntimeOrderContract {
         tuple: OrderedTupleRef<'_>,
         mut observe: impl FnMut() -> Result<(), E>,
     ) -> Result<(), E> {
-        if tuple.len() != self.keys.len() {
+        if tuple.len() != self.keys().len() {
             return Err(OrderedTupleError::ArityMismatch.into());
         }
-        for (ordinal, key) in self.keys.iter().enumerate() {
+        for (ordinal, key) in self.keys().iter().enumerate() {
             observe()?;
             if tuple
                 .value(ordinal)
@@ -975,7 +1012,7 @@ impl RuntimeOrderContract {
         self.validate_borrowed_tuple(right, || {
             work.step().map_err(ControlledOrderedTupleError::Kernel)
         })?;
-        for (ordinal, key) in self.keys.iter().enumerate() {
+        for (ordinal, key) in self.keys().iter().enumerate() {
             work.step()?;
             let left = left.value(ordinal);
             let right = right.value(ordinal);

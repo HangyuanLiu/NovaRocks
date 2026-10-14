@@ -308,3 +308,188 @@ fn ordered_topn_owned_control_refusal_frees_unpublished_key_and_canonical_prefix
     ));
     assert_eq!(tracker.current(), 0);
 }
+
+fn static_utf8_order(
+    direction: novarocks_local_program::FilterSortDirection,
+    null_order: novarocks_local_program::FilterNullOrder,
+) -> novarocks_local_program::StaticFilterContract {
+    novarocks_local_program::StaticFilterContract::Ordered {
+        keys: Arc::from([novarocks_local_program::FilterOrderKey {
+            data_type: DataType::Utf8,
+            direction,
+            null_order,
+        }]),
+        comparator_digest: [17; 32],
+        contract_digest: [23; 32],
+    }
+}
+
+#[test]
+fn ordered_topn_owned_frozen_key_slots_share_last_owner_and_preserve_legacy_content() {
+    use crate::runtime_filter::contribution::{RuntimeOrderNullOrder, RuntimeOrderSortDirection};
+    use novarocks_local_program::{FilterNullOrder, FilterSortDirection};
+    for (direction, expected_direction) in [
+        (
+            FilterSortDirection::Ascending,
+            RuntimeOrderSortDirection::Ascending,
+        ),
+        (
+            FilterSortDirection::Descending,
+            RuntimeOrderSortDirection::Descending,
+        ),
+    ] {
+        for (nulls, expected_nulls) in [
+            (FilterNullOrder::First, RuntimeOrderNullOrder::First),
+            (FilterNullOrder::Last, RuntimeOrderNullOrder::Last),
+        ] {
+            let tracker = MemTracker::new_root("ordered-frozen-keys-last-alias");
+            let host = OrderedTopNAllocationHost::new(tracker.clone());
+            let contract = host
+                .utf8_order_contract(&static_utf8_order(direction, nulls), &Control::pass())
+                .unwrap();
+            let expected = RuntimeOrderContract::from_frozen(
+                [RuntimeOrderKey::with_order(
+                    DataType::Utf8,
+                    expected_direction,
+                    expected_nulls,
+                )],
+                [17; 32],
+                [23; 32],
+            );
+            assert_eq!(contract, expected);
+            assert_eq!(format!("{contract:?}"), format!("{expected:?}"));
+            let held = tracker.current();
+            assert!(held > std::mem::size_of::<RuntimeOrderKey>() as i64);
+            let last = contract.clone();
+            assert_eq!(contract.keys().as_ptr(), last.keys().as_ptr());
+            assert_eq!(tracker.current(), held);
+            let legacy_copy = expected.clone();
+            assert_ne!(expected.keys().as_ptr(), legacy_copy.keys().as_ptr());
+            let tuple = OrderedTuple::new([Some(OrderedScalar::Utf8("\u{6d77}\0".into()))]);
+            let bound = CodecContribution::ordered_bound(OrderedBoundUpdate::new([23; 32], tuple));
+            let legacy_bytes = encode_contribution(
+                &bound,
+                ContributionCodecExpectation::OrderedBound(&expected),
+                1024,
+            )
+            .unwrap();
+            let owned_bytes = encode_contribution(
+                &bound,
+                ContributionCodecExpectation::OrderedBound(&contract),
+                1024,
+            )
+            .unwrap();
+            assert_eq!(owned_bytes.payload(), legacy_bytes.payload());
+            drop(contract);
+            drop(host);
+            assert_eq!(tracker.current(), held);
+            std::thread::spawn(move || {
+                assert_eq!(last, expected);
+                assert_eq!(last.comparator_digest(), [17; 32]);
+                assert_eq!(last.digest(), [23; 32]);
+                drop(last);
+            })
+            .join()
+            .unwrap();
+            assert_eq!(tracker.current(), 0);
+        }
+    }
+}
+
+#[test]
+fn ordered_topn_owned_frozen_key_slots_refuse_real_prefix_vector_and_holder_limits() {
+    use novarocks_local_program::{FilterNullOrder, FilterSortDirection};
+    let contract = static_utf8_order(FilterSortDirection::Ascending, FilterNullOrder::First);
+    let prefix = source_custody_prefix_facts().requests().bytes();
+    for limit in [1, prefix, prefix + std::mem::size_of::<RuntimeOrderKey>()] {
+        let tracker = MemTracker::new_root("ordered-frozen-keys-hard-limit");
+        tracker.install_limit_once(limit as i64).unwrap();
+        let host = OrderedTopNAllocationHost::new(tracker.clone());
+        let control = Control::pass();
+        assert!(matches!(
+            host.utf8_order_contract(&contract, &control),
+            Err(KernelFailure::ResourceExhausted)
+        ));
+        assert_eq!(tracker.current(), 0);
+        if limit == 1 {
+            assert_eq!(control.calls.load(Ordering::SeqCst), 0);
+        } else if limit > prefix {
+            assert!(
+                control.calls.load(Ordering::SeqCst) > 1,
+                "holder refusal follows actual slot allocation"
+            );
+        }
+    }
+}
+
+#[test]
+fn ordered_topn_owned_frozen_key_slots_preserve_control_causes_and_named_uninstalled_shapes() {
+    use novarocks_local_program::{FilterNullOrder, FilterSortDirection, StaticFilterContract};
+    let tracker = MemTracker::new_root("ordered-frozen-keys-control");
+    let host = OrderedTopNAllocationHost::new(tracker.clone());
+    let contract = static_utf8_order(FilterSortDirection::Descending, FilterNullOrder::Last);
+    let control = Control::pass();
+    drop(host.utf8_order_contract(&contract, &control).unwrap());
+    assert_eq!(tracker.current(), 0);
+    for cause in [
+        KernelFailure::Cancelled,
+        KernelFailure::DeadlineExceeded,
+        KernelFailure::ResourceExhausted,
+    ] {
+        for ordinal in 0..control.calls.load(Ordering::SeqCst) {
+            let refusal = Control {
+                refuse_at: Some(ordinal),
+                cause: cause.clone(),
+                ..Control::pass()
+            };
+            assert!(matches!(host.utf8_order_contract(&contract, &refusal), Err(e) if e == cause));
+            assert_eq!(
+                tracker.current(),
+                0,
+                "unpublished slots and holder are actually freed"
+            );
+        }
+    }
+    let StaticFilterContract::Ordered { keys, .. } = contract else {
+        unreachable!()
+    };
+    let wrong_type = StaticFilterContract::Ordered {
+        keys: Arc::from([novarocks_local_program::FilterOrderKey {
+            data_type: DataType::Int64,
+            ..keys[0].clone()
+        }]),
+        comparator_digest: [17; 32],
+        contract_digest: [23; 32],
+    };
+    let wrong_arity = StaticFilterContract::Ordered {
+        keys: Arc::from([keys[0].clone(), keys[0].clone()]),
+        comparator_digest: [17; 32],
+        contract_digest: [23; 32],
+    };
+    let membership = StaticFilterContract::membership(
+        &DataType::Utf8,
+        novarocks_local_program::FilterNullSemantics::NeverMatches,
+    )
+    .unwrap();
+    for (shape, detail) in [
+        (
+            wrong_type,
+            "pure Aggregate TopN runtime filter order key type other than Utf8 is not installed",
+        ),
+        (
+            wrong_arity,
+            "pure Aggregate TopN runtime filter requires one complete order key",
+        ),
+        (
+            membership,
+            "pure Aggregate TopN runtime filter requires an ordered contract",
+        ),
+    ] {
+        let control = Control::pass();
+        assert!(
+            matches!(host.utf8_order_contract(&shape, &control), Err(KernelFailure::InvalidProgram(d)) if d.message() == detail)
+        );
+        assert_eq!(control.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(tracker.current(), 0);
+    }
+}

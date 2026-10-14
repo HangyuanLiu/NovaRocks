@@ -23,12 +23,13 @@ use std::{fmt, ops::Deref, sync::Arc};
 
 use novarocks_functions::opaque_memory::{OpaqueReservation, OpaqueRetainedCharge};
 use novarocks_functions::{
-    AggregateStateAllocator, EvaluationCheckpoints, KernelEvaluationControl, KernelFailure,
-    MAX_UNOBSERVED_KERNEL_WORK, SourceBackingOwner, source_custody_prefix_facts,
+    AggregateStateAllocator, EvaluationCheckpoints, KernelDiagnostic, KernelEvaluationControl,
+    KernelFailure, MAX_UNOBSERVED_KERNEL_WORK, SourceBackingOwner, source_custody_prefix_facts,
 };
 
 use super::contribution::{
     ControlledContributionCodecError, OrderedScalarRef, OrderedTupleRef, RuntimeOrderContract,
+    RuntimeOrderKey, RuntimeOrderNullOrder, RuntimeOrderSortDirection,
     borrowed_ordered_bound_encoded_len, visit_borrowed_ordered_bound,
 };
 use crate::exec::expr::agg::{AggregateAllocator, AggregateVec};
@@ -37,6 +38,20 @@ use crate::runtime::mem_tracker::MemTracker;
 
 struct ByteBacking {
     bytes: AggregateVec<u8>,
+}
+
+struct OrderKeyBacking {
+    keys: AggregateVec<RuntimeOrderKey>,
+}
+
+/// Share the entire paid frozen key sequence; expose no detachable slots or
+/// holder. Legacy contracts retain their original by-value Vec cloning.
+#[derive(Clone)]
+pub(crate) struct OwnedOrderKeys(SourceBackingOwner<OrderKeyBacking>);
+impl OwnedOrderKeys {
+    pub(crate) fn as_slice(&self) -> &[RuntimeOrderKey] {
+        &self.0.borrowed().keys
+    }
 }
 
 #[derive(Clone)]
@@ -166,6 +181,66 @@ impl OrderedTopNAllocationHost {
 
     pub(crate) fn vector_allocator(&self) -> AggregateAllocator {
         self.allocator.clone()
+    }
+
+    /// Reconstruct the already frozen, first installed static order once on
+    /// the actual creating host. No driver deep-copies these inner key slots.
+    pub(crate) fn utf8_order_contract(
+        &self,
+        contract: &novarocks_local_program::StaticFilterContract,
+        control: &dyn KernelEvaluationControl,
+    ) -> Result<RuntimeOrderContract, KernelFailure> {
+        use novarocks_local_program::{FilterNullOrder, FilterSortDirection, StaticFilterContract};
+        let StaticFilterContract::Ordered {
+            keys,
+            comparator_digest,
+            contract_digest,
+        } = contract
+        else {
+            return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                "pure Aggregate TopN runtime filter requires an ordered contract",
+            )));
+        };
+        let [key] = keys.as_ref() else {
+            return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                "pure Aggregate TopN runtime filter requires one complete order key",
+            )));
+        };
+        if key.data_type != arrow::datatypes::DataType::Utf8 {
+            return Err(KernelFailure::InvalidProgram(KernelDiagnostic::new(
+                "pure Aggregate TopN runtime filter order key type other than Utf8 is not installed",
+            )));
+        }
+        let _prefix = self.reserve_prefix()?;
+        let mut work = EvaluationCheckpoints::new(control);
+        work.flush()?;
+        let mut slots = AggregateVec::new_in(self.allocator.clone());
+        slots
+            .try_reserve_exact(1)
+            .map_err(|_| KernelFailure::ResourceExhausted)?;
+        work.flush()?;
+        slots.push(RuntimeOrderKey::with_order(
+            arrow::datatypes::DataType::Utf8,
+            match key.direction {
+                FilterSortDirection::Ascending => RuntimeOrderSortDirection::Ascending,
+                FilterSortDirection::Descending => RuntimeOrderSortDirection::Descending,
+            },
+            match key.null_order {
+                FilterNullOrder::First => RuntimeOrderNullOrder::First,
+                FilterNullOrder::Last => RuntimeOrderNullOrder::Last,
+            },
+        ));
+        let owner = SourceBackingOwner::try_from_owned_direct(
+            OrderKeyBacking { keys: slots },
+            Arc::clone(&self.host),
+            &mut work,
+        )?;
+        work.finish()?;
+        Ok(RuntimeOrderContract::from_owned_keys(
+            OwnedOrderKeys(owner),
+            *comparator_digest,
+            *contract_digest,
+        ))
     }
 
     fn reserve_prefix(&self) -> Result<OpaqueReservation, KernelFailure> {
