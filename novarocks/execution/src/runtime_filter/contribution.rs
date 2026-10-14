@@ -391,6 +391,93 @@ pub enum OrderedScalar {
     Timestamp(i64),
     Decimal128(i128),
 }
+
+/// Borrowed values use the same frozen scalar vocabulary as owned tuples.
+/// UTF-8 data remains with its original input or immutable bound owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrderedScalarRef<'a> {
+    Boolean(bool),
+    Int8(i8),
+    Int16(i16),
+    Int32(i32),
+    Int64(i64),
+    LargeInt(i128),
+    Utf8(&'a str),
+    Date32(i32),
+    Timestamp(i64),
+    Decimal128(i128),
+}
+
+impl OrderedScalar {
+    pub fn as_borrowed(&self) -> OrderedScalarRef<'_> {
+        match self {
+            Self::Boolean(value) => OrderedScalarRef::Boolean(*value),
+            Self::Int8(value) => OrderedScalarRef::Int8(*value),
+            Self::Int16(value) => OrderedScalarRef::Int16(*value),
+            Self::Int32(value) => OrderedScalarRef::Int32(*value),
+            Self::Int64(value) => OrderedScalarRef::Int64(*value),
+            Self::LargeInt(value) => OrderedScalarRef::LargeInt(*value),
+            Self::Utf8(value) => OrderedScalarRef::Utf8(value),
+            Self::Date32(value) => OrderedScalarRef::Date32(*value),
+            Self::Timestamp(value) => OrderedScalarRef::Timestamp(*value),
+            Self::Decimal128(value) => OrderedScalarRef::Decimal128(*value),
+        }
+    }
+}
+
+/// A one-key bound needs no temporary owned tuple or scalar allocation.
+#[derive(Clone, Copy, Debug)]
+pub enum OrderedTupleRef<'a> {
+    Owned(&'a OrderedTuple),
+    Single(Option<OrderedScalarRef<'a>>),
+}
+
+impl<'a> OrderedTupleRef<'a> {
+    fn len(self) -> usize {
+        match self {
+            Self::Owned(tuple) => tuple.values().len(),
+            Self::Single(_) => 1,
+        }
+    }
+    fn value(self, ordinal: usize) -> Option<OrderedScalarRef<'a>> {
+        match self {
+            Self::Owned(tuple) => tuple.values()[ordinal]
+                .as_ref()
+                .map(OrderedScalar::as_borrowed),
+            Self::Single(value) => {
+                debug_assert_eq!(ordinal, 0);
+                value
+            }
+        }
+    }
+}
+
+/// A control refusal never becomes an immutable tuple/type mismatch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ControlledOrderedTupleError {
+    Tuple(OrderedTupleError),
+    Kernel(novarocks_functions::KernelFailure),
+}
+impl From<OrderedTupleError> for ControlledOrderedTupleError {
+    fn from(error: OrderedTupleError) -> Self {
+        Self::Tuple(error)
+    }
+}
+impl From<novarocks_functions::KernelFailure> for ControlledOrderedTupleError {
+    fn from(error: novarocks_functions::KernelFailure) -> Self {
+        Self::Kernel(error)
+    }
+}
+
+struct LegacyOrderControl;
+impl novarocks_functions::KernelEvaluationControl for LegacyOrderControl {
+    fn checkpoint(&self, _: u32) -> Result<(), novarocks_functions::KernelFailure> {
+        Ok(())
+    }
+    fn wait(&self, _: std::time::Duration) -> Result<(), novarocks_functions::KernelFailure> {
+        unreachable!("ordered comparison never waits")
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OrderedTuple {
     values: Vec<Option<OrderedScalar>>,
@@ -796,15 +883,24 @@ impl RuntimeOrderContract {
         self.comparator_digest
     }
     pub fn validate_tuple(&self, tuple: &OrderedTuple) -> Result<(), OrderedTupleError> {
-        if tuple.values().len() != self.keys.len() {
-            return Err(OrderedTupleError::ArityMismatch);
+        self.validate_borrowed_tuple(OrderedTupleRef::Owned(tuple), || Ok(()))
+    }
+    fn validate_borrowed_tuple<E: From<OrderedTupleError>>(
+        &self,
+        tuple: OrderedTupleRef<'_>,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
+        if tuple.len() != self.keys.len() {
+            return Err(OrderedTupleError::ArityMismatch.into());
         }
-        if self.keys.iter().zip(tuple.values()).any(|(key, value)| {
-            value
-                .as_ref()
-                .is_some_and(|value| !scalar_matches(value, key.data_type()))
-        }) {
-            return Err(OrderedTupleError::TypeMismatch);
+        for (ordinal, key) in self.keys.iter().enumerate() {
+            observe()?;
+            if tuple
+                .value(ordinal)
+                .is_some_and(|value| !scalar_ref_matches(value, key.data_type()))
+            {
+                return Err(OrderedTupleError::TypeMismatch.into());
+            }
         }
         Ok(())
     }
@@ -813,9 +909,39 @@ impl RuntimeOrderContract {
         left: &OrderedTuple,
         right: &OrderedTuple,
     ) -> Result<Ordering, OrderedTupleError> {
-        self.validate_tuple(left)?;
-        self.validate_tuple(right)?;
-        for ((key, left), right) in self.keys.iter().zip(left.values()).zip(right.values()) {
+        match self.compare_borrowed_controlled(
+            OrderedTupleRef::Owned(left),
+            OrderedTupleRef::Owned(right),
+            &LegacyOrderControl,
+        ) {
+            Ok(ordering) => Ok(ordering),
+            Err(ControlledOrderedTupleError::Tuple(error)) => Err(error),
+            Err(ControlledOrderedTupleError::Kernel(_)) => {
+                unreachable!("the explicit legacy order control cannot refuse")
+            }
+        }
+    }
+
+    /// The original NULL/direction/scalar order with explicit interruption.
+    /// Single-key callers borrow UTF-8 directly instead of copying a tuple.
+    pub fn compare_borrowed_controlled(
+        &self,
+        left: OrderedTupleRef<'_>,
+        right: OrderedTupleRef<'_>,
+        control: &dyn novarocks_functions::KernelEvaluationControl,
+    ) -> Result<Ordering, ControlledOrderedTupleError> {
+        let mut work = novarocks_functions::EvaluationCheckpoints::new(control);
+        work.flush()?;
+        self.validate_borrowed_tuple(left, || {
+            work.step().map_err(ControlledOrderedTupleError::Kernel)
+        })?;
+        self.validate_borrowed_tuple(right, || {
+            work.step().map_err(ControlledOrderedTupleError::Kernel)
+        })?;
+        for (ordinal, key) in self.keys.iter().enumerate() {
+            work.step()?;
+            let left = left.value(ordinal);
+            let right = right.value(ordinal);
             let ordering = match (left, right) {
                 (None, None) => Ordering::Equal,
                 (None, Some(_)) => match key.null_order() {
@@ -827,7 +953,7 @@ impl RuntimeOrderContract {
                     RuntimeOrderNullOrder::Last => Ordering::Less,
                 },
                 (Some(left), Some(right)) => {
-                    let ordering = compare_scalar(left, right)?;
+                    let ordering = compare_scalar_ref(left, right, control, &mut work)?;
                     match key.direction() {
                         RuntimeOrderSortDirection::Ascending => ordering,
                         RuntimeOrderSortDirection::Descending => ordering.reverse(),
@@ -835,9 +961,11 @@ impl RuntimeOrderContract {
                 }
             };
             if ordering != Ordering::Equal {
+                work.finish()?;
                 return Ok(ordering);
             }
         }
+        work.finish()?;
         Ok(Ordering::Equal)
     }
 }
@@ -1778,19 +1906,23 @@ fn decode_scalar(
     })
 }
 fn scalar_matches(value: &OrderedScalar, data_type: &DataType) -> bool {
+    scalar_ref_matches(value.as_borrowed(), data_type)
+}
+
+fn scalar_ref_matches(value: OrderedScalarRef<'_>, data_type: &DataType) -> bool {
     match (value, data_type) {
-        (OrderedScalar::Boolean(_), DataType::Boolean)
-        | (OrderedScalar::Int8(_), DataType::Int8)
-        | (OrderedScalar::Int16(_), DataType::Int16)
-        | (OrderedScalar::Int32(_), DataType::Int32)
-        | (OrderedScalar::Int64(_), DataType::Int64)
-        | (OrderedScalar::Utf8(_), DataType::Utf8)
-        | (OrderedScalar::Date32(_), DataType::Date32)
-        | (OrderedScalar::Timestamp(_), DataType::Timestamp(_, _)) => true,
-        (OrderedScalar::Decimal128(value), DataType::Decimal128(precision, _)) => 10_i128
+        (OrderedScalarRef::Boolean(_), DataType::Boolean)
+        | (OrderedScalarRef::Int8(_), DataType::Int8)
+        | (OrderedScalarRef::Int16(_), DataType::Int16)
+        | (OrderedScalarRef::Int32(_), DataType::Int32)
+        | (OrderedScalarRef::Int64(_), DataType::Int64)
+        | (OrderedScalarRef::Utf8(_), DataType::Utf8)
+        | (OrderedScalarRef::Date32(_), DataType::Date32)
+        | (OrderedScalarRef::Timestamp(_), DataType::Timestamp(_, _)) => true,
+        (OrderedScalarRef::Decimal128(value), DataType::Decimal128(precision, _)) => 10_i128
             .checked_pow((*precision).into())
-            .is_some_and(|limit| *value > -limit && *value < limit),
-        (OrderedScalar::LargeInt(_), DataType::FixedSizeBinary(width)) => {
+            .is_some_and(|limit| value > -limit && value < limit),
+        (OrderedScalarRef::LargeInt(_), DataType::FixedSizeBinary(width)) => {
             *width == LARGEINT_BYTE_WIDTH
         }
         _ => false,
@@ -1915,22 +2047,46 @@ fn visit_scalar(value: &OrderedScalar, visit: &mut impl FnMut(&[u8])) {
         }
     }
 }
-fn compare_scalar(
-    left: &OrderedScalar,
-    right: &OrderedScalar,
-) -> Result<Ordering, OrderedTupleError> {
+fn compare_scalar_ref(
+    left: OrderedScalarRef<'_>,
+    right: OrderedScalarRef<'_>,
+    control: &dyn novarocks_functions::KernelEvaluationControl,
+    work: &mut novarocks_functions::EvaluationCheckpoints<'_>,
+) -> Result<Ordering, ControlledOrderedTupleError> {
     Ok(match (left, right) {
-        (OrderedScalar::Boolean(a), OrderedScalar::Boolean(b)) => a.cmp(b),
-        (OrderedScalar::Int8(a), OrderedScalar::Int8(b)) => a.cmp(b),
-        (OrderedScalar::Int16(a), OrderedScalar::Int16(b)) => a.cmp(b),
-        (OrderedScalar::Int32(a), OrderedScalar::Int32(b)) => a.cmp(b),
-        (OrderedScalar::Int64(a), OrderedScalar::Int64(b)) => a.cmp(b),
-        (OrderedScalar::LargeInt(a), OrderedScalar::LargeInt(b)) => a.cmp(b),
-        (OrderedScalar::Utf8(a), OrderedScalar::Utf8(b)) => a.as_bytes().cmp(b.as_bytes()),
-        (OrderedScalar::Date32(a), OrderedScalar::Date32(b)) => a.cmp(b),
-        (OrderedScalar::Timestamp(a), OrderedScalar::Timestamp(b)) => a.cmp(b),
-        (OrderedScalar::Decimal128(a), OrderedScalar::Decimal128(b)) => a.cmp(b),
-        _ => return Err(OrderedTupleError::TypeMismatch),
+        (OrderedScalarRef::Boolean(a), OrderedScalarRef::Boolean(b)) => a.cmp(&b),
+        (OrderedScalarRef::Int8(a), OrderedScalarRef::Int8(b)) => a.cmp(&b),
+        (OrderedScalarRef::Int16(a), OrderedScalarRef::Int16(b)) => a.cmp(&b),
+        (OrderedScalarRef::Int32(a), OrderedScalarRef::Int32(b)) => a.cmp(&b),
+        (OrderedScalarRef::Int64(a), OrderedScalarRef::Int64(b)) => a.cmp(&b),
+        (OrderedScalarRef::LargeInt(a), OrderedScalarRef::LargeInt(b)) => a.cmp(&b),
+        (OrderedScalarRef::Utf8(a), OrderedScalarRef::Utf8(b)) => {
+            work.flush()?;
+            let mut ordering = Ordering::Equal;
+            let quantum = novarocks_functions::MAX_UNOBSERVED_KERNEL_WORK as usize;
+            for (a, b) in a
+                .as_bytes()
+                .chunks(quantum)
+                .zip(b.as_bytes().chunks(quantum))
+            {
+                ordering = a.cmp(b);
+                // Each public byte comparison has bounded input. Report its
+                // actual work before exposing even an early unequal result.
+                control.checkpoint(a.len().max(b.len()) as u32)?;
+                if ordering != Ordering::Equal {
+                    break;
+                }
+            }
+            if ordering == Ordering::Equal {
+                a.len().cmp(&b.len())
+            } else {
+                ordering
+            }
+        }
+        (OrderedScalarRef::Date32(a), OrderedScalarRef::Date32(b)) => a.cmp(&b),
+        (OrderedScalarRef::Timestamp(a), OrderedScalarRef::Timestamp(b)) => a.cmp(&b),
+        (OrderedScalarRef::Decimal128(a), OrderedScalarRef::Decimal128(b)) => a.cmp(&b),
+        _ => return Err(OrderedTupleError::TypeMismatch.into()),
     })
 }
 fn push_count(out: &mut Vec<u8>, count: usize) -> Result<(), ContributionSizeError> {
@@ -2016,6 +2172,234 @@ mod tests {
     };
     use arrow::array::{ArrayRef, Int32Array};
     use arrow::datatypes::DataType;
+
+    /// Owner-local contract checks: std byte ordering is the independent
+    /// oracle; declared strings need no service, timer, thread or cleanup.
+    #[test]
+    fn ordered_topn_owned_borrowed_utf8_matches_legacy_and_byte_oracle() {
+        let boundary_prefix = "x".repeat(novarocks_functions::MAX_UNOBSERVED_KERNEL_WORK as usize);
+        let values = [
+            None,
+            Some(String::new()),
+            Some("a".to_string()),
+            Some("a\0".to_string()),
+            Some("é".to_string()),
+            Some("海港".to_string()),
+            Some(boundary_prefix.clone()),
+            Some(format!("{boundary_prefix}a")),
+            Some(format!("{boundary_prefix}b")),
+        ];
+        for direction in [
+            RuntimeOrderSortDirection::Ascending,
+            RuntimeOrderSortDirection::Descending,
+        ] {
+            for null_order in [RuntimeOrderNullOrder::First, RuntimeOrderNullOrder::Last] {
+                let contract = RuntimeOrderContract::new(
+                    [RuntimeOrderKey::with_order(
+                        DataType::Utf8,
+                        direction,
+                        null_order,
+                    )],
+                    [7; 32],
+                );
+                for left in &values {
+                    for right in &values {
+                        let expected = match (left, right) {
+                            (None, None) => Ordering::Equal,
+                            (None, Some(_)) => {
+                                if null_order == RuntimeOrderNullOrder::First {
+                                    Ordering::Less
+                                } else {
+                                    Ordering::Greater
+                                }
+                            }
+                            (Some(_), None) => {
+                                if null_order == RuntimeOrderNullOrder::First {
+                                    Ordering::Greater
+                                } else {
+                                    Ordering::Less
+                                }
+                            }
+                            (Some(left), Some(right)) => {
+                                let ordering = left.as_bytes().cmp(right.as_bytes());
+                                if direction == RuntimeOrderSortDirection::Descending {
+                                    ordering.reverse()
+                                } else {
+                                    ordering
+                                }
+                            }
+                        };
+                        let owned_left = OrderedTuple::new([left.clone().map(OrderedScalar::Utf8)]);
+                        let owned_right =
+                            OrderedTuple::new([right.clone().map(OrderedScalar::Utf8)]);
+                        assert_eq!(contract.compare(&owned_left, &owned_right), Ok(expected));
+                        assert_eq!(
+                            contract.compare_borrowed_controlled(
+                                OrderedTupleRef::Single(
+                                    left.as_deref().map(OrderedScalarRef::Utf8)
+                                ),
+                                OrderedTupleRef::Single(
+                                    right.as_deref().map(OrderedScalarRef::Utf8)
+                                ),
+                                &LegacyOrderControl,
+                            ),
+                            Ok(expected),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordered_topn_owned_borrowed_keeps_original_tuple_type_rules() {
+        let cases = [
+            (
+                DataType::Boolean,
+                OrderedScalar::Boolean(false),
+                OrderedScalar::Boolean(true),
+            ),
+            (
+                DataType::Int8,
+                OrderedScalar::Int8(i8::MIN),
+                OrderedScalar::Int8(i8::MAX),
+            ),
+            (
+                DataType::Int16,
+                OrderedScalar::Int16(i16::MIN),
+                OrderedScalar::Int16(i16::MAX),
+            ),
+            (
+                DataType::Int32,
+                OrderedScalar::Int32(i32::MIN),
+                OrderedScalar::Int32(i32::MAX),
+            ),
+            (
+                DataType::Int64,
+                OrderedScalar::Int64(i64::MIN),
+                OrderedScalar::Int64(i64::MAX),
+            ),
+            (
+                DataType::FixedSizeBinary(16),
+                OrderedScalar::LargeInt(i128::MIN),
+                OrderedScalar::LargeInt(i128::MAX),
+            ),
+            (
+                DataType::Date32,
+                OrderedScalar::Date32(-1),
+                OrderedScalar::Date32(1),
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                OrderedScalar::Timestamp(-1),
+                OrderedScalar::Timestamp(1),
+            ),
+            (
+                DataType::Decimal128(2, 1),
+                OrderedScalar::Decimal128(-99),
+                OrderedScalar::Decimal128(99),
+            ),
+        ];
+        for (data_type, left, right) in cases {
+            let contract = RuntimeOrderContract::new([RuntimeOrderKey::new(data_type)], [9; 32]);
+            assert_eq!(
+                contract.compare_borrowed_controlled(
+                    OrderedTupleRef::Single(Some(left.as_borrowed())),
+                    OrderedTupleRef::Single(Some(right.as_borrowed())),
+                    &LegacyOrderControl,
+                ),
+                Ok(Ordering::Less),
+            );
+            assert_eq!(
+                contract.compare(
+                    &OrderedTuple::new([Some(left)]),
+                    &OrderedTuple::new([Some(right)])
+                ),
+                Ok(Ordering::Less)
+            );
+        }
+        for (data_type, value) in [
+            (DataType::FixedSizeBinary(8), OrderedScalarRef::LargeInt(0)),
+            (
+                DataType::Decimal128(2, 1),
+                OrderedScalarRef::Decimal128(100),
+            ),
+            (
+                DataType::Decimal128(2, 1),
+                OrderedScalarRef::Decimal128(-100),
+            ),
+            (DataType::Utf8, OrderedScalarRef::Int64(0)),
+        ] {
+            let contract = RuntimeOrderContract::new([RuntimeOrderKey::new(data_type)], [9; 32]);
+            assert_eq!(
+                contract.compare_borrowed_controlled(
+                    OrderedTupleRef::Single(Some(value)),
+                    OrderedTupleRef::Single(None),
+                    &LegacyOrderControl
+                ),
+                Err(ControlledOrderedTupleError::Tuple(
+                    OrderedTupleError::TypeMismatch
+                ))
+            );
+        }
+        let contract = RuntimeOrderContract::new([RuntimeOrderKey::new(DataType::Utf8)], [9; 32]);
+        let empty = OrderedTuple::new([]);
+        assert_eq!(
+            contract.compare(&empty, &empty),
+            Err(OrderedTupleError::ArityMismatch)
+        );
+    }
+
+    /// Interruption is driven through the real public control port, with no
+    /// wall-clock timeout or allocator hook. An equal long prefix must stop.
+    #[test]
+    fn ordered_topn_owned_borrowed_utf8_checks_control_inside_long_prefix() {
+        use novarocks_functions::{
+            KernelEvaluationControl, KernelFailure, MAX_UNOBSERVED_KERNEL_WORK,
+        };
+        use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+        struct Control {
+            units: AtomicU32,
+            cause: KernelFailure,
+        }
+        impl KernelEvaluationControl for Control {
+            fn checkpoint(&self, units: u32) -> Result<(), KernelFailure> {
+                assert!(units <= MAX_UNOBSERVED_KERNEL_WORK);
+                let observed = self.units.fetch_add(units, AtomicOrdering::Relaxed) + units;
+                if observed >= 2 * MAX_UNOBSERVED_KERNEL_WORK {
+                    Err(self.cause.clone())
+                } else {
+                    Ok(())
+                }
+            }
+            fn wait(&self, _: std::time::Duration) -> Result<(), KernelFailure> {
+                panic!("ordered comparison never waits")
+            }
+        }
+        let text = "x".repeat(1 << 20);
+        let contract = RuntimeOrderContract::new([RuntimeOrderKey::new(DataType::Utf8)], [1; 32]);
+        for cause in [
+            KernelFailure::Cancelled,
+            KernelFailure::DeadlineExceeded,
+            KernelFailure::ResourceExhausted,
+        ] {
+            let control = Control {
+                units: AtomicU32::new(0),
+                cause: cause.clone(),
+            };
+            assert_eq!(
+                contract.compare_borrowed_controlled(
+                    OrderedTupleRef::Single(Some(OrderedScalarRef::Utf8(&text))),
+                    OrderedTupleRef::Single(Some(OrderedScalarRef::Utf8(&text))),
+                    &control
+                ),
+                Err(ControlledOrderedTupleError::Kernel(cause))
+            );
+            let observed = control.units.load(AtomicOrdering::Relaxed);
+            assert!(observed >= 2 * MAX_UNOBSERVED_KERNEL_WORK);
+            assert!(observed < 4 * MAX_UNOBSERVED_KERNEL_WORK);
+        }
+    }
 
     #[test]
     fn arrow_membership_encoder_uses_the_frozen_contract_and_nrfc_frame() {
