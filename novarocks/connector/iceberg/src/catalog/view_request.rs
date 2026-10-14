@@ -120,7 +120,7 @@ pub(crate) enum ViewSchema {
     /// reference server adds nothing for it, so `-1` would select nothing.
     Existing(i32),
     /// A schema added by the same commit and selected by `-1`.
-    New(Schema),
+    New(Box<Schema>),
 }
 
 /// A replacement checked against the loaded view metadata.
@@ -198,7 +198,7 @@ impl ValidatedViewReplace {
                     .with_schema_id(next_id)
                     .build()
                     .map_err(|error| format!("build replaced Iceberg view schema: {error}"))?;
-                (ViewSchema::New(schema), -1)
+                (ViewSchema::New(Box::new(schema)), -1)
             }
         };
         let version_id = current

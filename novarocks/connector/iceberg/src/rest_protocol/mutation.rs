@@ -82,7 +82,7 @@ pub(crate) struct SqlRepresentationWire {
 pub(crate) enum ViewUpdateWire {
     /// Carries no `last-column-id`: the server derives it.
     AddSchema {
-        schema: Schema,
+        schema: Box<Schema>,
     },
     #[serde(rename_all = "kebab-case")]
     AddViewVersion {

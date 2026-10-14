@@ -264,7 +264,8 @@ mod tests {
 
     #[test]
     fn non_initial_state_is_refused() {
-        let cases: Vec<(&str, Box<dyn Fn(&mut serde_json::Value)>)> = vec![
+        type Mutation = Box<dyn Fn(&mut serde_json::Value)>;
+        let cases: Vec<(&str, Mutation)> = vec![
             (
                 "last sequence number",
                 Box::new(|m| m["last-sequence-number"] = serde_json::json!(4)),
