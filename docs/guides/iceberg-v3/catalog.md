@@ -35,7 +35,7 @@ source "$fixture_publication/env.sh"
 mysql -h 127.0.0.1 -P "$NOVA_ENV_MYSQL_PORT" -uroot < "$NOVAROCKS_ICE_REST_CATALOG_SQL"
 ```
 
-最后一行要求已有按生成 FE/BE 配置启动的 NovaRocks 服务。生成 SQL 使用本次 `NOVAROCKS_ICEBERG_REST_URI`、客户端 warehouse 与对象存储端点。REST 客户端构造由 `catalog_runtime::build_rest_catalog` 路径完成；catalog 操作由 `NovaRocksRestCatalog` 承接，不是解析后仍走 Hadoop 的占位语法。
+最后一行要求已有按生成 FE/BE 配置启动的 NovaRocks 服务。生成 SQL 使用本次 `NOVAROCKS_ICEBERG_REST_URI`、客户端 warehouse 与对象存储端点。REST catalog 的每个 generation 由 `catalog_runtime.rs` 构造：先校验持久定义（`header.*`、`rest.auth.type`、`iceberg.rest.server-routing-headers`），再解析 FE 的 `CatalogControl` 身份，构造 FE 认证 owner 与 NovaRocks 的 HTTP 客户端（不跟随重定向、不重试、只用 HTTP/1.1），分别经 `with_auth_manager`、`with_client` 注入上游 `RestCatalog`。会话在第一次使用时经建立入口（`rest_protocol/attempt.rs`）建立一次，上游的读请求与 NovaRocks 自己发出的请求共用这一份会话与连接池；catalog 操作由 `NovaRocksRestCatalog` 承接，不是解析后仍走 Hadoop 的占位语法。
 
 `runtime/current` 只是定位器，入口的 `published` 原子发布绑定和配置。`NOVA_ENV_REST_ENV_FILE` 和 `[env].fixture_env_file` 固定到本次 publication；`NOVA_ENV_RUNTIME_DIR` 存 SQLite 等稳定数据，不能用来拼接 env.sh。Spark 使用生成的容器网络端点，NovaRocks 使用 host 端点。
 
@@ -51,20 +51,95 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
 
 ## REST 认证
 
-当前使用 vendored iceberg-rust `0.11.0` 的 `AuthManager`。`rest.auth.type` 现在会生效，按 ASCII 大小写不敏感匹配：
+REST catalog 的认证只有一个入口：catalog 定义中的凭证绑定。材料保存在各角色本地的启动配置里，不写进 catalog 定义，也不随 native fragment 或 FE/BE 传输。每个角色的 `Authorization` 只由该角色的认证 owner 设置：
 
-| 用户属性 | 行为 |
-|---|---|
-| `rest.auth.type=none` | 不添加 OAuth2/Bearer 认证；服务端 `/v1/config` 返回 token 也不会自行启用认证 |
-| `rest.auth.type=oauth2` | 选择 SDK OAuth2 会话；已配置 token 优先，否则通过已配置 credential 换取并缓存 token |
-| 未配置 `rest.auth.type` | 只从用户配置的 `token`、`credential`、`oauth2-server-uri` 推断；存在任一项则选 OAuth2，否则为 none |
-| 其它值 | 操作初始化失败，明确报告未知认证类型；不会回退到匿名方式 |
+| 角色 | catalog 定义中的绑定 | 用途 |
+|---|---|---|
+| FE | `credential.catalog-control.*`（`consumer-role=frontend`，`mode=static`） | FE 的全部 catalog 请求：`/v1/config` 握手、浏览、加载、DDL、提交、FE 进程内的凭证续期 |
+| BE | `credential.data-credential-vending.*`（`consumer-role=backend`，`mode=static`） | BE 为自己取得、续期 vended 存储凭证；只在委派模式（`credential.object-store-data.mode=vended`）下使用 |
 
-OAuth2 的隐式推断会在初始化时记告警。明确写 `rest.auth.type` 可避免这条告警；只填写 `oauth2-server-uri` 并不会创造认证凭据。
+catalog 定义没有 `CatalogControl` 绑定时，FE 的请求不带 `Authorization`。两个绑定必须引用不同的 `name`/`generation`。一个委派模式 catalog 的示例（其余对象存储属性按部署补齐）：
 
-FE catalog 定义不能直接保存 token/credential。默认选择 `none` 时，不再像旧版本那样因 `/v1/config` 下发 token 而启用认证；依赖这种下发行为的服务需要调整认证配置。已经显式选择或推断为 OAuth2 时，SDK 会话仍按合并后的属性消费服务端 token，当前尚未由新的 Connector 会话权威关闭该覆盖。不要把服务端下发属性当成另一条 FE 凭据配置入口。
+```sql
+CREATE EXTERNAL CATALOG rest_vended PROPERTIES (
+  "type" = "iceberg",
+  "iceberg.catalog.type" = "rest",
+  "uri" = "https://catalog.example/api",
+  "iceberg.catalog.warehouse" = "wh",
+  "header.x-tenant" = "t1",
+  "credential.catalog-control.consumer-role" = "frontend",
+  "credential.catalog-control.mode" = "static",
+  "credential.catalog-control.name" = "rest-control",
+  "credential.catalog-control.generation" = "v1",
+  "credential.object-store-data.consumer-role" = "backend",
+  "credential.object-store-data.mode" = "vended",
+  "credential.data-credential-vending.consumer-role" = "backend",
+  "credential.data-credential-vending.mode" = "static",
+  "credential.data-credential-vending.name" = "rest-executor",
+  "credential.data-credential-vending.generation" = "v1"
+);
+```
 
-BE 使用消费方已有 token/credential 的注入方式保持。SDK 缓存的认证 token 不自动刷新；对象存储委派凭据的续租另由消费方 `StorageAuthority`/凭据租约驱动，两者不是同一个凭据生命周期。`header.*` 仍在认证之后合并，显式 Authorization header 可覆盖生成的 token header。后续会话所有权迁移需要单独验证这些行为，不能从本地匿名 fixture 推断远程认证能力。
+材料在 FE 与每个 BE 的配置中各自声明。OAuth2 client credentials 用 `kind = "iceberg-rest-oauth2"`，bearer 令牌用 `kind = "iceberg-rest-bearer"` 与 `token`；secret 可以写成 `${ENV:NAME}` 引用：
+
+```toml
+# FE config
+[[connector.credentials]]
+purpose = "catalog-control"
+name = "rest-control"
+generation = "v1"
+kind = "iceberg-rest-oauth2"
+client_id = "novarocks-fe"
+client_secret = "${ENV:REST_FE_CLIENT_SECRET}"
+
+# Each BE config
+[[connector.credentials]]
+purpose = "data-credential-vending"
+name = "rest-executor"
+generation = "v1"
+kind = "iceberg-rest-oauth2"
+client_id = "novarocks-be"
+client_secret = "${ENV:REST_BE_CLIENT_SECRET}"
+```
+
+OAuth2 的令牌请求只取 catalog 定义中的属性：令牌端点 `oauth2-server-uri`（缺省为 `{uri}/v1/oauth/tokens`）、`scope`（缺省 `catalog`）、`audience`、`resource`；服务端经 `/v1/config` 下发的这些属性被忽略。令牌换取一次后缓存，不刷新；收到 401 或 419 时不换令牌重发。
+
+**会被拒绝的配置。** 下列配置在建 catalog 与构造 generation 时报错：
+
+- `rest.auth.type`（任意大小写）。NovaRocks 注入自己的认证 owner，上游不再按它选择认证方式；错误说明认证只能经 `CatalogControl` 或 `DataCredentialVending` 绑定配置；
+- `token`、`credential` 等含敏感标记的属性：catalog 定义不保存秘密；
+- 认证类的 `header.*`：`Authorization`、`Proxy-Authorization`、`Cookie`、`Set-Cookie`，以及名称含 `token`、`secret`、`password`、`credential`、`access_key` 的请求头（不分大小写）；错误同样指向这两个绑定；
+- 协议类的 `header.*`：`Content-Type`、`Accept`、`User-Agent`、`X-Client-Version`、`X-Iceberg-Access-Delegation`。这些由客户端按请求设置；访问委派头是否发送由调用点决定。
+
+API key、cookie、SigV4 等其他认证方式暂不支持。
+
+**服务端经 `/v1/config` 下发的配置。**
+
+- 下发 `token`、`credential` 或认证类请求头：会话建立失败，该 catalog 的查询与 DDL 都无法执行，错误说明服务端配置携带了认证材料。需要在服务端去掉这些下发项。
+- 下发协议类请求头（例如 Gravitino 在 defaults 中下发 `header.X-Iceberg-Access-Delegation`）：NovaRocks 自己发出的请求不使用它，也不需要声明。
+- 下发其他请求头（`header.<name>`）：FE 照常发送；要让 BE 在分布式 vended 读取中也发送它，须在 `iceberg.rest.server-routing-headers` 中声明。
+
+**`iceberg.rest.server-routing-headers`。** 逗号分隔、不分大小写的请求头名称列表，声明「服务端经 `/v1/config` 下发的这些请求头是公开的路由信息，可以交给 BE」。catalog 定义中的 `header.*` 本身就是公开的，不需要声明；名称与值都与 `header.*` 相同的下发项按持久定义处理，值不同则按服务端下发处理。列表中不能出现认证类或协议类名称，也不能有空项。例如服务端下发 `header.x-region`：
+
+```sql
+"iceberg.rest.server-routing-headers" = "x-region"
+```
+
+**不跟随重定向。** 任何 REST 请求都不跟随 3xx，包括 `/v1/config`、令牌端点与上游发出的读请求。`uri` 与 `oauth2-server-uri` 必须配置为最终地址：遇到 3xx 时，读请求与会话建立失败，变更请求报告结果未知。
+
+**vended 读取的准入错误。** 委派模式下，FE 为 BE 形成凭证租约时检查 BE 能否自己取得凭证；不能时在派发之前拒绝查询，BE 收不到任务。委派模式 catalog 上的 CTAS 在 stage 之前做同样的配置检查。
+
+| 错误中的说明 | 含义 | 修正 |
+|---|---|---|
+| `declares no DataCredentialVending credential binding` | catalog 定义没有 BE 的取得身份 | 加上 `credential.data-credential-vending.*`，并在每个 BE 配置中声明对应的 `[[connector.credentials]]` |
+| ``sent request header `<name>` through /v1/config ... add `<name>` to the `iceberg.rest.server-routing-headers` catalog property`` | 服务端下发了未声明的请求头，BE 无法完整复现 FE 的路由 | 确认它是公开的路由头后加入 `iceberg.rest.server-routing-headers`，或让服务端停止下发 |
+| `routing context for execution nodes exceeds its bounds` | 路由请求头超过 16 个，或名称与值合计超过 4 KiB | 减少 `header.*` 与声明的下发请求头 |
+| `routing address is not a valid URL`、`routing address must be http or https ...` 或 `routing address exceeds 2048 bytes` | 生效的 catalog 地址或服务端给出的凭证端点含用户信息、查询串或片段，或过长 | 修正 `uri`，或服务端的 `overrides.uri` / 凭证端点地址 |
+| `cannot be forwarded to execution nodes` | 某个路由请求头的值含非可见 ASCII 字符 | 改用可见 ASCII 的值 |
+
+FE 无法核对 BE 本地配置：BE 缺少 `DataCredentialVending` 所引用的身份时，该 BE 第一次读取数据时明确失败。BE 取得凭证时只使用 FE 冻结的地址与公开路由请求头，加上自己的令牌，不建立自己的 catalog 会话。
+
+变更请求的结果判定（例如 400、404 报告结果未知、不清理产物，删除接受 204 或空响应体的 200）与上述认证规则的长期契约见 [ADR-0175](../../adr/ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md)。
 
 ## Hadoop 与 Hive
 

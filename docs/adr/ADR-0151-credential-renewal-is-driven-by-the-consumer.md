@@ -5,6 +5,10 @@ domain: [distributed-query-lifecycle, provider-spi]
 status: active
 supersedes: [ADR-0149]
 superseded-by: null
+partially-superseded-by:
+  - id: ADR-0175
+    scope: "Meaning of the announced acquisition paths: both carry the frozen public routing context, the execution node never opens its own catalog session, and a vended read is admitted only when execution-node first acquisition can be formed; consumer-driven renewal, role-local material and ratio windows remain effective"
+    link: "ADR-0175-iceberg-rest-session-authority-and-mutation-evidence.md"
 date: 2026-09-18
 provenance:
   - "PR: https://github.com/NovaRocks/NovaRocks/pull/1063"
