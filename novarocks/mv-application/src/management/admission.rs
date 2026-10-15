@@ -851,10 +851,15 @@ impl ManagementEntrance {
             keyed_documents::{decode_management_slot, management_slot_name},
         };
         let catalog = request.catalog_handle.clone();
-        let view = lease
+        let mut view = lease
             .observe_keyed_documents(request.clone())
             .map_err(MvDocumentError::KeyedStorage)?;
-        self.resolve_pending_slot_changes(lease, request)?;
+        let convergence = self.resolve_pending_slot_changes(lease, request.clone())?;
+        if convergence.reinstall_current_projection {
+            view = lease
+                .observe_keyed_documents(request)
+                .map_err(MvDocumentError::KeyedStorage)?;
+        }
         let slot = view
             .slots
             .get(&management_slot_name()?)

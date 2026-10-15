@@ -41,7 +41,18 @@ pub struct CreateMvDependencyRequest {
 }
 
 pub fn stored_definition_dependency_ref(projection: &StoredMvProjection) -> MvDependencyObjectRef {
-    let target = projection.facts.source_revision();
+    definition_dependency_ref(projection.facts.source_revision())
+}
+
+pub fn stored_keyed_definition_dependency_ref(
+    projection: &super::keyed_documents::StoredKeyedMvProjection,
+) -> MvDependencyObjectRef {
+    definition_dependency_ref(projection.facts.source_revision())
+}
+
+fn definition_dependency_ref(
+    target: &super::definition::MvAcceleratorSourceRevision,
+) -> MvDependencyObjectRef {
     iceberg_mv_dependency_ref(
         target.target.instance_id.as_str(),
         target.target.namespace.as_ref(),

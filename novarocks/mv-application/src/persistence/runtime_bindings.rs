@@ -78,11 +78,39 @@ pub fn reconstruct_runtime_bindings(
     projection: &MvDocumentProjection,
     schema: &MvExactTargetSchemaFacts,
 ) -> Result<MvRuntimeBindings, String> {
-    let interpretation = projection.interpretation();
-    if schema.object_id != projection.source_revision().target_object_id {
+    reconstruct_from_documents(
+        projection.definition(),
+        projection.interpretation(),
+        &projection.source_revision().target_object_id,
+        projection.metadata_version(),
+        schema,
+    )
+}
+
+pub fn reconstruct_keyed_runtime_bindings(
+    projection: &super::keyed_documents::MvKeyedDocumentProjection,
+    schema: &MvExactTargetSchemaFacts,
+) -> Result<MvRuntimeBindings, String> {
+    reconstruct_from_documents(
+        projection.definition(),
+        projection.interpretation(),
+        &projection.source_revision().target_object_id,
+        projection.metadata_version(),
+        schema,
+    )
+}
+
+fn reconstruct_from_documents(
+    definition: &super::codec::DefinitionDocument,
+    interpretation: &super::codec::InterpretationDocument,
+    object_id: &ConnectorTableObjectId,
+    metadata_version: &ConnectorCommittedVersion,
+    schema: &MvExactTargetSchemaFacts,
+) -> Result<MvRuntimeBindings, String> {
+    if schema.object_id != *object_id {
         return Err("MV runtime target object is not from the exact document generation".into());
     }
-    if &schema.metadata_version != projection.metadata_version() {
+    if &schema.metadata_version != metadata_version {
         return Err("MV runtime target metadata is not from the exact document generation".into());
     }
     if schema.schema_version != interpretation.target.schema_version {
@@ -130,8 +158,7 @@ pub fn reconstruct_runtime_bindings(
             "MV interpretation has no physical binding for a logical identity".to_string()
         })
     };
-    let outputs = projection
-        .definition()
+    let outputs = definition
         .outputs
         .iter()
         .map(|output| {
