@@ -245,8 +245,11 @@ fn original_large_field_alias_keeps_real_origin_to_cross_thread_last_free() {
             now_ns: 1,
         })
         .unwrap();
-    assert_eq!(transfer.returned_idle, 0);
-    assert_eq!(binding.authority().root().committed_bytes(), root_c);
+    // The independent execution table has already been destroyed. Its real
+    // idle backing may return while source-field aliases retain responsibility.
+    let retained_c = root_c.checked_sub(transfer.returned_idle).unwrap();
+    assert!(retained_c > 0);
+    assert_eq!(binding.authority().root().committed_bytes(), retained_c);
     assert_eq!(
         global_store().snapshot_ref(reference).unwrap().outstanding,
         retained.outstanding
@@ -261,7 +264,7 @@ fn original_large_field_alias_keeps_real_origin_to_cross_thread_last_free() {
     binding
         .authority()
         .maintain(binding.authority().maintenance_scan_bound().unwrap());
-    assert!(binding.authority().root().committed_bytes() < root_c);
+    assert!(binding.authority().root().committed_bytes() < retained_c);
 }
 
 #[test]
@@ -357,10 +360,37 @@ fn original_type_host_preserves_a_qualified_shared_shortage_without_running_body
     };
     assert_eq!(journal.shortage, Some(receipt.clone()));
     assert!(receipt.coverage.complete);
+    assert_eq!(
+        journal.current_namespace,
+        Some(novarocks_plan_codec::physical_type_v2::TypeMaterializationNamespace::Source)
+    );
+    let execution = journal.completed_execution.as_ref().unwrap();
+    assert_eq!(execution.body.settlement.as_ref().unwrap().debt, 0);
+    assert_eq!(execution.body.stopped, Some(Ok(())));
+    // Source refusal unwinds the already materialized execution table. Those
+    // actual frees invalidate the original qualified receipt after publication.
+    assert!(
+        !binding
+            .authority()
+            .shortage_is_fresh(&receipt, Duration::from_secs(1))
+    );
+    // Requalify the exact same request against the remaining live filler.
+    // The stale receipt is preserved, never reused as an admission verdict.
+    let novarocks_execution::runtime::kernel_memory::KernelMemoryAdmission::SharedShortage(
+        rechecked,
+    ) = novarocks_execution::runtime::kernel_memory::request_complete_operation(
+        Some(&binding),
+        journal.workset_bytes.unwrap(),
+    )
+    else {
+        panic!("the unchanged source request must still have a qualified shortage")
+    };
+    assert!(rechecked.coverage.complete);
+    assert_eq!(rechecked.refusal.requested, receipt.refusal.requested);
     assert!(
         binding
             .authority()
-            .shortage_is_fresh(&receipt, Duration::from_secs(1))
+            .shortage_is_fresh(&rechecked, Duration::from_secs(1))
     );
     assert_eq!(
         receipt.refusal.requested,
