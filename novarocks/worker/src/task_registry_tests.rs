@@ -723,6 +723,7 @@ fn root_ownership_snapshot_observes_retired_task_context_and_busy_registry() {
         ),
         (1, 0, 1)
     );
+    #[cfg(feature = "test-controls")]
     fixture.registry.with_registry_lock_for_test(|| {
         assert_eq!(
             fixture.registry.try_root_ownership_snapshot().unwrap(),

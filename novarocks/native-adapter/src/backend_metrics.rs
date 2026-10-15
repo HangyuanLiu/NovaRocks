@@ -1597,7 +1597,7 @@ mod tests {
         )
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     #[test]
     fn root_ownership_scrape_omits_stale_or_absent_samples_in_both_formats() {
         let absent = BackendMetricsRegistry::new().unwrap();
@@ -1728,7 +1728,7 @@ mod tests {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     #[test]
     fn preparation_busy_scrape_omits_stale_values_without_blocking_control_metrics() {
         let owner = preparation_owner();
@@ -1813,7 +1813,7 @@ mod tests {
         );
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-controls")]
     #[test]
     fn preparation_poison_is_an_error_in_both_formats() {
         let owner = preparation_owner();
