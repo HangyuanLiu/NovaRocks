@@ -15,7 +15,7 @@ CREATE TABLE safe_table (id INT) TBLPROPERTIES ('ordinary.application.key' = 'un
 INSERT INTO safe_table VALUES (1);
 
 -- query 2
--- @expect_error=novarocks.* namespace is reserved
+-- @expect_error=reserved for document storage
 CREATE TABLE rejected_0 (id INT) TBLPROPERTIES ('novarocks.doc.v2.root.test' = 'forbidden');
 
 -- query 3
@@ -25,11 +25,11 @@ CREATE TABLE rejected_0 (id INT);
 DROP TABLE rejected_0;
 
 -- query 4
--- @expect_error=novarocks.* namespace is reserved
+-- @expect_error=reserved for document storage
 ALTER TABLE safe_table SET TBLPROPERTIES ('novarocks.doc.v2.root.test' = 'forbidden');
 
 -- query 5
--- @expect_error=novarocks.* namespace is reserved
+-- @expect_error=reserved for document storage
 CREATE TABLE rejected_1 (id INT) TBLPROPERTIES ('novarocks.doc.future.version' = 'forbidden');
 
 -- query 6
@@ -39,11 +39,11 @@ CREATE TABLE rejected_1 (id INT);
 DROP TABLE rejected_1;
 
 -- query 7
--- @expect_error=novarocks.* namespace is reserved
+-- @expect_error=reserved for document storage
 ALTER TABLE safe_table SET TBLPROPERTIES ('novarocks.doc.future.version' = 'forbidden');
 
 -- query 8
--- @expect_error=novarocks.* namespace is reserved
+-- @expect_error=reserved for document storage
 CREATE TABLE rejected_2 (id INT) TBLPROPERTIES ('novarocks.documents.v1' = 'forbidden');
 
 -- query 9
@@ -53,11 +53,11 @@ CREATE TABLE rejected_2 (id INT);
 DROP TABLE rejected_2;
 
 -- query 10
--- @expect_error=novarocks.* namespace is reserved
+-- @expect_error=reserved for document storage
 ALTER TABLE safe_table SET TBLPROPERTIES ('novarocks.documents.v1' = 'forbidden');
 
 -- query 11
--- @expect_error=novarocks.* namespace is reserved
+-- @expect_error=reserved for document storage
 CREATE TABLE rejected_3 (id INT) TBLPROPERTIES ('novarocks.internal.pending-documents.v1' = 'forbidden');
 
 -- query 12
@@ -67,11 +67,11 @@ CREATE TABLE rejected_3 (id INT);
 DROP TABLE rejected_3;
 
 -- query 13
--- @expect_error=novarocks.* namespace is reserved
+-- @expect_error=reserved for document storage
 ALTER TABLE safe_table SET TBLPROPERTIES ('novarocks.internal.pending-documents.v1' = 'forbidden');
 
 -- query 14
--- @expect_error=novarocks.* namespace is reserved
+-- @expect_error=reserved for document storage
 CREATE TABLE rejected_4 (id INT) TBLPROPERTIES ('novarocks.documents.preparation-digest.v1' = 'forbidden');
 
 -- query 15
@@ -81,11 +81,11 @@ CREATE TABLE rejected_4 (id INT);
 DROP TABLE rejected_4;
 
 -- query 16
--- @expect_error=novarocks.* namespace is reserved
+-- @expect_error=reserved for document storage
 ALTER TABLE safe_table SET TBLPROPERTIES ('novarocks.documents.preparation-digest.v1' = 'forbidden');
 
 -- query 17
--- @expect_error=novarocks.* namespace is reserved
+-- @expect_error=reserved for document storage
 CREATE TABLE rejected_5 (id INT) TBLPROPERTIES ('novarocks.documents.update.operation-id.v1' = 'forbidden');
 
 -- query 18
@@ -95,11 +95,11 @@ CREATE TABLE rejected_5 (id INT);
 DROP TABLE rejected_5;
 
 -- query 19
--- @expect_error=novarocks.* namespace is reserved
+-- @expect_error=reserved for document storage
 ALTER TABLE safe_table SET TBLPROPERTIES ('novarocks.documents.update.operation-id.v1' = 'forbidden');
 
 -- query 20
--- @expect_error=novarocks.* namespace is reserved
+-- @expect_error=reserved for document storage
 CREATE TABLE rejected_6 (id INT) TBLPROPERTIES ('novarocks.managed.owner' = 'forbidden');
 
 -- query 21
@@ -109,7 +109,7 @@ CREATE TABLE rejected_6 (id INT);
 DROP TABLE rejected_6;
 
 -- query 22
--- @expect_error=novarocks.* namespace is reserved
+-- @expect_error=reserved for document storage
 ALTER TABLE safe_table SET TBLPROPERTIES ('novarocks.managed.owner' = 'forbidden');
 
 -- query 23
