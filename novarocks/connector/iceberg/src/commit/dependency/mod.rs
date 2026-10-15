@@ -21,6 +21,7 @@ mod builtin;
 mod history;
 mod inputs;
 
+pub(crate) use builtin::diagnose_ref_unchanged;
 pub use builtin::validate;
 pub use history::{HistoryGap, HistoryWindow, history_window};
 pub use inputs::{LiveEntry, LiveSet, ValidationInputs};

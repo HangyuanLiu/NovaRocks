@@ -38,6 +38,23 @@ pub async fn validate(
     .await
 }
 
+/// Reuse the dependency owner for a metadata-only post-rejection diagnosis.
+/// Other dependencies must not open manifests or history for this diagnostic.
+pub(crate) async fn diagnose_ref_unchanged(
+    intent: &OperationIntent,
+    metadata: &TableMetadata,
+    parent: Option<i64>,
+    io: &dyn ArtifactWriter,
+) -> Result<Verdict> {
+    let mut inputs = ValidationInputs::new(metadata, parent, io);
+    validate_dependencies(
+        &[Dependency::RefUnchanged],
+        intent.start().map(|start| start.snapshot_id),
+        &mut inputs,
+    )
+    .await
+}
+
 async fn validate_dependencies(
     dependencies: &[Dependency],
     start: Option<i64>,
