@@ -23,12 +23,12 @@ use std::sync::Arc;
 
 use arrow_buffer::i256;
 use arrow_schema::DataType;
+use novarocks_type_contract::ValueTypeRef;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, DecimalOverflowPolicy,
     PureCompileControl,
 };
 use novarocks_types::SlotId;
-use novarocks_types::logical::LogicalType;
 
 /// Matches the native-v1 expanded-expression budget. This bounds the arena
 /// independently of the encoded descriptor's byte budget.
@@ -104,6 +104,10 @@ pub enum StaticFunctionKind {
     IsNotNull,
     Abs,
     Round,
+    /// The original default host's exact opaque Binary leaf; no name alias.
+    PercentileToBinary,
+    /// Existing default same-carrier JSON-to-text conversion after frozen validation.
+    JsonToText,
     Date(&'static str),
     Array(&'static str),
     Map(&'static str),
@@ -395,48 +399,44 @@ impl StaticExprKind {
     }
 }
 
-/// Pure nested field semantics formerly attached to a mutable Chunk schema.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StaticFieldSchema {
-    logical_type: Option<LogicalType>,
-    children: Arc<[StaticFieldSchema]>,
-}
-
-impl StaticFieldSchema {
-    pub fn new(logical_type: Option<LogicalType>, children: Vec<Self>) -> Self {
-        Self {
-            logical_type,
-            children: Arc::from(children),
-        }
-    }
-
-    pub const fn logical_type(&self) -> Option<LogicalType> {
-        self.logical_type
-    }
-
-    pub fn children(&self) -> &[Self] {
-        &self.children
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct StaticExprNode {
     kind: StaticExprKind,
     data_type: DataType,
-    field_schema: Option<StaticFieldSchema>,
+    field_schema: Option<ValueTypeRef>,
+    complete_type: Option<novarocks_functions::FunctionValueType>,
 }
 
 impl StaticExprNode {
     pub fn new(
         kind: StaticExprKind,
         data_type: DataType,
-        field_schema: Option<StaticFieldSchema>,
+        field_schema: Option<ValueTypeRef>,
     ) -> Self {
         Self {
             kind,
             data_type,
             field_schema,
+            complete_type: None,
         }
+    }
+
+    /// Save the exact semantic and physical author with both original holds.
+    /// The bare carrier/schema constructor remains an expansion-only adapter.
+    pub fn new_value_typed(
+        kind: StaticExprKind,
+        value_type: novarocks_functions::FunctionValueType,
+    ) -> Self {
+        Self {
+            kind,
+            data_type: value_type.data_type().clone(),
+            field_schema: None,
+            complete_type: Some(value_type),
+        }
+    }
+
+    pub fn value_type(&self) -> Option<&novarocks_functions::FunctionValueType> {
+        self.complete_type.as_ref()
     }
 
     pub const fn kind(&self) -> &StaticExprKind {
@@ -447,8 +447,11 @@ impl StaticExprNode {
         &self.data_type
     }
 
-    pub const fn field_schema(&self) -> Option<&StaticFieldSchema> {
-        self.field_schema.as_ref()
+    pub fn field_schema(&self) -> Option<&ValueTypeRef> {
+        self.complete_type
+            .as_ref()
+            .map(|ty| ty.value_type())
+            .or(self.field_schema.as_ref())
     }
 }
 
@@ -640,7 +643,7 @@ impl ImmutableExpressions {
                 observe(ExpressionObservation::OpaqueBoundary)?;
                 let same = novarocks_type_contract::arrow_data_types_exact(
                     &node.data_type,
-                    &value.value_type().data_type,
+                    &value.value_type().data_type(),
                 );
                 observe(ExpressionObservation::OpaqueBoundary)?;
                 if !same {

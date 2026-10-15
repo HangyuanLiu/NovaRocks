@@ -365,6 +365,16 @@ pub trait PureFunctionMetadataOwner:
     fn binding_declaration(&self) -> &FunctionBindingDeclaration;
     fn implementation_declarations(&self) -> &[PureImplementationDeclaration];
 
+    /// Loan the SAME immutable binding author to its single carrier. Concrete
+    /// owners loan their original core here; the default remains explicitly
+    /// original and cannot claim scoped allocation governance.
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner
+    where
+        Self: Sized + 'static,
+    {
+        crate::FunctionBindingResolverOwner::original(self)
+    }
+
     /// Candidate-only static profile admission from this same installed owner.
     /// The default preserves the existing presence contract. It grants no
     /// preparation, payload validation, environment fact or execution seal.
@@ -587,6 +597,18 @@ trait InstalledPureOwner: Send + Sync {
         options: PureCallPreparation,
         control: &dyn PureCompileControl,
     ) -> Result<PreparedPureCallDraft, FunctionSpecializationFailure>;
+    fn prepare_checked(
+        &self,
+        _checked: &crate::CheckedCallEffectInput<'_>,
+        _input: CallEffectInput<'_>,
+        _selected: Arc<FunctionBindingSelection>,
+        _frozen: Option<&CallEffects>,
+        _options: PureCallPreparation,
+        _control: &dyn PureCompileControl,
+    ) -> Result<PreparedPureCallDraft, crate::CheckedOwnerFailure<FunctionSpecializationFailure>>
+    {
+        Err(crate::CheckedOwnerFailure::UnconvertedOwner)
+    }
 }
 
 #[derive(Clone)]
@@ -671,6 +693,27 @@ impl<O: PureFunctionMetadataOwner> FunctionEffectOwner for RegisteredOwner<O> {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
+        self.refine_registered_core(input, control, || {
+            self.owner.validate_and_refine(input, control)
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_registered_checked_core(input, checked, control)
+    }
+}
+
+impl<O: PureFunctionMetadataOwner> RegisteredOwner<O> {
+    fn refine_registered_prefix(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<(), FunctionEffectOwnerError<FunctionBindingError>> {
         control
             .checkpoint(CompilePhase::FunctionSpecialization, 0)
             .map_err(FunctionEffectOwnerError::Control)?;
@@ -688,11 +731,41 @@ impl<O: PureFunctionMetadataOwner> FunctionEffectOwner for RegisteredOwner<O> {
             )
             .into());
         }
+        Ok(())
+    }
+    fn refine_registered_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        invoke: impl FnOnce() -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        self.refine_registered_prefix(input, control)?;
+        invoke().map_err(|error| match error {
+            FunctionEffectOwnerError::Owner(error) => effect_binding_failure(error),
+            control => control,
+        })
+    }
+    fn refine_registered_checked_core(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<
+        CallEffects,
+        crate::CheckedOwnerFailure<FunctionEffectOwnerError<FunctionBindingError>>,
+    > {
+        self.refine_registered_prefix(input, control)
+            .map_err(crate::CheckedOwnerFailure::Original)?;
+        checked
+            .require_registered(self.declaration.as_ref(), input)
+            .map_err(|error| crate::CheckedOwnerFailure::Original(effect_binding_failure(error)))?;
         self.owner
-            .validate_and_refine(input, control)
+            .validate_and_refine_checked(input, checked, control)
             .map_err(|error| match error {
-                FunctionEffectOwnerError::Owner(error) => effect_binding_failure(error),
-                control => control,
+                crate::CheckedOwnerFailure::Original(FunctionEffectOwnerError::Owner(error)) => {
+                    crate::CheckedOwnerFailure::Original(effect_binding_failure(error))
+                }
+                other => other,
             })
     }
 }
@@ -707,7 +780,7 @@ fn effect_binding_failure(
 }
 
 macro_rules! forward_preparation {
-    ($bound:ident, $method:ident, $contract:ty, $prepared:ty) => {
+    ($bound:ident, $method:ident, $checked:ident, $contract:ty, $prepared:ty) => {
         impl<O: PureFunctionMetadataOwner + $bound> $bound for RegisteredOwner<O> {
             fn $method(
                 &self,
@@ -717,30 +790,72 @@ macro_rules! forward_preparation {
             ) -> Result<Arc<$prepared>, KernelFailure> {
                 self.owner.$method(input, contract, control)
             }
+            fn $checked(
+                &self,
+                input: CallEffectInput<'_>,
+                checked: &crate::CheckedCallEffectInput<'_>,
+                contract: Arc<$contract>,
+                control: &dyn PureCompileControl,
+            ) -> Result<Arc<$prepared>, crate::CheckedOwnerFailure<KernelFailure>> {
+                checked
+                    .require_registered(self.declaration.as_ref(), input)
+                    .map_err(|_| {
+                        crate::CheckedOwnerFailure::Original(crate::kernel_control::invalid(
+                            "preparation borrows a different registered checked owner",
+                        ))
+                    })?;
+                self.owner.$checked(input, checked, contract, control)
+            }
         }
     };
 }
-forward_preparation!(
-    PureScalarImplementation,
-    prepare_scalar,
-    ScalarCallContract,
-    dyn PreparedScalarKernel
-);
+impl<O: PureFunctionMetadataOwner + PureScalarImplementation> PureScalarImplementation
+    for RegisteredOwner<O>
+{
+    fn prepare_scalar(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
+        self.owner.prepare_scalar(input, contract, control)
+    }
+    fn prepare_scalar_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        checked
+            .require_registered(self.declaration.as_ref(), input)
+            .map_err(|_| {
+                crate::CheckedOwnerFailure::Original(crate::kernel_control::invalid(
+                    "scalar preparation borrows a different registered checked owner",
+                ))
+            })?;
+        self.owner
+            .prepare_scalar_checked(input, checked, contract, control)
+    }
+}
 forward_preparation!(
     PureInvocationScalarImplementation,
     prepare_invocation_scalar,
+    prepare_invocation_scalar_checked,
     ScalarCallContract,
     dyn PreparedInvocationScalarKernel
 );
 forward_preparation!(
     PureWindowImplementation,
     prepare_window,
+    prepare_window_checked,
     WindowCallContract,
     dyn PreparedWindowKernel
 );
 forward_preparation!(
     PureTableImplementation,
     prepare_table,
+    prepare_table_checked,
     TableCallContract,
     dyn PreparedTableKernel
 );
@@ -757,6 +872,24 @@ impl<O: PureFunctionMetadataOwner + PureHigherOrderImplementation> PureHigherOrd
         self.owner
             .prepare_higher_order(input, contract, body, control)
     }
+    fn prepare_higher_order_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<HigherOrderCallContract>,
+        body: Arc<LambdaBodyContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedHigherOrderKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        checked
+            .require_registered(self.declaration.as_ref(), input)
+            .map_err(|_| {
+                crate::CheckedOwnerFailure::Original(crate::kernel_control::invalid(
+                    "preparation borrows a different registered checked owner",
+                ))
+            })?;
+        self.owner
+            .prepare_higher_order_checked(input, checked, contract, body, control)
+    }
 }
 impl<O: PureFunctionMetadataOwner + PureAggregateImplementation> PureAggregateImplementation
     for RegisteredOwner<O>
@@ -769,6 +902,23 @@ impl<O: PureFunctionMetadataOwner + PureAggregateImplementation> PureAggregateIm
         control: &dyn PureCompileControl,
     ) -> Result<Arc<Self::Kernel>, KernelFailure> {
         self.owner.prepare_aggregate(input, contract, control)
+    }
+    fn prepare_aggregate_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<AggregateCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<Self::Kernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        checked
+            .require_registered(self.declaration.as_ref(), input)
+            .map_err(|_| {
+                crate::CheckedOwnerFailure::Original(crate::kernel_control::invalid(
+                    "preparation borrows a different registered checked owner",
+                ))
+            })?;
+        self.owner
+            .prepare_aggregate_checked(input, checked, contract, control)
     }
 }
 impl<O: PureFunctionMetadataOwner + PureAggregateWindowImplementation>
@@ -834,6 +984,33 @@ impl<O: PureFunctionMetadataOwner + PureScalarImplementation> InstalledPureOwner
             prepared: PreparedPureKernel::Scalar(value.into_prepared()),
         })
     }
+    fn prepare_checked(
+        &self,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        frozen: Option<&CallEffects>,
+        options: PureCallPreparation,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedPureCallDraft, crate::CheckedOwnerFailure<FunctionSpecializationFailure>>
+    {
+        let PureCallPreparation::Scalar { arguments } = options else {
+            return Err(crate::CheckedOwnerFailure::Original(wrong_options()));
+        };
+        let value = crate::scalar_kernel::specialize_scalar_checked(
+            self.0.as_ref(),
+            checked,
+            input,
+            selected,
+            frozen,
+            arguments,
+            control,
+        )?;
+        Ok(PreparedPureCallDraft {
+            effects: value.effects(),
+            prepared: PreparedPureKernel::Scalar(value.into_prepared()),
+        })
+    }
 }
 impl<O: PureFunctionMetadataOwner + PureInvocationScalarImplementation> InstalledPureOwner
     for InvocationScalarOwner<O>
@@ -865,6 +1042,34 @@ impl<O: PureFunctionMetadataOwner + PureInvocationScalarImplementation> Installe
                 specialize_invocation_scalar(self.0.as_ref(), input, selected, arguments, control)
             }
         }?;
+        Ok(PreparedPureCallDraft {
+            effects: value.effects(),
+            prepared: PreparedPureKernel::ScalarInvocation(value.into_prepared()),
+        })
+    }
+
+    fn prepare_checked(
+        &self,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        frozen: Option<&CallEffects>,
+        options: PureCallPreparation,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedPureCallDraft, crate::CheckedOwnerFailure<FunctionSpecializationFailure>>
+    {
+        let PureCallPreparation::Scalar { arguments } = options else {
+            return Err(wrong_options().into());
+        };
+        let value = crate::scalar_invocation::specialize_invocation_scalar_once_checked(
+            self.0.as_ref(),
+            checked,
+            input,
+            selected,
+            frozen,
+            arguments,
+            control,
+        )?;
         Ok(PreparedPureCallDraft {
             effects: value.effects(),
             prepared: PreparedPureKernel::ScalarInvocation(value.into_prepared()),
@@ -904,6 +1109,34 @@ impl<O: PureFunctionMetadataOwner + PureHigherOrderImplementation> InstalledPure
             prepared: PreparedPureKernel::HigherOrder(value.into_prepared()),
         })
     }
+
+    fn prepare_checked(
+        &self,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        frozen: Option<&CallEffects>,
+        options: PureCallPreparation,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedPureCallDraft, crate::CheckedOwnerFailure<FunctionSpecializationFailure>>
+    {
+        let PureCallPreparation::HigherOrder(options) = options else {
+            return Err(wrong_options().into());
+        };
+        let value = crate::higher_order_kernel::specialize_once_checked(
+            self.0.as_ref(),
+            checked,
+            input,
+            selected,
+            frozen,
+            options,
+            control,
+        )?;
+        Ok(PreparedPureCallDraft {
+            effects: value.effects(),
+            prepared: PreparedPureKernel::HigherOrder(value.into_prepared()),
+        })
+    }
 }
 impl<O: PureFunctionMetadataOwner + PureScalarImplementation + PureHigherOrderImplementation>
     InstalledPureOwner for ScalarHigherOrderOwner<O>
@@ -927,6 +1160,25 @@ impl<O: PureFunctionMetadataOwner + PureScalarImplementation + PureHigherOrderIm
                 HigherOrderOwner(self.0.clone()).prepare(input, selected, frozen, options, control)
             }
             _ => Err(wrong_options()),
+        }
+    }
+
+    fn prepare_checked(
+        &self,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        frozen: Option<&CallEffects>,
+        options: PureCallPreparation,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedPureCallDraft, crate::CheckedOwnerFailure<FunctionSpecializationFailure>>
+    {
+        match options {
+            options @ PureCallPreparation::Scalar { .. } => ScalarOwner(self.0.clone())
+                .prepare_checked(checked, input, selected, frozen, options, control),
+            options @ PureCallPreparation::HigherOrder(_) => HigherOrderOwner(self.0.clone())
+                .prepare_checked(checked, input, selected, frozen, options, control),
+            _ => Err(wrong_options().into()),
         }
     }
 }
@@ -956,6 +1208,38 @@ impl<O: PureFunctionMetadataOwner + PureAggregateImplementation> InstalledPureOw
             options,
             control,
         )
+    }
+
+    fn prepare_checked(
+        &self,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        frozen: Option<&CallEffects>,
+        options: PureCallPreparation,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedPureCallDraft, crate::CheckedOwnerFailure<FunctionSpecializationFailure>>
+    {
+        let PureCallPreparation::Aggregate { arguments, options } = options else {
+            return Err(wrong_options().into());
+        };
+        let value = crate::aggregate_kernel::specialize_aggregate_once_checked(
+            self.0.as_ref(),
+            checked,
+            input,
+            selected,
+            frozen,
+            arguments,
+            options,
+            control,
+        )?;
+        let effects = value.effects();
+        let handle = PreparedAggregateHandle::from_typed(value.into_prepared(), control)
+            .map_err(FunctionSpecializationFailure::Kernel)?;
+        Ok(PreparedPureCallDraft {
+            effects,
+            prepared: PreparedPureKernel::Aggregate(handle),
+        })
     }
 }
 fn prepare_aggregate_handle<O: PureAggregateImplementation>(
@@ -1036,6 +1320,39 @@ impl<O: PureFunctionMetadataOwner + PureAggregateWindowImplementation> Installed
             _ => Err(wrong_options()),
         }
     }
+
+    fn prepare_checked(
+        &self,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        frozen: Option<&CallEffects>,
+        options: PureCallPreparation,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedPureCallDraft, crate::CheckedOwnerFailure<FunctionSpecializationFailure>>
+    {
+        match options {
+            options @ PureCallPreparation::Aggregate { .. } => AggregateOwner(self.0.clone())
+                .prepare_checked(checked, input, selected, frozen, options, control),
+            PureCallPreparation::AggregateWindow { arguments, options } => {
+                let value = crate::window_kernel::specialize_aggregate_window_once_checked(
+                    self.0.as_ref(),
+                    checked,
+                    input,
+                    selected,
+                    frozen,
+                    arguments,
+                    options,
+                    control,
+                )?;
+                Ok(PreparedPureCallDraft {
+                    effects: value.effects(),
+                    prepared: PreparedPureKernel::Window(value.into_prepared()),
+                })
+            }
+            _ => Err(wrong_options().into()),
+        }
+    }
 }
 impl<O: PureFunctionMetadataOwner + PureWindowImplementation> InstalledPureOwner
     for WindowOwner<O>
@@ -1078,6 +1395,35 @@ impl<O: PureFunctionMetadataOwner + PureWindowImplementation> InstalledPureOwner
             prepared: PreparedPureKernel::Window(value.into_prepared()),
         })
     }
+
+    fn prepare_checked(
+        &self,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        frozen: Option<&CallEffects>,
+        options: PureCallPreparation,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedPureCallDraft, crate::CheckedOwnerFailure<FunctionSpecializationFailure>>
+    {
+        let PureCallPreparation::Window { arguments, options } = options else {
+            return Err(wrong_options().into());
+        };
+        let value = crate::window_kernel::specialize_window_once_checked(
+            self.0.as_ref(),
+            checked,
+            input,
+            selected,
+            frozen,
+            arguments,
+            options,
+            control,
+        )?;
+        Ok(PreparedPureCallDraft {
+            effects: value.effects(),
+            prepared: PreparedPureKernel::Window(value.into_prepared()),
+        })
+    }
 }
 impl<O: PureFunctionMetadataOwner + PureTableImplementation> InstalledPureOwner for TableOwner<O> {
     fn accepts_installed_abi(&self, abi: PureKernelAbi) -> bool {
@@ -1110,6 +1456,34 @@ impl<O: PureFunctionMetadataOwner + PureTableImplementation> InstalledPureOwner 
             prepared: PreparedPureKernel::Table(value.into_prepared()),
         })
     }
+
+    fn prepare_checked(
+        &self,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        frozen: Option<&CallEffects>,
+        options: PureCallPreparation,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedPureCallDraft, crate::CheckedOwnerFailure<FunctionSpecializationFailure>>
+    {
+        let PureCallPreparation::Table { arguments } = options else {
+            return Err(wrong_options().into());
+        };
+        let value = crate::table_kernel::specialize_table_once_checked(
+            self.0.as_ref(),
+            checked,
+            input,
+            selected,
+            frozen,
+            arguments,
+            control,
+        )?;
+        Ok(PreparedPureCallDraft {
+            effects: value.effects(),
+            prepared: PreparedPureKernel::Table(value.into_prepared()),
+        })
+    }
 }
 impl<O: PureFunctionMetadataOwner> InstalledPureOwner for ControlOwner<O> {
     fn accepts_installed_abi(&self, abi: PureKernelAbi) -> bool {
@@ -1128,6 +1502,40 @@ impl<O: PureFunctionMetadataOwner> InstalledPureOwner for ControlOwner<O> {
         };
         let (receipt, effects) = crate::specialization::refine_once_for_specialization(
             self.0.as_ref(),
+            input,
+            frozen,
+            arguments,
+            control,
+        )?;
+        let call = Arc::new(
+            FunctionCallContract::from_refined(input, &receipt, selected, control)
+                .map_err(FunctionSpecializationFailure::Kernel)?,
+        );
+        control
+            .checkpoint(CompilePhase::FunctionSpecialization, 0)
+            .map_err(FunctionSpecializationFailure::Control)?;
+        Ok(PreparedPureCallDraft {
+            effects,
+            prepared: PreparedPureKernel::ControlIntrinsic(call),
+        })
+    }
+
+    fn prepare_checked(
+        &self,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        frozen: Option<&CallEffects>,
+        options: PureCallPreparation,
+        control: &dyn PureCompileControl,
+    ) -> Result<PreparedPureCallDraft, crate::CheckedOwnerFailure<FunctionSpecializationFailure>>
+    {
+        let PureCallPreparation::ControlIntrinsic { arguments } = options else {
+            return Err(wrong_options().into());
+        };
+        let (receipt, effects) = crate::specialization::refine_once_checked(
+            self.0.as_ref(),
+            checked,
             input,
             frozen,
             arguments,
@@ -1202,11 +1610,11 @@ fn attach_definition<O: PureFunctionMetadataOwner + 'static>(
     owner: Arc<dyn InstalledPureOwner>,
     aggregate_resolver: Option<Arc<dyn AggregateSignatureResolver>>,
 ) -> Result<FunctionDefinition, PureCatalogError> {
-    let mut definition = FunctionDefinition::bound(
+    let mut definition = FunctionDefinition::bound_with_owner(
         name,
         visibility,
         registered.declaration.as_ref().clone(),
-        registered.clone(),
+        Arc::clone(&registered.owner).binding_resolver_owner(),
         aggregate_resolver,
     )?;
     let binding = definition
@@ -1470,6 +1878,29 @@ impl PureEngineFunctionCatalog {
     ) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
         self.prepare(input, selected, Some(frozen), options, control)
     }
+    /// The actual BE caller supplies its original finite construction scope.
+    /// Binding validation and all installed owner repeats consume one exact
+    /// borrowed receipt; an unconverted owner never falls back to pure work.
+    pub fn prepare_frozen_with_creator_in<H>(
+        &self,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        frozen: &CallEffects,
+        options: PureCallPreparation,
+        constant_policy: &crate::ConstantPolicy,
+        creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        control: &dyn PureCompileControl,
+    ) -> Result<PureCallSpecialization, CheckedCallPreparationFailure<H>> {
+        prepare_selected_with_creation(
+            &self.catalog,
+            input,
+            selected,
+            Some(frozen),
+            options,
+            control,
+            Some((creation, constant_policy)),
+        )
+    }
     fn prepare(
         &self,
         input: CallEffectInput<'_>,
@@ -1524,6 +1955,18 @@ impl EngineFunctionCatalog {
         control: &dyn PureCompileControl,
     ) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
         prepare_selected(self, input, selected, None, options, control)
+    }
+    /// Prepare this exact installed overload from original frozen call facts.
+    /// This grants no whole-catalogue seal and cannot fall back to fresh facts.
+    pub fn prepare_frozen_selected(
+        &self,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        frozen: &CallEffects,
+        options: PureCallPreparation,
+        control: &dyn PureCompileControl,
+    ) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
+        prepare_selected(self, input, selected, Some(frozen), options, control)
     }
 }
 
@@ -1581,8 +2024,45 @@ fn prepare_selected(
     options: PureCallPreparation,
     control: &dyn PureCompileControl,
 ) -> Result<PureCallSpecialization, FunctionSpecializationFailure> {
+    prepare_selected_with_creation::<std::convert::Infallible>(
+        catalog, input, selected, frozen, options, control, None,
+    )
+    .map_err(|error| match error {
+        CheckedCallPreparationFailure::Preparation(crate::CheckedOwnerFailure::Original(error)) => {
+            error
+        }
+        CheckedCallPreparationFailure::Binding(crate::FunctionBindingCreationFailure::Binding(
+            error,
+        )) => error.into(),
+        CheckedCallPreparationFailure::Binding(crate::FunctionBindingCreationFailure::Creator(
+            never,
+        )) => match never {},
+        CheckedCallPreparationFailure::Binding(
+            crate::FunctionBindingCreationFailure::Resource(_),
+        )
+        | CheckedCallPreparationFailure::Binding(
+            crate::FunctionBindingCreationFailure::UnconvertedResolverOwner,
+        )
+        | CheckedCallPreparationFailure::Preparation(
+            crate::CheckedOwnerFailure::UnconvertedOwner,
+        ) => unreachable!("pure preparation never enters a staged checked adapter"),
+    })
+}
+
+fn prepare_selected_with_creation<H>(
+    catalog: &EngineFunctionCatalog,
+    input: CallEffectInput<'_>,
+    selected: Arc<FunctionBindingSelection>,
+    frozen: Option<&CallEffects>,
+    options: PureCallPreparation,
+    control: &dyn PureCompileControl,
+    mut creation: Option<(
+        &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        &crate::ConstantPolicy,
+    )>,
+) -> Result<PureCallSpecialization, CheckedCallPreparationFailure<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
-    let result = (|| {
+    let result: Result<PureCallSpecialization, CheckedCallPreparationFailure<H>> = (|| {
         let binding = lookup_selected_binding(catalog, input.function_id, &mut work)?;
         let exact_owner = binding.declaration.kind() == input.kind
             && std::ptr::eq(input.selected, selected.as_ref());
@@ -1590,18 +2070,32 @@ fn prepare_selected(
         if !exact_owner {
             return Err(FunctionSpecializationFailure::InvalidInput(
                 "pure preparation has a different exact kind or selected owner",
-            ));
+            )
+            .into());
         }
         // Use the same complete selected-signature author as frozen metadata
         // consumers. Owner refinement below still validates its own facts.
         work.flush()?;
-        catalog.validate_frozen_selection(
-            input.function_id,
-            input.kind,
-            selected.as_ref(),
-            input.request,
-            control,
-        )?;
+        let checked = match creation.as_mut() {
+            Some((scope, policy)) => Some(catalog.check_call_effect_input_with_creator_in(
+                input,
+                policy,
+                &mut **scope,
+                control,
+            )?),
+            None => {
+                catalog
+                    .validate_frozen_selection(
+                        input.function_id,
+                        input.kind,
+                        selected.as_ref(),
+                        input.request,
+                        control,
+                    )
+                    .map_err(FunctionSpecializationFailure::from)?;
+                None
+            }
+        };
         work.flush()?;
         let declaration = lookup_installed_overload(binding, &selected.overload, &mut work)?;
         let attachment = declaration.attachment;
@@ -1611,12 +2105,23 @@ fn prepare_selected(
             .accepts_preparation(&options);
         work.step()?;
         if !accepts {
-            return Err(wrong_options());
+            return Err(wrong_options().into());
         }
         work.flush()?;
-        let draft = attachment
-            .owner
-            .prepare(input, selected, frozen, options, control)?;
+        let draft = match &checked {
+            Some(checked) => {
+                checked
+                    .require_catalog(catalog)
+                    .map_err(FunctionSpecializationFailure::from)?;
+                attachment
+                    .owner
+                    .prepare_checked(checked, input, selected, frozen, options, control)
+                    .map_err(CheckedCallPreparationFailure::Preparation)?
+            }
+            None => attachment
+                .owner
+                .prepare(input, selected, frozen, options, control)?,
+        };
         work.flush()?;
         Ok(PureCallSpecialization {
             prepared: draft.prepared,
@@ -1633,18 +2138,71 @@ fn prepare_selected(
     // Preparation may forward an original compile refusal through the kernel
     // boundary. Both typed representations remain primary without a callback.
     if matches!(
-        result,
-        Err(FunctionSpecializationFailure::Control(_))
-            | Err(FunctionSpecializationFailure::Kernel(
-                KernelFailure::Cancelled
-                    | KernelFailure::DeadlineExceeded
-                    | KernelFailure::ResourceExhausted
-            ))
+        &result,
+        Err(CheckedCallPreparationFailure::Binding(
+            crate::FunctionBindingCreationFailure::Creator(_)
+        )) | Err(CheckedCallPreparationFailure::Binding(
+            crate::FunctionBindingCreationFailure::Resource(_)
+        )) | Err(CheckedCallPreparationFailure::Binding(
+            crate::FunctionBindingCreationFailure::Binding(FunctionBindingError::Control(_))
+        )) | Err(CheckedCallPreparationFailure::Preparation(
+            crate::CheckedOwnerFailure::Original(
+                FunctionSpecializationFailure::Control(_)
+                    | FunctionSpecializationFailure::Kernel(
+                        KernelFailure::Cancelled
+                            | KernelFailure::DeadlineExceeded
+                            | KernelFailure::ResourceExhausted
+                    )
+            )
+        ))
     ) {
         return result;
     }
     work.finish()?;
     result
+}
+
+#[derive(Debug)]
+pub enum CheckedCallPreparationFailure<H> {
+    Binding(crate::FunctionBindingCreationFailure<H>),
+    Preparation(crate::CheckedOwnerFailure<FunctionSpecializationFailure>),
+}
+impl<H> From<crate::FunctionBindingCreationFailure<H>> for CheckedCallPreparationFailure<H> {
+    fn from(error: crate::FunctionBindingCreationFailure<H>) -> Self {
+        Self::Binding(error)
+    }
+}
+impl<H> From<FunctionSpecializationFailure> for CheckedCallPreparationFailure<H> {
+    fn from(error: FunctionSpecializationFailure) -> Self {
+        Self::Preparation(crate::CheckedOwnerFailure::Original(error))
+    }
+}
+impl<H> From<novarocks_type_contract::CompileControlError> for CheckedCallPreparationFailure<H> {
+    fn from(error: novarocks_type_contract::CompileControlError) -> Self {
+        FunctionSpecializationFailure::Control(error).into()
+    }
+}
+impl EngineFunctionCatalog {
+    pub(crate) fn prepare_selected_checked_with_creator_in<H>(
+        &self,
+        input: CallEffectInput<'_>,
+        selected: Arc<FunctionBindingSelection>,
+        frozen: Option<&CallEffects>,
+        options: PureCallPreparation,
+        constant_policy: &crate::ConstantPolicy,
+        creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        control: &dyn PureCompileControl,
+    ) -> Result<PureCallSpecialization, CheckedCallPreparationFailure<H>> {
+        prepare_selected_with_creation(
+            self,
+            input,
+            selected,
+            frozen,
+            options,
+            control,
+            Some((creation, constant_policy)),
+        )
+    }
 }
 
 pub(crate) fn digest_pure_attachment(
@@ -1677,3 +2235,7 @@ mod selected_fresh_tests;
 #[cfg(test)]
 #[path = "pure_overload_declaration_tests.rs"]
 mod pure_overload_declaration_tests;
+
+#[cfg(test)]
+#[path = "pure_catalogue/abs_checked_selection_tests.rs"]
+mod abs_checked_selection_tests;

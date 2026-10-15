@@ -368,7 +368,9 @@ fn lambda_parameter_shape_and_body_type_remain_explicit() {
         None,
     );
     let lambda = FunctionArgumentType::Lambda {
-        parameter_types: vec![FunctionValueType::new(DataType::Int64, false)].into_boxed_slice(),
+        parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+            vec![FunctionValueType::new(DataType::Int64, false)].into_boxed_slice(),
+        ),
         result_type: FunctionValueType::new(DataType::Boolean, true),
     };
     ProgramTypedExpressions::try_new(
@@ -390,7 +392,9 @@ fn lambda_parameter_shape_and_body_type_remain_explicit() {
         unreachable!()
     };
     let wrong = FunctionArgumentType::Lambda {
-        parameter_types: Box::default(),
+        parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+            Box::default(),
+        ),
         result_type,
     };
     assert_eq!(
@@ -414,7 +418,7 @@ fn lambda_parameter_shape_and_body_type_remain_explicit() {
 }
 
 #[test]
-fn exact_dictionary_field_identity_and_root_logical_validation_are_observed() {
+fn source_dictionary_ids_do_not_change_static_value_binding_and_invalid_nominals_fail_at_author() {
     #[allow(deprecated)]
     let field = |id| {
         Arc::new(Field::new_dict(
@@ -431,7 +435,9 @@ fn exact_dictionary_field_identity_and_root_logical_validation_are_observed() {
     let source = resolved(
         vec![StaticExprNode::new(
             StaticExprKind::Literal(StaticLiteral::Null),
-            left.clone(),
+            FunctionValueType::new(left.clone(), true)
+                .data_type()
+                .clone(),
             None,
         )],
         None,
@@ -442,29 +448,15 @@ fn exact_dictionary_field_identity_and_root_logical_validation_are_observed() {
         &Control::default(),
     )
     .unwrap();
-    assert_eq!(
-        ProgramTypedExpressions::try_new(
-            source,
-            main_types(vec![value(right, true)]),
-            &Control::default()
-        )
-        .unwrap_err(),
-        ProgramExpressionTypeError::TypeMismatch
-    );
-    let wrong = FunctionArgumentType::Value(FunctionValueType {
-        data_type: DataType::Boolean,
-        nullable: true,
-        logical_type: ValueLogicalType::Json,
-    });
+    ProgramTypedExpressions::try_new(
+        source,
+        main_types(vec![value(right, true)]),
+        &Control::default(),
+    )
+    .unwrap();
     assert!(matches!(
-        ProgramTypedExpressions::try_new(
-            resolved(vec![bool_node()], None),
-            main_types(vec![wrong]),
-            &Control::default()
-        ),
-        Err(ProgramExpressionTypeError::Kernel(
-            KernelFailure::InvalidProgram(_)
-        ))
+        FunctionValueType::try_with_logical_type(DataType::Boolean, true, ValueLogicalType::Json),
+        Err(_)
     ));
 }
 
@@ -543,7 +535,11 @@ fn cv(
     ordinal: u32,
 ) -> novarocks_functions::ConstantValue {
     novarocks_functions::ConstantPool::try_new(
-        Arc::new(ty.try_to_field("selected").unwrap()),
+        Arc::new(Field::new(
+            "selected",
+            array.data_type().clone(),
+            ty.nullable(),
+        )),
         ty,
         array.to_data(),
         cv_policy(),
@@ -555,7 +551,7 @@ fn cv(
     .unwrap()
 }
 fn cv_node(value: novarocks_functions::ConstantValue) -> StaticExprNode {
-    let ty = value.value_type().data_type.clone();
+    let ty = value.value_type().data_type().clone();
     StaticExprNode::new(StaticExprKind::Constant(value), ty, None)
 }
 
@@ -607,7 +603,11 @@ fn shared_constants_keep_selected_rows_float_bits_and_exact_complete_types() {
         vec![Arc::new(StringArray::from(vec![Some("null"), Some("{}")]))],
         None,
     ));
-    let exact = FunctionValueType::new(array.data_type().clone(), false);
+    let exact = crate::test_value_types::string_structure_from_source(
+        &[("json", true, true)],
+        false,
+        array.data_type(),
+    );
     let nested = cv(array, exact.clone(), 1);
     ProgramTypedExpressions::try_new(
         resolved(vec![cv_node(nested.clone())], None),
@@ -615,21 +615,30 @@ fn shared_constants_keep_selected_rows_float_bits_and_exact_complete_types() {
         &Control::default(),
     )
     .unwrap();
-    let wrong = FunctionValueType::new(
-        DataType::Struct(
-            vec![Arc::new(child.as_ref().clone().with_metadata(
-                HashMap::from([
-                    (
-                        novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_owned(),
-                        "json".to_owned(),
-                    ),
-                    ("provider".to_owned(), "different".to_owned()),
-                ]),
-            ))]
-            .into(),
-        ),
-        false,
+    let changed_source = DataType::Struct(
+        vec![Arc::new(child.as_ref().clone().with_metadata(
+            HashMap::from([
+                (
+                    novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_owned(),
+                    "json".to_owned(),
+                ),
+                ("provider".to_owned(), "different".to_owned()),
+            ]),
+        ))]
+        .into(),
     );
+    let source_attributes_only = crate::test_value_types::string_structure_from_source(
+        &[("json", true, true)],
+        false,
+        &changed_source,
+    );
+    ProgramTypedExpressions::try_new(
+        resolved(vec![cv_node(nested.clone())], None),
+        main_types(vec![FunctionArgumentType::Value(source_attributes_only)]),
+        &Control::default(),
+    )
+    .unwrap();
+    let wrong = crate::test_value_types::string_structure(&[("json", true, false)], false);
     assert_eq!(
         ProgramTypedExpressions::try_new(
             resolved(vec![cv_node(nested)], None),
@@ -755,4 +764,169 @@ fn shared_constant_definition_control_never_becomes_a_partial_typed_program() {
             );
         }
     }
+}
+
+#[test]
+fn created_type_table_late_slice_retains_only_its_original_arena_owner() {
+    struct Hold;
+    impl novarocks_type_contract::ValueTypeStorageHold for Hold {}
+    let temporary_hold = Arc::new(Hold);
+    let table_hold = Arc::new(Hold);
+    let arena_hold = Arc::new(Hold);
+    let temporary_weak = Arc::downgrade(&temporary_hold);
+    let table_weak = Arc::downgrade(&table_hold);
+    let arena_weak = Arc::downgrade(&arena_hold);
+    let mut request = |_: std::alloc::Layout| Ok::<_, ()>(());
+    let mut opaque = |_: usize| Ok::<_, ()>(());
+    let mut retained_request = |_: std::alloc::Layout| Ok::<_, ()>(());
+    let mut retained_opaque = |_: usize| Ok::<_, ()>(());
+    let mut temporary = ValueSchemaCreation::new(
+        ValueTypeStorageLifetime::held(temporary_hold.clone()),
+        &mut request,
+        &mut opaque,
+    );
+    let mut retained = ValueSchemaCreation::new(
+        ValueTypeStorageLifetime::held(table_hold.clone()),
+        &mut retained_request,
+        &mut retained_opaque,
+    );
+    // The real producer owns this collection from its first Vec allocation;
+    // the downstream constructor never borrows the table's scope for it.
+    let source_value = value(DataType::Boolean, true);
+    let source_requests = std::sync::atomic::AtomicUsize::new(0);
+    let mut source_request = |_: std::alloc::Layout| {
+        source_requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok::<_, novarocks_type_contract::owned_resources::layout::LayoutResourceError>(())
+    };
+    source_request(std::alloc::Layout::array::<FunctionArgumentType>(1).unwrap()).unwrap();
+    let mut entries = Vec::with_capacity(1);
+    entries.push(source_value);
+    let entries = FunctionArgumentTypes::try_from_boxed_observed(
+        entries.into_boxed_slice(),
+        ValueTypeStorageLifetime::held(arena_hold.clone()),
+        &mut source_request,
+    )
+    .unwrap();
+    assert_eq!(
+        source_requests.load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+    let typed = ProgramTypedExpressions::try_new_with_creator_in(
+        shared_truth_value_fixture(DataType::Boolean),
+        BTreeMap::from([(ProgramExpressionArena::Main, entries)]),
+        &mut temporary,
+        &mut retained,
+        &Control::default(),
+    )
+    .unwrap();
+    let late = typed.types()[&ProgramExpressionArena::Main].clone();
+    assert_eq!(late.as_slice(), &[value(DataType::Boolean, true)]);
+    drop(typed);
+    drop(temporary);
+    drop(retained);
+    drop(temporary_hold);
+    drop(table_hold);
+    drop(arena_hold);
+    assert!(temporary_weak.upgrade().is_none());
+    assert!(table_weak.upgrade().is_none());
+    assert!(arena_weak.upgrade().is_some());
+    drop(late);
+    assert!(arena_weak.upgrade().is_none());
+}
+
+#[test]
+fn created_type_table_refuses_each_actual_final_request_without_control_tail() {
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    struct Trace(Mutex<Vec<(CompilePhase, u32)>>);
+    impl PureCompileControl for Trace {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            self.0.lock().unwrap().push((phase, units));
+            Ok(())
+        }
+    }
+    let run = |fail_at: Option<usize>| {
+        let calls = shared_truth_value_fixture(DataType::Boolean);
+        let control = Trace(Mutex::new(Vec::new()));
+        let next = AtomicUsize::new(0);
+        let refused = AtomicUsize::new(usize::MAX);
+        let cause = Arc::new(());
+        let observe = || {
+            let at = next.fetch_add(1, Ordering::Relaxed);
+            if Some(at) == fail_at {
+                refused.store(control.0.lock().unwrap().len(), Ordering::Relaxed);
+                Err(cause.clone())
+            } else {
+                Ok(())
+            }
+        };
+        let mut request = |_: std::alloc::Layout| observe();
+        let mut opaque = |_: usize| observe();
+        let mut temporary_request = |_: std::alloc::Layout| Ok::<_, Arc<()>>(());
+        let mut temporary_opaque = |_: usize| Ok::<_, Arc<()>>(());
+        let mut temporary = ValueSchemaCreation::new(
+            ValueTypeStorageLifetime::pure(),
+            &mut temporary_request,
+            &mut temporary_opaque,
+        );
+        let mut retained =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
+        let result = ProgramTypedExpressions::try_new_with_creator_in(
+            calls,
+            BTreeMap::from([(
+                ProgramExpressionArena::Main,
+                FunctionArgumentTypes::from_pure_boxed(
+                    vec![value(DataType::Boolean, true)].into_boxed_slice(),
+                ),
+            )]),
+            &mut temporary,
+            &mut retained,
+            &control,
+        );
+        if let Some(at) = fail_at {
+            assert!(
+                matches!(result, Err(ProgramCreationFailure::Creator(actual))
+                if Arc::ptr_eq(&actual, &cause))
+            );
+            assert_eq!(next.load(Ordering::Relaxed), at + 1);
+            assert_eq!(
+                control.0.lock().unwrap().len(),
+                refused.load(Ordering::Relaxed)
+            );
+        } else {
+            assert!(result.is_ok());
+        }
+        next.load(Ordering::Relaxed)
+    };
+    let total = run(None);
+    assert!(
+        total >= 2,
+        "actual final tree and table Arc must be observed"
+    );
+    for at in 0..total {
+        run(Some(at));
+    }
+}
+
+#[test]
+fn pure_guarded_type_table_shares_the_original_arena_collection() {
+    let entries = FunctionArgumentTypes::from_pure_boxed(
+        vec![value(DataType::Boolean, true)].into_boxed_slice(),
+    );
+    let original = entries.clone();
+    let typed = ProgramTypedExpressions::try_new_guarded(
+        shared_truth_value_fixture(DataType::Boolean),
+        BTreeMap::from([(ProgramExpressionArena::Main, entries)]),
+        &Control::default(),
+    )
+    .unwrap();
+    let published = &typed.types()[&ProgramExpressionArena::Main];
+    assert_eq!(published.as_slice(), original.as_slice());
+    assert_eq!(published.as_slice().as_ptr(), original.as_slice().as_ptr());
+    assert_eq!(
+        typed.definition_type(ProgramExpressionArena::Main, ProgramExprId::new(0)),
+        Some(&value(DataType::Boolean, true))
+    );
 }

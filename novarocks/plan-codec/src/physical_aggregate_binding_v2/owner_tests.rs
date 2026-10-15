@@ -147,9 +147,10 @@ fn aggregate_caller_chain_retains_four_phases_full_types_and_actual_namespace_lo
             assert_eq!(
                 raw.state_argument_contract,
                 if at == 0 {
-                    wire::AggregateStateArgumentContract::ValueRootNullabilityIndependent as i32
+                    novarocks_proto_models::common::AggregateStateArgumentContract::ValueRootNullabilityIndependent as i32
                 } else {
-                    wire::AggregateStateArgumentContract::ExactSignature as i32
+                    novarocks_proto_models::common::AggregateStateArgumentContract::ExactSignature
+                        as i32
                 }
             );
             let loan = encoded
@@ -205,8 +206,8 @@ fn aggregate_caller_chain_retains_four_phases_full_types_and_actual_namespace_lo
         else {
             panic!("Lambda");
         };
-        assert_eq!(result_type.logical_type, ValueLogicalType::LargeInt);
-        let DataType::Struct(fields) = &parameter_types[1].data_type else {
+        assert_eq!(result_type.logical_type(), ValueLogicalType::LargeInt);
+        let DataType::Struct(fields) = &parameter_types[1].data_type() else {
             panic!("Struct");
         };
         let DataType::Struct(original) = &fresh
@@ -214,15 +215,13 @@ fn aggregate_caller_chain_retains_four_phases_full_types_and_actual_namespace_lo
             .type_table()
             .value_type(u32::MAX)
             .unwrap()
-            .data_type
+            .data_type()
         else {
             panic!("source Struct");
         };
         assert!(Arc::ptr_eq(&fields[0], &original[0]));
-        assert_eq!(
-            fields[0].metadata().get("original").map(String::as_str),
-            Some("metadata")
-        );
+        assert_eq!(fields[0].metadata().capacity(), 0);
+        assert!(fields[0].is_nullable());
         assert!(std::ptr::eq(
             out.definition_in(0, &mut |_| Ok(()), &mut work)
                 .unwrap()
@@ -234,7 +233,7 @@ fn aggregate_caller_chain_retains_four_phases_full_types_and_actual_namespace_lo
 }
 
 #[test]
-fn aggregate_caller_owned_layout_is_thirteen_requests_six_refs_and_source_once() {
+fn aggregate_caller_owned_layout_is_four_requests_six_refs_and_source_once() {
     let control = Control::default();
     let raw = [raw_aggregate(
         0,
@@ -253,15 +252,13 @@ fn aggregate_caller_owned_layout_is_thirteen_requests_six_refs_and_source_once()
         .unwrap();
         let f = *prepared.facts();
         let request_bytes = 2 * Layout::array::<(u32, AggregateBinding)>(1).unwrap().size()
-            + 2 * Layout::array::<FunctionArgumentType>(2).unwrap().size()
-            + 2 * Layout::array::<FunctionValueType>(2).unwrap().size()
-            + "test/aggregate".len()
-            + "test/aggregate/overload".len()
             + "test/aggregate/state-v1".len()
-            + 4 * Layout::new::<DataType>().size();
+            + novarocks_type_contract::AggregateStateFormatId::storage_allocation_layout()
+                .unwrap()
+                .size();
         assert_eq!(f.definition_count, 1);
         assert_eq!(f.type_reference_count, 6);
-        assert_eq!(f.allocation_requests_upper_bound, 13);
+        assert_eq!(f.allocation_requests_upper_bound, 4);
         assert_eq!(f.request_bytes_upper_bound, request_bytes);
         assert_eq!(
             f.coexisting_source_and_request_bytes_upper_bound,
@@ -323,9 +320,10 @@ fn aggregate_known_root_and_dictionary_requests_precede_pending_late_causes() {
                 assert_eq!(control.trace(), [0]);
             }
         }
-        // Direct sole clone-prefix seam: the captured root Dictionary has two
-        // owned Box requests before its first library-boundary flush.
-        let dict = headers.functions().type_table().value_type(8).unwrap();
+        // An immutable type loan adds no request, even when its source was
+        // dictionary encoded. Original control still stops the real clone.
+        let value = headers.functions().type_table().value_type(8).unwrap();
+        assert_eq!(value.data_type(), &DataType::Utf8);
         for cause in CAUSES {
             control.arm(Some((1, cause)));
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
@@ -334,12 +332,13 @@ fn aggregate_known_root_and_dictionary_requests_precede_pending_late_causes() {
             }
             let mut model = MaterializationModel::for_composition(1, 0, SOURCE, 0);
             let mut cap = limits();
-            cap.max_allocation_requests = 1;
-            assert!(matches!(
-                model.count_owned_type_clone_in(dict, cap, &mut |_| Ok(()), &mut work),
-                Err(Error::Control(CompileControlError::ResourceExhausted))
-            ));
-            assert_eq!(control.trace(), [0]);
+            cap.max_allocation_requests = 0;
+            cap.max_request_bytes = 0;
+            let result = model.count_owned_type_clone_in(value, cap, &mut |_| Ok(()), &mut work);
+            assert!(matches!(result, Err(Error::Control(actual)) if actual == cause));
+            assert_eq!(model.facts.allocation_requests_upper_bound, 0);
+            assert_eq!(model.facts.request_bytes_upper_bound, 0);
+            assert_eq!(control.trace(), [0, 255]);
         }
     });
 }
@@ -690,7 +689,7 @@ fn aggregate_actual_captured_signature_prefixes_admit_before_completed_lookup() 
                     };
                     let mut model = MaterializationModel::for_composition(1, 0, SOURCE, 0);
                     let mut cap = limits();
-                    cap.max_allocation_requests = 0;
+                    cap.max_type_references = 0;
                     crate::physical_binding_v2::preflight_scalar_signature_copy_in(
                         binding,
                         &mut model,

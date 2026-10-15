@@ -324,12 +324,12 @@ mod tests {
     ) -> AggregateCall {
         let argument_types = args
             .iter()
-            .map(|arg| arg.value_type.data_type.clone())
+            .map(|arg| arg.value_type.data_type().clone())
             .collect::<Vec<_>>();
         AggregateCall {
             name: name.to_string(),
             distinct,
-            result_type: DataType::Int64,
+            result_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             output_column_id,
             source: crate::binding::AggregateArgumentSource::uncertified(
                 args,

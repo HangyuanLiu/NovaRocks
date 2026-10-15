@@ -47,18 +47,18 @@ pub(crate) struct ConnectorWritePlanInput {
 impl ConnectorWritePlanInput {
     /// The writer input schema, one field per input column.
     ///
-    /// Each field is materialized from its column's declared value type, so a
-    /// root logical identity (LARGEINT, HLL, BITMAP, UUID, VARIANT, ...) stays
-    /// on the field the statistics pins are checked against. A plain carrier
-    /// column materializes as the same unannotated field it always did.
+    /// Fields contain only the declared normalized value layout and NULL law.
+    /// Statistics borrow the same original input columns' complete declarations;
+    /// this representation never carries logical identity in annotations.
     pub(crate) fn target_schema_from_sql_write_plan_input(
         sink: &SqlWritePlanInput,
-    ) -> Result<SchemaRef, String> {
+        control: &dyn novarocks_type_contract::PureCompileControl,
+    ) -> Result<SchemaRef, crate::compiler::SqlCompileError> {
         let fields = sink
             .contract
             .input_columns
             .iter()
-            .map(writer_input_field)
+            .map(|column| writer_input_field(column, control))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Arc::new(Schema::new(fields)))
     }
@@ -84,7 +84,11 @@ impl ConnectorWritePlanInput {
     /// boundary. This consumes no provider metadata: the binding token stays
     /// in the SQL contract for application-side writer registration.
     pub(crate) fn from_sql_write_plan_input(sink: SqlWritePlanInput) -> Result<Self, String> {
-        let target_schema = Self::target_schema_from_sql_write_plan_input(&sink)?;
+        let target_schema = Self::target_schema_from_sql_write_plan_input(
+            &sink,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .map_err(|error| error.to_string())?;
         Ok(Self {
             target_schema,
             input: sink.input,
@@ -95,12 +99,33 @@ impl ConnectorWritePlanInput {
 
 /// Materialize one writer input column as the Arrow field its declared value
 /// type authors.
-fn writer_input_field(column: &ColumnDef) -> Result<arrow::datatypes::Field, String> {
-    column
-        .declared_value_type()
-        .map_err(|error| format!("write input column `{}`: {error}", column.name))?
-        .try_to_field(column.name.clone())
-        .map_err(|error| format!("write input column `{}`: {error}", column.name))
+fn writer_input_field(
+    column: &ColumnDef,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<arrow::datatypes::Field, crate::compiler::SqlCompileError> {
+    use super::auxiliary::WriterInputTypeError;
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
+    let value = column
+        .declared_value_type_observed::<WriterInputTypeError>(|| {
+            control
+                .checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
+                .map_err(WriterInputTypeError::Control)
+        })
+        .map_err(|error| match error {
+            WriterInputTypeError::Control(error) => crate::compiler::SqlCompileError::from(error),
+            WriterInputTypeError::Declaration(error) => {
+                crate::compiler::SqlCompileError::Compilation(format!(
+                    "write input column `{}`: {error}",
+                    column.name
+                ))
+            }
+        })?;
+    control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 0)?;
+    Ok(arrow::datatypes::Field::new(
+        column.name.clone(),
+        value.data_type().clone(),
+        value.nullable(),
+    ))
 }
 
 #[cfg(test)]
@@ -181,12 +206,14 @@ mod tests {
 
     fn plan_statistics(
         schema: &Schema,
+        columns: &[ColumnDef],
         requirements: &[StatisticsRequiredAggregation],
     ) -> Result<(), String> {
         plan_writer_statistics(
             &[WriterStatisticsTargetInput {
                 target: WriteTargetOrdinal::try_new(0).expect("target"),
                 input_schema: schema,
+                input_columns: columns,
                 requirements,
             }],
             theta_catalog().as_ref(),
@@ -198,9 +225,8 @@ mod tests {
         .map_err(|error| error.to_string())
     }
 
-    /// A plain carrier column materializes exactly the unannotated field it
-    /// always did, and each declared root identity survives as the field's
-    /// logical annotation.
+    /// Complete root domains remain on their original declarations while
+    /// execution representation fields carry no annotations.
     #[test]
     fn writer_input_schema_keeps_root_logical_identities_and_plain_carriers() {
         let sink = sink_with_input_columns(vec![
@@ -221,8 +247,11 @@ mod tests {
             ),
             column("v", DataType::LargeBinary, true, Some(SqlType::Variant)),
         ]);
-        let schema = ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink)
-            .expect("writer input schema");
+        let schema = ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(
+            &sink,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("writer input schema");
         assert_eq!(
             schema.field(0).as_ref(),
             &Field::new("id", DataType::Int64, false)
@@ -235,8 +264,11 @@ mod tests {
             (5, ValueLogicalType::Variant),
         ] {
             let field = schema.field(ordinal);
-            let value_type = FunctionValueType::try_from_field(field).expect("field value type");
-            assert_eq!(value_type.logical_type, expected, "{}", field.name());
+            let value_type = sink.contract.input_columns[ordinal]
+                .declared_value_type()
+                .expect("complete declared value type");
+            assert_eq!(field.metadata().capacity(), 0);
+            assert_eq!(value_type.logical_type(), expected, "{}", field.name());
             assert_eq!(
                 field.data_type(),
                 &sink.contract.input_columns[ordinal].data_type
@@ -259,17 +291,28 @@ mod tests {
                 Some(SqlType::LargeInt),
             ),
         ]);
-        let schema = ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink)
-            .expect("writer input schema");
+        let schema = ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(
+            &sink,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect("writer input schema");
         let requirements = vec![largeint_pin(1, "big")];
-        plan_statistics(&schema, &requirements).expect("LARGEINT pin plans");
+        plan_statistics(&schema, &sink.contract.input_columns, &requirements)
+            .expect("LARGEINT pin plans");
 
         let undeclared = Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("big", DataType::FixedSizeBinary(16), false),
         ]);
-        let error = plan_statistics(&undeclared, &requirements)
-            .expect_err("an undeclared carrier contradicts the pin");
+        let error = plan_statistics(
+            &undeclared,
+            &[
+                column("id", DataType::Int64, false, None),
+                column("big", DataType::FixedSizeBinary(16), false, None),
+            ],
+            &requirements,
+        )
+        .expect_err("an undeclared carrier contradicts the pin");
         assert!(
             error.contains("does not match the pinned column"),
             "{error}"
@@ -286,8 +329,14 @@ mod tests {
             false,
             Some(SqlType::LargeInt),
         )]);
-        let error = ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink)
-            .expect_err("LARGEINT over Int64 is refused");
-        assert!(error.contains("write input column `big`"), "{error}");
+        let error = ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(
+            &sink,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .expect_err("LARGEINT over Int64 is refused");
+        assert!(
+            error.to_string().contains("write input column `big`"),
+            "{error}"
+        );
     }
 }

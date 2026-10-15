@@ -461,7 +461,10 @@ fn join_output_columns_from_children(
 
 fn nullable_output_columns(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
     for column in &mut columns {
-        column.value_type.nullable = true;
+        column.value_type = column
+            .value_type
+            .with_nullable(true)
+            .expect("validated root NULL contract");
     }
     columns
 }
@@ -880,7 +883,13 @@ mod tests {
             source.value_type
         );
         let mut wrong_domain = source.clone();
-        wrong_domain.value_type.logical_type = ValueLogicalType::Physical;
+        wrong_domain.value_type =
+            novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                wrong_domain.value_type.data_type().clone(),
+                wrong_domain.value_type.nullable(),
+                ValueLogicalType::Physical,
+            )
+            .unwrap();
         assert!(
             project_requested_output_columns(
                 &[wrong_domain],
@@ -900,25 +909,42 @@ mod tests {
             ),
             false,
         );
-        let mut wrong_field = source.clone();
-        wrong_field.value_type.data_type = DataType::Struct(
-            vec![
-                Field::new("nested", DataType::Utf8, false)
-                    .with_metadata([("provider.field-id".into(), "18".into())].into()),
-            ]
-            .into(),
-        );
+        let mut source_attributes_changed = source.clone();
+        source_attributes_changed.value_type =
+            novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                DataType::Struct(
+                    vec![
+                        Field::new("nested", DataType::Utf8, false)
+                            .with_metadata([("provider.field-id".into(), "18".into())].into()),
+                    ]
+                    .into(),
+                ),
+                source_attributes_changed.value_type.nullable(),
+                source_attributes_changed.value_type.logical_type(),
+            )
+            .unwrap();
         assert!(
             project_requested_output_columns(
-                &[wrong_field],
+                &[source_attributes_changed],
                 &[source.clone()],
                 "full-domain fixture",
+            )
+            .is_ok()
+        );
+        let mut wrong_name = source.clone();
+        wrong_name.value_type =
+            crate::test_value_types::string_structure(&[("renamed", false, false)], false);
+        assert!(
+            project_requested_output_columns(
+                &[wrong_name],
+                &[source.clone()],
+                "semantic name drift fixture",
             )
             .is_err()
         );
         let widened = nullable_output_columns(vec![source.clone()]);
         let mut expected = source.value_type.clone();
-        expected.nullable = true;
+        expected = expected.with_nullable(true).unwrap();
         assert_eq!(widened[0].value_type, expected);
         assert_eq!(output_column_ref(&widened[0]).value_type, expected);
     }
@@ -928,8 +954,11 @@ mod tests {
         for (actual, expected) in actual.iter().zip(expected.iter()) {
             assert_eq!(actual.column_id, expected.column_id);
             assert_eq!(actual.name, expected.name);
-            assert_eq!(actual.value_type.data_type, expected.value_type.data_type);
-            assert_eq!(actual.value_type.nullable, expected.value_type.nullable);
+            assert_eq!(
+                actual.value_type.data_type(),
+                expected.value_type.data_type()
+            );
+            assert_eq!(actual.value_type.nullable(), expected.value_type.nullable());
             assert_eq!(actual.is_internal, expected.is_internal);
         }
     }
@@ -993,8 +1022,8 @@ mod tests {
                 .iter()
                 .map(|column| ColumnDef {
                     name: column.name.clone(),
-                    data_type: column.value_type.data_type.clone(),
-                    nullable: column.value_type.nullable,
+                    data_type: column.value_type.data_type().clone(),
+                    nullable: column.value_type.nullable(),
                     write_default: None,
                     logical_type: None,
                 })
@@ -1172,10 +1201,10 @@ mod tests {
             ExprKind::Literal(LiteralValue::Int(1))
         ));
         assert_eq!(
-            values.rows[0][0].value_type.data_type,
+            values.rows[0][0].value_type.data_type().clone(),
             arrow::datatypes::DataType::Int64
         );
-        assert!(!values.rows[0][0].value_type.nullable);
+        assert!(!values.rows[0][0].value_type.nullable());
     }
 
     #[test]
@@ -1603,11 +1632,18 @@ mod tests {
             let mut expected_left = left_column.clone();
             let mut expected_right = right_column.clone();
             match join_type {
-                JoinKind::LeftOuter => expected_right.value_type.nullable = true,
-                JoinKind::RightOuter => expected_left.value_type.nullable = true,
+                JoinKind::LeftOuter => {
+                    expected_right.value_type =
+                        expected_right.value_type.with_nullable(true).unwrap()
+                }
+                JoinKind::RightOuter => {
+                    expected_left.value_type = expected_left.value_type.with_nullable(true).unwrap()
+                }
                 JoinKind::FullOuter => {
-                    expected_left.value_type.nullable = true;
-                    expected_right.value_type.nullable = true;
+                    expected_left.value_type =
+                        expected_left.value_type.with_nullable(true).unwrap();
+                    expected_right.value_type =
+                        expected_right.value_type.with_nullable(true).unwrap();
                 }
                 _ => {}
             }
@@ -1618,16 +1654,16 @@ mod tests {
         };
 
         let left_outer = convert(JoinKind::LeftOuter);
-        assert!(!left_outer.output_columns[0].value_type.nullable);
-        assert!(left_outer.output_columns[1].value_type.nullable);
+        assert!(!left_outer.output_columns[0].value_type.nullable());
+        assert!(left_outer.output_columns[1].value_type.nullable());
 
         let right_outer = convert(JoinKind::RightOuter);
-        assert!(right_outer.output_columns[0].value_type.nullable);
-        assert!(!right_outer.output_columns[1].value_type.nullable);
+        assert!(right_outer.output_columns[0].value_type.nullable());
+        assert!(!right_outer.output_columns[1].value_type.nullable());
 
         let full_outer = convert(JoinKind::FullOuter);
-        assert!(full_outer.output_columns[0].value_type.nullable);
-        assert!(full_outer.output_columns[1].value_type.nullable);
+        assert!(full_outer.output_columns[0].value_type.nullable());
+        assert!(full_outer.output_columns[1].value_type.nullable());
         assert_eq!(
             full_outer.output_columns[0].column_id,
             left_column.column_id

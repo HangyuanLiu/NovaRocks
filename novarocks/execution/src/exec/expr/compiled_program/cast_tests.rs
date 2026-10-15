@@ -107,6 +107,7 @@ fn package(
                 )
                 .unwrap();
             frozen.push(FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,
@@ -185,10 +186,10 @@ fn result_literal(
     result: &FunctionValueType,
     policy: DecimalOverflowPolicy,
 ) -> ExprId {
-    if matches!(result.data_type, DataType::Timestamp(_, None)) {
+    if matches!(result.data_type(), DataType::Timestamp(_, None)) {
         return literal(builder, result, LiteralValue::Timestamp(71));
     }
-    if result.data_type == DataType::Int64 {
+    if *result.data_type() == DataType::Int64 {
         return literal(builder, result, LiteralValue::Int64(71));
     }
     let source = FunctionValueType::new(DataType::Int64, false);
@@ -199,7 +200,7 @@ fn result_literal(
             result.clone(),
             ExprKind::Cast {
                 expr: value,
-                target: result.data_type.clone(),
+                target: result.data_type().clone(),
                 decimal_overflow_policy: policy,
                 allow_throw_exception: allow_ref(),
             },
@@ -233,7 +234,7 @@ fn fixture(
         .unwrap();
     let mut projections = Vec::new();
     for (id, ty) in &columns {
-        let definition = if !ty.nullable && ty.data_type == DataType::Float32 {
+        let definition = if !ty.nullable() && *ty.data_type() == DataType::Float32 {
             let exact = builder
                 .add_expression(
                     input_node,
@@ -254,10 +255,10 @@ fn fixture(
                 )
                 .unwrap()
         } else {
-            let value = if ty.nullable {
+            let value = if ty.nullable() {
                 LiteralValue::Null
             } else {
-                match ty.data_type {
+                match ty.data_type() {
                     DataType::Binary => {
                         LiteralValue::Binary(b"native producer".to_vec().into_boxed_slice())
                     }
@@ -302,7 +303,7 @@ fn fixture(
         .unwrap();
     let mut authors = BTreeMap::new();
     let mut child = if matches!(source, Source::Constant) {
-        if source_type.data_type == DataType::Float32 {
+        if *source_type.data_type() == DataType::Float32 {
             let exact = literal(
                 &mut builder,
                 &FunctionValueType::new(DataType::Float64, false),
@@ -321,7 +322,7 @@ fn fixture(
                 )
                 .unwrap()
         } else {
-            let value = match source_type.data_type {
+            let value = match source_type.data_type() {
                 DataType::Binary => {
                     LiteralValue::Binary(b"native\0producer".to_vec().into_boxed_slice())
                 }
@@ -372,7 +373,7 @@ fn fixture(
             result_type.clone(),
             ExprKind::Cast {
                 expr: child,
-                target: result_type.data_type.clone(),
+                target: result_type.data_type().clone(),
                 decimal_overflow_policy: policy,
                 allow_throw_exception: allow_ref(),
             },

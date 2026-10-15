@@ -17,9 +17,13 @@
 
 //! SQL semantic output provenance for physically ambiguous scalar values.
 
+#[cfg(test)]
 use arrow::datatypes::{DataType, Field};
 use novarocks_parser::{Span, ast};
-use novarocks_types::logical::{LogicalType, field_with_logical_type};
+#[cfg(test)]
+use novarocks_types::logical::LogicalType;
+#[cfg(test)]
+use novarocks_types::logical::field_with_logical_type;
 use novarocks_types::schema::SqlType;
 
 use super::{AnalyzerContext, scope::AnalyzerScope};
@@ -29,514 +33,65 @@ use crate::analyze_error::AnalyzeError;
 #[path = "logical_container.rs"]
 mod container;
 
+enum OutputProjectionError {
+    Source(novarocks_types::ExecutionColumnTypeError),
+    Control(novarocks_type_contract::CompileControlError),
+}
+impl From<novarocks_types::ExecutionColumnTypeError> for OutputProjectionError {
+    fn from(error: novarocks_types::ExecutionColumnTypeError) -> Self {
+        Self::Source(error)
+    }
+}
 impl AnalyzerContext<'_> {
     pub(super) fn logical_output_type(
         &self,
-        source: Option<&ast::Expr>,
+        _source: Option<&ast::Expr>,
         expression: &TypedExpr,
-        scope: &AnalyzerScope,
-    ) -> Option<SqlType> {
-        // The existing independent source witness also covers explicitly typed
-        // empty/all-null JSON literals and catalog JSON-list columns. A physical
-        // List<Utf8> or an output CAST alone does not establish this witness.
-        if self.json_list_provenance(source, expression, scope)
-            && matches!(&expression.value_type.data_type, DataType::List(item)
-                if item.data_type() == &DataType::Utf8)
-        {
-            return Some(SqlType::Array(Box::new(SqlType::Json)));
-        }
-        // A public CAST target alone cannot prove Json contents or serialized
-        // Variant identity. Json retains its already-proven source domain. The
-        // existing exact LargeBinary -> LargeBinary Variant CAST returns the
-        // original array, so a separately proven Variant source also retains
-        // its identity. Other explicit CASTs keep their current owner semantics,
-        // including an explicit VARBINARY/VARCHAR CAST clearing that identity.
-        if let Some(ast::Expr::Cast(cast)) = source {
-            let target_name = cast.data_type.name.parts.last();
-            let json_target = target_name.is_some_and(|part| {
-                part.value.eq_ignore_ascii_case("json") || part.value.eq_ignore_ascii_case("jsonb")
-            });
-            let variant_target =
-                target_name.is_some_and(|part| part.value.eq_ignore_ascii_case("variant"));
-            return match (&expression.kind, json_target, variant_target) {
-                (ExprKind::Cast { expr: inner, .. }, true, _) => self
-                    .logical_output_type(Some(&cast.expr), inner, scope)
-                    .filter(|domain| *domain == SqlType::Json),
-                (ExprKind::Cast { expr: inner, .. }, _, true)
-                    if inner.value_type.data_type == DataType::LargeBinary
-                        && expression.value_type.data_type == DataType::LargeBinary =>
-                {
-                    self.logical_output_type(Some(&cast.expr), inner, scope)
-                        .filter(|domain| *domain == SqlType::Variant)
+        _scope: &AnalyzerScope,
+    ) -> Result<Option<SqlType>, AnalyzeError> {
+        use novarocks_type_contract::{CompileCheckpoints, CompilePhase};
+        let mut work = CompileCheckpoints::try_new(self.control, CompilePhase::Validate)
+            .map_err(AnalyzeError::control)?;
+        let result = novarocks_types::sql_type_from_execution_value_observed(
+            expression.value_type.typed_binding(),
+            |units| {
+                for _ in 0..units {
+                    work.step().map_err(OutputProjectionError::Control)?;
                 }
-                _ => None,
-            };
+                // The projector calls before each actual name/container copy.
+                work.flush().map_err(OutputProjectionError::Control)
+            },
+        );
+        if let Err(OutputProjectionError::Control(error)) = &result {
+            return Err(AnalyzeError::control(*error));
         }
-        // Materialized implicit coercions preserve a domain only while both
-        // carriers remain compatible with that already-established domain.
-        if let ExprKind::Cast { expr: inner, .. } = &expression.kind {
-            let domain = self.logical_output_type(source, inner, scope)?;
-            return (logical_carrier_matches(&domain, &inner.value_type.data_type)
-                && logical_carrier_matches(&domain, &expression.value_type.data_type))
-            .then_some(domain);
+        work.finish().map_err(AnalyzeError::control)?;
+        match result {
+            Ok(projected) => Ok(Some(projected)),
+            // SQL declarations have no NULL/Union/unsigned leaf vocabulary.
+            // Absence of presentation never changes the complete bound type.
+            Err(OutputProjectionError::Source(
+                novarocks_types::ExecutionColumnTypeError::UnrepresentableValue(_)
+                | novarocks_types::ExecutionColumnTypeError::UnrepresentableCarrier(_),
+            )) => Ok(None),
+            Err(OutputProjectionError::Source(error)) => {
+                Err(AnalyzeError::internal(error.to_string()))
+            }
+            Err(OutputProjectionError::Control(_)) => {
+                unreachable!("original control already returned")
+            }
         }
-        let source_binding = match source {
-            Some(ast::Expr::Identifier(ident)) => scope.resolve(None, &ident.value).ok(),
-            Some(ast::Expr::CompoundIdentifier(parts)) if parts.parts.len() >= 2 => {
-                let n = parts.parts.len();
-                scope
-                    .resolve(Some(&parts.parts[n - 2].value), &parts.parts[n - 1].value)
-                    .ok()
-            }
-            _ => None,
-        };
-        if let Some((column_id, _, _)) = source_binding {
-            return self
-                .factory
-                .borrow()
-                .logical_type(column_id)
-                .filter(|domain| {
-                    logical_carrier_matches(domain, &expression.value_type.data_type)
-                });
-        }
-        let domain = match &expression.kind {
-            ExprKind::ColumnRef { .. } => scope.logical_type_of_expr(expression),
-            ExprKind::FunctionCall { binding, args, .. } => {
-                if let Some(domain) = crate::functions::scalar_output_logical_type(binding) {
-                    Some(domain)
-                } else if binding.kind == novarocks_functions::FunctionKind::Scalar {
-                    let source_args = match source {
-                        Some(ast::Expr::FunctionCall(function)) => {
-                            Some(function.arguments.as_slice())
-                        }
-                        _ => None,
-                    };
-                    let source_arg = |index: usize| source_args.and_then(|args| args.get(index));
-                    match binding.function_id.as_str() {
-                        "builtin.scalar/coalesce/v1" => self.merge_logical_values(
-                            args.iter().enumerate().map(|(i, arg)| (source_arg(i), arg)),
-                            scope,
-                        ),
-                        "builtin.scalar/ifnull/v1" | "builtin.scalar/nvl/v1" if args.len() == 2 => {
-                            self.merge_logical_values(
-                                args.iter().enumerate().map(|(i, arg)| (source_arg(i), arg)),
-                                scope,
-                            )
-                        }
-                        "builtin.scalar/if/v1" if args.len() == 3 => self.merge_logical_values(
-                            args.iter()
-                                .enumerate()
-                                .skip(1)
-                                .map(|(i, arg)| (source_arg(i), arg)),
-                            scope,
-                        ),
-                        // The comparator can affect equality but never supplies
-                        // the returned value. Its own logical domain is irrelevant.
-                        "builtin.scalar/nullif/v1" if args.len() == 2 => {
-                            self.logical_output_type(source_arg(0), &args[0], scope)
-                        }
-                        _ => self.container_output_type(source, expression, scope),
-                    }
-                } else {
-                    None
-                }
-            }
-            ExprKind::AggregateCall { resolved, args, .. } => {
-                crate::functions::aggregate_output_logical_type(resolved).or_else(|| {
-                    if resolved.kind == novarocks_functions::FunctionKind::Aggregate
-                        && resolved.function_id.as_str() == "builtin.aggregate/any_value/v1"
-                        && args.len() == 1
-                    {
-                        self.logical_output_type(
-                            container::argument_source(source, 0),
-                            &args[0],
-                            scope,
-                        )
-                    } else {
-                        self.container_output_type(source, expression, scope)
-                    }
-                })
-            }
-            ExprKind::WindowCall {
-                aggregate_binding: Some(binding),
-                args,
-                ..
-            } => crate::functions::aggregate_output_logical_type(binding).or_else(|| {
-                if binding.kind == novarocks_functions::FunctionKind::Aggregate
-                    && binding.function_id.as_str() == "builtin.aggregate/any_value/v1"
-                    && args.len() == 1
-                {
-                    self.logical_output_type(container::argument_source(source, 0), &args[0], scope)
-                } else {
-                    self.container_output_type(source, expression, scope)
-                }
-            }),
-            ExprKind::WindowCall {
-                aggregate_binding: None,
-                ..
-            } => self.window_value_output_type(source, expression, scope),
-            ExprKind::Case {
-                when_then,
-                else_expr,
-                ..
-            } => {
-                let case = match source {
-                    Some(ast::Expr::Case(case)) => Some(case),
-                    _ => None,
-                };
-                self.merge_logical_values(
-                    when_then
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (_, value))| (case.and_then(|case| case.results.get(i)), value))
-                        .chain(else_expr.as_deref().map(|value| {
-                            (case.and_then(|case| case.else_result.as_deref()), value)
-                        })),
-                    scope,
-                )
-            }
-            ExprKind::Nested(inner) => self.logical_output_type(
-                source.and_then(|source| match source {
-                    ast::Expr::Nested(nested) => Some(nested.expression.as_ref()),
-                    _ => None,
-                }),
-                inner,
-                scope,
-            ),
-            _ => None,
-        };
-        domain.filter(|domain| logical_carrier_matches(domain, &expression.value_type.data_type))
     }
 
-    fn merge_logical_values<'a>(
-        &self,
-        values: impl IntoIterator<Item = (Option<&'a ast::Expr>, &'a TypedExpr)>,
-        scope: &AnalyzerScope,
-    ) -> Option<SqlType> {
-        let mut domain = None;
-        for (source, value) in values {
-            if is_null_value(source, value) {
-                continue;
-            }
-            let current = self.logical_output_type(source, value, scope)?;
-            match &domain {
-                Some(previous) if *previous != current => return None,
-                None => domain = Some(current),
-                _ => {}
-            }
-        }
-        domain
-    }
-
-    /// Value provenance is separate from a public CAST target's type spelling.
-    /// Only catalog JSON, exact JSON producers, and their preserving operators
-    /// establish this fact. Derived/CTE columns carry it by ColumnId.
     pub(super) fn json_list_provenance(
         &self,
-        source: Option<&ast::Expr>,
+        _source: Option<&ast::Expr>,
         expression: &TypedExpr,
-        scope: &AnalyzerScope,
+        _scope: &AnalyzerScope,
     ) -> bool {
-        if let Some(ast::Expr::Cast(cast)) = source {
-            let Some(ast::TypeNameArgument::Type(item)) = cast.data_type.arguments.first() else {
-                return false;
-            };
-            let array_json = cast
-                .data_type
-                .name
-                .parts
-                .last()
-                .is_some_and(|part| part.value.eq_ignore_ascii_case("array"))
-                && item.name.parts.last().is_some_and(|part| {
-                    matches!(part.value.to_ascii_lowercase().as_str(), "json" | "jsonb")
-                });
-            return array_json
-                && matches!(&expression.kind,
-                ExprKind::Cast { expr: inner, .. } if self.json_list_provenance(Some(&cast.expr), inner, scope));
-        }
-        let source_id = match source {
-            Some(ast::Expr::Identifier(ident)) => scope.resolve(None, &ident.value).ok(),
-            Some(ast::Expr::CompoundIdentifier(parts)) if parts.parts.len() >= 2 => {
-                let n = parts.parts.len();
-                scope
-                    .resolve(Some(&parts.parts[n - 2].value), &parts.parts[n - 1].value)
-                    .ok()
-            }
-            _ => None,
-        };
-        if let Some((column_id, _, _)) = source_id {
-            return self.factory.borrow().has_json_list_provenance(column_id);
-        }
-        match &expression.kind {
-            // Internal output adapters and materialized binding coercions do
-            // not establish proof. The original source must establish it.
-            ExprKind::Cast { expr: inner, .. } => self.json_list_provenance(source, inner, scope),
-            ExprKind::ColumnRef { column_id, .. } => {
-                self.factory.borrow().has_json_list_provenance(*column_id)
-            }
-            ExprKind::Nested(inner) => self.json_list_provenance(
-                source.and_then(|source| match source {
-                    ast::Expr::Nested(nested) => Some(nested.expression.as_ref()),
-                    _ => None,
-                }),
-                inner,
-                scope,
-            ),
-            ExprKind::FunctionCall { binding, args, .. }
-                if binding.function_id.as_str() == "builtin.scalar/__array_literal/v1" =>
-            {
-                let Some(ast::Expr::Array(array)) = source else {
-                    return false;
-                };
-                self.json_array_elements_provenance(array, args, scope)
-            }
-            ExprKind::FunctionCall { binding, args, .. }
-                if binding.function_id.as_str() == "builtin.scalar/array_sortby/v1" =>
-            {
-                let Some(ast::Expr::FunctionCall(function)) = source else {
-                    return false;
-                };
-                function
-                    .arguments
-                    .first()
-                    .zip(args.first())
-                    .is_some_and(|(source, value)| {
-                        self.json_list_provenance(Some(source), value, scope)
-                    })
-            }
-            ExprKind::AggregateCall { resolved, args, .. }
-                if resolved.function_id.as_str() == "builtin.aggregate/array_agg/v1" =>
-            {
-                let Some(ast::Expr::FunctionCall(function)) = source else {
-                    return false;
-                };
-                function
-                    .arguments
-                    .first()
-                    .zip(args.first())
-                    .is_some_and(|(source, value)| {
-                        self.logical_output_type(Some(source), value, scope) == Some(SqlType::Json)
-                    })
-            }
-            ExprKind::WindowCall {
-                aggregate_binding: Some(binding),
-                args,
-                ..
-            } if binding.function_id.as_str() == "builtin.aggregate/array_agg/v1" => {
-                let Some(ast::Expr::FunctionCall(function)) = source else {
-                    return false;
-                };
-                function
-                    .arguments
-                    .first()
-                    .zip(args.first())
-                    .is_some_and(|(source, value)| {
-                        self.logical_output_type(Some(source), value, scope) == Some(SqlType::Json)
-                    })
-            }
-            ExprKind::Case {
-                when_then,
-                else_expr,
-                ..
-            } => {
-                let Some(ast::Expr::Case(case)) = source else {
-                    return false;
-                };
-                let mut saw_json = false;
-                for (source, value) in case
-                    .results
-                    .iter()
-                    .zip(when_then.iter().map(|(_, value)| value))
-                    .chain(case.else_result.as_deref().zip(else_expr.as_deref()))
-                {
-                    if matches!(
-                        source,
-                        ast::Expr::Literal(ast::Literal {
-                            kind: ast::LiteralKind::Null,
-                            ..
-                        })
-                    ) {
-                        continue;
-                    }
-                    if !self.json_list_provenance(Some(source), value, scope) {
-                        return false;
-                    }
-                    saw_json = true;
-                }
-                saw_json
-            }
-            _ => false,
-        }
+        use novarocks_type_contract::{ValueKind, ValueLogicalType};
+        matches!(expression.value_type.value_type().kind(), ValueKind::List(item) if item.domain() == Some(ValueLogicalType::Json))
     }
-
-    pub(super) fn json_array_elements_provenance(
-        &self,
-        array: &ast::ArrayExpr,
-        args: &[TypedExpr],
-        scope: &AnalyzerScope,
-    ) -> bool {
-        if array.element_type.as_ref().is_some_and(|target| {
-            !target.name.parts.last().is_some_and(|part| {
-                matches!(part.value.to_ascii_lowercase().as_str(), "json" | "jsonb")
-            })
-        }) {
-            return false;
-        }
-        if array.elements.len() != args.len() {
-            return false;
-        }
-        let mut saw_json = false;
-        let all_json = array.elements.iter().zip(args).all(|(source, value)| {
-            if matches!(
-                source,
-                ast::Expr::Literal(ast::Literal {
-                    kind: ast::LiteralKind::Null,
-                    ..
-                })
-            ) {
-                return true;
-            }
-            let json = self.logical_output_type(Some(source), value, scope) == Some(SqlType::Json);
-            saw_json |= json;
-            json
-        });
-        all_json && (saw_json || array.element_type.is_some())
-    }
-
-    /// Keep scalar/aggregate bindings exact. The ordinary output CAST adapts
-    /// the List item's semantic field metadata. An explicitly typed empty
-    /// JSON literal also materializes its Utf8 item carrier without any values.
-    pub(super) fn adapt_json_list_output(
-        &self,
-        expression: TypedExpr,
-        json_input: bool,
-        span: Span,
-    ) -> Result<TypedExpr, AnalyzeError> {
-        if !json_input {
-            return Ok(expression);
-        }
-        let binding = match &expression.kind {
-            ExprKind::AggregateCall { resolved, .. } => Some(resolved),
-            ExprKind::FunctionCall { binding, .. } => Some(binding),
-            ExprKind::WindowCall {
-                aggregate_binding, ..
-            } => aggregate_binding.as_ref(),
-            _ => None,
-        };
-        if !binding.is_some_and(|binding| {
-            matches!(
-                binding.function_id.as_str(),
-                "builtin.aggregate/array_agg/v1"
-                    | "builtin.scalar/__array_literal/v1"
-                    | "builtin.scalar/array_sortby/v1"
-            )
-        }) {
-            return Ok(expression);
-        }
-        let DataType::List(item) = &expression.value_type.data_type else {
-            return Err(AnalyzeError::type_mismatch(
-                "JSON list producer binding must declare a List result",
-                span,
-            ));
-        };
-        let empty_json_literal = matches!(&expression.kind,
-            ExprKind::FunctionCall { binding, args, .. }
-                if binding.function_id.as_str() == "builtin.scalar/__array_literal/v1" && args.is_empty());
-        if item.data_type() != &DataType::Utf8
-            && !(empty_json_literal && item.data_type() == &DataType::Null)
-        {
-            return Err(AnalyzeError::type_mismatch(
-                "JSON list elements must use their declared Utf8 physical carrier",
-                span,
-            ));
-        }
-        let target = DataType::List(std::sync::Arc::new(field_with_logical_type(
-            Field::new(item.name(), DataType::Utf8, item.is_nullable()),
-            LogicalType::Json,
-        )));
-        let mut value_type = expression.value_type.clone();
-        value_type.data_type = target.clone();
-        Ok(TypedExpr {
-            kind: ExprKind::Cast {
-                expr: Box::new(expression),
-                target: target.clone(),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type,
-        })
-    }
-}
-
-// Compatibility checks consume a supplied logical authority; they never infer
-// one from the physical carrier. Offset-width adaptations retain the same
-// String/Binary/Json domain, while conversions to another family clear it.
-fn logical_carrier_matches(domain: &SqlType, carrier: &DataType) -> bool {
-    use arrow::datatypes::TimeUnit;
-    match (domain, carrier) {
-        (SqlType::String | SqlType::Json, DataType::Utf8 | DataType::LargeUtf8)
-        | (
-            SqlType::Binary
-            | SqlType::Hll
-            | SqlType::Bitmap
-            | SqlType::Object
-            | SqlType::Percentile,
-            DataType::Binary | DataType::LargeBinary,
-        )
-        | (SqlType::Variant, DataType::LargeBinary)
-        | (SqlType::TinyInt, DataType::Int8)
-        | (SqlType::SmallInt, DataType::Int16)
-        | (SqlType::Int, DataType::Int32)
-        | (SqlType::BigInt, DataType::Int64)
-        | (SqlType::LargeInt, DataType::FixedSizeBinary(16))
-        | (SqlType::Float, DataType::Float32)
-        | (SqlType::Double, DataType::Float64)
-        | (SqlType::Boolean, DataType::Boolean)
-        | (SqlType::Date, DataType::Date32)
-        | (SqlType::Time, DataType::Time64(TimeUnit::Microsecond))
-        | (SqlType::DateTime, DataType::Timestamp(TimeUnit::Microsecond, _))
-        | (SqlType::DateTimeNs, DataType::Timestamp(TimeUnit::Nanosecond, _)) => true,
-        (
-            SqlType::Decimal { precision, scale },
-            DataType::Decimal128(p, s) | DataType::Decimal256(p, s),
-        ) => precision == p && scale == s,
-        (
-            SqlType::Array(item),
-            DataType::List(field) | DataType::LargeList(field) | DataType::FixedSizeList(field, _),
-        ) => logical_carrier_matches(item, field.data_type()),
-        (SqlType::Map(key, value), DataType::Map(entries, _)) => match entries.data_type() {
-            DataType::Struct(fields) if fields.len() == 2 => {
-                logical_carrier_matches(key, fields[0].data_type())
-                    && logical_carrier_matches(value, fields[1].data_type())
-            }
-            _ => false,
-        },
-        (SqlType::Struct(expected), DataType::Struct(actual)) => {
-            expected.len() == actual.len()
-                && expected.iter().zip(actual).all(|((name, domain), field)| {
-                    name == field.name() && logical_carrier_matches(domain, field.data_type())
-                })
-        }
-        _ => false,
-    }
-}
-fn is_null_value(source: Option<&ast::Expr>, value: &TypedExpr) -> bool {
-    if value.value_type.data_type == DataType::Null {
-        return true;
-    }
-    match &value.kind {
-        ExprKind::Literal(crate::analysis::LiteralValue::Null) => return true,
-        ExprKind::Cast { expr, .. } | ExprKind::Nested(expr) if is_null_value(None, expr) => {
-            return true;
-        }
-        _ => {}
-    }
-    matches!(
-        source,
-        Some(ast::Expr::Literal(ast::Literal {
-            kind: ast::LiteralKind::Null,
-            ..
-        }))
-    )
 }
 
 #[cfg(test)]
@@ -593,7 +148,7 @@ mod scalar_domain_tests {
                                 "entries",
                                 DataType::Struct(
                                     vec![
-                                        Field::new("key", DataType::Utf8, true),
+                                        Field::new("key", DataType::Utf8, false),
                                         Field::new("value", DataType::Binary, true),
                                     ]
                                     .into(),
@@ -653,9 +208,16 @@ mod scalar_domain_tests {
         CONTROL.get_or_init(crate::compiler::SqlCompileControl::unbounded)
     }
     fn context(factory: Rc<RefCell<ColumnRefFactory>>) -> AnalyzerContext<'static> {
+        context_with_control(factory, fixture_control())
+    }
+    fn context_with_control<'a>(
+        factory: Rc<RefCell<ColumnRefFactory>>,
+        control: &'a crate::compiler::SqlCompileControl,
+    ) -> AnalyzerContext<'a> {
         AnalyzerContext {
+            materialized_values: None,
             constant_policy: crate::constant::test_constant_policy(),
-            control: fixture_control(),
+            control,
             catalog: &Catalog,
             current_database: "db",
             function_catalog: crate::functions::builtin_sql_function_catalog(),
@@ -684,115 +246,164 @@ mod scalar_domain_tests {
         );
         assert_eq!(
             output_domains("select array<varchar>[json_object('k',1)],array<json>['plain']"),
-            vec![Some(SqlType::Array(Box::new(SqlType::String))); 2],
+            vec![
+                Some(SqlType::Array(Box::new(SqlType::String))),
+                Some(SqlType::Array(Box::new(SqlType::String)))
+            ],
         );
         assert_eq!(
             output_domains("select cast(['plain'] as array<json>)"),
-            vec![None],
+            vec![Some(SqlType::Array(Box::new(SqlType::String)))],
         );
+        let sql = "select array<json>['{}'],array<json>[parse_json('{}')]";
+        assert_eq!(
+            output_domains(sql),
+            vec![
+                Some(SqlType::Array(Box::new(SqlType::String))),
+                Some(SqlType::Array(Box::new(SqlType::Json)))
+            ]
+        );
+        let expressions = output_expressions(sql);
+        assert_eq!(domain_at(&expressions[0], &[0]), None);
+        assert_eq!(
+            domain_at(&expressions[1], &[0]),
+            Some(novarocks_type_contract::ValueLogicalType::Json)
+        );
+        for expression in expressions {
+            let ExprKind::FunctionCall { binding, .. } = &expression.kind else {
+                panic!("literal owner");
+            };
+            let novarocks_functions::FunctionResultType::Scalar(result) =
+                &binding.selected.result_type
+            else {
+                panic!("scalar");
+            };
+            assert_eq!(result, &expression.value_type);
+            let DataType::List(item) = expression.value_type.data_type() else {
+                panic!("list");
+            };
+            assert_eq!(item.metadata().capacity(), 0);
+        }
+    }
+
+    fn domain_at(
+        expression: &TypedExpr,
+        path: &[usize],
+    ) -> Option<novarocks_type_contract::ValueLogicalType> {
+        let mut value = expression.value_type.value_type();
+        for &index in path {
+            value = value.child_type_at(index).expect("actual semantic child");
+        }
+        value.domain()
+    }
+
+    fn typed_row_fixture(value: TypedExpr) -> (AnalyzerContext<'static>, AnalyzerScope, TypedExpr) {
+        let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
+        let scope = AnalyzerScope::new(factory.clone());
+        let context = context(factory);
+        let bound = super::super::resolve_expr::resolved_scalar_call_at(
+            context.function_catalog,
+            "row",
+            vec![value],
+            Span::new(0, 0),
+            context.sql_semantics.sql_mode().decimal_overflow_policy(),
+            context.constant_policy,
+            context.control,
+        )
+        .unwrap();
+        (context, scope, bound)
+    }
+    fn typed_list_source(json: bool, item_nullable: bool) -> TypedExpr {
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: crate::column_id::ColumnRefFactory::new().create(
+                    None,
+                    "source".into(),
+                    crate::test_value_types::string_list(item_nullable, json, false),
+                ),
+                qualifier: None,
+                column: "source".into(),
+            },
+            value_type: crate::test_value_types::string_list(item_nullable, json, false),
+        }
     }
 
     #[test]
-    fn m07_json_list_missing_marker_requires_its_independent_source_witness() {
-        for (marker, witness, accepted) in [
-            (None, false, false),
-            (None, true, true),
-            (Some("json"), false, true),
-            (Some("json"), true, true),
-            (Some("unknown"), true, false),
-            (Some("hll"), true, false),
-        ] {
-            let item = Field::new("item", DataType::Utf8, true);
-            let item = match marker {
-                Some(value) => item.with_metadata(
-                    [(
-                        novarocks_types::logical::NR_LOGICAL_TYPE_KEY.to_owned(),
-                        value.to_owned(),
-                    )]
-                    .into(),
-                ),
-                None => item,
-            };
-            let carrier = DataType::List(Arc::new(item));
-            let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
-            let id = factory.borrow_mut().create(
-                None,
-                "source".into(),
-                novarocks_type_contract::FunctionValueType::new(carrier.clone(), true),
-            );
-            factory
-                .borrow_mut()
-                .set_logical_type(id, Some(SqlType::Array(Box::new(SqlType::Json))));
-            factory.borrow_mut().set_json_list_provenance(id, witness);
-            let scope = AnalyzerScope::new(factory.clone());
-            let context = context(factory);
-            let source = TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: id,
-                    qualifier: None,
-                    column: "source".into(),
-                },
-                value_type: novarocks_type_contract::FunctionValueType::new(carrier, true),
-            };
-            if witness && !accepted {
-                // A binding coercion must not hide the original conflicting
-                // item marker behind an ordinary List<Utf8> argument.
-                let target = DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
-                let coerced = TypedExpr {
-                    kind: ExprKind::Cast {
-                        expr: Box::new(source.clone()),
-                        target: target.clone(),
-                        decimal_overflow_policy:
-                            novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-                    },
-                    value_type: novarocks_type_contract::FunctionValueType::new(target, true),
-                };
-                let bound = super::super::resolve_expr::resolved_scalar_call_at(
-                    context.function_catalog,
-                    "row",
-                    vec![coerced],
-                    Span::new(0, 0),
-                    context.sql_semantics.sql_mode().decimal_overflow_policy(),
-                    context.constant_policy,
-                    context.control,
-                )
+    fn typed_wrapper_selected_full_binding_is_the_only_domain_author() {
+        for json in [false, true] {
+            let source = typed_list_source(json, false);
+            let (context, scope, bound) = typed_row_fixture(source.clone());
+            let before = bound.clone();
+            let adapted = context
+                .adapt_bound_output_domains(bound, None, &scope, Span::new(0, 0))
                 .unwrap();
-                assert!(
-                    context
-                        .adapt_bound_output_domains(bound, None, &scope, Span::new(0, 0))
-                        .is_err()
-                );
-            }
-            let bound = super::super::resolve_expr::resolved_scalar_call_at(
-                context.function_catalog,
-                "row",
-                vec![source],
-                Span::new(0, 0),
-                context.sql_semantics.sql_mode().decimal_overflow_policy(),
-                context.constant_policy,
-                context.control,
-            )
-            .unwrap();
-            let result = context.adapt_bound_output_domains(bound, None, &scope, Span::new(0, 0));
+            assert_eq!(adapted.value_type, before.value_type);
+            let ExprKind::FunctionCall { binding, args, .. } = &adapted.kind else {
+                panic!("original call");
+            };
+            let ExprKind::FunctionCall {
+                binding: original, ..
+            } = &before.kind
+            else {
+                panic!("original selection");
+            };
+            assert_eq!(binding.resolved(), original.resolved());
+            assert_eq!(args[0].value_type, source.value_type);
+            let child = adapted
+                .value_type
+                .value_type()
+                .child_type_at(0)
+                .unwrap()
+                .child_type_at(0)
+                .unwrap();
             assert_eq!(
-                result.is_ok(),
-                accepted,
-                "marker={marker:?} witness={witness}: {result:?}"
+                child.domain(),
+                json.then_some(novarocks_type_contract::ValueLogicalType::Json)
             );
-            if accepted {
-                let result = result.unwrap();
-                let DataType::Struct(fields) = result.value_type.data_type else {
-                    panic!("row result");
-                };
-                let DataType::List(item) = fields[0].data_type() else {
-                    panic!("list result");
-                };
-                assert_eq!(
-                    novarocks_types::logical::logical_type_of_field(item),
-                    Some(LogicalType::Json)
-                );
-            }
+            assert!(!child.nullable());
+            let DataType::Struct(fields) = adapted.value_type.data_type() else {
+                panic!("row");
+            };
+            let DataType::List(item) = fields[0].data_type() else {
+                panic!("list");
+            };
+            assert_eq!(item.name(), "item");
+            assert_eq!(item.metadata().capacity(), 0);
         }
+    }
+
+    #[test]
+    fn typed_wrapper_rejects_actual_domain_child_null_and_selected_result_drift() {
+        let (context, scope, bound) = typed_row_fixture(typed_list_source(true, false));
+        for replacement in [
+            crate::test_value_types::string_list(false, false, false),
+            crate::test_value_types::string_list(true, true, false),
+        ] {
+            let mut changed = bound.clone();
+            let ExprKind::FunctionCall { args, .. } = &mut changed.kind else {
+                panic!("row");
+            };
+            args[0].value_type = replacement;
+            assert!(
+                context
+                    .adapt_bound_output_domains(changed, None, &scope, Span::new(0, 0))
+                    .unwrap_err()
+                    .to_string()
+                    .contains("complete selected binding")
+            );
+        }
+        let mut changed = bound.clone();
+        changed.value_type = changed
+            .value_type
+            .with_nullable(!changed.value_type.nullable())
+            .unwrap();
+        assert!(
+            context
+                .adapt_bound_output_domains(changed, None, &scope, Span::new(0, 0))
+                .unwrap_err()
+                .to_string()
+                .contains("wrapper result")
+        );
     }
 
     #[test]
@@ -874,107 +485,281 @@ mod scalar_domain_tests {
         );
         assert_eq!(
             output_domains("select coalesce(null,null),case when true then null else null end"),
-            vec![None, None]
+            vec![None, Some(SqlType::String)]
         );
     }
 
     #[test]
     fn m07_scalar_mixed_values_and_explicit_string_cast_never_guess_json_or_opaque() {
+        // IF's installed selection still refuses distinct nominal arguments;
+        // the CASE syntax owner independently selects explicit byte erasure.
+        let error = super::super::analyze(&query("select if(true,h,b) from t"), &Catalog, "db")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no matching declared overload"),
+            "{error}"
+        );
+        let sql = "select case when true then h else b end from t";
+        assert_eq!(output_domains(sql), vec![Some(SqlType::Binary)]);
+        let expression = output_expressions(sql).remove(0);
+        assert_eq!(
+            expression.value_type,
+            novarocks_type_contract::FunctionValueType::new(DataType::Binary, true)
+        );
+        let ExprKind::Case {
+            when_then,
+            else_expr,
+            ..
+        } = &expression.kind
+        else {
+            panic!("actual CASE owner");
+        };
+        for (converted, original_domain) in [
+            (
+                &when_then[0].1,
+                novarocks_type_contract::ValueLogicalType::Hll,
+            ),
+            (
+                else_expr.as_deref().unwrap(),
+                novarocks_type_contract::ValueLogicalType::Bitmap,
+            ),
+        ] {
+            let ExprKind::FunctionCall { binding, args, .. } = &converted.kind else {
+                panic!("real selected erasure");
+            };
+            assert_eq!(
+                binding.function_id.as_str(),
+                novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_FUNCTION_ID
+            );
+            assert_eq!(
+                binding.selected.overload.as_str(),
+                "builtin.scalar/value_domain_conversion/opaque_to_binary_same_structure/v1"
+            );
+            let novarocks_functions::FunctionResultType::Scalar(result) =
+                &binding.selected.result_type
+            else {
+                panic!("scalar");
+            };
+            assert_eq!(result, &converted.value_type);
+            assert_eq!(converted.value_type, expression.value_type);
+            assert_eq!(args[0].value_type.logical_type(), original_domain);
+            let novarocks_functions::FunctionArgumentType::Value(formal) =
+                &binding.selected.argument_types[0]
+            else {
+                panic!("value formal");
+            };
+            assert_eq!(&args[0].value_type, formal);
+            let original_arguments = args
+                .iter()
+                .map(|argument| {
+                    crate::analysis::function_argument(
+                        argument,
+                        crate::constant::test_constant_policy(),
+                        fixture_control(),
+                    )
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            crate::functions::build_builtin_engine_function_catalog()
+                .unwrap()
+                .validate_bound(
+                    binding.resolved(),
+                    novarocks_functions::FunctionBindingRequest {
+                        arguments: &original_arguments,
+                        logical_argument_count: original_arguments.len(),
+                        expected_result_type: Some(result),
+                    },
+                    fixture_control(),
+                )
+                .unwrap();
+        }
         assert_eq!(
             output_domains(
-                "select coalesce(j,s),ifnull(j,'plain'),if(true,h,b),case when true then h else b end,cast(j as varchar),cast(h as varbinary),cast(s as json) from t"
+                "select coalesce(j,s),ifnull(j,'plain'),cast(j as varchar),cast(h as varbinary),cast(s as json) from t"
             ),
-            vec![None; 7]
+            vec![
+                Some(SqlType::String),
+                Some(SqlType::String),
+                Some(SqlType::String),
+                Some(SqlType::Binary),
+                Some(SqlType::String)
+            ]
         );
         assert_eq!(
             output_domains("select cast(j as json),coalesce(cast(j as json),null) from t"),
             vec![Some(SqlType::Json); 2]
         );
-        // Explicit target spelling alone cannot make an arbitrary Utf8 a Json.
-        assert_eq!(output_domains("select cast('plain' as json)"), vec![None]);
+        // A JSON target declaration alone does not validate ordinary text.
+        // The actual existing parse_json owner is the independently checked
+        // author of a JSON value; no carrier Cast may sign that domain.
+        let value = output_expressions("select cast('plain' as json)").remove(0);
+        assert_eq!(
+            value.value_type.logical_type(),
+            novarocks_type_contract::ValueLogicalType::Physical
+        );
+        assert_eq!(
+            output_domains("select cast('plain' as json)"),
+            vec![Some(SqlType::String)]
+        );
+        let parsed = output_expressions("select parse_json('{}')").remove(0);
+        assert_eq!(
+            parsed.value_type.logical_type(),
+            novarocks_type_contract::ValueLogicalType::Json
+        );
+        let ExprKind::FunctionCall { binding, .. } = &parsed.kind else {
+            panic!("real JSON parser owner");
+        };
+        assert_eq!(binding.function_id.as_str(), "builtin.scalar/parse_json/v1");
     }
 
     #[test]
     fn m07_scalar_nullif_comparator_does_not_supply_the_returned_domain() {
+        let error =
+            super::super::analyze(&query("select nullif(h,b) from t"), &Catalog, "db").unwrap_err();
+        assert!(
+            error.to_string().contains("no matching declared overload"),
+            "{error}"
+        );
         assert_eq!(
-            output_domains("select nullif(h,b),nullif(j,s),nullif(s,j),nullif(null,j) from t"),
+            output_domains("select nullif(h,h),nullif(j,s),nullif(s,j),nullif(null,j) from t"),
             vec![
                 Some(SqlType::Hll),
-                Some(SqlType::Json),
                 Some(SqlType::String),
-                None
+                Some(SqlType::String),
+                Some(SqlType::Json)
             ]
+        );
+        let expression = output_expressions("select nullif(null,j) from t").remove(0);
+        let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
+            panic!("actual nullif owner");
+        };
+        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+        else {
+            panic!("scalar");
+        };
+        assert_eq!(result, &expression.value_type);
+        assert_eq!(
+            result.logical_type(),
+            novarocks_type_contract::ValueLogicalType::Json
+        );
+        assert!(args[0].value_type.nullable());
+        assert!(
+            super::super::value_conversion::constant_is_null(
+                &args[0],
+                crate::constant::test_constant_policy(),
+                fixture_control()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            args[1].value_type.logical_type(),
+            novarocks_type_contract::ValueLogicalType::Json
         );
     }
 
     #[test]
     fn m07_scalar_shadowed_spelling_cannot_use_builtin_value_preservation() {
-        let (resolved, _, factory) =
-            super::super::analyze(&query("select coalesce(j,null) from t"), &Catalog, "db")
-                .unwrap();
-        let crate::analysis::QueryBody::Select(select) = resolved.body else {
-            panic!("expected select")
+        let mut expression = output_expressions("select coalesce(j,null) from t").remove(0);
+        let ExprKind::FunctionCall { binding, args, .. } = &mut expression.kind else {
+            panic!("call");
         };
-        let mut expression = select.projection[0].expr.clone();
-        let ExprKind::FunctionCall { binding, name, .. } = &mut expression.kind else {
-            panic!("expected bound function")
-        };
-        assert_eq!(name, "coalesce");
-        // Keep the actual selected argument/result signature and surface name,
-        // but replace the producer identity as an external catalog would.
-        let mut shadowed = binding.resolved().clone();
-        shadowed.function_id =
+        let original = binding.resolved().clone();
+        let mut changed = original.clone();
+        changed.function_id =
             novarocks_functions::FunctionId::try_new("test.shadow/coalesce/v1").unwrap();
-        *binding =
-            crate::binding::SqlFunctionBinding::new(shadowed, binding.decimal_overflow_policy());
-        let factory = Rc::new(RefCell::new(factory));
+        let control = fixture_control();
+        let arguments = args
+            .iter()
+            .map(|arg| {
+                crate::analysis::function_argument(
+                    arg,
+                    crate::constant::test_constant_policy(),
+                    control,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let request = novarocks_functions::FunctionBindingRequest {
+            arguments: &arguments,
+            logical_argument_count: arguments.len(),
+            expected_result_type: None,
+        };
+        assert!(
+            crate::functions::build_builtin_engine_function_catalog()
+                .unwrap()
+                .validate_bound(&changed, request, control)
+                .is_err()
+        );
+        assert!(
+            crate::functions::build_builtin_engine_function_catalog()
+                .unwrap()
+                .validate_bound(&original, request, control)
+                .is_ok()
+        );
+        let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         let scope = AnalyzerScope::new(factory.clone());
         assert_eq!(
-            context(factory).logical_output_type(None, &expression, &scope),
-            None
+            context(factory)
+                .logical_output_type(None, &expression, &scope)
+                .unwrap(),
+            Some(SqlType::Json)
         );
     }
 
     #[test]
     fn m07_scalar_implicit_offset_adaptation_preserves_authority_but_family_change_clears_it() {
         let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
-        let id = factory.borrow_mut().create(
-            None,
-            "j".into(),
-            novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
-        );
-        factory
-            .borrow_mut()
-            .set_logical_type(id, Some(SqlType::Json));
         let scope = AnalyzerScope::new(factory.clone());
         let context = context(factory);
-        let column = TypedExpr {
+        let json = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+            DataType::Utf8,
+            true,
+            novarocks_type_contract::ValueLogicalType::Json,
+        )
+        .unwrap();
+        let expression = TypedExpr {
             kind: ExprKind::ColumnRef {
-                column_id: id,
+                column_id: crate::column_id::ColumnId::UNSET,
                 qualifier: None,
                 column: "j".into(),
             },
-            value_type: novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
-        };
-        let cast = |target: DataType| TypedExpr {
-            kind: ExprKind::Cast {
-                expr: Box::new(column.clone()),
-                target: target.clone(),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(target, true),
+            value_type: json,
         };
         assert_eq!(
-            context.logical_output_type(None, &cast(DataType::LargeUtf8), &scope),
+            context
+                .logical_output_type(None, &expression, &scope)
+                .unwrap(),
             Some(SqlType::Json)
         );
-        assert_eq!(
-            context.logical_output_type(None, &cast(DataType::Binary), &scope),
-            None
+        // JSON's installed profile remains Utf8-only. Ordinary String offsets
+        // have one semantic declaration without widening that capability.
+        assert!(
+            novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                DataType::LargeUtf8,
+                true,
+                novarocks_type_contract::ValueLogicalType::Json
+            )
+            .is_err()
         );
+        for target in [DataType::Utf8, DataType::LargeUtf8] {
+            let expression = TypedExpr {
+                kind: ExprKind::ColumnRef {
+                    column_id: crate::column_id::ColumnId::UNSET,
+                    qualifier: None,
+                    column: "s".into(),
+                },
+                value_type: novarocks_type_contract::FunctionValueType::new(target, true),
+            };
+            assert_eq!(
+                context
+                    .logical_output_type(None, &expression, &scope)
+                    .unwrap(),
+                Some(SqlType::String)
+            );
+        }
         assert_eq!(
-            context.logical_output_type(None, &cast(DataType::Utf8), &scope),
-            Some(SqlType::Json)
+            output_domains("select cast(j as varchar),cast(h as varbinary) from t"),
+            vec![Some(SqlType::String), Some(SqlType::Binary)]
         );
     }
 
@@ -1020,10 +805,10 @@ mod scalar_domain_tests {
                 "select lead(j,1,s) over (),lag(s,1,j) over (),lead(h,1,b) over (),lag(b,1,h) over (),lead(j,1,cast(null as varchar)) over (),first_value(cast(j as varchar)) over (),lag(cast(j as varchar),1,j) over () from t"
             ),
             vec![
+                Some(SqlType::Json),
                 Some(SqlType::String),
-                Some(SqlType::String),
-                Some(SqlType::Binary),
-                Some(SqlType::Binary),
+                Some(SqlType::Hll),
+                Some(SqlType::Bitmap),
                 Some(SqlType::Json),
                 Some(SqlType::String),
                 Some(SqlType::String)
@@ -1061,42 +846,70 @@ mod scalar_domain_tests {
             else {
                 panic!("scalar selection")
             };
-            assert_eq!(result.data_type, selected.value_type.data_type);
-            let DataType::List(output) = &expression.value_type.data_type else {
+            assert_eq!(result.data_type(), selected.value_type.data_type());
+            let DataType::List(output) = &expression.value_type.data_type() else {
                 panic!("list output")
             };
-            let DataType::List(input) = &args[0].value_type.data_type else {
+            let DataType::List(input) = &args[0].value_type.data_type() else {
                 panic!("list input")
             };
             assert_eq!(output.name(), input.name());
             assert_eq!(output.is_nullable(), input.is_nullable());
             assert_eq!(output.data_type(), input.data_type());
+            assert_eq!(output.metadata().capacity(), 0);
             assert_eq!(
-                novarocks_types::logical::logical_type_of_field(output),
-                Some(LogicalType::Bitmap)
+                domain_at(&expression, &[0]),
+                Some(novarocks_type_contract::ValueLogicalType::Bitmap)
             );
         }
         let expression =
             output_expressions("select first_value(row(null,to_bitmap(1))) over ()").remove(0);
-        let DataType::Struct(fields) = &expression.value_type.data_type else {
+        let DataType::Struct(fields) = &expression.value_type.data_type() else {
             panic!("struct output")
         };
         assert_eq!(fields[0].data_type(), &DataType::Null);
         assert_eq!(fields[0].name(), "col1");
         assert_eq!(fields[1].name(), "col2");
+        assert_eq!(fields[1].metadata().capacity(), 0);
         assert_eq!(
-            novarocks_types::logical::logical_type_of_field(&fields[1]),
-            Some(LogicalType::Bitmap)
+            domain_at(&expression, &[1]),
+            Some(novarocks_type_contract::ValueLogicalType::Bitmap)
         );
         assert_eq!(
             output_domains("select first_value(row(null,to_bitmap(1))) over ()"),
             vec![None]
         );
-        // Current default-argument admission rejects these different nested
-        // carriers before binding. Domain forwarding must not widen that owner.
-        let mixed = "with q as (select [parse_json('{}')] as j,['plain'] as s) select lead(j,1,s) over () from q";
-        let error = super::super::analyze(&query(mixed), &Catalog, "db").unwrap_err();
-        assert!(error.to_string().contains("third parameter"), "{error}");
+        let sql = "with q as (select [parse_json('{}')] as j,['plain'] as s) select lead(j,1,s) over () from q";
+        let expression = output_expressions(sql).remove(0);
+        let ExprKind::WindowCall { binding, args, .. } = &original_window(&expression).kind else {
+            panic!("actual window");
+        };
+        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+        else {
+            panic!("scalar");
+        };
+        assert_eq!(&expression.value_type, result);
+        assert_eq!(
+            domain_at(&expression, &[0]),
+            Some(novarocks_type_contract::ValueLogicalType::Json)
+        );
+        for (actual, formal) in args.iter().zip(binding.selected.argument_types.iter()) {
+            let novarocks_functions::FunctionArgumentType::Value(formal) = formal else {
+                panic!("actual value argument");
+            };
+            assert!(
+                actual
+                    .value_type
+                    .fits_physical_binding_observed(formal, || Ok::<(), std::convert::Infallible>(
+                        ()
+                    ))
+                    .unwrap()
+            );
+        }
+        assert_eq!(
+            output_domains(sql),
+            vec![Some(SqlType::Array(Box::new(SqlType::Json)))]
+        );
     }
 
     #[test]
@@ -1124,9 +937,7 @@ mod scalar_domain_tests {
         ] {
             let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
             assert!(
-                error
-                    .to_string()
-                    .contains("LargeBinary requires its original logical identity"),
+                error.to_string().contains("no matching declared overload"),
                 "{error}"
             );
         }
@@ -1137,14 +948,14 @@ mod scalar_domain_tests {
             let ExprKind::WindowCall { args, .. } = &original_window(&expression).kind else {
                 unreachable!()
             };
-            let DataType::Struct(fields) = &expression.value_type.data_type else {
+            let DataType::Struct(fields) = &expression.value_type.data_type() else {
                 panic!("struct result")
             };
             assert_eq!(fields[0].data_type(), &DataType::Null);
             let DataType::Map(entries, sorted) = fields[1].data_type() else {
                 panic!("map sibling")
             };
-            let DataType::Struct(input) = &args[0].value_type.data_type else {
+            let DataType::Struct(input) = &args[0].value_type.data_type() else {
                 panic!("struct input")
             };
             let DataType::Map(input_entries, input_sorted) = input[1].data_type() else {
@@ -1165,9 +976,10 @@ mod scalar_domain_tests {
                 assert_eq!(actual.is_nullable(), input.is_nullable());
                 assert_eq!(actual.data_type(), input.data_type());
             }
+            assert_eq!(map_fields[1].metadata().capacity(), 0);
             assert_eq!(
-                novarocks_types::logical::logical_type_of_field(&map_fields[1]),
-                Some(LogicalType::Bitmap)
+                domain_at(&expression, &[1, 1]),
+                Some(novarocks_type_contract::ValueLogicalType::Bitmap)
             );
         }
         assert_eq!(output_domains(sql), vec![None; 2]);
@@ -1181,271 +993,382 @@ mod scalar_domain_tests {
             ),
             vec![Some(SqlType::Variant); 3]
         );
+        for sql in [
+            "select cast(s as variant) from t",
+            "select cast(j as variant) from t",
+            "select cast(X'AB01' as variant)",
+            "select cast(cast(v as varbinary) as variant) from t",
+        ] {
+            let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
+            assert_eq!(
+                error.kind(),
+                crate::analyze_error::AnalyzeErrorKind::TypeMismatch
+            );
+        }
         assert_eq!(
-            output_domains(
-                "select cast(s as variant),cast(j as variant),cast(X'AB01' as variant),cast(cast(v as varbinary) as variant),cast(v as varbinary) from t"
-            ),
-            vec![None; 5]
+            output_domains("select cast(v as varbinary) from t"),
+            vec![Some(SqlType::Binary)]
         );
         assert_eq!(
             output_domains(
-                "select first_value(cast(variant_get(parse_json('{\"a\":1}'),'$.a') as variant)) over (),last_value(cast(variant_get(parse_json('{\"a\":1}'),'$.a') as variant)) over ()"
+                "select first_value(cast(variant_get(v,'$.a') as variant)) over (),last_value(cast(variant_get(v,'$.a') as variant)) over () from t"
             ),
             vec![Some(SqlType::Variant); 2]
-        );
-        let sql = "select first_value(cast(variant_get(parse_json('{\"a\":1}'),'$.a') as variant)) over ()";
-        let expression = output_expressions(sql).remove(0);
-        let selected = original_window(&expression);
-        let ExprKind::WindowCall { binding, args, .. } = &selected.kind else {
-            panic!("window")
-        };
-        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
-        else {
-            panic!("scalar")
-        };
-        assert_eq!(result.data_type, DataType::LargeBinary);
-        assert_eq!(selected.value_type.data_type, result.data_type);
-        let ExprKind::Cast { expr, target, .. } = &args[0].kind else {
-            panic!("public CAST")
-        };
-        assert_eq!(target, &DataType::LargeBinary);
-        assert_eq!(expr.value_type.data_type, DataType::LargeBinary);
-        let ExprKind::FunctionCall { binding, .. } = &expr.kind else {
-            panic!("original producer")
-        };
-        assert_eq!(
-            binding.function_id.as_str(),
-            "builtin.scalar/variant_get/v1"
         );
     }
 
     #[test]
     fn m07_window_value_domains_require_exact_selected_binding_and_carrier() {
-        let (resolved, _, factory) = super::super::analyze(
-            &query("select first_value(parse_json('{}')) over ()"),
-            &Catalog,
-            "db",
-        )
-        .unwrap();
-        let crate::analysis::QueryBody::Select(select) = resolved.body else {
-            panic!("select")
-        };
-        let original = original_window(&select.projection[0].expr).clone();
-        let factory = Rc::new(RefCell::new(factory));
-        let scope = AnalyzerScope::new(factory.clone());
-        let context = context(factory);
-        assert_eq!(
-            context.logical_output_type(None, &original, &scope),
-            Some(SqlType::Json)
-        );
-        for change in 0..3 {
-            let mut candidate = original.clone();
-            let ExprKind::WindowCall { binding, .. } = &mut candidate.kind else {
-                unreachable!()
-            };
-            let mut selected = binding.resolved().clone();
-            match change {
-                0 => {
-                    selected.function_id =
-                        novarocks_functions::FunctionId::try_new("test.shadow/first_value/v1")
-                            .unwrap()
-                }
-                1 => selected.kind = novarocks_functions::FunctionKind::Scalar,
-                _ => {
-                    let novarocks_functions::FunctionResultType::Scalar(result) =
-                        &mut selected.selected.result_type
-                    else {
-                        unreachable!()
-                    };
-                    result.data_type = DataType::Binary;
-                }
-            }
-            *binding = crate::binding::SqlFunctionBinding::new(
-                selected,
-                binding.decimal_overflow_policy(),
-            );
-            assert_eq!(context.logical_output_type(None, &candidate, &scope), None);
-            let before = format!("{:?}", candidate.kind);
-            let adapted = context
-                .adapt_bound_output_domains(candidate, None, &scope, Span::new(0, 0))
-                .unwrap();
-            assert_eq!(format!("{:?}", adapted.kind), before);
-        }
-        let ExprKind::WindowCall { binding, args, .. } = &original.kind else {
-            unreachable!()
+        let original = output_expressions("select first_value(parse_json('{}')) over ()").remove(0);
+        let (binding, args) = match &original.kind {
+            ExprKind::FunctionCall { binding, args, .. }
+            | ExprKind::WindowCall { binding, args, .. } => (binding, args),
+            _ => panic!("complete call"),
         };
         let selection = binding.resolved().clone();
-        let arguments = format!("{args:?}");
-        let adapted = context
+        let control = fixture_control();
+        let arguments = args
+            .iter()
+            .map(|arg| {
+                crate::analysis::function_argument(
+                    arg,
+                    crate::constant::test_constant_policy(),
+                    control,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let request = novarocks_functions::FunctionBindingRequest {
+            arguments: &arguments,
+            logical_argument_count: arguments.len(),
+            expected_result_type: None,
+        };
+        assert!(
+            crate::functions::build_builtin_engine_function_catalog()
+                .unwrap()
+                .validate_bound(&selection, request, control)
+                .is_ok()
+        );
+        for change in 0..5 {
+            let mut changed = selection.clone();
+            match change {
+                0 => {
+                    changed.function_id =
+                        novarocks_functions::FunctionId::try_new("test.shadow/complete/v1").unwrap()
+                }
+                1 => changed.kind = novarocks_functions::FunctionKind::Aggregate,
+                2 => {
+                    changed.selected.result_type = novarocks_functions::FunctionResultType::Scalar(
+                        novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+                    )
+                }
+                3 => changed.logical_argument_count = 0,
+                _ => {
+                    let novarocks_functions::FunctionResultType::Scalar(result) =
+                        &mut changed.selected.result_type
+                    else {
+                        panic!("scalar");
+                    };
+                    *result = result.with_nullable(!result.nullable()).unwrap();
+                }
+            }
+            assert!(
+                crate::functions::build_builtin_engine_function_catalog()
+                    .unwrap()
+                    .validate_bound(&changed, request, control)
+                    .is_err(),
+                "exact selected alteration {change}"
+            );
+        }
+        let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
+        let scope = AnalyzerScope::new(factory.clone());
+        let adapted = context(factory)
             .adapt_bound_output_domains(original.clone(), None, &scope, Span::new(0, 0))
             .unwrap();
-        let ExprKind::WindowCall { binding, args, .. } = &original_window(&adapted).kind else {
-            unreachable!()
-        };
-        assert_eq!(binding.resolved(), &selection);
-        assert_eq!(format!("{args:?}"), arguments);
+        assert_eq!(adapted.value_type, original.value_type);
+        assert_eq!(
+            format!("{:?}", adapted.kind),
+            format!("{:?}", original.kind)
+        );
     }
 
     #[test]
-    fn m07_window_input_coercion_cannot_wash_original_nested_markers() {
-        for sql in [
-            "select first_value(m) over () from t",
-            "select last_value(r) over () from t",
-        ] {
-            let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
-            assert!(
-                error.to_string().contains("logical identity differs"),
-                "{error}"
-            );
-        }
-        let (resolved, _, factory) = super::super::analyze(
-            &query("select first_value([to_bitmap(1)]) over ()"),
-            &Catalog,
-            "db",
-        )
-        .unwrap();
-        let crate::analysis::QueryBody::Select(select) = resolved.body else {
-            panic!("select")
+    fn typed_wrapper_keeps_original_formal_null_widening_and_refuses_inverse() {
+        let mut nullable = typed_list_source(true, false);
+        nullable.value_type = nullable.value_type.with_nullable(true).unwrap();
+        let (context, scope, mut bound) = typed_row_fixture(nullable);
+        let before = bound.value_type.clone();
+        let ExprKind::FunctionCall { args, .. } = &mut bound.kind else {
+            panic!("row");
         };
-        let mut original = original_window(&select.projection[0].expr).clone();
-        let ExprKind::WindowCall { args, .. } = &mut original.kind else {
-            unreachable!()
+        args[0].value_type = args[0].value_type.with_nullable(false).unwrap();
+        assert_eq!(
+            context
+                .adapt_bound_output_domains(bound, None, &scope, Span::new(0, 0))
+                .unwrap()
+                .value_type,
+            before
+        );
+        let (context, scope, mut bound) = typed_row_fixture(typed_list_source(true, false));
+        let ExprKind::FunctionCall { args, .. } = &mut bound.kind else {
+            panic!("row");
         };
-        let clean = args[0].clone();
-        let corrupted = DataType::List(Arc::new(
-            Field::new("item", DataType::Binary, true).with_metadata(
-                [(
-                    novarocks_types::logical::NR_LOGICAL_TYPE_KEY.to_owned(),
-                    "unknown".to_owned(),
-                )]
-                .into(),
-            ),
-        ));
-        let bad_source = TypedExpr {
-            kind: clean.kind.clone(),
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                corrupted,
-                clean.value_type.nullable,
-            ),
-        };
-        args[0] = TypedExpr {
-            kind: ExprKind::Cast {
-                expr: Box::new(bad_source),
-                target: clean.value_type.data_type.clone(),
-                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
-            },
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                clean.value_type.data_type,
-                clean.value_type.nullable,
-            ),
-        };
-        let factory = Rc::new(RefCell::new(factory));
-        let scope = AnalyzerScope::new(factory.clone());
-        let context = context(factory);
+        args[0].value_type = args[0].value_type.with_nullable(true).unwrap();
         assert!(
             context
-                .adapt_bound_output_domains(original, None, &scope, Span::new(0, 0))
+                .adapt_bound_output_domains(bound, None, &scope, Span::new(0, 0))
                 .unwrap_err()
                 .to_string()
-                .contains("unknown or incompatible logical marker")
+                .contains("complete selected binding")
+        );
+    }
+
+    #[test]
+    fn typed_wrapper_keeps_actual_sql_cancellation_and_deadline_without_tail() {
+        use crate::compiler::{SqlCancellationObservation, SqlCompileControl};
+        use novarocks_type_contract::CompileControlError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Observation {
+            polls: AtomicUsize,
+            cancel_at: Option<usize>,
+        }
+        impl SqlCancellationObservation for Observation {
+            fn is_cancelled(&self) -> bool {
+                let poll = self.polls.fetch_add(1, Ordering::SeqCst);
+                self.cancel_at.is_some_and(|at| poll >= at)
+            }
+        }
+        let (_, scope, bound) = typed_row_fixture(typed_list_source(true, false));
+        let observation = Arc::new(Observation {
+            polls: AtomicUsize::new(0),
+            cancel_at: None,
+        });
+        let control = SqlCompileControl::new(None, observation.clone());
+        let context =
+            context_with_control(Rc::new(RefCell::new(ColumnRefFactory::new())), &control);
+        context
+            .adapt_bound_output_domains(bound.clone(), None, &scope, Span::new(0, 0))
+            .unwrap();
+        let baseline = observation.polls.load(Ordering::SeqCst);
+        assert!(baseline >= 2);
+        for at in 0..baseline {
+            let observation = Arc::new(Observation {
+                polls: AtomicUsize::new(0),
+                cancel_at: Some(at),
+            });
+            let control = SqlCompileControl::new(None, observation.clone());
+            let context =
+                context_with_control(Rc::new(RefCell::new(ColumnRefFactory::new())), &control);
+            let error = context
+                .adapt_bound_output_domains(bound.clone(), None, &scope, Span::new(0, 0))
+                .unwrap_err();
+            assert_eq!(error.control_error(), Some(CompileControlError::Cancelled));
+            assert_eq!(observation.polls.load(Ordering::SeqCst), at + 1);
+        }
+        let observation = Arc::new(Observation {
+            polls: AtomicUsize::new(0),
+            cancel_at: None,
+        });
+        let control = SqlCompileControl::new(
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1)),
+            observation.clone(),
+        );
+        let context =
+            context_with_control(Rc::new(RefCell::new(ColumnRefFactory::new())), &control);
+        let error = context
+            .adapt_bound_output_domains(bound, None, &scope, Span::new(0, 0))
+            .unwrap_err();
+        assert_eq!(
+            error.control_error(),
+            Some(CompileControlError::DeadlineExceeded)
+        );
+        assert_eq!(observation.polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn typed_display_projection_keeps_actual_sql_cancellation_and_deadline_without_tail() {
+        use crate::compiler::{SqlCancellationObservation, SqlCompileControl};
+        use novarocks_type_contract::CompileControlError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Observation {
+            polls: AtomicUsize,
+            cancel_at: Option<usize>,
+        }
+        impl SqlCancellationObservation for Observation {
+            fn is_cancelled(&self) -> bool {
+                let poll = self.polls.fetch_add(1, Ordering::SeqCst);
+                self.cancel_at.is_some_and(|at| poll >= at)
+            }
+        }
+        let (_, scope, bound) = typed_row_fixture(typed_list_source(true, false));
+        let observation = Arc::new(Observation {
+            polls: AtomicUsize::new(0),
+            cancel_at: None,
+        });
+        let control = SqlCompileControl::new(None, observation.clone());
+        let context =
+            context_with_control(Rc::new(RefCell::new(ColumnRefFactory::new())), &control);
+        context.logical_output_type(None, &bound, &scope).unwrap();
+        let baseline = observation.polls.load(Ordering::SeqCst);
+        assert!(baseline >= 2);
+        for at in 0..baseline {
+            let observation = Arc::new(Observation {
+                polls: AtomicUsize::new(0),
+                cancel_at: Some(at),
+            });
+            let control = SqlCompileControl::new(None, observation.clone());
+            let context =
+                context_with_control(Rc::new(RefCell::new(ColumnRefFactory::new())), &control);
+            let error = context
+                .logical_output_type(None, &bound, &scope)
+                .unwrap_err();
+            assert_eq!(error.control_error(), Some(CompileControlError::Cancelled));
+            assert_eq!(observation.polls.load(Ordering::SeqCst), at + 1);
+        }
+        let observation = Arc::new(Observation {
+            polls: AtomicUsize::new(0),
+            cancel_at: None,
+        });
+        let control = SqlCompileControl::new(
+            Some(std::time::Instant::now() - std::time::Duration::from_millis(1)),
+            observation.clone(),
+        );
+        let context =
+            context_with_control(Rc::new(RefCell::new(ColumnRefFactory::new())), &control);
+        let error = context
+            .logical_output_type(None, &bound, &scope)
+            .unwrap_err();
+        assert_eq!(
+            error.control_error(),
+            Some(CompileControlError::DeadlineExceeded)
+        );
+        assert_eq!(observation.polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn typed_wrapper_transparent_cast_cannot_wash_original_nominal_child() {
+        let original = typed_list_source(true, false);
+        let target = crate::test_value_types::string_list(false, false, false);
+        let coerced = TypedExpr {
+            kind: ExprKind::Cast {
+                expr: Box::new(original),
+                target: target.data_type().clone(),
+                decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
+            },
+            value_type: target,
+        };
+        let (context, scope, bound) = typed_row_fixture(coerced);
+        let error = context
+            .adapt_bound_output_domains(bound, None, &scope, Span::new(0, 0))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("original nominal domain"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn typed_wrapper_keeps_genuine_explicit_json_to_text_conversion() {
+        let expression =
+            output_expressions("select row(cast(parse_json('{}') as varchar))").remove(0);
+        let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
+            panic!("row");
+        };
+        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+        else {
+            panic!("scalar");
+        };
+        assert_eq!(result, &expression.value_type);
+        assert_eq!(
+            args[0].value_type.logical_type(),
+            novarocks_type_contract::ValueLogicalType::Physical
+        );
+        assert_eq!(
+            expression
+                .value_type
+                .value_type()
+                .child_type_at(0)
+                .unwrap()
+                .domain(),
+            None
+        );
+        let mut conversion = &args[0];
+        while let ExprKind::Cast { expr, .. } = &conversion.kind {
+            conversion = expr;
+        }
+        let ExprKind::FunctionCall {
+            binding: conversion_binding,
+            args: original,
+            ..
+        } = &conversion.kind
+        else {
+            panic!("selected explicit conversion");
+        };
+        assert_eq!(
+            conversion_binding.function_id.as_str(),
+            novarocks_functions::builtin::value_conversion::VALUE_CONVERSION_FUNCTION_ID
+        );
+        assert_eq!(
+            conversion_binding.selected.overload.as_str(),
+            "builtin.scalar/value_domain_conversion/json_text_same_structure/v1"
+        );
+        assert_eq!(
+            original[0].value_type.logical_type(),
+            novarocks_type_contract::ValueLogicalType::Json
+        );
+        assert_eq!(
+            conversion.value_type.logical_type(),
+            novarocks_type_contract::ValueLogicalType::Physical
         );
     }
 
     #[test]
     fn m07_window_partial_null_value_keeps_known_origin_through_internal_cast() {
-        let (resolved, _, factory) = super::super::analyze(
-            &query("select first_value(row(null,to_bitmap(1))) over ()"),
-            &Catalog,
-            "db",
-        )
-        .unwrap();
-        let crate::analysis::QueryBody::Select(select) = resolved.body else {
-            panic!("select")
+        let original =
+            output_expressions("select first_value(row(null,to_bitmap(1))) over ()").remove(0);
+        let ExprKind::WindowCall { args, binding, .. } = &original_window(&original).kind else {
+            panic!("window");
         };
-        let mut selected_window = original_window(&select.projection[0].expr).clone();
-        let ExprKind::WindowCall { args, binding, .. } = &mut selected_window.kind else {
-            unreachable!()
+        let before = binding.resolved().clone();
+        let source = args[0].value_type.clone();
+        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+        else {
+            panic!("scalar");
         };
-        let value = args[0].clone();
-        let DataType::Struct(fields) = &value.value_type.data_type else {
-            panic!("struct")
-        };
-        let clean = DataType::Struct(
-            fields
-                .iter()
-                .map(|field| {
-                    Arc::new(Field::new(
-                        field.name(),
-                        field.data_type().clone(),
-                        field.is_nullable(),
-                    ))
-                })
-                .collect::<Vec<_>>()
-                .into(),
-        );
-        let coerced = TypedExpr {
+        assert_eq!(result, &original.value_type);
+        let value = TypedExpr {
             kind: ExprKind::Cast {
-                expr: Box::new(value),
-                target: clean.clone(),
+                expr: Box::new(original.clone()),
+                target: original.value_type.data_type().clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
-            value_type: novarocks_type_contract::FunctionValueType::new(
-                clean.clone(),
-                args[0].value_type.nullable,
-            ),
+            value_type: original.value_type.clone(),
         };
-        let factory = Rc::new(RefCell::new(factory));
+        let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
         let scope = AnalyzerScope::new(factory.clone());
         let context = context(factory);
-        // Resolve the real installed Window overload for the executable
-        // coerced argument. The provenance adapter must retain this selection.
-        let original_binding = context
-            .function_catalog
-            .resolve_window_binding(
-                "first_value",
-                &[crate::analysis::function_argument(
-                    &coerced,
-                    context.constant_policy,
-                    context.control,
-                )
-                .unwrap()],
-                context.control,
-            )
-            .unwrap();
-        *binding = crate::binding::SqlFunctionBinding::new(
-            original_binding.clone(),
-            binding.decimal_overflow_policy(),
-        );
-        *args = vec![coerced];
-        selected_window.value_type.data_type = clean;
         let adapted = context
-            .adapt_bound_output_domains(selected_window, None, &scope, Span::new(0, 0))
+            .adapt_bound_output_domains(value, None, &scope, Span::new(0, 0))
             .unwrap();
-        let DataType::Struct(fields) = &adapted.value_type.data_type else {
-            panic!("struct")
+        assert_eq!(
+            context.logical_output_type(None, &adapted, &scope).unwrap(),
+            None
+        );
+        let DataType::Struct(fields) = adapted.value_type.data_type() else {
+            panic!("struct");
         };
         assert_eq!(fields[0].data_type(), &DataType::Null);
         assert_eq!(fields[1].name(), "col2");
+        assert_eq!(fields[1].metadata().capacity(), 0);
         assert_eq!(
-            novarocks_types::logical::logical_type_of_field(&fields[1]),
-            Some(LogicalType::Bitmap)
+            domain_at(&adapted, &[1]),
+            Some(novarocks_type_contract::ValueLogicalType::Bitmap)
         );
-        let ExprKind::WindowCall { binding, args, .. } = &original_window(&adapted).kind else {
-            unreachable!()
+        let ExprKind::WindowCall { args, binding, .. } = &original_window(&adapted).kind else {
+            panic!("window");
         };
-        assert_eq!(binding.resolved(), &original_binding);
-        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
-        else {
-            panic!("scalar")
-        };
-        assert_eq!(result.data_type, args[0].value_type.data_type);
-        assert_eq!(
-            novarocks_types::logical::logical_type_of_field(match &result.data_type {
-                DataType::Struct(fields) => &fields[1],
-                _ => panic!("selected struct"),
-            }),
-            None
-        );
+        assert_eq!(binding.resolved(), &before);
+        assert_eq!(args[0].value_type, source);
     }
 
     #[test]
@@ -1473,14 +1396,19 @@ mod scalar_domain_tests {
                 V::Opaque(O::Bitmap),
             ),
             (
+                "select first_value(hll_hash('x')) over ()",
+                D::Hll,
+                V::Opaque(O::Hll),
+            ),
+            (
                 "select lead(parse_json('{}'),1,null) over ()",
                 D::Json,
                 V::Json,
             ),
             (
                 "select lag(parse_json('{}'),1,'plain') over ()",
-                D::Plain,
-                V::String,
+                D::Json,
+                V::Json,
             ),
             (
                 "select lead('plain',1,parse_json('{}')) over ()",
@@ -1488,17 +1416,17 @@ mod scalar_domain_tests {
                 V::String,
             ),
             (
-                "select first_value(cast(variant_get(parse_json('{\"a\":1}'),'$.a') as variant)) over ()",
+                "select first_value(cast(variant_get(cast(null as variant),'$.a') as variant)) over ()",
                 D::Variant,
                 V::Variant,
             ),
             (
-                "with q as (select variant_get(parse_json('{\"a\":1}'),'$.a') as v) select lead(v,1,cast(v as variant)) over () from q",
+                "with q as (select variant_get(cast(null as variant),'$.a') as v) select lead(v,1,cast(v as variant)) over () from q",
                 D::Variant,
                 V::Variant,
             ),
             (
-                "with q as (select variant_get(parse_json('{\"a\":1}'),'$.a') as v) select lag(v,1,cast(v as variant)) over () from q",
+                "with q as (select variant_get(cast(null as variant),'$.a') as v) select lag(v,1,cast(v as variant)) over () from q",
                 D::Variant,
                 V::Variant,
             ),
@@ -1538,11 +1466,24 @@ mod scalar_domain_tests {
             };
             let result = completed.plan().result_port().unwrap();
             assert_eq!(result.fields[0].domain, domain, "{sql}");
+            let expected_domain = match domain {
+                D::Json => novarocks_type_contract::ValueLogicalType::Json,
+                D::Bitmap => novarocks_type_contract::ValueLogicalType::Bitmap,
+                D::Hll => novarocks_type_contract::ValueLogicalType::Hll,
+                D::Variant => novarocks_type_contract::ValueLogicalType::Variant,
+                D::Plain => novarocks_type_contract::ValueLogicalType::Physical,
+                _ => panic!("unexpected regression domain"),
+            };
+            assert_eq!(
+                result.fields[0].ty.logical_type(),
+                expected_domain,
+                "complete frozen Window output: {sql}"
+            );
             let schema = completed.scalar_schema().unwrap();
             assert_eq!(schema.field().value_type, scalar, "{sql}");
             assert_eq!(
                 schema.field().nullable,
-                result.fields[0].ty.nullable,
+                result.fields[0].ty.nullable(),
                 "{sql}"
             );
             assert_eq!(schema.source_slot(), None);
@@ -1575,11 +1516,15 @@ mod scalar_domain_tests {
             ),
             (
                 "select to_bitmap(1) as b,b as again,bitmap_to_binary(b) as raw",
-                vec![Some(SqlType::Bitmap), Some(SqlType::Bitmap), None],
+                vec![
+                    Some(SqlType::Bitmap),
+                    Some(SqlType::Bitmap),
+                    Some(SqlType::Binary),
+                ],
             ),
             (
                 "with q as (select percentile_hash(cast(1 as double)) as p) select cast(p as varbinary) as raw,p from q",
-                vec![None, Some(SqlType::Percentile)],
+                vec![Some(SqlType::Binary), Some(SqlType::Percentile)],
             ),
         ] {
             let (query, _, factory) = super::super::analyze(&query(sql), &Catalog, "db").unwrap();
@@ -1592,16 +1537,17 @@ mod scalar_domain_tests {
                 expected,
                 "{sql}",
             );
-            // Native V1's selected Binary signatures retain their exact type
-            // contracts; the root occurrence carries the existing source proof.
-            assert!(
-                query
-                    .output_columns
-                    .iter()
-                    .all(|column| column.value_type.logical_type
-                        == novarocks_type_contract::ValueLogicalType::Physical),
-                "{sql}"
-            );
+            for (column, expected) in query.output_columns.iter().zip(&expected) {
+                let projected = novarocks_types::sql_type_from_execution_value(
+                    column.value_type.typed_binding(),
+                )
+                .unwrap();
+                assert_eq!(
+                    Some(projected),
+                    *expected,
+                    "complete authored result: {sql}"
+                );
+            }
         }
     }
 
@@ -1675,23 +1621,25 @@ mod scalar_domain_tests {
             "select row(null,to_bitmap(1)),named_struct('missing',null,'value',percentile_hash(1.0))",
         );
         for (expression, marker, names) in [
-            (&expressions[0], LogicalType::Bitmap, ["col1", "col2"]),
+            (
+                &expressions[0],
+                novarocks_type_contract::ValueLogicalType::Bitmap,
+                ["col1", "col2"],
+            ),
             (
                 &expressions[1],
-                LogicalType::Percentile,
+                novarocks_type_contract::ValueLogicalType::Percentile,
                 ["missing", "value"],
             ),
         ] {
-            let DataType::Struct(fields) = &expression.value_type.data_type else {
+            let DataType::Struct(fields) = &expression.value_type.data_type() else {
                 panic!("expected struct")
             };
             assert_eq!(fields[0].data_type(), &DataType::Null);
             assert_eq!(fields[0].name(), names[0]);
             assert_eq!(fields[1].name(), names[1]);
-            assert_eq!(
-                novarocks_types::logical::logical_type_of_field(&fields[1]),
-                Some(marker)
-            );
+            assert_eq!(fields[1].metadata().capacity(), 0);
+            assert_eq!(domain_at(expression, &[1]), Some(marker));
         }
         // SqlType has no Null member. The exact actual fields carry this proof,
         // rather than a fabricated all-members SqlType or a plain opaque value.
@@ -1705,13 +1653,10 @@ mod scalar_domain_tests {
     }
 
     #[test]
-    fn m07_scalar_wrapper_output_adapter_preserves_selected_overload_and_shape() {
+    fn typed_scalar_wrapper_preserves_selected_full_result_without_output_adapter() {
         let expression = output_expressions("select [to_bitmap(1),null]").remove(0);
-        let ExprKind::Cast { expr, target, .. } = &expression.kind else {
-            panic!("expected explicit output adapter")
-        };
-        let ExprKind::FunctionCall { binding, .. } = &expr.kind else {
-            panic!("expected original bound function")
+        let ExprKind::FunctionCall { binding, args, .. } = &expression.kind else {
+            panic!("selected original function");
         };
         assert_eq!(
             binding.function_id.as_str(),
@@ -1719,80 +1664,114 @@ mod scalar_domain_tests {
         );
         let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
         else {
-            panic!("expected scalar result")
+            panic!("scalar result");
         };
-        assert_eq!(result.data_type, expr.value_type.data_type);
-        let (DataType::List(actual), DataType::List(adapted)) =
-            (&expr.value_type.data_type, target)
-        else {
-            panic!("expected lists")
+        assert_eq!(result, &expression.value_type);
+        let item = expression.value_type.value_type().child_type_at(0).unwrap();
+        assert_eq!(
+            item.domain(),
+            Some(novarocks_type_contract::ValueLogicalType::Bitmap)
+        );
+        assert!(item.nullable());
+        assert_eq!(
+            args[0].value_type.logical_type(),
+            novarocks_type_contract::ValueLogicalType::Bitmap
+        );
+        assert!(args[1].value_type.nullable());
+        let DataType::List(field) = expression.value_type.data_type() else {
+            panic!("list");
         };
-        assert_eq!(actual.name(), adapted.name());
-        assert_eq!(actual.is_nullable(), adapted.is_nullable());
-        assert_eq!(actual.data_type(), adapted.data_type());
-        assert_eq!(
-            novarocks_types::logical::logical_type_of_field(actual),
-            None
-        );
-        assert_eq!(
-            novarocks_types::logical::logical_type_of_field(adapted),
-            Some(LogicalType::Bitmap)
-        );
+        assert_eq!(field.metadata().capacity(), 0);
     }
 
     #[test]
     fn m07_scalar_wrapper_mixed_domains_clear_and_missing_source_markers_refuse() {
-        assert_eq!(
-            output_domains(
-                "select element_at([to_bitmap(1),hll_hash('x')],1),element_at([parse_json('{}'),'plain'],1)"
-            ),
-            vec![Some(SqlType::Binary), Some(SqlType::String)]
+        let error = super::super::analyze(
+            &query("select element_at([to_bitmap(1),hll_hash('x')],1)"),
+            &Catalog,
+            "db",
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("no matching declared overload"),
+            "{error}"
         );
-        // These trusted catalog facts deliberately lack their declared nested
-        // marker in Catalog. A wrapper must not launder them by adding a marker.
-        for sql in ["select map_values(m) from t", "select row(r) from t"] {
-            let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
-            assert!(
-                error.to_string().contains("logical identity differs"),
-                "{error}"
-            );
-        }
+        assert_eq!(
+            output_domains("select element_at([parse_json('{}'),'plain'],1)"),
+            vec![Some(SqlType::String)]
+        );
+        // The catalog's explicit recursive declaration is the author even when
+        // its external Arrow fields carry no execution-domain annotations.
+        assert_eq!(
+            output_domains("select map_values(m),row(r) from t"),
+            vec![
+                Some(SqlType::Array(Box::new(SqlType::Hll))),
+                Some(SqlType::Struct(vec![(
+                    "col1".into(),
+                    SqlType::Struct(vec![
+                        ("json".into(), SqlType::Json),
+                        ("bitmap".into(), SqlType::Bitmap)
+                    ])
+                )]))
+            ]
+        );
         assert_eq!(
             output_domains("select cast(element_at([to_bitmap(1)],1) as varbinary)"),
-            vec![None]
+            vec![Some(SqlType::Binary)]
         );
     }
 
     #[test]
     fn m07_scalar_shadowed_wrapper_binding_cannot_project_child_domain() {
-        let (resolved, _, factory) =
-            super::super::analyze(&query("select [to_bitmap(1)]"), &Catalog, "db").unwrap();
-        let crate::analysis::QueryBody::Select(select) = resolved.body else {
-            panic!("expected select")
+        let mut expression = output_expressions("select [to_bitmap(1)]").remove(0);
+        let ExprKind::FunctionCall { binding, args, .. } = &mut expression.kind else {
+            panic!("real complete call");
         };
-        let ExprKind::Cast { expr, .. } = select.projection[0].expr.clone().kind else {
-            panic!("expected adapter")
-        };
-        let mut original = *expr;
-        let ExprKind::FunctionCall { binding, .. } = &mut original.kind else {
-            panic!("expected original binding")
-        };
-        let mut shadowed = binding.resolved().clone();
-        shadowed.function_id =
+        let original = binding.resolved().clone();
+        let mut changed = original.clone();
+        changed.function_id =
             novarocks_functions::FunctionId::try_new("test.shadow/__array_literal/v1").unwrap();
-        *binding =
-            crate::binding::SqlFunctionBinding::new(shadowed, binding.decimal_overflow_policy());
-        let factory = Rc::new(RefCell::new(factory));
-        let scope = AnalyzerScope::new(factory.clone());
-        let context = context(factory);
-        let adapted = context
-            .adapt_bound_output_domains(original, None, &scope, Span::new(0, 0))
-            .unwrap();
-        let DataType::List(field) = &adapted.value_type.data_type else {
-            panic!("expected list")
+        let control = fixture_control();
+        let arguments = args
+            .iter()
+            .map(|arg| {
+                crate::analysis::function_argument(
+                    arg,
+                    crate::constant::test_constant_policy(),
+                    control,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let request = novarocks_functions::FunctionBindingRequest {
+            arguments: &arguments,
+            logical_argument_count: arguments.len(),
+            expected_result_type: None,
         };
-        assert_eq!(novarocks_types::logical::logical_type_of_field(field), None);
-        assert_eq!(context.logical_output_type(None, &adapted, &scope), None);
+        assert!(
+            crate::functions::build_builtin_engine_function_catalog()
+                .unwrap()
+                .validate_bound(&changed, request, control)
+                .is_err()
+        );
+        assert!(
+            crate::functions::build_builtin_engine_function_catalog()
+                .unwrap()
+                .validate_bound(&original, request, control)
+                .is_ok()
+        );
+        let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
+        let scope = AnalyzerScope::new(factory.clone());
+        assert_eq!(
+            context(factory)
+                .logical_output_type(None, &expression, &scope)
+                .unwrap(),
+            Some(SqlType::Array(Box::new(SqlType::Bitmap)))
+        );
+        assert_eq!(
+            domain_at(&expression, &[0]),
+            Some(novarocks_type_contract::ValueLogicalType::Bitmap)
+        );
     }
 
     fn original_transform(expression: &TypedExpr) -> &TypedExpr {
@@ -1822,17 +1801,17 @@ mod scalar_domain_tests {
             (
                 &expressions[0],
                 "builtin.scalar/array_flatten/v1",
-                LogicalType::Json,
+                novarocks_type_contract::ValueLogicalType::Json,
             ),
             (
                 &expressions[1],
                 "builtin.scalar/array_repeat/v1",
-                LogicalType::Bitmap,
+                novarocks_type_contract::ValueLogicalType::Bitmap,
             ),
             (
                 &expressions[2],
                 "builtin.scalar/__array_struct_subfield/v1",
-                LogicalType::Json,
+                novarocks_type_contract::ValueLogicalType::Json,
             ),
         ] {
             let ExprKind::FunctionCall { binding, .. } = &original_transform(expression).kind
@@ -1846,20 +1825,18 @@ mod scalar_domain_tests {
                 panic!("scalar selection");
             };
             assert_eq!(
-                &selected.data_type,
-                &original_transform(expression).value_type.data_type
+                &selected.data_type(),
+                &original_transform(expression).value_type.data_type()
             );
             let (DataType::List(actual), DataType::List(selected)) =
-                (&expression.value_type.data_type, &selected.data_type)
+                (&expression.value_type.data_type(), &selected.data_type())
             else {
                 panic!("List result");
             };
             assert_eq!(actual.name(), selected.name());
             assert_eq!(actual.is_nullable(), selected.is_nullable());
-            assert_eq!(
-                novarocks_types::logical::logical_type_of_field(actual),
-                Some(marker)
-            );
+            assert_eq!(actual.metadata().capacity(), 0);
+            assert_eq!(domain_at(expression, &[0]), Some(marker));
         }
     }
 
@@ -1884,7 +1861,7 @@ mod scalar_domain_tests {
             panic!("scalar");
         };
         let (DataType::List(item), DataType::List(selected_item)) =
-            (&expression.value_type.data_type, &selected.data_type)
+            (&expression.value_type.data_type(), &selected.data_type())
         else {
             panic!("List");
         };
@@ -1907,9 +1884,10 @@ mod scalar_domain_tests {
             panic!("partial source");
         };
         assert_eq!(children[0].data_type(), &DataType::Null);
+        assert_eq!(children[1].metadata().capacity(), 0);
         assert_eq!(
-            novarocks_types::logical::logical_type_of_field(&children[1]),
-            Some(LogicalType::Bitmap)
+            domain_at(&expression, &[0, 0, 1]),
+            Some(novarocks_type_contract::ValueLogicalType::Bitmap)
         );
     }
 
@@ -1922,16 +1900,17 @@ mod scalar_domain_tests {
         ] {
             assert_eq!(output_domains(sql), vec![None]);
             let expression = output_expressions(sql).remove(0);
-            let DataType::List(item) = &expression.value_type.data_type else {
+            let DataType::List(item) = &expression.value_type.data_type() else {
                 panic!("List");
             };
             let DataType::Struct(fields) = item.data_type() else {
                 panic!("Struct");
             };
             assert_eq!(fields[0].data_type(), &DataType::Null);
+            assert_eq!(fields[1].metadata().capacity(), 0);
             assert_eq!(
-                novarocks_types::logical::logical_type_of_field(&fields[1]),
-                Some(LogicalType::Bitmap)
+                domain_at(&expression, &[0, 1]),
+                Some(novarocks_type_contract::ValueLogicalType::Bitmap)
             );
         }
         for sql in [
@@ -1940,13 +1919,13 @@ mod scalar_domain_tests {
             "select arrays_zip([1],[2])",
         ] {
             let expression = output_expressions(sql).remove(0);
-            let DataType::List(item) = &expression.value_type.data_type else {
+            let DataType::List(item) = &expression.value_type.data_type() else {
                 panic!("ordinary List");
             };
             assert_eq!(novarocks_types::logical::logical_type_of_field(item), None);
         }
         let expression = output_expressions("select array_repeat(null,2)").remove(0);
-        let DataType::List(item) = &expression.value_type.data_type else {
+        let DataType::List(item) = &expression.value_type.data_type() else {
             panic!("NULL List");
         };
         assert_eq!(item.data_type(), &DataType::Null);
@@ -1956,11 +1935,15 @@ mod scalar_domain_tests {
     fn m07_container_trusted_and_null_variant_preserve_identity_unknown_cast_is_rejected() {
         let expression =
             output_expressions("select array_repeat(cast(null as variant),2)").remove(0);
-        let DataType::List(item) = &expression.value_type.data_type else {
+        let DataType::List(item) = &expression.value_type.data_type() else {
             panic!("typed NULL List");
         };
         assert_eq!(item.data_type(), &DataType::LargeBinary);
-        assert_eq!(novarocks_types::logical::logical_type_of_field(item), None);
+        assert_eq!(item.metadata().capacity(), 0);
+        assert_eq!(
+            domain_at(&expression, &[0]),
+            Some(novarocks_type_contract::ValueLogicalType::Variant)
+        );
         // Same-carrier CAST preserves an independently established Variant
         // identity. Target spelling alone does not establish serialized bytes.
         assert_eq!(
@@ -1975,9 +1958,7 @@ mod scalar_domain_tests {
         for sql in ["select array_repeat(cast('x' as variant),2)"] {
             let error = super::super::analyze(&query(sql), &Catalog, "db").unwrap_err();
             assert!(
-                error
-                    .to_string()
-                    .contains("LargeBinary requires its original logical identity"),
+                error.to_string().contains("no matching declared overload"),
                 "{error}"
             );
         }
@@ -1985,224 +1966,195 @@ mod scalar_domain_tests {
 
     #[test]
     fn m07_container_transform_requires_selected_identity_kind_and_result() {
-        let (resolved, _, factory) = super::super::analyze(
-            &query("select array_repeat(to_bitmap(1),2)"),
-            &Catalog,
-            "db",
-        )
-        .unwrap();
-        let crate::analysis::QueryBody::Select(select) = resolved.body else {
-            panic!("select");
-        };
-        let original = original_transform(&select.projection[0].expr).clone();
-        let factory = Rc::new(RefCell::new(factory));
-        let scope = AnalyzerScope::new(factory.clone());
-        let context = context(factory);
-        let ExprKind::FunctionCall { binding, args, .. } = &original.kind else {
-            panic!("call");
+        let original = output_expressions("select array_repeat(to_bitmap(1),2)").remove(0);
+        let (binding, args) = match &original.kind {
+            ExprKind::FunctionCall { binding, args, .. }
+            | ExprKind::WindowCall { binding, args, .. } => (binding, args),
+            _ => panic!("complete call"),
         };
         let selection = binding.resolved().clone();
-        let before_args = format!("{args:?}");
-        let adapted = context
-            .adapt_bound_output_domains(original.clone(), None, &scope, Span::new(0, 0))
-            .unwrap();
-        let ExprKind::FunctionCall { binding, args, .. } = &original_transform(&adapted).kind
-        else {
-            panic!("call");
+        let control = fixture_control();
+        let arguments = args
+            .iter()
+            .map(|arg| {
+                crate::analysis::function_argument(
+                    arg,
+                    crate::constant::test_constant_policy(),
+                    control,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let request = novarocks_functions::FunctionBindingRequest {
+            arguments: &arguments,
+            logical_argument_count: arguments.len(),
+            expected_result_type: None,
         };
-        assert_eq!(binding.resolved(), &selection);
-        assert_eq!(format!("{args:?}"), before_args);
-        for change in 0..6 {
-            let mut candidate = original.clone();
-            let ExprKind::FunctionCall { binding, .. } = &mut candidate.kind else {
-                unreachable!();
-            };
-            let mut selected = binding.resolved().clone();
+        assert!(
+            crate::functions::build_builtin_engine_function_catalog()
+                .unwrap()
+                .validate_bound(&selection, request, control)
+                .is_ok()
+        );
+        for change in 0..5 {
+            let mut changed = selection.clone();
             match change {
                 0 => {
-                    selected.function_id =
-                        novarocks_functions::FunctionId::try_new("test.shadow/array_repeat/v1")
-                            .unwrap()
+                    changed.function_id =
+                        novarocks_functions::FunctionId::try_new("test.shadow/complete/v1").unwrap()
                 }
-                1 => selected.kind = novarocks_functions::FunctionKind::Aggregate,
+                1 => changed.kind = novarocks_functions::FunctionKind::Aggregate,
                 2 => {
-                    let novarocks_functions::FunctionResultType::Scalar(result) =
-                        &mut selected.selected.result_type
-                    else {
-                        unreachable!();
-                    };
-                    result.data_type =
-                        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)));
+                    changed.selected.result_type = novarocks_functions::FunctionResultType::Scalar(
+                        novarocks_type_contract::FunctionValueType::new(DataType::Int32, true),
+                    )
                 }
-                3 => selected.logical_argument_count = 1,
-                4 => {
-                    let novarocks_functions::FunctionArgumentType::Value(value) =
-                        &mut selected.selected.argument_types[0]
-                    else {
-                        unreachable!();
-                    };
-                    value.data_type = DataType::Utf8;
-                }
+                3 => changed.logical_argument_count = 0,
                 _ => {
                     let novarocks_functions::FunctionResultType::Scalar(result) =
-                        &mut selected.selected.result_type
+                        &mut changed.selected.result_type
                     else {
-                        unreachable!();
+                        panic!("scalar");
                     };
-                    result.nullable = !candidate.value_type.nullable;
+                    *result = result.with_nullable(!result.nullable()).unwrap();
                 }
             }
-            *binding = crate::binding::SqlFunctionBinding::new(
-                selected,
-                binding.decimal_overflow_policy(),
+            assert!(
+                crate::functions::build_builtin_engine_function_catalog()
+                    .unwrap()
+                    .validate_bound(&changed, request, control)
+                    .is_err(),
+                "exact selected alteration {change}"
             );
-            assert_eq!(context.logical_output_type(None, &candidate, &scope), None);
-            let before = format!("{candidate:?}");
-            let result = context
-                .adapt_bound_output_domains(candidate, None, &scope, Span::new(0, 0))
-                .unwrap();
-            assert_eq!(format!("{result:?}"), before);
         }
+        let factory = Rc::new(RefCell::new(ColumnRefFactory::new()));
+        let scope = AnalyzerScope::new(factory.clone());
+        let adapted = context(factory)
+            .adapt_bound_output_domains(original.clone(), None, &scope, Span::new(0, 0))
+            .unwrap();
+        assert_eq!(adapted.value_type, original.value_type);
+        assert_eq!(
+            format!("{:?}", adapted.kind),
+            format!("{:?}", original.kind)
+        );
     }
 
     #[test]
-    fn m07_container_internal_sortby_subfield_keeps_nested_marker_and_binding() {
-        let sql = "select array_sortby((x)->x.key,[named_struct('key',1,'payload',to_bitmap(1))])";
-        let expression = output_expressions(sql).remove(0);
-        let ExprKind::FunctionCall { args, .. } = &original_transform(&expression).kind else {
-            panic!("sortby");
-        };
-        let ExprKind::FunctionCall { binding, .. } = &original_transform(&args[1]).kind else {
-            panic!("subfield");
-        };
+    fn typed_container_sortby_subfield_keeps_selected_source_and_real_conversion_owner() {
+        let expression = output_expressions(
+            "select array_sortby((x)->x.key,[named_struct('key',1,'payload',to_bitmap(1))])",
+        )
+        .remove(0);
         assert_eq!(
-            binding.function_id.as_str(),
-            "builtin.scalar/__array_struct_subfield/v1"
+            expression
+                .value_type
+                .value_type()
+                .child_type_at(0)
+                .unwrap()
+                .child_type_at(1)
+                .unwrap()
+                .domain(),
+            Some(novarocks_type_contract::ValueLogicalType::Bitmap)
         );
-        let DataType::List(item) = &expression.value_type.data_type else {
-            panic!("List");
-        };
-        let DataType::Struct(fields) = item.data_type() else {
-            panic!("Struct");
-        };
-        assert_eq!(
-            novarocks_types::logical::logical_type_of_field(&fields[1]),
-            Some(LogicalType::Bitmap)
-        );
-        // SORTBY executes its exact ordinary List<Utf8> key selection. Its
-        // coercion retains the independently adapted JSON subfield underneath.
         let (resolved, _, factory) = super::super::analyze(
-            &query("select array_sortby((x)->x.key,[named_struct('key',parse_json('{}'),'payload',1)])"),
-            &Catalog,
-            "db",
+            &query("select array_sortby((x)->x.key,[named_struct('key',parse_json('{}'),'payload',1)])"), &Catalog, "db",
         ).unwrap();
         let crate::analysis::QueryBody::Select(select) = resolved.body else {
             panic!("select");
         };
-        let json = select.projection[0].expr.clone();
-        let ExprKind::FunctionCall { binding, args, .. } = &original_transform(&json).kind else {
-            panic!("sortby");
+        let output = select.projection[0].expr.clone();
+        let ExprKind::FunctionCall { binding, args, .. } = &output.kind else {
+            panic!("original sortby");
         };
-        let outer_selection = binding.resolved().clone();
-        let outer_arguments = format!("{args:?}");
-        let novarocks_functions::FunctionArgumentType::Value(selected_key) =
+        let selection = binding.resolved().clone();
+        let original_arguments = format!("{args:?}");
+        let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+        else {
+            panic!("selected result");
+        };
+        assert_eq!(result, &output.value_type);
+        assert_eq!(
+            output
+                .value_type
+                .value_type()
+                .child_type_at(0)
+                .unwrap()
+                .child_type_at(0)
+                .unwrap()
+                .domain(),
+            Some(novarocks_type_contract::ValueLogicalType::Json)
+        );
+        let novarocks_functions::FunctionArgumentType::Value(key) =
             &binding.selected.argument_types[1]
         else {
-            panic!("selected key value");
+            panic!("selected key");
         };
-        let key = &args[1];
-        assert_eq!(key.value_type.data_type, selected_key.data_type);
-        assert_eq!(key.value_type.nullable, selected_key.nullable);
-        let DataType::List(outer_item) = &key.value_type.data_type else {
-            panic!("key List");
-        };
-        assert_eq!(outer_item.data_type(), &DataType::Utf8);
+        assert_eq!(&args[1].value_type, key);
         assert_eq!(
-            novarocks_types::logical::logical_type_of_field(outer_item),
-            None
+            key.value_type().child_type_at(0).unwrap().domain(),
+            Some(novarocks_type_contract::ValueLogicalType::Json)
         );
-        let ExprKind::Cast {
-            expr: adapted_key,
-            target,
-            ..
-        } = &key.kind
-        else {
-            panic!("selected key coercion");
-        };
-        assert_eq!(target, &selected_key.data_type);
-        let DataType::List(inner_item) = &adapted_key.value_type.data_type else {
-            panic!("adapted key List");
-        };
-        assert_eq!(
-            novarocks_types::logical::logical_type_of_field(inner_item),
-            Some(LogicalType::Json)
-        );
+        let subfield = original_transform(&args[1]);
         let ExprKind::FunctionCall {
             binding: subfield_binding,
-            args: subfield_args,
+            args: source_args,
             ..
-        } = &original_transform(adapted_key).kind
+        } = &subfield.kind
         else {
-            panic!("subfield call");
+            panic!("selected subfield");
         };
         assert_eq!(
             subfield_binding.function_id.as_str(),
             "builtin.scalar/__array_struct_subfield/v1"
         );
-        assert_eq!(
-            subfield_binding.kind,
-            novarocks_functions::FunctionKind::Scalar
-        );
         let novarocks_functions::FunctionResultType::Scalar(subfield_result) =
             &subfield_binding.selected.result_type
         else {
-            panic!("scalar subfield selection");
+            panic!("subfield result");
         };
+        assert_eq!(&subfield.value_type, subfield_result);
         assert_eq!(
-            subfield_result.data_type,
-            original_transform(adapted_key).value_type.data_type
+            subfield_result
+                .value_type()
+                .child_type_at(0)
+                .unwrap()
+                .domain(),
+            Some(novarocks_type_contract::ValueLogicalType::Json)
         );
         assert_eq!(
-            subfield_result.nullable,
-            original_transform(adapted_key).value_type.nullable
-        );
-        let DataType::List(selected_item) = &subfield_result.data_type else {
-            panic!("selected subfield List");
-        };
-        assert_eq!(
-            novarocks_types::logical::logical_type_of_field(selected_item),
-            None
+            source_args[0]
+                .value_type
+                .value_type()
+                .child_type_at(0)
+                .unwrap()
+                .child_type_at(0)
+                .unwrap()
+                .domain(),
+            Some(novarocks_type_contract::ValueLogicalType::Json)
         );
         assert!(
-            matches!(&subfield_args[1].kind, ExprKind::Literal(crate::analysis::LiteralValue::String(name)) if name == "key")
+            matches!(&source_args[1].kind, ExprKind::Literal(crate::analysis::LiteralValue::String(name)) if name == "key")
         );
-        let DataType::List(source_item) = &subfield_args[0].value_type.data_type else {
+        let DataType::List(item) = source_args[0].value_type.data_type() else {
             panic!("source List");
         };
-        let DataType::Struct(source_fields) = source_item.data_type() else {
+        let DataType::Struct(fields) = item.data_type() else {
             panic!("source Struct");
         };
-        assert_eq!(source_fields[0].name(), "key");
-        assert_eq!(
-            novarocks_types::logical::logical_type_of_field(&source_fields[0]),
-            Some(LogicalType::Json)
-        );
+        assert_eq!(fields[0].name(), "key");
+        assert_eq!(fields[0].metadata().capacity(), 0);
         let factory = Rc::new(RefCell::new(factory));
         let scope = AnalyzerScope::new(factory.clone());
         let context = context(factory);
-        assert_eq!(
-            context.logical_output_type(None, key, &scope),
-            Some(SqlType::Array(Box::new(SqlType::Json)))
-        );
-        let readapted = context
-            .adapt_bound_output_domains(json.clone(), None, &scope, Span::new(0, 0))
+        let validated = context
+            .adapt_bound_output_domains(output.clone(), None, &scope, Span::new(0, 0))
             .unwrap();
-        let ExprKind::FunctionCall { binding, args, .. } = &original_transform(&readapted).kind
-        else {
-            panic!("sortby selection after readaptation");
+        assert_eq!(validated.value_type, output.value_type);
+        let ExprKind::FunctionCall { binding, args, .. } = &validated.kind else {
+            panic!("same original sortby");
         };
-        assert_eq!(binding.resolved(), &outer_selection);
-        assert_eq!(format!("{args:?}"), outer_arguments);
+        assert_eq!(binding.resolved(), &selection);
+        assert_eq!(format!("{args:?}"), original_arguments);
     }
 
     #[test]
@@ -2245,7 +2197,7 @@ mod scalar_domain_tests {
                 })),
             ),
             (
-                "select array_repeat(cast(variant_get(parse_json('{}'),'$') as variant),2)",
+                "select array_repeat(cast(variant_get(cast(null as variant),'$') as variant),2)",
                 D::Plain,
                 V::List(Box::new(F {
                     nullable: true,
@@ -2253,7 +2205,7 @@ mod scalar_domain_tests {
                 })),
             ),
             (
-                "select element_at(array_repeat(cast(variant_get(parse_json('{}'),'$') as variant),2),1)",
+                "select element_at(array_repeat(cast(variant_get(cast(null as variant),'$') as variant),2),1)",
                 D::Variant,
                 V::Variant,
             ),
@@ -2320,7 +2272,7 @@ mod scalar_domain_tests {
             assert_eq!(schema.field().value_type, scalar, "{sql}");
             assert_eq!(
                 schema.field().nullable,
-                result.fields[0].ty.nullable,
+                result.fields[0].ty.nullable(),
                 "{sql}"
             );
             assert_eq!(schema.source_slot(), None);

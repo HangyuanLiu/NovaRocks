@@ -102,7 +102,7 @@ fn nominal_largeint_text_selected_scalar_constant_ordinal_and_null_preserve_valu
     let selection = Selection::try_sparse(4, &rows).unwrap();
     let compact = SelectedValues::try_new(
         selection,
-        &source.data_type,
+        source.data_type(),
         values.slice(1, 3),
         Box::default(),
     )

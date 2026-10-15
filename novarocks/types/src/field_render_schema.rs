@@ -15,11 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow_schema::{DataType, Field};
-
 use crate::PrimitiveType;
-use crate::arrow_primitive::arrow_field_to_primitive;
-use crate::logical::{LogicalType, logical_type_of_field};
 
 /// Render metadata carried with a result-field projection.
 ///
@@ -46,35 +42,6 @@ impl FieldRenderSchema {
         Self {
             primitive: None,
             json_value: false,
-            children,
-        }
-    }
-
-    pub fn from_field(field: &Field) -> Self {
-        let children = match field.data_type() {
-            DataType::Struct(fields) => fields
-                .iter()
-                .map(|child| Self::from_field(child.as_ref()))
-                .collect(),
-            DataType::List(item) | DataType::LargeList(item) => {
-                vec![Self::from_field(item.as_ref())]
-            }
-            DataType::Map(entries, _) => {
-                if let DataType::Struct(fields) = entries.data_type() {
-                    fields
-                        .iter()
-                        .take(2)
-                        .map(|child| Self::from_field(child.as_ref()))
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            }
-            _ => Vec::new(),
-        };
-        Self {
-            primitive: arrow_field_to_primitive(field),
-            json_value: matches!(logical_type_of_field(field), Some(LogicalType::Json)),
             children,
         }
     }

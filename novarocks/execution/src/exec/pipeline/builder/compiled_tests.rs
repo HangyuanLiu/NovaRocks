@@ -31,7 +31,9 @@ fn run(program: Arc<novarocks_local_program::LocalProgram>) -> Vec<Chunk> {
         None,
         None,
         None,
-        None,
+        Some(crate::runtime::mem_tracker::MemTracker::new_root(
+            "compiled tests",
+        )),
         Some(crate::runtime::execution_runtime::test_execution_runtime()),
     ));
     let output = ResultSinkHandle::new();
@@ -59,7 +61,7 @@ fn compiled_program_runs_through_compiled_roots_to_result_rows() {
         let chunks = run(program(mode, false));
         let rows: usize = chunks.iter().map(Chunk::len).sum();
         assert_eq!(rows, 1);
-        let batch = &chunks.iter().find(|c| c.len() == 1).unwrap().batch;
+        let batch = chunks.iter().find(|c| c.len() == 1).unwrap().record_batch();
         let sample = batch
             .column(0)
             .as_any()
@@ -82,7 +84,7 @@ fn compiled_program_runs_through_compiled_roots_to_result_rows() {
 #[test]
 fn twin_roots_of_one_definition_keep_independent_instances_in_the_pipeline() {
     let chunks = run(program(SeedMode::DirectConstant, true));
-    let batch = &chunks.iter().find(|c| c.len() == 1).unwrap().batch;
+    let batch = chunks.iter().find(|c| c.len() == 1).unwrap().record_batch();
     for column in 0..2 {
         let sample = batch
             .column(column)

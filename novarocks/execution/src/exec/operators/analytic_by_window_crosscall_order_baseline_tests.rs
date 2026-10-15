@@ -103,6 +103,8 @@ fn by_window_original_function_major_error_order_across_partitions() {
             args: vec![packed],
             return_type: DataType::Int32,
             aggregate_binding: Some(WindowAggregateBinding {
+                // Explicit legacy carrier fixture; this is not frozen-binding admission.
+                frozen: None,
                 function_name: name.into(),
                 resolved,
             }),

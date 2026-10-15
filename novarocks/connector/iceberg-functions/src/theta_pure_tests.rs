@@ -747,18 +747,18 @@ fn theta_pure_partitioned_partial_intermediate_final_keep_real_nonnull_compact_s
 
 #[test]
 fn theta_pure_nominal_domains_and_distinct_order_stale_selection_refuse_precisely() {
+    assert!(
+        FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(4),
+            false,
+            ValueLogicalType::Uuid
+        )
+        .is_err()
+    );
     let catalog = catalog();
     for source in [
-        FunctionValueType {
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: ValueLogicalType::Json,
-        },
-        FunctionValueType {
-            data_type: DataType::FixedSizeBinary(4),
-            nullable: false,
-            logical_type: ValueLogicalType::Uuid,
-        },
+        FunctionValueType::try_with_logical_type(DataType::Utf8, false, ValueLogicalType::Json)
+            .expect("valid temporary legacy value projection"),
         FunctionValueType::new(DataType::Time64(TimeUnit::Nanosecond), false),
         FunctionValueType::new(DataType::Timestamp(TimeUnit::Millisecond, None), false),
         FunctionValueType::new(
@@ -813,11 +813,14 @@ fn theta_pure_nominal_domains_and_distinct_order_stale_selection_refuse_precisel
             Arc::new(LargeBinaryArray::from(vec![&[1, 2][..]])),
         ),
     ] {
-        let f = Fixture::new(FunctionValueType {
-            data_type: array.data_type().clone(),
-            nullable: false,
-            logical_type: logical,
-        });
+        let f = Fixture::new(
+            FunctionValueType::try_from_legacy_declared_projection(
+                array.data_type().clone(),
+                false,
+                logical,
+            )
+            .expect("valid temporary legacy value projection"),
+        );
         assert_eq!(
             estimate_compact_theta(body(
                 &update(
@@ -891,8 +894,10 @@ fn theta_pure_nominal_domains_and_distinct_order_stale_selection_refuse_precisel
             .is_err()
     );
     let mut stale = f.selected.as_ref().clone();
-    stale.argument_types[0] =
-        FunctionArgumentType::Value(FunctionValueType::new(DataType::Int64, true));
+    let mut arguments = stale.argument_types.to_vec();
+    arguments[0] = FunctionArgumentType::Value(FunctionValueType::new(DataType::Int64, true));
+    stale.argument_types =
+        novarocks_type_contract::TypedFactSlice::from_pure_boxed(arguments.into_boxed_slice());
     let stale = Arc::new(stale);
     let mut input = f.input(AggregateKernelPhase::Single);
     input.selected = &stale;
@@ -1236,14 +1241,17 @@ fn theta_pure_attachment_keeps_original_family_resolver_and_rejects_metadata_dri
         .clone();
     let owner = ThetaPureOwner::from_registration(&registration).unwrap();
     assert!(Arc::ptr_eq(&owner.family, &family));
-    assert!(Arc::ptr_eq(&owner.resolver, &resolver));
+    assert!(std::ptr::addr_eq(
+        owner.resolver.as_ref(),
+        resolver.as_ref()
+    ));
     let attached = registration
         .try_attach_pure_aggregate(Arc::new(owner))
         .unwrap();
     assert!(Arc::ptr_eq(attached.family(), &family));
-    assert!(Arc::ptr_eq(
-        attached.definition().binding_resolver().unwrap(),
-        &resolver
+    assert!(std::ptr::addr_eq(
+        attached.definition().binding_resolver().unwrap().as_ref(),
+        resolver.as_ref()
     ));
     assert_eq!(
         attached

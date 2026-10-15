@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::DataType;
+use novarocks_type_contract::FunctionValueType;
 
 use crate::analysis::*;
 use crate::column_id::{ColumnId, ColumnRefFactory};
@@ -286,7 +286,7 @@ struct WindowOutputIdAllocator<'a> {
 }
 
 impl WindowOutputIdAllocator<'_> {
-    fn allocate(&mut self, output_name: &str, data_type: DataType, nullable: bool) -> ColumnId {
+    fn allocate(&mut self, output_name: &str, value_type: &FunctionValueType) -> ColumnId {
         let reuse_visible_output_id = self.reuse_visible_output_id
             && !self.visible_output_id_used
             && self.visible_output_column_id != ColumnId::UNSET;
@@ -294,16 +294,13 @@ impl WindowOutputIdAllocator<'_> {
             self.visible_output_id_used = true;
             self.visible_output_column_id
         } else {
-            self.factory.create(
-                None,
-                output_name.to_string(),
-                novarocks_type_contract::FunctionValueType::new(data_type.clone(), nullable),
-            )
+            self.factory
+                .create(None, output_name.to_string(), value_type.clone())
         };
         self.output_columns.push(OutputColumn {
             column_id,
             name: output_name.to_string(),
-            value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+            value_type: value_type.clone(),
 
             is_internal: !reuse_visible_output_id,
         });
@@ -359,11 +356,9 @@ fn rewrite_window_calls(
             // For FIRST_VALUE / LAST_VALUE the reversal also swaps the function
             // because reversing the iteration direction inverts which row is
             // "first" vs "last".
-            let output_column_id = output_ids.allocate(
-                &win_output_name,
-                expr.value_type.data_type.clone(),
-                expr.value_type.nullable,
-            );
+            // Publish the original selected binding, including nominal children,
+            // NULL contracts and the actual creator's independent holds.
+            let output_column_id = output_ids.allocate(&win_output_name, &expr.value_type);
 
             window_exprs.push(WindowExpr {
                 name: name.clone(),
@@ -375,7 +370,7 @@ fn rewrite_window_calls(
                 partition_by: partition_by.clone(),
                 order_by: order_by.clone(),
                 window_frame: window_frame.clone(),
-                result_type: expr.value_type.data_type.clone(),
+                result_type: expr.value_type.data_type().clone(),
                 output_name: win_output_name.clone(),
                 output_column_id,
                 ignore_nulls: *ignore_nulls,

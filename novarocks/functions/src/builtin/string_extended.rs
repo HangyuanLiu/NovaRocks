@@ -59,30 +59,30 @@ pub(super) fn validate_profile(
             return Err(invalid("extended string requires value arguments"));
         };
         step()?;
-        let physical = ty.logical_type == ValueLogicalType::Physical;
+        let physical = ty.logical_type() == ValueLogicalType::Physical;
         let admitted = match op {
             Operation::Unhex | Operation::ToBinary | Operation::RegexpReplace => {
-                physical && ty.data_type == DataType::Utf8
+                physical && ty.data_type() == &DataType::Utf8
             }
             Operation::RegexpExtract | Operation::RegexpExtractAll => {
                 physical
                     && if ordinal < 2 {
-                        ty.data_type == DataType::Utf8
+                        ty.data_type() == &DataType::Utf8
                     } else {
-                        ty.data_type == DataType::Int32
+                        ty.data_type() == &DataType::Int32
                     }
             }
             Operation::Money => {
                 physical
                     && matches!(
-                        ty.data_type,
+                        ty.data_type(),
                         DataType::Int64 | DataType::Float64 | DataType::Decimal128(..)
                     )
             }
             Operation::Murmur => {
                 (physical
                     && matches!(
-                        ty.data_type,
+                        ty.data_type(),
                         DataType::Utf8
                             | DataType::LargeUtf8
                             | DataType::Binary
@@ -102,8 +102,8 @@ pub(super) fn validate_profile(
                             | DataType::Decimal256(..)
                             | DataType::Timestamp(_, None)
                     ))
-                    || (ty.logical_type == ValueLogicalType::LargeInt
-                        && ty.data_type == DataType::FixedSizeBinary(16))
+                    || (ty.logical_type() == ValueLogicalType::LargeInt
+                        && ty.data_type() == &DataType::FixedSizeBinary(16))
             }
         };
         if !admitted {
@@ -121,8 +121,8 @@ pub(super) fn validate_profile(
         Operation::Murmur => DataType::Int32,
     };
     step()?;
-    if contract.result_type().logical_type != ValueLogicalType::Physical
-        || contract.result_type().data_type != expected
+    if contract.result_type().logical_type() != ValueLogicalType::Physical
+        || *contract.result_type().data_type() != expected
     {
         return Err(invalid(
             "extended string call differs from its exact selected result profile",
@@ -278,7 +278,7 @@ pub(super) fn evaluate<'a>(
         let FunctionArgumentType::Value(ty) = ty else {
             return Err(invalid("extended string requires value arguments"));
         };
-        if argument.array().data_type() != &ty.data_type {
+        if argument.array().data_type() != ty.data_type() {
             return Err(invalid(
                 "extended string actual argument carrier differs from selected contract",
             ));
@@ -291,7 +291,7 @@ pub(super) fn evaluate<'a>(
                     "extended string selected argument row out of bounds",
                 ));
             }
-            if argument.array().is_null(row) && !ty.nullable {
+            if argument.array().is_null(row) && !ty.nullable() {
                 return Err(internal(
                     "extended string non-null argument contains selected SQL NULL",
                 ));

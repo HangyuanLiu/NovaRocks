@@ -212,12 +212,16 @@ fn long_zone_data_error_is_full_until_owner_row_projection() {
     let array =
         Arc::new(TimestampMicrosecondArray::from(vec![i64::MAX]).with_timezone(zone.clone()))
             as ArrayRef;
-    // The feature-selected Arrow parser authors the complete source error.
+    // The locked Arrow parser owns this feature-dependent source diagnostic.
+    // Independently obtain its complete error, then require exact propagation.
     let expected = zone
         .parse::<arrow::array::timezone::Tz>()
         .unwrap_err()
         .to_string();
-    assert!(expected.contains(&zone));
+    assert!(
+        expected.contains(&zone),
+        "the entire original zone is retained"
+    );
     let mut values = TemporalValues::new(3, &mut work).unwrap();
     let rows = [5];
     assert_eq!(

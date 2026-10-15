@@ -1029,9 +1029,10 @@ mod tests {
             novarocks_types::identity::QueryId::new(71, 1),
             ResultSchema::new(vec![ResultField::new(
                 "value",
-                arrow::datatypes::DataType::Int32,
-                false,
-                None,
+                novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int32,
+                    false,
+                ),
             )]),
             ResultRowCarrier::relayed(
                 novarocks_result_contract::RootOutputKind::ClientRows,

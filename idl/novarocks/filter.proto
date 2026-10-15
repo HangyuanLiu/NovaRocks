@@ -200,6 +200,8 @@ message RuntimeFilterFrontendFeedbackPublication {
 message RuntimeFilterLogicalDomain {
   novarocks.common.TypeDesc value_type = 1;
   novarocks.plan.RuntimeFilterContract contract = 2;
+  // Standalone deployments own their complete TypeDesc bindings in this table.
+  novarocks.plan.ExecutionTypeTable execution_types = 3;
 }
 
 message RuntimeFilterChannelDeployment {

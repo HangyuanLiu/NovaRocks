@@ -29,6 +29,7 @@
 //! therefore one-way: query assembly reads this module, and this module never
 //! reaches back into it.
 
+use crate::connector::schema_creation::FrontendSchemaLoad;
 use std::sync::{Arc, RwLock};
 
 use novarocks_types::naming::TableIdentity;
@@ -39,6 +40,7 @@ use novarocks_sql::planning::catalog::PlannerMemoryCatalog;
 mod registry;
 mod schema_cache;
 mod service;
+#[cfg(test)]
 mod variant_identity;
 
 use registry::{Catalog, CatalogRegistry};
@@ -220,7 +222,7 @@ fn load_connector_table_materialization_with_resolution_typed(
     let metadata = planning_lease
         .binding()
         .metadata()
-        .load_table(ConnectorTableRequest {
+        .load_frontend_table(ConnectorTableRequest {
             table: ConnectorTableIdentity {
                 instance_id,
                 namespace: Arc::from(namespace),
@@ -258,25 +260,17 @@ pub fn connector_table_materialization_from_metadata(
 
     let mut columns = Vec::new();
     let mut row_lineage_metadata_columns = Vec::new();
-    for (ordinal, field) in metadata.schema.fields().iter().enumerate() {
+    for (ordinal, field) in metadata.schema().fields().iter().enumerate() {
         let fact = metadata.planning_facts.column_facts().get(ordinal);
-        let variant_identity = variant_identity::project_column(
-            &metadata.definition_facts,
-            ordinal,
-            field,
-            fact.map(|fact| fact.semantic_kind()).unwrap_or_default(),
-        )?;
-        let mut column = crate::connector::sql_column_from_connector_field(
-            field,
+        let column = crate::connector::sql_column_from_connector_binding(
+            field.name(),
+            metadata
+                .execution_schema()
+                .binding(ordinal)
+                .ok_or("catalog execution schema is missing an authored column")?,
             &metadata.planning_facts,
             ordinal,
         )?;
-        if let Some(logical_type) = variant_identity {
-            column.logical_type = Some(logical_type);
-            column
-                .declared_value_type()
-                .map_err(|error| error.to_string())?;
-        }
         match fact.map(|fact| fact.role()) {
             Some(ConnectorTableColumnRole::RowLineageSystem) => {
                 row_lineage_metadata_columns.push(column)
@@ -314,7 +308,7 @@ pub fn connector_table_materialization_from_metadata(
         columns,
         row_lineage_metadata_columns,
         read_table: metadata.table.clone(),
-        read_schema: metadata.schema.clone(),
+        read_schema: Arc::new(metadata.schema().clone()),
         read_selector: novarocks_spi::connector::ConnectorReadSelector::Current,
         sql_planning_facts: metadata.planning_facts.clone(),
         statistics_pin,

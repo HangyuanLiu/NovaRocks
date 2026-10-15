@@ -261,13 +261,13 @@ pub(crate) fn validate_expression(
                 // its operand does not -- negating the smallest integer has no
                 // answer, and a plan's nullability widens on the way out. It
                 // may not admit less.
-                let widens = expression.ty.nullable || !input.ty.nullable;
+                let widens = expression.ty.nullable() || !input.ty.nullable();
                 // Strict unary NULL preserves the actual nullable NULL domain
                 // and its child evaluation; it is not a numeric coercion.
-                let strict_null = input.ty.logical_type
+                let strict_null = input.ty.logical_type()
                     == novarocks_type_contract::ValueLogicalType::Physical
-                    && input.ty.data_type == DataType::Null
-                    && input.ty.nullable;
+                    && *input.ty.data_type() == DataType::Null
+                    && input.ty.nullable();
                 let valid = match op {
                     crate::UnaryOperator::Plus | crate::UnaryOperator::Minus => {
                         (is_numeric_value_type(&input.ty) || strict_null)
@@ -275,8 +275,8 @@ pub(crate) fn validate_expression(
                             && widens
                     }
                     crate::UnaryOperator::Not => {
-                        input.ty.data_type == DataType::Boolean
-                            && expression.ty.data_type == DataType::Boolean
+                        *input.ty.data_type() == DataType::Boolean
+                            && *expression.ty.data_type() == DataType::Boolean
                             && widens
                     }
                     crate::UnaryOperator::BitwiseNot => {
@@ -435,11 +435,16 @@ pub(crate) fn validate_expression(
                 ));
             }
             if let Some(input) = fragment.expressions().get(*expr)
-                && (input.ty.logical_type != expression.ty.logical_type
-                    || !novarocks_type_contract::preserves_nested_logical_identity(
-                        &input.ty.data_type,
-                        target,
-                    ))
+                && !novarocks_type_contract::is_default_json_structure_cast(
+                    &input.ty,
+                    &expression.ty,
+                )
+                && !novarocks_type_contract::preserves_value_domains_observed(
+                    input.ty.value_type(),
+                    expression.ty.value_type(),
+                    |_| Ok::<_, novarocks_type_contract::ValueTypeError>(()),
+                )
+                .unwrap_or(false)
             {
                 errors.push(ValidationError::new(
                     &path,
@@ -448,7 +453,7 @@ pub(crate) fn validate_expression(
             }
             if let Some(input) = fragment.expressions().get(*expr)
                 && !novarocks_type_contract::decimal_error_policy_cast_supported(
-                    &input.ty.data_type,
+                    &input.ty.data_type(),
                     target,
                     *decimal_overflow_policy,
                 )
@@ -463,19 +468,20 @@ pub(crate) fn validate_expression(
             // statement may stand this value where null is admitted. It may
             // not claim the reverse: a null-admitting input does not stop
             // admitting null by being converted.
-            if !novarocks_type_contract::arrow_data_types_exact(&expression.ty.data_type, target) {
+            if !novarocks_type_contract::arrow_data_types_exact(&expression.ty.data_type(), target)
+            {
                 // Both types, because which half drifted is the diagnosis.
                 errors.push(ValidationError::new(
                     &path,
                     format!(
                         "cast result type {:?} differs from its target {target:?}",
-                        expression.ty.data_type
+                        expression.ty.data_type()
                     ),
                 ));
             } else if fragment
                 .expressions()
                 .get(*expr)
-                .is_some_and(|input| input.ty.nullable && !expression.ty.nullable)
+                .is_some_and(|input| input.ty.nullable() && !expression.ty.nullable())
             {
                 errors.push(ValidationError::new(
                     &path,
@@ -489,14 +495,14 @@ pub(crate) fn validate_expression(
         ExprKind::InList { expr, list, .. } => {
             require_boolean_result(&expression.ty, &path, errors);
             if let Some(input) = fragment.expressions().get(*expr) {
-                let nullable = input.ty.nullable
+                let nullable = input.ty.nullable()
                     || list.iter().any(|candidate| {
                         fragment
                             .expressions()
                             .get(*candidate)
-                            .is_some_and(|candidate| candidate.ty.nullable)
+                            .is_some_and(|candidate| candidate.ty.nullable())
                     });
-                if nullable && !expression.ty.nullable {
+                if nullable && !expression.ty.nullable() {
                     errors.push(ValidationError::new(
                         &path,
                         "IN-list result stops admitting null its operands admit",
@@ -525,9 +531,9 @@ pub(crate) fn validate_expression(
                     fragment
                         .expressions()
                         .get(bound)
-                        .is_some_and(|bound| bound.ty.nullable)
-                }) || input.ty.nullable;
-                if nullable && !expression.ty.nullable {
+                        .is_some_and(|bound| bound.ty.nullable())
+                }) || input.ty.nullable();
+                if nullable && !expression.ty.nullable() {
                     errors.push(ValidationError::new(
                         &path,
                         "BETWEEN result stops admitting null its operands admit",
@@ -553,9 +559,9 @@ pub(crate) fn validate_expression(
                 fragment
                     .expressions()
                     .get(id)
-                    .is_some_and(|value| value.ty.nullable)
+                    .is_some_and(|value| value.ty.nullable())
             });
-            if nullable && !expression.ty.nullable {
+            if nullable && !expression.ty.nullable() {
                 errors.push(ValidationError::new(
                     &path,
                     "LIKE result stops admitting null its operands admit",
@@ -565,7 +571,7 @@ pub(crate) fn validate_expression(
                 fragment
                     .expressions()
                     .get(id)
-                    .is_some_and(|value| !is_utf8(&value.ty.data_type))
+                    .is_some_and(|value| !is_utf8(&value.ty.data_type()))
             }) {
                 errors.push(ValidationError::new(
                     &path,
@@ -597,40 +603,40 @@ pub(crate) fn validate_literal_type(
     errors: &mut ValidationContext,
 ) {
     let valid = match literal {
-        crate::LiteralValue::Null => ty.nullable,
-        crate::LiteralValue::Boolean(_) => ty.data_type == DataType::Boolean,
-        crate::LiteralValue::Int64(_) => ty.data_type == DataType::Int64,
-        crate::LiteralValue::UInt64(_) => ty.data_type == DataType::UInt64,
-        crate::LiteralValue::Float64Bits(_) => ty.data_type == DataType::Float64,
+        crate::LiteralValue::Null => ty.nullable(),
+        crate::LiteralValue::Boolean(_) => *ty.data_type() == DataType::Boolean,
+        crate::LiteralValue::Int64(_) => *ty.data_type() == DataType::Int64,
+        crate::LiteralValue::UInt64(_) => *ty.data_type() == DataType::UInt64,
+        crate::LiteralValue::Float64Bits(_) => *ty.data_type() == DataType::Float64,
         crate::LiteralValue::LargeInt(_) => {
-            novarocks_type_contract::is_largeint_data_type(&ty.data_type)
+            novarocks_type_contract::is_largeint_data_type(&ty.data_type())
                 && is_numeric_value_type(ty)
         }
         crate::LiteralValue::Decimal128(_) => {
-            matches!(ty.data_type, DataType::Decimal128(_, _))
+            matches!(ty.data_type(), DataType::Decimal128(_, _))
         }
         crate::LiteralValue::Decimal256(_) => {
-            matches!(ty.data_type, DataType::Decimal256(_, _))
+            matches!(ty.data_type(), DataType::Decimal256(_, _))
         }
-        crate::LiteralValue::Utf8(_) => is_utf8(&ty.data_type),
+        crate::LiteralValue::Utf8(_) => is_utf8(&ty.data_type()),
         crate::LiteralValue::Binary(_) => {
             matches!(
-                ty.data_type,
+                ty.data_type(),
                 DataType::Binary | DataType::LargeBinary | DataType::BinaryView
             )
         }
-        crate::LiteralValue::Date32(_) => ty.data_type == DataType::Date32,
+        crate::LiteralValue::Date32(_) => *ty.data_type() == DataType::Date32,
         crate::LiteralValue::Time64(_) => {
             matches!(
-                ty.data_type,
+                ty.data_type(),
                 DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond)
             )
         }
         crate::LiteralValue::Timestamp(_) => {
-            matches!(ty.data_type, DataType::Timestamp(_, _))
+            matches!(ty.data_type(), DataType::Timestamp(_, _))
         }
         crate::LiteralValue::IntervalMonthDayNano { .. } => {
-            ty.data_type == DataType::Interval(IntervalUnit::MonthDayNano)
+            *ty.data_type() == DataType::Interval(IntervalUnit::MonthDayNano)
         }
     };
     if !valid {
@@ -641,7 +647,7 @@ pub(crate) fn validate_literal_type(
             format!(
                 "literal {} differs from its declared type {:?}",
                 literal_kind_name(literal),
-                ty.data_type
+                ty.data_type()
             ),
         ));
     }
@@ -727,18 +733,18 @@ pub(crate) fn validate_boolean_connective_types(
         let Some(arg) = fragment.expressions().get(*arg) else {
             continue;
         };
-        if arg.ty.data_type != DataType::Boolean {
+        if *arg.ty.data_type() != DataType::Boolean {
             errors.push(ValidationError::new(
                 path,
                 format!("boolean connective argument {ordinal} is not boolean"),
             ));
         }
-        nullable |= arg.ty.nullable;
+        nullable |= arg.ty.nullable();
     }
     // Three-valued `AND` and `OR` answer null where an argument does, and a
     // plan's nullability widens on the way out. What they may not do is
     // answer less than their arguments admit.
-    if output.ty.data_type != DataType::Boolean || (nullable && !output.ty.nullable) {
+    if *output.ty.data_type() != DataType::Boolean || (nullable && !output.ty.nullable()) {
         errors.push(ValidationError::new(
             path,
             "boolean connective result type is inconsistent with its arguments",
@@ -758,7 +764,7 @@ pub(crate) fn validate_binary_types(
     // An operator may admit null neither operand does -- arithmetic answers
     // with null where it cannot answer with a number, and a plan's nullability
     // widens on the way out. It may not admit less than its operands do.
-    let nullable = left.ty.nullable || right.ty.nullable;
+    let nullable = left.ty.nullable() || right.ty.nullable();
     let nullability_widens = |output: bool| output || !nullable;
     let valid = match op {
         crate::BinaryOperator::Add
@@ -784,7 +790,8 @@ pub(crate) fn validate_binary_types(
             };
             arithmetic_result_value_type_with_op(&left.ty, &right.ty, operation).is_some_and(
                 |expected| {
-                    output.ty.same_value_domain(&expected) && nullability_widens(output.ty.nullable)
+                    output.ty.same_value_domain(&expected)
+                        && nullability_widens(output.ty.nullable())
                 },
             )
         }
@@ -795,11 +802,11 @@ pub(crate) fn validate_binary_types(
         | crate::BinaryOperator::Gt
         | crate::BinaryOperator::GtEq => {
             same_inputs
-                && output.ty.data_type == DataType::Boolean
-                && nullability_widens(output.ty.nullable)
+                && *output.ty.data_type() == DataType::Boolean
+                && nullability_widens(output.ty.nullable())
         }
         crate::BinaryOperator::EqForNull => {
-            same_inputs && output.ty.data_type == DataType::Boolean && !output.ty.nullable
+            same_inputs && *output.ty.data_type() == DataType::Boolean && !output.ty.nullable()
         }
         crate::BinaryOperator::BitAnd
         | crate::BinaryOperator::BitOr
@@ -807,7 +814,7 @@ pub(crate) fn validate_binary_types(
             same_inputs
                 && is_integer_value_type(&left.ty)
                 && output.ty.same_value_domain(&left.ty)
-                && nullability_widens(output.ty.nullable)
+                && nullability_widens(output.ty.nullable())
         }
     };
     if !valid {
@@ -838,25 +845,26 @@ pub(crate) fn validate_case_types(
         if let Some(when) = fragment.expressions().get(*when) {
             let valid = operand_type
                 .map(|operand| operand.same_value_domain(&when.ty))
-                .unwrap_or(when.ty.data_type == DataType::Boolean);
+                .unwrap_or(*when.ty.data_type() == DataType::Boolean);
             if !valid {
                 errors.push(ValidationError::new(
                     path,
                     match operand_type {
                         Some(operand) => format!(
                             "CASE compares {:?} against a branch of {:?}",
-                            operand.data_type, when.ty.data_type
+                            operand.data_type(),
+                            when.ty.data_type()
                         ),
-                        None => format!("CASE condition is {:?}, not a boolean", when.ty.data_type),
+                        None => {
+                            format!("CASE condition is {:?}, not a boolean", when.ty.data_type())
+                        }
                     },
                 ));
             }
         }
-        if fragment
-            .expressions()
-            .get(*then)
-            .is_some_and(|then| !then.ty.same_value_domain(&expression.ty))
-        {
+        if fragment.expressions().get(*then).is_some_and(|then| {
+            !super::value_bindings_match_ignoring_root_nullability(&then.ty, &expression.ty)
+        }) {
             errors.push(ValidationError::new(
                 path,
                 "CASE result type differs from its output",
@@ -867,7 +875,12 @@ pub(crate) fn validate_case_types(
         && fragment
             .expressions()
             .get(else_expr)
-            .is_some_and(|otherwise| !otherwise.ty.same_value_domain(&expression.ty))
+            .is_some_and(|otherwise| {
+                !super::value_bindings_match_ignoring_root_nullability(
+                    &otherwise.ty,
+                    &expression.ty,
+                )
+            })
     {
         errors.push(ValidationError::new(
             path,
@@ -879,15 +892,15 @@ pub(crate) fn validate_case_types(
             fragment
                 .expressions()
                 .get(*then)
-                .is_some_and(|then| then.ty.nullable)
+                .is_some_and(|then| then.ty.nullable())
         })
         || else_expr.is_some_and(|otherwise| {
             fragment
                 .expressions()
                 .get(otherwise)
-                .is_some_and(|otherwise| otherwise.ty.nullable)
+                .is_some_and(|otherwise| otherwise.ty.nullable())
         });
-    if result_nullable && !expression.ty.nullable {
+    if result_nullable && !expression.ty.nullable() {
         errors.push(ValidationError::new(
             path,
             "CASE result stops admitting null its branches admit",
@@ -932,7 +945,7 @@ pub(crate) fn validate_window_frame(
             .expressions()
             .get(expression)
             .is_some_and(|expression| {
-                !expression.ty.nullable
+                !expression.ty.nullable()
                     && (frame.units == crate::WindowFrameUnits::Range
                         || window_offset_literal_is_valid(&expression.kind, frame.units))
             });
@@ -1029,7 +1042,7 @@ pub(crate) fn window_row_offset(fragment: &Fragment, expression: ExprId) -> Opti
 }
 
 pub(crate) fn require_boolean_result(ty: &ValueType, path: &str, errors: &mut ValidationContext) {
-    if ty.data_type != DataType::Boolean {
+    if *ty.data_type() != DataType::Boolean {
         errors.push(ValidationError::new(
             path,
             "expression result is not Boolean",
@@ -1042,7 +1055,7 @@ pub(crate) fn require_non_nullable_boolean(
     path: &str,
     errors: &mut ValidationContext,
 ) {
-    if ty.data_type != DataType::Boolean || ty.nullable {
+    if *ty.data_type() != DataType::Boolean || ty.nullable() {
         errors.push(ValidationError::new(
             path,
             "expression result must be non-nullable Boolean",
@@ -1150,7 +1163,10 @@ pub(crate) fn validate_function_arguments(
                         parameter_types: actual_parameters,
                         ..
                     },
-                ) => actual_parameters == parameter_types && &actual.ty == result_type,
+                ) => {
+                    actual_parameters.as_ref() == parameter_types.as_slice()
+                        && &actual.ty == result_type
+                }
                 (crate::FunctionArgumentType::Lambda { .. }, _) => false,
             }
         });
@@ -1355,8 +1371,10 @@ pub(crate) fn validate_aggregate_arguments(
                     "state-consuming aggregate phase requires exactly one state input",
                 ));
             } else if let Some(argument) = fragment.expressions().get(args[0])
-                && (!argument.ty.same_value_domain(&binding.intermediate_type)
-                    || (binding.intermediate_type.nullable && !argument.ty.nullable))
+                && (!super::value_bindings_match_ignoring_root_nullability(
+                    &argument.ty,
+                    &binding.intermediate_type,
+                ) || (binding.intermediate_type.nullable() && !argument.ty.nullable()))
             {
                 // The carrier the state travelled in may admit null the
                 // phase before it never wrote -- a state crossing an

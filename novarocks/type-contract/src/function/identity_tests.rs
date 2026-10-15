@@ -243,3 +243,157 @@ fn observed_state_identity_visits_only_actual_bytes_and_preserves_primary_refusa
     .unwrap();
     assert_eq!(visits, 1024);
 }
+
+#[derive(Debug, Eq, PartialEq)]
+enum IdentityCreationFailure {
+    Identity(FunctionIdentityError),
+    Resource(crate::owned_resources::layout::LayoutResourceError),
+    Host(usize),
+}
+impl From<FunctionIdentityError> for IdentityCreationFailure {
+    fn from(error: FunctionIdentityError) -> Self {
+        Self::Identity(error)
+    }
+}
+impl From<crate::owned_resources::layout::LayoutResourceError> for IdentityCreationFailure {
+    fn from(error: crate::owned_resources::layout::LayoutResourceError) -> Self {
+        Self::Resource(error)
+    }
+}
+
+struct IdentityLifetime;
+impl crate::ValueTypeStorageHold for IdentityLifetime {}
+
+#[test]
+fn independent_identity_clones_retain_text_creator_and_keep_content_identity() {
+    use std::{
+        hash::{Hash, Hasher},
+        sync::Arc,
+    };
+    fn digest(value: &impl Hash) -> u64 {
+        let mut state = std::collections::hash_map::DefaultHasher::new();
+        value.hash(&mut state);
+        state.finish()
+    }
+    macro_rules! verify {
+        ($identity:ident, $text:literal) => {{
+            let owner = Arc::new(IdentityLifetime);
+            let weak = Arc::downgrade(&owner);
+            let storage = crate::ValueTypeStorageLifetime::held(owner);
+            let text: Box<str> = $text.into();
+            let original_text = text.as_ptr();
+            let value = $identity::try_from_boxed_in(text, storage).unwrap();
+            let pure = $identity::try_new($text).unwrap();
+            assert_eq!(
+                value.as_str().as_ptr(),
+                original_text,
+                "checked consume does not copy text"
+            );
+            assert_eq!(value, pure);
+            assert_eq!(value.cmp(&pure), std::cmp::Ordering::Equal);
+            assert_eq!(digest(&value), digest(&pure));
+            assert_eq!(format!("{value:?}"), format!("{pure:?}"));
+            let mut visits = 0;
+            let retained = value
+                .clone_observed(|| {
+                    visits += 1;
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+            assert_eq!(visits, 1);
+            assert_eq!(
+                retained.as_str().as_ptr(),
+                original_text,
+                "clone shares text backing"
+            );
+            drop(value);
+            assert!(weak.upgrade().is_some());
+            assert_eq!(retained.as_str(), $text);
+            drop(retained);
+            assert!(
+                weak.upgrade().is_none(),
+                "only the final identity releases its creator"
+            );
+        }};
+    }
+    verify!(FunctionId, "provider/full-function-v1");
+    verify!(FunctionOverloadId, "builtin.aggregate/count/derived-v1");
+    verify!(AggregateStateFormatId, "novarocks/count/state-v1");
+}
+
+#[test]
+fn identity_creation_preserves_first_host_refusal_without_later_work_or_request() {
+    use std::{cell::Cell, sync::Arc};
+    for fail_at in [1, 2] {
+        let requests = Cell::new(0);
+        let visits = Cell::new(0);
+        let work_at_refusal = Cell::new(None);
+        let owner = Arc::new(IdentityLifetime);
+        let weak = Arc::downgrade(&owner);
+        let result = AggregateStateFormatId::try_new_observed::<IdentityCreationFailure>(
+            "novarocks/count/state-v1",
+            crate::ValueTypeStorageLifetime::held(owner),
+            |layout| {
+                assert!(layout.size() > 0);
+                let at = requests.get() + 1;
+                requests.set(at);
+                if at == fail_at {
+                    work_at_refusal.set(Some(visits.get()));
+                    Err(IdentityCreationFailure::Host(at))
+                } else {
+                    Ok(())
+                }
+            },
+            |units| {
+                visits.set(visits.get() + units);
+                Ok(())
+            },
+        );
+        assert_eq!(result.unwrap_err(), IdentityCreationFailure::Host(fail_at));
+        assert_eq!(requests.get(), fail_at);
+        assert_eq!(work_at_refusal.get(), Some(visits.get()));
+        assert!(
+            weak.upgrade().is_none(),
+            "refused identity publishes no retained storage"
+        );
+    }
+}
+
+#[test]
+fn observed_identity_consume_has_one_actual_backing_request_and_original_grammar() {
+    let text: Box<str> = "fixture|unicode🙂,overload".into();
+    let ptr = text.as_ptr();
+    let mut requests = Vec::new();
+    let value = FunctionOverloadId::try_from_boxed_observed::<IdentityCreationFailure>(
+        text,
+        crate::ValueTypeStorageLifetime::pure(),
+        |layout| {
+            requests.push(layout);
+            Ok(())
+        },
+        |_| panic!("function overload grammar inspects length only"),
+    )
+    .unwrap();
+    assert_eq!(value.as_str().as_ptr(), ptr);
+    assert_eq!(
+        requests,
+        vec![FunctionOverloadId::storage_allocation_layout().unwrap()]
+    );
+    let mut requests = 0;
+    let result = AggregateStateFormatId::try_from_boxed_observed::<IdentityCreationFailure>(
+        "invalid|state".into(),
+        crate::ValueTypeStorageLifetime::pure(),
+        |_| {
+            requests += 1;
+            Ok(())
+        },
+        |_| Ok(()),
+    );
+    assert_eq!(
+        result.unwrap_err(),
+        IdentityCreationFailure::Identity(FunctionIdentityError::InvalidCharacters {
+            kind: "aggregate state format"
+        })
+    );
+    assert_eq!(requests, 0);
+}

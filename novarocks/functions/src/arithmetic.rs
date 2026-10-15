@@ -31,7 +31,7 @@ mod largeint;
 use novarocks_type_contract::{
     ArithmeticOperator, CompileCheckpoints, CompileControlError, CompilePhase,
     DecimalOverflowPolicy, ExpressionEffectContext, ExpressionEffects, FunctionValueType,
-    PureCompileControl, ValueLogicalType, arithmetic_result_value_type_with_op,
+    PureCompileControl, ValueLogicalType, arithmetic_result_value_shape_with_op,
 };
 use std::{error::Error, fmt};
 
@@ -41,6 +41,65 @@ use crate::{
     EvaluatedArgument, KernelEvaluationControl, KernelFailure, RowDataError,
     ScopedExpressionEffects,
 };
+
+/// Nominal source of a before-allocation canonical arithmetic type refusal.
+#[derive(Debug)]
+pub enum ArithmeticTypeCreationFailure<H> {
+    Control(CompileControlError),
+    Creator(H),
+}
+
+/// The original preparation error is separate from construction's exact
+/// creator/control/resource cause; no typed host failure is erased or formatted.
+#[derive(Debug)]
+pub enum ArithmeticCreationFailure<H> {
+    Prepare(ArithmeticPrepareError),
+    Construction(
+        novarocks_type_contract::ValueConstructionFailure<ArithmeticTypeCreationFailure<H>>,
+    ),
+}
+impl<H> From<ArithmeticPrepareError> for ArithmeticCreationFailure<H> {
+    fn from(error: ArithmeticPrepareError) -> Self {
+        Self::Prepare(error)
+    }
+}
+impl<H> From<CompileControlError> for ArithmeticCreationFailure<H> {
+    fn from(error: CompileControlError) -> Self {
+        Self::Prepare(error.into())
+    }
+}
+impl<H> ArithmeticCreationFailure<H> {
+    fn is_primary(&self) -> bool {
+        use novarocks_type_contract::ValueConstructionFailure as Failure;
+        match self {
+            Self::Prepare(error) => error.control_error().is_some(),
+            Self::Construction(
+                Failure::Observer(_) | Failure::Layout(_) | Failure::Vec(_) | Failure::HashMap(_),
+            ) => true,
+            Self::Construction(Failure::ValueType(_) | Failure::Rule(_)) => false,
+        }
+    }
+}
+fn pure_arithmetic_creation_failure(
+    error: ArithmeticCreationFailure<std::convert::Infallible>,
+) -> ArithmeticPrepareError {
+    use novarocks_type_contract::ValueConstructionFailure as Failure;
+    match error {
+        ArithmeticCreationFailure::Prepare(error) => error,
+        ArithmeticCreationFailure::Construction(Failure::Observer(
+            ArithmeticTypeCreationFailure::Control(error),
+        )) => error.into(),
+        ArithmeticCreationFailure::Construction(Failure::Observer(
+            ArithmeticTypeCreationFailure::Creator(never),
+        )) => match never {},
+        ArithmeticCreationFailure::Construction(
+            Failure::Layout(_) | Failure::Vec(_) | Failure::HashMap(_),
+        ) => CompileControlError::ResourceExhausted.into(),
+        ArithmeticCreationFailure::Construction(Failure::ValueType(_) | Failure::Rule(_)) => {
+            ArithmeticPrepareError::TypeMismatch
+        }
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ArithmeticPrepareError {
@@ -102,10 +161,10 @@ enum SignedWidth {
 }
 impl SignedWidth {
     fn from_type(ty: &FunctionValueType) -> Option<Self> {
-        if ty.logical_type != ValueLogicalType::Physical {
+        if ty.logical_type() != ValueLogicalType::Physical {
             return None;
         }
-        Self::from_carrier(&ty.data_type)
+        Self::from_carrier(ty.data_type())
     }
     fn from_carrier(carrier: &DataType) -> Option<Self> {
         Some(match carrier {
@@ -228,17 +287,66 @@ impl PreparedArithmeticRecipe {
         allow_throw_exception: bool,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ArithmeticPrepareError> {
+        Self::try_new_core::<std::convert::Infallible>(
+            operator,
+            left,
+            right,
+            result,
+            decimal_policy,
+            allow_throw_exception,
+            |_: &mut CompileCheckpoints<'_>| Ok(FunctionValueType::new(DataType::Float64, true)),
+            control,
+        )
+        .map_err(pure_arithmetic_creation_failure)
+    }
+
+    /// The actual factory opens only the Float target's independent lifetime,
+    /// after the original supported-input profile selected that construction.
+    /// Other families create no unused target or scope.
+    pub fn try_new_with_creator_in<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
+        operator: ArithmeticOperator,
+        left: &FunctionValueType,
+        right: &FunctionValueType,
+        result: &FunctionValueType,
+        decimal_policy: DecimalOverflowPolicy,
+        allow_throw_exception: bool,
+        factory: &F,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ArithmeticCreationFailure<H>> {
+        Self::try_new_core(
+            operator,
+            left,
+            right,
+            result,
+            decimal_policy,
+            allow_throw_exception,
+            |work| float::canonical_target_with_factory(factory, work),
+            control,
+        )
+    }
+
+    fn try_new_core<H>(
+        operator: ArithmeticOperator,
+        left: &FunctionValueType,
+        right: &FunctionValueType,
+        result: &FunctionValueType,
+        decimal_policy: DecimalOverflowPolicy,
+        allow_throw_exception: bool,
+        mut target: impl FnMut(
+            &mut CompileCheckpoints<'_>,
+        ) -> Result<FunctionValueType, ArithmeticCreationFailure<H>>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ArithmeticCreationFailure<H>> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)?;
-        let outcome = (|| {
+        let outcome: Result<Self, ArithmeticCreationFailure<H>> = (|| {
             for ty in [left, right, result] {
                 validate_type_observed(ty, &mut work).map_err(ArithmeticPrepareError::Kernel)?;
             }
-            let mut expected = arithmetic_result_value_type_with_op(left, right, operator)
+            // Both owning publication and this borrowed decision consume the
+            // same original numeric result author. Preparation admits its
+            // nullable result law without constructing discarded type nodes.
+            let expected = arithmetic_result_value_shape_with_op(left, right, operator)
                 .ok_or(ArithmeticPrepareError::Unsupported)?;
-            // This executable slice admits the source SQL author's nullable
-            // result profile. Capability selection uses the single shared
-            // result author, never a caller's incompatible target carrier.
-            expected.nullable = true;
             work.step()?;
             let algorithm = if let (Some(left), Some(right)) =
                 (SignedWidth::from_type(left), SignedWidth::from_type(right))
@@ -250,6 +358,8 @@ impl PreparedArithmeticRecipe {
                 right,
                 decimal_policy,
                 allow_throw_exception,
+                &mut target,
+                &mut work,
                 control,
             )? {
                 ArithmeticAlgorithm::Float(recipe)
@@ -257,26 +367,26 @@ impl PreparedArithmeticRecipe {
                 operator,
                 left,
                 right,
-                &expected,
+                (&expected.0, expected.1, true),
                 decimal_policy,
                 allow_throw_exception,
                 &mut work,
             )? {
                 ArithmeticAlgorithm::Decimal(recipe)
             } else if let Some(recipe) =
-                largeint::LargeIntArithmetic::prepare(operator, left, right, &expected, &mut work)?
+                largeint::LargeIntArithmetic::prepare(operator, left, right, &mut work)?
             {
                 ArithmeticAlgorithm::LargeInt(recipe)
             } else {
-                return Err(ArithmeticPrepareError::Unsupported);
+                return Err(ArithmeticPrepareError::Unsupported.into());
             };
             work.step()?;
-            let matches = result.nullable
-                && result.logical_type == expected.logical_type
-                && result.data_type == expected.data_type;
+            let matches = result.nullable()
+                && result.logical_type() == expected.1
+                && result.data_type() == &expected.0;
             work.step()?;
             if !matches {
-                return Err(ArithmeticPrepareError::TypeMismatch);
+                return Err(ArithmeticPrepareError::TypeMismatch.into());
             }
             // All admitted carriers are now closed scalar types: these copies
             // contain no field graph, metadata, timezone or dynamic backing.
@@ -295,7 +405,7 @@ impl PreparedArithmeticRecipe {
         if outcome
             .as_ref()
             .err()
-            .is_some_and(|error| error.control_error().is_some())
+            .is_some_and(ArithmeticCreationFailure::is_primary)
         {
             return outcome;
         }
@@ -465,8 +575,8 @@ pub(crate) fn checked_row(
 ) -> Result<Option<usize>, KernelFailure> {
     if let EvaluatedArgument::Constant(value) = argument {
         let actual = value.value_type();
-        let matches =
-            actual.logical_type == expected.logical_type && (!actual.nullable || expected.nullable);
+        let matches = actual.logical_type() == expected.logical_type()
+            && (!actual.nullable() || expected.nullable());
         work.step()?;
         if !matches {
             return Err(invalid(
@@ -477,7 +587,7 @@ pub(crate) fn checked_row(
     let array = argument.array();
     // All admitted arithmetic carriers are closed scalar types, so exact
     // equality here includes decimal precision/scale without a nested walk.
-    let matches = array.data_type() == &expected.data_type;
+    let matches = array.data_type() == expected.data_type();
     work.step()?;
     if !matches {
         return Err(invalid(
@@ -528,7 +638,7 @@ pub(crate) fn checked_row(
     let is_null = array.is_null(row);
     work.step()?;
     if is_null {
-        return if expected.nullable {
+        return if expected.nullable() {
             Ok(None)
         } else {
             Err(invalid(

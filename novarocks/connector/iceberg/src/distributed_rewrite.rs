@@ -121,13 +121,15 @@ impl IcebergDistributedRewriteControl {
     fn build_plan(
         &self,
         request: &ConnectorDistributedRewritePlanningRequest,
-    ) -> Result<ConnectorDistributedRewritePlan, ConnectorError> {
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorDistributedRewritePlan,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
         validate_context(&request.context)?;
         let target = self.provider.table_payload(request.operation().table())?;
         if target.metadata_table_type.is_some() {
-            return Err(invalid(
-                "Iceberg distributed rewrite requires a base table handle",
-            ));
+            return Err(invalid("Iceberg distributed rewrite requires a base table handle").into());
         }
         self.runtime
             .control_state()
@@ -171,7 +173,8 @@ impl IcebergDistributedRewriteControl {
                 {
                     return Err(invalid(
                         "Iceberg rewrite position delete files requires a format v3 table",
-                    ));
+                    )
+                    .into());
                 }
                 groups
             }
@@ -218,6 +221,7 @@ impl IcebergDistributedRewriteControl {
             scan_schema,
             row_lineage,
             metadata,
+            creation,
         )?;
         let state_digest = rewrite_state_digest(
             metadata.uuid().to_string().as_bytes(),
@@ -268,6 +272,7 @@ impl IcebergDistributedRewriteControl {
             payload,
             cohorts,
         )
+        .map_err(Into::into)
     }
 }
 
@@ -283,18 +288,20 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteControl {
     fn plan_rewrite(
         &self,
         request: ConnectorDistributedRewritePlanningRequest,
-    ) -> Result<ConnectorDistributedRewritePlan, ConnectorError> {
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorDistributedRewritePlan,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
         request.validate()?;
         if request.owner() != &self.key {
-            return Err(invalid(
-                "Iceberg distributed rewrite request has a foreign generation",
-            ));
+            return Err(
+                invalid("Iceberg distributed rewrite request has a foreign generation").into(),
+            );
         }
         let target = self.provider.table_payload(request.operation().table())?;
         if target.metadata_table_type.is_some() {
-            return Err(invalid(
-                "Iceberg distributed rewrite requires a base table handle",
-            ));
+            return Err(invalid("Iceberg distributed rewrite requires a base table handle").into());
         }
         let operation = match request.operation() {
             ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
@@ -322,12 +329,13 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteControl {
             return if existing.request_digest() == request.request_digest() {
                 Ok(existing)
             } else {
-                Err(invalid(
-                    "Iceberg distributed rewrite operation conflicts with cached plan",
-                ))
+                Err(
+                    invalid("Iceberg distributed rewrite operation conflicts with cached plan")
+                        .into(),
+                )
             };
         }
-        let planned = self.build_plan(&request)?;
+        let planned = self.build_plan(&request, creation)?;
         let mut plans = self
             .plans
             .lock()
@@ -338,7 +346,8 @@ impl ConnectorDistributedRewrite for IcebergDistributedRewriteControl {
             }
             Some(_) => Err(invalid(
                 "Iceberg distributed rewrite operation conflicts with cached plan",
-            )),
+            )
+            .into()),
             None => {
                 plans.insert(request.operation_id(), planned.clone());
                 Ok(planned)
@@ -874,7 +883,11 @@ fn cohort_plans_from_artifact(
     scan_schema: SchemaRef,
     row_lineage: bool,
     metadata: &crate::iceberg::spec::TableMetadata,
-) -> Result<Vec<ConnectorDistributedRewriteCohortPlan>, ConnectorError> {
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<
+    Vec<ConnectorDistributedRewriteCohortPlan>,
+    novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+> {
     let intent = match request.operation() {
         ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
             ConnectorWriteIntent::Overwrite
@@ -883,6 +896,7 @@ fn cohort_plans_from_artifact(
             ConnectorWriteIntent::RowDelta
         }
     };
+    let execution = rewrite_execution_schema(request.operation(), metadata, row_lineage, creation)?;
     artifact
         .groups
         .iter()
@@ -930,16 +944,78 @@ fn cohort_plans_from_artifact(
                     )
                 }
             };
-            ConnectorDistributedRewriteCohortPlan::try_new(
+            ConnectorDistributedRewriteCohortPlan::try_new_typed(
                 cohort_id,
                 read,
                 scan_schema.clone(),
+                execution.clone(),
                 arrow_schema_digest(&scan_schema),
                 preparation,
                 group_digest,
+                creation,
             )
         })
         .collect()
+}
+
+fn rewrite_execution_schema(
+    operation: &ConnectorDistributedRewriteOperation,
+    metadata: &crate::iceberg::spec::TableMetadata,
+    row_lineage: bool,
+    creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<
+    novarocks_connector_contract::ConnectorReadExecutionSchema,
+    novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+> {
+    use novarocks_connector_contract::{ConnectorReadExecutionSchema, PureProviderCompileError};
+    if matches!(
+        operation,
+        ConnectorDistributedRewriteOperation::RewriteDataFiles { .. }
+    ) {
+        let mut pseudo = creation.reserve::<String>(if row_lineage { 2 } else { 0 })?;
+        if row_lineage {
+            pseudo.push(creation.text(ICEBERG_ROW_ID_COL)?);
+            pseudo.push(creation.text(ICEBERG_LAST_UPDATED_SEQ_COL)?);
+        }
+        return crate::schema_mapping::catalog_value::table(
+            metadata,
+            metadata.current_schema(),
+            &pseudo,
+            creation,
+        );
+    }
+    let mut fields = creation.reserve(2)?;
+    let mut bindings = creation.reserve(2)?;
+    for (name, primitive) in [
+        ("file_path", crate::iceberg::spec::PrimitiveType::String),
+        ("pos", crate::iceberg::spec::PrimitiveType::Long),
+    ] {
+        let declared = crate::schema_mapping::typed_value::from_declaration(
+            &crate::iceberg::spec::Type::Primitive(primitive),
+            false,
+            None,
+            None,
+            creation,
+        )?;
+        let name = creation.text(name)?;
+        fields.push(creation.arc(Field::new(
+            name,
+            declared.binding.data_type().clone(),
+            false,
+        ))?);
+        bindings.push(declared.binding);
+    }
+    let fields = creation.arrow_fields(fields)?;
+    let schema = creation.arc(Schema::new(fields))?;
+    let storage = creation.storage();
+    let (request, work) = creation.observers();
+    ConnectorReadExecutionSchema::try_new_observed(
+        schema,
+        bindings.into_boxed_slice(),
+        storage,
+        |layout| request(layout).map_err(PureProviderCompileError::Control),
+        |units| work(units).map_err(PureProviderCompileError::Control),
+    )
 }
 
 fn rewrite_preparation(
@@ -2034,9 +2110,21 @@ mod tests {
                     admission_context(catalog_type),
                 )
                 .expect("request");
+                let mut layout = |_| Ok(());
+                let mut work = |_| Ok(());
+                let mut creation =
+                    novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+                        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                        &mut layout,
+                        &mut work,
+                    );
                 let error = adapter
-                    .plan_rewrite(request)
+                    .plan_rewrite(request, &mut creation)
                     .expect_err("catalog admission must refuse planning");
+                let novarocks_connector_contract::PureProviderCompileError::Provider(error) = error
+                else {
+                    panic!("catalog admission must retain its provider cause");
+                };
                 assert_eq!(error.kind(), ConnectorErrorKind::Unsupported);
                 assert!(error.to_string().contains(if catalog_type == "hive" {
                     "read-only compatibility entry"

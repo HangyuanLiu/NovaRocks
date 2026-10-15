@@ -20,8 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema, SlotLayout};
-use novarocks_plan_codec::native_type::{decode_field_type_owned, preflight_native_output_fields};
+use novarocks_execution::exec::chunk::{ChunkSchemaRef, ChunkSlotSchema, SlotLayout};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{common, plan};
 use novarocks_types::SlotId;
@@ -38,28 +37,17 @@ pub struct ProvenancedOutputColumn {
 }
 
 impl ProvenancedOutputColumn {
-    fn decode(
+    fn decode_with_types(
         column: common::OutputColumn,
         source_path: FieldPath,
         name_path: FieldPath,
         type_path: FieldPath,
+
+        type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
     ) -> Result<Self, NativeFragmentDecodeError> {
-        let type_desc = column.r#type.as_ref().ok_or_else(|| {
-            NativeFragmentDecodeError::missing(
-                type_path.clone(),
-                format!("ScanNode column {} type missing", column.name),
-            )
-        })?;
-        let field = decode_field_type_owned(&column.name, column.nullable, type_desc)
-            .map_err(|error| NativeFragmentDecodeError::invalid_value(type_path.clone(), error))?;
-        let slot_schema = ChunkSlotSchema::try_new_with_metadata_origins(
-            SlotId::new(column.column_id),
-            Arc::clone(field.field()),
-            field.metadata_origins().clone(),
-            None,
-            None,
-        )
-        .map_err(|error| NativeFragmentDecodeError::invalid_value(type_path.clone(), error))?;
+        let decoded =
+            type_decoder.output_layout(std::slice::from_ref(&column), source_path.clone())?;
+        let slot_schema = decoded.slot_schemas()[0].clone();
         Ok(Self {
             column,
             source_path,
@@ -120,9 +108,11 @@ impl DecodedScanOutputColumns {
     }
 }
 
-pub fn decode_scan_output_columns(
+pub(crate) fn decode_scan_output_columns(
     scan: &plan::ScanNode,
     scan_path: FieldPath,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<DecodedScanOutputColumns, NativeFragmentDecodeError> {
     if scan.columns.is_empty() {
         return Err(NativeFragmentDecodeError::missing(
@@ -130,9 +120,7 @@ pub fn decode_scan_output_columns(
             "ScanNode columns are empty",
         ));
     }
-    preflight_native_output_fields(&scan.columns).map_err(|error| {
-        NativeFragmentDecodeError::invalid_value(scan_path.clone().field("columns"), error)
-    })?;
+
     if scan.required_columns.len() > 65536
         || scan.required_columns.iter().any(|name| name.len() > 65536)
     {
@@ -196,11 +184,12 @@ pub fn decode_scan_output_columns(
                 ),
             ));
         }
-        let decoded = ProvenancedOutputColumn::decode(
+        let decoded = ProvenancedOutputColumn::decode_with_types(
             column.clone(),
             source_path.clone(),
             source_path.clone().field("name"),
             source_path.field("type"),
+            type_decoder,
         )?;
         columns.push(column.clone());
         provenanced.push(decoded);
@@ -210,9 +199,7 @@ pub fn decode_scan_output_columns(
         .map(|column| column.slot_schema().clone())
         .collect::<Vec<_>>();
     let layout = SlotLayout::for_slots(slot_schemas.iter().map(ChunkSlotSchema::slot_id));
-    let output_schema = ChunkSchema::try_new(slot_schemas)
-        .map(Arc::new)
-        .map_err(|error| NativeFragmentDecodeError::inconsistent(columns_path.clone(), error))?;
+    let output_schema = type_decoder.assemble_chunk_schema(slot_schemas, columns_path.clone())?;
     Ok(DecodedScanOutputColumns {
         columns,
         provenanced,

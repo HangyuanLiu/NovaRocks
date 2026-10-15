@@ -179,22 +179,78 @@ pub(super) fn payload(
         Bytes::from_static(value),
     )
 }
-/// The provider's own projected fields: names, field ids and schema metadata
-/// are provider facts the compiled layout must keep exactly.
+/// Provider execution projection; source IDs and attributes have their own facts.
 pub(super) fn public_schema() -> Schema {
-    Schema::new_with_metadata(
-        ["v0", "v1"]
-            .into_iter()
-            .enumerate()
-            .map(|(id, name)| {
-                Field::new(name, DataType::Int64, false).with_metadata(HashMap::from([(
-                    "provider.field-id".into(),
-                    (id + 1).to_string(),
-                )]))
-            })
-            .collect::<Vec<_>>(),
-        HashMap::from([("provider.schema".into(), "generation-1".into())]),
+    Schema::new(vec![
+        Field::new("v0", DataType::Int64, false),
+        Field::new("v1", DataType::Int64, false),
+    ])
+}
+pub(super) fn typed_public_schema(
+    source: ConnectorReadStaticFacts<ScanColumnId>,
+    kind: Option<ConnectorReadMetadataKind>,
+    schema: Schema,
+) -> ConnectorReadPublicFacts {
+    use novarocks_connector_contract::{
+        ConnectorReadExecutionSchema, ConnectorSourceFieldFacts, ConnectorSourceSchemaFacts,
+        ConnectorSourceSchemaShape,
+    };
+    use novarocks_type_contract::ValueTypeStorageLifetime;
+    let storage = ValueTypeStorageLifetime::pure();
+    let types = schema
+        .fields()
+        .iter()
+        .map(|field| FunctionValueType::new(field.data_type().clone(), field.is_nullable()))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let width = schema.fields().len();
+    let schema = Arc::new(schema);
+    let execution =
+        ConnectorReadExecutionSchema::try_new(schema.clone(), types, storage.clone()).unwrap();
+    let shape = ConnectorSourceSchemaShape::try_new(schema, storage.clone()).unwrap();
+    let fields = (0..width as u32)
+        .map(|ordinal| {
+            ConnectorSourceFieldFacts::try_new(
+                Box::from([ordinal]),
+                Some(ordinal as i32 + 1),
+                None,
+                HashMap::new(),
+                &[],
+                storage.clone(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    // This fixture is the actual map creator: one reserved table, one insertion,
+    // no removals or mutable escape. Its original geometry covers opaque source
+    // iteration work only; it is no FE allocation quota or charged-bytes floor.
+    let table =
+        novarocks_type_contract::owned_resources::hashmap::fresh_table_layout::<String, String>(1)
+            .unwrap();
+    let mut attributes = HashMap::with_capacity(1);
+    let key = "provider.schema";
+    let value = "generation-1";
+    attributes.insert(key.to_owned(), value.to_owned());
+    let source_bytes = table.layout.unwrap().size() + key.len() + value.len();
+    let facts = ConnectorSourceSchemaFacts::try_new_observed_with_source_invoice(
+        shape,
+        attributes,
+        fields,
+        storage,
+        source_bytes,
+        |_| Ok::<_, novarocks_connector_contract::ConnectorError>(()),
+        |_| Ok(()),
     )
+    .unwrap();
+    ConnectorReadPublicFacts::try_new_typed_with_control(
+        source,
+        kind,
+        &execution,
+        &facts,
+        &FixtureControl,
+    )
+    .unwrap()
 }
 
 struct Fixture {
@@ -721,14 +777,12 @@ fn fixture(spec: Spec) -> Fixture {
         if spec.metadata { vec![4] } else { vec![] },
     )
     .unwrap();
-    let public = ConnectorReadPublicFacts::try_new(
+    let public = typed_public_schema(
         source,
         spec.metadata
             .then(|| ConnectorReadMetadataKind::try_new("lake.entries").unwrap()),
         public_schema(),
-        vec![ValueLogicalType::Physical; 2],
-    )
-    .unwrap();
+    );
     let read = FrozenConnectorRead::try_new(scan, public).unwrap();
     let mut scans = BTreeMap::from([(ProviderReadOccurrenceId::new(0), read.clone())]);
     if second_scan {
@@ -1043,7 +1097,21 @@ fn residual_scan_compiles_to_the_provider_layout_seal_address_and_residual_root(
             .as_ref(),
         b"validated"
     );
-    // The layout is the provider's public schema, metadata included.
+    // Execution projection stays metadata-free; source facts remain on its
+    // original provider recipe owner, independently of layout semantics.
+    let source_facts = recipe
+        .frozen()
+        .public_facts()
+        .source_schema_facts()
+        .unwrap();
+    assert_eq!(
+        source_facts
+            .schema_attributes()
+            .get("provider.schema")
+            .map(String::as_str),
+        Some("generation-1")
+    );
+    assert_eq!(source_facts.field_fact(&[0]).unwrap().field_id(), Some(1));
     let layout = node.output_layout();
     assert_eq!(layout.schema().as_ref(), &public_schema());
     assert_eq!(layout.slots().len(), 2);

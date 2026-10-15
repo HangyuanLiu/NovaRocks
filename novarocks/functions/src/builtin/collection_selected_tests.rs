@@ -89,7 +89,7 @@ fn prepared(
 }
 fn map(keys: ArrayRef, values: ArrayRef, offsets: Vec<i32>, valid: Option<Vec<bool>>) -> ArrayRef {
     let fs = vec![
-        Arc::new(Field::new("key", keys.data_type().clone(), true)),
+        Arc::new(Field::new("key", keys.data_type().clone(), false)),
         Arc::new(Field::new("value", values.data_type().clone(), true)),
     ];
     let e = StructArray::new(fs.into(), vec![keys, values], None);
@@ -102,7 +102,7 @@ fn map(keys: ArrayRef, values: ArrayRef, offsets: Vec<i32>, valid: Option<Vec<bo
     ))
 }
 fn source(a: &ArrayRef) -> FunctionValueType {
-    FunctionValueType::new(a.data_type().clone(), true)
+    FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true)
 }
 #[test]
 fn collection_independent_column_scalar_compact_mappings_preserve_null_key_and_constructor_order() {
@@ -143,7 +143,7 @@ fn collection_independent_column_scalar_compact_mappings_preserve_null_key_and_c
         vec![None, Some(8), Some(10), Some(4), Some(8), Some(40)]
     );
     let m = map(
-        Arc::new(Int32Array::from(vec![Some(1), None, None, Some(4), None])),
+        Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
         Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5])),
         vec![0, 1, 3, 4, 5],
         None,
@@ -169,13 +169,13 @@ fn collection_independent_column_scalar_compact_mappings_preserve_null_key_and_c
             .unwrap()
             .iter()
             .collect::<Vec<_>>(),
-        vec![Some(3), Some(5)]
+        vec![None, None]
     );
 }
 #[test]
 fn map_lookup_original_unsupported_domain_is_bounded_rowdata_and_undemanded_errors_eliminate() {
     let m = map(
-        Arc::new(UInt64Array::from(vec![Some(1), None])),
+        Arc::new(UInt64Array::from(vec![1, 2])),
         Arc::new(Int32Array::from(vec![7, 8])),
         vec![0, 1, 2, 2],
         Some(vec![true, true, false]),
@@ -208,7 +208,7 @@ fn map_lookup_original_unsupported_domain_is_bounded_rowdata_and_undemanded_erro
             .unwrap()
             .iter()
             .collect::<Vec<_>>(),
-        vec![None, Some(8), None]
+        vec![None, None, None]
     );
     let rows = [1, 2];
     let mut k = ScalarEvaluationInstance::instantiate(p).unwrap();

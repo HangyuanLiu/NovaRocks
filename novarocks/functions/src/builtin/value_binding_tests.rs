@@ -27,7 +27,7 @@ fn value(ty: FunctionValueType) -> FunctionArgument {
     }
 }
 fn physical(carrier: DataType) -> FunctionValueType {
-    FunctionValueType::new(carrier, true)
+    FunctionValueType::from_legacy_declared_projection(carrier, true)
 }
 fn logical(carrier: DataType, domain: ValueLogicalType) -> FunctionValueType {
     FunctionValueType::try_with_logical_type(carrier, true, domain).unwrap()
@@ -112,7 +112,7 @@ fn repeated_variables_select_owner_authorized_common_domains() {
     }
     let arguments = [value(json()), value(json())];
     let binding = resolve("coalesce", FunctionKind::Scalar, &arguments);
-    assert_eq!(output(&binding).logical_type, ValueLogicalType::Json);
+    assert_eq!(output(&binding).logical_type(), ValueLogicalType::Json);
     let mut forged = binding;
     forged.selected.result_type = FunctionResultType::Scalar(physical(DataType::Utf8));
     assert!(
@@ -198,7 +198,7 @@ fn string_anchor_and_largeint_anchor_have_actual_conversion_bindings() {
         binding.selected.argument_types[0],
         FunctionArgumentType::Value(physical(DataType::Utf8))
     );
-    assert_eq!(output(&binding).logical_type, ValueLogicalType::Physical);
+    assert_eq!(output(&binding).logical_type(), ValueLogicalType::Physical);
     let binding = resolve_with_materialized_assignments(
         "bitand",
         &[
@@ -209,8 +209,8 @@ fn string_anchor_and_largeint_anchor_have_actual_conversion_bindings() {
             value(physical(DataType::Int64)),
         ],
     );
-    assert_eq!(output(&binding).logical_type, ValueLogicalType::LargeInt);
-    assert!(binding.selected.argument_types.iter().all(|argument| matches!(argument, FunctionArgumentType::Value(ty) if ty.logical_type == ValueLogicalType::LargeInt)));
+    assert_eq!(output(&binding).logical_type(), ValueLogicalType::LargeInt);
+    assert!(binding.selected.argument_types.iter().all(|argument| matches!(argument, FunctionArgumentType::Value(ty) if ty.logical_type() == ValueLogicalType::LargeInt)));
 }
 
 #[test]
@@ -265,7 +265,7 @@ fn nested_common_domain_and_null_variable_targets_keep_exact_conversion_recipes(
         ),
         ("provider-field".to_string(), "source-key".to_string()),
     ]);
-    let source = FunctionValueType::new(
+    let source = FunctionValueType::from_legacy_declared_projection(
         DataType::List(Arc::new(
             Field::new("source_item", DataType::Utf8, false).with_metadata(metadata.clone()),
         )),
@@ -286,18 +286,21 @@ fn nested_common_domain_and_null_variable_targets_keep_exact_conversion_recipes(
         crate::builtin::value_conversion::conversion_intermediate_type(&source, target)
             .unwrap()
             .unwrap();
-    let DataType::List(child) = &intermediate.data_type else {
+    let DataType::List(child) = intermediate.data_type() else {
         panic!("list");
     };
-    assert_eq!(child.name(), "source_item");
+    let DataType::List(source_child) = source.data_type() else {
+        panic!("source list")
+    };
+    assert_eq!(child.name(), source_child.name());
     assert!(!child.is_nullable());
-    assert_eq!(child.metadata(), &metadata);
+    assert!(child.metadata().is_empty());
     let nullable_json = json();
     let null = physical(DataType::Null);
     let binding =
         resolve_with_materialized_assignments("coalesce", &[value(null), value(nullable_json)]);
-    assert_eq!(output(&binding).logical_type, ValueLogicalType::Json);
-    assert!(binding.selected.argument_types.iter().all(|argument| matches!(argument, FunctionArgumentType::Value(value) if value.logical_type == ValueLogicalType::Json)));
+    assert_eq!(output(&binding).logical_type(), ValueLogicalType::Json);
+    assert!(binding.selected.argument_types.iter().all(|argument| matches!(argument, FunctionArgumentType::Value(value) if value.logical_type() == ValueLogicalType::Json)));
 }
 
 #[test]
@@ -367,7 +370,7 @@ fn largeint_anchor_has_exact_domain_and_numeric_results_are_owner_declared() {
         ("multi_distinct_sum", FunctionKind::Aggregate),
     ] {
         let binding = resolve(name, kind, &arguments);
-        assert_eq!(output(&binding).logical_type, ValueLogicalType::LargeInt);
+        assert_eq!(output(&binding).logical_type(), ValueLogicalType::LargeInt);
         if name == "sum" {
             // The exact LARGEINT SUM state is a physical 76-digit decimal.
             assert_eq!(
@@ -387,7 +390,7 @@ fn largeint_anchor_has_exact_domain_and_numeric_results_are_owner_declared() {
         &[value(physical(DataType::Int64))],
     );
     assert_eq!(
-        output(&abs_integer).logical_type,
+        output(&abs_integer).logical_type(),
         ValueLogicalType::LargeInt
     );
 }
@@ -411,11 +414,11 @@ fn json_producer_domains_follow_exact_registered_owners() {
     ] {
         let binding = resolve(name, FunctionKind::Scalar, &arguments);
         assert_eq!(
-            output(&binding).logical_type,
+            output(&binding).logical_type(),
             ValueLogicalType::Json,
             "{name}"
         );
-        assert_eq!(output(&binding).data_type, DataType::Utf8);
+        assert_eq!(output(&binding).data_type().clone(), DataType::Utf8);
         let definition = catalog.definition_by_id(&binding.function_id).unwrap();
         assert!(
             definition
@@ -517,16 +520,16 @@ fn array_aggregate_final_json_and_ordered_physical_state_are_separate() {
         catalog
             .validate_bound(&binding, request, crate::binding_test_control())
             .unwrap();
-        assert_eq!(output(&binding).data_type, DataType::List(json_item(true)));
+        assert_eq!(output(&binding), &physical(DataType::List(json_item(true))));
         let state = &binding
             .selected
             .aggregate
             .as_ref()
             .unwrap()
             .intermediate_type;
-        assert_eq!(state.logical_type, ValueLogicalType::Physical);
+        assert_eq!(state.logical_type(), ValueLogicalType::Physical);
         if ordered {
-            let DataType::Struct(fields) = &state.data_type else {
+            let DataType::Struct(fields) = state.data_type() else {
                 panic!("ordered state");
             };
             assert_eq!(fields.len(), 2);
@@ -541,7 +544,7 @@ fn array_aggregate_final_json_and_ordered_physical_state_are_separate() {
                 );
             }
         } else {
-            let DataType::List(item) = &state.data_type else {
+            let DataType::List(item) = state.data_type() else {
                 panic!("state list");
             };
             assert_eq!(item.data_type(), &DataType::Utf8);
@@ -573,7 +576,9 @@ fn value_domain_aggregate_states_preserve_complete_source_identity() {
         for name in ["min", "max", "any_value"] {
             let binding = resolve(name, FunctionKind::Aggregate, &arguments);
             let mut expected = source.clone();
-            expected.nullable = true;
+            expected = expected
+                .with_nullable(true)
+                .expect("valid function nullability declaration");
             assert_eq!(output(&binding), &expected);
             assert_eq!(
                 binding
@@ -590,8 +595,8 @@ fn value_domain_aggregate_states_preserve_complete_source_identity() {
                 .aggregate
                 .as_mut()
                 .unwrap()
-                .intermediate_type = physical(source.data_type.clone());
-            if source.logical_type != ValueLogicalType::Physical {
+                .intermediate_type = physical(source.data_type().clone());
+            if source.logical_type() != ValueLogicalType::Physical {
                 assert!(
                     builtin_engine_function_catalog()
                         .validate_bound(&forged, request(&arguments), crate::binding_test_control())
@@ -606,19 +611,24 @@ fn value_domain_aggregate_states_preserve_complete_source_identity() {
 fn array_literal_and_sortby_preserve_complete_json_child_identity() {
     let arguments = [value(json()), value(json())];
     let literal = resolve("__array_literal", FunctionKind::Scalar, &arguments);
-    assert_eq!(output(&literal).data_type, DataType::List(json_item(true)));
-    assert!(!output(&literal).nullable);
+    assert_eq!(
+        output(&literal),
+        &physical(DataType::List(json_item(true)))
+            .with_nullable(false)
+            .unwrap()
+    );
+    assert!(!output(&literal).nullable());
     let mixed = [value(json()), value(physical(DataType::Utf8))];
     let text_literal = resolve_with_materialized_assignments("__array_literal", &mixed);
     assert_eq!(
-        output(&text_literal).data_type,
+        output(&text_literal).data_type().clone(),
         DataType::List(Arc::new(Field::new("item", DataType::Utf8, true)))
     );
     assert_eq!(
-        output(&text_literal).logical_type,
+        output(&text_literal).logical_type(),
         ValueLogicalType::Physical
     );
-    assert!(!output(&text_literal).nullable);
+    assert!(!output(&text_literal).nullable());
     assert!(
         text_literal
             .selected
@@ -662,10 +672,11 @@ fn empty_array_instantiation_consumes_only_explicit_valid_list_constraint() {
     let catalog = builtin_engine_function_catalog();
     let default = resolve("__array_literal", FunctionKind::Scalar, &[]);
     assert_eq!(
-        output(&default).data_type,
+        output(&default).data_type().clone(),
         DataType::List(Arc::new(Field::new("item", DataType::Null, true)))
     );
-    let expected = FunctionValueType::new(DataType::List(json_item(false)), false);
+    let expected =
+        FunctionValueType::from_legacy_declared_projection(DataType::List(json_item(false)), false);
     let explicit = FunctionBindingRequest {
         arguments: &[],
         logical_argument_count: 0,
@@ -686,7 +697,7 @@ fn empty_array_instantiation_consumes_only_explicit_valid_list_constraint() {
     catalog
         .validate_bound(&binding, request(&[]), crate::binding_test_control())
         .unwrap();
-    let conflicting = FunctionValueType::new(
+    let conflicting = FunctionValueType::from_legacy_declared_projection(
         DataType::List(Arc::new(Field::new("item", DataType::Utf8, false))),
         false,
     );
@@ -702,10 +713,8 @@ fn empty_array_instantiation_consumes_only_explicit_valid_list_constraint() {
             )
             .is_err()
     );
-    for wrong in [
-        physical(DataType::Utf8),
-        json(),
-        FunctionValueType::new(
+    assert!(
+        FunctionValueType::try_from_legacy_declared_projection(
             DataType::List(Arc::new(
                 Field::new("item", DataType::Utf8, true).with_metadata(
                     [(
@@ -716,8 +725,11 @@ fn empty_array_instantiation_consumes_only_explicit_valid_list_constraint() {
                 ),
             )),
             false,
-        ),
-    ] {
+            ValueLogicalType::Physical,
+        )
+        .is_err()
+    );
+    for wrong in [physical(DataType::Utf8), json()] {
         assert!(
             catalog
                 .resolve_bound_user(
@@ -744,7 +756,7 @@ fn empty_array_instantiation_consumes_only_explicit_valid_list_constraint() {
             crate::binding_test_control(),
         )
         .unwrap();
-    let DataType::List(item) = &output(&binding).data_type else {
+    let DataType::List(item) = &output(&binding).data_type() else {
         panic!("list result");
     };
     assert_eq!(item.data_type(), &DataType::Int64);
@@ -759,16 +771,26 @@ fn higher_order_array_result_carries_actual_lambda_result_domain() {
     let source = physical(DataType::List(json_item(true)));
     let arguments = [
         FunctionArgument::Lambda {
-            parameter_types: vec![json()].into_boxed_slice(),
+            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                vec![json()].into_boxed_slice(),
+            ),
             result_type: json(),
         },
         value(source),
     ];
     let binding = resolve("array_map", FunctionKind::Scalar, &arguments);
-    assert_eq!(output(&binding).data_type, DataType::List(json_item(true)));
+    assert!(
+        matches!(output(&binding).data_type(), DataType::List(item) if item.metadata().is_empty())
+    );
+    assert_eq!(
+        output(&binding).child_at(0).unwrap().logical_type(),
+        ValueLogicalType::Json
+    );
     let wrong = [
         FunctionArgument::Lambda {
-            parameter_types: vec![physical(DataType::Utf8)].into_boxed_slice(),
+            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                vec![physical(DataType::Utf8)].into_boxed_slice(),
+            ),
             result_type: json(),
         },
         arguments[1].clone(),

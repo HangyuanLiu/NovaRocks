@@ -15,10 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{
-    BindingCodecError, BindingProjectionLimits, MaterializationModel, add, boxed, completed,
-    reserve,
-};
+use super::{BindingCodecError, BindingProjectionLimits, MaterializationModel, add};
 use crate::physical_type_v2::clone_value_type_observed;
 use novarocks_physical_plan::{BoundFunction, BoundTableFunction};
 use novarocks_type_contract::{
@@ -26,7 +23,7 @@ use novarocks_type_contract::{
     FunctionValueType,
 };
 
-fn header(
+pub(crate) fn header(
     source: &BoundFunction,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(), BindingCodecError> {
@@ -134,9 +131,6 @@ fn scalar_collection_counts(
     model: &mut MaterializationModel,
 ) -> Result<(), BindingCodecError> {
     model.items = add(model.items, source.argument_types.len())?;
-    model.request::<FunctionArgumentType>(source.argument_types.len(), 2)?;
-    model.request::<u8>(source.function_id.as_str().len(), 1)?;
-    model.request::<u8>(source.overload.as_str().len(), 1)?;
     model.facts.type_reference_count = add(model.facts.type_reference_count, 1)?;
     Ok(())
 }
@@ -192,7 +186,6 @@ fn preflight_argument_counts(
                     model.facts.type_reference_count,
                     add(parameter_types.len(), 1)?,
                 )?;
-                model.request::<FunctionValueType>(parameter_types.len(), 2)?;
             }
         }
         model.check(limits)?;
@@ -261,9 +254,19 @@ pub(crate) fn copy_scalar_signature_observed(
     source: &BoundFunction,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<BoundFunction, BindingCodecError> {
+    copy_scalar_signature_with_creator_observed::<std::convert::Infallible>(source, None, work)
+        .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+}
+pub(crate) fn copy_scalar_signature_with_creator_observed<H>(
+    source: &BoundFunction,
+    creator: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<BoundFunction, super::creation::Failure<H>> {
     header(source, work)?;
+    let _ = creator; // Sharing an immutable collection constructs no new holder.
+
     let (function_id, overload) = copy_identity(&source.function_id, &source.overload, work)?;
-    let argument_types = copy_arguments(&source.argument_types, work)?;
+    let argument_types = source.argument_types.clone_observed(|| work.step())?;
     let result_type = copy_type(&source.result_type, work)?;
     let output = BoundFunction::from_exact_signature(
         function_id,
@@ -282,50 +285,10 @@ fn copy_identity(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<(FunctionId, FunctionOverloadId), BindingCodecError> {
     work.flush()?;
-    let function_id = completed(
-        FunctionId::try_new(function.as_str())
-            .map_err(|_| BindingCodecError::InvalidShape("copied function identity is invalid")),
-        work,
-    )?;
-    work.flush()?;
-    let overload = completed(
-        FunctionOverloadId::try_new(overload.as_str())
-            .map_err(|_| BindingCodecError::InvalidShape("copied overload identity is invalid")),
-        work,
-    )?;
+    let function_id = function.clone_observed(|| work.step())?;
+    let overload = overload.clone_observed(|| work.step())?;
     work.flush()?;
     Ok((function_id, overload))
-}
-
-fn copy_arguments(
-    source: &[FunctionArgumentType],
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Box<[FunctionArgumentType]>, BindingCodecError> {
-    let mut arguments = reserve(source.len(), work)?;
-    for argument in source {
-        let copied = match argument {
-            FunctionArgumentType::Value(value) => {
-                FunctionArgumentType::Value(copy_type(value, work)?)
-            }
-            FunctionArgumentType::Lambda {
-                parameter_types,
-                result_type,
-            } => {
-                let mut parameters = reserve(parameter_types.len(), work)?;
-                for parameter in parameter_types {
-                    parameters.push(copy_type(parameter, work)?);
-                    work.step()?;
-                }
-                FunctionArgumentType::Lambda {
-                    parameter_types: boxed(parameters, work)?,
-                    result_type: copy_type(result_type, work)?,
-                }
-            }
-        };
-        arguments.push(copied);
-        work.step()?;
-    }
-    boxed(arguments, work)
 }
 
 fn table_header(
@@ -406,10 +369,6 @@ fn table_collection_counts(
         model.items,
         add(source.argument_types.len(), source.result_types.len())?,
     )?;
-    model.request::<FunctionArgumentType>(source.argument_types.len(), 2)?;
-    model.request::<FunctionValueType>(source.result_types.len(), 2)?;
-    model.request::<u8>(source.function_id.as_str().len(), 1)?;
-    model.request::<u8>(source.overload.as_str().len(), 1)?;
     model.facts.type_reference_count =
         add(model.facts.type_reference_count, source.result_types.len())?;
     Ok(())
@@ -467,13 +426,8 @@ pub(crate) fn copy_table_signature_observed(
 ) -> Result<BoundTableFunction, BindingCodecError> {
     table_header(source, work)?;
     let (function_id, overload) = copy_identity(&source.function_id, &source.overload, work)?;
-    let argument_types = copy_arguments(&source.argument_types, work)?;
-    let mut results = reserve(source.result_types.len(), work)?;
-    for value in &source.result_types {
-        results.push(copy_type(value, work)?);
-        work.step()?;
-    }
-    let result_types = boxed(results, work)?;
+    let argument_types = source.argument_types.clone_observed(|| work.step())?;
+    let result_types = source.result_types.clone_observed(|| work.step())?;
     let output = BoundTableFunction::from_exact_signature(
         function_id,
         overload,

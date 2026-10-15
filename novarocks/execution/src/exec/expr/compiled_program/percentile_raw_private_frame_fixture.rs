@@ -98,7 +98,7 @@ pub(super) fn program() -> Arc<LocalProgram> {
         ControlShape::Eager,
     );
     let result_ty = owner.result();
-    assert_eq!(result_ty.data_type, DataType::Float64);
+    assert_eq!(result_ty.data_type().clone(), DataType::Float64);
     let call = b
         .add_expression(
             output,

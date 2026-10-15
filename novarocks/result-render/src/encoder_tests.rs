@@ -183,3 +183,109 @@ fn plain_binary_names_do_not_infer_opaque_domains() {
         assert_eq!(body, expected);
     }
 }
+
+#[test]
+fn typed_root_cursor_keeps_the_actual_input_type_owner_and_rejects_another_schema() {
+    use novarocks_type_contract::{
+        ClientInputTypeBindings, TypedValueBinding, ValidatedClientInputTypes, ValueKind,
+        ValueLayout, ValueLogicalType, ValueTypeRef, ValueTypeStorageHold,
+        ValueTypeStorageLifetime,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Hold(Arc<AtomicUsize>);
+    impl ValueTypeStorageHold for Hold {}
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    struct Input {
+        schema: Arc<Schema>,
+        binding: TypedValueBinding,
+    }
+    impl ClientInputTypeBindings for Input {
+        fn binding_at(&self, ordinal: usize) -> Option<&TypedValueBinding> {
+            (ordinal == 0).then_some(&self.binding)
+        }
+        fn slot_at(&self, ordinal: usize) -> Option<u32> {
+            (ordinal == 0).then_some(7)
+        }
+        fn matches_schema(&self, schema: &Arc<Schema>) -> bool {
+            Arc::ptr_eq(&self.schema, schema)
+        }
+    }
+    let released = Arc::new(AtomicUsize::new(0));
+    let storage = ValueTypeStorageLifetime::held(Arc::new(Hold(released.clone())));
+    let binding = TypedValueBinding::try_new(
+        ValueTypeRef::try_new(
+            ValueKind::Nominal(ValueLogicalType::Json),
+            false,
+            storage.clone(),
+        )
+        .unwrap(),
+        ValueLayout::try_new(&DataType::Utf8, storage.clone()).unwrap(),
+    )
+    .unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "incoming",
+        DataType::Utf8,
+        false,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(StringArray::from(vec!["{}"]))],
+    )
+    .unwrap();
+    let contract = Arc::new(RootOutputContract::new(
+        novarocks_result_contract::RootProfileId::V1,
+        FrozenRootOutput::ClientRows(
+            ClientRenderSchema::try_new(
+                vec![RenderColumn {
+                    source_ordinal: 0,
+                    source_slot: Some(7),
+                    name: "published_name".into(),
+                    field: RenderField {
+                        native_type: N::Json,
+                        presentation: P::JsonText,
+                        nullable: false,
+                    },
+                }],
+                1,
+            )
+            .unwrap(),
+        ),
+    ));
+    let owner: Arc<dyn ClientInputTypeBindings> = Arc::new(Input {
+        schema: schema.clone(),
+        binding,
+    });
+    let proof = ValidatedMysqlInput::try_new(
+        ValidatedClientInputTypes::try_new(contract, owner.clone()).unwrap(),
+    )
+    .unwrap();
+    let other_batch =
+        RecordBatch::try_new(Arc::new(schema.as_ref().clone()), batch.columns().to_vec()).unwrap();
+    assert!(
+        ArrowMysqlTextEncoder::try_new_typed_root(proof.clone(), other_batch).is_err(),
+        "a different physical schema cannot borrow a previously established proof"
+    );
+    let mut encoder = ArrowMysqlTextEncoder::try_new_typed_root(proof.clone(), batch).unwrap();
+    drop(storage);
+    drop(owner);
+    drop(proof);
+    drop(schema);
+    assert_eq!(released.load(Ordering::SeqCst), 0);
+    let mut output = [0; 64];
+    let mut emitted = Vec::new();
+    for _ in 0..10 {
+        let turn = encoder.step(&mut output).unwrap();
+        emitted.extend_from_slice(&output[..turn.emitted_bytes]);
+        if turn.status == RenderTurnStatus::InputComplete {
+            break;
+        }
+    }
+    assert_eq!(emitted, [3, 0, 0, 0, 2, b'{', b'}']);
+    assert_eq!(released.load(Ordering::SeqCst), 0);
+    drop(encoder);
+    assert_eq!(released.load(Ordering::SeqCst), 1);
+}

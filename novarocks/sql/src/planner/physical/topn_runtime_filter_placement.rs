@@ -133,7 +133,7 @@ fn prove_topn_placement(
         return None;
     }
     let order_expr = &topn.items[0].expr;
-    if !is_supported_topn_key_type(&order_expr.value_type.data_type) {
+    if !is_supported_topn_key_type(&order_expr.value_type.data_type()) {
         return None;
     }
     let direction = if topn.items[0].asc {
@@ -291,8 +291,8 @@ fn trace_exact_source_probes(
             let mut probes = Vec::new();
             for (child_index, child) in node.children.iter().enumerate() {
                 let branch_column = set_op.child_output_columns[child_index].get(target_index)?;
-                if branch_column.value_type.data_type != probe_expr.value_type.data_type
-                    || branch_column.value_type.nullable != probe_expr.value_type.nullable
+                if branch_column.value_type.data_type() != probe_expr.value_type.data_type()
+                    || branch_column.value_type.nullable() != probe_expr.value_type.nullable()
                 {
                     return None;
                 }
@@ -331,8 +331,8 @@ fn bind_exact_column_ref(expr: &TypedExpr, columns: &[OutputColumn]) -> Option<T
 
 fn is_exact_column_ref(expr: &TypedExpr, column: &OutputColumn) -> bool {
     matches!(&expr.kind, ExprKind::ColumnRef { column_id, .. } if *column_id == column.column_id)
-        && expr.value_type.data_type == column.value_type.data_type
-        && expr.value_type.nullable == column.value_type.nullable
+        && expr.value_type.data_type() == column.value_type.data_type()
+        && expr.value_type.nullable() == column.value_type.nullable()
 }
 
 fn same_column_ref(left: &TypedExpr, right: &TypedExpr) -> bool {
@@ -347,8 +347,8 @@ fn same_column_ref(left: &TypedExpr, right: &TypedExpr) -> bool {
             },
         ) => {
             left_id == right_id
-                && left.value_type.data_type == right.value_type.data_type
-                && left.value_type.nullable == right.value_type.nullable
+                && left.value_type.data_type() == right.value_type.data_type()
+                && left.value_type.nullable() == right.value_type.nullable()
         }
         _ => false,
     }
@@ -356,8 +356,8 @@ fn same_column_ref(left: &TypedExpr, right: &TypedExpr) -> bool {
 
 fn is_same_column(left: &OutputColumn, right: &OutputColumn) -> bool {
     left.column_id == right.column_id
-        && left.value_type.data_type == right.value_type.data_type
-        && left.value_type.nullable == right.value_type.nullable
+        && left.value_type.data_type() == right.value_type.data_type()
+        && left.value_type.nullable() == right.value_type.nullable()
 }
 
 fn is_supported_topn_key_type(data_type: &DataType) -> bool {
@@ -636,7 +636,7 @@ mod tests {
         local.group_by[0] = TypedExpr {
             kind: ExprKind::Cast {
                 expr: Box::new(input.clone()),
-                target: input.value_type.data_type.clone(),
+                target: input.value_type.data_type().clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: input.value_type,
@@ -733,12 +733,26 @@ mod tests {
             (
                 "type drift",
                 Box::new(|plan| {
-                    aggregate_mut(plan).output_columns[0].value_type.data_type = DataType::Int32
+                    aggregate_mut(plan).output_columns[0].value_type =
+                        novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                            DataType::Int32,
+                            aggregate_mut(plan).output_columns[0].value_type.nullable(),
+                            aggregate_mut(plan).output_columns[0]
+                                .value_type
+                                .logical_type(),
+                        )
+                        .unwrap()
                 }),
             ),
             (
                 "nullability drift",
-                Box::new(|plan| aggregate_mut(plan).output_columns[0].value_type.nullable = true),
+                Box::new(|plan| {
+                    aggregate_mut(plan).output_columns[0].value_type = aggregate_mut(plan)
+                        .output_columns[0]
+                        .value_type
+                        .with_nullable(true)
+                        .unwrap()
+                }),
             ),
             (
                 "window boundary",
@@ -1041,7 +1055,7 @@ mod tests {
                         name: "t".to_string(),
                         columns: vec![ColumnDef {
                             name: name.to_string(),
-                            data_type: output.value_type.data_type.clone(),
+                            data_type: output.value_type.data_type().clone(),
                             nullable,
                             write_default: None,
                             logical_type: None,
@@ -1120,8 +1134,8 @@ mod tests {
                     expr: column(
                         1,
                         &key.name,
-                        key.value_type.data_type.clone(),
-                        key.value_type.nullable,
+                        key.value_type.data_type().clone(),
+                        key.value_type.nullable(),
                     ),
                     output_name: key.name.clone(),
                     output_column_id: key.column_id,
@@ -1142,15 +1156,15 @@ mod tests {
                 expr: Box::new(column(
                     1,
                     &key.name,
-                    key.value_type.data_type.clone(),
-                    key.value_type.nullable,
+                    key.value_type.data_type().clone(),
+                    key.value_type.nullable(),
                 )),
                 target: DataType::Int32,
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             value_type: novarocks_type_contract::FunctionValueType::new(
                 DataType::Int32,
-                key.value_type.nullable,
+                key.value_type.nullable(),
             ),
         };
         PhysicalPlanNode {
@@ -1166,7 +1180,7 @@ mod tests {
                 1,
                 &key.name,
                 DataType::Int32,
-                key.value_type.nullable,
+                key.value_type.nullable(),
             )],
             children: vec![child],
             stats: stats(),
@@ -1307,14 +1321,46 @@ mod tests {
     }
 
     fn replace_key_type(plan: &mut PhysicalPlanNode, data_type: DataType) {
-        topn_mut(plan).items[0].expr.value_type.data_type = data_type.clone();
+        topn_mut(plan).items[0].expr.value_type =
+            novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                data_type.clone(),
+                topn_mut(plan).items[0].expr.value_type.nullable(),
+                topn_mut(plan).items[0].expr.value_type.logical_type(),
+            )
+            .unwrap();
         let aggregate = aggregate_mut(plan);
-        aggregate.group_by[0].value_type.data_type = data_type.clone();
-        aggregate.output_columns[0].value_type.data_type = data_type.clone();
-        aggregate.output_layout.group_key_columns[0]
-            .value_type
-            .data_type = data_type.clone();
-        plan.output_columns[0].value_type.data_type = data_type;
+        aggregate.group_by[0].value_type =
+            novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                data_type.clone(),
+                aggregate.group_by[0].value_type.nullable(),
+                aggregate.group_by[0].value_type.logical_type(),
+            )
+            .unwrap();
+        aggregate.output_columns[0].value_type =
+            novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                data_type.clone(),
+                aggregate.output_columns[0].value_type.nullable(),
+                aggregate.output_columns[0].value_type.logical_type(),
+            )
+            .unwrap();
+        aggregate.output_layout.group_key_columns[0].value_type =
+            novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                data_type.clone(),
+                aggregate.output_layout.group_key_columns[0]
+                    .value_type
+                    .nullable(),
+                aggregate.output_layout.group_key_columns[0]
+                    .value_type
+                    .logical_type(),
+            )
+            .unwrap();
+        plan.output_columns[0].value_type =
+            novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                data_type,
+                plan.output_columns[0].value_type.nullable(),
+                plan.output_columns[0].value_type.logical_type(),
+            )
+            .unwrap();
     }
 
     fn stats() -> PhysicalPlanStats {

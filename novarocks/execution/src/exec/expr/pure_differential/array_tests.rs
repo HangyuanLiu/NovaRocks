@@ -62,14 +62,18 @@ fn profiles(nullable: bool) -> Vec<FunctionValueType> {
         .into_iter()
         .map(|ty| FunctionValueType::new(ty, nullable))
         .collect::<Vec<_>>();
-    out.push(FunctionValueType {
-        logical_type: ValueLogicalType::LargeInt,
-        ..FunctionValueType::new(DataType::FixedSizeBinary(16), nullable)
-    });
+    out.push(
+        FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            nullable,
+            ValueLogicalType::LargeInt,
+        )
+        .unwrap(),
+    );
     out
 }
 fn values(source: &FunctionValueType, rows: usize) -> ArrayRef {
-    if source.data_type == DataType::FixedSizeBinary(16) {
+    if *source.data_type() == DataType::FixedSizeBinary(16) {
         let pattern = [
             Some(i128::MIN),
             Some(i128::MAX),
@@ -80,7 +84,7 @@ fn values(source: &FunctionValueType, rows: usize) -> ArrayRef {
         ];
         return novarocks_types::largeint::array_from_i128(
             &(0..rows)
-                .map(|r| pattern[r % pattern.len()].or_else(|| (!source.nullable).then_some(7)))
+                .map(|r| pattern[r % pattern.len()].or_else(|| (!source.nullable()).then_some(7)))
                 .collect::<Vec<_>>(),
         )
         .unwrap();
@@ -102,7 +106,7 @@ fn pure_differential_array_every_scalar_nullable_and_logical_profile() {
         for nullable in [false, true] {
             for source in profiles(nullable)
                 .into_iter()
-                .filter(|source| source.logical_type != ValueLogicalType::LargeInt)
+                .filter(|source| source.logical_type() != ValueLogicalType::LargeInt)
             {
                 check(
                     AggregateDiffSpec::new(name)
@@ -120,14 +124,14 @@ fn pure_differential_array_empty_all_null_and_constant_source() {
     for name in ["array_agg", "array_agg_distinct"] {
         for source in profiles(true)
             .into_iter()
-            .filter(|source| source.logical_type != ValueLogicalType::LargeInt)
+            .filter(|source| source.logical_type() != ValueLogicalType::LargeInt)
             .chain([FunctionValueType::new(DataType::Null, true)])
         {
             for rows in [0, ROWS] {
                 let array = if rows == 0 {
-                    new_empty_array(&source.data_type)
+                    new_empty_array(&source.data_type())
                 } else {
-                    new_null_array(&source.data_type, rows)
+                    new_null_array(&source.data_type(), rows)
                 };
                 check(
                     AggregateDiffSpec::new(name)
@@ -298,8 +302,8 @@ fn pure_differential_array_unique_nonlist_catalogue_drift_is_named_refusal() {
             panic!("expected original non-List catalogue drift: {failure}")
         };
         assert_eq!(name, "array_unique_agg");
-        let scalar = &source.data_type;
-        let list = DataType::List(Arc::new(Field::new("item", scalar.clone(), true)));
+        let scalar = &source.data_type();
+        let list = DataType::List(Arc::new(Field::new("item", scalar.clone().clone(), true)));
         assert_eq!(
             reason,
             format!(
@@ -314,8 +318,8 @@ fn pure_differential_array_unique_every_accurate_list_element_profile() {
     for nullable in [false, true] {
         for source in profiles(nullable) {
             let elements = values(&source, 12);
-            let mut item = Field::new("element", source.data_type.clone(), true);
-            if source.logical_type == ValueLogicalType::LargeInt {
+            let mut item = Field::new("element", source.data_type().clone(), true);
+            if source.logical_type() == ValueLogicalType::LargeInt {
                 item = item.with_metadata(
                     [("nr_logical_type".to_string(), "largeint".to_string())].into(),
                 );
@@ -387,37 +391,83 @@ fn pure_differential_array_recursive_map_and_ordered_struct_values() {
     }
 }
 
+// The independently declared complete state/result and both actual phases
+// preserve the original values, NULLs, empty input, and partition behavior.
 #[test]
-fn pure_differential_array_logical_largeint_keeps_original_signature_drift_golden() {
+fn pure_differential_array_logical_largeint_full_state_result_and_values() {
+    use novarocks_type_contract::{ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime};
+    let nullable_item = FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        true,
+        ValueLogicalType::LargeInt,
+    )
+    .unwrap();
+    let expected_arrow = DataType::List(Arc::new(Field::new(
+        "item",
+        DataType::FixedSizeBinary(16),
+        true,
+    )));
+    let expected = FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(
+            ValueKind::List(nullable_item.value_type().clone()),
+            true,
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+        ValueLayout::try_new(&expected_arrow, ValueTypeStorageLifetime::pure()).unwrap(),
+    )
+    .unwrap();
+    let metadata_free = |ty: &DataType| {
+        let DataType::List(item) = ty else {
+            panic!("original ARRAY_AGG state/result must stay a list");
+        };
+        assert_eq!(item.name(), "item");
+        assert!(item.is_nullable());
+        assert_eq!(item.data_type(), &DataType::FixedSizeBinary(16));
+        assert_eq!(item.metadata().capacity(), 0);
+    };
     for name in ["array_agg", "array_agg_distinct"] {
         for nullable in [false, true] {
-            for rows in [0, 8] {
-                let source = FunctionValueType::try_with_logical_type(
-                    DataType::FixedSizeBinary(16),
-                    nullable,
-                    ValueLogicalType::LargeInt,
-                )
-                .unwrap();
-                let failure = run_aggregate_differential(
-                    &AggregateDiffSpec::new(name)
-                        .original_state_interpretation(false, vec![])
-                        .typed_column(source.clone(), values(&source, rows)),
-                )
-                .unwrap_err();
-                let DifferentialFailure::LegacyUnavailable {
-                    name: actual,
-                    reason,
-                } = failure
-                else {
-                    panic!("expected original ARRAY logical LARGEINT signature drift: {failure}")
-                };
-                assert_eq!(actual, name);
-                let state = "List(Field { data_type: FixedSizeBinary(16), nullable: true })";
-                let result = "List(Field { data_type: FixedSizeBinary(16), nullable: true, metadata: {\"nr_logical_type\": \"largeint\"} })";
-                let expected = format!(
-                    "bind aggregate `{name}`: aggregate `{name}` resolved signature drift: planned=ResolvedAggregateSignature {{ overload: AggregateOverloadIdentity(\"builtin.aggregate/{name}/derived-v1\"), argument_types: [FixedSizeBinary(16)], intermediate_type: {state}, output_type: {result}, state_format: AggregateStateFormatId(\"novarocks/{name}/state-v1\") }}, local=ResolvedAggregateSignature {{ overload: AggregateOverloadIdentity(\"builtin.aggregate/{name}/derived-v1\"), argument_types: [FixedSizeBinary(16)], intermediate_type: {state}, output_type: {state}, state_format: AggregateStateFormatId(\"novarocks/{name}/state-v1\") }}"
-                );
-                assert_eq!(reason, expected);
+            let source = FunctionValueType::try_with_logical_type(
+                DataType::FixedSizeBinary(16),
+                nullable,
+                ValueLogicalType::LargeInt,
+            )
+            .unwrap();
+            // Keep the old empty/eight-row MIN/MAX/-1/0/2^80/NULL-or-7 corpus.
+            // A separate all-NULL case pins child NULL and root non-NULL lists.
+            let mut inputs = vec![values(&source, 0), values(&source, 8)];
+            if nullable {
+                inputs.push(new_null_array(&DataType::FixedSizeBinary(16), 8));
+            }
+            for input in inputs {
+                let rows = input.len();
+                for grouped in [false, true] {
+                    for partitions in [3, 5] {
+                        let mut spec = AggregateDiffSpec::new(name)
+                            .original_state_interpretation(false, vec![])
+                            .typed_column(source.clone(), input.clone())
+                            .float_comparison(FloatComparison::Exact)
+                            .partitions(partitions, 2402);
+                        if grouped {
+                            spec = spec.grouped((0..rows).map(|row| row % 3).collect(), 5);
+                        }
+                        let summary = assert_aggregate_matches_v1(spec);
+                        assert_eq!(summary.rows, rows);
+                        assert_eq!(summary.groups, if grouped { 5 } else { 1 });
+                        assert_eq!(summary.partitions, partitions);
+                        assert_eq!(summary.matched_failures, 0);
+                        assert_eq!(summary.matched_panics, 0);
+                        assert_eq!(summary.null_results, 0);
+                        // Independent nominal child/root promises; not inferred
+                        // from output/state ArrayData or cloned selected types.
+                        assert_eq!(summary.result_type, expected);
+                        assert_eq!(summary.pure_state_type, expected);
+                        metadata_free(summary.result_type.data_type());
+                        metadata_free(summary.pure_state_type.data_type());
+                        metadata_free(&summary.legacy_intermediate_type);
+                    }
+                }
             }
         }
     }

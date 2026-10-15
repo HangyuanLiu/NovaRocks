@@ -197,7 +197,10 @@ fn kernel_source(
                 state_interpretation: receipt.then(|| {
                     Arc::new(novarocks_type_contract::AggregateStateInterpretation {
                         distinct: false,
-                        order_keys: Box::new([]),
+                        order_keys:
+                            novarocks_type_contract::AggregateStateOrderKeys::from_pure_boxed(
+                                Box::new([]),
+                            ),
                     })
                 }),
                 phase,
@@ -237,7 +240,7 @@ fn nested() -> ArrayRef {
     ))
 }
 fn source_type() -> FunctionValueType {
-    FunctionValueType::new(nested().data_type().clone(), false)
+    FunctionValueType::from_legacy_declared_projection(nested().data_type().clone(), false)
 }
 fn kernel(name: &str, phase: AggregateKernelPhase) -> ArrayKernel {
     kernel_source(name, source_type(), phase, true).unwrap()
@@ -476,29 +479,6 @@ fn array_all_phases_require_actual_producer_receipt() {
 }
 
 #[test]
-fn array_top_level_logical_largeint_inaccurate_profile_is_explicitly_rejected() {
-    for name in ["array_agg", "array_agg_distinct"] {
-        for nullable in [false, true] {
-            for phase in [
-                AggregateKernelPhase::Single,
-                AggregateKernelPhase::Partial,
-                AggregateKernelPhase::Intermediate,
-                AggregateKernelPhase::Final,
-            ] {
-                let source = FunctionValueType::try_with_logical_type(
-                    DataType::FixedSizeBinary(16),
-                    nullable,
-                    novarocks_type_contract::ValueLogicalType::LargeInt,
-                )
-                .unwrap();
-                let error = kernel_source(name, source, phase, true).unwrap_err();
-                assert!(error.to_string().contains(&format!("builtin.aggregate/{name}/v1 has no installed logical LARGEINT ARRAY input profile")),"{error}");
-            }
-        }
-    }
-}
-
-#[test]
 fn array_every_merge_and_output_checkpoint_preserves_original_typed_cause() {
     for name in ["array_agg", "array_agg_distinct", "array_unique_agg"] {
         let partial = kernel(name, AggregateKernelPhase::Partial);
@@ -677,10 +657,13 @@ fn ordered_kernel_source(
                 state_interpretation: receipt.then(|| {
                     Arc::new(novarocks_type_contract::AggregateStateInterpretation {
                         distinct: false,
-                        order_keys: Box::new([novarocks_type_contract::AggregateStateOrderKey {
-                            ascending: true,
-                            nulls_first: false,
-                        }]),
+                        order_keys:
+                            novarocks_type_contract::AggregateStateOrderKeys::from_pure_boxed(
+                                Box::new([novarocks_type_contract::AggregateStateOrderKey {
+                                    ascending: true,
+                                    nulls_first: false,
+                                }]),
+                            ),
                     })
                 }),
                 phase,
@@ -798,7 +781,8 @@ fn array_unique_nonlist_inaccurate_profile_is_explicitly_rejected() {
                 AggregateKernelPhase::Intermediate,
                 AggregateKernelPhase::Final,
             ] {
-                let source = FunctionValueType::new(data_type.clone(), nullable);
+                let source =
+                    FunctionValueType::from_legacy_declared_projection(data_type.clone(), nullable);
                 let error = kernel_source("array_unique_agg", source, phase, true).unwrap_err();
                 assert!(
                     error
@@ -808,5 +792,281 @@ fn array_unique_nonlist_inaccurate_profile_is_explicitly_rejected() {
                 );
             }
         }
+    }
+}
+
+// Complete installed-owner evidence preserves the original phases and order
+// channels, rejects full-type drift, and keeps the primary control cause.
+fn full_list(item: &FunctionValueType, nullable: bool) -> FunctionValueType {
+    use novarocks_type_contract::{ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime};
+    let storage = ValueTypeStorageLifetime::pure();
+    let layout = DataType::List(Arc::new(Field::new(
+        "item",
+        item.data_type().clone(),
+        item.nullable(),
+    )));
+    FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(
+            ValueKind::List(item.value_type().clone()),
+            nullable,
+            storage.clone(),
+        )
+        .unwrap(),
+        ValueLayout::try_new(&layout, storage).unwrap(),
+    )
+    .unwrap()
+}
+fn full_largeint(nullable: bool) -> FunctionValueType {
+    FunctionValueType::try_with_logical_type(
+        DataType::FixedSizeBinary(16),
+        nullable,
+        novarocks_type_contract::ValueLogicalType::LargeInt,
+    )
+    .unwrap()
+}
+fn full_named_struct(fields: Vec<(&str, FunctionValueType)>) -> FunctionValueType {
+    use novarocks_type_contract::{
+        ValueField, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+    let storage = ValueTypeStorageLifetime::pure();
+    let layout = DataType::Struct(
+        fields
+            .iter()
+            .map(|(name, field)| Field::new(*name, field.data_type().clone(), field.nullable()))
+            .collect::<Vec<_>>()
+            .into(),
+    );
+    let semantic = fields
+        .into_iter()
+        .map(|(name, field)| {
+            ValueField::new(
+                name.to_string(),
+                field.value_type().clone(),
+                storage.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    FunctionValueType::try_from_value(
+        ValueTypeRef::try_new(
+            ValueKind::Struct(semantic.into_boxed_slice()),
+            true,
+            storage.clone(),
+        )
+        .unwrap(),
+        ValueLayout::try_new(&layout, storage).unwrap(),
+    )
+    .unwrap()
+}
+#[test]
+fn array_complete_largeint_installed_all_phases_preserve_original_state_and_order_channels() {
+    let expected = full_list(&full_largeint(true), true);
+    let expected_ordered = full_named_struct(vec![
+        ("c0", expected.clone()),
+        (
+            "c1",
+            full_list(&FunctionValueType::new(DataType::Int64, true), true),
+        ),
+    ]);
+    for name in ["array_agg", "array_agg_distinct"] {
+        for nullable in [false, true] {
+            for phase in [
+                AggregateKernelPhase::Single,
+                AggregateKernelPhase::Partial,
+                AggregateKernelPhase::Intermediate,
+                AggregateKernelPhase::Final,
+            ] {
+                let kernel = kernel_source(name, full_largeint(nullable), phase, true).unwrap();
+                assert_eq!(kernel.contract.final_type(), &expected);
+                assert_eq!(kernel.contract.intermediate_type(), &expected);
+                let ordered =
+                    ordered_kernel_source(name, full_largeint(nullable), phase, true).unwrap();
+                assert_eq!(ordered.contract.final_type(), &expected);
+                assert_eq!(ordered.contract.intermediate_type(), &expected_ordered);
+                assert_eq!(
+                    ordered
+                        .contract
+                        .state_interpretation()
+                        .unwrap()
+                        .order_keys
+                        .len(),
+                    1
+                );
+                assert!(ordered.contract.state_interpretation().unwrap().order_keys[0].ascending);
+                assert!(
+                    !ordered.contract.state_interpretation().unwrap().order_keys[0].nulls_first
+                );
+                if phase.consumes_logical_arguments() {
+                    assert_eq!(ordered.contract.order_keys().len(), 1);
+                } else {
+                    assert!(ordered.contract.order_keys().is_empty());
+                }
+                let DataType::List(item) = expected.data_type() else {
+                    panic!("ARRAY result")
+                };
+                assert_eq!(item.metadata().capacity(), 0);
+                assert!(item.is_nullable());
+            }
+        }
+    }
+}
+#[test]
+fn array_complete_selected_ports_refuse_same_carrier_wrong_domain_child_null_and_ordered_state() {
+    let setup = |operation,
+                 arguments: &[FunctionArgumentType],
+                 output: &FunctionValueType,
+                 state: &FunctionValueType| {
+        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+            &Compile,
+            CompilePhase::FunctionSpecialization,
+        )
+        .unwrap();
+        validate_full_selected_types(operation, arguments, output, state, &mut work)
+    };
+    let actual = kernel_source(
+        "array_agg",
+        full_largeint(false),
+        AggregateKernelPhase::Single,
+        true,
+    )
+    .unwrap();
+    let arguments = &actual.contract.call().selected().argument_types;
+    let independent = full_list(&full_largeint(true), true);
+    assert!(setup(Operation::Array, arguments, &independent, &independent).is_ok());
+    for item in [
+        FunctionValueType::new(DataType::FixedSizeBinary(16), true),
+        FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            true,
+            novarocks_type_contract::ValueLogicalType::Uuid,
+        )
+        .unwrap(),
+    ] {
+        let wrong = full_list(&item, true);
+        assert_eq!(wrong.data_type(), independent.data_type());
+        for (output, state) in [(&wrong, &independent), (&independent, &wrong)] {
+            assert_eq!(
+                setup(Operation::Array, arguments, output, state).unwrap_err(),
+                invalid(
+                    "ARRAY aggregate selected output or state differs from its original full signature"
+                )
+            );
+        }
+    }
+    let wrong_child_null = full_list(&full_largeint(false), true);
+    assert!(setup(Operation::Array, arguments, &wrong_child_null, &independent).is_err());
+    assert!(setup(Operation::Array, arguments, &independent, &wrong_child_null).is_err());
+    let wrong_root_null = independent.with_nullable(false).unwrap();
+    assert!(setup(Operation::Array, arguments, &wrong_root_null, &independent).is_err());
+    for child_nullable in [false, true] {
+        let source = full_list(&full_largeint(child_nullable), false);
+        let kernel = kernel_source(
+            "array_agg",
+            source.clone(),
+            AggregateKernelPhase::Single,
+            true,
+        )
+        .unwrap();
+        let expected = full_list(&source.with_nullable(true).unwrap(), true);
+        assert_eq!(kernel.contract.final_type(), &expected);
+        let wrong_source_child = full_list(&full_largeint(!child_nullable), true);
+        let wrong = full_list(&wrong_source_child, true);
+        assert!(
+            setup(
+                Operation::Array,
+                &kernel.contract.call().selected().argument_types,
+                &wrong,
+                &expected
+            )
+            .is_err()
+        );
+    }
+    let ordered = ordered_kernel_source(
+        "array_agg",
+        full_largeint(true),
+        AggregateKernelPhase::Single,
+        true,
+    )
+    .unwrap();
+    let order_arguments = &ordered.contract.call().selected().argument_types;
+    let key = full_list(&FunctionValueType::new(DataType::Int64, true), true);
+    let correct = full_named_struct(vec![("c0", independent.clone()), ("c1", key.clone())]);
+    assert!(setup(Operation::Array, order_arguments, &independent, &correct).is_ok());
+    let wrong_domain = full_named_struct(vec![
+        (
+            "c0",
+            full_list(
+                &FunctionValueType::new(DataType::FixedSizeBinary(16), true),
+                true,
+            ),
+        ),
+        ("c1", key.clone()),
+    ]);
+    assert_eq!(wrong_domain.data_type(), correct.data_type());
+    for bad_state in [
+        wrong_domain,
+        full_named_struct(vec![("other", independent.clone()), ("c1", key.clone())]),
+        full_named_struct(vec![
+            ("c0", independent.clone()),
+            ("c1", key.with_nullable(false).unwrap()),
+        ]),
+    ] {
+        assert!(setup(Operation::Array, order_arguments, &independent, &bad_state).is_err());
+    }
+}
+#[test]
+fn array_complete_selected_port_control_is_primary_and_has_no_tail() {
+    struct Trace {
+        trace: Mutex<Vec<u32>>,
+        refuse: Option<usize>,
+    }
+    impl PureCompileControl for Trace {
+        fn checkpoint(&self, phase: CompilePhase, units: u32) -> Result<(), CompileControlError> {
+            assert_eq!(phase, CompilePhase::FunctionSpecialization);
+            assert!(units <= 256);
+            let mut trace = self.trace.lock().unwrap();
+            let at = trace.len();
+            trace.push(units);
+            if self.refuse == Some(at) {
+                Err(CompileControlError::Cancelled)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let kernel = ordered_kernel_source(
+        "array_agg",
+        full_largeint(true),
+        AggregateKernelPhase::Single,
+        true,
+    )
+    .unwrap();
+    let execute = |control: &Trace| -> Result<(), KernelFailure> {
+        let mut work = novarocks_type_contract::CompileCheckpoints::try_new(
+            control,
+            CompilePhase::FunctionSpecialization,
+        )
+        .map_err(compile_failure)?;
+        validate_full_selected_types(
+            Operation::Array,
+            &kernel.contract.call().selected().argument_types,
+            kernel.contract.final_type(),
+            kernel.contract.intermediate_type(),
+            &mut work,
+        )?;
+        work.finish().map_err(compile_failure)
+    };
+    let success = Trace {
+        trace: Mutex::new(Vec::new()),
+        refuse: None,
+    };
+    execute(&success).unwrap();
+    let trace = success.trace.into_inner().unwrap();
+    for at in 0..trace.len() {
+        let control = Trace {
+            trace: Mutex::new(Vec::new()),
+            refuse: Some(at),
+        };
+        assert_eq!(execute(&control).unwrap_err(), KernelFailure::Cancelled);
+        assert_eq!(control.trace.into_inner().unwrap(), trace[..=at]);
     }
 }

@@ -328,7 +328,7 @@ fn long_view(index: u32, prefix: u8) -> u128 {
 }
 
 #[test]
-fn exact_source_field_fvt_labels_and_timezone_presence_use_the_original_owner() {
+fn source_attributes_never_reauthor_complete_type_and_timezone_presence_is_exact() {
     let array: ArrayRef = Arc::new(StringArray::from(vec!["{\"v\":7}"]));
     let input = resource_input(array.as_ref(), 0);
     let plain = Field::new("source", DataType::Utf8, true);
@@ -350,10 +350,10 @@ fn exact_source_field_fvt_labels_and_timezone_presence_use_the_original_owner() 
             &Control::good(),
         )
         .unwrap();
-        assert_eq!(pool.value_type().logical_type, ValueLogicalType::Json);
+        assert_eq!(pool.value_type().logical_type(), ValueLogicalType::Json);
         assert_eq!(pool.field().metadata(), field.metadata());
     }
-    ordinary(
+    checked(
         &labelled,
         &FunctionValueType::new(DataType::Utf8, true),
         input,
@@ -375,17 +375,14 @@ fn exact_source_field_fvt_labels_and_timezone_presence_use_the_original_owner() 
         novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_owned(),
         "unknown".to_owned(),
     )]));
-    ordinary(&unknown, &json, input, policy());
-    let invalid = FunctionValueType {
-        data_type: DataType::FixedSizeBinary(16),
-        nullable: true,
-        logical_type: ValueLogicalType::Json,
-    };
-    ordinary(
-        &Field::new("source", DataType::FixedSizeBinary(16), true),
-        &invalid,
-        input,
-        policy(),
+    checked(&unknown, &json, input, policy());
+    assert!(
+        FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            true,
+            ValueLogicalType::Json
+        )
+        .is_err()
     );
     let temporal = resource_input(&TimestampNanosecondArray::from(vec![7]), 0);
     let absent = DataType::Timestamp(TimeUnit::Nanosecond, None);

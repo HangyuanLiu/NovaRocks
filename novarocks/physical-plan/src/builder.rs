@@ -196,7 +196,7 @@ impl FragmentBuilder {
         let input_properties = source.output_properties.clone();
         for predicate in &predicates {
             let expression = self.require_owned_expression(node, *predicate)?;
-            if expression.ty.data_type != DataType::Boolean {
+            if *expression.ty.data_type() != DataType::Boolean {
                 return Err(BuildError::PredicateIsNotBoolean(*predicate));
             }
         }

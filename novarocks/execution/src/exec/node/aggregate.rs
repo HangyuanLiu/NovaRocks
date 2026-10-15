@@ -60,6 +60,7 @@ impl AggOrderSpec {
 
 #[derive(Clone, Debug, Default)]
 pub struct AggFunction {
+    pub frozen: Option<std::sync::Arc<novarocks_local_program::FrozenAggregateSelection>>,
     /// Lowercased function name from FE (e.g. "sum", "count").
     pub name: String,
     /// Input expressions for aggregate arguments; empty means COUNT(*)-style aggregate.

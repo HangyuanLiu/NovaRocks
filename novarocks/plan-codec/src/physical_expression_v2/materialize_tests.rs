@@ -209,7 +209,7 @@ impl Fixture {
         let carrier_i64 = types
             .carriers
             .iter()
-            .find(|(_, t)| **t == DataType::Int64)
+            .find(|(_, t)| t.value == DataType::Int64)
             .map(|(id, _)| *id)
             .unwrap();
         let lambda = wire::FunctionArgumentType {
@@ -234,7 +234,9 @@ impl Fixture {
             }),
             logical_argument_count: 1,
             state_format: "original-state/v1".into(),
-            state_argument_contract: wire::AggregateStateArgumentContract::ExactSignature as i32,
+            state_argument_contract:
+                novarocks_proto_models::common::AggregateStateArgumentContract::ExactSignature
+                    as i32,
             intermediate_value_type_id: Some(5),
         }];
         let values = [(0, 0), (1, 6), (2, 4)]
@@ -850,12 +852,11 @@ fn owned_expression_requests_have_independent_stage_tree_dictionary_and_list_lay
         let bytes = Layout::array::<p::ExprNode>(4).unwrap().size()
             + 4 * node.size()
             + 2 * Layout::array::<p::ExprId>(2).unwrap().size()
-            + 2 * Layout::array::<FunctionValueType>(2).unwrap().size()
-            + 2 * Layout::new::<DataType>().size();
+            + 2 * Layout::array::<FunctionValueType>(2).unwrap().size();
         assert_eq!(facts.definition_count, 4);
         assert_eq!(facts.type_reference_count, 6);
         assert_eq!(facts.expression_reference_count, 3);
-        assert_eq!(facts.new_allocation_requests_upper_bound, 11);
+        assert_eq!(facts.new_allocation_requests_upper_bound, 9);
         assert_eq!(facts.new_allocation_request_bytes_upper_bound, bytes);
         assert_eq!(
             facts.coexisting_source_and_request_bytes_upper_bound,
@@ -866,8 +867,7 @@ fn owned_expression_requests_have_independent_stage_tree_dictionary_and_list_lay
         assert!(std::ptr::eq(out.functions(), fs));
         assert!(std::ptr::eq(out.aggregates(), ags));
         let payload = Layout::array::<p::ExprId>(2).unwrap().size()
-            + Layout::array::<FunctionValueType>(2).unwrap().size()
-            + 2 * Layout::new::<DataType>().size();
+            + Layout::array::<FunctionValueType>(2).unwrap().size();
         assert_eq!(
             out.retained_bytes,
             4 * (size_of::<p::ExprId>() + size_of::<p::ExprNode>()) + payload
@@ -879,22 +879,19 @@ fn owned_expression_requests_have_independent_stage_tree_dictionary_and_list_lay
         else {
             panic!("Lambda")
         };
-        let DataType::Struct(fields) = &parameter_types[1].data_type else {
+        let DataType::Struct(fields) = &parameter_types[1].data_type() else {
             panic!("Struct")
         };
-        let DataType::Struct(original) = &f.types.value_type(4).unwrap().data_type else {
+        let DataType::Struct(original) = &f.types.value_type(4).unwrap().data_type() else {
             panic!("source Struct")
         };
         assert!(Arc::ptr_eq(&fields[0], &original[0]));
-        assert_eq!(fields[0].metadata()["unknown"], "preserved");
-        let DataType::Dictionary(a, b) = &parameter_types[0].data_type else {
-            panic!("Dictionary")
-        };
-        let DataType::Dictionary(c, d) = &f.types.value_type(5).unwrap().data_type else {
-            panic!("source Dictionary")
-        };
-        assert!(!std::ptr::eq(a.as_ref(), c.as_ref()));
-        assert!(!std::ptr::eq(b.as_ref(), d.as_ref()));
+        assert_eq!(fields[0].metadata().capacity(), 0);
+        assert_eq!(parameter_types[0].data_type(), &DataType::Utf8);
+        assert!(std::ptr::eq(
+            parameter_types[0].data_type(),
+            f.types.value_type(5).unwrap().data_type()
+        ));
     });
 }
 

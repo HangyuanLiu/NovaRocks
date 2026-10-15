@@ -411,7 +411,7 @@ fn shaped_frames(rows: usize) -> Vec<Vec<WindowRowRange>> {
 const ROWS: usize = 23;
 
 fn nullable(array: &ArrayRef) -> FunctionValueType {
-    FunctionValueType::new(array.data_type().clone(), true)
+    FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true)
 }
 
 fn largeint_type() -> FunctionValueType {

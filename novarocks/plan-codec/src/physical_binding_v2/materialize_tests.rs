@@ -232,16 +232,19 @@ fn materialized_all_kinds_preserve_complete_signature_order_and_source_fields() 
             a.argument_types[0],
             FunctionArgumentType::Value(headers.type_table().value_type(8).unwrap().clone())
         );
-        let DataType::Struct(fields) = &a.result_type.data_type else {
+        let DataType::Struct(fields) = &a.result_type.data_type() else {
             panic!("struct");
         };
-        let DataType::Struct(original) =
-            &headers.type_table().value_type(u32::MAX).unwrap().data_type
+        let DataType::Struct(original) = &headers
+            .type_table()
+            .value_type(u32::MAX)
+            .unwrap()
+            .data_type()
         else {
             panic!("struct");
         };
         assert!(Arc::ptr_eq(&fields[0], &original[0]));
-        assert_eq!(fields[0].metadata().get("custom").unwrap(), "retained");
+        assert!(fields[0].metadata().is_empty());
         let MaterializedFunctionBinding::Scalar(b) = &output.definitions()[1].1 else {
             panic!("aggregate");
         };
@@ -255,7 +258,7 @@ fn materialized_all_kinds_preserve_complete_signature_order_and_source_fields() 
         };
         assert_eq!(parameter_types.len(), 2);
         assert_eq!(parameter_types[1], a.result_type);
-        assert_eq!(result_type.data_type, DataType::Int64);
+        assert_eq!(result_type.data_type(), &DataType::Int64);
         let MaterializedFunctionBinding::Scalar(c) = &output.definitions()[2].1 else {
             panic!("window");
         };
@@ -267,8 +270,11 @@ fn materialized_all_kinds_preserve_complete_signature_order_and_source_fields() 
         assert!(d.legacy_metadata.is_none());
         assert_eq!(d.result_types.len(), 3);
         assert_eq!(d.result_types[0], d.result_types[2]);
-        assert_eq!(d.result_types[1].data_type, DataType::FixedSizeBinary(16));
-        assert_eq!(d.result_types[1].logical_type, ValueLogicalType::LargeInt);
+        assert_eq!(
+            d.result_types[1].data_type(),
+            &DataType::FixedSizeBinary(16)
+        );
+        assert_eq!(d.result_types[1].logical_type(), ValueLogicalType::LargeInt);
         assert!(
             output.retained_invoice_floor().unwrap()
                 < SOURCE + output.facts().request_bytes_upper_bound + size_of_val(&output)
@@ -309,9 +315,25 @@ fn materialization_requests_have_independent_layout_oracle() {
         let args = Layout::array::<FunctionArgumentType>(3).unwrap().size();
         let params = Layout::array::<FunctionValueType>(2).unwrap().size();
         let results = Layout::array::<FunctionValueType>(3).unwrap().size();
-        // Two requests for Vec -> Box; eight identity Boxes; two Dictionary Boxes.
-        assert_eq!(f.allocation_requests_upper_bound, 2 + 6 + 2 + 2 + 8 + 2);
-        let golden = 2 * (pair + args + params + results) + 8 * 6 + 2 * size_of::<DataType>();
+        // Vec-to-Box backing plus one actual private holder for each nonempty
+        // collection; both identities have a Box and an Arc per definition.
+        let arguments = novarocks_type_contract::FunctionArgumentTypes::storage_allocation_layout()
+            .unwrap()
+            .size();
+        let parameters =
+            novarocks_type_contract::FunctionParameterTypes::storage_allocation_layout()
+                .unwrap()
+                .size();
+        let identities = FunctionId::storage_allocation_layout().unwrap().size()
+            + FunctionOverloadId::storage_allocation_layout()
+                .unwrap()
+                .size();
+        assert_eq!(f.allocation_requests_upper_bound, 2 + 9 + 3 + 3 + 16);
+        let golden = 2 * (pair + args + params + results)
+            + 8 * 6
+            + 3 * arguments
+            + 2 * parameters
+            + 4 * identities;
         assert_eq!(f.request_bytes_upper_bound, golden);
         assert_eq!(f.type_reference_count, 11);
         assert_eq!(
@@ -711,7 +733,9 @@ fn real_signature_collections_cannot_bypass_tighter_containing_node_items() {
     for lambda in [false, true] {
         let args = if lambda {
             vec![FunctionArgumentType::Lambda {
-                parameter_types: vec![ty.clone(); 320].into_boxed_slice(),
+                parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                    vec![ty.clone(); 320].into_boxed_slice(),
+                ),
                 result_type: ty.clone(),
             }]
         } else {
@@ -721,7 +745,9 @@ fn real_signature_collections_cannot_bypass_tighter_containing_node_items() {
             FunctionId::try_new("test/f").unwrap(),
             FunctionOverloadId::try_new("test/o").unwrap(),
             FunctionKind::Scalar,
-            args.into_boxed_slice(),
+            novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                args.into_boxed_slice(),
+            ),
             ty.clone(),
         );
         let mut l = node_limits();
@@ -750,41 +776,35 @@ fn real_signature_collections_cannot_bypass_tighter_containing_node_items() {
     }
 }
 #[test]
-fn known_dictionary_clone_requests_precede_post_delegate_control() {
-    let source = FunctionValueType::new(
-        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
-        true,
-    );
-    let control = Control::default();
-    let run = |binding_limits, node_limits| {
-        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode)?;
-        let mut model = Model::for_composition(1, 0, SOURCE, 0);
-        model.facts.type_reference_count = 1;
-        model.compose_in_node(resources::Model::default(), 0, node_limits, binding_limits)?;
-        model.count_owned_type_clone(&source, binding_limits, &mut work)
-    };
-    let mut child_limits = limits();
-    child_limits.max_work = usize::MAX;
-    control.arm(None);
-    run(child_limits, node_limits()).unwrap();
-    let success = control.trace();
-    assert!(success.len() > 1);
-    let prefix = &success[..success.len() - 1];
+fn known_clone_work_limit_precedes_post_delegate_control() {
+    let source = FunctionValueType::new(DataType::Utf8, true);
     for parent in [false, true] {
-        let mut child = child_limits;
-        let mut node = node_limits();
-        if parent {
-            node.max_allocation_requests = 1;
-        } else {
-            child.max_allocation_requests = 1;
-        }
         for cause in CAUSES {
-            control.arm(Some((prefix.len(), cause)));
+            let control = Control::default();
+            control.arm(Some((1, cause)));
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
+            for _ in 0..255 {
+                work.step().unwrap();
+            }
+            let mut model = Model::for_composition(1, 0, SOURCE, 0);
+            model.facts.type_reference_count = 1;
+            let mut child = limits();
+            let mut node = node_limits();
+            // The shared clone needs no allocation, but its two handle work
+            // units remain in the original child's and containing node's caps.
+            if parent {
+                node.max_work = 0;
+            } else {
+                child.max_work = 0;
+            }
+            let result = model
+                .compose_in_node(resources::Model::default(), 0, node, child)
+                .and_then(|_| model.count_owned_type_clone(&source, child, &mut work));
             assert!(matches!(
-                run(child, node),
+                result,
                 Err(Error::Control(CompileControlError::ResourceExhausted))
             ));
-            assert_eq!(control.trace(), prefix);
+            assert_eq!(control.trace(), [0]);
         }
     }
 }
@@ -886,11 +906,8 @@ fn admitted_clone_uses_original_requests_and_callbacks_without_double_charge() {
     control.arm(None);
     let original = run(false, &control).unwrap();
     let trace = control.trace();
-    assert_eq!(original.allocation_requests_upper_bound, 4);
-    assert_eq!(
-        original.request_bytes_upper_bound,
-        4 * Layout::new::<DataType>().size()
-    );
+    assert_eq!(original.allocation_requests_upper_bound, 0);
+    assert_eq!(original.request_bytes_upper_bound, 0);
     control.arm(None);
     let admitted = run(true, &control).unwrap();
     assert_eq!(admitted.definition_count, original.definition_count);
@@ -922,11 +939,8 @@ fn admitted_clone_uses_original_requests_and_callbacks_without_double_charge() {
 }
 
 #[test]
-fn admitted_clone_known_dictionary_growth_precedes_late_quantum_and_parent_refusal() {
-    let source = FunctionValueType::new(
-        DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
-        true,
-    );
+fn admitted_shared_clone_preserves_numeric_and_parent_first_refusal() {
+    let source = FunctionValueType::new(DataType::Utf8, true);
     for numeric in [false, true] {
         for cause in CAUSES {
             let control = Control::default();
@@ -934,25 +948,20 @@ fn admitted_clone_known_dictionary_growth_precedes_late_quantum_and_parent_refus
             let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
             let mut model = Model::for_composition(1, 0, SOURCE, 0);
             model.facts.type_reference_count = 1;
-            let mut node = node_limits();
-            if numeric {
-                node.max_allocation_requests = 1;
-            }
             model
-                .compose_in_node(resources::Model::default(), 0, node, limits())
+                .compose_in_node(resources::Model::default(), 0, node_limits(), limits())
                 .unwrap();
             for _ in 0..255 {
                 work.step().unwrap();
             }
+            let mut child = limits();
+            if numeric {
+                child.max_work = 0;
+            }
             let result = model.count_owned_type_clone_admitted(
                 &source,
-                limits(),
-                &mut |facts| {
-                    if !numeric && facts.allocation_requests_upper_bound > 1 {
-                        return Err(CompileControlError::ResourceExhausted);
-                    }
-                    Ok(())
-                },
+                child,
+                &mut |_| Err(CompileControlError::ResourceExhausted),
                 &mut work,
             );
             assert!(matches!(
@@ -960,7 +969,8 @@ fn admitted_clone_known_dictionary_growth_precedes_late_quantum_and_parent_refus
                 Err(Error::Control(CompileControlError::ResourceExhausted))
             ));
             assert_eq!(control.trace(), [0]);
-            assert!(model.facts.allocation_requests_upper_bound >= 2);
+            assert_eq!(model.facts.allocation_requests_upper_bound, 0);
+            assert_eq!(model.facts.request_bytes_upper_bound, 0);
         }
     }
 }

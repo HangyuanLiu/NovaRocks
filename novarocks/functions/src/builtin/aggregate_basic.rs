@@ -93,29 +93,35 @@ pub(super) fn validate_contract(
                 | DataType::Float64
         )
     };
-    let mut types = Vec::new();
+    let arguments = &c.call().selected().argument_types;
+    // Preserve the original control boundaries while borrowing the checked
+    // declarations instead of publishing a scratch carrier-pointer Vec.
     work.flush().map_err(compile_failure)?;
-    types
-        .try_reserve_exact(c.call().selected().argument_types.len())
-        .map_err(|_| KernelFailure::ResourceExhausted)?;
     work.flush().map_err(compile_failure)?;
-    for t in &c.call().selected().argument_types {
+    for t in arguments {
         let FunctionArgumentType::Value(t) = t else {
             return Err(invalid("basic aggregate requires value arguments"));
         };
         work.step().map_err(compile_failure)?;
-        if t.logical_type != ValueLogicalType::Physical {
+        if t.logical_type() != ValueLogicalType::Physical {
             return Err(invalid("basic aggregate requires physical argument types"));
         }
-        types.push(&t.data_type);
     }
     let FunctionResultType::Scalar(result) = &c.call().selected().result_type else {
         return Err(invalid("basic aggregate requires a scalar result"));
     };
-    let valid_inputs = types.len() == op.arity()
-        && types.iter().all(|t| {
+    let types = || {
+        arguments.iter().map(|argument| {
+            let FunctionArgumentType::Value(value) = argument else {
+                unreachable!("checked basic aggregate value argument")
+            };
+            value.data_type()
+        })
+    };
+    let valid_inputs = arguments.len() == op.arity()
+        && types().all(|t| {
             if op.boolean() || op == BasicOperation::CountIf {
-                **t == DataType::Boolean
+                *t == DataType::Boolean
             } else {
                 numeric(t)
                     || op == BasicOperation::Avg
@@ -136,12 +142,12 @@ pub(super) fn validate_contract(
     } else if op == BasicOperation::CountIf {
         DataType::Int64
     } else if op == BasicOperation::Avg {
-        match types.first() {
+        match types().next() {
             Some(t @ DataType::Decimal128(..)) => {
                 novarocks_type_contract::canonical_agg_decimal_type("avg", t)
                     .ok_or_else(|| invalid("AVG decimal type is unsupported"))?
             }
-            Some(t @ DataType::Decimal256(..)) => (**t).clone(),
+            Some(t @ DataType::Decimal256(..)) => t.clone(),
             _ => DataType::Float64,
         }
     } else {
@@ -149,10 +155,10 @@ pub(super) fn validate_contract(
     };
     work.step().map_err(compile_failure)?;
     if !valid_inputs
-        || result.data_type != expected_result
-        || result.logical_type != ValueLogicalType::Physical
-        || c.intermediate_type().data_type != expected_state
-        || c.intermediate_type().logical_type != ValueLogicalType::Physical
+        || *result.data_type() != expected_result
+        || result.logical_type() != ValueLogicalType::Physical
+        || *c.intermediate_type().data_type() != expected_state
+        || c.intermediate_type().logical_type() != ValueLogicalType::Physical
     {
         return Err(invalid(
             "basic aggregate selected argument, result or state type differs from its owner",
@@ -405,17 +411,17 @@ impl BasicKernel {
         };
         BasicComputation {
             operation: self.operation,
-            domain: match source.data_type {
+            domain: match source.data_type() {
                 DataType::Decimal128(..) => BasicStateDomain::Decimal128,
                 DataType::Decimal256(..) => BasicStateDomain::Decimal256,
                 _ => BasicStateDomain::Plain,
             },
-            input_scale: match source.data_type {
-                DataType::Decimal128(_, s) | DataType::Decimal256(_, s) => Some(s),
+            input_scale: match source.data_type() {
+                DataType::Decimal128(_, s) | DataType::Decimal256(_, s) => Some(*s),
                 _ => None,
             },
-            output_type: &output.data_type,
-            intermediate_type: &self.contract.intermediate_type().data_type,
+            output_type: output.data_type(),
+            intermediate_type: self.contract.intermediate_type().data_type(),
         }
     }
 }

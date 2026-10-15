@@ -69,8 +69,8 @@ fn binding() -> ConnectorWriteBinding {
     )
 }
 
-/// The provider's own input fields: names, nullability and field metadata
-/// are provider facts the compiled projection keeps.
+/// Provider source fields keep their attributes on the write recipe. Its
+/// separately authored execution bindings determine the static projection.
 fn target_fields() -> Vec<Field> {
     vec![
         Field::new("c1", DataType::Int64, false)
@@ -80,6 +80,12 @@ fn target_fields() -> Vec<Field> {
 }
 
 fn draft() -> ConnectorWriteRecipeDraft {
+    draft_with_types([
+        FunctionValueType::new(DataType::Int64, false),
+        FunctionValueType::new(DataType::Utf8, true),
+    ])
+}
+fn draft_with_types(declared: [FunctionValueType; 2]) -> ConnectorWriteRecipeDraft {
     let binding = binding();
     let payload = ConnectorEncodedPayload::new(
         ConnectorEnvelopeHeader::new(
@@ -94,14 +100,24 @@ fn draft() -> ConnectorWriteRecipeDraft {
         binding,
         payload,
         ConnectorWriteInputShape::Data {
-            fields: target_fields()
+            fields: declared
                 .into_iter()
                 .enumerate()
-                .map(|(ordinal, field)| {
-                    ConnectorWriteFieldBinding::new(
+                .map(|(ordinal, execution)| {
+                    let name = if ordinal == 0 { "c1" } else { "c2" };
+                    let mut field =
+                        Field::new(name, execution.data_type().clone(), execution.nullable());
+                    if ordinal == 0 {
+                        field = field.with_metadata(
+                            [("provider.field-id".to_owned(), "1".to_owned())].into(),
+                        );
+                    }
+                    ConnectorWriteFieldBinding::try_new_typed(
                         ConnectorWriteFieldToken::from_bytes([ordinal as u8 + 1; 32]),
                         field,
+                        execution,
                     )
+                    .unwrap()
                 })
                 .collect(),
         },
@@ -239,17 +255,35 @@ struct Fixture {
 /// NOT NULL `c1` and a nullable `c2`; the finish fragment publishes the Root
 /// result relation.
 fn fixture() -> Fixture {
-    let draft = draft();
+    fixture_with_types(
+        [
+            FunctionValueType::new(DataType::Int64, false),
+            FunctionValueType::new(DataType::Utf8, false),
+        ],
+        draft(),
+    )
+    .unwrap()
+}
+fn fixture_with_types(
+    source_types: [FunctionValueType; 2],
+    draft: ConnectorWriteRecipeDraft,
+) -> Result<Fixture, Box<dyn std::error::Error>> {
     let ordinal = WriteTargetOrdinal::try_new(0).unwrap();
     let mut builder = FragmentBuilder::new(WRITER_FRAGMENT);
     let source = builder.reserve_node_id().unwrap();
-    let cells = [
-        (ty(DataType::Int64, false), LiteralValue::Int64(1)),
-        (ty(DataType::Utf8, false), LiteralValue::Utf8("a".into())),
-    ];
+    let cells = source_types.into_iter().enumerate().map(|(ordinal, ty)| {
+        let literal = if ty.nullable() {
+            LiteralValue::Null
+        } else if ordinal == 0 {
+            LiteralValue::Int64(1)
+        } else {
+            LiteralValue::Utf8("a".into())
+        };
+        (ty, literal)
+    });
     let mut row = Vec::new();
     let mut values = Vec::new();
-    for (ordinal, (value_type, literal)) in cells.into_iter().enumerate() {
+    for (ordinal, (value_type, literal)) in cells.enumerate() {
         row.push(
             builder
                 .add_expression(source, value_type.clone(), ExprKind::Literal(literal))
@@ -308,10 +342,10 @@ fn fixture() -> Fixture {
                             provider_name: binding.field().name().clone().into(),
                             token: binding.token(),
                             input: *value,
-                            ty: ValueType::new(
-                                binding.field().data_type().clone(),
-                                binding.field().is_nullable(),
-                            ),
+                            ty: binding
+                                .execution_type()
+                                .expect("provider complete target declaration")
+                                .clone(),
                             hidden: false,
                         })
                         .collect(),
@@ -324,9 +358,8 @@ fn fixture() -> Fixture {
             },
         })
         .unwrap();
-    let producer = builder
-        .finish_definition(writer, FragmentSink::Stream { edge: EDGE }, dop_domain())
-        .unwrap();
+    let producer =
+        builder.finish_definition(writer, FragmentSink::Stream { edge: EDGE }, dop_domain())?;
 
     let mut builder = FragmentBuilder::new(FINISH_FRAGMENT);
     let exchange = builder.reserve_node_id().unwrap();
@@ -447,7 +480,7 @@ fn fixture() -> Fixture {
             .collect(),
     })
     .unwrap();
-    let plan = plan.finish().unwrap();
+    let plan = plan.finish()?;
 
     let mut uses = BTreeMap::new();
     let mut calls = BTreeMap::new();
@@ -475,14 +508,13 @@ fn fixture() -> Fixture {
         &pruning,
         &admissions,
         &FixtureControl,
-    )
-    .unwrap();
-    Fixture {
+    )?;
+    Ok(Fixture {
         writer: Arc::new(packages.remove(&WRITER_FRAGMENT).unwrap()),
         finish: Arc::new(packages.remove(&FINISH_FRAGMENT).unwrap()),
         writer_node: writer,
         finish_node: finish,
-    }
+    })
 }
 
 /// One complete eager use per literal root site in one root domain.
@@ -681,11 +713,13 @@ fn writer_fragment_compiles_a_positional_relation_over_synthetic_slot_reads() {
             projection,
             writer_multiplex_layout,
             partial_aggregates,
+            partial_preparation,
         } = graph.nodes()[root.index()].kind()
         else {
             panic!("the writer fragment roots at its TableWriter");
         };
         assert!(partial_aggregates.is_empty());
+        assert!(partial_preparation.is_none());
         assert_eq!(target.get(), 0);
         assert!(matches!(
             graph.nodes()[input.index()].kind(),
@@ -696,7 +730,25 @@ fn writer_fragment_compiles_a_positional_relation_over_synthetic_slot_reads() {
         // is nullable in the provider but fed a non-null value.
         let fields = projection.layout.schema().fields();
         assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0].as_ref(), &target_fields()[0]);
+        assert_eq!(
+            fields[0].as_ref(),
+            &Field::new("c1", DataType::Int64, false)
+        );
+        assert!(projection.layout.is_typed());
+        assert!(fields[0].metadata().is_empty());
+        assert_eq!(
+            program.write_recipes()[&root]
+                .draft()
+                .input()
+                .fields_iter()
+                .next()
+                .unwrap()
+                .field()
+                .metadata()
+                .get("provider.field-id")
+                .map(String::as_str),
+            Some("1")
+        );
         assert_eq!(
             fields[1].as_ref(),
             &target_fields()[1].clone().with_nullable(false)
@@ -1289,10 +1341,10 @@ fn statistics_fixture() -> StatisticsFixture {
                             provider_name: binding.field().name().clone().into(),
                             token: binding.token(),
                             input: *value,
-                            ty: ValueType::new(
-                                binding.field().data_type().clone(),
-                                binding.field().is_nullable(),
-                            ),
+                            ty: binding
+                                .execution_type()
+                                .expect("provider complete target declaration")
+                                .clone(),
                             hidden: false,
                         })
                         .collect(),
@@ -1730,6 +1782,7 @@ fn freeze_writer_calls(
                 )
                 .unwrap_or_else(|error| panic!("the frontend prepares {site:?}: {error}"));
             FrozenPhysicalCall {
+                materialized_writer_input: Some(input),
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,
@@ -1817,10 +1870,8 @@ fn writer_partial_calls_read_the_projection_and_write_their_auxiliary_channels()
     }
 }
 
-/// Gap 1: the frontend freezes only a writer call's relational context, not
-/// its materialized input's occurrence. The compiler's own dedicated input
-/// occurrence is accepted by the frozen preparation, which keeps the frozen
-/// context, and that occurrence enters no flow.
+/// The actual source fixture authors its call and Value root domains once.
+/// Compilation consumes that exact receipt instead of rebuilding a context.
 #[test]
 fn a_writer_call_input_is_its_own_materialized_occurrence_and_the_frozen_preparation_accepts_it() {
     let fixture = statistics_fixture();
@@ -1857,7 +1908,22 @@ fn a_writer_call_input_is_its_own_materialized_occurrence_and_the_frozen_prepara
                 call.specialization().source(),
                 PurePreparationSource::Frozen
             );
-            let input = crate::writer_statistics::materialized_input_context(context);
+            let original = package
+                .calls()
+                .entries()
+                .values()
+                .find(|source| source.context == context)
+                .unwrap();
+            let input = original
+                .materialized_writer_input
+                .expect("actual writer Value receipt");
+            assert!(
+                package
+                    .expression_uses()
+                    .flow()
+                    .domains()
+                    .contains_key(&input.domain)
+            );
             assert_ne!(input.use_id, context.use_id);
             assert_ne!(input.domain, context.domain);
             assert_eq!(input.demand, EvaluationDemand::Value);
@@ -1866,18 +1932,6 @@ fn a_writer_call_input_is_its_own_materialized_occurrence_and_the_frozen_prepara
             assert!(!flow.uses().contains_key(&context.use_id));
         }
         assert_eq!(prepared, 2);
-    }
-    // The dedicated occurrence never reuses its call's identity, including
-    // the smallest one.
-    for (use_id, domain) in [(0, 0), (0, 5), (3, 0), (7, 9)] {
-        let call = ExpressionEffectContext {
-            use_id: ExpressionUseId::new(use_id),
-            domain: EvaluationDomainId::new(domain),
-            demand: EvaluationDemand::Value,
-        };
-        let input = crate::writer_statistics::materialized_input_context(call);
-        assert_ne!(input.use_id, call.use_id);
-        assert_ne!(input.domain, call.domain);
     }
 }
 
@@ -2083,4 +2137,82 @@ fn unsupported_writer_statistics_shapes_are_refused_by_name() {
         "writer grouped Unpivot mapping for a target outside the finish's statistics targets"
     );
     control.finish().unwrap();
+}
+
+#[test]
+fn actual_writer_compilation_accepts_root_null_obligation_and_refuses_nested_binding_drift() {
+    use novarocks_type_contract::{
+        ValueField, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+        ValueTypeStorageLifetime,
+    };
+    fn nested(json: bool, child_nullable: bool) -> FunctionValueType {
+        let storage = ValueTypeStorageLifetime::pure();
+        let child = ValueTypeRef::try_new(
+            if json {
+                ValueKind::Nominal(ValueLogicalType::Json)
+            } else {
+                ValueKind::String
+            },
+            child_nullable,
+            storage.clone(),
+        )
+        .unwrap();
+        let value = ValueTypeRef::try_new(
+            ValueKind::Struct(Box::from([ValueField::new(
+                "payload",
+                child,
+                storage.clone(),
+            )])),
+            true,
+            storage.clone(),
+        )
+        .unwrap();
+        let layout = ValueLayout::try_new(
+            &DataType::Struct(vec![Field::new("payload", DataType::Utf8, child_nullable)].into()),
+            storage,
+        )
+        .unwrap();
+        FunctionValueType::try_from_value(value, layout).unwrap()
+    }
+    let source = [
+        FunctionValueType::new(DataType::Int64, true),
+        FunctionValueType::new(DataType::Utf8, false),
+    ];
+    let fixture = fixture_with_types(source, draft()).unwrap();
+    let program = compile(&fixture.writer, 1, None).unwrap();
+    let root = program.graph().root();
+    let ProgramNodeKind::TableWriter { projection, .. } =
+        program.graph().nodes()[root.index()].kind()
+    else {
+        panic!("actual writer")
+    };
+    assert!(projection.layout.value_binding_at(0).unwrap().nullable());
+    assert!(
+        !program.write_recipes()[&root]
+            .draft()
+            .input()
+            .fields_iter()
+            .next()
+            .unwrap()
+            .execution_type()
+            .unwrap()
+            .nullable()
+    );
+    for (actual, expected) in [
+        (nested(false, true), nested(true, true)),
+        (nested(true, false), nested(true, true)),
+    ] {
+        let declared = draft_with_types([FunctionValueType::new(DataType::Int64, false), expected]);
+        let actual_source = [FunctionValueType::new(DataType::Int64, false), actual];
+        match fixture_with_types(actual_source, declared) {
+            Err(cause) => assert!(
+                cause.to_string().contains("type") || cause.to_string().contains("binding"),
+                "{cause}"
+            ),
+            Ok(fixture) => assert!(
+                compile(&fixture.writer, 1, None).is_err(),
+                "writer must refuse complete nested domain/NULL drift"
+            ),
+        }
+    }
 }

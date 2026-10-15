@@ -23,8 +23,8 @@ use std::sync::Arc;
 use novarocks_local_program as lp;
 
 use super::*;
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
-use crate::exec::expr::static_program::thaw_field_schema;
+use crate::exec::chunk::ChunkSchema;
+
 use crate::exec::node::LocalRuntimeBindings;
 use crate::exec::node::aggregate::{
     AggFunction, AggOrderSpec, AggTypeSignature, AggregateTopNRuntimeFilterProducerBinding,
@@ -56,10 +56,6 @@ use crate::exec::node::table_write_aggregate::{
     WriterFinalAggregatePlan as RuntimeWriterFinalAggregatePlan,
     WriterGroupedUnpivotMapping as RuntimeWriterGroupedUnpivotMapping,
     WriterGroupedUnpivotPlan as RuntimeWriterGroupedUnpivotPlan,
-    WriterPartialAggregateCall as RuntimeWriterPartialAggregateCall,
-};
-use crate::exec::node::table_write_relation::{
-    RootWriteResultRelationSchema, WriterMultiplexRelationSchema,
 };
 use crate::exec::node::table_writer::TableWriterInputProjection;
 use crate::exec::node::unpivot::{
@@ -502,18 +498,39 @@ fn runtime_unpivot_constant(value: &lp::UnpivotConstant) -> RuntimeUnpivotConsta
 
 fn runtime_writer_final_plan(
     plan: &lp::WriterFinalAggregatePlan,
-) -> RuntimeWriterFinalAggregatePlan {
-    RuntimeWriterFinalAggregatePlan {
-        calls: plan
-            .calls
-            .iter()
-            .map(|call| RuntimeWriterFinalAggregateCall {
-                function_name: Arc::clone(&call.function_name),
-                resolved: call.resolved.clone(),
-                intermediate_input_slot_id: call.intermediate_input_slot_id,
-                final_output_slot_id: call.final_output_slot_id,
-            })
-            .collect(),
+) -> Result<RuntimeWriterFinalAggregatePlan, String> {
+    if let Some(prepared) = &plan.prepared {
+        if prepared.phase() != novarocks_functions::AggregateKernelPhase::Final
+            || prepared
+                .calls()
+                .iter()
+                .map(|call| (call.input(), call.output()))
+                .ne(plan
+                    .calls
+                    .iter()
+                    .map(|call| (call.intermediate_input_slot_id, call.final_output_slot_id)))
+        {
+            return Err(
+                "writer Final prepared occurrences differ from their original declaration".into(),
+            );
+        }
+    }
+    Ok(RuntimeWriterFinalAggregatePlan {
+        prepared: plan.prepared.clone(),
+        calls: if plan.prepared.is_some() {
+            Vec::new()
+        } else {
+            plan.calls
+                .iter()
+                .map(|call| RuntimeWriterFinalAggregateCall {
+                    frozen: call.frozen.clone(),
+                    function_name: Arc::clone(&call.function_name),
+                    resolved: call.resolved.clone(),
+                    intermediate_input_slot_id: call.intermediate_input_slot_id,
+                    final_output_slot_id: call.final_output_slot_id,
+                })
+                .collect()
+        },
         unpivot: plan
             .unpivot
             .as_ref()
@@ -539,7 +556,7 @@ fn runtime_writer_final_plan(
                 max_output_rows: unpivot.max_output_rows,
                 max_output_bytes: unpivot.max_output_bytes,
             }),
-    }
+    })
 }
 
 fn runtime_aggregate_calls(
@@ -551,6 +568,7 @@ fn runtime_aggregate_calls(
     let calls = functions
         .iter()
         .map(|function| AggFunction {
+            frozen: function.frozen.clone(),
             name: function.name.to_string(),
             inputs: function.inputs.iter().copied().map(expr).collect(),
             input_is_intermediate: function.input_is_intermediate,
@@ -624,15 +642,16 @@ fn keyed_assert_distribution_keys_from_layout(
     layout: &lp::StaticLayout,
     key_slots: &[novarocks_types::SlotId],
 ) -> Result<Vec<ExprId>, String> {
-    let schema = ChunkSchema::from_static_layout(layout)?;
     let mut keys = Vec::with_capacity(key_slots.len());
     for slot in key_slots {
-        let slot_schema = schema.slot(*slot).ok_or_else(|| {
-            format!("keyed assert_num_rows key slot {slot} is not present in child output schema")
+        let binding = layout.value_binding(*slot).ok_or_else(|| {
+            format!("keyed assert_num_rows key slot {slot} has no complete child output binding")
         })?;
+        let value =
+            novarocks_type_contract::FunctionValueType::try_from_typed_binding(binding.clone())
+                .map_err(|error| error.to_string())?;
         let arena = Arc::make_mut(&mut ctx.arena);
-        let id = arena.push_typed(ExprNode::SlotId(*slot), slot_schema.data_type().clone());
-        arena.set_field_schema(id, slot_schema.field_schema().clone());
+        let id = arena.push_value_typed(ExprNode::SlotId(*slot), value);
         keys.push(id);
     }
     Ok(keys)
@@ -787,15 +806,10 @@ fn build_pipeline_for_program_node(
             Ok(build)
         }
         lp::ProgramNodeKind::Values { values } => {
-            let chunk_schema = ChunkSchema::from_static_layout(values.layout())?;
-            // Dynamic cells are compiled roots; only the compiled pipeline
-            // evaluates them.
-            let batch = values
-                .batch()
-                .ok_or_else(|| format!("legacy Values node {node_id} has dynamic cells"))?;
-            let chunk = Chunk::new_with_chunk_schema(batch.clone(), chunk_schema);
+            // The original guarded batch owns its exact rows and type facts;
+            // only actual operator preparation may create the runtime schema.
             let source: Box<dyn OperatorFactory> =
-                Box::new(ValuesSourceFactory::new(chunk, node_id));
+                Box::new(ValuesSourceFactory::new_typed(values.clone(), node_id)?);
             let pipeline = new_source_pipeline_with_dop(ctx, source, 1);
             Ok(PipelineBuildResult {
                 pipeline,
@@ -890,6 +904,7 @@ fn build_pipeline_for_program_node(
             projection,
             writer_multiplex_layout,
             partial_aggregates,
+            partial_preparation,
         } => {
             let mut build = build_pipeline_for_program_node(program, bindings, *input, ctx)?;
             let hash_key = match program.nodes()[input.index()].kind() {
@@ -908,20 +923,21 @@ fn build_pipeline_for_program_node(
                 .get(&id)
                 .ok_or_else(|| format!("missing runtime writer binding for node {node_id}"))?;
             let relation =
-                WriterMultiplexRelationSchema::try_from_static_layout(writer_multiplex_layout)?;
+                crate::exec::node::table_write_relation::WriterMultiplexRelationTemplate::try_new_reserved(
+                    writer_multiplex_layout,
+                )?;
+            let partial_input_layout = projection.layout.clone();
             let projection = TableWriterInputProjection::from_static(
                 projection,
+                expected_layout,
                 ctx.arena.runtime_error_binding()?,
             )?;
-            let partial_calls = partial_aggregates
-                .iter()
-                .map(|call| RuntimeWriterPartialAggregateCall {
-                    input_slot_id: call.input_slot_id,
-                    function_name: Arc::clone(&call.function_name),
-                    resolved: call.resolved.clone(),
-                    intermediate_slot_id: call.intermediate_slot_id,
-                })
-                .collect::<Vec<_>>();
+            if !partial_aggregates.is_empty() && partial_preparation.is_none() {
+                return Err(
+                    "local writer partial calls lack their original frozen preparation source"
+                        .into(),
+                );
+            }
             build
                 .pipeline
                 .factories
@@ -931,9 +947,11 @@ fn build_pipeline_for_program_node(
                     Arc::clone(expected_layout.schema()),
                     projection,
                     relation,
-                    &partial_calls,
+                    partial_preparation.clone(),
+                    partial_input_layout,
+                    writer_multiplex_layout.clone(),
+                    ctx.arena.runtime_error_binding()?,
                     binding,
-                    Arc::clone(&ctx.function_set),
                 )?));
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
@@ -972,14 +990,18 @@ fn build_pipeline_for_program_node(
             pipeline
                 .factories
                 .push(Box::new(TableFinishOperatorFactory::new_local(
-                    node_id,
-                    expected_targets.clone(),
-                    WriterMultiplexRelationSchema::try_from_static_layout(writer_multiplex_layout)?,
-                    RootWriteResultRelationSchema::try_from_static_layout(root_result_layout)?,
-                    runtime_writer_final_plan(final_aggregates),
-                    binding,
-                    Arc::clone(&ctx.arena),
-                )?));
+                node_id,
+                expected_targets.clone(),
+                crate::exec::node::table_write_relation::WriterMultiplexRelationTemplate::try_new_reserved(
+                    writer_multiplex_layout,
+                )?,
+                crate::exec::node::table_write_relation::RootWriteResultRelationTemplate::try_new_reserved(
+                    root_result_layout,
+                )?,
+                runtime_writer_final_plan(final_aggregates)?,
+                binding,
+                Arc::clone(&ctx.arena),
+            )?));
             Ok(PipelineBuildResult {
                 pipeline,
                 extra_pipelines,
@@ -1197,20 +1219,19 @@ fn build_pipeline_for_program_node(
                     )?,
                 ));
             } else {
-                build
-                    .pipeline
-                    .factories
-                    .push(Box::new(UnpivotProcessorFactory::new(
+                build.pipeline.factories.push(Box::new(
+                    UnpivotProcessorFactory::new_from_static_layout(
                         node_id,
                         Arc::clone(&ctx.arena),
                         passthrough_columns,
                         *value_output_slot_id,
                         literal_output_slot_ids.clone(),
                         value_mappings,
-                        ChunkSchema::from_static_layout(node.output_layout())?,
+                        node.output_layout().clone(),
                         *max_output_rows,
                         *max_output_bytes,
-                    )?));
+                    )?,
+                ));
             }
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
@@ -1223,16 +1244,17 @@ fn build_pipeline_for_program_node(
             repeat_times,
         } => {
             let mut build = build_pipeline_for_program_node(program, bindings, *input, ctx)?;
-            build
-                .pipeline
-                .factories
-                .push(Box::new(RepeatProcessorFactory::new(
+            build.pipeline.factories.push(Box::new(
+                RepeatProcessorFactory::new_from_static_layouts(
                     node_id,
                     null_slot_ids.clone(),
                     grouping_slot_ids.clone(),
                     grouping_list.clone(),
                     *repeat_times,
-                )));
+                    program.nodes()[input.index()].output_layout().clone(),
+                    node.output_layout().clone(),
+                )?,
+            ));
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }
@@ -1335,7 +1357,8 @@ fn build_pipeline_for_program_node(
                     partition_exprs,
                     *partition_limit,
                 )
-            };
+            }
+            .with_input_layout(program.nodes()[input.index()].output_layout().clone());
             build.pipeline.factories.push(Box::new(factory));
             build.stream = StreamDesc::single();
             Ok(build)
@@ -1370,7 +1393,7 @@ fn build_pipeline_for_program_node(
             build
                 .pipeline
                 .factories
-                .push(Box::new(TableFunctionProcessorFactory::new(
+                .push(Box::new(TableFunctionProcessorFactory::new_typed(
                     node_id,
                     function_name.to_string(),
                     param_slots.clone(),
@@ -1380,9 +1403,10 @@ fn build_pipeline_for_program_node(
                     *is_left_join,
                     param_types.clone(),
                     ret_types.clone(),
-                    ChunkSchema::from_static_layout(node.output_layout())?,
+                    program.nodes()[input.index()].output_layout().clone(),
+                    node.output_layout().clone(),
                     output_slot_sources,
-                )));
+                )?));
             build.stream = StreamDesc::any(build.pipeline.dop);
             Ok(build)
         }
@@ -1430,6 +1454,7 @@ fn build_pipeline_for_program_node(
                         return_type: function.return_type.clone(),
                         aggregate_binding: function.aggregate_binding.as_ref().map(
                             |(name, resolved)| WindowAggregateBinding {
+                frozen: function.frozen_aggregate.clone(),
                                 function_name: name.to_string(),
                                 resolved: resolved.clone(),
                             },
@@ -1543,32 +1568,6 @@ fn build_pipeline_for_program_node(
             output_indices,
         } => {
             let mut build = build_pipeline_for_program_node(program, bindings, *input, ctx)?;
-            let schemas = expr_slot_schemas
-                .as_ref()
-                .map(|schemas| {
-                    schemas
-                        .iter()
-                        .map(|slot| {
-                            if let Some(origins) = &slot.metadata_origins {
-                                ChunkSlotSchema::try_new_with_metadata_origins(
-                                    slot.slot_id,
-                                    Arc::clone(&slot.field),
-                                    origins.clone(),
-                                    Some(thaw_field_schema(&slot.field_schema)),
-                                    slot.unique_id,
-                                )
-                            } else {
-                                ChunkSlotSchema::try_new_with_field(
-                                    slot.slot_id,
-                                    slot.field.as_ref().clone(),
-                                    Some(thaw_field_schema(&slot.field_schema)),
-                                    slot.unique_id,
-                                )
-                            }
-                        })
-                        .collect::<Result<Vec<_>, _>>()
-                })
-                .transpose()?;
             build.pipeline.factories.push(Box::new(
                 ProjectProcessorFactory::new(
                     node_id,
@@ -1576,9 +1575,9 @@ fn build_pipeline_for_program_node(
                     Arc::clone(&ctx.arena),
                     exprs.iter().copied().map(expr).collect(),
                     expr_slot_ids.clone(),
-                    schemas,
+                    expr_slot_schemas.clone(),
                     output_indices.clone(),
-                    ChunkSchema::from_static_layout(node.output_layout())?,
+                    node.output_layout().clone(),
                 )
                 .with_final_result_input_validation(*validate_final_result_input),
             ));
@@ -1679,21 +1678,24 @@ fn build_aggregate_pipeline(
             );
             let runtime_filter_session =
                 native_aggregate_topn_session(&topn_producers, &ctx.runtime_filter_execution)?;
-            Box::new(AggregateProcessorFactory::new_native(
-                node_id,
-                Arc::clone(&ctx.arena),
-                group_by.clone(),
-                partial_functions,
-                Arc::clone(&ctx.function_set),
-                resolved_aggregates.clone(),
-                true,
-                false,
-                Arc::clone(&output_chunk_schema),
-                topn_producers,
-                runtime_filter_session,
-                dop,
-                None,
-            )?)
+            Box::new(
+                AggregateProcessorFactory::new_native(
+                    node_id,
+                    Arc::clone(&ctx.arena),
+                    group_by.clone(),
+                    partial_functions,
+                    Arc::clone(&ctx.function_set),
+                    resolved_aggregates.clone(),
+                    true,
+                    false,
+                    Arc::clone(&output_chunk_schema),
+                    topn_producers,
+                    runtime_filter_session,
+                    dop,
+                    None,
+                )?
+                .with_local_partial_output(),
+            )
         };
 
         build.pipeline.factories.push(partial_agg_factory);
@@ -1753,21 +1755,24 @@ fn build_aggregate_pipeline(
             func.input_is_intermediate = false;
         }
         let local_factory: Box<dyn OperatorFactory> = {
-            Box::new(AggregateProcessorFactory::new_native(
-                node_id,
-                Arc::clone(&ctx.arena),
-                group_by.clone(),
-                partial_functions,
-                Arc::clone(&ctx.function_set),
-                resolved_aggregates.clone(),
-                true,
-                false,
-                Arc::clone(&output_chunk_schema),
-                Vec::new(),
-                None,
-                dop,
-                None,
-            )?)
+            Box::new(
+                AggregateProcessorFactory::new_native(
+                    node_id,
+                    Arc::clone(&ctx.arena),
+                    group_by.clone(),
+                    partial_functions,
+                    Arc::clone(&ctx.function_set),
+                    resolved_aggregates.clone(),
+                    true,
+                    false,
+                    Arc::clone(&output_chunk_schema),
+                    Vec::new(),
+                    None,
+                    dop,
+                    None,
+                )?
+                .with_local_partial_output(),
+            )
         };
         build.pipeline.factories.push(local_factory);
 
@@ -2215,22 +2220,113 @@ mod tests {
     use crate::exec::node::{ExecNode, ExecNodeKind, ExecPlan, ExternalSinkRequirement};
 
     #[test]
+    fn keyed_assert_distribution_keys_keep_complete_frozen_bindings() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        let values = [
+            FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+                .unwrap(),
+            FunctionValueType::new(DataType::Utf8, true),
+        ];
+        let slots = [SlotId::new(17), SlotId::new(29)];
+        let fields = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                Field::new(
+                    format!("key_{index}"),
+                    value.data_type().clone(),
+                    value.nullable(),
+                )
+            })
+            .collect::<Vec<_>>();
+        struct Control;
+        impl novarocks_type_contract::PureCompileControl for Control {
+            fn checkpoint(
+                &self,
+                _: novarocks_type_contract::CompilePhase,
+                _: u32,
+            ) -> Result<(), novarocks_type_contract::CompileControlError> {
+                Ok(())
+            }
+        }
+        let layout = lp::StaticLayout::try_new_typed_for_compile(
+            Arc::new(Schema::new(fields)),
+            Arc::from(slots),
+            values
+                .iter()
+                .map(|value| (value.typed_binding().clone(), None))
+                .collect(),
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            |_| Ok(()),
+            &Control,
+        )
+        .unwrap();
+        let mut ctx = PipelineBuildContext {
+            arena: Arc::new(ExprArena::default()),
+            function_set: crate::exec::expr::agg::test_builtin_execution_function_set(),
+            dep_manager: DependencyManager::new(),
+            runtime_filter_execution: PipelineRuntimeFilterExecution { session: None },
+            exchange_bindings: ExchangeBindings::default(),
+            scan_bindings: ScanBindings::default(),
+            compiled_writers: Default::default(),
+            next_pipeline_id: 0,
+            pipeline_dop: 1,
+            operator_buffer_chunks: 1,
+            local_exchange_buffer_mem_limit_per_driver: 1,
+            local_exchange_max_buffered_rows: i64::MAX,
+            precomputed_keyed_assert_keys: HashMap::new(),
+        };
+        let keys = keyed_assert_distribution_keys_from_layout(&mut ctx, &layout, &slots).unwrap();
+        assert_eq!(keys.len(), 2);
+        for ((id, slot), value) in keys.iter().zip(slots).zip(&values) {
+            assert!(
+                matches!(ctx.arena.node(*id), Some(ExprNode::SlotId(actual)) if *actual == slot)
+            );
+            assert_eq!(ctx.arena.value_type(*id), Some(value));
+        }
+        assert_ne!(ctx.arena.value_type(keys[0]), ctx.arena.value_type(keys[1]));
+        let frozen = Arc::try_unwrap(std::mem::replace(
+            &mut ctx.arena,
+            Arc::new(ExprArena::default()),
+        ))
+        .unwrap()
+        .into_immutable()
+        .unwrap();
+        let thawed = ExprArena::from_immutable(&frozen).unwrap();
+        for (id, value) in keys.iter().zip(&values) {
+            assert_eq!(thawed.value_type(*id), Some(value));
+        }
+        assert!(
+            keyed_assert_distribution_keys_from_layout(
+                &mut PipelineBuildContext {
+                    arena: Arc::new(thawed),
+                    ..ctx
+                },
+                &layout,
+                &[SlotId::new(99)],
+            )
+            .unwrap_err()
+            .contains("no complete child output binding")
+        );
+    }
+
+    #[test]
     fn direct_local_program_builds_values_filter_project_without_exec_plan() {
         let slot = SlotId::new(1);
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        let chunk_schema =
-            ChunkSchema::try_ref_from_schema_and_slot_ids(schema.as_ref(), &[slot]).unwrap();
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(Int64Array::from(vec![7]))],
         )
         .unwrap();
-        let chunk = Chunk::try_new_with_chunk_schema(batch, Arc::clone(&chunk_schema)).unwrap();
+        let declared = novarocks_type_contract::FunctionValueType::new(DataType::Int64, false);
+        let chunk = crate::exec::chunk::typed_fixture::chunk(batch, &[slot], &[declared.clone()]);
+        let chunk_schema = chunk.chunk_schema_ref();
         let mut arena = ExprArena::default();
-        let value_expr = arena.push_typed(ExprNode::SlotId(slot), DataType::Int64);
-        let predicate = arena.push_typed(
+        let value_expr = arena.push_value_typed(ExprNode::SlotId(slot), declared.clone());
+        let predicate = arena.push_value_typed(
             ExprNode::Literal(crate::exec::expr::LiteralValue::Bool(true)),
-            DataType::Boolean,
+            novarocks_type_contract::FunctionValueType::new(DataType::Boolean, false),
         );
         let values = ExecNode {
             kind: ExecNodeKind::Values(ValuesNode { chunk, node_id: 1 }),
@@ -2255,26 +2351,19 @@ mod tests {
                 output_chunk_schema: Arc::clone(&chunk_schema),
             }),
         };
-        let layout = lp::StaticLayout::try_new_exact(
-            Arc::clone(&schema),
-            Arc::from([slot]),
-            vec![(lp::StaticFieldSchema::new(None, vec![]), None)],
-        )
-        .unwrap();
+        let layout = crate::exec::chunk::typed_fixture::layout(schema, &[slot], &[declared]);
         let profile = lp::CompileProfile::new(
             NonZeroUsize::new(1).unwrap(),
             None,
             layout.identity().unwrap(),
             lp::KernelAbiVersion::CURRENT,
         );
-        let (program, bindings) = ExecPlan { arena, root }
-            .into_local_program_and_bindings(
-                profile,
-                BTreeMap::new(),
-                vec![ExternalSinkRequirement::Result],
-                FragmentSinkProgram::Result.into_static().unwrap(),
-            )
-            .unwrap();
+        let (program, bindings) = crate::exec::chunk::typed_fixture::lower(
+            ExecPlan { arena, root },
+            profile,
+            vec![ExternalSinkRequirement::Result],
+            FragmentSinkProgram::Result.into_static().unwrap(),
+        );
         let graph = build_native_pipeline_graph_for_local_program_with_runtime_settings(
             &program,
             &bindings,
@@ -2318,7 +2407,8 @@ mod tests {
 
         for target_dop in [1, 4] {
             let op: Arc<dyn ScanOp> = Arc::new(BoundScan);
-            let schema = Arc::new(ChunkSchema::empty());
+            let schema = crate::exec::chunk::typed_fixture::columns(&[], &[], &[], Vec::new(), 0)
+                .chunk_schema_ref();
             let plan = ExecPlan {
                 arena: ExprArena::default(),
                 root: ExecNode {
@@ -2329,20 +2419,22 @@ mod tests {
                     ),
                 },
             };
-            let profile = plan
-                .local_compile_profile(NonZeroUsize::new(target_dop as usize).unwrap(), None)
-                .unwrap();
-            let (program, bindings) = plan
-                .into_local_program_and_bindings(
-                    profile,
-                    BTreeMap::from([(
-                        7,
-                        crate::runtime::fragment::submission::tests::static_scan_for_test(),
-                    )]),
-                    Vec::new(),
-                    lp::StaticSinkProgram::Noop,
-                )
-                .unwrap();
+            let profile = crate::exec::chunk::typed_fixture::profile(
+                &plan,
+                NonZeroUsize::new(target_dop as usize).unwrap(),
+                None,
+            );
+            let (program, bindings) = crate::exec::chunk::typed_fixture::try_lower_with_scans(
+                plan,
+                profile,
+                BTreeMap::from([(
+                    7,
+                    crate::runtime::fragment::submission::tests::static_scan_for_test(),
+                )]),
+                Vec::new(),
+                lp::StaticSinkProgram::Noop,
+            )
+            .unwrap();
             let mut scans = ScanBindings::default();
             scans.insert(7, op);
             let graph = build_native_pipeline_graph_for_local_program_with_runtime_settings(
@@ -2491,12 +2583,14 @@ mod tests {
     fn shared_exchange_source_is_rejected_before_binding_a_receiver() {
         let slot = SlotId::new(1);
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
-        let layout = lp::StaticLayout::try_new_exact(
+        let layout = crate::exec::chunk::typed_fixture::layout(
             schema,
-            Arc::from([slot]),
-            vec![(lp::StaticFieldSchema::new(None, vec![]), None)],
-        )
-        .unwrap();
+            &[slot],
+            &[novarocks_type_contract::FunctionValueType::new(
+                DataType::Int64,
+                false,
+            )],
+        );
         let source_id = lp::ProgramNodeId::new(0);
         let root_id = lp::ProgramNodeId::new(1);
         let program = lp::LocalProgramGraph::try_new(
@@ -2556,12 +2650,14 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![7]))],
         )
         .unwrap();
-        let layout = lp::StaticLayout::try_new_exact(
+        let layout = crate::exec::chunk::typed_fixture::layout(
             schema,
-            Arc::from([slot]),
-            vec![(lp::StaticFieldSchema::new(None, vec![]), None)],
-        )
-        .unwrap();
+            &[slot],
+            &[novarocks_type_contract::FunctionValueType::new(
+                DataType::Int64,
+                false,
+            )],
+        );
         let values = lp::StaticValues::try_new(batch, layout.clone()).unwrap();
         let values_id = lp::ProgramNodeId::new(0);
         let program = lp::LocalProgramGraph::try_new(

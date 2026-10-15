@@ -351,7 +351,10 @@ mod tests {
         let plain = pool(Arc::new(array), false).value(0).unwrap();
         assert_eq!(text(&json), text(&plain));
         assert_eq!(json.value_type(), &value_type);
-        assert_eq!(plain.value_type().logical_type, ValueLogicalType::Physical);
+        assert_eq!(
+            plain.value_type().logical_type(),
+            ValueLogicalType::Physical
+        );
         let binary = pool(
             Arc::new(arrow_array::BinaryArray::from(vec![b"text".as_slice()])),
             false,
@@ -505,7 +508,7 @@ mod tests {
                     Some(expected)
                 );
                 assert_eq!(selected.value_type(), &original_type);
-                if original_type.data_type != DataType::Int64 {
+                if original_type.data_type() != &DataType::Int64 {
                     assert_eq!(int(&selected), None);
                 }
             }

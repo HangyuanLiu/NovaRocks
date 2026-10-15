@@ -199,6 +199,15 @@ pub trait PureScalarImplementation:
         contract: Arc<ScalarCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure>;
+    fn prepare_scalar_checked(
+        &self,
+        _input: CallEffectInput<'_>,
+        _checked: &crate::CheckedCallEffectInput<'_>,
+        _contract: Arc<ScalarCallContract>,
+        _control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        Err(crate::CheckedOwnerFailure::UnconvertedOwner)
+    }
 }
 
 /// One exact-owner preparation and complete use effects. The temporary
@@ -258,22 +267,82 @@ fn specialize_scalar_once<O: PureScalarImplementation + ?Sized>(
     let (receipt, effects) = crate::specialization::refine_once_for_specialization(
         owner, input, frozen, arguments, control,
     )?;
+    finish_scalar_specialization(input, selected, receipt, effects, control, |contract| {
+        owner
+            .prepare_scalar(input, contract, control)
+            .map_err(FunctionSpecializationFailure::Kernel)
+    })
+}
+
+fn finish_scalar_specialization<E: From<FunctionSpecializationFailure>>(
+    input: CallEffectInput<'_>,
+    selected: Arc<FunctionBindingSelection>,
+    receipt: RefinedCallEffects<'_>,
+    effects: ScopedExpressionEffects,
+    control: &dyn PureCompileControl,
+    prepare: impl FnOnce(Arc<ScalarCallContract>) -> Result<Arc<dyn PreparedScalarKernel>, E>,
+) -> Result<ScalarSpecialization, E> {
     let contract = Arc::new(
         ScalarCallContract::from_refined(input, &receipt, selected, control)
             .map_err(FunctionSpecializationFailure::Kernel)?,
     );
-    let prepared = owner
-        .prepare_scalar(input, contract.clone(), control)
-        .map_err(FunctionSpecializationFailure::Kernel)?;
+    let prepared = prepare(contract.clone())?;
     if !Arc::ptr_eq(prepared.contract(), &contract) {
-        return Err(FunctionSpecializationFailure::Kernel(internal(
+        return Err(E::from(FunctionSpecializationFailure::Kernel(internal(
             "scalar preparation replaced its exact immutable contract",
-        )));
+        ))));
     }
     control
         .checkpoint(CompilePhase::FunctionSpecialization, 0)
-        .map_err(FunctionSpecializationFailure::Control)?;
+        .map_err(FunctionSpecializationFailure::Control)
+        .map_err(E::from)?;
     Ok(ScalarSpecialization { prepared, effects })
+}
+
+impl From<FunctionSpecializationFailure>
+    for crate::CheckedOwnerFailure<FunctionSpecializationFailure>
+{
+    fn from(error: FunctionSpecializationFailure) -> Self {
+        Self::Original(error)
+    }
+}
+
+pub(crate) fn specialize_scalar_checked<O: PureScalarImplementation + ?Sized>(
+    owner: &O,
+    checked: &crate::CheckedCallEffectInput<'_>,
+    input: CallEffectInput<'_>,
+    selected: Arc<FunctionBindingSelection>,
+    frozen: Option<&CallEffects>,
+    arguments: ScopedExpressionEffects,
+    control: &dyn PureCompileControl,
+) -> Result<ScalarSpecialization, crate::CheckedOwnerFailure<FunctionSpecializationFailure>> {
+    // Same original specialization entry, and ONE original refinement parser.
+    control
+        .checkpoint(CompilePhase::FunctionSpecialization, 0)
+        .map_err(FunctionSpecializationFailure::Control)?;
+    let owner_adapter = crate::specialization::CheckedEffectAdapter { owner, checked };
+    let receipt = match frozen {
+        Some(frozen) => crate::validate_frozen_call_effects(&owner_adapter, input, frozen, control),
+        None => crate::refine_call_effects(&owner_adapter, input, control),
+    }
+    .map_err(crate::specialization::checked_refinement_failure)?;
+    let effects = receipt
+        .compose_for_use(input, arguments)
+        .map_err(FunctionSpecializationFailure::Effects)?;
+    finish_scalar_specialization(input, selected, receipt, effects, control, |contract| {
+        owner
+            .prepare_scalar_checked(input, checked, contract, control)
+            .map_err(|error| match error {
+                crate::CheckedOwnerFailure::Original(error) => {
+                    crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::Kernel(
+                        error,
+                    ))
+                }
+                crate::CheckedOwnerFailure::UnconvertedOwner => {
+                    crate::CheckedOwnerFailure::UnconvertedOwner
+                }
+            })
+    })
 }
 
 /// Mutable state belongs to one expression use in one evaluation instance.
@@ -466,8 +535,8 @@ pub(crate) fn evaluate_scalar_once<'a, E: ScalarInvocationError>(
     if selection.is_empty() && !invoke_empty {
         return SelectedValues::try_new(
             selection,
-            &contract.result_type().data_type,
-            new_empty_array(&contract.result_type().data_type),
+            contract.result_type().data_type(),
+            new_empty_array(contract.result_type().data_type()),
             Box::default(),
         )
         .map_err(|_| E::from(internal("empty scalar result violates its contract")));
@@ -508,7 +577,7 @@ pub(crate) fn evaluate_scalar_once<'a, E: ScalarInvocationError>(
         .same_rows_observed(selection, || work.step())?
         || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
             output.values().data_type(),
-            &contract.result_type().data_type,
+            contract.result_type().data_type(),
             || work.step(),
         )?
     {
@@ -517,7 +586,7 @@ pub(crate) fn evaluate_scalar_once<'a, E: ScalarInvocationError>(
         )));
     }
     work.finish()?;
-    if !contract.result_type().nullable {
+    if !contract.result_type().nullable() {
         let mut work = EvaluationCheckpoints::new(control);
         let mut errors = output.errors().iter().peekable();
         for row in 0..output.values().len() {

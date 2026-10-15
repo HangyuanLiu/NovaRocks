@@ -67,86 +67,45 @@ pub(crate) use resolver::{ResolveError, ResolvedScalarFunction};
 /// the same decision.
 pub(crate) use novarocks_functions::FunctionVolatility;
 
-/// Semantic result domains declared by exact installed built-in bindings.
-/// A physical carrier alone never establishes JSON or opaque provenance.
-/// Literal-dependent Variant calls retain their selected ordinary result domain.
+/// Project an already authored result declaration for SQL presentation.
+/// Function identity and selection validity belong to the original catalogue
+/// request validator; an output projection cannot repair a plain declaration.
+fn declared_output_logical_type(
+    result: &FunctionValueType,
+) -> Option<novarocks_types::schema::SqlType> {
+    use novarocks_type_contract::ValueLogicalType as V;
+    use novarocks_types::schema::SqlType as S;
+    match result.logical_type() {
+        V::Object => Some(S::Object),
+        V::Percentile => Some(S::Percentile),
+        V::Uuid => Some(S::Uuid),
+        domain => crate::analyzer::sql_logical_projection(domain),
+    }
+}
+
 pub(crate) fn scalar_output_logical_type(
     binding: &ResolvedFunctionBinding,
 ) -> Option<novarocks_types::schema::SqlType> {
-    use novarocks_types::schema::SqlType;
-
     if binding.kind != FunctionKind::Scalar {
         return None;
     }
     let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
         return None;
     };
-    if let Some(logical) = crate::analyzer::sql_logical_projection(result.logical_type) {
-        return Some(logical);
-    }
-    match (binding.function_id.as_str(), &result.data_type) {
-        (
-            "builtin.scalar/parse_json/v1"
-            | "builtin.scalar/json_object/v1"
-            | "builtin.scalar/json_query/v1",
-            DataType::Utf8,
-        ) => Some(SqlType::Json),
-        (
-            "builtin.scalar/to_bitmap/v1"
-            | "builtin.scalar/bitmap_empty/v1"
-            | "builtin.scalar/bitmap_from_string/v1"
-            | "builtin.scalar/bitmap_from_binary/v1"
-            | "builtin.scalar/bitmap_and/v1"
-            | "builtin.scalar/bitmap_or/v1"
-            | "builtin.scalar/bitmap_xor/v1"
-            | "builtin.scalar/bitmap_andnot/v1"
-            | "builtin.scalar/bitmap_intersect/v1"
-            | "builtin.scalar/sub_bitmap/v1"
-            | "builtin.scalar/bitmap_subset_limit/v1"
-            | "builtin.scalar/bitmap_subset_in_range/v1",
-            DataType::Binary,
-        ) => Some(SqlType::Bitmap),
-        ("builtin.scalar/hll_hash/v1", DataType::Binary) => Some(SqlType::Hll),
-        (
-            "builtin.scalar/percentile_hash/v1" | "builtin.scalar/percentile_empty/v1",
-            DataType::Binary,
-        ) => Some(SqlType::Percentile),
-        (
-            "builtin.scalar/variant_get/v1" | "builtin.scalar/try_variant_get/v1",
-            DataType::LargeBinary,
-        ) => Some(SqlType::Variant),
-        _ => None,
-    }
+    declared_output_logical_type(result)
 }
 
-/// Aggregate output identity is separate from its intermediate state carrier.
-/// Count results and externally serialized states retain their declared types.
+/// Aggregate result and intermediate-state declarations have distinct owners.
 pub(crate) fn aggregate_output_logical_type(
     binding: &ResolvedFunctionBinding,
 ) -> Option<novarocks_types::schema::SqlType> {
-    use novarocks_types::schema::SqlType;
-
     if binding.kind != FunctionKind::Aggregate {
         return None;
     }
     let FunctionResultType::Scalar(result) = &binding.selected.result_type else {
         return None;
     };
-    if let Some(logical) = crate::analyzer::sql_logical_projection(result.logical_type) {
-        return Some(logical);
-    }
-    match (binding.function_id.as_str(), &result.data_type) {
-        (
-            "builtin.aggregate/bitmap_agg/v1" | "builtin.aggregate/bitmap_union/v1",
-            DataType::Binary,
-        ) => Some(SqlType::Bitmap),
-        (
-            "builtin.aggregate/hll_union/v1" | "builtin.aggregate/hll_raw_agg/v1",
-            DataType::Binary,
-        ) => Some(SqlType::Hll),
-        ("builtin.aggregate/percentile_union/v1", DataType::Binary) => Some(SqlType::Percentile),
-        _ => None,
-    }
+    declared_output_logical_type(result)
 }
 
 pub(crate) fn aggregate_result_type(binding: &ResolvedFunctionBinding) -> &FunctionValueType {
@@ -276,12 +235,11 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
             let argument_types = bound
                 .selected
                 .argument_types
-                .into_vec()
-                .into_iter()
+                .iter()
                 .map(|argument| {
                     work.step()?;
                     match argument {
-                        FunctionArgumentType::Value(value) => Ok(value.data_type),
+                        FunctionArgumentType::Value(value) => Ok(value.data_type().clone()),
                         FunctionArgumentType::Lambda { .. } => Err(ResolveError::BadSignature(
                             "legacy scalar signature cannot represent a lambda argument".into(),
                         )),
@@ -289,7 +247,7 @@ impl crate::compiler::SqlFunctionCatalog for EngineFunctionCatalog {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(ResolvedScalarFunction {
-                return_type: result.data_type,
+                return_type: result.data_type().clone(),
                 argument_types,
                 enforce_argument_binding: true,
             })
@@ -584,7 +542,7 @@ impl TestExactAggregateBindingResolver {
             .arguments
             .iter()
             .map(|argument| match argument {
-                FunctionArgument::Value { value_type, .. } => Ok(value_type.data_type.clone()),
+                FunctionArgument::Value { value_type, .. } => Ok(value_type.data_type().clone()),
                 FunctionArgument::Lambda { .. } => Err(FunctionBindingError::NoMatchingOverload),
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -604,12 +562,14 @@ impl TestExactAggregateBindingResolver {
         Ok(FunctionBindingSelection {
             overload: FunctionOverloadId::try_new(overload.identity.as_str())
                 .map_err(|error| FunctionBindingError::InvalidBinding(error.to_string().into()))?,
-            argument_types: request
-                .arguments
-                .iter()
-                .map(FunctionArgument::argument_type)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                request
+                    .arguments
+                    .iter()
+                    .map(FunctionArgument::argument_type)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
             result_type: FunctionResultType::Scalar(FunctionValueType::new(
                 overload.output_type.clone(),
                 true,
@@ -664,7 +624,7 @@ impl FunctionBindingResolver for TestExactAggregateBindingResolver {
                     return Err(FunctionBindingError::NoMatchingOverload);
                 };
                 let exact = novarocks_type_contract::arrow_data_types_exact_observed(
-                    &value_type.data_type,
+                    &value_type.data_type(),
                     expected,
                     || work.step().map_err(FunctionBindingError::from),
                 )?;
@@ -891,7 +851,7 @@ mod tests {
             .unwrap();
         let shadow = builder.seal().unwrap();
         let bound = resolve_exact_scalar(&shadow, "json_object", &args);
-        assert_eq!(scalar_result(&bound).data_type, DataType::Utf8);
+        assert_eq!(scalar_result(&bound).data_type().clone(), DataType::Utf8);
         assert_eq!(scalar_output_logical_type(&bound), None);
     }
 
@@ -1033,7 +993,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let binding = resolve_exact_scalar(&catalog, name, &arguments);
             assert_eq!(
-                scalar_result(&binding).data_type,
+                scalar_result(&binding).data_type().clone(),
                 DataType::Binary,
                 "{name}"
             );
@@ -1054,7 +1014,11 @@ mod tests {
                 .map(|ty| value_argument(ty, false, None))
                 .collect::<Vec<_>>();
             let binding = resolve_exact_scalar(&catalog, name, &arguments);
-            assert_eq!(scalar_result(&binding).data_type, DataType::Utf8, "{name}");
+            assert_eq!(
+                scalar_result(&binding).data_type().clone(),
+                DataType::Utf8,
+                "{name}"
+            );
             assert_eq!(
                 scalar_output_logical_type(&binding),
                 Some(SqlType::Json),
@@ -1070,11 +1034,22 @@ mod tests {
         let catalog = build_builtin_engine_function_catalog().unwrap();
         for name in ["variant_get", "try_variant_get"] {
             let mut arguments = vec![
-                value_argument(DataType::LargeBinary, true, None),
+                FunctionArgument::Value {
+                    value_type: FunctionValueType::try_with_logical_type(
+                        DataType::LargeBinary,
+                        true,
+                        novarocks_type_contract::ValueLogicalType::Variant,
+                    )
+                    .unwrap(),
+                    constant: None,
+                },
                 value_argument(DataType::Utf8, false, Some(test_utf8_constant("$.value"))),
             ];
             let binding = resolve_exact_scalar(&catalog, name, &arguments);
-            assert_eq!(scalar_result(&binding).data_type, DataType::LargeBinary);
+            assert_eq!(
+                scalar_result(&binding).data_type().clone(),
+                DataType::LargeBinary
+            );
             assert_eq!(scalar_output_logical_type(&binding), Some(SqlType::Variant));
             let mut changed = binding.clone();
             changed.selected.result_type =
@@ -1086,7 +1061,7 @@ mod tests {
                 Some(test_utf8_constant("BIGINT")),
             ));
             let binding = resolve_exact_scalar(&catalog, name, &arguments);
-            assert_eq!(scalar_result(&binding).data_type, DataType::Int64);
+            assert_eq!(scalar_result(&binding).data_type().clone(), DataType::Int64);
             assert_eq!(scalar_output_logical_type(&binding), None);
         }
     }
@@ -1126,7 +1101,7 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{name} must bind exactly: {error}"));
             if domain.is_some() {
                 assert_eq!(
-                    aggregate_result_type(&binding).data_type,
+                    aggregate_result_type(&binding).data_type().clone(),
                     DataType::Binary,
                     "{name}"
                 );
@@ -1140,7 +1115,10 @@ mod tests {
         ] {
             let arguments = [value_argument(argument, true, None)];
             let binding = resolve_exact_scalar(&catalog, name, &arguments);
-            assert_eq!(scalar_result(&binding).data_type, DataType::Binary);
+            assert_eq!(
+                scalar_result(&binding).data_type().clone(),
+                DataType::Binary
+            );
             assert_eq!(scalar_output_logical_type(&binding), None, "{name}");
         }
     }
@@ -1166,7 +1144,7 @@ mod tests {
                 DataType::LargeBinary,
             ]
             .into_iter()
-            .filter(|carrier| *carrier != scalar_result(&binding).data_type)
+            .filter(|carrier| *carrier != *scalar_result(&binding).data_type())
             {
                 let mut changed = binding.clone();
                 changed.selected.result_type =
@@ -1179,10 +1157,28 @@ mod tests {
             changed = binding.clone();
             changed.function_id =
                 FunctionId::try_new(format!("external.scalar/{name}/v1")).unwrap();
-            assert_eq!(scalar_output_logical_type(&changed), None);
+            assert_eq!(
+                scalar_output_logical_type(&changed),
+                scalar_output_logical_type(&binding)
+            );
+            assert!(
+                catalog
+                    .validate_bound(
+                        &changed,
+                        FunctionBindingRequest {
+                            expected_result_type: None,
+                            arguments: &arguments,
+                            logical_argument_count: arguments.len()
+                        },
+                        &crate::compiler::SqlCompileControl::unbounded()
+                    )
+                    .is_err()
+            );
             changed = binding;
             changed.selected.result_type = FunctionResultType::Relation(
-                vec![FunctionValueType::new(DataType::Binary, true)].into_boxed_slice(),
+                novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    vec![FunctionValueType::new(DataType::Binary, true)].into_boxed_slice(),
+                ),
             );
             assert_eq!(scalar_output_logical_type(&changed), None);
         }
@@ -1211,9 +1207,27 @@ mod tests {
         changed = binding.clone();
         changed.function_id =
             FunctionId::try_new("external.aggregate/percentile_union/v1").unwrap();
-        assert_eq!(aggregate_output_logical_type(&changed), None);
+        assert_eq!(
+            aggregate_output_logical_type(&changed),
+            aggregate_output_logical_type(&binding)
+        );
+        assert!(
+            catalog
+                .validate_bound(
+                    &changed,
+                    FunctionBindingRequest {
+                        expected_result_type: None,
+                        arguments: &arguments,
+                        logical_argument_count: arguments.len()
+                    },
+                    &crate::compiler::SqlCompileControl::unbounded()
+                )
+                .is_err()
+        );
         changed = binding;
-        changed.selected.result_type = FunctionResultType::Relation(Box::new([]));
+        changed.selected.result_type = FunctionResultType::Relation(
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::new([])),
+        );
         assert_eq!(aggregate_output_logical_type(&changed), None);
     }
 
@@ -1229,13 +1243,46 @@ mod tests {
             "builtin.scalar/array_to_bitmap/v1",
         ] {
             binding.function_id = FunctionId::try_new(id).unwrap();
-            assert_eq!(scalar_output_logical_type(&binding), None, "{id}");
+            assert_eq!(
+                scalar_output_logical_type(&binding),
+                Some(novarocks_types::schema::SqlType::Bitmap),
+                "{id}"
+            );
+            assert!(
+                catalog
+                    .validate_bound(
+                        &binding,
+                        FunctionBindingRequest {
+                            expected_result_type: None,
+                            arguments: &[],
+                            logical_argument_count: 0
+                        },
+                        &crate::compiler::SqlCompileControl::unbounded()
+                    )
+                    .is_err()
+            );
         }
         let arguments = [value_argument(DataType::Utf8, false, None)];
         let mut binding = resolve_exact_scalar(&catalog, "parse_json", &arguments);
         for name in ["json_array", "to_json"] {
             binding.function_id = FunctionId::try_new(format!("builtin.scalar/{name}/v1")).unwrap();
-            assert_eq!(scalar_output_logical_type(&binding), None);
+            assert_eq!(
+                scalar_output_logical_type(&binding),
+                Some(novarocks_types::schema::SqlType::Json)
+            );
+            assert!(
+                catalog
+                    .validate_bound(
+                        &binding,
+                        FunctionBindingRequest {
+                            expected_result_type: None,
+                            arguments: &arguments,
+                            logical_argument_count: arguments.len()
+                        },
+                        &crate::compiler::SqlCompileControl::unbounded()
+                    )
+                    .is_err()
+            );
             assert_eq!(
                 builtin_disposition(name),
                 Some(BuiltinDisposition::Unavailable)
@@ -1265,6 +1312,8 @@ mod tests {
             .collect::<Vec<_>>();
         let mut selection = bound.selected.clone();
         selection.overload = overloads[0].clone();
+        selection.result_type =
+            FunctionResultType::Scalar(FunctionValueType::new(DataType::Utf8, false));
         let declaration = FunctionBindingDeclaration::try_new(
             FunctionId::try_new("test.shadow/json_object/v1").unwrap(),
             FunctionKind::Scalar,
@@ -1296,7 +1345,7 @@ mod tests {
             .unwrap();
         let shadow = builder.seal().unwrap();
         let bound = resolve_exact_scalar(&shadow, "json_object", &args);
-        assert_eq!(scalar_result(&bound).data_type, DataType::Utf8);
+        assert_eq!(scalar_result(&bound).data_type().clone(), DataType::Utf8);
         assert_eq!(scalar_output_logical_type(&bound), None);
     }
 
@@ -1316,19 +1365,21 @@ mod tests {
         let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
         let nonnull = [value_argument(DataType::Int64, false, None)];
         let nullable = [value_argument(DataType::Int64, true, None)];
-        assert!(!scalar_result(&resolve_exact_scalar(&catalog, "abs", &nonnull)).nullable);
-        assert!(scalar_result(&resolve_exact_scalar(&catalog, "abs", &nullable)).nullable);
+        assert!(!scalar_result(&resolve_exact_scalar(&catalog, "abs", &nonnull)).nullable());
+        assert!(scalar_result(&resolve_exact_scalar(&catalog, "abs", &nullable)).nullable());
 
         let coalesce = [
             value_argument(DataType::Int64, true, None),
             value_argument(DataType::Int64, false, None),
         ];
-        assert!(!scalar_result(&resolve_exact_scalar(&catalog, "coalesce", &coalesce)).nullable);
+        assert!(!scalar_result(&resolve_exact_scalar(&catalog, "coalesce", &coalesce)).nullable());
         let all_nullable = [
             value_argument(DataType::Int64, true, None),
             value_argument(DataType::Int64, true, None),
         ];
-        assert!(scalar_result(&resolve_exact_scalar(&catalog, "coalesce", &all_nullable)).nullable);
+        assert!(
+            scalar_result(&resolve_exact_scalar(&catalog, "coalesce", &all_nullable)).nullable()
+        );
 
         let count = catalog
             .resolve_bound_user(
@@ -1354,8 +1405,8 @@ mod tests {
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .expect("sum binding");
-        assert!(!aggregate_result_type(&count).nullable);
-        assert!(aggregate_result_type(&sum).nullable);
+        assert!(!aggregate_result_type(&count).nullable());
+        assert!(aggregate_result_type(&sum).nullable());
     }
 
     #[test]
@@ -1368,7 +1419,7 @@ mod tests {
             value_argument(DataType::Boolean, true, None),
         ];
         let named = resolve_exact_scalar(&catalog, "named_struct", &named);
-        let DataType::Struct(fields) = &scalar_result(&named).data_type else {
+        let DataType::Struct(fields) = &scalar_result(&named).data_type() else {
             panic!("named_struct must bind a struct result")
         };
         assert_eq!(fields[0].name(), "left");
@@ -1385,7 +1436,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            scalar_result(&rounded).data_type,
+            scalar_result(&rounded).data_type().clone(),
             DataType::Decimal128(38, 2)
         );
 
@@ -1393,12 +1444,20 @@ mod tests {
             &catalog,
             "variant_get",
             &[
-                value_argument(DataType::LargeBinary, false, None),
+                FunctionArgument::Value {
+                    value_type: FunctionValueType::try_with_logical_type(
+                        DataType::LargeBinary,
+                        false,
+                        novarocks_type_contract::ValueLogicalType::Variant,
+                    )
+                    .unwrap(),
+                    constant: None,
+                },
                 value_argument(DataType::Utf8, false, Some(test_utf8_constant("$.x"))),
                 value_argument(DataType::Utf8, false, Some(test_utf8_constant("BIGINT"))),
             ],
         );
-        assert_eq!(scalar_result(&variant).data_type, DataType::Int64);
+        assert_eq!(scalar_result(&variant).data_type().clone(), DataType::Int64);
     }
 
     #[test]
@@ -1447,9 +1506,9 @@ mod tests {
         );
         assert_eq!(
             binding.selected.result_type,
-            FunctionResultType::Relation(
+            FunctionResultType::Relation(novarocks_type_contract::TypedFactSlice::from_pure_boxed(
                 vec![FunctionValueType::new(DataType::Int64, true)].into_boxed_slice()
-            )
+            ))
         );
     }
 
@@ -1731,16 +1790,26 @@ mod tests {
             (DataType::Decimal128(18, 3), DataType::Decimal128(18, 3)),
         ] {
             for nullable in [false, true] {
-                let arguments = [value_argument(input.clone(), nullable, None)];
+                let input_type = if input == DataType::FixedSizeBinary(16) {
+                    FunctionValueType::try_with_logical_type(
+                        input.clone(),
+                        nullable,
+                        novarocks_type_contract::ValueLogicalType::LargeInt,
+                    )
+                    .unwrap()
+                } else {
+                    FunctionValueType::new(input.clone(), nullable)
+                };
+                let arguments = [FunctionArgument::Value {
+                    value_type: input_type.clone(),
+                    constant: None,
+                }];
                 let binding = resolve_exact_scalar(&catalog, "abs", &arguments);
-                assert_eq!(scalar_result(&binding).data_type, output);
-                assert_eq!(scalar_result(&binding).nullable, nullable);
+                assert_eq!(scalar_result(&binding).data_type().clone(), output);
+                assert_eq!(scalar_result(&binding).nullable(), nullable);
                 assert_eq!(
                     binding.selected.argument_types.as_ref(),
-                    &[FunctionArgumentType::Value(FunctionValueType::new(
-                        input.clone(),
-                        nullable
-                    ))]
+                    &[FunctionArgumentType::Value(input_type)]
                 );
                 catalog
                     .validate_bound(
@@ -1953,7 +2022,7 @@ mod tests {
                         .map(FunctionArgument::argument_type)
                         .collect::<Vec<_>>()
                 );
-                assert_eq!(scalar_result(&bound).data_type, DataType::Binary);
+                assert_eq!(scalar_result(&bound).data_type().clone(), DataType::Binary);
                 assert_eq!(
                     bound.semantics.intrinsic_row_error,
                     FunctionIntrinsicRowError::NoRowError
@@ -2069,7 +2138,7 @@ mod tests {
                     "entries",
                     DataType::Struct(
                         vec![
-                            Arc::new(arrow::datatypes::Field::new("key", DataType::Int64, true)),
+                            Arc::new(arrow::datatypes::Field::new("key", DataType::Int64, false)),
                             Arc::new(arrow::datatypes::Field::new("value", DataType::Int64, true)),
                         ]
                         .into(),
@@ -2530,7 +2599,10 @@ mod tests {
                 &crate::compiler::SqlCompileControl::unbounded(),
             )
             .unwrap();
-        assert_eq!(scalar_result(&bound).data_type, list(list(DataType::Int64)));
+        assert_eq!(
+            scalar_result(&bound).data_type().clone(),
+            list(list(DataType::Int64))
+        );
     }
 }
 

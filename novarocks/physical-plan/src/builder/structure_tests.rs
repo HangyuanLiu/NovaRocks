@@ -172,7 +172,9 @@ fn function_builder() -> FragmentBuilder {
                     function_id: FunctionId::try_new("fixture/structure/scalar").unwrap(),
                     overload: FunctionOverloadId::try_new("fixture/structure/zero-to-i64").unwrap(),
                     kind: FunctionKind::Scalar,
-                    argument_types: Box::default(),
+                    argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                        Box::default(),
+                    ),
                     result_type: ty.clone(),
                     legacy_metadata: Some(crate::LegacyBindingMetadata {
                         volatility: FunctionVolatility::Immutable,
@@ -368,7 +370,9 @@ fn structure_stage_keeps_reference_type_owner_and_both_dag_rejection() {
                             unreachable!()
                         };
                         function.argument_types =
-                            Box::from([FunctionArgumentType::Value(expr.ty.clone())]);
+                            novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                                FunctionArgumentType::Value(expr.ty.clone()),
+                            ]));
                         *args = Box::from([ExprId::new(0)]);
                         builder.expressions.insert(expr);
                     }
@@ -453,9 +457,10 @@ fn structure_stage_defers_legacy_intrinsic_bits_without_deferring_kind_or_signat
                 if kind_or_signature == 0 {
                     function.kind = FunctionKind::Table;
                 } else {
-                    function.argument_types = Box::from([FunctionArgumentType::Value(
-                        ValueType::new(DataType::Int64, false),
-                    )]);
+                    function.argument_types =
+                        novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                            FunctionArgumentType::Value(ValueType::new(DataType::Int64, false)),
+                        ]));
                 }
                 builder.expressions.insert(expr);
                 builder
@@ -606,13 +611,16 @@ fn structure_signature_correspondence_ignores_only_legacy_effects_and_keeps_full
             }
             2 => changed.kind = FunctionKind::Window,
             3 => {
-                changed.argument_types = Box::from([FunctionArgumentType::Value(ValueType::new(
-                    DataType::Int64,
-                    false,
-                ))])
+                changed.argument_types =
+                    novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                        FunctionArgumentType::Value(ValueType::new(DataType::Int64, false)),
+                    ]))
             }
-            4 => changed.result_type.data_type = DataType::Boolean,
-            5 => changed.result_type.nullable = true,
+            4 => {
+                changed.result_type =
+                    ValueType::new(DataType::Boolean, changed.result_type.nullable())
+            }
+            5 => changed.result_type = changed.result_type.with_nullable(true).unwrap(),
             _ => unreachable!(),
         }
         assert!(
@@ -623,7 +631,12 @@ fn structure_signature_correspondence_ignores_only_legacy_effects_and_keeps_full
     let mut nominal = original.clone();
     nominal.result_type = ValueType::new(DataType::Utf8, true);
     let mut json = nominal.clone();
-    json.result_type.logical_type = novarocks_type_contract::ValueLogicalType::Json;
+    json.result_type = ValueType::try_with_logical_type(
+        DataType::Utf8,
+        true,
+        novarocks_type_contract::ValueLogicalType::Json,
+    )
+    .unwrap();
     assert!(!nominal.signature_matches(&json));
 
     #[allow(deprecated)]
@@ -635,10 +648,12 @@ fn structure_signature_correspondence_ignores_only_legacy_effects_and_keeps_full
         false,
     );
     let mut nested = original.clone();
-    nested.argument_types = Box::from([FunctionArgumentType::Value(ValueType::new(
-        DataType::Struct(vec![std::sync::Arc::new(dictionary_field.clone())].into()),
-        false,
-    ))]);
+    nested.argument_types = novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+        FunctionArgumentType::Value(ValueType::new(
+            DataType::Struct(vec![std::sync::Arc::new(dictionary_field.clone())].into()),
+            false,
+        )),
+    ]));
     for change in 0..3 {
         #[allow(deprecated)]
         let field = match change {
@@ -662,13 +677,16 @@ fn structure_signature_correspondence_ignores_only_legacy_effects_and_keeps_full
             _ => unreachable!(),
         };
         let mut changed = nested.clone();
-        changed.argument_types = Box::from([FunctionArgumentType::Value(ValueType::new(
-            DataType::Struct(vec![std::sync::Arc::new(field)].into()),
-            false,
-        ))]);
+        changed.argument_types =
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                FunctionArgumentType::Value(ValueType::new(
+                    DataType::Struct(vec![std::sync::Arc::new(field)].into()),
+                    false,
+                )),
+            ]));
         assert!(
-            !nested.signature_matches(&changed),
-            "full nested type dimension {change}"
+            nested.signature_matches(&changed),
+            "runtime encoding/provider metadata do not change semantic signature {change}"
         );
     }
 }

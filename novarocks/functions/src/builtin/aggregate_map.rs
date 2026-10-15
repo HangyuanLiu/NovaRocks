@@ -198,7 +198,7 @@ impl MapKernel {
         else {
             unreachable!("validated scalar result")
         };
-        &output.data_type
+        output.data_type()
     }
     fn check_emit(
         &self,
@@ -391,7 +391,8 @@ impl PreparedAggregateKernel for MapKernel {
         observed(control, |work| {
             if !std::ptr::eq(input.contract(), self.contract.as_ref())
                 || self.contract.phase().consumes_logical_arguments()
-                || input.state().array().data_type() != &self.contract.intermediate_type().data_type
+                || input.state().array().data_type()
+                    != self.contract.intermediate_type().data_type()
             {
                 return Err(invalid(
                     "map_agg merge differs from its checked phase or state carrier",
@@ -582,7 +583,7 @@ impl MapKernel {
             let target = if final_output {
                 self.output_type()
             } else {
-                &self.contract.intermediate_type().data_type
+                self.contract.intermediate_type().data_type()
             };
             let mut scalar_work = ScalarWork::new(Some(work));
             let output = core::build_array_checked_states(
@@ -625,7 +626,7 @@ pub(super) fn validate_contract(
     };
     // The original resolver already owns the nested Map fields and all metadata.
     // No reader-support preflight is lawful: NULLs can skip unsupported children.
-    if !matches!(output.data_type, DataType::Map(..))
+    if !matches!(output.data_type(), DataType::Map(..))
         || !output.exactly_equals_observed::<KernelFailure>(contract.intermediate_type(), || {
             work.step().map_err(compile_failure)
         })?

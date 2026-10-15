@@ -438,6 +438,7 @@ fn relational_count_value_and_scalar_argument_uses_stay_disjoint_and_frozen_coll
     assert_eq!(context.use_id, ExpressionUseId::new(2));
     assert_ne!(context.domain, scalar_context.domain);
     let scalar_call = FrozenPhysicalCall {
+        materialized_writer_input: None,
         regexp_count_pattern_source: None,
         to_base64_byte_source: None,
         temporal_source: None,
@@ -447,6 +448,7 @@ fn relational_count_value_and_scalar_argument_uses_stay_disjoint_and_frozen_coll
         decimal_overflow_policy: DecimalOverflowPolicy::ReportError,
     };
     let aggregate_call = FrozenPhysicalCall {
+        materialized_writer_input: None,
         regexp_count_pattern_source: None,
         to_base64_byte_source: None,
         temporal_source: None,
@@ -487,6 +489,10 @@ fn relational_unnest_keeps_real_argument_root_separate_from_table_context_and_or
         ),
     );
     let list = ty(DataType::List(field.clone()), true);
+    let DataType::List(original_layout) = list.data_type() else {
+        unreachable!()
+    };
+    let original_layout = original_layout.clone();
     let literal = builder
         .add_expression(leaf, list.clone(), ExprKind::Literal(LiteralValue::Null))
         .unwrap();
@@ -569,11 +575,14 @@ fn relational_unnest_keeps_real_argument_root_separate_from_table_context_and_or
         authored.relational_contexts[0].0,
         PhysicalCallSite::Table { node: owner }
     );
-    let DataType::List(original) = &fragment.expressions().get(argument).unwrap().ty.data_type
+    let DataType::List(original) = &fragment.expressions().get(argument).unwrap().ty.data_type()
     else {
         unreachable!()
     };
-    assert!(Arc::ptr_eq(original, &field));
+    assert!(Arc::ptr_eq(&original, &original_layout));
+    assert_eq!(original.name(), "item");
+    assert!(original.metadata().is_empty());
+    assert_eq!(field.metadata()["unknown-source"], "preserved");
     let source = authored
         .root_uses
         .roots()

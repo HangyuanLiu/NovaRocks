@@ -112,7 +112,7 @@ fn non_boolean(json: bool) -> (StaticExprNode, FunctionArgumentType) {
     (
         StaticExprNode::new(
             StaticExprKind::Constant(constant),
-            ty.data_type.clone(),
+            ty.data_type().clone(),
             None,
         ),
         FunctionArgumentType::Value(ty),
@@ -137,7 +137,7 @@ fn fixture(
         } else {
             StaticExprKind::NaryAnd { args }
         },
-        root_type.data_type.clone(),
+        root_type.data_type().clone(),
         None,
     ));
     types.push(FunctionArgumentType::Value(root_type.clone()));
@@ -461,7 +461,10 @@ fn nary_boolean_rejects_lambda_operands_even_with_boolean_result_domain() {
                 vec![
                     body_type,
                     FunctionArgumentType::Lambda {
-                        parameter_types: Box::default(),
+                        parameter_types:
+                            novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                                Box::default(),
+                            ),
                         result_type: root_type.clone(),
                     },
                     FunctionArgumentType::Value(root_type.clone()),

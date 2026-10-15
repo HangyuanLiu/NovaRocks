@@ -1733,7 +1733,7 @@ fn values_constant_f64_observed(
         return Ok(ValuesLiteral::Null);
     }
     let ty = value.value_type();
-    let number = match (&ty.logical_type, &ty.data_type) {
+    let number = match (&ty.logical_type(), &ty.data_type()) {
         (
             ValueLogicalType::Physical,
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64,
@@ -2576,7 +2576,10 @@ fn widen_for_join_kind(
     fn widen(cols: Vec<crate::common::OutputColumn>) -> Vec<crate::common::OutputColumn> {
         cols.into_iter()
             .map(|mut c| {
-                c.value_type.nullable = true;
+                c.value_type = c
+                    .value_type
+                    .with_nullable(true)
+                    .expect("validated root NULL contract");
                 c
             })
             .collect()
@@ -2822,7 +2825,10 @@ fn repeat_output_columns(
                 .iter()
                 .any(|set| !set.contains(&column.column_id))
         {
-            column.value_type.nullable = true;
+            column.value_type = column
+                .value_type
+                .with_nullable(true)
+                .expect("validated root NULL contract");
         }
     }
     columns.extend(repeat.grouping_fn_ids.iter().map(|(name, column_id)| {
@@ -3514,7 +3520,10 @@ mod tests {
             AggregateCall {
                 name: "count".to_string(),
                 distinct: false,
-                result_type: arrow::datatypes::DataType::Int64,
+                result_type: novarocks_type_contract::FunctionValueType::new(
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                ),
                 output_column_id: ColumnId::new_for_test(3),
                 source: crate::binding::AggregateArgumentSource::uncertified(
                     vec![col_ref(2, "v")],
@@ -6765,8 +6774,8 @@ mod join_widening_tests {
     fn inner_preserves_nullability() {
         let out = widen_for_join_kind(JoinKind::Inner, vec![c("a", false)], vec![c("b", false)]);
         assert_eq!(out.len(), 2);
-        assert!(!out[0].value_type.nullable);
-        assert!(!out[1].value_type.nullable);
+        assert!(!out[0].value_type.nullable());
+        assert!(!out[1].value_type.nullable());
     }
 
     #[test]
@@ -6776,8 +6785,8 @@ mod join_widening_tests {
             vec![c("a", false)],
             vec![c("b", false)],
         );
-        assert!(!out[0].value_type.nullable, "left side preserved");
-        assert!(out[1].value_type.nullable, "right side widened");
+        assert!(!out[0].value_type.nullable(), "left side preserved");
+        assert!(out[1].value_type.nullable(), "right side widened");
     }
 
     #[test]
@@ -6787,8 +6796,8 @@ mod join_widening_tests {
             vec![c("a", false)],
             vec![c("b", false)],
         );
-        assert!(out[0].value_type.nullable, "left side widened");
-        assert!(!out[1].value_type.nullable, "right side preserved");
+        assert!(out[0].value_type.nullable(), "left side widened");
+        assert!(!out[1].value_type.nullable(), "right side preserved");
     }
 
     #[test]
@@ -6798,8 +6807,8 @@ mod join_widening_tests {
             vec![c("a", false)],
             vec![c("b", false)],
         );
-        assert!(out[0].value_type.nullable);
-        assert!(out[1].value_type.nullable);
+        assert!(out[0].value_type.nullable());
+        assert!(out[1].value_type.nullable());
     }
 
     #[test]
@@ -6807,7 +6816,7 @@ mod join_widening_tests {
         let out = widen_for_join_kind(JoinKind::LeftSemi, vec![c("a", false)], vec![c("b", false)]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, "a");
-        assert!(!out[0].value_type.nullable);
+        assert!(!out[0].value_type.nullable());
     }
 
     #[test]
@@ -6831,13 +6840,16 @@ mod join_widening_tests {
             vec![c("b", false)],
         );
         assert_eq!(out.len(), 3);
-        assert!(out[0].value_type.nullable, "nullable source stays nullable");
         assert!(
-            !out[1].value_type.nullable,
+            out[0].value_type.nullable(),
+            "nullable source stays nullable"
+        );
+        assert!(
+            !out[1].value_type.nullable(),
             "non-nullable source stays non-nullable"
         );
         assert!(
-            !out[2].value_type.nullable,
+            !out[2].value_type.nullable(),
             "non-nullable source on right stays non-nullable"
         );
     }
@@ -7070,14 +7082,15 @@ mod control_tests {
         let mut memo = Memo::new();
         let root = memo.new_group(values(0, 5));
         for id in 1..320 {
-            memo.add_expr_to_group(root, values(id, 9));
+            memo.add_expr_to_group(root, values(id, id + 9));
         }
+        assert_eq!(memo.groups[root].logical_exprs.len(), 320);
         for error in [
             CompileControlError::Cancelled,
             CompileControlError::DeadlineExceeded,
             CompileControlError::ResourceExhausted,
         ] {
-            let control = owner(256, Some(error));
+            let control = owner(2, Some(error));
             assert_class(
                 pick_group_representative(&memo, root, &input(), &control).unwrap_err(),
                 error,
@@ -7091,10 +7104,10 @@ mod control_tests {
                     .copied()
                     .filter(|u| *u > 0)
                     .collect::<Vec<_>>(),
-                vec![256]
+                vec![2]
             );
         }
-        let control = owner(256, None);
+        let control = owner(2, None);
         let (chosen, stats) = pick_group_representative(&memo, root, &input(), &control)
             .unwrap()
             .unwrap();
@@ -7109,7 +7122,7 @@ mod control_tests {
                 .copied()
                 .filter(|u| *u > 0)
                 .collect::<Vec<_>>(),
-            vec![256, 256, 128]
+            vec![2; 320]
         );
     }
     #[test]

@@ -33,10 +33,42 @@ use std::sync::Arc;
 
 use super::driver::{PipelineDriver, PipelineDriverBindings};
 use super::fragment_context::FragmentContext;
+use super::operator::input_construction::{
+    InputConstructionFactory, InputConstructionProfile, try_runtime_input_construction_factory,
+};
 use super::operator_factory::OperatorFactory;
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use tracing::debug;
+
+/// Bounds for construction observations; actual installed tracker limits still
+/// decide each request. This is no separate query or batch capacity grant.
+pub fn representation_construction_profile()
+-> Result<InputConstructionProfile, novarocks_type_contract::CompileControlError> {
+    let max_bytes = usize::try_from(i64::MAX)
+        .map_err(|_| novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+    let max_requests = novarocks_type_contract::MAX_VALUE_TYPE_NODES
+        .checked_mul(novarocks_type_contract::MAX_VALUE_TYPE_NODES)
+        .and_then(|nodes| nodes.checked_mul(64))
+        .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+    let opaque_per_node = novarocks_type_contract::MAX_VALUE_TYPE_DEPTH
+        .checked_add(2)
+        .and_then(|depth| depth.checked_mul(12))
+        .and_then(|requests| requests.checked_add(32))
+        .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+    let max_opaque_requests = novarocks_type_contract::MAX_VALUE_TYPE_NODES
+        .checked_mul(novarocks_type_contract::MAX_VALUE_TYPE_NODES)
+        .and_then(|nodes| nodes.checked_mul(opaque_per_node))
+        .ok_or(novarocks_type_contract::CompileControlError::ResourceExhausted)?;
+    Ok(InputConstructionProfile {
+        max_requests,
+        max_request_bytes: max_bytes,
+        max_opaque_requests,
+        max_opaque_bytes: max_bytes,
+        max_work: usize::MAX,
+        max_depth: novarocks_type_contract::MAX_VALUE_TYPE_DEPTH,
+    })
+}
 
 /// One pipeline definition containing ordered operator factories and dependency links.
 pub struct Pipeline {
@@ -78,6 +110,8 @@ impl Pipeline {
             let mut operator_profiles = Vec::new();
             let mem_root = ctx.runtime_state().mem_tracker();
             let mut operator_mem_trackers = Vec::with_capacity(self.op_factories.len());
+            let mut input_construction_factories: Vec<Option<Arc<dyn InputConstructionFactory>>> =
+                Vec::with_capacity(self.op_factories.len());
             let mut source_idx = None;
             let mut sink_idx = None;
             let driver_id = ctx.next_driver_id();
@@ -120,6 +154,33 @@ impl Pipeline {
                 if let Some(tracker) = operator_mem_tracker.as_ref() {
                     op.set_mem_tracker(Arc::clone(tracker));
                 }
+                // Keep the original-input root edge outside ordinary input
+                // construction. Its permit and actual-exit owner stay intact.
+                let ordinary_input = op
+                    .as_processor_ref()
+                    .is_some_and(|processor| !processor.takes_original_input());
+                let construction_factory = if ordinary_input || op.creates_typed_storage() {
+                    operator_mem_tracker
+                        .as_ref()
+                        .map(|tracker| {
+                            try_runtime_input_construction_factory(
+                                representation_construction_profile()?,
+                                Arc::clone(tracker),
+                                ctx.runtime_state().error_state(),
+                            )
+                        })
+                        .transpose()?
+                } else {
+                    None
+                };
+                if let Some(factory) = construction_factory.as_ref() {
+                    op.set_construction_factory(Arc::clone(factory));
+                }
+                input_construction_factories.push(if ordinary_input {
+                    construction_factory
+                } else {
+                    None
+                });
                 operator_mem_trackers.push(operator_mem_tracker);
                 if let Some(driver_profiler) = driver_profiler.as_ref() {
                     let op_profile = driver_profiler.child(op.name().to_string());
@@ -154,7 +215,8 @@ impl Pipeline {
                 std::sync::Arc::clone(ctx.runtime_state()),
                 ctx.fragment_instance_id(),
                 PipelineDriverBindings::new(ctx.event_sink(), Some(operator_mem_trackers))
-                    .with_query_memory(ctx.runtime_state().query_memory().cloned()),
+                    .with_query_memory(ctx.runtime_state().query_memory().cloned())
+                    .with_input_construction_factories(input_construction_factories),
             ));
         }
         Ok(drivers)

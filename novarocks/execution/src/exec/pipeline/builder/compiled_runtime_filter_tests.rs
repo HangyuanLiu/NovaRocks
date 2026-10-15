@@ -817,7 +817,9 @@ fn state(
             None,
             None,
             None,
-            None,
+            Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                "compiled runtime filter tests",
+            )),
             Some(crate::runtime::execution_runtime::test_execution_runtime()),
         )
         .with_runtime_filter_session(
@@ -1712,7 +1714,7 @@ fn join_under_consumer_node(program: &LocalProgram) -> Result<Arc<LocalProgram>,
             definitions: vec![(
                 StaticExprNode::new(
                     StaticExprKind::SlotId(output.slots()[0]),
-                    key_type.data_type.clone(),
+                    key_type.data_type().clone(),
                     None,
                 ),
                 key_type,

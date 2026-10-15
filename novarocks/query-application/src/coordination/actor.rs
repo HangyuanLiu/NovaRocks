@@ -5800,9 +5800,7 @@ mod tests {
     fn result_schema() -> ResultSchema {
         ResultSchema::new(vec![ResultField::new(
             "value",
-            DataType::Int64,
-            false,
-            None,
+            novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
         )])
     }
 

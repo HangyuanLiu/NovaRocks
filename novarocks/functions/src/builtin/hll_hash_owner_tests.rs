@@ -278,7 +278,7 @@ fn hll_hash_native_n1_profile_rejects_deferred_variadic_without_changing_binding
         DataType::Null,
     ] {
         let args = [FunctionArgument::Value {
-            value_type: FunctionValueType::new(ty, true),
+            value_type: FunctionValueType::from_legacy_declared_projection(ty, true),
             constant: None,
         }];
         // The actual original selected-domain author rejects these carriers
@@ -510,4 +510,21 @@ fn encoded(value: Option<i32>) -> Vec<u8> {
         )),
         None => crate::hll::encode_hll_empty(),
     }
+}
+
+#[test]
+fn native_hll_hash_declares_its_nominal_value_at_the_real_owner() {
+    let owner = owner();
+    let args = arguments(1);
+    let selected = owner
+        .resolve(request(&args), crate::binding_test_control())
+        .unwrap();
+    let crate::FunctionResultType::Scalar(result) = &selected.result_type else {
+        panic!("expected scalar result")
+    };
+    assert_eq!(
+        result.logical_type(),
+        novarocks_type_contract::ValueLogicalType::Hll
+    );
+    assert_eq!(result.data_type(), &DataType::Binary);
 }

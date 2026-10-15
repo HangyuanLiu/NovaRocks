@@ -120,7 +120,9 @@ fn argument_types(overload: &FunctionOverloadId) -> Vec<FunctionArgument> {
         vec![
             value(),
             FunctionArgument::Lambda {
-                parameter_types: Box::from([input_type()]),
+                parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                    Box::from([input_type()]),
+                ),
                 result_type: result_type(),
             },
         ]
@@ -219,7 +221,10 @@ impl Owner {
                     constant: None,
                 },
                 FunctionArgument::Lambda {
-                    parameter_types: types.clone(),
+                    parameter_types:
+                        novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                            types.clone(),
+                        ),
                     result_type: result_type(),
                 },
             ]
@@ -272,11 +277,13 @@ impl FunctionBindingResolver for Owner {
             .clone();
         let selected = FunctionBindingSelection {
             overload,
-            argument_types: request
-                .arguments
-                .iter()
-                .map(FunctionArgument::argument_type)
-                .collect(),
+            argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                request
+                    .arguments
+                    .iter()
+                    .map(FunctionArgument::argument_type)
+                    .collect::<Box<[_]>>(),
+            ),
             result_type: FunctionResultType::Scalar(result_type()),
             aggregate: None,
         };
@@ -306,11 +313,12 @@ impl FunctionBindingResolver for Owner {
         }
         if !arguments_equal
             || request.logical_argument_count != expected.len()
-            || selected.argument_types
+            || selected.argument_types.as_slice()
                 != expected
                     .iter()
                     .map(FunctionArgument::argument_type)
                     .collect::<Box<[_]>>()
+                    .as_ref()
             || selected.result_type != FunctionResultType::Scalar(result_type())
             || selected.aggregate.is_some()
         {
@@ -549,10 +557,12 @@ fn token(
     let arguments = owner.arguments(&oid(overload));
     let selected = Arc::new(FunctionBindingSelection {
         overload: oid(overload),
-        argument_types: arguments
-            .iter()
-            .map(FunctionArgument::argument_type)
-            .collect(),
+        argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+            arguments
+                .iter()
+                .map(FunctionArgument::argument_type)
+                .collect::<Box<[_]>>(),
+        ),
         result_type: FunctionResultType::Scalar(result_type()),
         aggregate: None,
     });
@@ -1541,11 +1551,11 @@ pub(crate) fn typed_call_fixture(kind: TypedCallFixture) -> ProgramResolvedCalls
             let definitions = arena(vec![
                 (
                     StaticExprKind::SlotId(SlotId::new(1)),
-                    types[0].data_type.clone(),
+                    types[0].data_type().clone(),
                 ),
                 (
                     StaticExprKind::SlotId(SlotId::new(2)),
-                    types[1].data_type.clone(),
+                    types[1].data_type().clone(),
                 ),
                 (
                     StaticExprKind::FunctionCall {
@@ -1560,7 +1570,7 @@ pub(crate) fn typed_call_fixture(kind: TypedCallFixture) -> ProgramResolvedCalls
                     .iter()
                     .enumerate()
                     .map(|(i, ty)| {
-                        Field::new(format!("typed{i}"), ty.data_type.clone(), ty.nullable)
+                        Field::new(format!("typed{i}"), ty.data_type().clone(), ty.nullable())
                     })
                     .collect::<Vec<_>>(),
             ));
@@ -1576,7 +1586,7 @@ pub(crate) fn typed_call_fixture(kind: TypedCallFixture) -> ProgramResolvedCalls
                     source_schema,
                     types
                         .iter()
-                        .map(|ty| arrow_array::new_null_array(&ty.data_type, 0))
+                        .map(|ty| arrow_array::new_null_array(&ty.data_type(), 0))
                         .collect(),
                 )
                 .unwrap(),
@@ -1656,6 +1666,214 @@ pub(crate) fn typed_call_fixture(kind: TypedCallFixture) -> ProgramResolvedCalls
             );
             ProgramResolvedCalls::try_new(snapshot, vec![(scope(0), call)], &Control::default())
                 .unwrap()
+        }
+    }
+}
+
+#[test]
+fn created_call_table_drops_scratch_and_keeps_finite_final_hold() {
+    struct Hold;
+    impl novarocks_type_contract::ValueTypeStorageHold for Hold {}
+    let (catalog, owner, _) = catalogue();
+    let snapshot = scalar_snapshot();
+    let token = scalar_token(&catalog, &owner, 0);
+    let expected = token.clone();
+    let temporary_hold = Arc::new(Hold);
+    let retained_hold = Arc::new(Hold);
+    let temporary_weak = Arc::downgrade(&temporary_hold);
+    let retained_weak = Arc::downgrade(&retained_hold);
+    let temporary_requests = AtomicUsize::new(0);
+    let retained_requests = AtomicUsize::new(0);
+    let mut request = |_: std::alloc::Layout| {
+        temporary_requests.fetch_add(1, Ordering::Relaxed);
+        Ok::<_, ()>(())
+    };
+    let mut opaque = |_: usize| {
+        temporary_requests.fetch_add(1, Ordering::Relaxed);
+        Ok::<_, ()>(())
+    };
+    let mut retained_request = |_: std::alloc::Layout| {
+        retained_requests.fetch_add(1, Ordering::Relaxed);
+        Ok::<_, ()>(())
+    };
+    let mut retained_opaque = |_: usize| {
+        retained_requests.fetch_add(1, Ordering::Relaxed);
+        Ok::<_, ()>(())
+    };
+    let mut temporary = ValueSchemaCreation::new(
+        ValueTypeStorageLifetime::held(temporary_hold.clone()),
+        &mut request,
+        &mut opaque,
+    );
+    let mut retained = ValueSchemaCreation::new(
+        ValueTypeStorageLifetime::held(retained_hold.clone()),
+        &mut retained_request,
+        &mut retained_opaque,
+    );
+    let resolved = ProgramResolvedCalls::try_new_with_creator_in(
+        snapshot,
+        vec![(scope(0), token)],
+        &mut temporary,
+        &mut retained,
+        &Control::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        resolved.calls()[&scope(0)].implementation(),
+        expected.implementation()
+    );
+    assert_eq!(resolved.calls()[&scope(0)].effects(), expected.effects());
+    assert!(temporary_requests.load(Ordering::Relaxed) > 0);
+    assert!(retained_requests.load(Ordering::Relaxed) > 0);
+    drop(temporary);
+    drop(retained);
+    drop(temporary_hold);
+    drop(retained_hold);
+    assert!(temporary_weak.upgrade().is_none());
+    assert!(retained_weak.upgrade().is_some());
+    drop(resolved);
+    assert!(retained_weak.upgrade().is_none());
+}
+
+#[test]
+fn created_call_table_each_real_request_preserves_host_and_has_no_tail() {
+    let (catalog, owner, _) = catalogue();
+    let source = scalar_snapshot();
+    let token = scalar_token(&catalog, &owner, 0);
+    let run = |fail_at: Option<usize>| {
+        let control = Control::default();
+        let next = AtomicUsize::new(0);
+        let refused = AtomicUsize::new(usize::MAX);
+        let cause = Arc::new(());
+        let observe = || {
+            let at = next.fetch_add(1, Ordering::Relaxed);
+            if Some(at) == fail_at {
+                refused.store(control.work.lock().unwrap().len(), Ordering::Relaxed);
+                Err(cause.clone())
+            } else {
+                Ok(())
+            }
+        };
+        let mut request = |_: std::alloc::Layout| observe();
+        let mut opaque = |_: usize| observe();
+        let mut retained_request = |_: std::alloc::Layout| observe();
+        let mut retained_opaque = |_: usize| observe();
+        let mut temporary =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
+        let mut retained = ValueSchemaCreation::new(
+            ValueTypeStorageLifetime::pure(),
+            &mut retained_request,
+            &mut retained_opaque,
+        );
+        let result = ProgramResolvedCalls::try_new_with_creator_in(
+            source.clone(),
+            vec![(scope(0), token.clone())],
+            &mut temporary,
+            &mut retained,
+            &control,
+        );
+        if let Some(at) = fail_at {
+            assert!(
+                matches!(result, Err(ProgramCreationFailure::Creator(actual))
+                if Arc::ptr_eq(&actual, &cause))
+            );
+            assert_eq!(next.load(Ordering::Relaxed), at + 1);
+            assert_eq!(
+                control.work.lock().unwrap().len(),
+                refused.load(Ordering::Relaxed)
+            );
+        } else {
+            assert!(result.is_ok());
+        }
+        next.load(Ordering::Relaxed)
+    };
+    let total = run(None);
+    assert!(
+        total > 2,
+        "original scratch and final tree/Arc are actual constructors"
+    );
+    for at in 0..total {
+        run(Some(at));
+    }
+}
+
+#[test]
+fn created_call_table_every_control_boundary_keeps_first_cause_and_no_tail() {
+    struct Compile<'a> {
+        next: AtomicUsize,
+        fail: Option<(usize, CompileControlError)>,
+        requests: &'a AtomicUsize,
+        refused_requests: AtomicUsize,
+    }
+    impl PureCompileControl for Compile<'_> {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            let at = self.next.fetch_add(1, Ordering::Relaxed);
+            if let Some((boundary, error)) = self.fail
+                && at == boundary
+            {
+                self.refused_requests
+                    .store(self.requests.load(Ordering::Relaxed), Ordering::Relaxed);
+                Err(error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    let (catalog, owner, _) = catalogue();
+    let source = scalar_snapshot();
+    let token = scalar_token(&catalog, &owner, 0);
+    let run = |fail| {
+        let requests = AtomicUsize::new(0);
+        let control = Compile {
+            next: AtomicUsize::new(0),
+            fail,
+            requests: &requests,
+            refused_requests: AtomicUsize::new(usize::MAX),
+        };
+        let observe = || {
+            requests.fetch_add(1, Ordering::Relaxed);
+            Ok::<_, ()>(())
+        };
+        let mut request = |_: std::alloc::Layout| observe();
+        let mut opaque = |_: usize| observe();
+        let mut retained_request = |_: std::alloc::Layout| observe();
+        let mut retained_opaque = |_: usize| observe();
+        let mut temporary =
+            ValueSchemaCreation::new(ValueTypeStorageLifetime::pure(), &mut request, &mut opaque);
+        let mut retained = ValueSchemaCreation::new(
+            ValueTypeStorageLifetime::pure(),
+            &mut retained_request,
+            &mut retained_opaque,
+        );
+        let result = ProgramResolvedCalls::try_new_with_creator_in(
+            source.clone(),
+            vec![(scope(0), token.clone())],
+            &mut temporary,
+            &mut retained,
+            &control,
+        );
+        if let Some((at, cause)) = fail {
+            assert!(
+                matches!(result, Err(ProgramCreationFailure::Control(actual)) if actual == cause)
+            );
+            assert_eq!(control.next.load(Ordering::Relaxed), at + 1);
+            assert_eq!(
+                requests.load(Ordering::Relaxed),
+                control.refused_requests.load(Ordering::Relaxed)
+            );
+        } else {
+            assert!(result.is_ok());
+        }
+        control.next.load(Ordering::Relaxed)
+    };
+    let total = run(None);
+    for cause in [
+        CompileControlError::Cancelled,
+        CompileControlError::DeadlineExceeded,
+        CompileControlError::ResourceExhausted,
+    ] {
+        for at in 0..total {
+            run(Some((at, cause)));
         }
     }
 }

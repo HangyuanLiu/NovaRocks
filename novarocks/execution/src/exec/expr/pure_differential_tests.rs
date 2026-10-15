@@ -64,8 +64,8 @@ fn scalar_ledger(summary: ScalarDiffSummary) -> ScalarDiffSummary {
         summary.function.as_str(),
         summary.overload.as_str(),
         summary.legacy_name,
-        summary.result_type.data_type,
-        summary.result_type.nullable,
+        summary.result_type.data_type(),
+        summary.result_type.nullable(),
         summary.rows,
         summary.selections,
         summary.legacy_batch_errors,
@@ -81,8 +81,8 @@ fn aggregate_ledger(summary: AggregateDiffSummary) -> AggregateDiffSummary {
          partitions={} matched_failures={} null_results={}",
         summary.function.as_str(),
         summary.overload.as_str(),
-        summary.result_type.data_type,
-        summary.pure_state_type.data_type,
+        summary.result_type.data_type(),
+        summary.pure_state_type.data_type(),
         summary.legacy_intermediate_type,
         summary.rows,
         summary.groups,
@@ -122,7 +122,7 @@ fn pure_differential_generators_are_seed_deterministic() {
         assert_ne!(first.to_data(), other.to_data(), "{value_type:?}");
         assert!(novarocks_type_contract::arrow_data_types_exact(
             first.data_type(),
-            &value_type.data_type
+            &value_type.data_type()
         ));
     }
 }
@@ -443,10 +443,9 @@ fn pure_differential_abs_matches_v1_for_every_selected_profile() {
     .enumerate()
     {
         for nullable in [true, false] {
-            let source = FunctionValueType {
-                nullable,
-                ..source.clone()
-            };
+            let source = (source.clone())
+                .with_nullable(nullable)
+                .expect("valid value root nullability transform");
             let values = generated(100 + seed as u64, &source, &profile);
             let summary = scalar_ledger(assert_scalar_matches_v1(
                 ScalarDiffSpec::new("abs")
@@ -454,7 +453,7 @@ fn pure_differential_abs_matches_v1_for_every_selected_profile() {
                     .sparse_selections(3, seed as u64),
             ));
             assert_eq!(summary.selections, 4);
-            assert_eq!(summary.result_type.nullable, nullable);
+            assert_eq!(summary.result_type.nullable(), nullable);
         }
     }
     // The frozen widening return of the smallest integer profile.
@@ -614,9 +613,9 @@ fn pure_differential_calendar_parts_match_v1_for_every_source_carrier() {
                 }
                 // A carrier SQL does not bind for this name is not a lane.
                 Err(DifferentialFailure::Resolution { error, .. }) => {
-                    println!("skip {name} over {:?}: {error}", source.data_type);
+                    println!("skip {name} over {:?}: {error}", source.data_type());
                 }
-                Err(failure) => panic!("{name} over {:?}: {failure}", source.data_type),
+                Err(failure) => panic!("{name} over {:?}: {failure}", source.data_type()),
             }
         }
     }
@@ -738,7 +737,7 @@ fn pure_differential_aggregates_match_v1_single_and_two_phase() {
         let values = generated(710 + index as u64, &source, &profile);
         // Float SUM is an unordered accumulation; its exact equality is not a
         // contract, so it is compared with a relative tolerance.
-        let floats = if name == "sum" && source.data_type == DataType::Float64 {
+        let floats = if name == "sum" && *source.data_type() == DataType::Float64 {
             FloatComparison::Tolerance {
                 absolute: 0.0,
                 relative: 1e-9,
@@ -931,10 +930,9 @@ fn pure_differential_bit_family_matches_v1_every_integer_profile() {
     .enumerate()
     {
         for nullable in [true, false] {
-            let source = FunctionValueType {
-                nullable,
-                ..source.clone()
-            };
+            let source = (source.clone())
+                .with_nullable(nullable)
+                .expect("valid value root nullability transform");
             let left = generated(0xb170 + index as u64, &source, &profile);
             let right = generated(0xb270 + index as u64, &source, &profile);
             for name in ["bitand", "bitor", "bitxor", "bitnot"] {

@@ -29,7 +29,7 @@ use crate::{
 };
 use arrow_array::{Array, UInt64Array};
 use arrow_schema::DataType;
-use novarocks_type_contract::ValueLogicalType;
+use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 use std::cell::RefCell;
 pub(super) fn validate_profile(
     contract: &ScalarCallContract,
@@ -39,23 +39,23 @@ pub(super) fn validate_profile(
         return Err(invalid("map_entries requires its one exact value argument"));
     };
     observe()?;
-    let DataType::Map(entries, _) = &source.data_type else {
+    let DataType::Map(entries, _) = source.data_type() else {
         return Err(invalid("map_entries requires its real Map source"));
     };
     let DataType::Struct(fields) = entries.data_type() else {
         return Err(invalid("map_entries requires its real Struct entries"));
     };
     let result = contract.result_type();
-    let DataType::List(item) = &result.data_type else {
+    let DataType::List(item) = result.data_type() else {
         return Err(invalid("map_entries requires its real List result"));
     };
     let DataType::Struct(output) = item.data_type() else {
         return Err(invalid("map_entries requires its real Struct item"));
     };
     observe()?;
-    if source.logical_type != ValueLogicalType::Physical
-        || result.logical_type != ValueLogicalType::Physical
-        || !result.nullable
+    if source.logical_type() != ValueLogicalType::Physical
+        || result.logical_type() != ValueLogicalType::Physical
+        || !result.nullable()
         || fields.len() != 2
         || output.len() != 2
     {
@@ -63,15 +63,21 @@ pub(super) fn validate_profile(
             "map_entries differs from its exact Physical Map to nullable List profile",
         ));
     }
-    for (source, target) in fields.iter().zip(output.iter()) {
-        let a = novarocks_type_contract::field_logical_type(source)
-            .map_err(|_| invalid("map_entries source child logical identity is invalid"))?;
-        let b = novarocks_type_contract::field_logical_type(target)
-            .map_err(|_| invalid("map_entries result child logical identity is invalid"))?;
-        observe()?;
-        if a != b
+    let output_semantic = result
+        .value_type()
+        .child_type_at(0)
+        .ok_or_else(|| invalid("map_entries has no semantic result item"))?;
+    for (index, (source_field, target)) in fields.iter().zip(output.iter()).enumerate() {
+        let a = source
+            .value_type()
+            .child_type_at(index)
+            .ok_or_else(|| invalid("map_entries source semantic child is absent"))?;
+        let b = output_semantic
+            .child_type_at(index)
+            .ok_or_else(|| invalid("map_entries result semantic child is absent"))?;
+        if !FunctionValueType::borrowed_value_domains_equal_observed(a, b, &mut observe)?
             || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
-                source.data_type(),
+                source_field.data_type(),
                 target.data_type(),
                 &mut observe,
             )?
@@ -101,11 +107,13 @@ pub(super) fn evaluate<'a>(
             CollectionObservation::OpaqueBoundary => work.borrow_mut().flush(),
         };
         // Preserve the original complete carrier/target conversion before exact selected copying.
-        let projection = project_observed(argument.array(), Some(&target.data_type), &mut observer)
-            .map_err(|e| match e {
-                MapEntriesFailure::Control(cause) => cause,
-                MapEntriesFailure::Data(text) => internal(&text),
-            })?;
+        let projection =
+            project_observed(argument.array(), Some(target.data_type()), &mut observer).map_err(
+                |e| match e {
+                    MapEntriesFailure::Control(cause) => cause,
+                    MapEntriesFailure::Data(text) => internal(&text),
+                },
+            )?;
         let mut indices = reserve::<Option<u64>>(selection.len(), &work)?;
         let mut contiguous_start = None::<usize>;
         let mut contiguous = true;
@@ -154,7 +162,7 @@ pub(super) fn evaluate<'a>(
         };
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             values,
             Box::default(),
             || work.borrow_mut().step(),

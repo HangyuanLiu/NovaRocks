@@ -25,7 +25,10 @@ mod compiled;
 mod compiled_origins;
 mod contract;
 mod control_flow;
+mod creation;
+mod expression_program;
 mod expression_roots;
+pub use expression_program::ExpressionProgram;
 mod expressions;
 mod layout;
 mod lexical_bindings;
@@ -35,11 +38,13 @@ mod provenance;
 mod provider_links;
 mod requirements;
 mod resolved_calls;
+mod root_attachment;
 mod runtime_filter;
 mod sink;
 mod typed_channels;
 mod typed_expressions;
 mod values;
+mod writer_preparation;
 
 pub use compiled::{
     CompiledAggregate, CompiledAggregateGrouping, CompiledExchangeInput, CompiledProgramFacts,
@@ -52,13 +57,14 @@ pub use contract::{
     RuntimeFilterId, ScanAssignmentKind, ScanSourceContract,
 };
 pub use control_flow::*;
+pub use creation::ProgramCreationFailure;
 pub use expression_roots::*;
 pub use expressions::{
     ExpressionsCompileError, ImmutableExpressions, MAX_STATIC_EXPRESSION_DEPTH,
     MAX_STATIC_EXPRESSION_DYNAMIC_BYTES, MAX_STATIC_EXPRESSIONS, ProgramExprId, StaticExprKind,
-    StaticExprNode, StaticExpressionError, StaticFieldSchema, StaticFunctionKind, StaticLiteral,
+    StaticExprNode, StaticExpressionError, StaticFunctionKind, StaticLiteral,
 };
-pub use layout::{LayoutCompileError, LayoutError, StaticLayout};
+pub use layout::{LayoutCompileError, LayoutCreationFailure, LayoutError, StaticLayout};
 pub use lexical_bindings::*;
 pub use novarocks_connector_contract::{
     ScanColumnId, StaticConnectorScan, StaticConnectorScanError, StaticScanAssignment,
@@ -68,18 +74,22 @@ pub use novarocks_connector_contract::{
 // can author a stream sink without a second execution-contract dependency.
 pub use novarocks_execution_contract::DataStreamPartitionType;
 pub use primitives::{ProgramComparisonSite, ProgramPrimitiveError};
+mod frozen_aggregate;
+pub use frozen_aggregate::{FrozenAggregateSelection, FrozenAggregateSelectionError};
+
 pub use program::{
     AggregateTopNFilter, AnalyticOutputColumn, AssertRowsMode, ChangeEventOutputExpr,
     ChangeEventSpec, FilterConsumerAtExpr, FilterConsumerAtJoinKey, FilterProducerAtExpr,
     JoinDistributionMode, JoinType, LocalProgramError, LocalProgramGraph,
     MAX_PROGRAM_EXPANDED_OCCURRENCES, MAX_PROGRAM_NODE_DEPTH, MAX_PROGRAM_NODES,
     NestedLoopJoinType, ProgramCompileError, ProgramNode, ProgramNodeKind, ProgramScanSource,
-    ProjectExpressionSlot, RowAssertion, SetOpKind, SortExpression, SortTopNType,
-    StaticAggregateCall, StaticAggregateOrder, StaticAggregateTypeSignature, StaticWindowFunction,
-    StaticWriterProjection, StreamingPreaggregationMode, TableFunctionOutputSlot, UnpivotConstant,
-    UnpivotMapping, UnpivotPassthrough, WindowBoundary, WindowFrame, WindowFunctionKind,
-    WindowType, WriterFinalAggregateCall, WriterFinalAggregatePlan, WriterGroupedUnpivotMapping,
-    WriterGroupedUnpivotPlan, WriterPartialAggregateCall,
+    ProjectExpressionSlot, ProjectExpressionSlots, RowAssertion, SetOpKind, SortExpression,
+    SortTopNType, StaticAggregateCall, StaticAggregateOrder, StaticAggregateTypeSignature,
+    StaticWindowFunction, StaticWriterProjection, StreamingPreaggregationMode,
+    TableFunctionOutputSlot, UnpivotConstant, UnpivotMapping, UnpivotPassthrough, WindowBoundary,
+    WindowFrame, WindowFunctionKind, WindowType, WriterFinalAggregateCall,
+    WriterFinalAggregatePlan, WriterGroupedUnpivotMapping, WriterGroupedUnpivotPlan,
+    WriterPartialAggregateCall,
 };
 pub use provenance::*;
 pub use provider_links::ProviderLinkError;
@@ -88,11 +98,16 @@ pub use requirements::{
     BindingRequirementsError, ProgramNodeId, ScanSourceKind,
 };
 pub use resolved_calls::*;
+pub use root_attachment::{
+    RootAttachmentError, attach_typed_root_channels_created_in, attach_typed_root_channels_in,
+    attach_typed_root_channels_with_factory_in,
+};
 pub use runtime_filter::{
     FilterConsumerActivation, FilterLateApplyGranularity, FilterMembershipSchema,
     FilterMembershipSchemaError, FilterNullOrder, FilterNullSemantics, FilterOrderKey,
     FilterProducerKind, FilterReduction, FilterSortDirection, StaticFilterConsumer,
     StaticFilterContract, StaticFilterError, StaticFilterProducer, encode_filter_key_type,
+    visit_filter_key_type,
 };
 pub use sink::{
     MAX_STATIC_SINK_BRANCHES, MAX_STATIC_SINK_COLUMNS, MAX_STATIC_SINK_EXPRESSIONS,
@@ -101,6 +116,14 @@ pub use sink::{
 pub use typed_channels::*;
 pub use typed_expressions::*;
 pub use values::{
-    MAX_STATIC_VALUES_BACKING_BYTES, StaticValues, StaticValuesBacking, StaticValuesCell,
-    StaticValuesError, ValuesCompileError,
+    MAX_STATIC_VALUES_BACKING_BYTES, StaticValueBatch, StaticValues, StaticValuesBacking,
+    StaticValuesCell, StaticValuesError, ValuesCompileError, ValuesCreationFailure,
 };
+pub use writer_preparation::{
+    PreparedWriterAggregateCall, PreparedWriterAggregateCalls, PreparedWriterCallsError,
+};
+
+// Shared semantic nodes retain their original creation responsibility.
+pub use novarocks_type_contract::ValueTypeRef;
+#[cfg(test)]
+mod test_value_types;

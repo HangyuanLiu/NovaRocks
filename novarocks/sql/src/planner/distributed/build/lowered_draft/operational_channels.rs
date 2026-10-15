@@ -391,7 +391,7 @@ impl Projection<'_> {
                         matches!(
                             self.kind,
                             Some(SqlExpressionCallKind::Scalar | SqlExpressionCallKind::Window)
-                        ) && matches!(value_type.data_type, arrow::datatypes::DataType::Null);
+                        ) && matches!(value_type.data_type(), arrow::datatypes::DataType::Null);
                     work.step()?;
                     require(
                         lawful,
@@ -411,14 +411,16 @@ impl Projection<'_> {
                         ));
                     };
                     let nonnull_carrier =
-                        !matches!(expected.data_type, arrow::datatypes::DataType::Null);
+                        !matches!(expected.data_type(), arrow::datatypes::DataType::Null);
                     work.step()?;
                     require(
                         nonnull_carrier,
                         "canonical NULL target is still the Null carrier",
                     )?;
                     let mut expected = clone_type(expected, work)?;
-                    expected.nullable = true;
+                    expected = expected
+                        .with_nullable(true)
+                        .expect("validated root NULL contract");
                     work.step()?;
                     exact_type(&expected, value.value_type(), work)?;
                     work.flush()?;
@@ -543,6 +545,10 @@ impl Projection<'_> {
         }
         work.flush()?;
         let parameter_types = parameters.into_boxed_slice();
+        work.step()?;
+        work.flush()?;
+        let parameter_types =
+            novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(parameter_types);
         work.step()?;
         work.flush()?;
         Ok(FunctionArgument::Lambda {

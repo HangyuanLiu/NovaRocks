@@ -83,7 +83,10 @@ fn mixed_request() -> PhysicalCallRequest {
             }),
         },
         FunctionArgument::Lambda {
-            parameter_types: Box::from([integer(), integer()]),
+            parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(Box::from([
+                integer(),
+                integer(),
+            ])),
             result_type: integer(),
         },
     ]);
@@ -137,7 +140,9 @@ fn checked_empty_requests(count: usize) -> crate::Fragment {
                         overload: FunctionOverloadId::try_new("test/resource-request/exact")
                             .unwrap(),
                         kind: FunctionKind::Scalar,
-                        argument_types: Box::default(),
+                        argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                            Box::default(),
+                        ),
                         result_type: integer(),
                         legacy_metadata: Some(crate::LegacyBindingMetadata {
                             volatility: FunctionVolatility::Immutable,
@@ -280,7 +285,7 @@ fn request_source_capacity_and_owned_extents_refuse_before_the_unadmitted_walk()
 }
 
 #[test]
-fn request_resource_success_and_ordinary_type_error_preserve_every_actual_control_prefix() {
+fn request_resource_success_preserves_control_prefix_and_type_author_refuses_invalid_requests() {
     let requests = vec![(
         PhysicalCallDefinition::Expression(crate::ExprId::new(u32::MAX)),
         mixed_request(),
@@ -289,17 +294,14 @@ fn request_resource_success_and_ordinary_type_error_preserve_every_actual_contro
         |control| source(&requests, requests.capacity(), control),
         Ok(()),
     );
-    let bad = vec![(
-        PhysicalCallDefinition::Expression(crate::ExprId::new(0)),
-        request(vec![FunctionArgument::Value {
-            value_type: ValueType::new(DataType::FixedSizeBinary(-1), true),
-            constant: None,
-        }]),
-    )];
-    let baseline = Control::default();
-    let expected = source(&bad, bad.capacity(), &baseline);
-    assert!(matches!(expected, Err(CallRequestError::Structure(_))));
-    prefixes(|control| source(&bad, bad.capacity(), control), expected);
+    assert!(
+        ValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(-1),
+            true,
+            novarocks_type_contract::ValueLogicalType::Physical
+        )
+        .is_err()
+    );
     let fragment = checked_empty_requests(2);
     prefixes(
         |control| {

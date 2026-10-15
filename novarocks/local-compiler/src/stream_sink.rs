@@ -46,7 +46,7 @@ use std::{
 /// root binding of each partition key and each key's exact input occurrence.
 pub(crate) struct SinkFlow {
     pub flow: ProgramControlFlow,
-    pub types: Vec<FunctionArgumentType>,
+    pub types: novarocks_type_contract::FunctionArgumentTypes,
     pub roots: Vec<ProgramRootUseBinding>,
     pub slots: Vec<ProgramSlotBinding>,
 }
@@ -59,29 +59,43 @@ pub(crate) struct LoweredStreamSink {
     pub flow: SinkFlow,
 }
 
-pub(crate) fn lower_stream_sink(
+pub(crate) fn lower_stream_sink_with_creation<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
     package: &FragmentPackage,
     cut: &OutboundFragmentCut,
     root: ProgramNodeId,
     root_layout: &StaticLayout,
     control: &dyn PureCompileControl,
-) -> Result<LoweredStreamSink, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    factory: Option<&F>,
+) -> Result<LoweredStreamSink, crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(package, cut, root, root_layout, &mut work);
-    if matches!(&result, Err(FragmentCompileError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    let result = lower_core_with_creation(
+        package,
+        cut,
+        root,
+        root_layout,
+        &mut work,
+        creation,
+        crate::creation::borrow_scope(&mut temporary),
+        factory,
+    );
+    crate::creation::finish_attempt(result, work)
 }
 
-fn lower_core(
+fn lower_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     cut: &OutboundFragmentCut,
     root: ProgramNodeId,
     root_layout: &StaticLayout,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<LoweredStreamSink, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    factory: Option<&F>,
+) -> Result<LoweredStreamSink, crate::FragmentCreationError<H>> {
     let fragment = package.fragment();
     let root_values = &fragment
         .nodes()
@@ -90,9 +104,10 @@ fn lower_core(
         .output
         .columns;
     if root_values.len() != root_layout.slots().len() {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "stream root layout width differs from its output",
-        ));
+        ))
+        .into());
     }
     // The sender keeps today's routing key: the destination physical node.
     let dest_node_id = i32::try_from(cut.destination_node.get()).map_err(|_| {
@@ -109,10 +124,11 @@ fn lower_core(
             Distribution::Hash { keys, scheme } => {
                 // The compiled branch names only the runtime hash family.
                 if scheme.definition.algorithm != PartitionHashAlgorithm::NativeExchangeV1 {
-                    return Err(FragmentCompileError::Unsupported {
+                    return Err((FragmentCompileError::Unsupported {
                         node: None,
                         feature: "hash stream partitioning algorithm",
-                    });
+                    })
+                    .into());
                 }
                 (DataStreamPartitionType::HashPartitioned, &keys[..])
             }
@@ -120,10 +136,11 @@ fn lower_core(
                 if scheme.hash != PartitionHashAlgorithm::NativeBucketCrc32V1
                     || scheme.layout != BucketLayoutAlgorithm::DenseZeroBasedV1
                 {
-                    return Err(FragmentCompileError::Unsupported {
+                    return Err((FragmentCompileError::Unsupported {
                         node: None,
                         feature: "bucket-shuffle stream partitioning algorithm",
-                    });
+                    })
+                    .into());
                 }
                 (
                     DataStreamPartitionType::BucketShuffleHashPartitioned,
@@ -131,25 +148,37 @@ fn lower_core(
                 )
             }
             Distribution::Unconstrained | Distribution::RoundRobin => {
-                return Err(FragmentCompileError::Unsupported {
+                return Err((FragmentCompileError::Unsupported {
                     node: None,
                     feature: "unconstrained or round-robin stream partitioning",
-                });
+                })
+                .into());
             }
         };
     if partition_type.requires_exprs() && keys.is_empty() {
-        return Err(FragmentCompileError::Invalid(
-            "hash stream partitioning has no keys",
-        ));
+        return Err((FragmentCompileError::Invalid("hash stream partitioning has no keys")).into());
     }
     let output_columns = projected_slots(cut, root_values, root_layout, work)?;
     // Each key is the first root occurrence of its value; the cut law already
     // proved membership, which is checked again rather than assumed.
     let mut nodes = Vec::new();
+    let mut type_scope = match factory {
+        Some(f) => {
+            work.flush()?;
+            Some(
+                f.begin_scope()
+                    .map_err(crate::FragmentCreationError::Creator)?,
+            )
+        }
+        None => None,
+    };
     let mut types = Vec::new();
     let mut ordinals = Vec::new();
     reserve_vec(&mut nodes, keys.len(), work)?;
-    reserve_vec(&mut types, keys.len(), work)?;
+    match type_scope.as_mut() {
+        Some(scope) => crate::creation::reserve_vec(&mut types, keys.len(), Some(scope), work)?,
+        None => reserve_vec(&mut types, keys.len(), work)?,
+    }
     reserve_vec(&mut ordinals, keys.len(), work)?;
     for key in keys {
         let ordinal = first_ordinal(root_values, *key, work)?.ok_or(
@@ -163,12 +192,13 @@ fn lower_core(
             ))?
             .ty;
         work.flush()?;
-        nodes.push(StaticExprNode::new(
+        nodes.push(StaticExprNode::new_value_typed(
             StaticExprKind::SlotId(root_layout.slots()[ordinal]),
-            ty.data_type.clone(),
-            None,
+            ty.clone_observed(|| work.step())?,
         ));
-        types.push(FunctionArgumentType::Value(ty.clone()));
+        types.push(FunctionArgumentType::Value(
+            ty.clone_observed(|| work.step())?,
+        ));
         work.flush()?;
         ordinals.push(u32::try_from(ordinal).map_err(|_| CompileControlError::ResourceExhausted)?);
         work.step()?;
@@ -176,6 +206,14 @@ fn lower_core(
     work.flush()?;
     // No legacy exception, dictionary or session-timezone capability exists
     // for a slot read; the arena is distinct from the Main arena by design.
+    let types = crate::creation::publish_argument_types(
+        types,
+        type_scope
+            .as_mut()
+            .map(|s| s as &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>),
+        work,
+    )
+    .map_err(crate::creation::argument_types_failure)?;
     let arena = ImmutableExpressions::try_new_for_compile(
         nodes,
         false,
@@ -192,10 +230,29 @@ fn lower_core(
     })?;
     let arena = Arc::new(arena);
     work.flush()?;
-    let (flow, roots, slots) = partition_flow(root, &ordinals, arena.nodes().len(), work)?;
+    let (flow, roots, slots) = partition_flow(
+        root,
+        &ordinals,
+        arena.nodes().len(),
+        work,
+        crate::creation::borrow_scope(&mut temporary),
+        creation,
+        factory,
+    )?;
     let partition_exprs = (0..ordinals.len()).map(ProgramExprId::new).collect();
     work.flush()?;
-    let layout = root_layout.project_by_slots_for_compile(&output_columns, work.control())?;
+    let control = work.control();
+    let storage = creation.storage_lifetime();
+    let layout = root_layout.project_by_slots_typed_with_creator(
+        &output_columns,
+        storage,
+        |layout| {
+            creation
+                .request_layout(layout)
+                .map_err(novarocks_local_program::LayoutCreationFailure::Creator)
+        },
+        control,
+    )?;
     work.flush()?;
     let branch = StaticStreamBranch::try_new(
         dest_node_id,
@@ -293,20 +350,43 @@ type PartitionFlow = (
 /// One root domain and one eager Value occurrence per key definition `i`,
 /// bound to `SinkPartition { branch: 0, key: i }` and read from the root's
 /// actual output occurrence. Identities are dense in this fresh Sink scope.
-fn partition_flow(
+fn partition_flow<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     root: ProgramNodeId,
     ordinals: &[u32],
     definitions: usize,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<PartitionFlow, FragmentCompileError> {
+    mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    _creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    factory: Option<&F>,
+) -> Result<PartitionFlow, crate::FragmentCreationError<H>> {
     let mut domains = Vec::new();
     let mut uses = Vec::new();
     let mut roots = Vec::new();
     let mut slots = Vec::new();
-    reserve_vec(&mut domains, ordinals.len(), work)?;
-    reserve_vec(&mut uses, ordinals.len(), work)?;
-    reserve_vec(&mut roots, ordinals.len(), work)?;
-    reserve_vec(&mut slots, ordinals.len(), work)?;
+    crate::creation::reserve_vec(
+        &mut domains,
+        ordinals.len(),
+        crate::creation::borrow_scope(&mut temporary),
+        work,
+    )?;
+    crate::creation::reserve_vec(
+        &mut uses,
+        ordinals.len(),
+        crate::creation::borrow_scope(&mut temporary),
+        work,
+    )?;
+    crate::creation::reserve_vec(
+        &mut roots,
+        ordinals.len(),
+        crate::creation::borrow_scope(&mut temporary),
+        work,
+    )?;
+    crate::creation::reserve_vec(
+        &mut slots,
+        ordinals.len(),
+        crate::creation::borrow_scope(&mut temporary),
+        work,
+    )?;
     for (key, &ordinal) in ordinals.iter().enumerate() {
         let identity = u32::try_from(key).map_err(|_| CompileControlError::ResourceExhausted)?;
         let domain = EvaluationDomainId::new(identity);
@@ -347,7 +427,23 @@ fn partition_flow(
         work.step()?;
     }
     work.flush()?;
-    let flow = ProgramControlFlow::try_new(domains, uses, definitions, work.control())?;
+    let flow = match factory {
+        Some(f) => {
+            let mut retained = f
+                .begin_scope()
+                .map_err(crate::FragmentCreationError::Creator)?;
+            ProgramControlFlow::try_new_with_creator_in(
+                domains,
+                uses,
+                definitions,
+                crate::creation::borrow_scope(&mut temporary)
+                    .expect("strong entry supplies temporary scope"),
+                &mut retained,
+                work.control(),
+            )?
+        }
+        None => ProgramControlFlow::try_new(domains, uses, definitions, work.control())?,
+    };
     work.flush()?;
     Ok((flow, roots, slots))
 }

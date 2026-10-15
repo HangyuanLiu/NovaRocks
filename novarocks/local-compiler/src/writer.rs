@@ -39,7 +39,6 @@
 //! retains its exact edge keys for the original per-driver local shuffle.
 
 use crate::{assert_rows::reserve_vec, lowering::FragmentCompileError};
-use arrow_schema::Schema;
 use novarocks_connector_contract::ConnectorWriteRecipe;
 use novarocks_local_program::{
     BindingRequirement, ExpressionsCompileError, ImmutableExpressions, ProgramChannelLayoutRole,
@@ -298,64 +297,46 @@ fn require_relation_output(
 
 /// One relation layout: the frozen field names and types, positionally, with
 /// compiler-allocated slots.
-pub(crate) fn relation_layout(
+pub(crate) fn relation_layout_with_creation<H>(
     schema: &WriterRelationSchema,
     slots: &[SlotId],
     control: &dyn PureCompileControl,
-) -> Result<StaticLayout, FragmentCompileError> {
-    relation_layout_with_source(schema, slots, None, control)
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<StaticLayout, crate::FragmentCreationError<H>> {
+    relation_layout_inner_with_creation(schema, slots, control, creation)
 }
-fn relation_layout_with_source(
+fn relation_layout_inner_with_creation<H>(
     schema: &WriterRelationSchema,
     slots: &[SlotId],
-    namespace: Option<&novarocks_type_contract::owned_resources::metadata_materialization::MaterializedFieldNamespace>,
     control: &dyn PureCompileControl,
-) -> Result<StaticLayout, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<StaticLayout, crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
     let result = (|| {
         if slots.len() != schema.fields.len() {
-            return Err(FragmentCompileError::Invalid(
+            return Err((FragmentCompileError::Invalid(
                 "writer relation width differs from its channels",
-            ));
+            ))
+            .into());
         }
-        let mut fields = Vec::new();
-        if namespace.is_none() {
-            reserve_vec(&mut fields, schema.fields.len(), &mut work)?;
-        }
-        let mut original_fields = if namespace.is_some() {
-            let mut fields = Vec::new();
-            reserve_vec(&mut fields, schema.fields.len(), &mut work)?;
-            Some(fields)
-        } else {
-            None
-        };
+        let mut typed_layout = crate::typed_layout::TypedLayoutBuilder::new_with_creation(
+            slots.len(),
+            &mut work,
+            creation,
+        )?;
         for field in schema.fields.iter() {
-            work.flush()?;
-            if let Some(original_fields) = original_fields.as_mut() {
-                let lowered = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(&field.ty, field.name.to_string());
-                work.flush()?;
-                original_fields.push(lowered?);
-            } else {
-                let lowered = field.ty.try_to_field(field.name.to_string());
-                work.flush()?;
-                fields.push(lowered?);
-            }
-            work.step()?;
+            typed_layout.push_with_creation(
+                &field.ty,
+                crate::typed_layout::copy_name_with_creation(&field.name, &mut work, creation)?,
+                &mut work,
+                creation,
+            )?;
         }
-        work.flush()?;
-        match (original_fields, namespace) {
-            (Some(fields), Some(namespace)) => {
-                let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema();
-                StaticLayout::try_new_materialized_for_compile(source, Arc::from(slots), work.control())
-            }
-            _ => StaticLayout::try_new_for_compile(Arc::new(Schema::new(fields)), Arc::from(slots), work.control()),
-        }.map_err(Into::into)
+        typed_layout
+            .finish_with_creation(slots, &mut work, creation)
+            .map_err(Into::into)
     })();
-    if matches!(&result, Err(FragmentCompileError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    crate::creation::finish_attempt(result, work)
 }
 
 /// The complete WriterProjection-arena scope of one writer: its flow and
@@ -364,7 +345,7 @@ fn relation_layout_with_source(
 pub(crate) struct WriterFlow {
     pub arena: ProgramExpressionArena,
     pub flow: ProgramControlFlow,
-    pub types: Vec<FunctionArgumentType>,
+    pub types: novarocks_type_contract::FunctionArgumentTypes,
     pub roots: Vec<ProgramRootUseBinding>,
     pub slots: Vec<ProgramSlotBinding>,
 }
@@ -390,33 +371,48 @@ pub(crate) struct WriterLoweringInput<'a> {
     pub projection_slots: &'a [SlotId],
 }
 
-pub(crate) fn lower_writer(
+pub(crate) fn lower_writer_with_creation<
+    H,
+    F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     id: ProgramNodeId,
     recipe: &ConnectorWriteRecipe,
     input: WriterLoweringInput<'_>,
     control: &dyn PureCompileControl,
-) -> Result<LoweredWriter, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    factory: Option<&F>,
+) -> Result<LoweredWriter, crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_writer_core(package, node, id, recipe, input, &mut work);
-    if matches!(&result, Err(FragmentCompileError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    let result = lower_writer_core_with_creation(
+        package,
+        node,
+        id,
+        recipe,
+        input,
+        &mut work,
+        creation,
+        crate::creation::borrow_scope(&mut temporary),
+        factory,
+    );
+    crate::creation::finish_attempt(result, work)
 }
 
-fn lower_writer_core(
+fn lower_writer_core_with_creation<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     id: ProgramNodeId,
     recipe: &ConnectorWriteRecipe,
     input: WriterLoweringInput<'_>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<LoweredWriter, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    factory: Option<&F>,
+) -> Result<LoweredWriter, crate::FragmentCreationError<H>> {
     let NodeKind::TableWriter { target } = &node.kind else {
-        return Err(FragmentCompileError::Invalid("TableWriter kind differs"));
+        return Err((FragmentCompileError::Invalid("TableWriter kind differs")).into());
     };
     let values = package.fragment().values();
     let recipe_fields = recipe.draft().input();
@@ -426,27 +422,32 @@ fn lower_writer_core(
         || width != input.projection_slots.len()
         || input.child_layout.slots().len() != input.child_node.output.columns.len()
     {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "table writer projection width differs from its recipe or channels",
-        ));
+        ))
+        .into());
     }
     let mut nodes = Vec::new();
+    let mut type_scope = match factory {
+        Some(f) => {
+            work.flush()?;
+            Some(
+                f.begin_scope()
+                    .map_err(crate::FragmentCreationError::Creator)?,
+            )
+        }
+        None => None,
+    };
     let mut types = Vec::new();
-    let mut fields = Vec::new();
+    let mut typed_layout =
+        crate::typed_layout::TypedLayoutBuilder::new_with_creation(width, work, creation)?;
     let mut ordinals = Vec::new();
     let mut channels = Vec::new();
     reserve_vec(&mut nodes, width, work)?;
-    reserve_vec(&mut types, width, work)?;
-    if recipe.draft().original_metadata_namespace().is_none() {
-        reserve_vec(&mut fields, width, work)?;
+    match type_scope.as_mut() {
+        Some(scope) => crate::creation::reserve_vec(&mut types, width, Some(scope), work)?,
+        None => reserve_vec(&mut types, width, work)?,
     }
-    let mut original_fields = if recipe.draft().original_metadata_namespace().is_some() {
-        let mut fields = Vec::new();
-        reserve_vec(&mut fields, width, work)?;
-        Some(fields)
-    } else {
-        None
-    };
     reserve_vec(&mut ordinals, width, work)?;
     reserve_vec(
         &mut channels,
@@ -473,24 +474,21 @@ fn lower_writer_core(
             ))?
             .ty;
         work.flush()?;
-        nodes.push(StaticExprNode::new(
+        nodes.push(StaticExprNode::new_value_typed(
             StaticExprKind::SlotId(input.child_layout.slots()[source]),
-            ty.data_type.clone(),
-            None,
+            ty.clone_observed(|| work.step())?,
         ));
-        types.push(FunctionArgumentType::Value(ty.clone()));
-        // The provider's own field, with the nullability of the value that
-        // feeds it; the provider-link law keeps every other fact exact.
-        if let Some(original_fields) = original_fields.as_mut() {
-            original_fields.push(
-                binding
-                    .original_field_materialization()
-                    .clone()
-                    .with_nullable_owned(ty.nullable),
-            );
-        } else {
-            fields.push(binding.field().clone().with_nullable(ty.nullable));
-        }
+        types.push(FunctionArgumentType::Value(
+            ty.clone_observed(|| work.step())?,
+        ));
+        // Provider attributes stay on the write recipe. This execution
+        // projection is authored by the complete input value binding.
+        typed_layout.push_with_creation(
+            ty,
+            crate::typed_layout::copy_name_with_creation(binding.field().name(), work, creation)?,
+            work,
+            creation,
+        )?;
         channels.push((
             ProgramChannelSite::Layout {
                 node: id,
@@ -504,27 +502,19 @@ fn lower_writer_core(
         work.step()?;
     }
     work.flush()?;
-    let projection_layout = match (
-        original_fields,
-        recipe.draft().original_metadata_namespace(),
-    ) {
-        (Some(fields), Some(namespace)) => {
-            let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::from_original_fields(fields, namespace.clone()).into_original_schema();
-            StaticLayout::try_new_materialized_for_compile(
-                source,
-                Arc::from(input.projection_slots),
-                work.control(),
-            )?
-        }
-        _ => StaticLayout::try_new_for_compile(
-            Arc::new(Schema::new(fields)),
-            Arc::from(input.projection_slots),
-            work.control(),
-        )?,
-    };
+    let projection_layout =
+        typed_layout.finish_with_creation(input.projection_slots, work, creation)?;
     work.flush()?;
     // A slot read needs no exception, dictionary or session-timezone
     // capability; the arena is distinct from the Main arena by design.
+    let types = crate::creation::publish_argument_types(
+        types,
+        type_scope
+            .as_mut()
+            .map(|s| s as &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>),
+        work,
+    )
+    .map_err(crate::creation::argument_types_failure)?;
     let arena = ImmutableExpressions::try_new_for_compile(
         nodes,
         false,
@@ -541,11 +531,11 @@ fn lower_writer_core(
     })?;
     let arena = Arc::new(arena);
     work.flush()?;
-    let multiplex = relation_layout_with_source(
+    let multiplex = relation_layout_inner_with_creation(
         &target.output_schema,
         input.output_slots,
-        package.original_metadata_namespace(),
         work.control(),
+        creation,
     )?;
     for (ordinal, field) in target.output_schema.fields.iter().enumerate() {
         channels.push((
@@ -564,9 +554,19 @@ fn lower_writer_core(
         input.projection_slots,
         input.output_slots,
         work,
+        creation,
     )?;
     let arena_id = ProgramExpressionArena::WriterProjection(id);
-    let flow = projection_flow(id, input.child, arena_id, &ordinals, work)?;
+    let flow = projection_flow(
+        id,
+        input.child,
+        arena_id,
+        &ordinals,
+        work,
+        crate::creation::borrow_scope(&mut temporary),
+        creation,
+        factory,
+    )?;
     work.flush()?;
     Ok(LoweredWriter {
         kind: ProgramNodeKind::TableWriter {
@@ -579,6 +579,9 @@ fn lower_writer_core(
                 layout: projection_layout,
             },
             writer_multiplex_layout: multiplex.clone(),
+            // This carrier's exact prepared handles are in its state templates.
+            // It never enters the PlanTree/local independent-source bridge.
+            partial_preparation: None,
             partial_aggregates,
         },
         requirement: BindingRequirement::TableWriter {
@@ -607,21 +610,44 @@ type ProjectionFlow = (
 /// bound to `WriterProjection { node, expression: i }` and read from the
 /// writer input's actual output occurrence. Identities are dense in this
 /// fresh arena scope.
-fn projection_flow(
+fn projection_flow<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     writer: ProgramNodeId,
     input: ProgramNodeId,
     arena: ProgramExpressionArena,
     ordinals: &[u32],
     work: &mut CompileCheckpoints<'_>,
-) -> Result<ProjectionFlow, FragmentCompileError> {
+    mut temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    _creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    factory: Option<&F>,
+) -> Result<ProjectionFlow, crate::FragmentCreationError<H>> {
     let mut domains = Vec::new();
     let mut uses = Vec::new();
     let mut roots = Vec::new();
     let mut slots = Vec::new();
-    reserve_vec(&mut domains, ordinals.len(), work)?;
-    reserve_vec(&mut uses, ordinals.len(), work)?;
-    reserve_vec(&mut roots, ordinals.len(), work)?;
-    reserve_vec(&mut slots, ordinals.len(), work)?;
+    crate::creation::reserve_vec(
+        &mut domains,
+        ordinals.len(),
+        crate::creation::borrow_scope(&mut temporary),
+        work,
+    )?;
+    crate::creation::reserve_vec(
+        &mut uses,
+        ordinals.len(),
+        crate::creation::borrow_scope(&mut temporary),
+        work,
+    )?;
+    crate::creation::reserve_vec(
+        &mut roots,
+        ordinals.len(),
+        crate::creation::borrow_scope(&mut temporary),
+        work,
+    )?;
+    crate::creation::reserve_vec(
+        &mut slots,
+        ordinals.len(),
+        crate::creation::borrow_scope(&mut temporary),
+        work,
+    )?;
     for (expression, &ordinal) in ordinals.iter().enumerate() {
         let identity =
             u32::try_from(expression).map_err(|_| CompileControlError::ResourceExhausted)?;
@@ -660,7 +686,23 @@ fn projection_flow(
         work.step()?;
     }
     work.flush()?;
-    let flow = ProgramControlFlow::try_new(domains, uses, ordinals.len(), work.control())?;
+    let flow = match factory {
+        Some(f) => {
+            let mut retained = f
+                .begin_scope()
+                .map_err(crate::FragmentCreationError::Creator)?;
+            ProgramControlFlow::try_new_with_creator_in(
+                domains,
+                uses,
+                ordinals.len(),
+                crate::creation::borrow_scope(&mut temporary)
+                    .expect("strong entry supplies temporary scope"),
+                &mut retained,
+                work.control(),
+            )?
+        }
+        None => ProgramControlFlow::try_new(domains, uses, ordinals.len(), work.control())?,
+    };
     work.flush()?;
     Ok((flow, roots, slots))
 }
@@ -692,30 +734,32 @@ pub(crate) struct FinishLoweringInput<'a> {
 /// Lower one admitted finish over its one writer-result receiver. The finish
 /// reads the receiver's layout unchanged as its multiplex relation and
 /// publishes its root relation with the frozen relation names.
-pub(crate) fn lower_finish(
+pub(crate) fn lower_finish_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     id: ProgramNodeId,
     input: FinishLoweringInput<'_>,
     control: &dyn PureCompileControl,
-) -> Result<LoweredFinish, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<LoweredFinish, crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
     let result = (|| {
         let NodeKind::TableFinish(spec) = &node.kind else {
-            return Err(FragmentCompileError::Invalid("TableFinish kind differs"));
+            return Err((FragmentCompileError::Invalid("TableFinish kind differs")).into());
         };
         let (child, child_layout, slots) = (input.child, input.child_layout, input.slots);
         if child_layout.slots().len() != spec.input_schema.fields.len() {
-            return Err(FragmentCompileError::Invalid(
+            return Err((FragmentCompileError::Invalid(
                 "table finish input layout differs from its input relation",
-            ));
+            ))
+            .into());
         }
         work.flush()?;
-        let root = relation_layout_with_source(
+        let root = relation_layout_inner_with_creation(
             &spec.output_schema,
             slots,
-            package.original_metadata_namespace(),
             work.control(),
+            creation,
         )?;
         let statistics = crate::writer_statistics::lower_finish_statistics(
             package,
@@ -728,6 +772,7 @@ pub(crate) fn lower_finish(
                 expressions: input.expressions,
             },
             &mut work,
+            creation,
         )?;
         let mut channels = Vec::new();
         reserve_vec(
@@ -781,11 +826,7 @@ pub(crate) fn lower_finish(
             channels,
         })
     })();
-    if matches!(&result, Err(FragmentCompileError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    crate::creation::finish_attempt(result, work)
 }
 
 fn first_ordinal(

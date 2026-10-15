@@ -362,8 +362,8 @@ mod tests {
     }
 
     fn nested(expr: TypedExpr) -> TypedExpr {
-        let data_type = expr.value_type.data_type.clone();
-        let nullable = expr.value_type.nullable;
+        let data_type = expr.value_type.data_type().clone();
+        let nullable = expr.value_type.nullable();
         TypedExpr {
             kind: ExprKind::Nested(Box::new(expr)),
             value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),

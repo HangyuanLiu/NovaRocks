@@ -19,6 +19,7 @@
 //! Original constructors retain their laws. This component neither seals provider
 //! private facts nor admits a whole FragmentPackage or a host allocation grant.
 
+use crate::host_projection_v2::ProjectionFailure;
 use crate::{
     allocation_exit_v2::reserve_exit,
     binding_index_v2::{BindingIndex, lookup_work_upper_bound, prepare_work_upper_bound},
@@ -31,14 +32,17 @@ use crate::{
         DecodedProviderBindings, EncodedProviderBindings, ProviderBindingCodecError,
     },
     physical_schema_v2::{DecodedSchemas, EncodedSchemas, SchemaCodecError},
-    physical_type_v2::{TypeCodecError, decode_logical, encode_logical},
+    physical_type_v2::TypeCodecError,
 };
 use novarocks_connector_contract as c;
 use novarocks_physical_plan::NodeId;
 use novarocks_proto_codec::{FieldPath, ProtocolError, connector_read as codec};
 use novarocks_proto_models::{connector_read as cv, physical_package_v2 as w};
-use novarocks_type_contract::{CompileCheckpoints, CompileControlError, ValueLogicalType};
-use std::{alloc::Layout, collections::BTreeMap, fmt, num::NonZeroU64, sync::Arc};
+use novarocks_type_contract::ValueSchemaCreation;
+use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
+use std::{
+    alloc::Layout, collections::BTreeMap, convert::Infallible, fmt, num::NonZeroU64, sync::Arc,
+};
 
 type E = ReadScanCodecError;
 #[derive(Debug)]
@@ -57,11 +61,15 @@ pub enum ReadScanCodecError {
     Node(NodeCodecError),
     SourceModel(&'static str),
     InvalidShape(&'static str),
+    ConstructionResource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+    InvalidSourceSchema(crate::physical_public_source_schema_v2::PublicSourceSchemaCodecError),
 }
 impl fmt::Display for E {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(e) => e.fmt(f),
+            Self::InvalidSourceSchema(e) => e.fmt(f),
+            Self::ConstructionResource(e) => write!(f, "read schema construction: {e:?}"),
             Self::Provider(e) => e.fmt(f),
             Self::Scan(e) => e.fmt(f),
             Self::Recipe(e) => e.fmt(f),
@@ -78,6 +86,21 @@ impl fmt::Display for E {
     }
 }
 impl std::error::Error for E {}
+impl From<crate::physical_public_source_schema_v2::PublicSourceSchemaCodecError> for E {
+    fn from(error: crate::physical_public_source_schema_v2::PublicSourceSchemaCodecError) -> Self {
+        match error {
+            crate::physical_public_source_schema_v2::PublicSourceSchemaCodecError::Control(
+                error,
+            ) => Self::Control(error),
+            error => Self::InvalidSourceSchema(error),
+        }
+    }
+}
+impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError> for E {
+    fn from(error: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        Self::ConstructionResource(error)
+    }
+}
 impl From<CompileControlError> for E {
     fn from(e: CompileControlError) -> Self {
         Self::Control(e)
@@ -234,6 +257,7 @@ pub struct ReadScanSource<'a> {
     pub node: NodeId,
     pub read: &'a c::FrozenConnectorRead,
     pub schema_id: u32,
+    pub source_schema_id: u32,
     pub expression_ids: &'a [u32],
 }
 #[derive(Clone, Copy)]
@@ -241,12 +265,16 @@ pub struct ReadScanEncodeContext<'a, 's, 'c> {
     pub bindings: &'a EncodedProviderBindings<'s, 'c>,
     pub payloads: &'a EncodedConnectorPayloads<'s, 'c>,
     pub schemas: &'a EncodedSchemas<'a, 's, 'c>,
+    pub source_schemas:
+        &'a [crate::physical_public_source_schema_v2::SourceSchemaFactsSource<'s>],
 }
 #[derive(Clone, Copy)]
 pub struct ReadScanDecodeContext<'a, 'w, 'c> {
     pub bindings: &'a DecodedProviderBindings<'w, 'c>,
     pub payloads: &'a DecodedConnectorPayloads<'w, 'c>,
     pub schemas: &'a DecodedSchemas<'a, 'c>,
+    pub source_schemas:
+        Option<&'a crate::physical_public_source_schema_v2::DecodedPublicSourceSchemas>,
 }
 struct Model {
     source: usize,
@@ -1241,10 +1269,12 @@ fn count_public_source(p: &c::ConnectorReadPublicFacts, m: &mut Model) -> Result
         m.bytes(32)?;
         m.bytes(evidence.len())?;
     }
-    m.items(p.logical_types().len())?;
-    m.request::<i32>(p.logical_types().len(), 1)
+    Ok(())
 }
 fn count_public_raw(p: &w::ConnectorReadPublicFacts, m: &mut Model) -> Result<(), E> {
+    // The two namespace IDs are inline scalar references. Retired root-label
+    // backing has no request/work contribution. The containing DTO header uses
+    // the actual generated FrozenReadScan Layout, including this contraction.
     if let Some(s) = &p.source {
         for n in [s.input_version.len(), s.coverage_evidence.len()] {
             m.bytes(n)?;
@@ -1264,12 +1294,12 @@ fn count_public_raw(p: &w::ConnectorReadPublicFacts, m: &mut Model) -> Result<()
         m.bytes(k.len())?;
         arc_request::<u8>(k.len(), m)?;
     }
-    m.items(p.logical_types.len())?;
-    m.request::<ValueLogicalType>(p.logical_types.len(), 1)
+    Ok(())
 }
 fn encode_public(
     p: &c::ConnectorReadPublicFacts,
     schema_id: u32,
+    source_schema_id: u32,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<w::ConnectorReadPublicFacts, E> {
     use w::connector_read_artifact_coverage::Kind;
@@ -1288,12 +1318,9 @@ fn encode_public(
             evidence: copy(evidence, work)?,
         }),
     };
-    let mut logical_types = reserve(p.logical_types().len(), work)?;
-    for logical in p.logical_types() {
-        logical_types.push(encode_logical(*logical));
-        work.step()?;
-    }
     Ok(w::ConnectorReadPublicFacts {
+        execution_schema_id: Some(schema_id),
+        source_schema_id: Some(source_schema_id),
         source: Some(w::ConnectorReadStaticFacts {
             input_version: copy(s.input_version().as_bytes(), work)?,
             selection_digest: copy(&s.selection_digest(), work)?,
@@ -1305,14 +1332,28 @@ fn encode_public(
             Some(k) => Some(text(k.as_str(), work)?),
             None => None,
         },
-        schema_id: Some(schema_id),
-        logical_types,
     })
 }
+fn require_public_schema_references(
+    public: &w::ConnectorReadPublicFacts,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(), E> {
+    required(
+        public.execution_schema_id,
+        "read execution schema ID absent",
+        work,
+    )?;
+    required(
+        public.source_schema_id,
+        "read source schema facts ID absent",
+        work,
+    )?;
+    Ok(())
+}
+
 type DecodedPublicSource = (
     c::ConnectorReadStaticFacts<c::ScanColumnId>,
     Option<c::ConnectorReadMetadataKind>,
-    Vec<ValueLogicalType>,
 );
 fn decode_public_source(
     p: &w::ConnectorReadPublicFacts,
@@ -1377,12 +1418,7 @@ fn decode_public_source(
         })?),
         None => None,
     };
-    let mut logical = reserve(p.logical_types.len(), work)?;
-    for l in &p.logical_types {
-        logical.push(opaque(work, || decode_logical(*l).map_err(E::from))?);
-        work.step()?;
-    }
-    Ok((source, metadata_kind, logical))
+    Ok((source, metadata_kind))
 }
 fn source_work(source: c::ConnectorReadWorkSource) -> i32 {
     match source {
@@ -1519,18 +1555,86 @@ pub fn encode_read_scans_observed(
         // caller lends the truthful union; only actual inline/layout floors
         // and the original namespace lower-floor authors are checked here.
         m.floor(std::mem::size_of::<c::FrozenConnectorRead>())?;
+        let public = source.read.public_facts();
+        let execution = required(
+            public.execution_schema(),
+            "read execution schema absent",
+            work,
+        )?;
+        let source_facts = required(
+            public.source_schema_facts(),
+            "read source schema facts absent",
+            work,
+        )?;
         let schema = required(
             context.schemas.source_observed(source.schema_id, work)?,
-            "read schema source absent",
+            "read execution schema source absent",
             work,
         )?;
         observed(
-            if std::ptr::eq(schema, source.read.public_facts().schema()) {
+            if std::ptr::eq(schema, execution.schema()) {
                 Ok(())
             } else {
                 Err(E::InvalidShape(
-                    "read schema is not the original same-emission source",
+                    "read execution schema is not the original same-emission source",
                 ))
+            },
+            work,
+        )?;
+        for (ordinal, expected) in execution.bindings().iter().enumerate() {
+            let original = required(
+                context
+                    .schemas
+                    .execution_binding_observed(source.schema_id, ordinal, work)?,
+                "read execution field has no complete binding",
+                work,
+            )?;
+            observed(
+                if std::ptr::eq(original, expected) {
+                    Ok(())
+                } else {
+                    Err(E::InvalidShape(
+                        "read execution binding is not the original occurrence",
+                    ))
+                },
+                work,
+            )?;
+        }
+        let mut found = false;
+        for entry in context.source_schemas {
+            let same = entry.id == source.source_schema_id;
+            work.step()?;
+            if same {
+                if found || !std::ptr::eq(entry.facts, source_facts) {
+                    return Err(E::InvalidShape(
+                        "read source schema is not the original same-emission source",
+                    ));
+                }
+                let shape = required(
+                    context
+                        .schemas
+                        .source_observed(entry.source_shape_schema_id, work)?,
+                    "read source shape schema absent",
+                    work,
+                )?;
+                observed(
+                    if std::ptr::eq(shape, source_facts.shape().schema()) {
+                        Ok(())
+                    } else {
+                        Err(E::InvalidShape(
+                            "read source shape is not the original same-emission source",
+                        ))
+                    },
+                    work,
+                )?;
+                found = true;
+            }
+        }
+        observed(
+            if found {
+                Ok(())
+            } else {
+                Err(E::InvalidShape("read source facts namespace ID absent"))
             },
             work,
         )?;
@@ -1614,6 +1718,7 @@ pub fn encode_read_scans_observed(
             public_facts: Some(encode_public(
                 source.read.public_facts(),
                 source.schema_id,
+                source.source_schema_id,
                 work,
             )?),
         });
@@ -1672,6 +1777,63 @@ pub fn decode_read_scans_observed(
         ReadScanProjectionFacts,
     ),
     E,
+> {
+    decode_read_scans_core::<Infallible>(
+        scans,
+        expressions,
+        context,
+        source_retained_bytes,
+        limits,
+        admit,
+        None,
+        work,
+    )
+    .map_err(ProjectionFailure::without_host)
+}
+
+pub fn decode_read_scans_with_creator<H>(
+    scans: &[w::FrozenReadScan],
+    expressions: &[w::ConnectorExpressionDefinition],
+    context: ReadScanDecodeContext<'_, '_, '_>,
+    source_retained_bytes: usize,
+    limits: ReadScanProjectionLimits,
+    admit: &mut impl FnMut(&ReadScanProjectionFacts) -> Result<(), CompileControlError>,
+    creation: &mut ValueSchemaCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    (
+        Vec<(NodeId, c::FrozenConnectorRead)>,
+        ReadScanProjectionFacts,
+    ),
+    ProjectionFailure<E, H>,
+> {
+    decode_read_scans_core(
+        scans,
+        expressions,
+        context,
+        source_retained_bytes,
+        limits,
+        admit,
+        Some(creation),
+        work,
+    )
+}
+
+fn decode_read_scans_core<H>(
+    scans: &[w::FrozenReadScan],
+    expressions: &[w::ConnectorExpressionDefinition],
+    context: ReadScanDecodeContext<'_, '_, '_>,
+    source_retained_bytes: usize,
+    limits: ReadScanProjectionLimits,
+    admit: &mut impl FnMut(&ReadScanProjectionFacts) -> Result<(), CompileControlError>,
+    mut creation: Option<&mut ValueSchemaCreation<'_, H>>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    (
+        Vec<(NodeId, c::FrozenConnectorRead)>,
+        ReadScanProjectionFacts,
+    ),
+    ProjectionFailure<E, H>,
 > {
     let mut m = Model::new::<(NodeId, c::FrozenConnectorRead)>(scans.len(), source_retained_bytes)?;
     m.items(add(
@@ -1766,7 +1928,8 @@ pub fn decode_read_scans_observed(
     for scan in scans {
         required(scan.recipe.as_ref(), "read recipe absent", work)?;
         let facts = required(scan.facts.as_ref(), "scan facts absent", work)?;
-        required(scan.public_facts.as_ref(), "read public facts absent", work)?;
+        let public = required(scan.public_facts.as_ref(), "read public facts absent", work)?;
+        require_public_schema_references(public, work)?;
         required(
             facts.enforced_predicate.as_ref(),
             "enforced scan predicate absent",
@@ -1962,33 +2125,141 @@ pub fn decode_read_scans_observed(
             .map_err(E::from)?
         };
         m.complete(last)?;
-        let schema = required(
-            context.schemas.schema_observed(
-                required(public.schema_id, "read public schema ID absent", work)?,
-                work,
-            )?,
-            "read public schema absent",
-            work,
-        )?;
-        let (source, kind, logical) = decode_public_source(public, work)?;
+        let (source, kind) = decode_public_source(public, work)?;
         let mut last = c::WriterOwnedResourceFacts::default();
         let public = {
+            // The immutable wire was checked by the one presence pass. Pure
+            // and BE creator routes consume the same two explicit namespaces.
+            let execution_id = public
+                .execution_schema_id
+                .expect("checked read execution schema ID");
+            let source_id = public
+                .source_schema_id
+                .expect("checked read source schema facts ID");
+            let source_namespace = required(
+                context.source_schemas,
+                "read source schema namespace absent",
+                work,
+            )?;
+            let source_schema = required(
+                source_namespace
+                    .lookup_observed(source_id, work)
+                    .map_err(E::from)?,
+                "read source schema facts absent",
+                work,
+            )?;
+            let schema_owner = required(
+                context
+                    .schemas
+                    .materialized_schema_observed(execution_id, work)?,
+                "read execution schema absent",
+                work,
+            )?;
+            let schema = schema_owner.schema();
+            if schema.metadata().capacity() != 0 {
+                return Err(E::InvalidShape(
+                    "execution read schema carries format metadata backing",
+                )
+                .into());
+            }
+            let count = schema.fields().len();
+            let bindings_layout = layout::<novarocks_type_contract::FunctionValueType>(count)?;
+            request_read_layout(&mut creation, bindings_layout)?;
+            let mut bindings = reserve(count, work)?;
+            for ordinal in 0..count {
+                let binding = required(
+                    context
+                        .schemas
+                        .execution_binding_observed(execution_id, ordinal, work)?,
+                    "read execution field has no complete binding",
+                    work,
+                )?;
+                bindings.push(binding.clone());
+                work.step()?;
+            }
+            if bindings_layout.size() != 0 {
+                if let Some(creation) = creation.as_deref_mut() {
+                    creation
+                        .observe_opaque_upper_bound(bindings_layout.size())
+                        .map_err(ProjectionFailure::Host)?;
+                }
+            }
+            request_read_layout(
+                &mut creation,
+                novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<
+                    arrow::datatypes::Schema,
+                >())
+                .map_err(|_| E::Control(CompileControlError::ResourceExhausted))?,
+            )?;
+            let storage = if let Some(creation) = creation.as_deref_mut() {
+                creation.storage_lifetime().retaining_observed(
+                    &schema_owner.storage_lifetime(),
+                    |layout| {
+                        creation
+                            .request_layout(layout)
+                            .map_err(ProjectionFailure::Host)
+                    },
+                )?
+            } else {
+                schema_owner.storage_lifetime()
+            };
+            work.flush()?;
+            let schema = Arc::new(arrow::datatypes::Schema::new(schema.fields().clone()));
+            let execution = c::ConnectorReadExecutionSchema::try_new_observed(
+                schema,
+                bindings.into_boxed_slice(),
+                storage,
+                |layout| request_read_layout(&mut creation, layout),
+                |units| -> Result<(), ProjectionFailure<E, H>> {
+                    work.flush()?;
+                    let mut remaining = units;
+                    while remaining != 0 {
+                        let quantum = remaining.min(256) as u32;
+                        work.control().checkpoint(
+                            novarocks_type_contract::CompilePhase::ProviderValidation,
+                            quantum,
+                        )?;
+                        remaining -= quantum as usize;
+                    }
+                    Ok(())
+                },
+            )?;
             let mut child_admit = |f: &c::WriterOwnedResourceFacts| {
                 let complete = m.facts(f, limits).map_err(merge_child_control)?;
                 admit(&complete)?;
                 last = *f;
                 Ok(())
             };
-            c::ConnectorReadPublicFacts::try_new_from_borrowed_schema_with_materializations_observed(
-                source,
-                kind,
-                schema,
-                logical,
-                source_retained_bytes,
-                &mut child_admit,
-                work,
-            )
-            .map_err(E::from)?
+            if let Some(creation) = creation.as_deref_mut() {
+                c::ConnectorReadPublicFacts::try_new_typed_with_creator(
+                    source,
+                    kind,
+                    &execution,
+                    source_schema,
+                    source_retained_bytes,
+                    &mut child_admit,
+                    creation,
+                    work,
+                )
+                .map_err(|error| match error {
+                    c::TypedReadCreationFailure::Creator(error) => ProjectionFailure::Host(error),
+                    c::TypedReadCreationFailure::Contract(error) => {
+                        ProjectionFailure::Codec(E::from(error))
+                    }
+                })?
+            } else {
+                c::ConnectorReadPublicFacts::try_new_typed_observed(
+                    source,
+                    kind,
+                    &execution,
+                    source_schema,
+                    schema_owner.storage_lifetime(),
+                    source_retained_bytes,
+                    &mut child_admit,
+                    work,
+                )
+                .map_err(E::from)?
+            }
         };
         m.complete(last)?;
         let read = opaque(work, || {
@@ -2003,3 +2274,34 @@ pub fn decode_read_scans_observed(
 
 #[cfg(test)]
 mod tests;
+
+macro_rules! read_projection_error {
+    ($($error:ty),* $(,)?) => {$(
+        impl<H> From<$error> for ProjectionFailure<ReadScanCodecError,H> {
+            fn from(error: $error) -> Self { Self::Codec(E::from(error)) }
+        }
+    )*};
+}
+read_projection_error!(
+    CompileControlError,
+    SchemaCodecError,
+    c::ConnectorError,
+    BindingCodecError,
+    ProviderBindingCodecError,
+    ConnectorPayloadCodecError,
+    codec::DomainCodecError,
+    novarocks_type_contract::owned_resources::layout::LayoutResourceError
+);
+
+/// None is the explicit pure reconstruction API, not an allocation grant.
+fn request_read_layout<H>(
+    creation: &mut Option<&mut ValueSchemaCreation<'_, H>>,
+    layout: Layout,
+) -> Result<(), ProjectionFailure<E, H>> {
+    if let Some(creation) = creation.as_deref_mut() {
+        creation
+            .request_layout(layout)
+            .map_err(ProjectionFailure::Host)?;
+    }
+    Ok(())
+}

@@ -94,23 +94,14 @@ pub struct CompiledProgramFacts {
     pub aggregates: BTreeMap<ProgramNodeId, CompiledAggregate>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct LocalProgram {
-    checked: ProgramLexicalBindings,
+    expressions: std::sync::Arc<crate::ExpressionProgram>,
     provenance: ProgramProvenance,
     writes: BTreeMap<ProgramNodeId, ConnectorWriteRecipe>,
     exchange_inputs: BTreeMap<ProgramNodeId, CompiledExchangeInput>,
     scan_inputs: BTreeMap<ProgramNodeId, CompiledScanInput>,
     aggregates: BTreeMap<ProgramNodeId, CompiledAggregate>,
-    native_negate: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedNativeNegateRecipe>,
-    native_bitnot: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedNativeBitNotRecipe>,
-    native_inlist: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedNativeInListRecipe>,
-    native_like: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedNativeLikeRecipe>,
-    arithmetic: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedArithmeticRecipe>,
-    casts: BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedCastRecipe>,
-    comparisons: BTreeMap<ProgramComparisonSite, novarocks_functions::PreparedComparisonRecipe>,
-    null_safe_comparisons:
-        BTreeMap<crate::ProgramUseRef, novarocks_functions::PreparedNullSafeComparisonRecipe>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -215,6 +206,16 @@ impl std::error::Error for LocalProgramCompileError {
         }
     }
 }
+impl<H> From<LocalProgramCompileError>
+    for crate::ProgramCreationFailure<LocalProgramCompileError, H>
+{
+    fn from(error: LocalProgramCompileError) -> Self {
+        match error {
+            LocalProgramCompileError::Control(error) => Self::Control(error),
+            other => Self::Owner(other),
+        }
+    }
+}
 impl LocalProgram {
     /// Accept only the complete checked chain, not an AST and optional receipts.
     /// Provenance is freshly authored against its actual local graph. Compiler
@@ -233,6 +234,61 @@ impl LocalProgram {
         facts: CompiledProgramFacts,
         control: &dyn PureCompileControl,
     ) -> Result<Self, LocalProgramCompileError> {
+        Self::try_new_core::<std::convert::Infallible, crate::creation::NoFactory>(
+            checked,
+            operators,
+            allowed_sources,
+            facts,
+            None,
+            None,
+            control,
+        )
+        .map_err(|error| match error {
+            crate::ProgramCreationFailure::Owner(error) => error,
+            crate::ProgramCreationFailure::Control(error) => {
+                LocalProgramCompileError::Control(error)
+            }
+            crate::ProgramCreationFailure::Resource(_)
+            | crate::ProgramCreationFailure::Capacity(_) => {
+                LocalProgramCompileError::Control(CompileControlError::ResourceExhausted)
+            }
+            crate::ProgramCreationFailure::Creator(never) => match never {},
+        })
+    }
+    pub fn try_new_with_creator_in<H, F>(
+        checked: ProgramLexicalBindings,
+        operators: Vec<LocalOperatorProvenance>,
+        allowed_sources: &BTreeSet<DiagnosticSourceNodeId>,
+        facts: CompiledProgramFacts,
+        temporary: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+        retained_factory: &F,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, crate::ProgramCreationFailure<LocalProgramCompileError, H>>
+    where
+        F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+    {
+        Self::try_new_core(
+            checked,
+            operators,
+            allowed_sources,
+            facts,
+            Some(temporary),
+            Some(retained_factory),
+            control,
+        )
+    }
+    fn try_new_core<H, F>(
+        checked: ProgramLexicalBindings,
+        operators: Vec<LocalOperatorProvenance>,
+        allowed_sources: &BTreeSet<DiagnosticSourceNodeId>,
+        facts: CompiledProgramFacts,
+        temporary: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+        retained_factory: Option<&F>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, crate::ProgramCreationFailure<LocalProgramCompileError, H>>
+    where
+        F: novarocks_type_contract::ValueSchemaCreationFactory<H>,
+    {
         let CompiledProgramFacts {
             writes,
             exchange_inputs,
@@ -254,52 +310,43 @@ impl LocalProgram {
         work.step().map_err(LocalProgramCompileError::Control)?;
         work.flush().map_err(LocalProgramCompileError::Control)?;
         if !has_sink {
-            return Err(LocalProgramCompileError::MissingSink);
+            return Err(LocalProgramCompileError::MissingSink.into());
         }
         let provenance =
-            crate::compiled_origins::compile_origins(graph, operators, allowed_sources, control)?;
-        crate::provider_links::validate_provider_links(&checked, &writes, control)?;
+            crate::compiled_origins::compile_origins(graph, operators, allowed_sources, control)
+                .map_err(LocalProgramCompileError::from)?;
+        crate::provider_links::validate_provider_links(&checked, &writes, control)
+            .map_err(LocalProgramCompileError::from)?;
         validate_exchange_inputs(graph, &exchange_inputs, control)?;
         validate_scan_inputs(graph, &scan_inputs, control)?;
         validate_aggregates(graph, &aggregates, control)?;
-        let native_like = crate::primitives::compile_native_like(&checked, control)?;
-        let native_inlist = crate::primitives::compile_native_inlist(&checked, control)?;
-        let native_negate = crate::primitives::compile_native_negate(&checked, control)?;
-        let native_bitnot = crate::primitives::compile_native_bitnot(&checked, control)?;
-        let arithmetic = crate::primitives::compile_arithmetic(&checked, control)?;
-        let casts = crate::primitives::compile_casts(&checked, control)?;
-        let comparisons = crate::primitives::compile_comparisons(&checked, control)?;
-        let null_safe_comparisons =
-            crate::primitives::compile_null_safe_comparisons(&checked, control)?;
+        let expressions = match retained_factory {
+            Some(factory) => crate::ExpressionProgram::try_new_with_creator_in(
+                checked,
+                temporary.expect("strong entry supplies the real temporary scope"),
+                factory,
+                control,
+            )
+            .map_err(|error| error.map_owner(LocalProgramCompileError::from))?,
+            None => crate::ExpressionProgram::try_new(checked, control)
+                .map_err(LocalProgramCompileError::from)?,
+        };
         // Each delegated author finishes its completed work and propagates a
         // first control refusal directly; no control object enters the product.
         Ok(Self {
-            checked,
+            expressions,
             provenance,
             writes,
             exchange_inputs,
             scan_inputs,
             aggregates,
-            comparisons,
-            null_safe_comparisons,
-            native_like,
-            native_inlist,
-            native_negate,
-            native_bitnot,
-            arithmetic,
-            casts,
         })
     }
-    pub const fn checked(&self) -> &ProgramLexicalBindings {
-        &self.checked
+    pub fn checked(&self) -> &ProgramLexicalBindings {
+        self.expressions.checked()
     }
     pub fn graph(&self) -> &LocalProgramGraph {
-        self.checked
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .snapshot()
-            .program()
+        self.expressions.graph()
     }
     pub const fn provenance(&self) -> &ProgramProvenance {
         &self.provenance
@@ -319,64 +366,60 @@ impl LocalProgram {
     pub fn aggregates(&self) -> &BTreeMap<ProgramNodeId, CompiledAggregate> {
         &self.aggregates
     }
+    pub fn expressions(&self) -> &std::sync::Arc<crate::ExpressionProgram> {
+        &self.expressions
+    }
     pub fn comparison_recipe(
         &self,
         site: ProgramComparisonSite,
     ) -> Option<&novarocks_functions::PreparedComparisonRecipe> {
-        self.comparisons.get(&site)
+        self.expressions.comparison_recipe(site)
     }
     pub fn null_safe_comparison_recipe(
         &self,
         site: crate::ProgramUseRef,
     ) -> Option<&novarocks_functions::PreparedNullSafeComparisonRecipe> {
-        self.null_safe_comparisons.get(&site)
+        self.expressions.null_safe_comparison_recipe(site)
     }
     pub fn native_like_recipe(
         &self,
         site: crate::ProgramUseRef,
     ) -> Option<&novarocks_functions::PreparedNativeLikeRecipe> {
-        self.native_like.get(&site)
+        self.expressions.native_like_recipe(site)
     }
     pub fn native_inlist_recipe(
         &self,
         site: crate::ProgramUseRef,
     ) -> Option<&novarocks_functions::PreparedNativeInListRecipe> {
-        self.native_inlist.get(&site)
+        self.expressions.native_inlist_recipe(site)
     }
     pub fn native_negate_recipe(
         &self,
         site: crate::ProgramUseRef,
     ) -> Option<&novarocks_functions::PreparedNativeNegateRecipe> {
-        self.native_negate.get(&site)
+        self.expressions.native_negate_recipe(site)
     }
     pub fn native_bitnot_recipe(
         &self,
         site: crate::ProgramUseRef,
     ) -> Option<&novarocks_functions::PreparedNativeBitNotRecipe> {
-        self.native_bitnot.get(&site)
+        self.expressions.native_bitnot_recipe(site)
     }
     pub fn arithmetic_recipe(
         &self,
         site: crate::ProgramUseRef,
     ) -> Option<&novarocks_functions::PreparedArithmeticRecipe> {
-        self.arithmetic.get(&site)
+        self.expressions.arithmetic_recipe(site)
     }
     pub fn cast_recipe(
         &self,
         site: crate::ProgramUseRef,
     ) -> Option<&novarocks_functions::PreparedCastRecipe> {
-        self.casts.get(&site)
+        self.expressions.cast_recipe(site)
     }
-    /// Borrow the exact checked implementation's lifecycle; never rebuild a
-    /// second state declaration from a name or legacy expression tag.
+    /// Borrow the same expression owner's exact selected lifecycle.
     pub fn state_template(&self, site: ProgramCallSite) -> Option<ProgramStateTemplate<'_>> {
-        self.checked
-            .channels()
-            .expressions()
-            .resolved_calls()
-            .calls()
-            .get(&site)
-            .map(|call| call.state_template())
+        self.expressions.state_template(site)
     }
 }
 

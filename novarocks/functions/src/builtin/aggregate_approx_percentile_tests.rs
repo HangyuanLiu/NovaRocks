@@ -154,7 +154,12 @@ fn kernel(
         domain: EvaluationDomainId::new(60),
         demand: EvaluationDemand::Value,
     };
-    let state_type = FunctionValueType::new(DataType::Binary, true);
+    let state_type = selected
+        .aggregate
+        .as_ref()
+        .unwrap()
+        .intermediate_type
+        .clone();
     let uses = (0..args.len())
         .map(|n| Some(ExpressionUseId::new(902 + u32::try_from(n).unwrap())))
         .collect::<Vec<_>>();
@@ -213,7 +218,9 @@ fn kernel(
 fn types(values: &[ArrayRef]) -> Vec<FunctionValueType> {
     values
         .iter()
-        .map(|value| FunctionValueType::new(value.data_type().clone(), true))
+        .map(|value| {
+            FunctionValueType::from_legacy_declared_projection(value.data_type().clone(), true)
+        })
         .collect()
 }
 fn update_selected(
@@ -225,7 +232,17 @@ fn update_selected(
     mapping: &[usize],
     control: &dyn KernelEvaluationControl,
 ) -> Result<(), EvaluationFailure> {
-    let args = values
+    let ingress_values = values
+        .iter()
+        .zip(kernel.contract.call().selected().argument_types.iter())
+        .map(|(array, argument)| {
+            let crate::FunctionArgumentType::Value(binding) = argument else {
+                panic!("value fixture argument");
+            };
+            crate::test_value_ingress::array_for_binding(array, binding).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let args = ingress_values
         .iter()
         .map(EvaluatedArgument::Column)
         .collect::<Vec<_>>();

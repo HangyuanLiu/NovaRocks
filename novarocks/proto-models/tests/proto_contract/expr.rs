@@ -106,27 +106,18 @@ fn scalar_type(prim: common::PrimitiveType) -> IType {
     IType { prim: prim as i32 }
 }
 
-fn type_to_proto(ty: &IType) -> common::TypeDesc {
-    common::TypeDesc {
-        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
-            r#type: ty.prim,
-            len: None,
-            precision: None,
-            scale: None,
-            time_unit: None,
-            time_zone: None,
-        })),
-    }
+fn type_to_proto(ty: &IType, nullable: bool) -> common::TypeDesc {
+    super::common::scalar_ref(common::PrimitiveType::try_from(ty.prim).unwrap(), nullable)
 }
 
-fn type_from_proto(proto: &common::TypeDesc) -> Result<IType, String> {
-    let kind = proto.kind.as_ref().ok_or("Expr.type.kind missing")?;
-    match kind {
-        common::type_desc::Kind::Scalar(scalar) => Ok(IType {
-            prim: scalar.r#type,
-        }),
-        _ => Err("expr test analogue only accepts scalar TypeDesc".to_string()),
-    }
+fn type_from_proto(
+    proto: &common::TypeDesc,
+    table: &novarocks_proto_models::plan::ExecutionTypeTable,
+    nullable: bool,
+) -> Result<IType, String> {
+    Ok(IType {
+        prim: super::common::scalar_from_ref(proto, table, nullable)?,
+    })
 }
 
 fn literal_to_proto(literal: &ILiteral) -> common::LiteralValue {
@@ -179,6 +170,7 @@ fn expr_to_proto(expr: &IExpr) -> expr_proto::Expr {
             right,
             decimal_overflow_policy,
         } => Kind::BinaryOp(Box::new(expr_proto::BinaryOpExpr {
+            allow_throw_exception: None,
             decimal_overflow_policy: policy_to_proto(*decimal_overflow_policy),
             op: *op,
             left: Some(Box::new(expr_to_proto(left))),
@@ -189,6 +181,8 @@ fn expr_to_proto(expr: &IExpr) -> expr_proto::Expr {
             args,
             distinct,
         } => Kind::FunctionCall(expr_proto::FunctionCall {
+            frozen_binding: None,
+            original_request_id: None,
             function_name: function_name.clone(),
             args: args.iter().map(expr_to_proto).collect(),
             distinct: *distinct,
@@ -198,9 +192,10 @@ fn expr_to_proto(expr: &IExpr) -> expr_proto::Expr {
             target,
             decimal_overflow_policy,
         } => Kind::Cast(Box::new(expr_proto::CastExpr {
+            allow_throw_exception: None,
             decimal_overflow_policy: policy_to_proto(*decimal_overflow_policy),
             operand: Some(Box::new(expr_to_proto(operand))),
-            target: Some(type_to_proto(target)),
+            target: Some(type_to_proto(target, expr.nullable)),
         })),
         IExprKind::Case {
             operand,
@@ -233,16 +228,24 @@ fn expr_to_proto(expr: &IExpr) -> expr_proto::Expr {
     };
 
     expr_proto::Expr {
-        r#type: Some(type_to_proto(&expr.ty)),
+        original_definition_id: None,
+        r#type: Some(type_to_proto(&expr.ty, expr.nullable)),
         nullable: expr.nullable,
         kind: Some(kind),
     }
 }
 
-fn expr_from_proto(proto: &expr_proto::Expr) -> Result<IExpr, String> {
+fn expr_from_proto(
+    proto: &expr_proto::Expr,
+    table: &novarocks_proto_models::plan::ExecutionTypeTable,
+) -> Result<IExpr, String> {
     use expr_proto::expr::Kind;
 
-    let ty = type_from_proto(proto.r#type.as_ref().ok_or("Expr.type missing")?)?;
+    let ty = type_from_proto(
+        proto.r#type.as_ref().ok_or("Expr.type missing")?,
+        table,
+        proto.nullable,
+    )?;
     let kind = match proto.kind.as_ref().ok_or("Expr.kind missing")? {
         Kind::ColumnRef(column_ref) => IExprKind::ColumnRef {
             column_id: column_ref.column_id,
@@ -257,9 +260,11 @@ fn expr_from_proto(proto: &expr_proto::Expr) -> Result<IExpr, String> {
             op: binary.op,
             left: Box::new(expr_from_proto(
                 binary.left.as_ref().ok_or("BinaryOpExpr.left missing")?,
+                table,
             )?),
             right: Box::new(expr_from_proto(
                 binary.right.as_ref().ok_or("BinaryOpExpr.right missing")?,
+                table,
             )?),
         },
         Kind::FunctionCall(call) => IExprKind::FunctionCall {
@@ -267,7 +272,7 @@ fn expr_from_proto(proto: &expr_proto::Expr) -> Result<IExpr, String> {
             args: call
                 .args
                 .iter()
-                .map(expr_from_proto)
+                .map(|expr| expr_from_proto(expr, table))
                 .collect::<Result<Vec<_>, _>>()?,
             distinct: call.distinct,
         },
@@ -275,30 +280,39 @@ fn expr_from_proto(proto: &expr_proto::Expr) -> Result<IExpr, String> {
             decimal_overflow_policy: policy_from_proto(cast.decimal_overflow_policy)?,
             operand: Box::new(expr_from_proto(
                 cast.operand.as_ref().ok_or("CastExpr.operand missing")?,
+                table,
             )?),
-            target: type_from_proto(cast.target.as_ref().ok_or("CastExpr.target missing")?)?,
+            target: type_from_proto(
+                cast.target.as_ref().ok_or("CastExpr.target missing")?,
+                table,
+                proto.nullable,
+            )?,
         },
         Kind::CaseExpr(case_expr) => IExprKind::Case {
             operand: case_expr
                 .operand
                 .as_ref()
-                .map(|operand| expr_from_proto(operand).map(Box::new))
+                .map(|operand| expr_from_proto(operand, table).map(Box::new))
                 .transpose()?,
             when_then: case_expr
                 .when_then
                 .iter()
                 .map(|branch| {
-                    let when =
-                        expr_from_proto(branch.when.as_ref().ok_or("WhenThen.when missing")?)?;
-                    let then =
-                        expr_from_proto(branch.then.as_ref().ok_or("WhenThen.then missing")?)?;
+                    let when = expr_from_proto(
+                        branch.when.as_ref().ok_or("WhenThen.when missing")?,
+                        table,
+                    )?;
+                    let then = expr_from_proto(
+                        branch.then.as_ref().ok_or("WhenThen.then missing")?,
+                        table,
+                    )?;
                     Ok((when, then))
                 })
                 .collect::<Result<Vec<_>, String>>()?,
             else_expr: case_expr
                 .else_expr
                 .as_ref()
-                .map(|else_expr| expr_from_proto(else_expr).map(Box::new))
+                .map(|else_expr| expr_from_proto(else_expr, table).map(Box::new))
                 .transpose()?,
         },
         Kind::InList(in_list) => IExprKind::InList {
@@ -307,11 +321,12 @@ fn expr_from_proto(proto: &expr_proto::Expr) -> Result<IExpr, String> {
                     .operand
                     .as_ref()
                     .ok_or("InListExpr.operand missing")?,
+                table,
             )?),
             list: in_list
                 .list
                 .iter()
-                .map(expr_from_proto)
+                .map(|expr| expr_from_proto(expr, table))
                 .collect::<Result<Vec<_>, _>>()?,
             negated: in_list.negated,
         },
@@ -431,6 +446,7 @@ fn classify_kind(kind: expr_proto::expr::Kind) -> &'static str {
         expr_proto::expr::Kind::LambdaParamRef(_) => "lambda_param_ref",
         expr_proto::expr::Kind::Lambda(_) => "lambda",
         expr_proto::expr::Kind::Nested(_) => "nested",
+        expr_proto::expr::Kind::ConstantReference(_) => "constant_reference",
     }
 }
 
@@ -442,13 +458,15 @@ fn recursive_expr_survives_proto_roundtrip() {
     let decoded: expr_proto::Expr = roundtrip_message(&proto);
     assert_eq!(proto, decoded);
 
-    let back = expr_from_proto(&decoded).expect("convert Expr back");
+    let table = roundtrip_message(&super::common::scalar_table());
+    let back = expr_from_proto(&decoded, &table).expect("convert Expr back");
     assert_eq!(original, back);
 }
 
 #[test]
 fn missing_expr_fields_report_boundary_errors() {
     let missing_type = expr_proto::Expr {
+        original_definition_id: None,
         r#type: None,
         nullable: false,
         kind: Some(expr_proto::expr::Kind::ColumnRef(expr_proto::ColumnRef {
@@ -458,17 +476,21 @@ fn missing_expr_fields_report_boundary_errors() {
         })),
     };
     assert_eq!(
-        expr_from_proto(&missing_type).expect_err("missing type"),
+        expr_from_proto(&missing_type, &super::common::scalar_table()).expect_err("missing type"),
         "Expr.type missing"
     );
 
     let missing_kind = expr_proto::Expr {
-        r#type: Some(type_to_proto(&scalar_type(common::PrimitiveType::Boolean))),
+        original_definition_id: None,
+        r#type: Some(type_to_proto(
+            &scalar_type(common::PrimitiveType::Boolean),
+            false,
+        )),
         nullable: false,
         kind: None,
     };
     assert_eq!(
-        expr_from_proto(&missing_kind).expect_err("missing kind"),
+        expr_from_proto(&missing_kind, &super::common::scalar_table()).expect_err("missing kind"),
         "Expr.kind missing"
     );
 }
@@ -478,7 +500,10 @@ fn expr_kind_match_is_exhaustive_over_current_oneof() {
     use expr_proto::expr::Kind;
 
     let expr = sample_proto_expr();
-    let ty = Some(type_to_proto(&scalar_type(common::PrimitiveType::Boolean)));
+    let ty = Some(type_to_proto(
+        &scalar_type(common::PrimitiveType::Boolean),
+        false,
+    ));
     let sort_item = expr_proto::SortItem {
         expr: Some(expr.clone()),
         asc: true,
@@ -498,6 +523,7 @@ fn expr_kind_match_is_exhaustive_over_current_oneof() {
             value: Some(literal_to_proto(&ILiteral::Null)),
         }),
         Kind::BinaryOp(Box::new(expr_proto::BinaryOpExpr {
+            allow_throw_exception: None,
             decimal_overflow_policy: expr_proto::DecimalOverflowPolicy::OutputNull as i32,
             op: expr_proto::BinaryOp::Add as i32,
             left: Some(Box::new(expr.clone())),
@@ -508,6 +534,8 @@ fn expr_kind_match_is_exhaustive_over_current_oneof() {
             operand: Some(Box::new(expr.clone())),
         })),
         Kind::FunctionCall(expr_proto::FunctionCall {
+            frozen_binding: None,
+            original_request_id: None,
             function_name: "abs".to_string(),
             args: vec![expr.clone()],
             distinct: false,
@@ -534,6 +562,7 @@ fn expr_kind_match_is_exhaustive_over_current_oneof() {
             ignore_nulls: false,
         }),
         Kind::Cast(Box::new(expr_proto::CastExpr {
+            allow_throw_exception: None,
             decimal_overflow_policy: expr_proto::DecimalOverflowPolicy::OutputNull as i32,
             operand: Some(Box::new(expr.clone())),
             target: ty.clone(),
@@ -579,7 +608,10 @@ fn expr_kind_match_is_exhaustive_over_current_oneof() {
             params: vec![expr_proto::LambdaParam {
                 slot_id: 3,
                 name: Some("x".to_string()),
-                r#type: Some(type_to_proto(&scalar_type(common::PrimitiveType::Bigint))),
+                r#type: Some(type_to_proto(
+                    &scalar_type(common::PrimitiveType::Bigint),
+                    true,
+                )),
                 nullable: true,
             }],
             body: Some(Box::new(expr.clone())),
@@ -587,12 +619,17 @@ fn expr_kind_match_is_exhaustive_over_current_oneof() {
         Kind::Nested(Box::new(expr_proto::NestedExpr {
             inner: Some(Box::new(expr)),
         })),
+        Kind::ConstantReference(novarocks_proto_models::call_request::ConstantReference {
+            pool_id: Some(0),
+            row_ordinal: 0,
+        }),
     ];
 
     let names = kinds.into_iter().map(classify_kind).collect::<Vec<_>>();
-    assert_eq!(names.len(), 17);
+    assert_eq!(names.len(), 18);
     assert!(names.contains(&"column_ref"));
     assert!(names.contains(&"nested"));
+    assert!(names.contains(&"constant_reference"));
 }
 
 #[test]
@@ -617,7 +654,10 @@ fn decimal_policy_roundtrip_is_explicit_and_rejects_unspecified() {
             },
         };
         let decoded = roundtrip_message(&expr_to_proto(&original));
-        assert_eq!(expr_from_proto(&decoded).unwrap(), original);
+        assert_eq!(
+            expr_from_proto(&decoded, &super::common::scalar_table()).unwrap(),
+            original
+        );
     }
     for invalid in [0, -1, 99] {
         assert!(policy_from_proto(invalid).is_err());

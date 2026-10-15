@@ -213,15 +213,20 @@ impl Fixture {
     }
 }
 fn ty(array: &ArrayRef, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(array.data_type().clone(), nullable)
+    FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), nullable)
 }
 fn lists(offsets: Vec<i32>, values: Vec<Option<i32>>, validity: Option<Vec<bool>>) -> ArrayRef {
-    Arc::new(ListArray::new(
+    let raw: ArrayRef = Arc::new(ListArray::new(
         Arc::new(Field::new("original-item", DataType::Int32, true)),
         OffsetBuffer::new(ScalarBuffer::from(offsets)),
         Arc::new(Int32Array::from(values)),
         validity.map(NullBuffer::from),
-    ))
+    ));
+    crate::test_value_ingress::array_for_binding(
+        &raw,
+        &FunctionValueType::new(raw.data_type().clone(), true),
+    )
+    .unwrap()
 }
 fn capacity(rows: usize, completions: usize) -> TableStepCapacity {
     TableStepCapacity {
@@ -282,7 +287,8 @@ fn installed_unnest_fresh_and_frozen_keep_exact_selection_full_fields_and_table_
         Field::new("struct-item", DataType::Struct(vec![child].into()), false)
             .with_metadata([("item-source".into(), "exact".into())].into()),
     );
-    let source = FunctionValueType::new(DataType::List(items.clone()), true);
+    let source =
+        FunctionValueType::from_legacy_declared_projection(DataType::List(items.clone()), true);
     let fixture = Fixture::new(std::slice::from_ref(&source));
     let fresh = fixture.prepare(&CompileControl::default()).unwrap();
     let frozen = fixture
@@ -321,7 +327,7 @@ fn installed_unnest_fresh_and_frozen_keep_exact_selection_full_fields_and_table_
         };
         assert_eq!(
             kernel.contract().result_types()[0],
-            FunctionValueType::new(items.data_type().clone(), true)
+            FunctionValueType::from_legacy_declared_projection(items.data_type().clone(), true)
         );
     }
     assert_eq!(fresh.source(), PurePreparationSource::Fresh);
@@ -330,7 +336,13 @@ fn installed_unnest_fresh_and_frozen_keep_exact_selection_full_fields_and_table_
     let FunctionResultType::Relation(results) = &mut forged.result_type else {
         unreachable!()
     };
-    results[0].nullable = false;
+    let mut revised = results.to_vec();
+    revised[0] = revised[0]
+        .with_nullable(false)
+        .expect("valid function nullability declaration");
+    *results = novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+        revised.into_boxed_slice(),
+    );
     let forged = Arc::new(forged);
     let mut bad_input = fixture.input();
     bad_input.selected = forged.as_ref();
@@ -591,7 +603,7 @@ fn original_constant_ordinal_scalar_and_compact_channels_have_independent_addres
 }
 
 #[test]
-fn dictionary_and_nested_children_keep_original_metadata_and_padding_semantics() {
+fn explicit_dictionary_plain_ingress_and_nested_values_keep_padding_semantics() {
     let dictionary: ArrayRef = Arc::new(
         DictionaryArray::<Int8Type>::try_new(
             Int8Array::from(vec![Some(0), None, Some(1)]),
@@ -599,6 +611,7 @@ fn dictionary_and_nested_children_keep_original_metadata_and_padding_semantics()
         )
         .unwrap(),
     );
+    let dictionary = arrow_cast::cast(dictionary.as_ref(), &DataType::Utf8).unwrap();
     let field = Arc::new(
         Field::new("dictionary-item", dictionary.data_type().clone(), true)
             .with_metadata([("child-source".into(), "unaltered".into())].into()),
@@ -624,6 +637,8 @@ fn dictionary_and_nested_children_keep_original_metadata_and_padding_semantics()
         structs,
         None,
     ));
+    let array = crate::test_value_ingress::array_for_binding(&array, &ty(&array, true)).unwrap();
+    let nested = crate::test_value_ingress::array_for_binding(&nested, &ty(&nested, true)).unwrap();
     let fixture = Fixture::new(&[ty(&array, true), ty(&nested, true)]);
     let kernel = fixture.kernel();
     let args = [
@@ -641,17 +656,17 @@ fn dictionary_and_nested_children_keep_original_metadata_and_padding_semantics()
             .next(capacity(4, 1), &RuntimeControl::default())
             .unwrap(),
     );
-    let dictionary = result.columns[0]
+    let plain = result.columns[0]
         .as_any()
-        .downcast_ref::<DictionaryArray<Int8Type>>()
+        .downcast_ref::<StringArray>()
         .unwrap();
     assert_eq!(
-        dictionary.keys().iter().collect::<Vec<_>>(),
-        [Some(0), None, Some(1)]
+        plain.iter().collect::<Vec<_>>(),
+        [Some("first"), None, Some("second")]
     );
     assert!(novarocks_type_contract::arrow_data_types_exact(
         result.columns[1].data_type(),
-        &kernel.contract().result_types()[1].data_type
+        kernel.contract().result_types()[1].data_type()
     ));
     let structs = result.columns[1]
         .as_any()
@@ -663,7 +678,7 @@ fn dictionary_and_nested_children_keep_original_metadata_and_padding_semantics()
 }
 
 #[test]
-fn union_and_run_encoded_children_use_original_extend_nulls_and_pass_full_page_contract() {
+fn union_padding_passes_full_page_contract_while_run_encoded_input_is_refused() {
     use arrow_array::{Int16Array, RunArray, UnionArray, types::Int16Type};
     use arrow_schema::UnionFields;
     let fields = UnionFields::try_new(
@@ -700,15 +715,22 @@ fn union_and_run_encoded_children_use_original_extend_nulls_and_pass_full_page_c
         None,
     ));
     let longest = lists(vec![0, 3], vec![Some(1), Some(2), Some(3)], None);
-    let fixture = Fixture::new(&[
-        ty(&union_list, true),
-        ty(&run_list, true),
-        ty(&longest, true),
-    ]);
+    let run_kernel = Fixture::new(&[ty(&run_list, true)]).kernel();
+    assert!(
+        SelectedTableInput::try_new(
+            run_kernel.contract(),
+            Selection::all(1),
+            &[EvaluatedArgument::Column(&run_list)],
+            &RuntimeControl::default()
+        )
+        .is_err()
+    );
+    let union_list =
+        crate::test_value_ingress::array_for_binding(&union_list, &ty(&union_list, true)).unwrap();
+    let fixture = Fixture::new(&[ty(&union_list, true), ty(&longest, true)]);
     let kernel = fixture.kernel();
     let args = [
         EvaluatedArgument::Column(&union_list),
-        EvaluatedArgument::Column(&run_list),
         EvaluatedArgument::Column(&longest),
     ];
     let mut cursor = TableEvaluationCursor::begin(
@@ -727,24 +749,17 @@ fn union_and_run_encoded_children_use_original_extend_nulls_and_pass_full_page_c
     for (index, column) in output.columns.iter().enumerate() {
         assert!(novarocks_type_contract::arrow_data_types_exact(
             column.data_type(),
-            &kernel.contract().result_types()[index].data_type
+            kernel.contract().result_types()[index].data_type()
         ));
         assert_eq!(column.len(), 3);
     }
     assert_eq!(output.columns[0].logical_null_count(), 2);
-    assert_eq!(output.columns[1].logical_null_count(), 2);
     let union = output.columns[0]
         .as_any()
         .downcast_ref::<UnionArray>()
         .unwrap();
     assert_eq!(ints(union.child(0))[0], Some(7));
-    let run = output.columns[1]
-        .as_any()
-        .downcast_ref::<RunArray<Int16Type>>()
-        .unwrap();
-    assert_eq!(ints(run.values())[run.get_physical_index(0)], Some(9));
-    assert_eq!(ints(run.values())[run.get_physical_index(2)], None);
-    assert_eq!(ints(&output.columns[2]), [Some(1), Some(2), Some(3)]);
+    assert_eq!(ints(&output.columns[1]), [Some(1), Some(2), Some(3)]);
     assert_eq!(&*output.completed_parents, [0]);
     assert!(output.eof);
     cursor.finish(&RuntimeControl::default()).unwrap();

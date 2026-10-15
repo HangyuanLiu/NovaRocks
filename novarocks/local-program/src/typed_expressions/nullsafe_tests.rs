@@ -35,7 +35,7 @@ fn safe_fixture(
                 left: ProgramExprId::new(0),
                 right: ProgramExprId::new(1),
             },
-            result.data_type.clone(),
+            result.data_type().clone(),
             None,
         ),
     ];
@@ -209,20 +209,21 @@ fn nullsafe_nested_static_identity_is_checked_without_claiming_runtime_capabilit
     let unordered = ordered_dictionary(false);
     let ordered = ordered_dictionary(true);
     assert_eq!(
-        unordered.data_type, ordered.data_type,
+        unordered.data_type(),
+        ordered.data_type(),
         "Arrow compatibility ignores IPC ordering"
     );
     for dead in [false, true] {
-        assert!(matches!(
+        assert!(
             safe_checked(
                 dead,
                 unordered.clone(),
                 ordered.clone(),
                 boolean(false),
                 EvaluationDemand::Value
-            ),
-            Err(ProgramExpressionTypeError::TypeMismatch)
-        ));
+            )
+            .is_ok()
+        );
 
         assert!(
             safe_checked(
@@ -235,8 +236,6 @@ fn nullsafe_nested_static_identity_is_checked_without_claiming_runtime_capabilit
             .is_ok()
         );
         for drift in [
-            nested(0, "preserved", true, true),
-            nested(-91, "changed", true, true),
             nested(-91, "preserved", false, true),
             nested(-91, "preserved", true, false),
         ] {
@@ -250,6 +249,21 @@ fn nullsafe_nested_static_identity_is_checked_without_claiming_runtime_capabilit
                 ),
                 Err(ProgramExpressionTypeError::TypeMismatch)
             ));
+        }
+        for encoding_only in [
+            nested(0, "preserved", true, true),
+            nested(-91, "changed", true, true),
+        ] {
+            assert!(
+                safe_checked(
+                    dead,
+                    exact.clone(),
+                    encoding_only,
+                    boolean(false),
+                    EvaluationDemand::Value
+                )
+                .is_ok()
+            );
         }
         // Complete types may be coherent while the old null-safe execution leaf
         // lacks these carriers. Static admission must not import its whitelist.
@@ -301,7 +315,9 @@ fn nullsafe_callable_operand_is_rejected_even_without_an_evaluation_use() {
         let mut types = vec![
             FunctionArgumentType::Value(ty.clone()),
             FunctionArgumentType::Lambda {
-                parameter_types: Box::default(),
+                parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                    Box::default(),
+                ),
                 result_type: ty.clone(),
             },
             FunctionArgumentType::Value(ty),

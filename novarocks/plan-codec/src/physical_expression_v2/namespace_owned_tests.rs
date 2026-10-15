@@ -196,7 +196,7 @@ fn caller_owned_literal_captured_comparer_preserves_original_facts_and_primary_r
         pool: ConstantPoolId::new(u32::MAX),
         ordinal: 1,
     }));
-    bad.replace(0, |node| node.ty.nullable = false);
+    bad.replace(0, |node| node.ty = node.ty.with_nullable(false).unwrap());
     bad.input[0].type_id = 7;
     prefixes(|c| invoke(&bad, c, limits()), false);
 

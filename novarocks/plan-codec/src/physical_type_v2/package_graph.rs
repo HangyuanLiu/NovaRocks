@@ -21,8 +21,8 @@
 use super::{
     TypeCodecError, TypeProjectionLimits,
     graph::{Index, IndexProjectionFacts, Node},
-    graph_domains::{DomainScratchFacts, RootDomains, TypeGraphDomainFacts, prepare_domains},
-    root_sources::{PackageTypeRootSources, prepare_package_type_root_sources},
+    graph_domains::{DomainScratchFacts, RootDomains, TypeGraphDomainFacts},
+    root_sources::PackageTypeRootSources,
 };
 use crate::btree_resources_v2::{self as btree, BTreeResourceError};
 use novarocks_proto_models::{physical_package_v2 as raw, physical_type_v2 as wire};
@@ -157,18 +157,73 @@ pub fn prepare_package_type_graph<'source>(
     admit: &mut impl FnMut(&PackageTypeGraphFacts) -> Result<(), CompileControlError>,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<PreparedPackageTypeGraph<'source>, TypeCodecError> {
+    prepare_package_type_graph_with_host::<std::convert::Infallible>(
+        package,
+        limits,
+        source_retained_bytes,
+        &mut |facts| admit(facts).map_err(Into::into),
+        work,
+    )
+    .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+}
+
+pub(super) fn prepare_package_type_graph_with_host<'source, H>(
+    package: &'source raw::FragmentPackage,
+    limits: TypeProjectionLimits,
+    source_retained_bytes: usize,
+    admit: &mut impl FnMut(
+        &PackageTypeGraphFacts,
+    ) -> Result<
+        (),
+        crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+    >,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    PreparedPackageTypeGraph<'source>,
+    crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+> {
+    prepare_package_type_graph_namespace_with_host(
+        package,
+        limits,
+        super::root_sources::TypeNamespace::Execution,
+        source_retained_bytes,
+        admit,
+        work,
+    )
+}
+
+pub(super) fn prepare_package_type_graph_namespace_with_host<'source, H>(
+    package: &'source raw::FragmentPackage,
+    limits: TypeProjectionLimits,
+    namespace: super::root_sources::TypeNamespace,
+    source_retained_bytes: usize,
+    admit: &mut impl FnMut(
+        &PackageTypeGraphFacts,
+    ) -> Result<
+        (),
+        crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+    >,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    PreparedPackageTypeGraph<'source>,
+    crate::host_projection_v2::ProjectionFailure<TypeCodecError, H>,
+> {
     // Only scalar headers are read here. All exposed counts precede callbacks.
-    let (vertices, definitions) = match &package.types {
-        Some(table) => {
+    let (vertices, definitions) = match namespace.table(package) {
+        Ok(table) => {
             let vertices = add(table.carriers.len(), table.fields.len())?;
-            (vertices, add(vertices, table.value_types.len())?)
+            (
+                vertices,
+                add(
+                    add(vertices, table.value_types.len())?,
+                    table.logical_types.len(),
+                )?,
+            )
         }
-        None => (0, 0),
+        Err(_) => (0, 0),
     };
     if definitions > limits.max_definitions {
-        return Err(TypeCodecError::InvalidShape(
-            "type projection exceeds caller limit",
-        ));
+        return Err(TypeCodecError::InvalidShape("type projection exceeds caller limit").into());
     }
     let graph_shape = (
         vertices,
@@ -177,11 +232,11 @@ pub fn prepare_package_type_graph<'source>(
     // All scratch layouts and fixed traversal work are already known from
     // these scalar headers. Reuse the original pure authors before the first
     // source step; a later callback must not precede a known resource refusal.
-    let known_index = package
-        .types
-        .as_ref()
-        .map(|table| Index::projection_facts(table, limits, source_retained_bytes))
-        .transpose()?;
+    let known_index = Some(Index::projection_facts(
+        namespace.table(package)?,
+        limits,
+        source_retained_bytes,
+    )?);
     let known_scratch = DomainScratchFacts::prepare(vertices)?;
     let index_source = add(
         add(
@@ -191,8 +246,9 @@ pub fn prepare_package_type_graph<'source>(
         size_of::<PreparedPackageTypeGraph<'_>>(),
     )?;
     let mut facts = PackageTypeGraphFacts::default();
-    let roots = prepare_package_type_root_sources(
+    let roots = super::root_sources::prepare_package_type_root_sources_namespace_with_host(
         package,
+        namespace,
         source_retained_bytes,
         &mut |root| {
             let count = add(
@@ -221,14 +277,14 @@ pub fn prepare_package_type_graph<'source>(
     let root_facts = roots.facts();
     let table = roots.table_for(package)?;
     let mut index_facts = None;
-    let index = Index::prepare_observed(
+    let index = Index::prepare_observed_with_host(
         table,
         limits,
         source_retained_bytes,
         &mut |contribution| {
             // Defense against a changed author header, with no new namespace.
             if contribution.definition_count != definitions {
-                return Err(CompileControlError::ResourceExhausted);
+                return Err(CompileControlError::ResourceExhausted.into());
             }
             let known_domains = known_scratch.projection_facts(
                 0,
@@ -257,7 +313,7 @@ pub fn prepare_package_type_graph<'source>(
     // The sparse Index is now a real retained source. Its established request
     // upper bounds cover its backing without guessing any private capacity.
     // Count the original package once; no hidden child wallet/control exists.
-    let domains = prepare_domains(
+    let domains = super::graph_domains::prepare_domains_with_host(
         &index,
         &roots,
         package,

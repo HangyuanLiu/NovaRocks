@@ -547,60 +547,91 @@ pub(super) fn encode_with_host<H>(
     )?;
     let mut output = vector(inputs.len(), work)?;
     for input in inputs {
-        let mut args = vector(input.arguments.len(), work)?;
-        for ids in input.arguments {
-            let kind = match ids {
-                ArgumentTypeIds::Value(id) => wire::function_argument_type::Kind::ValueTypeId(*id),
-                ArgumentTypeIds::Lambda { parameters, result } => {
-                    let mut ids = vector(parameters.len(), work)?;
-                    for id in *parameters {
-                        ids.push(*id);
-                        work.step()?;
-                    }
-                    wire::function_argument_type::Kind::Lambda(wire::LambdaArgumentType {
-                        parameter_value_type_ids: ids,
-                        result_value_type_id: Some(*result),
-                    })
-                }
-            };
-            args.push(wire::FunctionArgumentType { kind: Some(kind) });
-            work.step()?;
-        }
-        let result = match input.result {
-            ResultTypeIds::Scalar(id) => {
-                wire::function_binding_definition::Result::ScalarValueTypeId(id)
-            }
-            ResultTypeIds::Relation(ids) => {
-                let mut values = vector(ids.len(), work)?;
-                for id in ids {
-                    values.push(*id);
-                    work.step()?;
-                }
-                wire::function_binding_definition::Result::Relation(wire::RelationResultTypes {
-                    value_type_ids: values,
-                })
-            }
-        };
-        let kind = match input.source {
-            BindingSource::Scalar(value) => scalar_kind(value.kind)?,
-            BindingSource::ResolvedScalar(value) => scalar_kind(value.kind)?,
-            BindingSource::Table(_) => wire::FunctionKind::Table,
-        };
-        let (function, overload) = names(input.source);
-        // All FIVE legacy fields are deliberately excluded: volatility,
-        // argument_evaluation, failure_behavior, intrinsic_row_error and
-        // semantic_parameters belong to migration/occurrence owners.
-        output.push(wire::FunctionBindingDefinition {
-            id: input.id,
-            function_id: string(function, work)?,
-            overload_id: string(overload, work)?,
-            kind: kind as i32,
-            arguments: args,
-            result: Some(result),
-        });
+        output.push(emit_binding_definition(
+            input,
+            &mut OriginalBindingEmission(work),
+        )?);
         work.step()?;
     }
     Ok((output, facts))
+}
+
+/// Sole field emission body. Type references have already been checked by the
+/// enclosing actual namespace owner. This is not binding or capability proof.
+pub(crate) trait BindingEmission {
+    type Error: From<BindingCodecError>;
+    fn vector<T>(&mut self, count: usize) -> Result<Vec<T>, Self::Error>;
+    fn string(&mut self, source: &str) -> Result<String, Self::Error>;
+    fn step(&mut self) -> Result<(), Self::Error>;
+}
+struct OriginalBindingEmission<'a, 'c>(&'a mut CompileCheckpoints<'c>);
+impl BindingEmission for OriginalBindingEmission<'_, '_> {
+    type Error = BindingCodecError;
+    fn vector<T>(&mut self, count: usize) -> Result<Vec<T>, Self::Error> {
+        vector(count, self.0)
+    }
+    fn string(&mut self, source: &str) -> Result<String, Self::Error> {
+        string(source, self.0)
+    }
+    fn step(&mut self) -> Result<(), Self::Error> {
+        self.0.step().map_err(Into::into)
+    }
+}
+pub(crate) fn emit_binding_definition<P: BindingEmission>(
+    input: &FunctionBindingInput<'_>,
+    emission: &mut P,
+) -> Result<wire::FunctionBindingDefinition, P::Error> {
+    let mut args = emission.vector(input.arguments.len())?;
+    for ids in input.arguments {
+        let kind = match ids {
+            ArgumentTypeIds::Value(id) => wire::function_argument_type::Kind::ValueTypeId(*id),
+            ArgumentTypeIds::Lambda { parameters, result } => {
+                let mut ids = emission.vector(parameters.len())?;
+                for id in *parameters {
+                    ids.push(*id);
+                    emission.step()?;
+                }
+                wire::function_argument_type::Kind::Lambda(wire::LambdaArgumentType {
+                    parameter_value_type_ids: ids,
+                    result_value_type_id: Some(*result),
+                })
+            }
+        };
+        args.push(wire::FunctionArgumentType { kind: Some(kind) });
+        emission.step()?;
+    }
+    let result = match input.result {
+        ResultTypeIds::Scalar(id) => {
+            wire::function_binding_definition::Result::ScalarValueTypeId(id)
+        }
+        ResultTypeIds::Relation(ids) => {
+            let mut values = emission.vector(ids.len())?;
+            for id in ids {
+                values.push(*id);
+                emission.step()?;
+            }
+            wire::function_binding_definition::Result::Relation(wire::RelationResultTypes {
+                value_type_ids: values,
+            })
+        }
+    };
+    let kind = match input.source {
+        BindingSource::Scalar(value) => scalar_kind(value.kind)?,
+        BindingSource::ResolvedScalar(value) => scalar_kind(value.kind)?,
+        BindingSource::Table(_) => wire::FunctionKind::Table,
+    };
+    let (function, overload) = names(input.source);
+    // All FIVE legacy fields are deliberately excluded: volatility,
+    // argument_evaluation, failure_behavior, intrinsic_row_error and
+    // semantic_parameters belong to migration/occurrence owners.
+    Ok(wire::FunctionBindingDefinition {
+        id: input.id,
+        function_id: emission.string(function)?,
+        overload_id: emission.string(overload)?,
+        kind: kind as i32,
+        arguments: args,
+        result: Some(result),
+    })
 }
 
 pub(crate) fn verify_scalar_signature(

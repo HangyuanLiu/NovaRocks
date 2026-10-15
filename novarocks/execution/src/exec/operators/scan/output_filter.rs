@@ -222,7 +222,7 @@ impl ScanOutputFilter {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .ok_or_else(|| "scan conjunct predicate must return boolean array".to_string())?;
-        let filtered_batch = filter_record_batch(&chunk.batch, filter_mask)
+        let filtered_batch = filter_record_batch(chunk.record_batch(), filter_mask)
             .map_err(|e| format!("scan conjunct filter failed: {}", e))?;
         if let Some(profiles) = profiles {
             profiles

@@ -29,6 +29,7 @@ pub mod matching;
 pub mod math;
 pub mod mv_state;
 pub mod object;
+mod opaque_binary;
 mod pattern_memo;
 pub mod string;
 pub mod struct_fn;
@@ -61,6 +62,7 @@ pub use math::eval_math_function;
 pub use math::eval_round;
 pub use mv_state::eval_mv_state_function;
 pub use object::eval_object_function;
+pub(super) use opaque_binary::{eval_json_to_text, eval_percentile_to_binary};
 pub use string::eval_split;
 pub use string::eval_string_function;
 pub use string::eval_substring;
@@ -96,6 +98,10 @@ pub enum FunctionKind {
     // Math functions
     Abs,
     Round,
+    /// Frozen original Percentile(Binary) to Physical(Binary) CAST leaf.
+    PercentileToBinary,
+    /// Frozen existing JSON-to-text same-carrier CAST, with exact child domains.
+    JsonToText,
 
     // Date/Time functions (generic dispatcher)
     Date(&'static str),
@@ -269,6 +275,12 @@ pub fn lookup_function(name: &str) -> Option<FunctionKind> {
 /// Get function metadata for validation.
 pub fn function_metadata(kind: FunctionKind) -> FunctionMetadata {
     match kind {
+        FunctionKind::PercentileToBinary | FunctionKind::JsonToText => FunctionMetadata {
+            name: "value_domain_conversion",
+            min_args: 1,
+            max_args: 1,
+            kind,
+        },
         FunctionKind::ArrayMap => FunctionMetadata {
             name: "array_map",
             min_args: 2,

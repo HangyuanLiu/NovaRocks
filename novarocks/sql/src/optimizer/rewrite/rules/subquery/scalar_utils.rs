@@ -131,7 +131,10 @@ fn join_output_columns(
 
 fn make_nullable(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
     for column in &mut columns {
-        column.value_type.nullable = true;
+        column.value_type = column
+            .value_type
+            .with_nullable(true)
+            .expect("validated root NULL contract");
     }
     columns
 }
@@ -943,21 +946,21 @@ mod tests {
             &arena,
         )
         .expect("left outer output columns");
-        assert!(!left_outer[0].value_type.nullable);
-        assert!(left_outer[1].value_type.nullable);
+        assert!(!left_outer[0].value_type.nullable());
+        assert!(left_outer[1].value_type.nullable());
 
         let right_outer = opt_output_columns(
             &join(left.clone(), right.clone(), JoinKind::RightOuter, None),
             &arena,
         )
         .expect("right outer output columns");
-        assert!(right_outer[0].value_type.nullable);
-        assert!(!right_outer[1].value_type.nullable);
+        assert!(right_outer[0].value_type.nullable());
+        assert!(!right_outer[1].value_type.nullable());
 
         let full_outer = opt_output_columns(&join(left, right, JoinKind::FullOuter, None), &arena)
             .expect("full outer output columns");
-        assert!(full_outer[0].value_type.nullable);
-        assert!(full_outer[1].value_type.nullable);
+        assert!(full_outer[0].value_type.nullable());
+        assert!(full_outer[1].value_type.nullable());
     }
     struct CheckControl {
         checks: std::sync::Mutex<Vec<u32>>,

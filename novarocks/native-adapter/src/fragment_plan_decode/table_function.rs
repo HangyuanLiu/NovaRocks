@@ -6,16 +6,25 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field};
 
-    use super::super::{DecodedNode, NativePlanDecodeContext, decode_node};
+    use super::super::{DecodedNode, NativePlanDecodeContext};
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::exec::node::table_function::TableFunctionOutputSlot;
-    use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_models::{common, expr, plan};
     use novarocks_types::SlotId;
 
+    fn decode_node(
+        node: &plan::DistributedNode,
+        arena: &mut ExprArena,
+        context: &NativePlanDecodeContext,
+    ) -> Result<DecodedNode, crate::fragment_error::NativeFragmentDecodeError> {
+        crate::fragment_expression::fixture_sources::with_decoder(|decoder| {
+            super::super::decode_node_with_types(node, arena, context, decoder)
+        })
+    }
+
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
-        encode_type(data_type).expect("encode type")
+        crate::fragment_expression::fixture_sources::type_desc(data_type)
     }
 
     fn output_column(column_id: u32, name: &str, data_type: DataType) -> common::OutputColumn {
@@ -30,6 +39,7 @@ mod tests {
 
     fn column_ref(column_id: u32, data_type: DataType) -> expr::Expr {
         expr::Expr {
+            original_definition_id: None,
             r#type: Some(type_desc(&data_type)),
             nullable: true,
             kind: Some(expr::expr::Kind::ColumnRef(expr::ColumnRef {

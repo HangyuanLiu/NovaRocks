@@ -40,7 +40,7 @@ fn original_concat_binding(
     for fragment in owner.plan().fragments().values() {
         for node in fragment.nodes().values() {
             if let NodeKind::Aggregate { calls, .. } = &node.kind {
-                if let Some((ordinal, source)) = calls.iter().enumerate().next() {
+                if let Some(source) = calls.first() {
                     let loan = owner
                         .borrow_call_dependency_observed(
                             SqlCallDependencySite::Aggregate {
@@ -48,7 +48,7 @@ fn original_concat_binding(
                                 node,
                                 site: PhysicalCallSite::Aggregate {
                                     node: node.id,
-                                    call: ordinal as u32,
+                                    call: 0,
                                 },
                                 source,
                             },

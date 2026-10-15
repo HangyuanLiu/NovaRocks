@@ -147,7 +147,16 @@ fn emitted_utf8_cast_override_retains_raw_before_normal_and_format() {
 fn canonicalized_equal_type_cast_does_not_resurrect_source_provenance() {
     let owner = authored(call(
         "time_format",
-        vec![cast(text("12:34:56"), DataType::Utf8), text("%f")],
+        vec![
+            {
+                let source = text("12:34:56");
+                let source_type = source.value_type.clone();
+                let mut equal_cast = cast(source, DataType::Utf8);
+                equal_cast.value_type = source_type;
+                equal_cast
+            },
+            text("%f"),
+        ],
     ));
     assert_eq!(author_shapes(&owner), vec![S::FormatOrdinary]);
 }
@@ -182,7 +191,8 @@ fn original_seconds_roundtrip_authors_only_original_integer_use() {
                     .get(source.sources[0].definition)
                     .unwrap()
                     .ty
-                    .data_type,
+                    .data_type()
+                    .clone(),
                 DataType::Int64
             );
         }

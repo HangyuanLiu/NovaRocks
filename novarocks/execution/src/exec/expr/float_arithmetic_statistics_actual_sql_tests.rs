@@ -89,14 +89,16 @@ fn authored(mode: SqlPhysicalEmissionMode) {
                 );
                 let mut expected =
                     arithmetic_result_value_type_with_op(left, right, operator).unwrap();
-                expected.nullable = true;
+                expected = expected
+                    .with_nullable(true)
+                    .expect("valid test root nullability");
                 assert_eq!(expr.ty, expected);
                 assert!(allow_throw_exception.is_some());
-                if matches!(left.data_type, DataType::Float32 | DataType::Float64)
-                    || matches!(right.data_type, DataType::Float32 | DataType::Float64)
+                if matches!(left.data_type(), DataType::Float32 | DataType::Float64)
+                    || matches!(right.data_type(), DataType::Float32 | DataType::Float64)
                 {
-                    assert_eq!(expr.ty.data_type, DataType::Float64);
-                    assert_eq!(expr.ty.logical_type, ValueLogicalType::Physical);
+                    assert_eq!(expr.ty.data_type().clone(), DataType::Float64);
+                    assert_eq!(expr.ty.logical_type(), ValueLogicalType::Physical);
                     float += 1;
                 }
             }

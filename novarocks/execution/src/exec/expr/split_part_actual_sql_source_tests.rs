@@ -60,9 +60,9 @@ fn check(mode: SqlPhysicalEmissionMode) {
                     panic!("real selected value argument")
                 };
                 assert_eq!(value_type, bound);
-                assert_eq!(bound.logical_type, ValueLogicalType::Physical);
+                assert_eq!(bound.logical_type(), ValueLogicalType::Physical);
                 assert_eq!(
-                    bound.data_type,
+                    bound.data_type().clone(),
                     if index < 2 {
                         DataType::Utf8
                     } else {

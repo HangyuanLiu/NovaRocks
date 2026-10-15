@@ -121,9 +121,9 @@ fn borrowed<'a>(
     control: &Control,
 ) -> Result<EncodedTypeTable<'a>, TypeCodecError> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
-    let result = encode_borrowed_type_table_writer_sources_in(
-        values,
-        fields,
+    let result = super::sender_tests::projected_roots_in(
+        ValueRootSources::Borrowed(values),
+        FieldRootSources::Borrowed(fields),
         writers,
         source,
         limits(),
@@ -142,10 +142,65 @@ fn field_definition(id: u32, carrier: u32, name: &str, nullable: bool) -> wire::
         name: name.into(),
         nullable,
         carrier_type_id: Some(carrier),
-        metadata: vec![],
-        dictionary_id: None,
-        dictionary_is_ordered: None,
+        logical_type_id: None,
+
+        value_binding_id: None,
     }
+}
+
+fn original_source_wire(recipe: &c::ConnectorWriteRecipeDraft, id: u32) -> wire::SourceFieldTable {
+    // Borrow the actual checked Writer recipe: its permissive source grammar
+    // is never replaced by a copied strict Field or execution declaration.
+    let ids: Vec<_> = recipe
+        .input()
+        .fields_iter()
+        .enumerate()
+        .map(|(ordinal, _)| {
+            if ordinal == 0 {
+                id
+            } else if id == u32::MAX {
+                u32::try_from(ordinal - 1).unwrap()
+            } else {
+                u32::try_from(ordinal).unwrap()
+            }
+        })
+        .collect();
+    let writers = [WriterTypeSource::new(recipe, &ids)];
+    let control = Control::default();
+    let encoded = borrowed(&[], &[], &writers, SOURCE, &control).unwrap();
+    let wire = encoded.as_source_wire().unwrap().clone();
+    let mut request = |_: std::alloc::Layout| Ok::<(), CompileControlError>(());
+    let mut opaque = |_: usize| Ok::<(), CompileControlError>(());
+    let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        &mut request,
+        &mut opaque,
+    );
+    // Explicit pure fixture creator, not a BE account. The same receiving
+    // parser must retain every original attribute/descriptor and source row.
+    let mut receiving =
+        CompileCheckpoints::try_new(&super::sender_tests::Setup, CompilePhase::Decode).unwrap();
+    let package = super::sender_tests::original_source_package(recipe, &ids, wire.clone());
+    let decoded = decode_package_type_table_with_creator_in(
+        &package,
+        SOURCE,
+        limits(),
+        &mut creation,
+        &mut receiving,
+    )
+    .unwrap();
+    for (field_id, binding) in ids.iter().zip(recipe.input().fields_iter()) {
+        let actual = decoded
+            .source_field_observed(*field_id, &mut receiving)
+            .unwrap()
+            .unwrap();
+        assert!(novarocks_type_contract::arrow_fields_exact(
+            actual,
+            binding.field()
+        ));
+    }
+    receiving.finish().unwrap();
+    wire
 }
 
 #[test]
@@ -170,7 +225,7 @@ fn borrowed_dictionary_and_strict_arc_preserve_original_loans_and_sparse_repeate
     let owned_fields = [(0, strict.clone()), (u32::MAX, strict.clone())];
     let old_control = Control::default();
     let mut old_work = CompileCheckpoints::try_new(&old_control, CompilePhase::Encode).unwrap();
-    let old = encode_type_table_writer_sources_observed(
+    let old = super::sender_tests::projected_in(
         &owned_values,
         &owned_fields,
         &[],
@@ -182,6 +237,7 @@ fn borrowed_dictionary_and_strict_arc_preserve_original_loans_and_sparse_repeate
     .unwrap();
     old_work.finish().unwrap();
     assert_eq!(encoded.as_wire(), old.as_wire());
+    assert_eq!(encoded.as_source_wire(), old.as_source_wire());
     assert_eq!(control.trace(), old_control.trace());
     assert_eq!(
         encoded
@@ -194,15 +250,30 @@ fn borrowed_dictionary_and_strict_arc_preserve_original_loans_and_sparse_repeate
     );
     assert_eq!(
         encoded
-            .as_wire()
+            .as_source_wire()
+            .unwrap()
+            .shape
+            .as_ref()
+            .unwrap()
             .fields
             .iter()
             .map(|v| v.id)
             .collect::<Vec<_>>(),
         [0, u32::MAX]
     );
-    // Repeated Dictionary roots emit independent three-carrier occurrences.
-    assert_eq!(encoded.as_wire().carriers.len(), 8);
+    // Borrowed execution roots are normalized; source fields remain separate occurrences.
+    assert_eq!(encoded.as_wire().carriers.len(), 2);
+    assert_eq!(
+        encoded
+            .as_source_wire()
+            .unwrap()
+            .shape
+            .as_ref()
+            .unwrap()
+            .carriers
+            .len(),
+        2
+    );
     let key_ids: Vec<_> = encoded
         .as_wire()
         .carriers
@@ -212,20 +283,17 @@ fn borrowed_dictionary_and_strict_arc_preserve_original_loans_and_sparse_repeate
             _ => None,
         })
         .collect();
-    assert_eq!(key_ids.len(), 2);
-    assert_ne!(key_ids[0], key_ids[1]);
+    assert!(key_ids.is_empty());
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
     for id in [0, u32::MAX] {
         let actual = encoded.value_type_observed(id, &mut work).unwrap().unwrap();
         assert!(std::ptr::eq(actual, &value));
-        let (DataType::Dictionary(actual_key, actual_value), DataType::Dictionary(key, inner)) =
-            (&actual.data_type, &value.data_type)
-        else {
-            panic!("Dictionary source");
-        };
-        assert!(std::ptr::eq(actual_key.as_ref(), key.as_ref()));
-        assert!(std::ptr::eq(actual_value.as_ref(), inner.as_ref()));
-        let actual_field = encoded.field_observed(id, &mut work).unwrap().unwrap();
+        assert_eq!(actual.data_type(), &DataType::Int64);
+        assert!(std::ptr::eq(actual.data_type(), value.data_type()));
+        let actual_field = encoded
+            .source_field_observed(id, &mut work)
+            .unwrap()
+            .unwrap();
         assert!(std::ptr::eq(actual_field, &strict));
         assert!(Arc::ptr_eq(actual_field, &strict));
         assert_eq!(
@@ -235,15 +303,11 @@ fn borrowed_dictionary_and_strict_arc_preserve_original_loans_and_sparse_repeate
         assert!(actual_field.metadata()["b"].ends_with('\0'));
     }
     work.finish().unwrap();
-    // Existing plain source API remains valid for the same strict roots.
-    let plain = encode_type_table_sources(
-        &owned_values,
-        &owned_fields,
-        strict_limits(),
-        &Control::default(),
-    )
-    .unwrap();
-    assert_eq!(plain.as_wire(), encoded.as_wire());
+    // Pure source projection retains the same original Arc loans/attributes.
+    let mut work = CompileCheckpoints::try_new(&old_control, CompilePhase::Encode).unwrap();
+    let plain = encode_source_field_table_pure_in(&fields, strict_limits(), &mut work).unwrap();
+    work.finish().unwrap();
+    assert_eq!(&plain, encoded.as_source_wire().unwrap());
 }
 
 #[test]
@@ -260,14 +324,20 @@ fn borrowed_writer_recipe_retains_permissive_original_fields_across_ordinals() {
     let ids = [0, u32::MAX];
     let writers = [WriterTypeSource::new(&recipe, &ids)];
     let encoded = borrowed(&[], &[], &writers, SOURCE, &Control::default()).unwrap();
-    let mut expected_first = field_definition(0, 0, "writer\0", false);
-    expected_first.metadata = vec![plan::ArrowFieldMetadataEntry {
-        key: "large".into(),
-        value: "雪".repeat(6826) + "ab",
-    }];
+    let expected_first = field_definition(0, 0, "writer\0", false);
+    let original = recipe.input().fields_iter().next().unwrap().field();
+    let source_wire = original_source_wire(&recipe, 0);
     assert_eq!(
-        encoded.as_wire(),
+        source_wire.field_facts[0].metadata,
+        vec![plan::ArrowFieldMetadataEntry {
+            key: "large".into(),
+            value: "雪".repeat(6826) + "ab",
+        }]
+    );
+    assert_eq!(
+        encoded.as_source_wire().unwrap().shape.as_ref().unwrap(),
         &wire::TypeTable {
+            logical_types: Vec::new(),
             carriers: vec![
                 wire::CarrierTypeDefinition {
                     id: 0,
@@ -289,7 +359,7 @@ fn borrowed_writer_recipe_retains_permissive_original_fields_across_ordinals() {
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
     for (id, binding) in ids.iter().zip(recipe.input().fields_iter()) {
         let actual = encoded
-            .field_source_observed(*id, &mut work)
+            .source_field_source_observed(*id, &mut work)
             .unwrap()
             .unwrap();
         assert!(std::ptr::eq(actual, binding.field()));
@@ -297,7 +367,7 @@ fn borrowed_writer_recipe_retains_permissive_original_fields_across_ordinals() {
     }
     work.finish().unwrap();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
-    let old = encode_type_table_writer_sources_observed(
+    let old = super::sender_tests::projected_in(
         &[],
         &[],
         &writers,
@@ -315,9 +385,7 @@ fn borrowed_writer_recipe_retains_permissive_original_fields_across_ordinals() {
     )];
     assert!(matches!(
         encode_type_table_sources(&[], &strict, strict_limits(), &Control::default()),
-        Err(TypeCodecError::InvalidShape(
-            "Arrow field metadata entry exceeds its owner bound"
-        ))
+        Err(TypeCodecError::InvalidShape(_))
     ));
 }
 
@@ -470,7 +538,7 @@ fn borrowed_tuple_floor_uses_actual_loan_geometry_and_preserves_owned_legal_base
         .unwrap()
         .size()
         + size_of_val(&owned_values);
-    let old = encode_type_table_writer_sources_observed(
+    let old = super::sender_tests::projected_in(
         &owned_values,
         &[],
         &[],

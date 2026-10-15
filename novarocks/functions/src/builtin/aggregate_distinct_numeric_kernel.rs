@@ -66,14 +66,14 @@ impl DistinctNumericKernel {
         else {
             unreachable!("validated numeric value argument")
         };
-        &source.data_type
+        source.data_type()
     }
     fn output_type(&self) -> &DataType {
         let FunctionResultType::Scalar(result) = &self.contract.call().selected().result_type
         else {
             unreachable!("validated scalar result")
         };
-        &result.data_type
+        result.data_type()
     }
 }
 impl PreparedAggregateKernel for DistinctNumericKernel {
@@ -392,7 +392,7 @@ pub(super) fn validate_contract(
     let FunctionResultType::Scalar(result) = &selected.result_type else {
         return Err(invalid("numeric DISTINCT requires a scalar result"));
     };
-    let expected = match (&source.data_type, operation) {
+    let expected = match (source.data_type(), operation) {
         (
             DataType::Int8
             | DataType::Int16
@@ -416,22 +416,22 @@ pub(super) fn validate_contract(
             ty,
         )
         .ok_or_else(|| invalid("numeric DISTINCT decimal output is unsupported"))?,
-        (ty @ DataType::Decimal256(..), DistinctOperation::Avg) => ty.clone(),
+        (ty @ DataType::Decimal256(..), DistinctOperation::Avg) => ty.clone().clone(),
         _ => {
             return Err(invalid(&format!(
                 "{} has no installed numeric DISTINCT input profile for {:?}",
                 contract.call().function_id().as_str(),
-                source.data_type,
+                source.data_type(),
             )));
         }
     };
     work.step()
         .map_err(crate::kernel_control::compile_failure)?;
-    if source.logical_type != ValueLogicalType::Physical
-        || result.logical_type != ValueLogicalType::Physical
-        || result.data_type != expected
-        || contract.intermediate_type().logical_type != ValueLogicalType::Physical
-        || contract.intermediate_type().data_type != DataType::Binary
+    if source.logical_type() != ValueLogicalType::Physical
+        || result.logical_type() != ValueLogicalType::Physical
+        || result.data_type() != &expected
+        || contract.intermediate_type().logical_type() != ValueLogicalType::Physical
+        || contract.intermediate_type().data_type() != &DataType::Binary
     {
         return Err(invalid(
             "numeric DISTINCT selected input, result or state domain differs from its owner",

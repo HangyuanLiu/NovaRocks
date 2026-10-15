@@ -26,6 +26,7 @@ novarocks-query-application.workspace = true
 novarocks-result-contract.workspace = true
 novarocks-result-render.workspace = true
 novarocks-types.workspace = true
+novarocks-type-contract.workspace = true
 novarocks-workload-control.workspace = true
 opensrv-mysql = { version = "0.7", default-features = false }
 sha2 = { workspace = true, optional = true }

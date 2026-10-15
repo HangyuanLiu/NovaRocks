@@ -96,10 +96,18 @@ pub struct MaterializedFunctionBindings<'loan, 'source> {
     source_invoice: usize,
     retained_bytes: usize,
     facts: BindingProjectionFacts,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
+    construction_request_upper: Option<usize>,
 }
 impl<'loan, 'source> MaterializedFunctionBindings<'loan, 'source> {
     pub fn definitions(&self) -> &[(u32, MaterializedFunctionBinding)] {
         &self.definitions
+    }
+    /// Completed original-author construction upper, including temporary
+    /// requests. Pure authors have no supplied construction provenance.
+    /// This is not precise retained bytes, a capacity grant or a MEM ledger.
+    pub fn creation_request_bytes_upper_bound(&self) -> Option<usize> {
+        self.construction_request_upper
     }
     pub fn facts(&self) -> &BindingProjectionFacts {
         &self.facts
@@ -691,8 +699,25 @@ fn preflight(
     for definition in headers.as_wire() {
         model.items = add(model.items, definition.arguments.len())?;
         model.request::<FunctionArgumentType>(definition.arguments.len(), 2)?;
+        if !definition.arguments.is_empty() {
+            model.request_layouts(
+                novarocks_type_contract::FunctionArgumentTypes::storage_allocation_layout()
+                    .map_err(Error::Resource)?,
+                1,
+            )?;
+        }
         model.request::<u8>(definition.function_id.len(), 1)?;
         model.request::<u8>(definition.overload_id.len(), 1)?;
+        model.request_layouts(
+            FunctionId::storage_allocation_layout()
+                .map_err(|_| CompileControlError::ResourceExhausted)?,
+            1,
+        )?;
+        model.request_layouts(
+            FunctionOverloadId::storage_allocation_layout()
+                .map_err(|_| CompileControlError::ResourceExhausted)?,
+            1,
+        )?;
         if observed {
             model.check_admitted(limits, admit)?;
         } else {
@@ -710,6 +735,9 @@ fn preflight(
                         add(lambda.parameter_value_type_ids.len(), 1)?,
                     )?;
                     model.request::<FunctionValueType>(lambda.parameter_value_type_ids.len(), 2)?;
+                    if !lambda.parameter_value_type_ids.is_empty() {
+                        model.request_layouts(novarocks_type_contract::FunctionParameterTypes::storage_allocation_layout().map_err(Error::Resource)?,1)?;
+                    }
                 }
                 None => {
                     w.step()?;
@@ -734,6 +762,14 @@ fn preflight(
                     relation.value_type_ids.len(),
                 )?;
                 model.request::<FunctionValueType>(relation.value_type_ids.len(), 2)?;
+                if !relation.value_type_ids.is_empty() {
+                    model.request_layouts(
+                        novarocks_type_contract::FunctionParameterTypes::storage_allocation_layout(
+                        )
+                        .map_err(Error::Resource)?,
+                        1,
+                    )?;
+                }
             }
             None => {
                 w.step()?;
@@ -881,102 +917,165 @@ fn materialize_in<'loan, 'source>(
     token: PreparedFunctionBindingsMaterialization<'loan, 'source>,
     w: &mut CompileCheckpoints<'_>,
 ) -> Result<MaterializedFunctionBindings<'loan, 'source>, Error> {
+    materialize_core::<std::convert::Infallible>(token, None, w)
+        .map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+}
+fn materialize_core<'loan, 'source, H>(
+    token: PreparedFunctionBindingsMaterialization<'loan, 'source>,
+    creator: Option<&mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>>,
+    w: &mut CompileCheckpoints<'_>,
+) -> Result<MaterializedFunctionBindings<'loan, 'source>, super::creation::Failure<H>> {
+    let mut construction = super::creation::Construction { creator };
+    let storage = construction.storage();
+    let construction_request_upper = construction
+        .creator
+        .as_ref()
+        .map(|_| token.facts.request_bytes_upper_bound);
+    w.step()?;
     (|| {
-        let mut definitions = reserve(token.headers.as_wire().len(), w)?;
+        let mut definitions = construction.reserve(token.headers.as_wire().len(), w)?;
         for raw in token.headers.as_wire() {
-            // These original constructors own exact identity validation/copy.
-            // Header bounds guarantee at most 1024 trusted UTF8 bytes each.
-            w.flush()?;
-            let function = completed(
-                FunctionId::try_new(&raw.function_id)
-                    .map_err(|_| shape("materialized function identity is invalid")),
-                w,
-            )?;
-            w.flush()?;
-            w.flush()?;
-            let overload = completed(
-                FunctionOverloadId::try_new(&raw.overload_id)
-                    .map_err(|_| shape("materialized overload identity is invalid")),
-                w,
-            )?;
-            w.flush()?;
-            let mut arguments = reserve(raw.arguments.len(), w)?;
-            for argument in &raw.arguments {
-                let value = match &argument.kind {
-                    Some(wire::function_argument_type::Kind::ValueTypeId(id)) => {
-                        FunctionArgumentType::Value(clone_type(token.headers.type_table(), *id, w)?)
-                    }
-                    Some(wire::function_argument_type::Kind::Lambda(lambda)) => {
-                        let mut parameters = reserve(lambda.parameter_value_type_ids.len(), w)?;
-                        for id in &lambda.parameter_value_type_ids {
-                            parameters.push(clone_type(token.headers.type_table(), *id, w)?);
-                            w.step()?;
-                        }
-                        FunctionArgumentType::Lambda {
-                            parameter_types: boxed(parameters, w)?,
-                            result_type: clone_type(
-                                token.headers.type_table(),
-                                lambda
-                                    .result_value_type_id
-                                    .ok_or_else(|| shape("materialized Lambda result is absent"))?,
-                                w,
-                            )?,
-                        }
-                    }
-                    None => return Err(shape("materialized binding argument changed")),
-                };
-                arguments.push(value);
-                w.step()?;
-            }
-            let arguments = boxed(arguments, w)?;
-            let binding = match (&raw.result, wire::FunctionKind::try_from(raw.kind)) {
-                (
-                    Some(wire::function_binding_definition::Result::ScalarValueTypeId(id)),
-                    Ok(kind),
-                ) => {
-                    let kind = match kind {
-                        wire::FunctionKind::Scalar => FunctionKind::Scalar,
-                        wire::FunctionKind::Aggregate => FunctionKind::Aggregate,
-                        wire::FunctionKind::Window => FunctionKind::Window,
-                        _ => return Err(shape("materialized scalar result has a different kind")),
-                    };
-                    MaterializedFunctionBinding::Scalar(BoundFunction::from_exact_signature(
-                        function,
-                        overload,
-                        kind,
-                        arguments,
-                        clone_type(token.headers.type_table(), *id, w)?,
-                    ))
-                }
-                (
-                    Some(wire::function_binding_definition::Result::Relation(relation)),
-                    Ok(wire::FunctionKind::Table),
-                ) => {
-                    let mut result = reserve(relation.value_type_ids.len(), w)?;
-                    for id in &relation.value_type_ids {
-                        result.push(clone_type(token.headers.type_table(), *id, w)?);
-                        w.step()?;
-                    }
-                    MaterializedFunctionBinding::Table(BoundTableFunction::from_exact_signature(
-                        function,
-                        overload,
-                        arguments,
-                        boxed(result, w)?,
-                    ))
-                }
-                _ => return Err(shape("materialized binding kind and result differ")),
-            };
+            let binding = materialize_definition_in(raw, &mut construction, w, &mut |id, w| {
+                clone_type(token.headers.type_table(), id, w)
+                    .map_err(crate::host_projection_v2::ProjectionFailure::Codec)
+            })?;
             definitions.push((raw.id, binding));
             w.step()?;
         }
         Ok(MaterializedFunctionBindings {
-            definitions: boxed(definitions, w)?,
+            definitions: construction.boxed(definitions, w)?,
             headers: token.headers,
             source_invoice: token.source_invoice,
             retained_bytes: token.retained_bytes,
             facts: token.facts,
+            _storage: storage,
+            construction_request_upper,
         })
     })()
+}
+
+fn materialize_definition_in<H>(
+    raw: &wire::FunctionBindingDefinition,
+    construction: &mut super::creation::Construction<'_, H>,
+    w: &mut CompileCheckpoints<'_>,
+    clone_type: &mut impl FnMut(
+        u32,
+        &mut CompileCheckpoints<'_>,
+    ) -> Result<FunctionValueType, super::creation::Failure<H>>,
+) -> Result<MaterializedFunctionBinding, super::creation::Failure<H>> {
+    let function = construction.function(&raw.function_id, w)?;
+    let overload = construction.overload(&raw.overload_id, w)?;
+    let mut arguments = construction.reserve(raw.arguments.len(), w)?;
+    for argument in &raw.arguments {
+        let value = match &argument.kind {
+            Some(wire::function_argument_type::Kind::ValueTypeId(id)) => {
+                FunctionArgumentType::Value(clone_type(*id, w)?)
+            }
+            Some(wire::function_argument_type::Kind::Lambda(lambda)) => {
+                let mut parameters =
+                    construction.reserve(lambda.parameter_value_type_ids.len(), w)?;
+                for id in &lambda.parameter_value_type_ids {
+                    parameters.push(clone_type(*id, w)?);
+                    w.step()?;
+                }
+                FunctionArgumentType::Lambda {
+                    parameter_types: {
+                        let boxed = construction.boxed(parameters, w)?;
+                        construction.collection(boxed, w)?
+                    },
+                    result_type: clone_type(
+                        lambda
+                            .result_value_type_id
+                            .ok_or_else(|| shape("materialized Lambda result is absent"))?,
+                        w,
+                    )?,
+                }
+            }
+            None => return Err(shape("materialized binding argument changed").into()),
+        };
+        arguments.push(value);
+        w.step()?;
+    }
+    let boxed_arguments = construction.boxed(arguments, w)?;
+    let arguments = construction.collection(boxed_arguments, w)?;
+    let binding = match (&raw.result, wire::FunctionKind::try_from(raw.kind)) {
+        (Some(wire::function_binding_definition::Result::ScalarValueTypeId(id)), Ok(kind)) => {
+            let kind = match kind {
+                wire::FunctionKind::Scalar => FunctionKind::Scalar,
+                wire::FunctionKind::Aggregate => FunctionKind::Aggregate,
+                wire::FunctionKind::Window => FunctionKind::Window,
+                _ => {
+                    return Err(shape("materialized scalar result has a different kind").into());
+                }
+            };
+            MaterializedFunctionBinding::Scalar(BoundFunction::from_exact_signature(
+                function,
+                overload,
+                kind,
+                arguments,
+                clone_type(*id, w)?,
+            ))
+        }
+        (
+            Some(wire::function_binding_definition::Result::Relation(relation)),
+            Ok(wire::FunctionKind::Table),
+        ) => {
+            let mut result = construction.reserve(relation.value_type_ids.len(), w)?;
+            for id in &relation.value_type_ids {
+                result.push(clone_type(*id, w)?);
+                w.step()?;
+            }
+            MaterializedFunctionBinding::Table(BoundTableFunction::from_exact_signature(
+                function,
+                overload,
+                arguments,
+                {
+                    let boxed = construction.boxed(result, w)?;
+                    construction.collection(boxed, w)?
+                },
+            ))
+        }
+        _ => return Err(shape("materialized binding kind and result differ").into()),
+    };
+    Ok(binding)
+}
+
+/// Project one exact definition from the PlanTree execution type namespace.
+/// The original signature grammar and constructor body are shared with v2.
+/// No installed owner, context, original request or effect is inferred here.
+pub fn materialize_execution_binding_with_creator_in<H>(
+    raw: &wire::FunctionBindingDefinition,
+    types: &crate::execution_type_table::DecodedExecutionTypeTable,
+    creation: &mut dyn novarocks_type_contract::ValueSchemaCreationScope<H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<MaterializedFunctionBinding, super::creation::Failure<H>> {
+    let mut lookup = |id, work: &mut CompileCheckpoints<'_>| {
+        work.flush()?;
+        let present = types
+            .get_observed(id, work)
+            .map_err(|error| Error::from(crate::physical_type_v2::TypeCodecError::from(error)))?
+            .is_some();
+        work.step()?;
+        work.flush()?;
+        if present {
+            Ok(())
+        } else {
+            Err(shape("binding header value type is absent"))
+        }
+    };
+    super::read::validate_definitions_with_lookup(std::slice::from_ref(raw), &mut lookup, work)?;
+    let mut construction = super::creation::Construction {
+        creator: Some(creation),
+    };
+    materialize_definition_in(raw, &mut construction, work, &mut |id, work| {
+        let source = types
+            .get_observed(id, work)
+            .map_err(|error| Error::from(crate::physical_type_v2::TypeCodecError::from(error)))?
+            .ok_or_else(|| shape("materialized binding value type is absent"))?;
+        source
+            .clone_observed(|| work.step())
+            .map_err(|cause| Error::Control(cause).into())
+    })
 }
 
 /// Original preparation with growing binding facts and no scope entry/footer.
@@ -1027,3 +1126,18 @@ pub fn materialize_function_bindings_in<'loan, 'source>(
 #[cfg(test)]
 #[path = "materialize_tests.rs"]
 mod tests;
+
+/// Strong consumer of the original token. Numeric facts remain structural
+/// observations; every actual constructor request goes to the supplied host.
+pub fn materialize_function_bindings_with_creator_in<'loan, 'source, H>(
+    token: PreparedFunctionBindingsMaterialization<'loan, 'source>,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<MaterializedFunctionBindings<'loan, 'source>, super::creation::Failure<H>> {
+    let same = std::ptr::addr_eq(work.control(), token.headers.original_control());
+    work.step()?;
+    if !same {
+        return Err(shape("binding materialization has a different original control").into());
+    }
+    materialize_core(token, Some(creation), work)
+}

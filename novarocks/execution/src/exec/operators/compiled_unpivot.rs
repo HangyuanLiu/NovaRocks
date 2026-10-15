@@ -37,27 +37,37 @@
 //! `UnpivotExpansion` core; the writer's grouped Unpivot runs it once per
 //! target with that target's own mappings.
 
+use std::alloc::Layout;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, Int32Array, ListArray, MapArray, StringArray, StructArray};
 use arrow::buffer::OffsetBuffer;
-use arrow::datatypes::{DataType, FieldRef, SchemaRef};
+use arrow::datatypes::{DataType, FieldRef};
 use arrow::record_batch::RecordBatch;
 use novarocks_local_program::{
     LocalProgram, ProgramExpressionRootSite, ProgramNodeExpressionRole, ProgramNodeId,
-    ProgramNodeKind, UnpivotConstant,
+    ProgramNodeKind, StaticLayout, UnpivotConstant,
 };
 use novarocks_types::SlotId;
 
-use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances};
-use super::unpivot_processor::{concat_owned, flattened_segments, next_bounded_output};
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
+use super::compiled_expression::{RuntimeKernelControl, evaluate_all, instances, root_value_type};
+use super::unpivot_processor::{
+    concat_owned, concat_owned_with_construction, flattened_segments, next_bounded_output,
+    next_bounded_output_with_construction, unpivot_copy_failure, unpivot_vec,
+};
+use crate::exec::chunk::{Chunk, ChunkBatchProjection, ChunkSchemaRef};
 use crate::exec::expr::compiled_program::CompiledExpressionInstance;
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{
+    ConstructionFailure, InputConstructionFactory, InputConstructionOwner, Operator,
+    ProcessorOperator,
+};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use novarocks_functions::array_projection::ArrayNormalizationStep;
+use novarocks_functions::{KernelEvaluationControl, KernelFailure};
+use novarocks_type_contract::{ValueSchemaCreation, ValueTypeStorageLifetime};
 
 /// The frozen source of one literal channel for one mapping.
 #[derive(Clone)]
@@ -89,14 +99,13 @@ pub(crate) enum Producer {
 pub struct CompiledUnpivotProcessorFactory {
     name: String,
     program: Arc<LocalProgram>,
-    /// The frozen input port; channels are read by position.
-    input: SchemaRef,
     sites: Vec<ProgramExpressionRootSite>,
     producers: Arc<[Producer]>,
     mappings: usize,
     max_output_rows: usize,
     max_output_bytes: usize,
-    output: ChunkSchemaRef,
+    output_layout: StaticLayout,
+    input_layout: StaticLayout,
     error: Arc<RuntimeErrorState>,
 }
 
@@ -169,7 +178,26 @@ impl CompiledUnpivotProcessorFactory {
                 .position(|candidate| *candidate == slot)
                 .ok_or_else(|| invalid(format!("writes slot {slot} outside its output")))
         };
-        let input_type = |ordinal: usize| input_layout.schema().field(ordinal).data_type();
+        if !input_layout.is_typed() || !layout.is_typed() {
+            return Err(invalid(
+                "requires complete typed input and output declarations".to_owned(),
+            ));
+        }
+        let binding_matches = |source: usize, target: usize| -> Result<bool, String> {
+            let source = input_layout
+                .value_binding(input_layout.slots()[source])
+                .ok_or_else(|| invalid("has no source value binding".to_owned()))?;
+            let target = layout
+                .value_binding(layout.slots()[target])
+                .ok_or_else(|| invalid("has no target value binding".to_owned()))?;
+            Ok((!source.nullable() || target.nullable())
+                && source
+                    .borrowed()
+                    .same_physical_binding_ignoring_root_nullability_observed(
+                        target.borrowed(),
+                        || Ok::<(), String>(()),
+                    )?)
+        };
         let output_type = |ordinal: usize| layout.schema().field(ordinal).data_type();
         let mut producers: Vec<Option<Producer>> = vec![None; layout.slots().len()];
         let mut assign = |ordinal: usize, producer: Producer| {
@@ -183,7 +211,7 @@ impl CompiledUnpivotProcessorFactory {
         for column in passthrough_columns {
             let source = input_ordinal(column.input_slot_id)?;
             let target = output_ordinal(column.output_slot_id)?;
-            if input_type(source) != output_type(target) {
+            if !binding_matches(source, target)? {
                 return Err(invalid(format!(
                     "passthrough slot {} changes type",
                     column.input_slot_id
@@ -195,7 +223,7 @@ impl CompiledUnpivotProcessorFactory {
         let mut value_inputs = Vec::with_capacity(value_mappings.len());
         for mapping in value_mappings {
             let source = input_ordinal(mapping.input_value_slot_id)?;
-            if input_type(source) != output_type(value) {
+            if !binding_matches(source, value)? {
                 return Err(invalid(format!(
                     "value slot {} differs from the value channel type",
                     mapping.input_value_slot_id
@@ -228,10 +256,33 @@ impl CompiledUnpivotProcessorFactory {
                                     .map_err(|_| invalid("has too many literals".to_string()))?,
                             },
                         });
+                        let declared =
+                            root_value_type(&program, *sites.last().expect("site was added"))?;
+                        let target_binding = layout
+                            .value_binding(*slot)
+                            .ok_or_else(|| invalid("literal binding is absent".to_owned()))?;
+                        if (declared.nullable() && !target_binding.nullable())
+                            || !declared
+                                .typed_binding()
+                                .borrowed()
+                                .same_physical_binding_ignoring_root_nullability_observed(
+                                    target_binding.borrowed(),
+                                    || Ok::<(), String>(()),
+                                )?
+                        {
+                            return Err(invalid(
+                                "literal changes its complete value declaration".to_owned(),
+                            ));
+                        }
                         LiteralSource::Root(sites.len() - 1)
                     }
                     UnpivotConstant::Int32List(values) => {
-                        if list_item_field(output_type(target)).is_none() {
+                        if list_item_field(output_type(target)).is_none()
+                            || !matches!(
+                                layout.value_binding(*slot).map(|binding| binding.value_type().kind()),
+                                Some(novarocks_type_contract::ValueKind::List(item)) if matches!(item.kind(), novarocks_type_contract::ValueKind::Scalar(DataType::Int32))
+                            )
+                        {
                             return Err(invalid(format!(
                                 "Int32List constant targets {:?}",
                                 output_type(target)
@@ -240,7 +291,12 @@ impl CompiledUnpivotProcessorFactory {
                         LiteralSource::Int32List(Arc::from(values.as_slice()))
                     }
                     UnpivotConstant::Utf8Map(entries) => {
-                        if map_entries_field(output_type(target)).is_none() {
+                        if map_entries_field(output_type(target)).is_none()
+                            || !matches!(
+                                layout.value_binding(*slot).map(|binding| binding.value_type().kind()),
+                                Some(novarocks_type_contract::ValueKind::Map { key, value }) if matches!(key.kind(), novarocks_type_contract::ValueKind::String) && matches!(value.kind(), novarocks_type_contract::ValueKind::String)
+                            )
+                        {
                             return Err(invalid(format!(
                                 "Utf8Map constant targets {:?}",
                                 output_type(target)
@@ -268,20 +324,20 @@ impl CompiledUnpivotProcessorFactory {
                 producer.ok_or_else(|| invalid(format!("output channel {ordinal} has no producer")))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let output = ChunkSchema::from_compiled_layout(layout)?;
-        let input = input_layout.schema().clone();
+        let output_layout = layout.clone();
+        let input_layout = input_layout.clone();
         let (max_output_rows, max_output_bytes) = (*max_output_rows, *max_output_bytes);
         let mappings = value_mappings.len();
         Ok(Self {
             name: format!("COMPILED_UNPIVOT (node={at})"),
             program,
-            input,
             sites,
             producers: Arc::from(producers),
             mappings,
             max_output_rows,
             max_output_bytes,
-            output,
+            output_layout,
+            input_layout,
             error,
         })
     }
@@ -296,17 +352,18 @@ impl OperatorFactory for CompiledUnpivotProcessorFactory {
         Box::new(CompiledUnpivotProcessor {
             name: self.name.clone(),
             program: Arc::clone(&self.program),
-            input_schema: Arc::clone(&self.input),
             sites: self.sites.clone(),
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             instances: None,
-            expansion: UnpivotExpansion::new(
-                Arc::clone(&self.producers),
-                Arc::clone(&self.output),
-                self.mappings,
-                self.max_output_rows,
-                self.max_output_bytes,
-            ),
+            expansion: None,
+            output_layout: self.output_layout.clone(),
+            input_layout: self.input_layout.clone(),
+            producers: self.producers.clone(),
+            mappings: self.mappings,
+            max_output_rows: self.max_output_rows,
+            max_output_bytes: self.max_output_bytes,
+            construction: None,
+            instance_storage: None,
             mem_tracker: None,
             finishing: false,
             finished: false,
@@ -316,8 +373,9 @@ impl OperatorFactory for CompiledUnpivotProcessorFactory {
 
 /// One input batch and its evaluated scalar constant columns.
 struct Expanding {
-    batch: RecordBatch,
+    batch: ChunkBatchProjection,
     constants: Vec<ArrayRef>,
+    storage: Option<ValueTypeStorageLifetime>,
 }
 
 /// The reusable Unpivot expansion: each input row becomes one output row per
@@ -363,7 +421,7 @@ impl UnpivotExpansion {
     /// columns, one per `LiteralSource::Root` index.
     pub(crate) fn start(
         &mut self,
-        batch: RecordBatch,
+        batch: ChunkBatchProjection,
         constants: Vec<ArrayRef>,
     ) -> ExecutionResult<()> {
         if self.input.is_some() {
@@ -390,8 +448,31 @@ impl UnpivotExpansion {
                 }
             }
         }
-        self.input = Some(Expanding { batch, constants });
+        self.input = Some(Expanding {
+            batch,
+            constants,
+            storage: None,
+        });
         self.cursor = 0;
+        Ok(())
+    }
+
+    /// A complete typed caller supplies both original backing responsibility
+    /// and the actual owner of its freshly sliced constant/reference scaffolds.
+    /// This shares the existing start/type gate; it creates no second decoder.
+    pub(crate) fn start_typed(
+        &mut self,
+        batch: ChunkBatchProjection,
+        constants: Vec<ArrayRef>,
+        storage: ValueTypeStorageLifetime,
+    ) -> ExecutionResult<()> {
+        if !self.output.is_typed() {
+            return Err(ConstructionFailure::MissingOwner.into());
+        }
+        self.start(batch, constants)?;
+        if let Some(input) = &mut self.input {
+            input.storage = Some(storage);
+        }
         Ok(())
     }
 
@@ -404,7 +485,7 @@ impl UnpivotExpansion {
             return Ok(None);
         };
         let total =
-            input.batch.num_rows().checked_mul(self.mappings).ok_or(
+            input.batch.len().checked_mul(self.mappings).ok_or(
                 "ResourceExhausted: unpivot expanded row count exceeds addressable memory",
             )?;
         let (producers, output, cursor) = (&self.producers, &self.output, self.cursor);
@@ -423,16 +504,55 @@ impl UnpivotExpansion {
         }
         Ok(Some(chunk))
     }
+    pub(crate) fn next_typed(
+        &mut self,
+        tracker: Option<&Arc<MemTracker>>,
+        factory: &dyn InputConstructionFactory,
+        control: &dyn KernelEvaluationControl,
+    ) -> ExecutionResult<Option<Chunk>> {
+        let Some(input) = self.input.as_ref() else {
+            return Ok(None);
+        };
+        let total = input
+            .batch
+            .len()
+            .checked_mul(self.mappings)
+            .ok_or(KernelFailure::ResourceExhausted)?;
+        let (producers, output, cursor) = (&self.producers, &self.output, self.cursor);
+        let (chunk, rows) = next_bounded_output_with_construction(
+            total - cursor,
+            self.max_output_rows,
+            self.max_output_bytes,
+            &mut self.hint,
+            tracker,
+            factory,
+            control,
+            |len| build_output_typed(producers, output, input, cursor, len, factory, control),
+        )?;
+        self.cursor += rows;
+        if self.cursor == total {
+            self.input = None;
+            self.cursor = 0;
+        }
+        Ok(Some(chunk))
+    }
 }
 
 struct CompiledUnpivotProcessor {
     name: String,
     program: Arc<LocalProgram>,
-    input_schema: SchemaRef,
     sites: Vec<ProgramExpressionRootSite>,
     control: RuntimeKernelControl,
     instances: Option<Vec<CompiledExpressionInstance>>,
-    expansion: UnpivotExpansion,
+    expansion: Option<UnpivotExpansion>,
+    output_layout: StaticLayout,
+    input_layout: StaticLayout,
+    producers: Arc<[Producer]>,
+    mappings: usize,
+    max_output_rows: usize,
+    max_output_bytes: usize,
+    construction: Option<Arc<dyn InputConstructionFactory>>,
+    instance_storage: Option<ValueTypeStorageLifetime>,
     mem_tracker: Option<Arc<MemTracker>>,
     finishing: bool,
     finished: bool,
@@ -454,10 +574,10 @@ fn int32_list(item: &FieldRef, values: &[i32], copies: usize) -> Result<ArrayRef
     .map_err(|error| format!("compiled Unpivot Int32List constant: {error}"))
 }
 
-fn utf8_map(
+fn utf8_map<T: AsRef<str>>(
     entries_field: &FieldRef,
     sorted: bool,
-    entries: &[(Arc<str>, Arc<str>)],
+    entries: &[(T, T)],
     copies: usize,
 ) -> Result<ArrayRef, String> {
     let DataType::Struct(fields) = entries_field.data_type() else {
@@ -499,46 +619,359 @@ fn build_output(
     start: usize,
     len: usize,
 ) -> Result<Chunk, String> {
-    let segments = flattened_segments(start, len, input.batch.num_rows());
+    let segments = flattened_segments(start, len, input.batch.len());
     let schema = output.arrow_schema_ref();
-    let mut columns = Vec::with_capacity(producers.len());
-    for (ordinal, producer) in producers.iter().enumerate() {
-        let field = schema.field(ordinal);
-        let mut parts = Vec::with_capacity(segments.len());
-        for segment in &segments {
-            let (offset, rows) = (segment.input_offset, segment.len);
-            parts.push(match producer {
-                Producer::Passthrough { input: source } => {
-                    input.batch.column(*source).slice(offset, rows)
-                }
-                Producer::Value { inputs } => input
-                    .batch
-                    .column(inputs[segment.mapping_index])
-                    .slice(offset, rows),
-                Producer::Literal { sources } => match &sources[segment.mapping_index] {
-                    LiteralSource::Root(root) => input.constants[*root].slice(offset, rows),
-                    LiteralSource::Int32List(values) => {
-                        let item = list_item_field(field.data_type())
-                            .ok_or("compiled Unpivot list channel changed type")?;
-                        int32_list(item, values, rows)?
-                    }
-                    LiteralSource::Utf8Map(entries) => {
-                        let (entries_field, sorted) = map_entries_field(field.data_type())
-                            .ok_or("compiled Unpivot map channel changed type")?;
-                        utf8_map(entries_field, sorted, entries, rows)?
-                    }
-                },
-            });
-        }
-        let slot = output.slot_ids()[ordinal];
-        columns.push(concat_owned(parts, slot)?);
-    }
+    let columns = build_columns(
+        producers,
+        &schema,
+        input,
+        &segments,
+        |_, count| Ok::<_, String>(Vec::with_capacity(count)),
+        |array, offset, rows| Ok(array.slice(offset, rows)),
+        |literal, field, rows| materialize_literal(literal, field, rows),
+        |parts, ordinal| concat_owned(parts, output.slot_ids()[ordinal]),
+    )?;
     let batch = RecordBatch::try_new(schema, columns)
         .map_err(|error| format!("compiled Unpivot output: {error}"))?;
     Chunk::try_new_with_chunk_schema(batch, Arc::clone(output))
 }
 
+/// Borrow the existing frozen protocol; strings are never recopied to share
+/// the constructor with the native generic Unpivot source.
+pub(crate) enum FixedLiteralView<'a, T: AsRef<str>> {
+    Int32List(&'a [i32]),
+    Utf8Map(&'a [(T, T)]),
+}
+pub(crate) fn materialize_fixed_literal<T: AsRef<str>>(
+    source: FixedLiteralView<'_, T>,
+    field: &arrow::datatypes::Field,
+    rows: usize,
+) -> Result<ArrayRef, String> {
+    match source {
+        FixedLiteralView::Int32List(values) => int32_list(
+            list_item_field(field.data_type())
+                .ok_or("compiled Unpivot list channel changed type")?,
+            values,
+            rows,
+        ),
+        FixedLiteralView::Utf8Map(entries) => {
+            let (entries_field, sorted) = map_entries_field(field.data_type())
+                .ok_or("compiled Unpivot map channel changed type")?;
+            utf8_map(entries_field, sorted, entries, rows)
+        }
+    }
+}
+fn materialize_literal(
+    source: &LiteralSource,
+    field: &arrow::datatypes::Field,
+    rows: usize,
+) -> Result<ArrayRef, String> {
+    match source {
+        LiteralSource::Int32List(values) => {
+            materialize_fixed_literal(FixedLiteralView::<Arc<str>>::Int32List(values), field, rows)
+        }
+        LiteralSource::Utf8Map(entries) => {
+            materialize_fixed_literal(FixedLiteralView::Utf8Map(entries), field, rows)
+        }
+        LiteralSource::Root(_) => {
+            Err("compiled Unpivot scalar requires its evaluated source".to_owned())
+        }
+    }
+}
+
+/// One expansion/materialization body shared with the explicit legacy grouped
+/// adapter. The runtime route supplies its original creator before each step.
+#[derive(Clone, Copy)]
+enum ColumnVectorRole {
+    Temporary,
+    Result,
+}
+fn build_columns<E: From<String>>(
+    producers: &[Producer],
+    schema: &arrow::datatypes::Schema,
+    input: &Expanding,
+    segments: &[super::unpivot_processor::Segment],
+    mut vector: impl FnMut(ColumnVectorRole, usize) -> Result<Vec<ArrayRef>, E>,
+    mut slice: impl FnMut(&ArrayRef, usize, usize) -> Result<ArrayRef, E>,
+    mut literal: impl FnMut(&LiteralSource, &arrow::datatypes::Field, usize) -> Result<ArrayRef, E>,
+    mut concatenate: impl FnMut(Vec<ArrayRef>, usize) -> Result<ArrayRef, E>,
+) -> Result<Vec<ArrayRef>, E> {
+    let mut columns = vector(ColumnVectorRole::Result, producers.len())?;
+    for (ordinal, producer) in producers.iter().enumerate() {
+        let field = schema.field(ordinal);
+        let mut parts = vector(ColumnVectorRole::Temporary, segments.len())?;
+        for segment in segments {
+            let (offset, rows) = (segment.input_offset, segment.len);
+            parts.push(match producer {
+                Producer::Passthrough { input: source } => {
+                    slice(input.batch.record_batch().column(*source), offset, rows)?
+                }
+                Producer::Value { inputs } => slice(
+                    input
+                        .batch
+                        .record_batch()
+                        .column(inputs[segment.mapping_index]),
+                    offset,
+                    rows,
+                )?,
+                Producer::Literal { sources } => match &sources[segment.mapping_index] {
+                    LiteralSource::Root(root) => slice(&input.constants[*root], offset, rows)?,
+                    source => literal(source, field, rows)?,
+                },
+            });
+        }
+        columns.push(concatenate(parts, ordinal)?);
+    }
+    Ok(columns)
+}
+
+fn request_arc<T>(owner: &dyn InputConstructionOwner) -> ExecutionResult<()> {
+    owner.request(
+        novarocks_type_contract::owned_resources::layout::arc_layout(Layout::new::<T>())
+            .map_err(ConstructionFailure::Resource)?,
+    )?;
+    Ok(())
+}
+
+fn primitive_adoption(
+    owner: &dyn InputConstructionOwner,
+    control: &dyn KernelEvaluationControl,
+) -> ExecutionResult<()> {
+    control.checkpoint(0)?;
+    let mut request = |layout| owner.request(layout);
+    let mut opaque = |bytes| owner.observe_opaque_upper_bound(bytes);
+    let mut creation =
+        ValueSchemaCreation::new(owner.storage_lifetime(), &mut request, &mut opaque);
+    novarocks_functions::selected_copy::preflight_primitive_vec_adoption_construction_observed(
+        &mut creation,
+        &mut |boundary| {
+            owner.observe(
+                0,
+                &[],
+                ArrayNormalizationStep::InspectConstructionWork {
+                    units: usize::from(!boundary),
+                },
+            )
+        },
+    )
+    .map_err(unpivot_copy_failure)
+}
+
+/// The fixed literal protocol remains Int32List/Utf8Map. This observes the
+/// actual original Arrow 58.4 constructors, without deriving a value domain.
+fn observe_literal(
+    source: &LiteralSource,
+    rows: usize,
+    owner: &dyn InputConstructionOwner,
+    control: &dyn KernelEvaluationControl,
+) -> ExecutionResult<()> {
+    match source {
+        LiteralSource::Int32List(values) => observe_fixed_literal(
+            FixedLiteralView::<Arc<str>>::Int32List(values),
+            rows,
+            owner,
+            control,
+        ),
+        LiteralSource::Utf8Map(entries) => {
+            observe_fixed_literal(FixedLiteralView::Utf8Map(entries), rows, owner, control)
+        }
+        LiteralSource::Root(_) => Err(ConstructionFailure::InvalidSource(
+            "evaluated scalar is not a fixed literal constructor".to_owned(),
+        )
+        .into()),
+    }
+}
+pub(crate) fn observe_fixed_literal<T: AsRef<str>>(
+    source: FixedLiteralView<'_, T>,
+    rows: usize,
+    owner: &dyn InputConstructionOwner,
+    control: &dyn KernelEvaluationControl,
+) -> ExecutionResult<()> {
+    let extent = |n: usize| n.checked_mul(rows).ok_or(KernelFailure::ResourceExhausted);
+    let offsets = rows
+        .checked_add(1)
+        .ok_or(KernelFailure::ResourceExhausted)?;
+    Layout::array::<i32>(offsets).map_err(|_| KernelFailure::ResourceExhausted)?;
+    primitive_adoption(owner, control)?;
+    match source {
+        FixedLiteralView::Int32List(values) => {
+            i32::try_from(extent(values.len())?).map_err(|_| KernelFailure::ResourceExhausted)?;
+            Layout::array::<i32>(extent(values.len())?)
+                .map_err(|_| KernelFailure::ResourceExhausted)?;
+            primitive_adoption(owner, control)?;
+            request_arc::<Int32Array>(owner)?;
+            request_arc::<ListArray>(owner)?;
+        }
+        FixedLiteralView::Utf8Map(entries) => {
+            let count = extent(entries.len())?;
+            i32::try_from(count).map_err(|_| KernelFailure::ResourceExhausted)?;
+            owner.request(
+                Layout::array::<&str>(count).map_err(|_| KernelFailure::ResourceExhausted)?,
+            )?;
+            owner.request(
+                Layout::array::<&str>(count).map_err(|_| KernelFailure::ResourceExhausted)?,
+            )?;
+            // byte_array::from_iter_values uses rounded MutableBuffer offsets
+            // and doubling byte growth. These are opaque operation bounds,
+            // separate from the two actual source-reference Vec requests.
+            for key in [true, false] {
+                let mut bytes = 0usize;
+                for (k, v) in entries.iter() {
+                    control.checkpoint(1)?;
+                    bytes = bytes
+                        .checked_add(if key {
+                            k.as_ref().len()
+                        } else {
+                            v.as_ref().len()
+                        })
+                        .ok_or(KernelFailure::ResourceExhausted)?;
+                }
+                bytes = extent(bytes)?;
+                i32::try_from(bytes).map_err(|_| KernelFailure::ResourceExhausted)?;
+                let offset_bytes = count
+                    .checked_add(1)
+                    .and_then(|n| n.checked_mul(std::mem::size_of::<i32>()))
+                    .and_then(|n| n.checked_add(63))
+                    .map(|n| n & !63)
+                    .ok_or(KernelFailure::ResourceExhausted)?;
+                let mut growth =
+                    novarocks_functions::arrow_ipc_construction::SchemaRequestAccumulator::default(
+                    );
+                growth.geometric::<u8, novarocks_functions::arrow_ipc_construction::IpcConstructionError<ConstructionFailure>>(bytes, 64, 1,
+                    &mut || control.checkpoint(0).map_err(novarocks_functions::arrow_ipc_construction::IpcConstructionError::Control))
+                    .map_err(|error| match error {
+                        novarocks_functions::arrow_ipc_construction::IpcConstructionError::Control(cause) => ExecutionFailure::from(cause),
+                        novarocks_functions::arrow_ipc_construction::IpcConstructionError::Creator(cause) => ExecutionFailure::from(cause),
+                        novarocks_functions::arrow_ipc_construction::IpcConstructionError::Geometry(novarocks_functions::arrow_ipc_construction::IpcGeometryError::Overflow) => ExecutionFailure::from(KernelFailure::ResourceExhausted),
+                        other => ExecutionFailure::from(ConstructionFailure::InvalidSource(other.to_string())),
+                    })?;
+                offset_bytes
+                    .checked_add(growth.bytes)
+                    .ok_or(KernelFailure::ResourceExhausted)?;
+                primitive_adoption(owner, control)?;
+                primitive_adoption(owner, control)?;
+                request_arc::<StringArray>(owner)?;
+            }
+            owner.request(
+                Layout::array::<ArrayRef>(2).map_err(|_| KernelFailure::ResourceExhausted)?,
+            )?;
+            request_arc::<MapArray>(owner)?;
+        }
+    }
+    control.checkpoint(0)?;
+    Ok(())
+}
+
+fn build_output_typed(
+    producers: &[Producer],
+    output: &ChunkSchemaRef,
+    input: &Expanding,
+    start: usize,
+    len: usize,
+    factory: &dyn InputConstructionFactory,
+    control: &dyn KernelEvaluationControl,
+) -> ExecutionResult<Chunk> {
+    let owner = factory.begin_typed_construction(output)?;
+    let temporary = factory.begin_typed_construction(output)?;
+    let input_storage = input
+        .storage
+        .as_ref()
+        .ok_or(ConstructionFailure::MissingOwner)?;
+    let count = if len == 0 {
+        0
+    } else {
+        (start % input.batch.len())
+            .checked_add(len - 1)
+            .ok_or(KernelFailure::ResourceExhausted)?
+            / input.batch.len()
+            + 1
+    };
+    let mut segments = unpivot_vec::<super::unpivot_processor::Segment>(count, temporary.as_ref())?;
+    super::unpivot_processor::visit_flattened_segments(start, len, input.batch.len(), |segment| {
+        segments.push(segment)
+    });
+    let schema = output.arrow_schema_ref();
+    let columns = build_columns(
+        producers,
+        &schema,
+        input,
+        &segments,
+        |role, count| match role {
+            ColumnVectorRole::Result => unpivot_vec(count, owner.as_ref()),
+            ColumnVectorRole::Temporary => unpivot_vec(count, temporary.as_ref()),
+        },
+        |source, offset, length| {
+            temporary.observe(
+                0,
+                &[],
+                ArrayNormalizationStep::SliceArray {
+                    source,
+                    offset,
+                    length,
+                },
+            )?;
+            let result = source.slice(offset, length);
+            temporary.observe(0, &[], ArrayNormalizationStep::OpaqueOperationFinished)?;
+            Ok(result)
+        },
+        |literal, field, rows| {
+            observe_literal(literal, rows, temporary.as_ref(), control)?;
+            let result =
+                materialize_literal(literal, field, rows).map_err(ExecutionFailure::from)?;
+            control.checkpoint(0)?;
+            Ok(result)
+        },
+        |parts, ordinal| {
+            concat_owned_with_construction(
+                parts,
+                output.slot_ids()[ordinal],
+                temporary.as_ref(),
+                owner.as_ref(),
+                control,
+            )
+        },
+    )?;
+    let storage = if len == 0 {
+        owner.storage_lifetime()
+    } else {
+        owner
+            .storage_lifetime()
+            .retaining_observed(input_storage, |layout| owner.request(layout))?
+    };
+    Ok(Chunk::try_new_typed_with_columns_owned_observed::<
+        ConstructionFailure,
+        _,
+    >(output.clone(), columns, len, storage, |step| {
+        owner.observe(0, &[], step)
+    })?)
+}
+
 impl Operator for CompiledUnpivotProcessor {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        self.control.bind_construction_factory(factory.clone());
+        self.construction = Some(factory);
+    }
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        if self.expansion.is_some() {
+            return Ok(());
+        }
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let output = factory.create_compiled_chunk_schema(&self.output_layout)?;
+        self.expansion = Some(UnpivotExpansion::new(
+            self.producers.clone(),
+            output,
+            self.mappings,
+            self.max_output_rows,
+            self.max_output_bytes,
+        ));
+        Ok(())
+    }
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.control.bind_runtime_memory(state);
         Ok(())
@@ -563,20 +996,78 @@ impl Operator for CompiledUnpivotProcessor {
 
 impl ProcessorOperator for CompiledUnpivotProcessor {
     fn need_input(&self) -> bool {
-        !self.finishing && !self.finished && !self.expansion.is_expanding()
+        !self.finishing
+            && !self.finished
+            && !self
+                .expansion
+                .as_ref()
+                .is_some_and(UnpivotExpansion::is_expanding)
     }
     fn has_output(&self) -> bool {
-        self.expansion.is_expanding()
+        self.expansion
+            .as_ref()
+            .is_some_and(UnpivotExpansion::is_expanding)
     }
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
-        if self.expansion.is_expanding() {
+        if self
+            .expansion
+            .as_ref()
+            .is_some_and(UnpivotExpansion::is_expanding)
+        {
             return Err("compiled Unpivot received input while expanding".into());
         }
         if chunk.is_empty() {
             return Ok(());
         }
-        if chunk.batch.schema().as_ref() != self.input_schema.as_ref() {
-            return Err("compiled Unpivot input differs from its frozen input port".into());
+        self.expansion
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        if chunk.chunk_schema().slot_ids() != self.input_layout.slots() {
+            return Err(ConstructionFailure::InvalidSource(
+                "compiled Unpivot input occurrences differ from its declaration".to_owned(),
+            )
+            .into());
+        }
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let owner = factory.begin_input_construction(&chunk)?;
+        for (ordinal, slot) in chunk.chunk_schema().slots().iter().enumerate() {
+            let declared = self
+                .input_layout
+                .value_binding(self.input_layout.slots()[ordinal])
+                .ok_or_else(|| {
+                    ConstructionFailure::InvalidSource(
+                        "compiled Unpivot input binding is absent".to_owned(),
+                    )
+                })?;
+            if slot.name() != self.input_layout.schema().field(ordinal).name()
+                || !slot.typed_binding().borrowed().exactly_equals_observed(
+                    declared.borrowed(),
+                    || {
+                        owner.observe(
+                            ordinal,
+                            &[],
+                            ArrayNormalizationStep::InspectConstructionWork { units: 1 },
+                        )
+                    },
+                )?
+            {
+                return Err(ConstructionFailure::InvalidSource(
+                    "compiled Unpivot input changes its complete value binding".to_owned(),
+                )
+                .into());
+            }
+        }
+        if self.instances.is_none() {
+            if !self.sites.is_empty() {
+                owner.request(
+                    Layout::array::<CompiledExpressionInstance>(self.sites.len())
+                        .map_err(|_| KernelFailure::ResourceExhausted)?,
+                )?;
+            }
+            self.instance_storage = Some(owner.storage_lifetime());
         }
         instances(
             &mut self.instances,
@@ -585,30 +1076,74 @@ impl ProcessorOperator for CompiledUnpivotProcessor {
             &self.control,
         )?;
         let instances = self.instances.as_mut().expect("instances were created");
-        let mut constants = Vec::with_capacity(self.sites.len());
+        let mut constants = unpivot_vec::<ArrayRef>(self.sites.len(), owner.as_ref())?;
         for (instance, site) in instances.iter_mut().zip(&self.sites) {
-            constants.push(evaluate_all(instance, *site, &chunk.batch, &self.control)?);
+            constants.push(evaluate_all(
+                instance,
+                *site,
+                chunk.record_batch(),
+                &self.control,
+            )?);
         }
-        self.expansion.start(chunk.batch, constants)
+        let storage = chunk.source_storage_lifetime_observed::<ConstructionFailure>(
+            owner.storage_lifetime(),
+            |layout| owner.request(layout),
+        )?;
+        let expansion = self
+            .expansion
+            .as_mut()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        expansion.input = Some(Expanding {
+            batch: chunk.into_batch_projection(),
+            constants,
+            storage: Some(storage),
+        });
+        expansion.cursor = 0;
+        Ok(())
     }
     fn pull_chunk(&mut self, _state: &RuntimeState) -> ExecutionResult<Option<Chunk>> {
-        if !self.expansion.is_expanding() {
+        if !self
+            .expansion
+            .as_ref()
+            .is_some_and(UnpivotExpansion::is_expanding)
+        {
             if self.finishing {
                 self.finished = true;
             }
             return Ok(None);
         }
-        let chunk = self.expansion.next(self.mem_tracker.as_ref())?;
-        if !self.expansion.is_expanding() && self.finishing {
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let chunk = self
+            .expansion
+            .as_mut()
+            .ok_or(ConstructionFailure::MissingOwner)?
+            .next_typed(self.mem_tracker.as_ref(), factory.as_ref(), &self.control)?;
+        if !self
+            .expansion
+            .as_ref()
+            .is_some_and(UnpivotExpansion::is_expanding)
+            && self.finishing
+        {
             self.finished = true;
         }
         Ok(chunk)
     }
     fn set_finishing(&mut self, _state: &RuntimeState) -> ExecutionResult<()> {
         self.finishing = true;
-        if !self.expansion.is_expanding() {
+        if !self
+            .expansion
+            .as_ref()
+            .is_some_and(UnpivotExpansion::is_expanding)
+        {
             self.finished = true;
         }
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "compiled_unpivot/creation_tests.rs"]
+mod creation_tests;

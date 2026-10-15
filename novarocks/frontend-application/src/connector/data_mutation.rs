@@ -17,6 +17,7 @@
 
 //! Provider-neutral application bridge for one FE-only data mutation.
 
+use crate::connector::schema_creation::FrontendSchemaLoad;
 use std::fmt;
 use std::sync::Arc;
 
@@ -252,7 +253,7 @@ impl DataMutationSession {
             })?;
         let metadata = lease
             .metadata()
-            .load_table(ConnectorTableRequest {
+            .load_frontend_table(ConnectorTableRequest {
                 table: table.clone(),
                 resolution: ConnectorTableResolution::StrictBaseTable,
                 context: context.clone(),
@@ -474,6 +475,35 @@ mod tests {
 
     use super::*;
 
+    fn empty_table_metadata(
+        header: novarocks_spi::connector::ConnectorTableMetadataHeader,
+        creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        // This fixture explicitly declares a zero-column table.
+        let schema = creation.arc(Schema::empty())?;
+        let storage = creation.storage();
+        let execution = {
+            let (request, work) = creation.observers();
+            novarocks_connector_contract::ConnectorReadExecutionSchema::try_new_observed(
+                schema.clone(),
+                Vec::new().into_boxed_slice(),
+                storage,
+                |layout| {
+                    request(layout)
+                        .map_err(novarocks_connector_contract::PureProviderCompileError::Control)
+                },
+                |units| {
+                    work(units)
+                        .map_err(novarocks_connector_contract::PureProviderCompileError::Control)
+                },
+            )?
+        };
+        ConnectorTableMetadata::try_new_typed(header, schema, execution, creation)
+    }
+
     #[derive(Clone, Copy)]
     enum Mode {
         Committed,
@@ -574,26 +604,34 @@ mod tests {
         fn load_table(
             &self,
             request: ConnectorTableRequest,
-        ) -> Result<ConnectorTableMetadata, ConnectorError> {
+            creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            ConnectorTableMetadata,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
             self.metadata_calls.fetch_add(1, Ordering::SeqCst);
             if matches!(self.mode, Mode::MetadataFailure) {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::NotFound,
                     "table metadata is unavailable",
-                ));
+                )
+                .into());
             }
-            Ok(ConnectorTableMetadata {
-                identity: request.table,
-                schema: Arc::new(Schema::empty()),
-                planning_facts: ConnectorTablePlanningFacts::empty(),
-                definition_facts: novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
-                version: None,
-                statistics_data_version: None,
-                table: novarocks_spi::connector::ConnectorTableHandle::try_new(
-                    self.descriptor.instance_id.clone(),
-                    Bytes::from_static(b"table"),
-                )?,
-            })
+            empty_table_metadata(
+                novarocks_spi::connector::ConnectorTableMetadataHeader {
+                    identity: request.table,
+                    planning_facts: ConnectorTablePlanningFacts::empty(),
+                    definition_facts:
+                        novarocks_spi::connector::ConnectorTableDefinitionFacts::empty(),
+                    version: None,
+                    statistics_data_version: None,
+                    table: novarocks_spi::connector::ConnectorTableHandle::try_new(
+                        self.descriptor.instance_id.clone(),
+                        Bytes::from_static(b"table"),
+                    )?,
+                },
+                creation,
+            )
         }
     }
 

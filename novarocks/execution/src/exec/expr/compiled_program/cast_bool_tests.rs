@@ -286,7 +286,7 @@ fn actual_compiled_bool_cast_nonnullable_bool_literal_and_true_constant_broadcas
                             .cast_recipe(root_context(&program).0)
                             .unwrap()
                             .result_type()
-                            .nullable
+                            .nullable()
                     );
                 }
             }

@@ -102,7 +102,7 @@ fn original_zero(partial: bool, direct: bool, inputs: &[Chunk]) -> Chunk {
     processor.set_finishing(&state).unwrap();
     let result = processor.pull_chunk(&state).unwrap().unwrap();
     assert_eq!(result.len(), 1);
-    assert!(result.batch.columns().is_empty());
+    assert!(result.record_batch().columns().is_empty());
     assert!(processor.pull_chunk(&state).unwrap().is_none());
     drop(operator);
     assert_eq!(tracker.current(), 0);
@@ -134,6 +134,13 @@ fn compiled_aggregate_zero_calls_original_and_real_compiled_before() {
     let right = run(&partial, &[], tracker.clone());
     let out = run(&final_stage, &[left, right], tracker.clone());
     assert_eq!(out.len(), 1);
-    assert!(out.batch.columns().is_empty());
+    assert!(out.record_batch().columns().is_empty());
+    assert!(
+        tracker.current() > 0,
+        "live typed output keeps its actual creator"
+    );
+    drop(raw);
+    drop(empty);
+    drop(out);
     assert_eq!(tracker.current(), 0);
 }

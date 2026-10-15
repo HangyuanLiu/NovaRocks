@@ -28,7 +28,7 @@ fn by_copy_joint_actual_chunk_input_and_new_output_keep_distinct_lifetimes() {
     let input_tracker = MemTracker::new_child("original Chunk", &query);
     let copy_tracker = MemTracker::new_child("actual copy host", &query);
     let original = owned_source(&input_tracker);
-    let array = Arc::clone(original.batch.column(X));
+    let array = Arc::clone(original.record_batch().column(X));
     let original_stock = input_tracker.current();
     assert!(original_stock > 0);
     let mut control = RuntimeKernelControl::new(Arc::new(RuntimeErrorState::default()));
@@ -80,7 +80,7 @@ fn by_copy_joint_actual_chunk_refusal_releases_original_input_without_output() {
     let input_tracker = MemTracker::new_child("original Chunk", &query);
     let copy_tracker = MemTracker::new_child("refused actual copy", &query);
     let original = owned_source(&input_tracker);
-    let array = Arc::clone(original.batch.column(X));
+    let array = Arc::clone(original.record_batch().column(X));
     let mut control = RuntimeKernelControl::new(Arc::new(RuntimeErrorState::default()));
     control.bind_mem_tracker(Arc::clone(&copy_tracker));
     let host = control.allocator().unwrap();

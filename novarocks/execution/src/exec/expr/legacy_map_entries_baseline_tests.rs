@@ -224,7 +224,8 @@ fn original_map_entries_constant_keeps_original_host_broadcast() {
         a.clone(),
     );
     let (mut arena, _, chunk) = setup(fixture(false));
-    let id = arena.push_typed(ExprNode::Constant(constant), a.data_type().clone());
+    let declared = constant.value_type().clone();
+    let id = arena.push_value_typed(ExprNode::Constant(constant), declared);
     let out =
         super::function::map::eval_map_entries(&arena, ExprId(usize::MAX), &[id], &chunk).unwrap();
     assert_eq!(chunk.len(), 4);

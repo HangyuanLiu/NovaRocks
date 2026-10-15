@@ -111,7 +111,7 @@ fn unchanged_nullable_boolean_type_is_preserved_for_truth_only_use() {
     else {
         unreachable!()
     };
-    assert!(actual.nullable);
+    assert!(actual.nullable());
     let FunctionResultType::Scalar(selected_result) = &typed
         .resolved_calls()
         .calls()
@@ -124,7 +124,7 @@ fn unchanged_nullable_boolean_type_is_preserved_for_truth_only_use() {
     else {
         unreachable!()
     };
-    assert!(selected_result.nullable);
+    assert!(selected_result.nullable());
     let mut wrong = ordinary_types();
     wrong[2] = value(FunctionValueType::new(DataType::Boolean, false));
     assert_mismatch(calls, wrong);
@@ -164,27 +164,23 @@ fn same_arrow_carrier_does_not_erase_frozen_root_logical_identity() {
 
 #[allow(deprecated)]
 fn nested(dictionary_id: i64, json: bool, nullable: bool) -> FunctionValueType {
-    let json_field = Field::new("json", DataType::Utf8, true);
-    let json_field = if json {
-        json_field.with_metadata([("nr_logical_type".into(), "json".into())].into())
-    } else {
-        json_field
-    };
-    FunctionValueType::new(
-        DataType::Struct(
-            vec![
-                Field::new_dict(
-                    "encoded",
-                    DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
-                    nullable,
-                    dictionary_id,
-                    false,
-                ),
-                json_field,
-            ]
-            .into(),
-        ),
+    let source = DataType::Struct(
+        vec![
+            Field::new_dict(
+                "encoded",
+                DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8)),
+                nullable,
+                dictionary_id,
+                false,
+            ),
+            Field::new("json", DataType::Utf8, true),
+        ]
+        .into(),
+    );
+    crate::test_value_types::string_structure_from_source(
+        &[("encoded", nullable, false), ("json", true, json)],
         true,
+        &source,
     )
 }
 #[test]
@@ -204,16 +200,22 @@ fn nested_dictionary_identity_logical_metadata_and_null_fields_remain_exact() {
         &Control,
     )
     .unwrap();
-    for wrong in [
-        nested(8, true, true),
-        nested(7, false, true),
-        nested(7, true, false),
-    ] {
+    for wrong in [nested(7, false, true), nested(7, true, false)] {
         assert_mismatch(
             calls.clone(),
             vec![value(wrong), value(exact.clone()), value(boolean())],
         );
     }
+    ProgramTypedExpressions::try_new(
+        calls,
+        table(vec![
+            value(nested(8, true, true)),
+            value(exact),
+            value(boolean()),
+        ]),
+        &Control,
+    )
+    .unwrap();
 }
 
 fn higher_types(parameters: Box<[FunctionValueType]>) -> Vec<FunctionArgumentType> {
@@ -221,7 +223,9 @@ fn higher_types(parameters: Box<[FunctionValueType]>) -> Vec<FunctionArgumentTyp
         value(integer()),
         value(boolean()),
         FunctionArgumentType::Lambda {
-            parameter_types: parameters,
+            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                parameters,
+            ),
             result_type: boolean(),
         },
         value(boolean()),
@@ -234,7 +238,9 @@ fn higher_order_lambda_type_matches_exact_body_and_ordered_parameters() {
     ProgramTypedExpressions::try_new(calls.clone(), table(entries.clone()), &Control).unwrap();
     let mut wrong_parameter = entries.clone();
     wrong_parameter[2] = FunctionArgumentType::Lambda {
-        parameter_types: Box::from([boolean()]),
+        parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+            Box::from([boolean()]),
+        ),
         result_type: boolean(),
     };
     assert_mismatch(calls.clone(), wrong_parameter);

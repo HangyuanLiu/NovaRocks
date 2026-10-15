@@ -45,94 +45,41 @@ pub use crate::compiler::SqlMvRelationOccurrenceId;
 /// admission owns its limits; this check adds no scalar profile restriction.
 pub(crate) fn validate_persistable_output(
     resolved: &crate::analysis::ResolvedQuery,
-    factory: &crate::column_id::ColumnRefFactory,
+    _factory: &crate::column_id::ColumnRefFactory,
 ) -> Result<(), String> {
     for column in resolved
         .output_columns
         .iter()
         .filter(|column| !column.is_internal)
     {
-        if let Some(logical) = factory.borrowed_logical_type(column.column_id) {
-            PersistenceOutputInspection::logical(logical)?;
+        if has_private_persistence_domain(column.value_type.value_type()) {
+            return Err(
+                "Object and Percentile result domains are unsupported for persisted schemas".into(),
+            );
         }
-        PersistenceOutputInspection::data_type(&column.value_type.data_type)?;
     }
     Ok(())
 }
 
-struct PersistenceOutputInspection;
-
-impl PersistenceOutputInspection {
-    fn rejected() -> String {
-        "Object and Percentile result domains are unsupported for persisted schemas".into()
+/// The sole SQL persistence-domain check. Source annotations and optional
+/// catalog summaries do not author any node of the complete execution type.
+/// Existing immutable type admission bounds this borrowed recursion; there is
+/// no additional scalar capability limit or FE allocation quota here.
+pub(crate) fn has_private_persistence_domain(
+    value: &novarocks_type_contract::ValueTypeRef,
+) -> bool {
+    use novarocks_type_contract::{ValueKind, ValueLogicalType};
+    if matches!(
+        value.kind(),
+        ValueKind::Nominal(ValueLogicalType::Object | ValueLogicalType::Percentile)
+    ) {
+        return true;
     }
-
-    fn logical(logical: &novarocks_types::schema::SqlType) -> Result<(), String> {
-        use novarocks_types::schema::SqlType;
-        match logical {
-            SqlType::Object | SqlType::Percentile => Err(Self::rejected()),
-            SqlType::Array(item) => Self::logical(item),
-            SqlType::Map(key, value) => {
-                Self::logical(key)?;
-                Self::logical(value)
-            }
-            SqlType::Struct(fields) => {
-                for (_, field) in fields {
-                    Self::logical(field)?;
-                }
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-
-    fn field(field: &arrow::datatypes::Field) -> Result<(), String> {
-        use novarocks_types::logical::NR_LOGICAL_TYPE_KEY;
-        if field
-            .metadata()
-            .get(NR_LOGICAL_TYPE_KEY)
-            .is_some_and(|value| {
-                let value = value.trim();
-                value.eq_ignore_ascii_case("object") || value.eq_ignore_ascii_case("percentile")
-            })
-        {
-            return Err(Self::rejected());
-        }
-        Self::data_type(field.data_type())
-    }
-
-    fn data_type(data_type: &arrow::datatypes::DataType) -> Result<(), String> {
-        use arrow::datatypes::DataType;
-        match data_type {
-            DataType::List(field)
-            | DataType::LargeList(field)
-            | DataType::FixedSizeList(field, _)
-            | DataType::ListView(field)
-            | DataType::LargeListView(field)
-            | DataType::Map(field, _) => Self::field(field),
-            DataType::Struct(fields) => {
-                for field in fields {
-                    Self::field(field)?;
-                }
-                Ok(())
-            }
-            DataType::Union(fields, _) => {
-                for (_, field) in fields.iter() {
-                    Self::field(field)?;
-                }
-                Ok(())
-            }
-            DataType::Dictionary(key, value) => {
-                Self::data_type(key)?;
-                Self::data_type(value)
-            }
-            DataType::RunEndEncoded(runs, values) => {
-                Self::field(runs)?;
-                Self::field(values)
-            }
-            _ => Ok(()),
-        }
-    }
+    (0..value.child_count()).any(|index| {
+        value
+            .child_type_at(index)
+            .is_some_and(has_private_persistence_domain)
+    })
 }
 
 /// SQL-owned branch marker used by sealed UNION ALL MV refresh layouts.
@@ -492,7 +439,7 @@ mod refresh_property_facade_tests {
         let (resolved, _, factory) =
             crate::analyzer::analyze(&query, &TestIcebergCatalog, "sales").unwrap();
         assert_eq!(
-            resolved.output_columns[0].value_type.data_type,
+            resolved.output_columns[0].value_type.data_type().clone(),
             DataType::Binary
         );
         validate_persistable_output(&resolved, &factory)
@@ -549,7 +496,7 @@ mod refresh_property_facade_tests {
                     Field::new("item", DataType::Binary, true),
                     LogicalType::Object,
                 )),
-                None,
+                Some(SqlType::Array(Box::new(SqlType::Object))),
             ),
             (
                 DataType::Struct(
@@ -559,7 +506,7 @@ mod refresh_property_facade_tests {
                     ))]
                     .into(),
                 ),
-                None,
+                Some(SqlType::Struct(vec![("state".into(), SqlType::Percentile)])),
             ),
         ];
         let query = parse_query("SELECT state AS renamed FROM source");
@@ -679,12 +626,12 @@ mod refresh_property_facade_tests {
             ValueLogicalType::Physical,
         ];
         for (column, logical_type) in facts.output_columns.iter().zip(expected) {
-            assert_eq!(column.value_type.logical_type, logical_type);
-            assert!(column.value_type.nullable);
+            assert_eq!(column.value_type.logical_type(), logical_type);
+            assert!(column.value_type.nullable());
         }
         assert_eq!(
-            facts.output_columns[4].value_type.data_type,
-            facts.output_columns[5].value_type.data_type
+            facts.output_columns[4].value_type.data_type(),
+            facts.output_columns[5].value_type.data_type()
         );
         assert_ne!(
             facts.output_columns[4].value_type,
@@ -700,12 +647,12 @@ mod refresh_property_facade_tests {
         assert_eq!(facts.output_columns.len(), 2);
         assert_eq!(facts.output_columns[0].name, "order_id");
         assert_eq!(
-            facts.output_columns[0].value_type.data_type,
+            facts.output_columns[0].value_type.data_type().clone(),
             DataType::Int64
         );
-        assert!(!facts.output_columns[0].value_type.nullable);
+        assert!(!facts.output_columns[0].value_type.nullable());
         assert_eq!(facts.output_columns[1].name, "region");
-        assert!(facts.output_columns[1].value_type.nullable);
+        assert!(facts.output_columns[1].value_type.nullable());
     }
 
     #[test]
@@ -1030,11 +977,9 @@ mod refresh_property_facade_tests {
 
     fn cv_utf8(logical: novarocks_type_contract::ValueLogicalType, metadata: &str) -> TypedExpr {
         use arrow::array::{Array, StringArray};
-        let ty = FunctionValueType {
-            data_type: DataType::Utf8,
-            nullable: false,
-            logical_type: logical,
-        };
+        let ty =
+            FunctionValueType::try_from_legacy_declared_projection(DataType::Utf8, false, logical)
+                .expect("valid temporary legacy value projection");
         let field = arrow::datatypes::Field::new("selected", DataType::Utf8, false).with_metadata(
             std::collections::HashMap::from([("source".into(), metadata.into())]),
         );
@@ -1056,16 +1001,22 @@ mod refresh_property_facade_tests {
     #[test]
     fn refresh_identity_rejects_full_cv_root_field_metadata_and_logical_disagreement() {
         use novarocks_type_contract::ValueLogicalType;
-        for (left, right) in [
-            (
-                cv_utf8(ValueLogicalType::Physical, "a"),
-                cv_utf8(ValueLogicalType::Physical, "b"),
-            ),
-            (
-                cv_utf8(ValueLogicalType::Physical, "a"),
-                cv_utf8(ValueLogicalType::Json, "a"),
-            ),
-        ] {
+        let same = cv_refresh_input(
+            cv_utf8(ValueLogicalType::Physical, "a"),
+            cv_utf8(ValueLogicalType::Physical, "b"),
+        );
+        assert!(
+            same.refresh_property(crate::optimizer::test_optimizer_control())
+                .is_ok()
+        );
+        assert!(
+            same.refresh_contract(crate::optimizer::test_optimizer_control())
+                .is_ok()
+        );
+        for (left, right) in [(
+            cv_utf8(ValueLogicalType::Physical, "a"),
+            cv_utf8(ValueLogicalType::Json, "a"),
+        )] {
             let input = cv_refresh_input(left, right);
             assert!(matches!(
                 input.refresh_property(crate::optimizer::test_optimizer_control()),
@@ -1105,7 +1056,7 @@ mod refresh_property_facade_tests {
         let array = StructArray::new(fields.clone(), children, None);
         let ty = FunctionValueType::new(DataType::Struct(fields), false);
         let pool = novarocks_functions::ConstantPool::try_new(
-            std::sync::Arc::new(Field::new("selected", ty.data_type.clone(), false)),
+            std::sync::Arc::new(Field::new("selected", array.data_type().clone(), false)),
             ty.clone(),
             array.to_data(),
             crate::constant::test_constant_policy(),
@@ -2035,7 +1986,7 @@ fn aggregate_input_types_from_resolved_query(
         let slot = input_types.get_mut(*aggregate_index).ok_or_else(|| {
             format!("aggregate MV aggregate index out of range: aggregate_index={aggregate_index}")
         })?;
-        *slot = args.first().map(|arg| arg.value_type.data_type.clone());
+        *slot = args.first().map(|arg| arg.value_type.data_type().clone());
     }
     Ok(input_types)
 }

@@ -118,7 +118,7 @@ pub(super) fn definition(
 }
 
 struct NumericElementaryOwner {
-    resolver: BuiltinScalarResolver,
+    resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
     family: Family,
@@ -160,7 +160,7 @@ impl NumericElementaryOwner {
             })
             .collect();
         Ok(Self {
-            resolver,
+            resolver: Arc::new(resolver),
             declaration,
             implementations,
             family,
@@ -213,6 +213,10 @@ impl FunctionBindingResolver for NumericElementaryOwner {
 }
 
 impl PureFunctionMetadataOwner for NumericElementaryOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::fixed_scalar(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -241,32 +245,21 @@ impl FunctionEffectOwner for NumericElementaryOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        work.step().map_err(FunctionEffectOwnerError::Control)?;
-        if input.function_id != self.declaration.function_id() || input.kind != FunctionKind::Scalar
-        {
-            return Err(FunctionBindingError::UnknownFunction.into());
-        }
-        if !input.environment.is_empty()
-            || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                && input.proof_scope != CallProofScope::Domain(input.context.domain)
-        {
-            return Err(FunctionBindingError::InvalidBinding(
-                "numeric elementary has no environment dependencies and requires an exact proof scope"
-                    .into(),
-            )
-            .into());
-        }
-        work.flush().map_err(FunctionEffectOwnerError::Control)?;
-        self.validate_selected(input.selected, input.request, control)
-            .map_err(|error| match error {
-                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
-                other => FunctionEffectOwnerError::Owner(other),
-            })?;
-        let result = self.call_effects(input.proof_scope);
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        Ok(result)
+        self.refine_selected_core(input, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_selected_core(input, control, || {
+            checked.require_fixed_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -277,39 +270,21 @@ impl PureScalarImplementation for NumericElementaryOwner {
         contract: Arc<ScalarCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        work.step().map_err(compile_failure)?;
-        if input.function_id != self.declaration.function_id()
-            || input.kind != FunctionKind::Scalar
-            || contract.function_id() != input.function_id
-            || !std::ptr::eq(contract.selected(), input.selected)
-            || contract.context() != input.context
-            || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-            || contract.effects() != &self.call_effects(input.proof_scope)
-            || !input.environment.is_empty()
-        {
-            return Err(invalid(
-                "numeric elementary preparation differs from its exact checked call",
-            ));
-        }
-        work.flush().map_err(compile_failure)?;
-        self.validate_selected(input.selected, input.request, control)
-            .map_err(|error| match error {
-                FunctionBindingError::Control(error) => compile_failure(error),
-                _ => invalid("numeric elementary preparation has a stale selected binding"),
-            })?;
-        let operation = self
-            .family
-            .operation(input.selected.argument_types.len())
-            .ok_or_else(|| invalid("elementary preparation has an invalid selected arity"))?;
-        work.finish().map_err(compile_failure)?;
-        // The prepared object retains the same canonical contract. Its body is
-        // a static pure implementation and needs no live resolver or authority.
-        Ok(Arc::new(PreparedNumericElementary {
-            contract,
-            operation,
-        }))
+        self.prepare_selected_core(input, contract, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn prepare_scalar_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_selected_core(input, contract, control, || {
+            checked.require_fixed_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -571,7 +546,10 @@ mod tests {
                         .iter()
                         .enumerate()
                         .map(|(index, source)| {
-                            FunctionValueType::new(source.clone(), mask & (1 << index) != 0)
+                            FunctionValueType::from_legacy_declared_projection(
+                                source.clone(),
+                                mask & (1 << index) != 0,
+                            )
                         })
                         .collect::<Vec<_>>();
                     let arguments = full_sources
@@ -596,12 +574,12 @@ mod tests {
                     let FunctionResultType::Scalar(result) = &selected.result_type else {
                         panic!("scalar result required")
                     };
-                    assert_eq!(result.data_type, DataType::Float64);
-                    assert_eq!(result.logical_type, ValueLogicalType::Physical);
+                    assert_eq!(result.data_type().clone(), DataType::Float64);
+                    assert_eq!(result.logical_type(), ValueLogicalType::Physical);
                     assert_eq!(
-                        result.nullable,
+                        result.nullable(),
                         if *name == "sign" {
-                            full_sources[0].nullable
+                            full_sources[0].nullable()
                         } else {
                             true
                         }
@@ -667,7 +645,12 @@ mod tests {
             let profile = source_profiles(name).remove(0);
             let arguments = profile
                 .iter()
-                .map(|ty| argument(FunctionValueType::new(ty.clone(), false)))
+                .map(|ty| {
+                    argument(FunctionValueType::from_legacy_declared_projection(
+                        ty.clone(),
+                        false,
+                    ))
+                })
                 .collect::<Vec<_>>();
             let selected = Arc::new(
                 owner
@@ -695,12 +678,11 @@ mod tests {
             );
             stale = (*selected).clone();
             stale.argument_types = if arguments.is_empty() {
-                Box::new([FunctionArgumentType::Value(FunctionValueType::new(
-                    DataType::Int8,
-                    false,
-                ))])
+                novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(Box::new([
+                    FunctionArgumentType::Value(FunctionValueType::new(DataType::Int8, false)),
+                ]))
             } else {
-                Box::new([])
+                novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(Box::new([]))
             };
             assert!(
                 owner
@@ -837,16 +819,18 @@ mod tests {
         for source in [
             FunctionValueType::new(DataType::Decimal128(18, 3), false),
             FunctionValueType::new(DataType::UInt64, false),
-            FunctionValueType {
-                data_type: DataType::FixedSizeBinary(16),
-                nullable: false,
-                logical_type: ValueLogicalType::Uuid,
-            },
-            FunctionValueType {
-                data_type: DataType::FixedSizeBinary(16),
-                nullable: false,
-                logical_type: ValueLogicalType::LargeInt,
-            },
+            FunctionValueType::try_from_legacy_declared_projection(
+                DataType::FixedSizeBinary(16),
+                false,
+                ValueLogicalType::Uuid,
+            )
+            .expect("valid temporary legacy function value declaration"),
+            FunctionValueType::try_from_legacy_declared_projection(
+                DataType::FixedSizeBinary(16),
+                false,
+                ValueLogicalType::LargeInt,
+            )
+            .expect("valid temporary legacy function value declaration"),
         ] {
             for index in 0..2 {
                 let mut wrong = arguments.clone();
@@ -879,7 +863,12 @@ mod tests {
             let profile = source_profiles(name).remove(0);
             let arguments = profile
                 .iter()
-                .map(|ty| argument(FunctionValueType::new(ty.clone(), false)))
+                .map(|ty| {
+                    argument(FunctionValueType::from_legacy_declared_projection(
+                        ty.clone(),
+                        false,
+                    ))
+                })
                 .collect::<Vec<_>>();
             let selected = Arc::new(
                 owner
@@ -905,5 +894,80 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+impl NumericElementaryOwner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        work.step().map_err(FunctionEffectOwnerError::Control)?;
+        if input.function_id != self.declaration.function_id() || input.kind != FunctionKind::Scalar
+        {
+            return Err(FunctionBindingError::UnknownFunction.into());
+        }
+        if !input.environment.is_empty()
+            || !matches!(input.proof_scope, CallProofScope::Unconditional)
+                && input.proof_scope != CallProofScope::Domain(input.context.domain)
+        {
+            return Err(FunctionBindingError::InvalidBinding(
+                "numeric elementary has no environment dependencies and requires an exact proof scope"
+                    .into(),
+            )
+            .into());
+        }
+        work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+            other => FunctionEffectOwnerError::Owner(other),
+        })?;
+        let result = self.call_effects(input.proof_scope);
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
+        Ok(result)
+    }
+    fn prepare_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(compile_failure)?;
+        work.step().map_err(compile_failure)?;
+        if input.function_id != self.declaration.function_id()
+            || input.kind != FunctionKind::Scalar
+            || contract.function_id() != input.function_id
+            || !std::ptr::eq(contract.selected(), input.selected)
+            || contract.context() != input.context
+            || contract.decimal_overflow_policy() != input.decimal_overflow_policy
+            || contract.effects() != &self.call_effects(input.proof_scope)
+            || !input.environment.is_empty()
+        {
+            return Err(invalid(
+                "numeric elementary preparation differs from its exact checked call",
+            ));
+        }
+        work.flush().map_err(compile_failure)?;
+        validate().map_err(|error| match error {
+            FunctionBindingError::Control(error) => compile_failure(error),
+            _ => invalid("numeric elementary preparation has a stale selected binding"),
+        })?;
+        let operation = self
+            .family
+            .operation(input.selected.argument_types.len())
+            .ok_or_else(|| invalid("elementary preparation has an invalid selected arity"))?;
+        work.finish().map_err(compile_failure)?;
+        // The prepared object retains the same canonical contract. Its body is
+        // a static pure implementation and needs no live resolver or authority.
+        Ok(Arc::new(PreparedNumericElementary {
+            contract,
+            operation,
+        }))
     }
 }

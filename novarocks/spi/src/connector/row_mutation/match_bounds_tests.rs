@@ -15,10 +15,37 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::typed_execution_fields_tests::value;
 use super::*;
+use novarocks_type_contract::{FunctionValueType, ValueField, ValueKind, ValueTypeStorageLifetime};
 use std::sync::Arc;
 
-fn contract(field: Field) -> Result<ConnectorMutationMatchContract, ConnectorError> {
+fn bigint(nullable: bool) -> FunctionValueType {
+    value(
+        ValueKind::Scalar(DataType::Int64),
+        DataType::Int64,
+        nullable,
+    )
+}
+fn text(nullable: bool) -> FunctionValueType {
+    value(ValueKind::String, DataType::Utf8, nullable)
+}
+
+fn contract(
+    field: Field,
+    declared: FunctionValueType,
+) -> Result<ConnectorMutationMatchContract, ConnectorError> {
+    let source = ConnectorMutationSourceField::try_new_typed(
+        ConnectorWriteFieldToken::from_bytes([1; 32]),
+        field,
+        0,
+        declared,
+    )?;
+    contract_source(source)
+}
+fn contract_source(
+    source: ConnectorMutationSourceField,
+) -> Result<ConnectorMutationMatchContract, ConnectorError> {
     let instance = super::super::ConnectorInstanceId::parse("match.bounds").unwrap();
     let owner = ConnectorProviderBindingKey {
         instance_id: instance.clone(),
@@ -31,7 +58,7 @@ fn contract(field: Field) -> Result<ConnectorMutationMatchContract, ConnectorErr
         owner,
         table,
         base,
-        vec![ConnectorMutationSourceField::new(token, field, 0)],
+        vec![source],
         Vec::new(),
         Vec::new(),
         vec![token],
@@ -49,10 +76,10 @@ fn reset_calls() {
 fn calls() -> usize {
     MATCH_LAYOUT_ALLOCATION_CALLS.with(|n| n.get())
 }
-fn refused(field: Field) {
+fn refused(field: Field, declared: FunctionValueType) {
     reset_calls();
     assert_eq!(
-        contract(field).unwrap_err().kind(),
+        contract(field, declared).unwrap_err().kind(),
         ConnectorErrorKind::ResourceExhausted
     );
     assert_eq!(
@@ -61,9 +88,33 @@ fn refused(field: Field) {
         "borrowed preflight must precede layout allocation"
     );
 }
-fn old_digest(contract: &ConnectorMutationMatchContract) -> [u8; 32] {
+// Impossible oversized source shapes are adversarial private corruption of a
+// genuine small typed author. They cannot be authored as a legal 4096-node value
+// tree; the original borrowed-source preflight must still refuse before Debug.
+fn refused_corrupted_source(field: Field) {
+    let mut source = ConnectorMutationSourceField::try_new_typed(
+        ConnectorWriteFieldToken::from_bytes([1; 32]),
+        Field::new("id", DataType::Int64, false),
+        0,
+        bigint(false),
+    )
+    .unwrap();
+    source.field = field;
+    reset_calls();
+    assert_eq!(
+        contract_source(source).unwrap_err().kind(),
+        ConnectorErrorKind::ResourceExhausted
+    );
+    assert_eq!(
+        calls(),
+        0,
+        "original source bounds precede layout allocation"
+    );
+}
+
+fn formatted_source_typed_digest(contract: &ConnectorMutationMatchContract) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(b"novarocks.connector-row-mutation-match.v1\0");
+    h.update(b"novarocks.connector-row-mutation-match.v2\0");
     digest_owner(&mut h, &contract.owner);
     digest_bytes(&mut h, contract.table.payload());
     h.update(contract.base_version.digest());
@@ -71,11 +122,41 @@ fn old_digest(contract: &ConnectorMutationMatchContract) -> [u8; 32] {
         h.update(f.token.to_bytes());
         h.update(f.source_ordinal.to_be_bytes());
         digest_bytes(&mut h, format!("{:?}", f.field).as_bytes());
+        h.update(b"complete-execution-binding\0");
+        let ty = f.execution_type().expect("explicit fixture declaration");
+        novarocks_type_contract::write_value_type_identity_observed(ty.value_type(), |part| {
+            h.update(part);
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap();
+        novarocks_type_contract::write_value_layout_identity_observed(
+            ty.typed_binding().layout(),
+            |part| {
+                h.update(part);
+                Ok::<(), std::convert::Infallible>(())
+            },
+        )
+        .unwrap();
     }
     for f in contract.before_fields.iter().chain(&contract.after_fields) {
         h.update(f.token.to_bytes());
         h.update(f.target_ordinal.to_be_bytes());
         digest_bytes(&mut h, format!("{:?}", f.field).as_bytes());
+        h.update(b"complete-execution-binding\0");
+        let ty = f.execution_type().expect("explicit fixture declaration");
+        novarocks_type_contract::write_value_type_identity_observed(ty.value_type(), |part| {
+            h.update(part);
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap();
+        novarocks_type_contract::write_value_layout_identity_observed(
+            ty.typed_binding().layout(),
+            |part| {
+                h.update(part);
+                Ok::<(), std::convert::Infallible>(())
+            },
+        )
+        .unwrap();
     }
     for token in &contract.uniqueness_tokens {
         h.update(token.to_bytes());
@@ -109,11 +190,33 @@ fn match_bounds_streaming_digest_matches_original_arrow_debug() {
         )
         .with_metadata(metadata.clone()),
     );
+    let nested_type = value(
+        ValueKind::Struct(
+            vec![ValueField::new(
+                "nested",
+                text(true).value_type().clone(),
+                ValueTypeStorageLifetime::pure(),
+            )]
+            .into_boxed_slice(),
+        ),
+        DataType::Struct(vec![Field::new("nested", DataType::Utf8, true)].into()),
+        true,
+    );
+    let declared = value(
+        ValueKind::List(nested_type.value_type().clone()),
+        DataType::List(Arc::new(Field::new(
+            "item",
+            nested_type.data_type().clone(),
+            true,
+        ))),
+        true,
+    );
     let c = contract(
         Field::new("quote\"\\\n中文", DataType::List(nested), true).with_metadata(metadata),
+        declared,
     )
     .unwrap();
-    assert_eq!(c.digest, old_digest(&c));
+    assert_eq!(c.digest, formatted_source_typed_digest(&c));
     c.validate().unwrap();
 }
 
@@ -130,14 +233,29 @@ fn match_bounds_keep_original_map_vocabulary_for_schema_seal() {
         ),
         false,
     ));
-    let c = contract(Field::new("id", DataType::Map(entries, false), false)).unwrap();
-    assert_eq!(c.digest, old_digest(&c));
+    let declared = value(
+        ValueKind::Map {
+            key: text(false).value_type().clone(),
+            value: bigint(true).value_type().clone(),
+        },
+        DataType::Map(entries.clone(), false),
+        false,
+    );
+    let c = contract(
+        Field::new("id", DataType::Map(entries, false), false),
+        declared,
+    )
+    .unwrap();
+    assert_eq!(c.digest, formatted_source_typed_digest(&c));
     c.validate().unwrap();
 }
 
 #[test]
 fn match_bounds_large_name_refused_before_layout_allocation() {
-    refused(Field::new("x".repeat(65537), DataType::Int64, false));
+    refused(
+        Field::new("x".repeat(65537), DataType::Int64, false),
+        bigint(false),
+    );
 }
 
 #[test]
@@ -147,11 +265,27 @@ fn match_bounds_shared_metadata_amplification_refused_before_layout_allocation()
     let mut metadata = HashMap::new();
     metadata.insert("hint".into(), "v".repeat(65536));
     let child = Arc::new(Field::new("v", DataType::Null, true).with_metadata(metadata));
-    refused(Field::new(
-        "id",
-        DataType::Struct(vec![child; 256].into()),
+    let null = value(ValueKind::Scalar(DataType::Null), DataType::Null, true);
+    let declared = value(
+        ValueKind::Struct(
+            (0..256)
+                .map(|_| {
+                    ValueField::new(
+                        "v",
+                        null.value_type().clone(),
+                        ValueTypeStorageLifetime::pure(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ),
+        DataType::Struct(vec![Arc::new(Field::new("v", DataType::Null, true)); 256].into()),
         false,
-    ));
+    );
+    refused(
+        Field::new("id", DataType::Struct(vec![child; 256].into()), false),
+        declared,
+    );
 }
 
 #[test]
@@ -162,7 +296,7 @@ fn match_bounds_repeated_type_paths_have_a_node_bound() {
         DataType::Struct(vec![leaf; 128].into()),
         true,
     ));
-    refused(Field::new(
+    refused_corrupted_source(Field::new(
         "id",
         DataType::Struct(vec![group; 128].into()),
         false,
@@ -175,12 +309,12 @@ fn match_bounds_depth_refused_before_arrow_debug_recursion() {
     for _ in 0..64 {
         field = Arc::new(Field::new("item", DataType::List(field), true));
     }
-    refused(Field::new("id", DataType::List(field), false));
+    refused_corrupted_source(Field::new("id", DataType::List(field), false));
 }
 
 #[test]
 fn match_bounds_validate_rechecks_borrowed_fields_before_allocating() {
-    let mut c = contract(Field::new("id", DataType::Int64, false)).unwrap();
+    let mut c = contract(Field::new("id", DataType::Int64, false), bigint(false)).unwrap();
     c.identity_fields[0].field = Field::new("x".repeat(65537), DataType::Int64, false);
     reset_calls();
     assert_eq!(
@@ -192,7 +326,7 @@ fn match_bounds_validate_rechecks_borrowed_fields_before_allocating() {
 
 #[test]
 fn match_bounds_actual_vec_capacity_is_checked_before_layout_allocation() {
-    let c = contract(Field::new("id", DataType::Int64, false)).unwrap();
+    let c = contract(Field::new("id", DataType::Int64, false), bigint(false)).unwrap();
     let capacity = 16 * 1024 * 1024 / std::mem::size_of::<ConnectorMutationSourceField>() + 1;
     let mut identities = Vec::with_capacity(capacity);
     identities.push(c.identity_fields[0].clone());
@@ -214,7 +348,7 @@ fn match_bounds_actual_vec_capacity_is_checked_before_layout_allocation() {
 
 #[test]
 fn match_bounds_field_count_refused_before_layout_allocation() {
-    let c = contract(Field::new("id", DataType::Int64, false)).unwrap();
+    let c = contract(Field::new("id", DataType::Int64, false), bigint(false)).unwrap();
     let identities = vec![c.identity_fields[0].clone(); 4096];
     reset_calls();
     let error = ConnectorMutationMatchContract::try_new(
@@ -236,24 +370,35 @@ fn match_bounds_field_count_refused_before_layout_allocation() {
 fn match_bounds_sparse_metadata_capacity_is_checked_before_debug() {
     let mut metadata = HashMap::with_capacity(16 * 1024 * 1024 / 128 + 1);
     metadata.insert("tiny".into(), "value".into());
-    refused(Field::new("id", DataType::Int64, false).with_metadata(metadata));
+    refused(
+        Field::new("id", DataType::Int64, false).with_metadata(metadata),
+        bigint(false),
+    );
 }
 
 #[test]
-fn match_bounds_before_after_order_and_effect_keep_v1_digest() {
-    let mut c = contract(Field::new("id", DataType::Int64, false)).unwrap();
+fn match_bounds_before_after_order_and_effect_keep_formatted_source_and_typed_digest() {
+    let mut c = contract(Field::new("id", DataType::Int64, false), bigint(false)).unwrap();
     let mut metadata = HashMap::new();
     metadata.insert("hint".into(), "quoted\"\n".into());
-    let before = vec![ConnectorMutationTargetField::new(
-        ConnectorWriteFieldToken::from_bytes([3; 32]),
-        Field::new("before", DataType::Utf8, false).with_metadata(metadata.clone()),
-        1,
-    )];
-    let after = vec![ConnectorMutationTargetField::new(
-        ConnectorWriteFieldToken::from_bytes([4; 32]),
-        Field::new("after", DataType::Utf8, true).with_metadata(metadata),
-        2,
-    )];
+    let before = vec![
+        ConnectorMutationTargetField::try_new_typed(
+            ConnectorWriteFieldToken::from_bytes([3; 32]),
+            Field::new("before", DataType::Utf8, false).with_metadata(metadata.clone()),
+            1,
+            text(false),
+        )
+        .unwrap(),
+    ];
+    let after = vec![
+        ConnectorMutationTargetField::try_new_typed(
+            ConnectorWriteFieldToken::from_bytes([4; 32]),
+            Field::new("after", DataType::Utf8, true).with_metadata(metadata),
+            2,
+            text(true),
+        )
+        .unwrap(),
+    ];
     c.effect_field.target_ordinal = 3;
     let c = ConnectorMutationMatchContract::try_new(
         c.owner,
@@ -266,6 +411,6 @@ fn match_bounds_before_after_order_and_effect_keep_v1_digest() {
         c.effect_field,
     )
     .unwrap();
-    assert_eq!(c.digest, old_digest(&c));
+    assert_eq!(c.digest, formatted_source_typed_digest(&c));
     c.validate().unwrap();
 }

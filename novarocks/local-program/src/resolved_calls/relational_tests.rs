@@ -137,7 +137,7 @@ impl Owner {
             let argument = value_type(DataType::Int64);
             overloads.push(FunctionOverloadDeclaration::from_effects(
                 overload.clone(),
-                format!("{:?}", argument.data_type),
+                format!("{:?}", argument.data_type()),
                 "Int64",
                 (kind == FunctionKind::Aggregate).then(|| AggregateBindingDeclaration {
                     state_argument_contract:
@@ -293,7 +293,7 @@ impl AggregateSignatureResolver for Owner {
             .iter()
             .find(|selected| {
                 matches!(&selected.argument_types[0], FunctionArgumentType::Value(ty)
-                    if arguments == [ty.data_type.clone()])
+                    if arguments == [ty.data_type().clone()])
             })
             .ok_or(FunctionResolutionError::NoMatchingSignature {
                 candidates: self.selections.len(),
@@ -934,7 +934,7 @@ fn resolved_signature(owner: &Owner) -> ResolvedAggregateSignature {
             .argument_types
             .iter()
             .map(|arg| match arg {
-                FunctionArgumentType::Value(ty) => ty.data_type.clone(),
+                FunctionArgumentType::Value(ty) => ty.data_type().clone(),
                 FunctionArgumentType::Lambda { .. } => unreachable!(),
             })
             .collect(),
@@ -943,6 +943,21 @@ fn resolved_signature(owner: &Owner) -> ResolvedAggregateSignature {
         state_format: state_format(),
     }
 }
+/// The actual fixture catalogue already owns this complete selection. Its
+/// static calls retain that exact source; display aliases and raw signatures
+/// are not authorities for reconstructing the selected semantics.
+fn frozen_selection(owner: &Owner) -> Arc<FrozenAggregateSelection> {
+    Arc::new(
+        FrozenAggregateSelection::try_new(
+            owner.declaration.function_id().clone(),
+            owner.selections[0].clone(),
+            1,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap(),
+    )
+}
+
 pub(crate) fn aggregate_node(
     owner: &Owner,
     intermediate: bool,
@@ -960,6 +975,7 @@ pub(crate) fn aggregate_node(
                     input: ProgramNodeId::new(0),
                     group_by: vec![ProgramExprId::new(0); group_roots],
                     functions: vec![StaticAggregateCall {
+                        frozen: Some(frozen_selection(owner)),
                         state_interpretation: None,
                         // Deliberately unrelated display text: it is never implementation authority.
                         name: "display_alias_without_catalogue_entry".into(),
@@ -1134,6 +1150,7 @@ pub(crate) fn window_program(
                     partition_exprs: vec![],
                     order_by_exprs: vec![],
                     functions: vec![StaticWindowFunction {
+                        frozen_aggregate: aggregate.then(|| frozen_selection(owner)),
                         kind: if aggregate {
                             WindowFunctionKind::Sum
                         } else {
@@ -1169,6 +1186,8 @@ fn prepared_window_graph(
                 partition_exprs: vec![],
                 order_by_exprs: vec![],
                 functions: vec![StaticWindowFunction {
+                    // This fixture declares a window-only prepared call.
+                    frozen_aggregate: None,
                     kind: WindowFunctionKind::Prepared,
                     args: vec![ProgramExprId::new(0)],
                     return_type: DataType::Int64,
@@ -1463,11 +1482,13 @@ pub(crate) fn writer_program(
                 },
                 writer_multiplex_layout: intermediate.clone(),
                 partial_aggregates: vec![WriterPartialAggregateCall {
+                    frozen: Some(frozen_selection(owner)),
                     input_slot_id: SlotId::new(partial_input_slot),
                     function_name: "writer_alias".into(),
                     resolved: resolved_signature(owner),
                     intermediate_slot_id: SlotId::new(2),
                 }],
+                partial_preparation: None,
             },
             intermediate.clone(),
         ),
@@ -1479,7 +1500,9 @@ pub(crate) fn writer_program(
                 writer_multiplex_layout: intermediate.clone(),
                 root_result_layout: final_layout.clone(),
                 final_aggregates: WriterFinalAggregatePlan {
+                    prepared: None,
                     calls: vec![WriterFinalAggregateCall {
+                        frozen: Some(frozen_selection(owner)),
                         function_name: "finish_alias".into(),
                         resolved: resolved_signature(owner),
                         intermediate_input_slot_id: SlotId::new(final_input_slot),

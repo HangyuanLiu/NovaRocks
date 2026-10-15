@@ -13,26 +13,27 @@ mod tests {
                 .expect("builtin function catalog"),
         ))
     }
-    use super::super::{NativePlanDecodeContext, decode_node};
+    use super::super::NativePlanDecodeContext;
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
     use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_proto_models::plan;
     use novarocks_types::SlotId;
 
-    fn ordered_concat_merge_plan(name: &str) -> plan::DistributedNode {
+    fn ordered_concat_merge_plan(name: &str) -> FixturePlan {
         let signature = resolved_aggregate_update_signature(
             name,
             &[DataType::Utf8, DataType::Utf8],
             &[DataType::Utf8, DataType::Utf8, DataType::Int64],
         );
-        let intermediate_type = novarocks_plan_codec::native_type::decode_type(
-            signature
-                .as_ref()
-                .and_then(|signature| signature.intermediate_type.as_ref())
-                .expect("concat intermediate type"),
+        let intermediate_type = aggregate_source(
+            name,
+            &[DataType::Utf8, DataType::Utf8],
+            &[DataType::Utf8, DataType::Utf8, DataType::Int64],
         )
-        .expect("decoded concat intermediate type");
+        .intermediate()
+        .data_type()
+        .clone();
         let local_columns = vec![output_column(3, "concat_state", intermediate_type.clone())];
         let local = physical_node(
             20,
@@ -57,6 +58,14 @@ mod tests {
             }),
             local_columns,
             vec![values_node(10)],
+        )
+        .with_original_aggregate(
+            0,
+            aggregate_source(
+                name,
+                &[DataType::Utf8, DataType::Utf8],
+                &[DataType::Utf8, DataType::Utf8, DataType::Int64],
+            ),
         );
         let final_columns = vec![output_column(4, "concat_result", DataType::Utf8)];
         physical_node(
@@ -83,10 +92,18 @@ mod tests {
             final_columns,
             vec![local],
         )
+        .with_original_aggregate(
+            0,
+            aggregate_source(
+                name,
+                &[DataType::Utf8, DataType::Utf8],
+                &[DataType::Utf8, DataType::Utf8, DataType::Int64],
+            ),
+        )
     }
 
     fn assert_concat_phase_limits(
-        plan: &plan::DistributedNode,
+        plan: &FixturePlan,
         context: &NativePlanDecodeContext,
         expected: Option<i64>,
     ) {
@@ -167,6 +184,10 @@ mod tests {
             }),
             columns,
             vec![one_col_values_node(10)],
+        )
+        .with_original_aggregate(
+            0,
+            aggregate_source("sum", &[DataType::Int64], &[DataType::Int64]),
         );
         let context = aggregate_decode_context().with_query_options(Some(QueryOptions {
             group_concat_max_len: Some(5),
@@ -277,7 +298,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("exact resolved signature missing"),
+                .contains("aggregate frozen signature is absent"),
             "{error}"
         );
     }
@@ -312,6 +333,10 @@ mod tests {
             }),
             output_columns,
             vec![one_col_values_node(10)],
+        )
+        .with_original_aggregate(
+            0,
+            aggregate_source("sum", &[DataType::Int64], &[DataType::Int64]),
         );
         let error = decode_node(
             &aggregate,
@@ -320,7 +345,9 @@ mod tests {
         )
         .expect_err("state format drift must fail");
         assert!(
-            error.to_string().contains("resolved signature drift"),
+            error.to_string().contains(
+                "aggregate state format or argument contract differs from its declaration"
+            ),
             "{error}"
         );
     }
@@ -357,6 +384,10 @@ mod tests {
             }),
             visible_output,
             vec![three_col_values_node(10)],
+        )
+        .with_original_aggregate(
+            0,
+            aggregate_source("sum", &[DataType::Int64], &[DataType::Int64]),
         );
 
         let lowered = lower(&aggregate);
@@ -404,6 +435,10 @@ mod tests {
             }),
             output_columns,
             vec![one_col_values_node(10)],
+        )
+        .with_original_aggregate(
+            0,
+            aggregate_source("avg", &[DataType::Int64], &[DataType::Int64]),
         );
         let lowered = lower(&aggregate);
         let ExecNodeKind::Aggregate(aggregate) = lowered.node.kind else {
@@ -444,6 +479,10 @@ mod tests {
             }),
             output_columns,
             vec![one_col_values_node(10)],
+        )
+        .with_original_aggregate(
+            0,
+            aggregate_source("avg", &[DataType::Int64], &[DataType::Int64]),
         );
         let lowered = lower(&aggregate);
         let ExecNodeKind::Aggregate(aggregate) = lowered.node.kind else {
@@ -492,6 +531,10 @@ mod tests {
             }),
             output_columns,
             vec![one_col_values_node(10)],
+        )
+        .with_original_aggregate(
+            0,
+            aggregate_source("avg", &[DataType::Int64], &[DataType::Int64]),
         );
 
         let error = decode_node(
@@ -532,6 +575,10 @@ mod tests {
             }),
             output_columns,
             vec![one_col_values_node(10)],
+        )
+        .with_original_aggregate(
+            0,
+            aggregate_source("avg", &[DataType::Int64], &[DataType::Int64]),
         );
 
         let error = decode_node(
@@ -572,6 +619,10 @@ mod tests {
             }),
             output_columns,
             vec![values_node(10)],
+        )
+        .with_original_aggregate(
+            0,
+            aggregate_source("avg", &[DataType::Int64], &[DataType::Int64]),
         );
 
         let lowered = lower(&aggregate);
@@ -599,13 +650,14 @@ mod tests {
             &[DataType::Utf8, DataType::Utf8],
             &[DataType::Utf8, DataType::Utf8, DataType::Int64],
         );
-        let intermediate_type = novarocks_plan_codec::native_type::decode_type(
-            resolved_signature
-                .as_ref()
-                .and_then(|signature| signature.intermediate_type.as_ref())
-                .expect("catalog intermediate type"),
+        let intermediate_type = aggregate_source(
+            "group_concat",
+            &[DataType::Utf8, DataType::Utf8],
+            &[DataType::Utf8, DataType::Utf8, DataType::Int64],
         )
-        .expect("decoded intermediate type");
+        .intermediate()
+        .data_type()
+        .clone();
         let output_columns = vec![output_column(3, "gc", intermediate_type.clone())];
         let aggregate = physical_node(
             20,
@@ -630,6 +682,14 @@ mod tests {
             }),
             output_columns,
             vec![values_node(10)],
+        )
+        .with_original_aggregate(
+            0,
+            aggregate_source(
+                "group_concat",
+                &[DataType::Utf8, DataType::Utf8],
+                &[DataType::Utf8, DataType::Utf8, DataType::Int64],
+            ),
         );
 
         let mut arena = ExprArena::default();
@@ -694,6 +754,10 @@ mod tests {
             }),
             output_columns,
             vec![values_node(10)],
+        )
+        .with_original_aggregate(
+            0,
+            aggregate_source("count_if", &[DataType::Boolean], &[DataType::Boolean]),
         );
 
         let mut arena = ExprArena::default();

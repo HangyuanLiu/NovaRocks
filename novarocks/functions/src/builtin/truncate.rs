@@ -60,8 +60,8 @@ enum NumericInput<'a> {
 }
 impl<'a> NumericInput<'a> {
     fn checked(array: &'a ArrayRef, source: &FunctionValueType) -> Result<Self, KernelFailure> {
-        if source.logical_type != ValueLogicalType::Physical
-            || array.data_type() != &source.data_type
+        if source.logical_type() != ValueLogicalType::Physical
+            || array.data_type() != source.data_type()
         {
             return Err(invalid(
                 "truncate input differs from its exact numeric carrier",
@@ -76,7 +76,7 @@ impl<'a> NumericInput<'a> {
                     .ok_or_else(|| internal("truncate numeric carrier cannot be downcast"))
             };
         }
-        match &source.data_type {
+        match source.data_type() {
             DataType::Int8 => downcast!(Int8Array, Int8),
             DataType::Int16 => downcast!(Int16Array, Int16),
             DataType::Int32 => downcast!(Int32Array, Int32),
@@ -140,7 +140,7 @@ impl<'a> NumericValue<'a> {
         Ok(Self {
             argument,
             view: NumericInput::checked(argument.array(), source)?,
-            nullable: source.nullable,
+            nullable: source.nullable(),
         })
     }
     fn row(&self, ordinal: usize, batch_row: usize) -> Result<Option<usize>, KernelFailure> {
@@ -177,23 +177,23 @@ impl Output {
         rows: usize,
         policy: DecimalOverflowPolicy,
     ) -> Result<Self, KernelFailure> {
-        if target.logical_type != ValueLogicalType::Physical || !target.nullable {
+        if target.logical_type() != ValueLogicalType::Physical || !target.nullable() {
             return Err(invalid(
                 "truncate requires its exact nullable Physical result",
             ));
         }
-        match target.data_type {
+        match target.data_type() {
             DataType::Int64 => Ok(Self::Integer(Int64Builder::with_capacity(rows))),
             DataType::Float64 => Ok(Self::Float(Float64Builder::with_capacity(rows))),
             DataType::Decimal128(38, scale) => {
                 let builder = Decimal128Builder::with_capacity(rows)
-                    .with_precision_and_scale(38, scale)
+                    .with_precision_and_scale(38, *scale)
                     .map_err(|_| {
                         invalid("truncate selected decimal result parameters are invalid")
                     })?;
                 Ok(Self::Decimal {
                     builder,
-                    multiplier: 10_f64.powi(i32::from(scale)),
+                    multiplier: 10_f64.powi(i32::from(*scale)),
                     precision: 38,
                     policy,
                 })
@@ -324,7 +324,7 @@ pub(super) fn evaluate_truncate<'a>(
     work.finish()?;
     SelectedValues::try_new(
         selection,
-        &target.data_type,
+        target.data_type(),
         values,
         errors.into_boxed_slice(),
     )

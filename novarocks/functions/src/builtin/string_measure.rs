@@ -152,13 +152,13 @@ pub(super) fn check_types(
     let nullable = if op == StringMeasureOp::Ascii {
         true
     } else {
-        source.nullable
+        source.nullable()
     };
-    if source.logical_type != ValueLogicalType::Physical
-        || source.data_type != DataType::Utf8
-        || target.logical_type != ValueLogicalType::Physical
-        || target.data_type != DataType::Int32
-        || target.nullable != nullable
+    if source.logical_type() != ValueLogicalType::Physical
+        || source.data_type() != &DataType::Utf8
+        || target.logical_type() != ValueLogicalType::Physical
+        || target.data_type() != &DataType::Int32
+        || target.nullable() != nullable
     {
         return Err(StaticProfileFailure::Type);
     }
@@ -195,7 +195,7 @@ pub(super) fn evaluate_string_measure<'a>(
         values,
         |ordinal, batch| argument.value_row(ordinal, batch),
         selection,
-        Some(source.nullable),
+        Some(source.nullable()),
         &mut work,
         |value| {
             match value {
@@ -216,7 +216,7 @@ pub(super) fn evaluate_string_measure<'a>(
     })?;
     let output = Arc::new(builder.finish()) as ArrayRef;
     work.take().unwrap().finish()?;
-    SelectedValues::try_new(selection, &target.data_type, output, Box::default())
+    SelectedValues::try_new(selection, target.data_type(), output, Box::default())
         .map_err(|_| internal("string measurement compact output violates its selected contract"))
 }
 fn legacy_failure(error: MeasureFailure) -> String {
@@ -421,9 +421,9 @@ mod tests {
                     let mut kernel = ScalarEvaluationInstance::instantiate(prepared).unwrap();
                     assert_eq!(kernel.contract().decimal_overflow_policy(), policy);
                     let ty = kernel.contract().result_type();
-                    assert_eq!(ty.logical_type, ValueLogicalType::Physical);
-                    assert_eq!(ty.data_type, DataType::Int32);
-                    assert_eq!(ty.nullable, name == "ascii" || nullable);
+                    assert_eq!(ty.logical_type(), ValueLogicalType::Physical);
+                    assert_eq!(ty.data_type().clone(), DataType::Int32);
+                    assert_eq!(ty.nullable(), name == "ascii" || nullable);
                     let result = kernel
                         .evaluate(Selection::all(EXPECTED.len()), &args, &Control::default())
                         .unwrap();

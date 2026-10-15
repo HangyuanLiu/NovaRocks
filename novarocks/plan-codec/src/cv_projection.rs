@@ -20,6 +20,7 @@
 
 use super::{ExpressionEncodingContext, NATIVE_V1_MAX_EXPANDED_EXPR_DYNAMIC_BYTES};
 use crate::PhysicalEncodeError;
+use crate::physical_encode::fragment_type_owner::{TypeEncodingResources, TypeEncodingResult};
 use arrow::datatypes::DataType;
 use novarocks_constant_contract::{ConstantError, ConstantValue};
 use novarocks_physical_plan::{ConstantReference, ValueType};
@@ -38,7 +39,7 @@ pub(super) fn cost(
         {
             return Ok((0, 0));
         }
-        let (messages, bytes) = match &expected.data_type {
+        let (messages, bytes) = match &expected.data_type() {
             DataType::Boolean => {
                 required(value.try_boolean().map_err(constant_error)?)?;
                 (0, 0)
@@ -91,80 +92,89 @@ pub(super) fn cost(
     })
 }
 
-pub(super) fn encode(
+pub(super) fn encode<H>(
     reference: ConstantReference,
     expected: &ValueType,
     context: ExpressionEncodingContext<'_>,
-) -> Result<common::LiteralValue, PhysicalEncodeError> {
-    with_value(reference, expected, context, |value, work| {
-        use common::literal_value::Value;
-        let payload = if value
-            .is_null_observed(CompilePhase::Encode, work.control())
-            .map_err(constant_error)?
-        {
-            Value::NullValue(true)
-        } else {
-            match &expected.data_type {
-                DataType::Boolean => {
-                    Value::BoolValue(required(value.try_boolean().map_err(constant_error)?)?)
+    resources: &mut TypeEncodingResources<'_, H>,
+) -> TypeEncodingResult<common::LiteralValue, H> {
+    with_value_resources(
+        reference,
+        expected,
+        context,
+        resources,
+        |value, resources| {
+            use common::literal_value::Value;
+            let payload = if value
+                .is_null_observed(CompilePhase::Encode, resources.work.control())
+                .map_err(constant_error)?
+            {
+                Value::NullValue(true)
+            } else {
+                match &expected.data_type() {
+                    DataType::Boolean => {
+                        Value::BoolValue(required(value.try_boolean().map_err(constant_error)?)?)
+                    }
+                    DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                        Value::IntValue(required(value.try_i64().map_err(constant_error)?)?)
+                    }
+                    DataType::Float32 => {
+                        Value::FloatValue(f64::from(exact_wire_f32(value, &mut resources.work)?))
+                    }
+                    // Prost's double codec copies to_bits/from_bits without numeric
+                    // conversion; the native Float64 literal also retains f64.
+                    DataType::Float64 => Value::FloatValue(f64::from_bits(required(
+                        value.try_f64_bits().map_err(constant_error)?,
+                    )?)),
+                    DataType::FixedSizeBinary(16) => Value::LargeintValue(copy_bytes(
+                        &required(value.try_largeint().map_err(constant_error)?)?.to_be_bytes(),
+                        resources,
+                    )?),
+                    DataType::Decimal128(precision, scale) => {
+                        Value::DecimalValue(common::DecimalLiteral {
+                            value: copy_bytes(
+                                &required(value.try_decimal128().map_err(constant_error)?)?
+                                    .to_be_bytes(),
+                                resources,
+                            )?,
+                            precision: u32::from(*precision),
+                            scale: i32::from(*scale),
+                        })
+                    }
+                    DataType::Decimal256(precision, scale) => {
+                        Value::DecimalValue(common::DecimalLiteral {
+                            value: copy_bytes(
+                                &required(value.try_decimal256_be().map_err(constant_error)?)?,
+                                resources,
+                            )?,
+                            precision: u32::from(*precision),
+                            scale: i32::from(*scale),
+                        })
+                    }
+                    DataType::Utf8 => Value::StringValue(copy_text(
+                        required(value.try_utf8().map_err(constant_error)?)?,
+                        resources,
+                    )?),
+                    DataType::Binary | DataType::LargeBinary => Value::BinaryValue(copy_bytes(
+                        required(value.try_binary().map_err(constant_error)?)?,
+                        resources,
+                    )?),
+                    DataType::Date32 => {
+                        Value::Date32Value(required(value.try_date32().map_err(constant_error)?)?)
+                    }
+                    _ => {
+                        return Err(
+                            "native wire v1 cannot preserve this non-NULL constant carrier".into(),
+                        );
+                    }
                 }
-                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                    Value::IntValue(required(value.try_i64().map_err(constant_error)?)?)
-                }
-                DataType::Float32 => Value::FloatValue(f64::from(exact_wire_f32(value, work)?)),
-                // Prost's double codec copies to_bits/from_bits without numeric
-                // conversion; the native Float64 literal also retains f64.
-                DataType::Float64 => Value::FloatValue(f64::from_bits(required(
-                    value.try_f64_bits().map_err(constant_error)?,
-                )?)),
-                DataType::FixedSizeBinary(16) => Value::LargeintValue(copy_bytes(
-                    &required(value.try_largeint().map_err(constant_error)?)?.to_be_bytes(),
-                    work,
-                )?),
-                DataType::Decimal128(precision, scale) => {
-                    Value::DecimalValue(common::DecimalLiteral {
-                        value: copy_bytes(
-                            &required(value.try_decimal128().map_err(constant_error)?)?
-                                .to_be_bytes(),
-                            work,
-                        )?,
-                        precision: u32::from(*precision),
-                        scale: i32::from(*scale),
-                    })
-                }
-                DataType::Decimal256(precision, scale) => {
-                    Value::DecimalValue(common::DecimalLiteral {
-                        value: copy_bytes(
-                            &required(value.try_decimal256_be().map_err(constant_error)?)?,
-                            work,
-                        )?,
-                        precision: u32::from(*precision),
-                        scale: i32::from(*scale),
-                    })
-                }
-                DataType::Utf8 => Value::StringValue(copy_text(
-                    required(value.try_utf8().map_err(constant_error)?)?,
-                    work,
-                )?),
-                DataType::Binary | DataType::LargeBinary => Value::BinaryValue(copy_bytes(
-                    required(value.try_binary().map_err(constant_error)?)?,
-                    work,
-                )?),
-                DataType::Date32 => {
-                    Value::Date32Value(required(value.try_date32().map_err(constant_error)?)?)
-                }
-                _ => {
-                    return Err(
-                        "native wire v1 cannot preserve this non-NULL constant carrier".into(),
-                    );
-                }
-            }
-        };
-        work.step()?;
-        Ok(common::LiteralValue {
-            value: Some(payload),
-        })
-    })
+            };
+            resources.work.step()?;
+            Ok(common::LiteralValue {
+                value: Some(payload),
+            })
+        },
+    )
 }
 
 pub(super) fn window_offset(
@@ -173,8 +183,8 @@ pub(super) fn window_offset(
     context: ExpressionEncodingContext<'_>,
 ) -> Result<i64, PhysicalEncodeError> {
     with_value(reference, expected, context, |value, work| {
-        if expected.logical_type != novarocks_type_contract::ValueLogicalType::Physical
-            || expected.data_type != DataType::Int64
+        if expected.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
+            || expected.data_type() != &DataType::Int64
         {
             return Err(
                 "native wire v1 window bound must be a non-negative exact Int64 constant".into(),
@@ -242,51 +252,72 @@ fn constant_error(error: ConstantError) -> PhysicalEncodeError {
         error => PhysicalEncodeError::Invalid(error.to_string()),
     }
 }
-fn copy_bytes(
+fn copy_bytes<H>(
     bytes: &[u8],
-    work: &mut CompileCheckpoints<'_>,
-) -> Result<Vec<u8>, PhysicalEncodeError> {
+    resources: &mut TypeEncodingResources<'_, H>,
+) -> TypeEncodingResult<Vec<u8>, H> {
     if bytes.len() > NATIVE_V1_MAX_EXPANDED_EXPR_DYNAMIC_BYTES {
         return Err("native wire v1 selected constant exceeds expression payload limit".into());
     }
-    work.flush()?;
-    let mut output = Vec::new();
-    output
-        .try_reserve_exact(bytes.len())
-        .map_err(|_| PhysicalEncodeError::Control(CompileControlError::ResourceExhausted))?;
-    work.flush()?;
+    let mut output = resources.vector(bytes.len())?;
     for chunk in bytes.chunks(1024) {
         output.extend_from_slice(chunk);
-        work.step()?;
+        resources.work.step()?;
     }
     Ok(output)
 }
-fn copy_text(text: &str, work: &mut CompileCheckpoints<'_>) -> Result<String, PhysicalEncodeError> {
-    if text.len() > NATIVE_V1_MAX_EXPANDED_EXPR_DYNAMIC_BYTES {
-        return Err("native wire v1 selected constant exceeds expression payload limit".into());
-    }
-    work.flush()?;
-    let mut output = String::new();
-    output
-        .try_reserve_exact(text.len())
-        .map_err(|_| PhysicalEncodeError::Control(CompileControlError::ResourceExhausted))?;
-    work.flush()?;
-    let mut remaining = text;
-    while !remaining.is_empty() {
-        let mut end = remaining.len().min(1024);
-        while !remaining.is_char_boundary(end) {
-            end -= 1;
-        }
-        output.push_str(&remaining[..end]);
-        work.step()?;
-        remaining = &remaining[end..];
-    }
-    Ok(output)
+fn copy_text<H>(
+    text: &str,
+    resources: &mut TypeEncodingResources<'_, H>,
+) -> TypeEncodingResult<String, H> {
+    let bytes = copy_bytes(text.as_bytes(), resources)?;
+    Ok(String::from_utf8(bytes).expect("borrowed UTF-8 remains valid"))
+}
+fn with_value_resources<T, H>(
+    reference: ConstantReference,
+    expected: &ValueType,
+    context: ExpressionEncodingContext<'_>,
+    resources: &mut TypeEncodingResources<'_, H>,
+    consume: impl FnOnce(&ConstantValue, &mut TypeEncodingResources<'_, H>) -> TypeEncodingResult<T, H>,
+) -> TypeEncodingResult<T, H> {
+    let value = context
+        .constants
+        .resolve_observed(reference, expected, &mut resources.work)
+        .map_err(|error| match error {
+            novarocks_physical_plan::ConstantReferenceError::Control(cause) => {
+                PhysicalEncodeError::Control(cause)
+            }
+            error => PhysicalEncodeError::Invalid(error.to_string()),
+        })?;
+    consume(&value, resources)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn encode(
+        reference: ConstantReference,
+        expected: &ValueType,
+        context: ExpressionEncodingContext<'_>,
+    ) -> Result<common::LiteralValue, PhysicalEncodeError> {
+        let mut request = |_: std::alloc::Layout| {
+            Ok::<_, crate::host_projection_v2::AdmissionRefusal<std::convert::Infallible>>(())
+        };
+        let mut resources = TypeEncodingResources {
+            request: &mut request,
+            work: CompileCheckpoints::try_new(context.control, CompilePhase::Encode)?,
+            type_policy: crate::physical_encode::fragment_type_owner::ExecutionTypeEncodingPolicy::LegacyInline,
+            storage: novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        };
+        let result = super::encode(reference, expected, context, &mut resources)
+            .map_err(crate::host_projection_v2::ProjectionFailure::without_host);
+        if matches!(&result, Err(PhysicalEncodeError::Control(_))) {
+            return result;
+        }
+        resources.work.finish()?;
+        result
+    }
+
     use arrow::array::{
         Array, ArrayRef, Float32Array, Float64Array, Int64Array, StringArray,
         TimestampMicrosecondArray,
@@ -370,8 +401,10 @@ mod tests {
             reference,
             ty,
             ExpressionEncodingContext {
+                writer_calls: None,
                 constants: pools,
                 control: &baseline,
+                types: None,
             },
         );
         if ordinary {
@@ -391,7 +424,7 @@ mod tests {
                     calls: Mutex::new(Vec::new()),
                 };
                 assert!(
-                    matches!(encode(reference,ty,ExpressionEncodingContext{constants:pools,control:&refusing}),Err(PhysicalEncodeError::Control(actual)) if actual==cause)
+                    matches!(encode(reference,ty,ExpressionEncodingContext{writer_calls:None,constants:pools,control:&refusing, types: None, }),Err(PhysicalEncodeError::Control(actual)) if actual==cause)
                 );
                 assert_eq!(refusing.trace(), trace[..=at]);
             }
@@ -404,8 +437,10 @@ mod tests {
         let (pools, ty) = source(Arc::new(Int64Array::from(vec![99, i64::MIN, 42])), false);
         let control = Control::good();
         let context = ExpressionEncodingContext {
+            writer_calls: None,
             constants: &pools,
             control: &control,
+            types: None,
         };
         assert_eq!(
             encode(reference(1), &ty, context).unwrap().value,
@@ -424,8 +459,10 @@ mod tests {
                 reference(1),
                 &ty,
                 ExpressionEncodingContext {
+                    writer_calls: None,
                     constants: &pools,
                     control: &control,
+                    types: None,
                 },
             )
             .unwrap();
@@ -448,8 +485,10 @@ mod tests {
             );
             let control = Control::good();
             let context = ExpressionEncodingContext {
+                writer_calls: None,
                 constants: &pools,
                 control: &control,
+                types: None,
             };
             assert_eq!(cost(reference(1), &ty, context).unwrap(), (0, 0));
             let wire = encode(reference(1), &ty, context).unwrap();
@@ -468,8 +507,10 @@ mod tests {
                 reference(0),
                 &ty,
                 ExpressionEncodingContext {
+                    writer_calls: None,
                     constants: &pools,
                     control: &Control::good(),
+                    types: None,
                 },
             )
             .unwrap_err();
@@ -490,8 +531,10 @@ mod tests {
         );
         let control = Control::good();
         let context = ExpressionEncodingContext {
+            writer_calls: None,
             constants: &pools,
             control: &control,
+            types: None,
         };
         assert_eq!(
             cost(reference(1), &ty, context).unwrap(),
@@ -502,8 +545,10 @@ mod tests {
             reference(1),
             &ty,
             ExpressionEncodingContext {
+                writer_calls: None,
                 constants: &pools,
                 control: &baseline,
+                types: None,
             },
         )
         .unwrap();
@@ -524,7 +569,7 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
             };
             assert!(
-                matches!(encode(reference(1),&ty,ExpressionEncodingContext{constants:&pools,control:&control}),Err(PhysicalEncodeError::Control(actual)) if actual==cause)
+                matches!(encode(reference(1),&ty,ExpressionEncodingContext{writer_calls:None,constants:&pools,control:&control, types: None, }),Err(PhysicalEncodeError::Control(actual)) if actual==cause)
             );
             assert_eq!(control.trace(), trace[..=at]);
         }
@@ -538,8 +583,10 @@ mod tests {
         );
         let control = Control::good();
         let context = ExpressionEncodingContext {
+            writer_calls: None,
             constants: &pools,
             control: &control,
+            types: None,
         };
         assert_eq!(
             encode(reference(0), &ty, context).unwrap().value,
@@ -600,8 +647,10 @@ mod tests {
                 .insert(ConstantPoolId::new(u32::MAX), value.pool().clone())
                 .unwrap();
             let context = ExpressionEncodingContext {
+                writer_calls: None,
                 constants: &pools,
                 control: &control,
+                types: None,
             };
             let wire = encode(reference(0), value.value_type(), context).unwrap();
             match (index, wire.value) {
@@ -641,8 +690,10 @@ mod tests {
         );
         let control = Control::good();
         let context = ExpressionEncodingContext {
+            writer_calls: None,
             constants: &pools,
             control: &control,
+            types: None,
         };
         assert_eq!(window_offset(reference(1), &ty, context).unwrap(), 42);
         assert!(matches!(

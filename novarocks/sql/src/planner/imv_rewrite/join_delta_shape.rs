@@ -134,9 +134,9 @@ fn unique_action_output_column_id(columns: &[OutputColumn]) -> Option<ColumnId> 
 fn valid_action_output_column_id(column: &OutputColumn) -> Option<ColumnId> {
     (column.name.eq_ignore_ascii_case(ImvActionColumn::NAME)
         && column.is_internal
-        && column.value_type.data_type == DataType::Int8
-        && !column.value_type.nullable)
-        .then_some(column.column_id)
+        && *column.value_type.data_type() == DataType::Int8
+        && !column.value_type.nullable())
+    .then_some(column.column_id)
 }
 
 fn has_reserved_action_output_name(column: &OutputColumn) -> bool {
@@ -164,9 +164,9 @@ fn valid_project_action_column_id(item: &ProjectItem) -> Option<ColumnId> {
         return None;
     };
     (*column_id == item.output_column_id
-        && item.expr.value_type.data_type == DataType::Int8
-        && !item.expr.value_type.nullable)
-        .then_some(item.output_column_id)
+        && *item.expr.value_type.data_type() == DataType::Int8
+        && !item.expr.value_type.nullable())
+    .then_some(item.output_column_id)
 }
 
 fn has_reserved_action_project_output_name(item: &ProjectItem) -> bool {

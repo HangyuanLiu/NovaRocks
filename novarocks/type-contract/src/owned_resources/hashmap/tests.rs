@@ -22,6 +22,96 @@ use std::{
 };
 
 #[test]
+fn incremental_operation_upper_covers_real_empty_then_insert_growth() {
+    let mut zero_calls = 0;
+    let zero =
+        incremental_insert_allocation_upper_bound_observed::<u64, u64, HashMapResourceError>(
+            0,
+            || {
+                zero_calls += 1;
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!((zero, zero_calls), (0, 0));
+
+    for count in [1, 3, 4, 7, 8, 14, 15, 29, 257] {
+        // Real incremental std operations establish each growth boundary;
+        // the existing locked fresh author supplies that table's raw shape.
+        // Public capacity is used only in this independent behavior oracle,
+        // never as an original source invoice or a production allocation fact.
+        let mut map = HashMap::<u64, u64>::new();
+        let mut old_capacity = 0;
+        let mut actual_growth_bytes = 0;
+        let mut grows = 0;
+        for at in 0..count {
+            assert!(map.insert(at as u64, at as u64).is_none());
+            let capacity = map.capacity();
+            if capacity != old_capacity {
+                let shape = fresh_table_layout::<u64, u64>(at + 1).unwrap();
+                let usable = if shape.buckets < 8 {
+                    shape.buckets - 1
+                } else {
+                    shape.buckets / 8 * 7
+                };
+                assert_eq!(capacity, usable);
+                actual_growth_bytes += shape.request_bytes_upper_bound;
+                grows += 1;
+                old_capacity = capacity;
+            }
+        }
+        let mut observations = 0;
+        let upper = incremental_insert_allocation_upper_bound_observed::<
+            u64,
+            u64,
+            HashMapResourceError,
+        >(count, || {
+            observations += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert!(grows > 0 && upper > 0);
+        assert!(upper >= actual_growth_bytes);
+        assert!(observations >= grows);
+        assert_eq!(map.len(), count);
+    }
+}
+
+#[test]
+fn incremental_operation_preserves_first_nominal_refusal_and_checked_overflow() {
+    #[derive(Debug, Eq, PartialEq)]
+    enum Failure {
+        Caller(u64),
+        Model(HashMapResourceError),
+    }
+    impl From<HashMapResourceError> for Failure {
+        fn from(cause: HashMapResourceError) -> Self {
+            Self::Model(cause)
+        }
+    }
+    let mut calls = 0;
+    let result =
+        incremental_insert_allocation_upper_bound_observed::<u64, u64, Failure>(usize::MAX, || {
+            calls += 1;
+            if calls == 2 {
+                Err(Failure::Caller(0xfeed))
+            } else {
+                Ok(())
+            }
+        });
+    assert_eq!(result, Err(Failure::Caller(0xfeed)));
+    assert_eq!(calls, 2);
+    // This follows finite checked prospective calculations only; no huge
+    // allocation or actual insertion is attempted for the overflow input.
+    assert!(matches!(
+        incremental_insert_allocation_upper_bound_observed::<u64, u64, Failure>(usize::MAX, || Ok(
+            ()
+        )),
+        Err(Failure::Model(HashMapResourceError::Arithmetic(_)))
+    ));
+}
+
+#[test]
 fn fresh_string_table_has_independent_small_and_load_factor_layout_goldens() {
     assert_eq!(Layout::new::<(String, String)>().size(), 48);
     assert_eq!(Layout::new::<(String, String)>().align(), 8);

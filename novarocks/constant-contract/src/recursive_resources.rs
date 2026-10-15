@@ -86,20 +86,85 @@ pub fn preflight_recursive_pool_resources_in(
         node_lengths,
         input,
         policy,
-        &mut PoolObserver::parent(admit),
+        &mut PoolObserver::parent(&mut |facts| admit(facts).map_err(ConstantError::from)),
         work,
     )
 }
-fn preflight_recursive_pool_resources_core(
+/// The same recursive resource author with the original caller refusal intact.
+pub fn preflight_recursive_pool_resources_observed<H>(
     field: &Field,
     value_type: &FunctionValueType,
     node_lengths: impl IntoIterator<Item = u64>,
     input: RecursiveConstantResourceInput,
     policy: ConstantPolicy,
-    observer: &mut PoolObserver<'_>,
+    admit: &mut impl FnMut(&ConstantOwnerResourceFacts) -> Result<(), H>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<ConstantResourceFacts, ConstantError> {
-    let metadata_bytes = validate_type_owned(field, value_type, policy, observer, work)?;
+) -> Result<ConstantResourceFacts, ConstantCreationFailure<H>> {
+    preflight_recursive_pool_resources_core(
+        field,
+        value_type,
+        node_lengths,
+        input,
+        policy,
+        &mut PoolObserver::parent(&mut |facts| {
+            admit(facts).map_err(ConstantCreationFailure::Creator)
+        }),
+        work,
+    )
+}
+/// The same lazy-node resource author without an external receiving quota.
+/// Its output seals only this input's checked finite numerical envelope.
+pub fn preflight_recursive_pool_resources_input_derived_observed<H>(
+    field: &Field,
+    value_type: &FunctionValueType,
+    node_lengths: impl IntoIterator<Item = u64>,
+    input: RecursiveConstantResourceInput,
+    admit: &mut impl FnMut(&ConstantOwnerResourceFacts) -> Result<(), H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(ConstantResourceFacts, ConstantPolicy), ConstantCreationFailure<H>> {
+    preflight_recursive_pool_resources_profile_core(
+        field,
+        value_type,
+        node_lengths,
+        input,
+        None,
+        &mut PoolObserver::parent(&mut |facts| {
+            admit(facts).map_err(ConstantCreationFailure::Creator)
+        }),
+        work,
+    )
+}
+fn preflight_recursive_pool_resources_core<E: PoolFailure>(
+    field: &Field,
+    value_type: &FunctionValueType,
+    node_lengths: impl IntoIterator<Item = u64>,
+    input: RecursiveConstantResourceInput,
+    policy: ConstantPolicy,
+    observer: &mut PoolObserver<'_, E>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ConstantResourceFacts, E> {
+    preflight_recursive_pool_resources_profile_core(
+        field,
+        value_type,
+        node_lengths,
+        input,
+        Some(policy),
+        observer,
+        work,
+    )
+    .map(|(facts, _)| facts)
+}
+fn preflight_recursive_pool_resources_profile_core<E: PoolFailure>(
+    field: &Field,
+    value_type: &FunctionValueType,
+    node_lengths: impl IntoIterator<Item = u64>,
+    input: RecursiveConstantResourceInput,
+    policy: Option<ConstantPolicy>,
+    observer: &mut PoolObserver<'_, E>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<(ConstantResourceFacts, ConstantPolicy), E> {
+    let type_facts = validate_type_profile_owned(field, value_type, policy, observer, work)?;
+    let metadata_bytes = type_facts.metadata;
     let mut lengths = node_lengths.into_iter();
     let mut scanned = ScanFacts::default();
     let root = scan_nodes(
@@ -114,9 +179,9 @@ fn preflight_recursive_pool_resources_core(
     let extra = lengths.next();
     observer.step(work)?;
     if extra.is_some() {
-        return Err(ConstantError::Invalid(
-            "constant resource projection has extra nodes",
-        ));
+        return Err(
+            (ConstantError::Invalid("constant resource projection has extra nodes")).into(),
+        );
     }
     let logical = logical_elements_observed_owned(
         root.len,
@@ -125,14 +190,14 @@ fn preflight_recursive_pool_resources_core(
         observer,
         work,
     )?;
-    limit(
+    optional_limit(
         logical,
-        policy.max_logical_elements,
+        policy.map(|p| p.max_logical_elements),
         "constant logical element limit exceeded",
     )?;
-    limit(
+    optional_limit(
         input.retained_buffer_capacity_bytes_upper_bound,
-        policy.max_retained_buffer_bytes,
+        policy.map(|p| p.max_retained_buffer_bytes),
         "constant retained buffer limit exceeded",
     )?;
     scanned.buffer_count = input.buffer_count_upper_bound;
@@ -141,38 +206,54 @@ fn preflight_recursive_pool_resources_core(
     scanned.view_validation_bytes = input.view_validation_bytes_upper_bound;
     scanned.utf8_fallback_validation_bytes = input.utf8_fallback_validation_bytes_upper_bound;
     observer.step(work)?;
-    let envelope = validation_envelope_owned(
+    let envelope = validation_envelope_profile_owned(
         ValidationCounts::from(&scanned),
         metadata_bytes,
         policy,
         observer,
         work,
     )?;
-    Ok(ConstantResourceFacts {
-        rows: root.len,
-        array_nodes: scanned.nodes,
-        buffer_count: scanned.buffer_count,
-        logical_elements_upper_bound: logical,
-        retained_buffer_capacity_bytes: scanned.retained,
-        metadata_bytes,
-        library_validation_work_upper_bound: envelope.work,
-        library_validation_temporary_bytes_upper_bound: envelope.temporary,
-        library_validation_bytes_upper_bound: envelope.bytes,
-    })
+    let sealed = policy.unwrap_or(ConstantPolicy {
+        max_rows: root.len,
+        max_array_nodes: scanned.nodes,
+        max_logical_elements: logical,
+        max_retained_buffer_bytes: scanned.retained,
+        max_type_depth: u32::try_from(scanned.depth)
+            .map_err(|_| ConstantError::Limit("constant array depth is not representable"))?,
+        max_type_nodes: type_facts.nodes,
+        max_dictionary_depth: 0,
+        max_metadata_bytes: metadata_bytes,
+        max_library_validation_work: envelope.work,
+        max_library_validation_bytes: envelope.bytes,
+    });
+    Ok((
+        ConstantResourceFacts {
+            rows: root.len,
+            array_nodes: scanned.nodes,
+            buffer_count: scanned.buffer_count,
+            logical_elements_upper_bound: logical,
+            retained_buffer_capacity_bytes: scanned.retained,
+            metadata_bytes,
+            library_validation_work_upper_bound: envelope.work,
+            library_validation_temporary_bytes_upper_bound: envelope.temporary,
+            library_validation_bytes_upper_bound: envelope.bytes,
+        },
+        sealed,
+    ))
 }
 
-fn scan_nodes(
+fn scan_nodes<E: PoolFailure>(
     ty: &DataType,
     depth: u32,
     lengths: &mut impl Iterator<Item = u64>,
-    policy: ConstantPolicy,
+    policy: Option<ConstantPolicy>,
     scanned: &mut ScanFacts,
-    observer: &mut PoolObserver<'_>,
+    observer: &mut PoolObserver<'_, E>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<ElementMetric, ConstantError> {
-    limit(
+) -> Result<ElementMetric, E> {
+    optional_limit(
         u64::from(depth),
-        u64::from(policy.max_type_depth),
+        policy.map(|p| u64::from(p.max_type_depth)),
         "constant array depth limit exceeded",
     )?;
     limit(
@@ -186,19 +267,23 @@ fn scan_nodes(
         "constant resource projection lacks an expected node",
     ))?;
     if depth == 1 {
-        limit(len, policy.max_rows, "constant row limit exceeded")?;
+        optional_limit(
+            len,
+            policy.map(|p| p.max_rows),
+            "constant row limit exceeded",
+        )?;
     }
     scanned.nodes = checked_add(scanned.nodes, 1)?;
-    limit(
+    optional_limit(
         scanned.nodes,
-        policy.max_array_nodes,
+        policy.map(|p| p.max_array_nodes),
         "constant array node limit exceeded",
     )?;
     scanned.depth = scanned.depth.max(u64::from(depth));
     scanned.storage_elements = checked_add(scanned.storage_elements, len)?;
-    limit(
+    optional_limit(
         scanned.storage_elements,
-        policy.max_logical_elements,
+        policy.map(|p| p.max_logical_elements),
         "constant stored element limit exceeded",
     )?;
     observer.step(work)?;
@@ -236,11 +321,12 @@ fn scan_nodes(
         _ if is_flat_resource_carrier(ty) => value_elements(ty, std::iter::empty()),
         _ => Err(ConstantError::Invalid(
             "constant resource projection has an unsupported recursive carrier",
-        )),
+        )
+        .into()),
     };
     // A nested refusal is primary: do not observe again after it. Ordinary
     // metric errors still account for the completed variant/math work.
-    if matches!(&max_value, Err(ConstantError::Control(_))) {
+    if max_value.as_ref().is_err_and(|error| error.skip_tail()) {
         return max_value.map(|max_value| ElementMetric { len, max_value });
     }
     observer.step(work)?;

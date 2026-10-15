@@ -51,7 +51,7 @@ pub struct RootArrayStorageLimits {
 /// test (`root_capacity_introspection`). It assumes the arrow-buffer `pool`
 /// feature is off, which that test also guards.
 // Design: ADR-0170 (docs/adr/ADR-0170-third-party-crates-are-bounded-by-public-configuration-not-forked.md)
-pub const ARROW_BUFFER_OWNER_METADATA_BOUND: usize = 96;
+pub use novarocks_functions::array_projection::ARROW_BUFFER_OWNER_METADATA_BOUND;
 
 /// Sum full allocation capacities reported by upstream Arrow, including
 /// sliced-away backing and complete dictionary values. A fixed identity cache

@@ -95,7 +95,7 @@ fn fixture(sorted: bool) -> ArrayRef {
         ],
         None,
     );
-    Arc::new(MapArray::new(
+    let external: ArrayRef = Arc::new(MapArray::new(
         Arc::new(Field::new(
             "authored-entries",
             entries.data_type().clone(),
@@ -105,10 +105,17 @@ fn fixture(sorted: bool) -> ArrayRef {
         entries,
         Some(NullBuffer::from(vec![true, true, false, true])),
         sorted,
-    ))
+    ));
+    let binding = FunctionValueType::try_with_logical_type(
+        external.data_type().clone(),
+        true,
+        novarocks_type_contract::ValueLogicalType::Physical,
+    )
+    .unwrap();
+    crate::test_value_ingress::array_for_binding(&external, &binding).unwrap()
 }
 fn source(a: &ArrayRef) -> FunctionValueType {
-    FunctionValueType::new(a.data_type().clone(), true)
+    FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true)
 }
 fn instance(a: &ArrayRef) -> ScalarEvaluationInstance {
     ScalarEvaluationInstance::instantiate(
@@ -267,6 +274,8 @@ fn map_entries_owner_full_nested_profiles_preserve_no_ordered_decoder_or_nominal
             None,
             false,
         ));
+        let binding = source(&a);
+        let a = crate::test_value_ingress::array_for_binding(&a, &binding).unwrap();
         let args = [EvaluatedArgument::Column(&a)];
         let out = instance(&a)
             .evaluate(Selection::all(1), &args, &Control::default())
@@ -368,7 +377,7 @@ fn map_entries_owner_compile_success_and_original_admission_rejection_all_actual
                 &good
             )
             .is_ok(),
-            matches!(ty.data_type, DataType::Map(..))
+            matches!(ty.data_type(), DataType::Map(..))
         );
         let trace = good.trace.lock().unwrap().clone();
         assert!(!trace.is_empty());
@@ -409,16 +418,14 @@ fn map_entries_owner_compile_success_and_original_admission_rejection_all_actual
     }
 }
 
-fn check_all_projection_causes(
-    a: &ArrayRef,
-    selection: Selection<'_>,
-    args: &[EvaluatedArgument<'_>],
-) {
-    let good = Control::default();
-    instance(a).evaluate(selection, args, &good).unwrap();
-    let trace = good.trace.lock().unwrap().clone();
-    assert!(!trace.is_empty());
-    for at in 0..trace.len() {
+fn check_raw_projection_causes(a: &ArrayRef) {
+    let mut calls = 0;
+    crate::builtin::map_entries_core::project_observed(a, None, &mut |_| {
+        calls += 1;
+        Ok::<_, KernelFailure>(())
+    })
+    .unwrap();
+    for stop in 0..calls {
         for cause in [
             KernelFailure::Cancelled,
             KernelFailure::DeadlineExceeded,
@@ -428,24 +435,36 @@ fn check_all_projection_causes(
             KernelFailure::Operational(crate::KernelDiagnostic::new("original operational cause")),
             KernelFailure::InstanceFailed,
         ] {
-            let control = Control {
-                trace: Mutex::new(vec![]),
-                refusal: Some((at, cause.clone())),
-            };
-            let mut kernel = instance(a);
-            assert_eq!(
-                kernel.evaluate(selection, args, &control).unwrap_err(),
-                cause
+            let mut at = 0;
+            let result = crate::builtin::map_entries_core::project_observed(a, None, &mut |_| {
+                assert!(at <= stop);
+                let current = at;
+                at += 1;
+                if current == stop {
+                    Err(cause.clone())
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(
+                matches!(result, Err(crate::builtin::map_entries_core::MapEntriesFailure::Control(actual)) if actual == cause)
             );
-            assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
-            let after = Control::default();
-            assert_eq!(
-                kernel.evaluate(selection, args, &after).unwrap_err(),
-                KernelFailure::InstanceFailed
-            );
-            assert!(after.trace.lock().unwrap().is_empty());
+            assert_eq!(at, stop + 1);
         }
     }
+}
+fn reject_raw_installed(a: &ArrayRef, selection: Selection<'_>, args: &[EvaluatedArgument<'_>]) {
+    let mut kernel = instance(a);
+    assert!(matches!(
+        kernel.evaluate(selection, args, &Control::default()),
+        Err(KernelFailure::InvalidProgram(_))
+    ));
+    let after = Control::default();
+    assert_eq!(
+        kernel.evaluate(selection, args, &after).unwrap_err(),
+        KernelFailure::InstanceFailed
+    );
+    assert!(after.trace.lock().unwrap().is_empty());
 }
 fn wide_dictionary(rows: usize, dictionary_len: usize) -> ArrayRef {
     use arrow_array::{DictionaryArray, Int8Array, types::Int8Type};
@@ -490,55 +509,74 @@ fn assert_dictionary_extent(a: &ArrayRef, expected: usize) {
     assert_eq!(dictionary.values().len(), expected);
 }
 #[test]
-fn map_entries_owner_contiguous_actual_address_view_preserves_original_dictionary128() {
+fn raw_arrow_map_entries_contiguous_projection_keeps_dictionary128_and_strict_installed_gate() {
     let a = wide_dictionary(4, 128);
-    for a in [a.clone(), a.slice(1, 3)] {
-        let args = [EvaluatedArgument::Column(&a)];
-        let out = instance(&a)
-            .evaluate(Selection::all(a.len()), &args, &Control::default())
-            .unwrap();
-        assert_eq!(out.values().len(), a.len());
-        assert_dictionary_extent(out.values(), 128);
-        check_all_projection_causes(&a, Selection::all(a.len()), &args);
+    for a in [a.clone(), a.slice(1, 3), a.slice(1, 2)] {
+        let out = crate::builtin::map_entries_core::project(&a, None).unwrap();
+        assert_eq!(out.len(), a.len());
+        assert_dictionary_extent(&out, 128);
+        check_raw_projection_causes(&a);
+        reject_raw_installed(
+            &a,
+            Selection::all(a.len()),
+            &[EvaluatedArgument::Column(&a)],
+        );
     }
-    let rows = [1, 2];
-    let selection = Selection::try_sparse(4, &rows).unwrap();
-    let args = [EvaluatedArgument::Column(&a)];
-    let out = instance(&a)
-        .evaluate(selection, &args, &Control::default())
-        .unwrap();
-    assert_dictionary_extent(out.values(), 128);
-    check_all_projection_causes(&a, selection, &args);
 }
 #[test]
-fn map_entries_owner_noncontiguous_addresses_keep_original_shared_copy_dictionary_guard() {
-    let rows = [0, 2];
-    let selection = Selection::try_sparse(4, &rows).unwrap();
-    let a = wide_dictionary(4, 127);
-    let args = [EvaluatedArgument::Column(&a)];
-    let out = instance(&a)
-        .evaluate(selection, &args, &Control::default())
-        .unwrap();
-    assert_dictionary_extent(out.values(), 127);
-    check_all_projection_causes(&a, selection, &args);
-    let a = wide_dictionary(4, 128);
-    let args = [EvaluatedArgument::Column(&a)];
-    let mut kernel = instance(&a);
-    assert_eq!(
-        kernel
-            .evaluate(selection, &args, &Control::default())
-            .unwrap_err(),
-        KernelFailure::ResourceExhausted
-    );
-    let after = Control::default();
-    assert_eq!(
-        kernel.evaluate(selection, &args, &after).unwrap_err(),
-        KernelFailure::InstanceFailed
-    );
-    assert!(after.trace.lock().unwrap().is_empty());
+fn raw_arrow_map_entries_noncontiguous_copy_preserves_dictionary_constructor_guard() {
+    use crate::selected_copy::{CopyError, ExtendSegment, preflight_extend_multi};
+    use arrow_data::transform::MutableArrayData;
+    let segments = [0, 2].map(|start| ExtendSegment {
+        source: 0,
+        start,
+        len: 1,
+        repeats: 1,
+        nulls: 0,
+    });
+    for dictionary_len in [127, 128] {
+        let a = wide_dictionary(4, dictionary_len);
+        let list = crate::builtin::map_entries_core::project(&a, None).unwrap();
+        let run = |observer: &mut dyn FnMut(bool) -> Result<(), KernelFailure>| {
+            preflight_extend_multi(&[list.as_ref()], &segments, 2, observer)
+        };
+        let mut calls = 0;
+        let result = run(&mut |_| {
+            calls += 1;
+            Ok(())
+        });
+        if dictionary_len == 127 {
+            result.unwrap();
+            let data = list.to_data();
+            let mut copy = MutableArrayData::new(vec![&data], false, 2);
+            copy.extend(0, 0, 1);
+            copy.extend(0, 2, 3);
+            let out = arrow_array::make_array(copy.freeze());
+            assert_dictionary_extent(&out, 127);
+        } else {
+            assert!(matches!(result, Err(CopyError::Extent)));
+        }
+        for stop in 0..calls {
+            let cause =
+                KernelFailure::Operational(crate::KernelDiagnostic::new("raw copy original cause"));
+            let mut at = 0;
+            let result = run(&mut |_| {
+                assert!(at <= stop);
+                let current = at;
+                at += 1;
+                if current == stop {
+                    Err(cause.clone())
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(matches!(result, Err(CopyError::Control(actual)) if actual == cause));
+            assert_eq!(at, stop + 1);
+        }
+    }
 }
 #[test]
-fn map_entries_owner_single_constant_ordinal_and_selected_column_use_same_contiguous_proof() {
+fn raw_arrow_map_entries_pool_and_selected_addresses_keep_backing_without_kernel_capability() {
     let a = wide_dictionary(4, 128);
     let ty = source(&a);
     let policy = ConstantPolicy {
@@ -553,8 +591,12 @@ fn map_entries_owner_single_constant_ordinal_and_selected_column_use_same_contig
         max_library_validation_work: 1 << 24,
         max_library_validation_bytes: 1 << 24,
     };
+    let field = ty
+        .try_to_field("actual-pool")
+        .unwrap()
+        .with_data_type(a.data_type().clone());
     let pool = ConstantPool::try_new(
-        Arc::new(ty.try_to_field("actual-pool").unwrap()),
+        Arc::new(field),
         ty,
         a.to_data(),
         policy,
@@ -562,25 +604,23 @@ fn map_entries_owner_single_constant_ordinal_and_selected_column_use_same_contig
         crate::binding_test_control(),
     )
     .unwrap();
-    let v = pool.value(3).unwrap();
-    let args = [EvaluatedArgument::Constant(&v)];
-    let out = instance(&a)
-        .evaluate(Selection::all(1), &args, &Control::default())
-        .unwrap();
-    assert_dictionary_extent(out.values(), 128);
-    check_all_projection_causes(&a, Selection::all(1), &args);
-    // Every source row has the same payload. This real public selected value
-    // represents batch rows 0/2 with compact ordinals 0/1, without an Arrow copy.
+    let value = pool.value(3).unwrap();
+    let selected = value.pool().array().slice(value.ordinal() as usize, 1);
+    let out = crate::builtin::map_entries_core::project(&selected, None).unwrap();
+    assert_dictionary_extent(&out, 128);
+    check_raw_projection_causes(&selected);
+    reject_raw_installed(
+        &a,
+        Selection::all(1),
+        &[EvaluatedArgument::Constant(&value)],
+    );
     let rows = [0, 2];
     let selection = Selection::try_sparse(4, &rows).unwrap();
     let prior =
         crate::SelectedValues::try_new(selection, a.data_type(), a.slice(0, 2), Box::default())
             .unwrap();
-    let args = [EvaluatedArgument::SelectedColumn(&prior)];
-    let out = instance(&a)
-        .evaluate(selection, &args, &Control::default())
-        .unwrap();
-    assert_eq!(out.values().len(), 2);
-    assert_dictionary_extent(out.values(), 128);
-    check_all_projection_causes(&a, selection, &args);
+    let out = crate::builtin::map_entries_core::project(prior.values(), None).unwrap();
+    assert_eq!(out.len(), 2);
+    assert_dictionary_extent(&out, 128);
+    reject_raw_installed(&a, selection, &[EvaluatedArgument::SelectedColumn(&prior)]);
 }

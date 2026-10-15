@@ -194,7 +194,7 @@ impl WindowKernelPartition for RankingPartition<'_> {
                     ));
                 }
                 let rows = self.input.full_input().partition_rows();
-                let target = &self.prepared.contract.result_type().data_type;
+                let target = self.prepared.contract.result_type().data_type();
                 let mut cursor = PeerCursor {
                     peers: self.input.peers(),
                     group: 0,

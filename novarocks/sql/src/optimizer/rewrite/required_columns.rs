@@ -1672,19 +1672,35 @@ mod tests {
         let arena_rc = make_arena();
         let mut action =
             make_output_column(ColumnId::new_for_test(14), crate::common::CHANGE_OP_COLUMN);
-        action.value_type.data_type = DataType::Int8;
+        action.value_type = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+            DataType::Int8,
+            action.value_type.nullable(),
+            action.value_type.logical_type(),
+        )
+        .unwrap();
         action.is_internal = true;
         let mut join_apply_key = make_output_column(
             ColumnId::new_for_test(15),
             crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
         );
-        join_apply_key.value_type.data_type = DataType::Utf8;
+        join_apply_key.value_type =
+            novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                DataType::Utf8,
+                join_apply_key.value_type.nullable(),
+                join_apply_key.value_type.logical_type(),
+            )
+            .unwrap();
         join_apply_key.is_internal = true;
         let mut row_id = make_output_column(
             ColumnId::new_for_test(19),
             crate::common::ICEBERG_ROW_ID_COL,
         );
-        row_id.value_type.data_type = DataType::Int64;
+        row_id.value_type = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+            DataType::Int64,
+            row_id.value_type.nullable(),
+            row_id.value_type.logical_type(),
+        )
+        .unwrap();
         row_id.is_internal = true;
         let output_columns = vec![
             make_output_column(ColumnId::new_for_test(1), "id"),
@@ -1731,25 +1747,47 @@ mod tests {
         let arena_rc = make_arena();
         let mut action =
             make_output_column(ColumnId::new_for_test(14), crate::common::CHANGE_OP_COLUMN);
-        action.value_type.data_type = DataType::Int8;
+        action.value_type = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+            DataType::Int8,
+            action.value_type.nullable(),
+            action.value_type.logical_type(),
+        )
+        .unwrap();
         action.is_internal = true;
         let mut join_apply_key = make_output_column(
             ColumnId::new_for_test(20),
             crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
         );
-        join_apply_key.value_type.data_type = DataType::Utf8;
+        join_apply_key.value_type =
+            novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                DataType::Utf8,
+                join_apply_key.value_type.nullable(),
+                join_apply_key.value_type.logical_type(),
+            )
+            .unwrap();
         join_apply_key.is_internal = false;
         let mut row_id = make_output_column(
             ColumnId::new_for_test(19),
             crate::common::ICEBERG_ROW_ID_COL,
         );
-        row_id.value_type.data_type = DataType::Int64;
+        row_id.value_type = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+            DataType::Int64,
+            row_id.value_type.nullable(),
+            row_id.value_type.logical_type(),
+        )
+        .unwrap();
         row_id.is_internal = true;
         let mut branch_row_id = make_output_column(
             ColumnId::new_for_test(91),
             crate::common::ICEBERG_ROW_ID_COL,
         );
-        branch_row_id.value_type.data_type = DataType::Int64;
+        branch_row_id.value_type =
+            novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                DataType::Int64,
+                branch_row_id.value_type.nullable(),
+                branch_row_id.value_type.logical_type(),
+            )
+            .unwrap();
         branch_row_id.is_internal = true;
         let output_columns = vec![
             make_output_column(ColumnId::new_for_test(1), "id"),

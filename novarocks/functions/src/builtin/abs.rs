@@ -46,16 +46,16 @@ pub(super) fn evaluate_abs<'a>(
         return Err(invalid("ABS requires one evaluated argument"));
     };
     let target = input.contract().result_type();
-    if source.nullable != target.nullable {
+    if source.nullable() != target.nullable() {
         return Err(invalid(
             "ABS result must preserve selected input nullability",
         ));
     }
     let width = match (
-        source.logical_type,
-        &source.data_type,
-        target.logical_type,
-        &target.data_type,
+        source.logical_type(),
+        source.data_type(),
+        target.logical_type(),
+        target.data_type(),
     ) {
         (
             ValueLogicalType::Physical,
@@ -118,12 +118,12 @@ pub(super) fn evaluate_abs<'a>(
     let selection = input.selection();
     output_capacity(selection.len(), width.max(8))?;
     let array = argument.array();
-    if array.data_type() != &source.data_type {
+    if array.data_type() != source.data_type() {
         return Err(internal(
             "ABS selected primitive carrier cannot be downcast",
         ));
     }
-    let decimal = if matches!(source.data_type, DataType::Decimal128(..)) {
+    let decimal = if matches!(source.data_type(), DataType::Decimal128(..)) {
         Some(
             array
                 .as_any()
@@ -144,10 +144,10 @@ pub(super) fn evaluate_abs<'a>(
             ));
         }
         if array.is_null(row) {
-            if !target.nullable {
+            if !target.nullable() {
                 return Err(internal("ABS non-null selected argument contains SQL NULL"));
             }
-        } else if let (Some(decimal), DataType::Decimal128(p, s)) = (decimal, &source.data_type) {
+        } else if let (Some(decimal), DataType::Decimal128(p, s)) = (decimal, source.data_type()) {
             // This is the original selected input contract check, not a second ABS
             // algorithm or another decimal rescaling author.
             Decimal128Type::validate_decimal_precision(decimal.value(row), *p, *s)
@@ -180,7 +180,7 @@ pub(super) fn evaluate_abs<'a>(
     };
     let values = evaluate_abs_core(
         compact,
-        &target.data_type,
+        target.data_type(),
         &mut |observation| match observation {
             AbsObservation::Step => work.step(),
             AbsObservation::OpaqueBoundary => work.flush(),
@@ -191,7 +191,7 @@ pub(super) fn evaluate_abs<'a>(
         AbsError::Legacy(error) => KernelFailure::Operational(crate::KernelDiagnostic::new(&error)),
     })?;
     work.finish()?;
-    SelectedValues::try_new(selection, &target.data_type, values, Box::default())
+    SelectedValues::try_new(selection, target.data_type(), values, Box::default())
         .map_err(|_| internal("ABS compact output violates its selected contract"))
 }
 /// Check Rust allocation representability, not an application capacity grant.
@@ -260,7 +260,7 @@ mod tests {
             .unwrap()
     }
     fn physical(data_type: DataType, nullable: bool) -> FunctionValueType {
-        FunctionValueType::new(data_type, nullable)
+        FunctionValueType::from_legacy_declared_projection(data_type, nullable)
     }
     fn column_result(array: ArrayRef, source: FunctionValueType) -> ArrayRef {
         let mut instance = instance(source);
@@ -611,7 +611,7 @@ mod tests {
         assert!(output.values().is_empty());
         assert_eq!(output.values().data_type(), &DataType::FixedSizeBinary(16));
         assert_eq!(
-            instance.contract().result_type().logical_type,
+            instance.contract().result_type().logical_type(),
             ValueLogicalType::LargeInt
         );
         assert!(output.errors().is_empty());

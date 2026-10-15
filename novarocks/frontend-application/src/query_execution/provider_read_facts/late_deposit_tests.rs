@@ -66,10 +66,10 @@ struct LateProvider {
     descriptor: ConnectorInstanceDescriptor,
     catalog: CatalogHandle,
     table: Mutex<Option<Arc<ActualFrozenTable>>>,
-    freeze_started: mpsc::Sender<()>,
-    freeze_release: Mutex<mpsc::Receiver<()>>,
+    declared_type: novarocks_type_contract::FunctionValueType,
     opens: AtomicUsize,
     freezes: AtomicUsize,
+    public_schemas: AtomicUsize,
 }
 impl ProviderReadRuntime for LateProvider {
     type Table = Arc<ActualFrozenTable>;
@@ -119,14 +119,80 @@ impl ProviderReadMetadata for LateProvider {
     ) -> Result<Vec<ProviderReadColumnBinding<Self::Column>>, ConnectorError> {
         Ok(vec![ProviderReadColumnBinding::new("k", LateColumn, false)])
     }
+    fn read_public_schema(
+        &self,
+        _: &ConnectorSession,
+        _: &Self::Table,
+        columns: &[&Self::Column],
+        creation: &mut ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorReadPublicSchema,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        use novarocks_connector_contract::{
+            ConnectorReadExecutionSchema, ConnectorSourceSchemaFacts, ConnectorSourceSchemaShape,
+            PureProviderCompileError,
+        };
+        // The fixture provider independently declares k as required Int64.
+        // Neither SQL's requested type nor source annotations supply semantics.
+        let mut fields = creation.reserve(columns.len())?;
+        let mut bindings = creation.reserve(columns.len())?;
+        for _ in columns {
+            creation.work(1)?;
+            let name = creation.text("k")?;
+            fields.push(creation.arc(arrow::datatypes::Field::new(
+                name,
+                arrow::datatypes::DataType::Int64,
+                false,
+            ))?);
+            bindings.push(self.declared_type.clone());
+        }
+        let fields = creation.arrow_fields(fields)?;
+        let schema = creation.arc(arrow::datatypes::Schema::new(fields))?;
+        let storage = creation.storage();
+        let (request, work) = creation.observers();
+        let execution = ConnectorReadExecutionSchema::try_new_observed::<
+            PureProviderCompileError<ConnectorError>,
+        >(
+            schema.clone(),
+            bindings.into_boxed_slice(),
+            storage.clone(),
+            |layout| request(layout).map_err(PureProviderCompileError::Control),
+            |units| work(units).map_err(PureProviderCompileError::Control),
+        )?;
+        let shape = ConnectorSourceSchemaShape::try_new_observed::<
+            PureProviderCompileError<ConnectorError>,
+        >(schema, storage.clone(), |units| {
+            work(units).map_err(PureProviderCompileError::Control)
+        })?;
+        let source = ConnectorSourceSchemaFacts::try_new_observed::<
+            PureProviderCompileError<ConnectorError>,
+        >(
+            shape,
+            std::collections::HashMap::new(),
+            Box::new([]),
+            storage.clone(),
+            |layout| request(layout).map_err(PureProviderCompileError::Control),
+            |units| work(units).map_err(PureProviderCompileError::Control),
+        )?;
+        let published = ConnectorReadPublicSchema::try_new_typed_observed::<
+            PureProviderCompileError<ConnectorError>,
+        >(
+            &execution,
+            &source,
+            storage,
+            |layout| request(layout).map_err(PureProviderCompileError::Control),
+            |units| work(units).map_err(PureProviderCompileError::Control),
+        )?;
+        self.public_schemas.fetch_add(1, Ordering::AcqRel);
+        Ok(published)
+    }
     fn final_static_facts(
         &self,
         _: &ConnectorSession,
         _: &Self::Table,
     ) -> Result<ConnectorReadStaticFacts<Self::Column>, ConnectorError> {
         self.freezes.fetch_add(1, Ordering::AcqRel);
-        let _ = self.freeze_started.send(());
-        let _ = self.freeze_release.lock().unwrap().recv();
         ConnectorReadStaticFacts::try_new(
             ConnectorReadInputVersion::try_new(Arc::<[u8]>::from(&b"input-v1"[..]))?,
             [9; 32],
@@ -206,6 +272,8 @@ impl ProviderReadSplitManager for LateProvider {
 struct LateAccessSealer {
     adapter: Arc<ReadRuntimeAdapter<LateProvider>>,
     seals: Arc<AtomicUsize>,
+    entered: mpsc::Sender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
 }
 impl ConnectorReadAttemptAccessSealer for LateAccessSealer {
     fn seal(
@@ -214,6 +282,10 @@ impl ConnectorReadAttemptAccessSealer for LateAccessSealer {
         mint: ConnectorReadAttemptAccessMint,
     ) -> Result<ConnectorReadAttemptAccessSource, ConnectorError> {
         self.seals.fetch_add(1, Ordering::AcqRel);
+        // Schema publication has completed; hold the actual frozen mint until
+        // the original plan sink closes, then exercise the late deposit.
+        let _ = self.entered.send(());
+        let _ = self.release.lock().unwrap().recv();
         Ok(mint.seal(Arc::new(LateReacquirer(self.adapter.clone()))))
     }
 }
@@ -228,7 +300,7 @@ impl ConnectorReadAttemptAccessReacquirer for LateReacquirer {
 }
 struct LateRequestFactory {
     adapter: Arc<ReadRuntimeAdapter<LateProvider>>,
-    seals: Arc<AtomicUsize>,
+    sealer: Arc<LateAccessSealer>,
 }
 impl ConnectorReadRequestControlFactory for LateRequestFactory {
     fn for_planning(
@@ -239,10 +311,7 @@ impl ConnectorReadRequestControlFactory for LateRequestFactory {
             ConnectorReadRequestControl::provider_reacquire_attempt_access(
                 self.adapter.clone(),
                 self.adapter.clone(),
-                Arc::new(LateAccessSealer {
-                    adapter: self.adapter.clone(),
-                    seals: self.seals.clone(),
-                }),
+                self.sealer.clone(),
             ),
         )
     }
@@ -312,17 +381,17 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
         crate::task_execution::blocking_io::tests::admitted_class(ResultWindowClass::Local);
     let capacity =
         QueryResultCapacityBinding::try_new(&root.owner.scope(), window.retain_alias()).unwrap();
-    let (freeze_started, freeze_entered) = mpsc::channel();
-    let (release_freeze, freeze_held) = mpsc::channel();
+    let (seal_started, seal_entered) = mpsc::channel();
+    let (release_seal, seal_held) = mpsc::channel();
     let (drop_started, drop_entered) = mpsc::channel();
     let (release_drop, drop_held) = mpsc::channel();
     let destroyed = Arc::new(AtomicBool::new(false));
     let (disarm, watch) = mpsc::channel();
-    let rescue_freeze = release_freeze.clone();
+    let rescue_seal = release_seal.clone();
     let rescue_drop = release_drop.clone();
     let watchdog = std::thread::spawn(move || {
         if watch.recv_timeout(Duration::from_secs(6)).is_err() {
-            let _ = rescue_freeze.send(());
+            let _ = rescue_seal.send(());
             let _ = rescue_drop.send(());
         }
     });
@@ -339,13 +408,22 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
             release: Mutex::new(drop_held),
             destroyed: destroyed.clone(),
         }))),
-        freeze_started,
-        freeze_release: Mutex::new(freeze_held),
+        declared_type: novarocks_type_contract::FunctionValueType::new(
+            arrow::datatypes::DataType::Int64,
+            false,
+        ),
         opens: AtomicUsize::new(0),
         freezes: AtomicUsize::new(0),
+        public_schemas: AtomicUsize::new(0),
     });
     let adapter = Arc::new(ReadRuntimeAdapter::new(provider.clone()));
     let seals = Arc::new(AtomicUsize::new(0));
+    let sealer = Arc::new(LateAccessSealer {
+        adapter: adapter.clone(),
+        seals: seals.clone(),
+        entered: seal_started,
+        release: Mutex::new(seal_held),
+    });
     let relation_calls = Arc::new(AtomicUsize::new(0));
     let props = CatalogProperties::new(
         catalog.clone(),
@@ -370,7 +448,7 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
                 adapter.clone(),
                 Some(Arc::new(LateRequestFactory {
                     adapter: adapter.clone(),
-                    seals: seals.clone(),
+                    sealer,
                 })),
                 Arc::new(LateEncoder {
                     catalog: catalog.clone(),
@@ -477,7 +555,8 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
         published.store(true, Ordering::Release);
         (answer, sink.into_taken())
     });
-    let entered = freeze_entered.recv_timeout(Duration::from_secs(2)).is_ok();
+    let entered = seal_entered.recv_timeout(Duration::from_secs(2)).is_ok();
+    let schema_was_published = provider.public_schemas.load(Ordering::Acquire) == 1;
     stop.request_stop();
     root.owner.cancel(CancellationReason::Requested);
     control.expire_deadlines();
@@ -498,7 +577,7 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
     root.business.release();
     drop(window);
     let held_call = control.snapshot();
-    let _ = release_freeze.send(());
+    let _ = release_seal.send(());
     let table_drop_entered = drop_entered.recv_timeout(Duration::from_secs(2)).is_ok();
     let held_output = control.snapshot();
     let held = !destroyed.load(Ordering::Acquire);
@@ -524,6 +603,7 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
     drop(runtime);
     assert!(
         entered
+            && schema_was_published
             && cancelled
             && retired
             && no_new_generation
@@ -543,6 +623,7 @@ fn actual_provider_freeze_keeps_local_backing_and_rejects_a_closed_plan_deposit(
     }
     assert_eq!(provider.opens.load(Ordering::Acquire), 1);
     assert_eq!(provider.freezes.load(Ordering::Acquire), 1);
+    assert_eq!(provider.public_schemas.load(Ordering::Acquire), 1);
     assert_eq!(
         seals.load(Ordering::Acquire),
         1,

@@ -772,8 +772,8 @@ pub fn analyze_view_query(
         .filter(|column| !column.is_internal)
         .map(|column| ViewOutputColumn {
             name: column.name,
-            data_type: column.value_type.data_type,
-            nullable: column.value_type.nullable,
+            data_type: column.value_type.data_type().clone(),
+            nullable: column.value_type.nullable(),
         })
         .collect())
 }
@@ -832,7 +832,7 @@ mod tests {
     }
 
     #[test]
-    fn m07_external_view_rejects_actual_nested_private_marker_without_top_fact() {
+    fn m07_external_view_rejects_complete_nested_private_type_without_top_domain() {
         use arrow::datatypes::{DataType, Field};
         use novarocks_types::logical::{LogicalType, field_with_logical_type};
         use std::sync::Arc;
@@ -850,7 +850,9 @@ mod tests {
                 ))),
                 nullable: true,
                 write_default: None,
-                logical_type: None,
+                logical_type: Some(novarocks_types::schema::SqlType::Array(Box::new(
+                    novarocks_types::schema::SqlType::Percentile,
+                ))),
             }],
         )
         .unwrap();

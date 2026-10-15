@@ -84,7 +84,7 @@ fn failures() -> [KernelFailure; 7] {
     ]
 }
 fn ty(data_type: DataType, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(data_type, nullable)
+    FunctionValueType::from_legacy_declared_projection(data_type, nullable)
 }
 fn recipe(source: &DataType, nullable: bool, target: &DataType) -> DefaultValueRecipe {
     DefaultValueRecipe::try_new(
@@ -591,18 +591,8 @@ fn numeric_nominal_nonnullable_result_and_required_child_refuse_without_type_ret
         ValueLogicalType::LargeInt,
         ValueLogicalType::Uuid,
     ] {
-        let malformed = FunctionValueType {
-            data_type: DataType::Float64,
-            nullable: true,
-            logical_type: logical,
-        };
         assert!(
-            DefaultValueRecipe::try_new(
-                &malformed,
-                &ty(DataType::Int64, true),
-                &CompileControl::default()
-            )
-            .is_err()
+            FunctionValueType::try_with_logical_type(DataType::Float64, true, logical).is_err()
         );
     }
     let null: ArrayRef = Arc::new(Float64Array::from(vec![None]));

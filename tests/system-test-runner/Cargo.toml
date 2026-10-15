@@ -32,6 +32,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 arrow-array.workspace = true
+arrow-ipc.workspace = true
 bytes.workspace = true
 h2.workspace = true
 http.workspace = true

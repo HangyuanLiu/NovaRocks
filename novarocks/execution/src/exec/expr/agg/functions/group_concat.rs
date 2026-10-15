@@ -199,7 +199,7 @@ impl AggregateFunction for GroupConcatAgg {
         let (_, is_asc_order, _, _) = group_concat_kind(spec)?;
         let columns = extract_input_columns(array)?;
         let layout = GroupConcatLayout::infer(columns.len(), is_asc_order.len())?;
-        let arg_types = core::intermediate_arg_types(&spec.intermediate_type)?;
+        let arg_types = core::intermediate_arg_types_borrowed(&spec.intermediate_type)?;
         if columns.len() != arg_types.len() {
             return Err(format!(
                 "group_concat argument count mismatch: expected {}, got {}",
@@ -207,7 +207,7 @@ impl AggregateFunction for GroupConcatAgg {
                 columns.len()
             ));
         }
-        for (index, (column, expected)) in columns.iter().zip(&arg_types).enumerate() {
+        for (index, (column, expected)) in columns.iter().zip(arg_types).enumerate() {
             if column.data_type() != expected {
                 return Err(format!(
                     "group_concat argument type mismatch at {index}: expected {expected:?}, got {:?}",
@@ -303,6 +303,8 @@ mod tests {
         order: crate::exec::node::aggregate::AggOrderSpec,
     ) -> AggFunction {
         AggFunction {
+            // Explicit legacy carrier fixture; this is not frozen-binding admission.
+            frozen: None,
             name: name.to_string(),
             inputs: vec![],
             input_is_intermediate,

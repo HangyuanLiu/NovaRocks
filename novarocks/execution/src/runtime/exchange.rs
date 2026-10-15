@@ -53,6 +53,7 @@ use novarocks_types::format_uuid;
 use novarocks_types::{SlotId, UniqueId};
 use tracing::debug;
 
+mod reader_structure;
 mod result_ipc_preflight;
 pub use result_ipc_preflight::{TypedRootResultDecodeBounds, preflight_typed_root_result_decode};
 
@@ -129,6 +130,53 @@ impl std::fmt::Display for ExchangeSenderIdentity {
     }
 }
 
+/// A malformed original wire/source and the actual construction owner's
+/// refusal retain distinct causes through delivery. No wire status is inferred
+/// from error text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExchangeReceiveFailure {
+    Wire(String),
+    Construction(crate::exec::pipeline::operator::ConstructionFailure),
+}
+impl From<String> for ExchangeReceiveFailure {
+    fn from(error: String) -> Self {
+        Self::Wire(error)
+    }
+}
+impl From<crate::exec::pipeline::operator::ConstructionFailure> for ExchangeReceiveFailure {
+    fn from(error: crate::exec::pipeline::operator::ConstructionFailure) -> Self {
+        Self::Construction(error)
+    }
+}
+impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+    for ExchangeReceiveFailure
+{
+    fn from(error: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        Self::Construction(error.into())
+    }
+}
+impl From<novarocks_type_contract::ValueTypeError> for ExchangeReceiveFailure {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::Wire(error.to_string())
+    }
+}
+impl std::fmt::Display for ExchangeReceiveFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wire(error) => error.fmt(formatter),
+            Self::Construction(error) => error.fmt(formatter),
+        }
+    }
+}
+impl std::error::Error for ExchangeReceiveFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Wire(_) => None,
+            Self::Construction(error) => Some(error),
+        }
+    }
+}
+
 /// How a registered receiver binds the columns of a decoded wire payload to
 /// its expected chunk schema.
 ///
@@ -159,6 +207,7 @@ impl ExchangeColumnBinding {
 struct ExpectedReceiverSchema {
     chunk_schema: ChunkSchemaRef,
     column_binding: ExchangeColumnBinding,
+    creation_factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
 }
 
 const CANCELED_KEYS_TTL: Duration = Duration::from_secs(600);
@@ -277,7 +326,8 @@ struct ReceiverState {
     #[cfg(feature = "test-controls")]
     test_observer: Option<Arc<dyn TestEventObserver>>,
     expected: Option<ExpectedReceiverSchema>,
-    sender_wire_meta: HashMap<ExchangeSenderIdentity, ExchangeWireMeta>,
+    sender_wire_meta: HashMap<ExchangeSenderIdentity, Arc<GuardedExchangeWireMeta>>,
+    sender_wire_table_storage: Option<novarocks_type_contract::ValueTypeStorageLifetime>,
     finished: HashSet<ExchangeSenderIdentity>,
     chunks: VecDeque<Chunk>,
     recv_request_count: u128,
@@ -439,6 +489,7 @@ impl ExecutionExchangeRegistry {
         key: ExchangeKey,
         expected_senders: usize,
         chunk_schema: ChunkSchemaRef,
+        creation_factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
     ) -> Result<(), String> {
         Self::register_expected_chunk_schema_inner(
             self,
@@ -447,6 +498,7 @@ impl ExecutionExchangeRegistry {
             chunk_schema,
             ExchangeColumnBinding::BySlotId,
             false,
+            creation_factory,
         )
     }
 
@@ -457,12 +509,14 @@ impl ExecutionExchangeRegistry {
         key: ExchangeKey,
         expected_senders: usize,
         chunk_schema: ChunkSchemaRef,
+        creation_factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
     ) -> Result<(), String> {
         self.try_register_expected_chunk_schema_with_binding(
             key,
             expected_senders,
             chunk_schema,
             ExchangeColumnBinding::BySlotId,
+            creation_factory,
         )
     }
 
@@ -473,6 +527,7 @@ impl ExecutionExchangeRegistry {
         expected_senders: usize,
         chunk_schema: ChunkSchemaRef,
         column_binding: ExchangeColumnBinding,
+        creation_factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
     ) -> Result<(), String> {
         Self::register_expected_chunk_schema_inner(
             self,
@@ -481,6 +536,7 @@ impl ExecutionExchangeRegistry {
             chunk_schema,
             column_binding,
             true,
+            creation_factory,
         )
     }
 
@@ -491,7 +547,11 @@ impl ExecutionExchangeRegistry {
         chunk_schema: ChunkSchemaRef,
         column_binding: ExchangeColumnBinding,
         reject_existing: bool,
+        creation_factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
     ) -> Result<(), String> {
+        if !chunk_schema.is_typed() {
+            return Err("exchange receiver requires its complete frozen execution schema".into());
+        }
         if is_key_canceled(registry, &key) {
             return Err("exchange canceled".to_string());
         }
@@ -523,62 +583,21 @@ impl ExecutionExchangeRegistry {
             }
             Some(_) => {}
             None => {
-                Self::retag_queued_chunks_for_expected_schema(
-                    &mut st,
-                    &chunk_schema,
-                    column_binding,
-                )?;
+                if !st.chunks.is_empty() {
+                    return Err(
+                        "exchange chunks arrived before their frozen receiver was registered"
+                            .into(),
+                    );
+                }
                 st.expected = Some(ExpectedReceiverSchema {
                     chunk_schema,
                     column_binding,
+                    creation_factory,
                 });
             }
         }
         st.expected_senders = st.expected_senders.max(expected_senders);
         receiver.cv.notify_all();
-        Ok(())
-    }
-
-    fn retag_queued_chunks_for_expected_schema(
-        st: &mut ReceiverState,
-        expected_chunk_schema: &ChunkSchemaRef,
-        column_binding: ExchangeColumnBinding,
-    ) -> Result<(), String> {
-        if st.chunks.is_empty() {
-            return Ok(());
-        }
-        let tracker = st.mem_tracker.clone();
-        for chunk in st.chunks.iter_mut() {
-            let wire_meta = ExchangeWireMeta {
-                slot_ids_by_index: chunk
-                    .chunk_schema()
-                    .slots()
-                    .iter()
-                    .map(|slot| slot.slot_id())
-                    .collect(),
-            };
-            // A chunk queued before registration still carries its sender's
-            // wire slot ids in wire column order, so the registered binding
-            // applies to it exactly as it would have at decode time.
-            let (batch, chunk_schema) = materialize_chunk_for_wire_meta(
-                Some(expected_chunk_schema),
-                &chunk.batch,
-                &wire_meta,
-                column_binding.prefers_wire_slot_ids(),
-                column_binding == ExchangeColumnBinding::Positional,
-                DecodeCarrierContract::Exchange,
-            )?;
-            let mut retagged = chunk_from_exchange_batch(batch, chunk_schema).map_err(|e| {
-                format!(
-                    "retag queued exchange chunk for late expected schema failed: {}",
-                    e
-                )
-            })?;
-            if let Some(tracker) = tracker.as_ref() {
-                retagged.transfer_to(tracker);
-            }
-            *chunk = retagged;
-        }
         Ok(())
     }
 
@@ -1259,9 +1278,98 @@ impl Write for BoundedPayloadWriter {
     }
 }
 
-fn decode_exchange_payload_envelope(bytes: &[u8]) -> Result<DecodedExchangePayload<'_>, String> {
+#[derive(Clone, Copy)]
+struct BorrowedExchangeWireMeta<'a> {
+    words: &'a [u8],
+}
+impl<'a> BorrowedExchangeWireMeta<'a> {
+    fn len(self) -> usize {
+        self.words.len() / std::mem::size_of::<u32>()
+    }
+    fn ids(self) -> impl Iterator<Item = SlotId> + 'a {
+        self.words
+            .chunks_exact(4)
+            .map(|word| SlotId::new(u32::from_le_bytes([word[0], word[1], word[2], word[3]])))
+    }
+    fn matches(
+        self,
+        original: &ExchangeWireMeta,
+        factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+    ) -> Result<bool, ExchangeReceiveFailure> {
+        if self.len() != original.slot_ids_by_index.len() {
+            return Ok(false);
+        }
+        for (actual, expected) in self.ids().zip(&original.slot_ids_by_index) {
+            factory.observe_input_work(1)?;
+            if actual != *expected {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+struct BorrowedExchangePayload<'a> {
+    wire_meta: Option<BorrowedExchangeWireMeta<'a>>,
+    arrow_payload: &'a [u8],
+}
+struct GuardedExchangeWireMeta {
+    value: ExchangeWireMeta,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl GuardedExchangeWireMeta {
+    fn try_from_source(
+        source: BorrowedExchangeWireMeta<'_>,
+        owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
+    ) -> Result<Arc<Self>, ExchangeReceiveFailure> {
+        owner.request(
+            std::alloc::Layout::array::<SlotId>(source.len()).map_err(|_| {
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic
+            })?,
+        )?;
+        let mut ids = Vec::with_capacity(source.len());
+        for id in source.ids() {
+            owner.observe(
+                0,
+                &[],
+                crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork { units: 1 },
+            )?;
+            ids.push(id);
+        }
+        owner.request(
+            novarocks_type_contract::owned_resources::layout::arc_layout(
+                std::alloc::Layout::new::<Self>(),
+            )?,
+        )?;
+        Ok(Arc::new(Self {
+            value: ExchangeWireMeta {
+                slot_ids_by_index: ids,
+            },
+            _storage: owner.storage_lifetime(),
+        }))
+    }
+}
+impl From<novarocks_type_contract::owned_resources::hashmap::HashMapResourceError>
+    for ExchangeReceiveFailure
+{
+    fn from(
+        error: novarocks_type_contract::owned_resources::hashmap::HashMapResourceError,
+    ) -> Self {
+        use novarocks_type_contract::owned_resources::hashmap::HashMapResourceError;
+        match error {
+            HashMapResourceError::Arithmetic(_) => {
+                novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic
+                    .into()
+            }
+            HashMapResourceError::SourceModel(detail) => Self::Construction(
+                crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(detail.into()),
+            ),
+        }
+    }
+}
+
+fn borrow_exchange_payload_envelope(bytes: &[u8]) -> Result<BorrowedExchangePayload<'_>, String> {
     if bytes.is_empty() {
-        return Ok(DecodedExchangePayload {
+        return Ok(BorrowedExchangePayload {
             wire_meta: None,
             arrow_payload: bytes,
         });
@@ -1269,7 +1377,7 @@ fn decode_exchange_payload_envelope(bytes: &[u8]) -> Result<DecodedExchangePaylo
     if bytes.len() < EXCHANGE_PAYLOAD_MAGIC.len()
         || &bytes[..EXCHANGE_PAYLOAD_MAGIC.len()] != EXCHANGE_PAYLOAD_MAGIC
     {
-        return Ok(DecodedExchangePayload {
+        return Ok(BorrowedExchangePayload {
             wire_meta: None,
             arrow_payload: bytes,
         });
@@ -1299,18 +1407,21 @@ fn decode_exchange_payload_envelope(bytes: &[u8]) -> Result<DecodedExchangePaylo
     let slot_count = u32::from_le_bytes(slot_count_bytes) as usize;
 
     let wire_meta = if flags[0] & EXCHANGE_PAYLOAD_FLAG_SLOT_IDS != 0 {
-        let mut slot_ids_by_index = Vec::with_capacity(slot_count);
-        for idx in 0..slot_count {
-            let mut slot_bytes = [0u8; 4];
-            cursor.read_exact(&mut slot_bytes).map_err(|e| {
-                format!(
-                    "failed to read exchange payload slot id at index {}: {e}",
-                    idx
-                )
-            })?;
-            slot_ids_by_index.push(SlotId::new(u32::from_le_bytes(slot_bytes)));
+        let words_start = EXCHANGE_PAYLOAD_MAGIC.len() + cursor.position() as usize;
+        let words_len = slot_count
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| "exchange slot word extent overflow".to_string())?;
+        let available = bytes.len().saturating_sub(words_start);
+        if words_len > available {
+            let idx = available / std::mem::size_of::<u32>();
+            return Err(format!(
+                "failed to read exchange payload slot id at index {idx}: failed to fill whole buffer"
+            ));
         }
-        Some(ExchangeWireMeta { slot_ids_by_index })
+        cursor.set_position(cursor.position() + words_len as u64);
+        Some(BorrowedExchangeWireMeta {
+            words: &bytes[words_start..words_start + words_len],
+        })
     } else {
         if slot_count != 0 {
             return Err(format!(
@@ -1321,9 +1432,19 @@ fn decode_exchange_payload_envelope(bytes: &[u8]) -> Result<DecodedExchangePaylo
         None
     };
     let payload_offset = EXCHANGE_PAYLOAD_MAGIC.len() + cursor.position() as usize;
-    Ok(DecodedExchangePayload {
+    Ok(BorrowedExchangePayload {
         wire_meta,
         arrow_payload: &bytes[payload_offset..],
+    })
+}
+
+fn decode_exchange_payload_envelope(bytes: &[u8]) -> Result<DecodedExchangePayload<'_>, String> {
+    let borrowed = borrow_exchange_payload_envelope(bytes)?;
+    Ok(DecodedExchangePayload {
+        wire_meta: borrowed.wire_meta.map(|source| ExchangeWireMeta {
+            slot_ids_by_index: source.ids().collect(),
+        }),
+        arrow_payload: borrowed.arrow_payload,
     })
 }
 
@@ -1371,16 +1492,16 @@ fn normalize_exchange_batch_for_schema(
     schema: &SchemaRef,
     chunk_index: usize,
 ) -> Result<RecordBatch, String> {
-    if chunk.batch.num_columns() != schema.fields().len() {
+    if chunk.record_batch().num_columns() != schema.fields().len() {
         return Err(format!(
             "exchange chunk column count mismatch at index {}: batch_columns={} schema_fields={}",
             chunk_index,
-            chunk.batch.num_columns(),
+            chunk.record_batch().num_columns(),
             schema.fields().len()
         ));
     }
     let columns = chunk
-        .batch
+        .record_batch()
         .columns()
         .iter()
         .zip(schema.fields().iter())
@@ -1566,11 +1687,6 @@ fn chunk_from_exchange_batch(
     batch: RecordBatch,
     chunk_schema: ChunkSchemaRef,
 ) -> Result<Chunk, String> {
-    if batch.num_columns() == 0 && chunk_schema.slots().is_empty() {
-        let mut chunk = Chunk::default();
-        chunk.batch = batch;
-        return Ok(chunk);
-    }
     Chunk::try_new_with_chunk_schema(batch, chunk_schema)
 }
 
@@ -1580,264 +1696,626 @@ enum DecodeCarrierContract {
     RootResult,
 }
 
-// Root output metadata must be checked while the original wire fields are
-// still present: retagging a nested Arrow carrier replaces its child fields.
-fn validate_root_result_wire_domains(
-    source: &arrow::datatypes::Field,
-    expected: &arrow::datatypes::Field,
-) -> Result<(), String> {
-    use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY};
-    fn marker(field: &arrow::datatypes::Field) -> Result<Option<LogicalType>, String> {
-        let Some(value) = field.metadata().get(NR_LOGICAL_TYPE_KEY) else {
-            return Ok(None);
-        };
-        for domain in [
-            LogicalType::Json,
-            LogicalType::Hll,
-            LogicalType::Bitmap,
-            LogicalType::Object,
-            LogicalType::Percentile,
-        ] {
-            if value.trim().eq_ignore_ascii_case(domain.metadata_value()) {
-                return Ok(Some(domain));
+enum ExchangeHeaderCreation<'a> {
+    Runtime(&'a dyn crate::exec::pipeline::operator::InputConstructionOwner),
+    RuntimeWithSource {
+        owner: &'a dyn crate::exec::pipeline::operator::InputConstructionOwner,
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+    },
+    #[cfg(test)]
+    PureInspection,
+}
+impl ExchangeHeaderCreation<'_> {
+    fn storage(&self) -> novarocks_type_contract::ValueTypeStorageLifetime {
+        match self {
+            Self::Runtime(owner) => owner.storage_lifetime(),
+            Self::RuntimeWithSource { storage, .. } => storage.clone(),
+            #[cfg(test)]
+            Self::PureInspection => novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        }
+    }
+    fn request(&self, layout: std::alloc::Layout) -> Result<(), ExchangeReceiveFailure> {
+        match self {
+            Self::Runtime(owner) | Self::RuntimeWithSource { owner, .. } => {
+                owner.request(layout).map_err(Into::into)
+            }
+            #[cfg(test)]
+            Self::PureInspection => {
+                let _ = layout;
+                Ok(())
             }
         }
-        Err("root result wire field contains an unknown logical domain marker".into())
     }
-    let actual = marker(source)?;
-    let declared = marker(expected)?;
-    if actual.is_some() && actual != declared {
-        return Err("root result wire logical domain differs from declared output domain".into());
-    }
-    // Carrier shape and primitive details are checked separately by the exact
-    // type contract. Walk every field-bearing nested carrier before that check.
-    match (source.data_type(), expected.data_type()) {
-        (DataType::List(source), DataType::List(expected))
-        | (DataType::LargeList(source), DataType::LargeList(expected))
-        | (DataType::FixedSizeList(source, _), DataType::FixedSizeList(expected, _))
-        | (DataType::Map(source, _), DataType::Map(expected, _)) => {
-            validate_root_result_wire_domains(source, expected)?;
-        }
-        (DataType::Struct(source), DataType::Struct(expected)) => {
-            for (source, expected) in source.iter().zip(expected) {
-                validate_root_result_wire_domains(source, expected)?;
+    fn observe(
+        &self,
+        ordinal: usize,
+        step: crate::exec::chunk::ArrayNormalizationStep<'_>,
+    ) -> Result<(), ExchangeReceiveFailure> {
+        match self {
+            Self::Runtime(owner) | Self::RuntimeWithSource { owner, .. } => {
+                owner.observe(ordinal, &[], step).map_err(Into::into)
+            }
+            #[cfg(test)]
+            Self::PureInspection => {
+                let _ = (ordinal, step);
+                Ok(())
             }
         }
-        _ => {}
     }
-    Ok(())
+    fn work(&self, units: usize) -> Result<(), ExchangeReceiveFailure> {
+        self.observe(
+            0,
+            crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork { units },
+        )
+    }
 }
 
-/// Descriptor-authoritative decode: the receiver's registered chunk schema is
-/// the exact Arrow type contract. Decoded columns may be rebuilt to the
-/// receiver's field metadata and slot namespace, but type drift fails here.
-/// `exact_expected_fields` is set for a compiled positional receiver: each
-/// decoded column must already be the receiver's frozen carrier, and the
-/// chunk presents exactly the receiver's frozen fields -- name, metadata and
-/// nullability -- because compiled roots check their input port exactly.
+/// The authenticated edge owns the complete declaration. Arrow fields supply
+/// format/encoding facts only; no domain marker can import execution semantics.
+/// The unchanged Arrow reader's payload/source allocation remains separately
+/// governed; this body covers its newly derived schema and Chunk headers.
 fn materialize_chunk_for_wire_meta(
-    expected_chunk_schema: Option<&ChunkSchemaRef>,
-    batch: &RecordBatch,
+    expected_chunk_schema: &ChunkSchemaRef,
+    batch: RecordBatch,
     wire_meta: &ExchangeWireMeta,
     prefer_wire_slot_ids: bool,
-    exact_expected_fields: bool,
     carrier_contract: DecodeCarrierContract,
-) -> Result<(RecordBatch, ChunkSchemaRef), String> {
-    if wire_meta.slot_ids_by_index.len() != batch.num_columns() {
-        return Err(format!(
-            "exchange wire slot id count mismatch: batch_columns={} slot_ids={}",
-            batch.num_columns(),
-            wire_meta.slot_ids_by_index.len()
-        ));
+    creation: &ExchangeHeaderCreation<'_>,
+) -> Result<Chunk, ExchangeReceiveFailure> {
+    if !expected_chunk_schema.is_typed() {
+        return Err("exchange requires its complete frozen execution schema"
+            .to_string()
+            .into());
     }
-    let Some(expected_chunk_schema) = expected_chunk_schema else {
-        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-            batch.schema().as_ref(),
-            &wire_meta.slot_ids_by_index,
-        )?;
-        return Ok((batch.clone(), chunk_schema));
-    };
-    if wire_meta.slot_ids_by_index.len() != expected_chunk_schema.slots().len() {
-        return Err(format!(
-            "exchange expected schema column count mismatch: wire_columns={} expected_columns={}",
-            wire_meta.slot_ids_by_index.len(),
-            expected_chunk_schema.slots().len()
-        ));
+    let count = expected_chunk_schema.slots().len();
+    if count != wire_meta.slot_ids_by_index.len() {
+        return Err("exchange frozen declaration differs from wire column count"
+            .to_string()
+            .into());
     }
-    let batch_schema = batch.schema();
-
-    // Check whether wire slot IDs match the expected schema. Some callers
-    // deliberately use an independent expected-slot namespace, so they force
-    // position-based mapping even when numeric slot IDs overlap.
+    let rows = batch.num_rows();
+    // Count-only keeps the existing marker's row count without manufacturing
+    // another unowned empty Arrow schema. No logical column is imported.
+    if count == 0 {
+        if batch.num_columns() != 0
+            && !(batch.num_columns() == 1
+                && batch.schema().field(0).name() == EXCHANGE_ZERO_COLUMN_MARKER_FIELD)
+        {
+            return Err("exchange count-only wire marker differs".to_string().into());
+        }
+        return Chunk::try_new_typed_with_columns_owned_observed(
+            expected_chunk_schema.clone(),
+            Vec::new(),
+            rows,
+            creation.storage(),
+            |step| creation.observe(0, step),
+        );
+    }
+    if count != batch.num_columns() {
+        return Err("exchange decoded column count differs".to_string().into());
+    }
     let wire_ids_match = carrier_contract == DecodeCarrierContract::Exchange
         && prefer_wire_slot_ids
         && wire_meta
             .slot_ids_by_index
             .iter()
             .all(|id| expected_chunk_schema.slot(*id).is_some());
-    let expected_slots_by_index = if wire_ids_match {
-        &[] as &[_]
-    } else {
-        expected_chunk_schema.slots()
-    };
-
-    let mut slots = Vec::with_capacity(batch.num_columns());
-    let mut columns = Vec::with_capacity(batch.num_columns());
-    let mut any_materialized = false;
-    for (idx, slot_id) in wire_meta.slot_ids_by_index.iter().enumerate() {
+    creation.request(
+        std::alloc::Layout::array::<crate::exec::chunk::ChunkSlotSchema>(count).map_err(|_| {
+            novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic
+        })?,
+    )?;
+    let mut slots = Vec::with_capacity(count);
+    creation.request(std::alloc::Layout::array::<ArrayRef>(count).map_err(|_| {
+        novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic
+    })?)?;
+    let mut columns = Vec::with_capacity(count);
+    let source_schema = batch.schema();
+    let mut reuses_prepared = true;
+    for (ordinal, source) in batch.columns().iter().enumerate() {
         let expected_slot = if wire_ids_match {
-            expected_chunk_schema.slot(*slot_id).ok_or_else(|| {
-                format!(
-                    "exchange wire slot id {} not found in expected chunk schema at index {}",
-                    slot_id, idx
-                )
-            })?
+            expected_chunk_schema
+                .slot(wire_meta.slot_ids_by_index[ordinal])
+                .expect("borrowed membership checked")
         } else {
-            // Position-based fallback: use the expected schema's slot at the
-            // same column index.
-            expected_slots_by_index.get(idx).ok_or_else(|| {
-                format!(
-                    "exchange column index {} out of range for expected chunk schema (len={})",
-                    idx,
-                    expected_slots_by_index.len()
-                )
-            })?
+            &expected_chunk_schema.slots()[ordinal]
         };
-        let field = batch_schema.field(idx);
-        if carrier_contract == DecodeCarrierContract::RootResult {
-            validate_root_result_wire_domains(field, expected_slot.field())?;
-        }
-        let mut out_column = batch.column(idx).clone();
-        let mut out_field = field.as_ref().clone();
-
-        let expected_arrow_type = expected_slot.data_type();
-        if field.data_type() != expected_arrow_type {
-            let root = format!("slot {}", expected_slot.slot_id());
-            // The root Result sink explicitly supports both string dictionary
-            // carriers for its frozen Utf8 value semantics. Exchange keeps its
-            // existing exact offset contract and independent slot namespace.
-            let root_dictionary = carrier_contract == DecodeCarrierContract::RootResult
-                && expected_arrow_type == &DataType::Utf8
-                && matches!(field.data_type(), DataType::Dictionary(key, value)
-                    if key.as_ref() == &DataType::Int32
-                        && matches!(value.as_ref(), DataType::Utf8 | DataType::LargeUtf8));
-            if !root_dictionary {
-                check_exchange_data_type(expected_arrow_type, field.data_type(), &root)?;
-            }
-            if !root_dictionary
-                && !is_exchange_dictionary_carrier_for_expected(
-                    expected_arrow_type,
-                    field.data_type(),
+        let mut has_dictionary_occurrence = false;
+        crate::exec::chunk::validate_chunk_carrier_encoding_observed(
+            source.data_type(),
+            &mut |carrier| {
+                has_dictionary_occurrence |= matches!(carrier, DataType::Dictionary(..));
+                creation.observe(
+                    ordinal,
+                    crate::exec::chunk::ArrayNormalizationStep::InspectType(carrier),
                 )
+            },
+        )?;
+        if !novarocks_type_contract::value_layout_matches_carrier_observed(
+            expected_slot.typed_binding().layout(),
+            source.data_type(),
+            |units| creation.work(units),
+        )? {
+            return Err(
+                format!("exchange column {ordinal} differs from its frozen value layout: expected={:?} actual={:?}", expected_slot.typed_binding().layout().data_type(), source.data_type()).into(),
+            );
+        }
+        let array = crate::exec::chunk::normalize_execution_array_observed(source, |step| {
+            creation.observe(ordinal, step)
+        })?;
+        let field = if !has_dictionary_occurrence
+            && array.data_type() == expected_slot.field().data_type()
+        {
+            Arc::clone(expected_slot.field_ref())
+        } else {
+            // A real IPC occurrence publishes its own dictionary descriptor.
+            // It never borrows an ID/order fact from the receiver's value type.
+            let original = source_schema.field(ordinal);
+            creation.observe(
+                ordinal,
+                crate::exec::chunk::ArrayNormalizationStep::RebuildField {
+                    source: original,
+                    target: array.data_type(),
+                    name: expected_slot.name(),
+                },
+            )?;
+            let field = if matches!(array.data_type(), DataType::Dictionary(..)) {
+                #[allow(deprecated)]
+                arrow::datatypes::Field::new_dict(
+                    expected_slot.name(),
+                    array.data_type().clone(),
+                    expected_slot.nullable(),
+                    original.dict_id().ok_or_else(|| {
+                        "exchange dictionary occurrence ID is missing".to_string()
+                    })?,
+                    original.dict_is_ordered().ok_or_else(|| {
+                        "exchange dictionary occurrence order is missing".to_string()
+                    })?,
+                )
+            } else {
+                arrow::datatypes::Field::new(
+                    expected_slot.name(),
+                    array.data_type().clone(),
+                    expected_slot.nullable(),
+                )
+            };
+            reuses_prepared = false;
+            Arc::new(field)
+        };
+        if expected_slot.slot_id() != expected_chunk_schema.slots()[ordinal].slot_id() {
+            reuses_prepared = false;
+        }
+        slots.push(crate::exec::chunk::ChunkSlotSchema::try_new_typed_observed(
+            expected_slot.slot_id(),
+            field,
+            expected_slot.typed_binding().clone(),
+            expected_slot.unique_id(),
+            creation.storage(),
+            |step| creation.observe(ordinal, step),
+        )?);
+        columns.push(array);
+    }
+    let schema = if reuses_prepared {
+        expected_chunk_schema.clone()
+    } else {
+        let schema = crate::exec::chunk::ChunkSchema::try_new_typed_observed(
+            slots,
+            creation.storage(),
+            |layout| creation.request(layout),
+            |units| creation.work(units),
+        )?;
+        creation.request(
+            novarocks_type_contract::owned_resources::layout::arc_layout(
+                std::alloc::Layout::new::<crate::exec::chunk::ChunkSchema>(),
+            )?,
+        )?;
+        Arc::new(schema)
+    };
+    Chunk::try_new_typed_with_columns_owned_observed(
+        schema,
+        columns,
+        rows,
+        creation.storage(),
+        |step| creation.observe(0, step),
+    )
+}
+
+/// Existing count-only wire purpose: one Int8 marker per logical row. Its
+/// unchanged primitive payload construction is distinct from these newly
+/// observed public schema/array/batch headers.
+fn build_zero_column_marker_batch_with_creation(
+    rows: usize,
+    owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
+    control: &dyn novarocks_functions::KernelEvaluationControl,
+) -> crate::runtime::fragment::ExecutionResult<RecordBatch> {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
+    fn checked_arc(layout: std::alloc::Layout) -> Result<std::alloc::Layout, ConstructionFailure> {
+        arc_layout(layout).map_err(ConstructionFailure::from)
+    }
+    i64::try_from(rows)
+        .map_err(|_| ConstructionFailure::Resource(LayoutResourceError::Arithmetic))?;
+    owner.request(
+        std::alloc::Layout::array::<u8>(EXCHANGE_ZERO_COLUMN_MARKER_FIELD.len())
+            .map_err(|_| ConstructionFailure::Resource(LayoutResourceError::Arithmetic))?,
+    )?;
+    owner.request(checked_arc(std::alloc::Layout::new::<
+        arrow::datatypes::Field,
+    >())?)?;
+    let field = Arc::new(arrow::datatypes::Field::new(
+        EXCHANGE_ZERO_COLUMN_MARKER_FIELD,
+        DataType::Int8,
+        false,
+    ));
+    owner.request(
+        std::alloc::Layout::array::<arrow::datatypes::FieldRef>(1)
+            .map_err(|_| ConstructionFailure::Resource(LayoutResourceError::Arithmetic))?,
+    )?;
+    let fields = vec![field];
+    owner.request(checked_arc(
+        std::alloc::Layout::array::<arrow::datatypes::FieldRef>(1)
+            .map_err(|_| ConstructionFailure::Resource(LayoutResourceError::Arithmetic))?,
+    )?)?;
+    let fields: arrow::datatypes::Fields = fields.into();
+    owner.request(checked_arc(std::alloc::Layout::new::<Schema>())?)?;
+    let schema = Arc::new(Schema::new(fields));
+    build_zero_column_marker_batch_for_schema_with_creation(rows, schema, owner, control)
+}
+
+fn build_zero_column_marker_batch_for_schema_with_creation(
+    rows: usize,
+    schema: SchemaRef,
+    owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
+    control: &dyn novarocks_functions::KernelEvaluationControl,
+) -> crate::runtime::fragment::ExecutionResult<RecordBatch> {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
+    let mut request = |layout| owner.request(layout);
+    let mut opaque = |bytes| owner.observe_opaque_upper_bound(bytes);
+    let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
+        owner.storage_lifetime(),
+        &mut request,
+        &mut opaque,
+    );
+    // Observe only the original primitive Buffer adoption structure. The
+    // existing marker Vec payload remains with its original accounting.
+    novarocks_functions::selected_copy::preflight_primitive_vec_adoption_construction(
+        &mut creation,
+        control,
+    )
+    .map_err(|cause| -> crate::runtime::fragment::ExecutionFailure {
+        use novarocks_functions::selected_copy::{CopyConstructionError, CopyError};
+        match cause {
+            CopyConstructionError::Creator(cause) => cause.into(),
+            CopyConstructionError::Resource(cause) => ConstructionFailure::Resource(cause).into(),
+            CopyConstructionError::Copy(CopyError::Control(cause)) => cause.into(),
+            CopyConstructionError::Copy(CopyError::Extent) => {
+                ConstructionFailure::Resource(LayoutResourceError::Arithmetic).into()
+            }
+            CopyConstructionError::Copy(CopyError::Invalid(detail)) => {
+                ConstructionFailure::InvalidSource(detail.into()).into()
+            }
+            CopyConstructionError::Copy(CopyError::Unsupported(ty)) => {
+                ConstructionFailure::InvalidSource(format!(
+                    "count-only marker adoption carrier is unsupported: {ty:?}"
+                ))
+                .into()
+            }
+        }
+    })?;
+    owner.request(
+        arc_layout(std::alloc::Layout::new::<Int8Array>()).map_err(ConstructionFailure::from)?,
+    )?;
+    let array = Arc::new(Int8Array::from(vec![0_i8; rows])) as ArrayRef;
+    owner.request(
+        std::alloc::Layout::array::<ArrayRef>(1)
+            .map_err(|_| ConstructionFailure::Resource(LayoutResourceError::Arithmetic))?,
+    )?;
+    Ok(RecordBatch::try_new(schema, vec![array])
+        .map_err(|error| format!("failed to build count-only wire marker: {error}"))?)
+}
+
+/// Encoding failures retain their actual operation source, even when an
+/// original creator failure already has a text-only Pipeline payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExchangeEncodeFailure {
+    Wire(String),
+    Execution(crate::runtime::fragment::ExecutionFailure),
+}
+impl ExchangeEncodeFailure {
+    pub fn into_execution(self) -> crate::runtime::fragment::ExecutionFailure {
+        match self {
+            Self::Wire(error) => error.into(),
+            Self::Execution(error) => error,
+        }
+    }
+}
+impl From<String> for ExchangeEncodeFailure {
+    fn from(error: String) -> Self {
+        Self::Wire(error)
+    }
+}
+impl From<crate::runtime::fragment::ExecutionFailure> for ExchangeEncodeFailure {
+    fn from(error: crate::runtime::fragment::ExecutionFailure) -> Self {
+        Self::Execution(error)
+    }
+}
+impl From<crate::exec::pipeline::operator::ConstructionFailure> for ExchangeEncodeFailure {
+    fn from(error: crate::exec::pipeline::operator::ConstructionFailure) -> Self {
+        Self::Execution(error.into())
+    }
+}
+impl std::fmt::Display for ExchangeEncodeFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wire(error) => f.write_str(error),
+            Self::Execution(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for ExchangeEncodeFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Wire(_) => None,
+            Self::Execution(error) => Some(error),
+        }
+    }
+}
+
+/// Real BE sender schema/header preparation. Complete immutable declarations
+/// remain authoritative; the writer's occurrence IDs are format facts only.
+/// Existing serialized payload/backing accounting is unchanged.
+fn encode_typed_arrow_ipc_chunks_to<W: std::io::Write>(
+    chunks: &[Chunk],
+    output: &mut W,
+    owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
+    control: &dyn novarocks_functions::KernelEvaluationControl,
+) -> Result<(), ExchangeEncodeFailure> {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use novarocks_functions::arrow_ipc_construction::{
+        IpcConstructionError, IpcGeometryError, observe_stream_writer_batch_construction,
+        observe_stream_writer_schema_construction,
+    };
+    let first = &chunks[0];
+    let first_marker = if first.columns().is_empty() {
+        Some(build_zero_column_marker_batch_with_creation(
+            first.len(),
+            owner,
+            control,
+        )?)
+    } else {
+        None
+    };
+    let schema = first_marker
+        .as_ref()
+        .map(|batch| batch.schema())
+        .unwrap_or_else(|| first.chunk_schema().arrow_schema_ref());
+    for chunk in chunks {
+        if !chunk.chunk_schema().is_typed() || chunk.columns().len() != first.columns().len() {
+            return Err(ConstructionFailure::InvalidSource(
+                "exchange sender source differs from its complete channel declaration".into(),
+            )
+            .into());
+        }
+        for (expected, actual) in first
+            .chunk_schema()
+            .slots()
+            .iter()
+            .zip(chunk.chunk_schema().slots())
+        {
+            if !expected
+                .typed_binding()
+                .borrowed()
+                .exactly_equals_observed(actual.typed_binding().borrowed(), || {
+                    owner.observe(
+                        0,
+                        &[],
+                        crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork {
+                            units: 1,
+                        },
+                    )
+                })?
             {
-                match crate::exec::chunk::type_compatibility::retag_column(
-                    batch.column(idx),
-                    expected_arrow_type,
-                ) {
-                    Ok(retagged) => {
-                        out_column = retagged;
-                        out_field = arrow::datatypes::Field::new(
-                            field.name(),
-                            out_column.data_type().clone(),
-                            field.is_nullable(),
+                return Err(ConstructionFailure::InvalidSource(
+                    "exchange sender source differs from its complete channel declaration".into(),
+                )
+                .into());
+            }
+        }
+    }
+    let mut request = |layout| owner.request(layout);
+    let mut opaque = |bytes| owner.observe_opaque_upper_bound(bytes);
+    let mut creation = novarocks_type_contract::ValueSchemaCreation::new(
+        owner.storage_lifetime(),
+        &mut request,
+        &mut opaque,
+    );
+    // This sole schema writer model excludes record-batch payload copying.
+    // Batch-private structure/payload bounds remain a separately listed gap.
+    let map_ipc = |cause: IpcConstructionError<ConstructionFailure>| -> crate::runtime::fragment::ExecutionFailure {
+        match cause {
+            IpcConstructionError::Creator(cause) => cause.into(),
+            IpcConstructionError::Control(cause) => cause.into(),
+            IpcConstructionError::Geometry(IpcGeometryError::Overflow)
+                | IpcConstructionError::HashMap(novarocks_type_contract::owned_resources::hashmap::HashMapResourceError::Arithmetic(_)) => ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic).into(),
+            IpcConstructionError::Geometry(IpcGeometryError::SourceModel) => ConstructionFailure::InvalidSource("exchange IPC schema writer source model is unsupported".into()).into(),
+            IpcConstructionError::Shape(cause) => ConstructionFailure::InvalidSource(format!("exchange IPC schema carrier structure is invalid: {cause:?}")).into(),
+            IpcConstructionError::HashMap(novarocks_type_contract::owned_resources::hashmap::HashMapResourceError::SourceModel(detail)) => ConstructionFailure::InvalidSource(detail.into()).into(),
+        }
+    };
+    let schema_facts =
+        observe_stream_writer_schema_construction(schema.as_ref(), &mut creation, control)
+            .map_err(map_ipc)?;
+    {
+        let mut writer = StreamWriter::try_new(output, schema.as_ref())
+            .map_err(|error| format!("failed to create Arrow IPC writer: {error}"))?;
+        for (index, chunk) in chunks.iter().enumerate() {
+            if chunk.columns().is_empty() {
+                let marker;
+                let batch = if index == 0 {
+                    first_marker
+                        .as_ref()
+                        .expect("count-only branch established")
+                } else {
+                    marker = build_zero_column_marker_batch_for_schema_with_creation(
+                        chunk.len(),
+                        schema.clone(),
+                        owner,
+                        control,
+                    )?;
+                    &marker
+                };
+                observe_stream_writer_batch_construction(
+                    batch,
+                    &schema_facts,
+                    &mut creation,
+                    control,
+                )
+                .map_err(map_ipc)?;
+                writer
+                    .write(batch)
+                    .map_err(|error| format!("failed to write batch: {error}"))?;
+            } else {
+                // The original retag body refuses mixed Plain/Dictionary
+                // representation. Keep that existing capability boundary;
+                // root labels are purpose projections from the first declaration.
+                for (field, array) in schema.fields().iter().zip(chunk.columns()) {
+                    if field.data_type() != array.data_type() {
+                        // Original retag refuses mixed Plain/Dictionary. Reject
+                        // the borrowed representation before to_data could create
+                        // unobserved temporary headers; no hydrate or type rewrite.
+                        return Err(format!(
+                            "exchange chunk representation differs at index {index}"
                         )
-                        .with_metadata(field.metadata().clone());
-                        any_materialized = true;
-                    }
-                    Err(m) => {
-                        debug!(
-                            "exchange decoded arrow metadata retag skipped at index {} for slot {}: batch={:?} expected={:?} ({:?})",
-                            idx,
-                            slot_id,
-                            field.data_type(),
-                            expected_arrow_type,
-                            m.kind
-                        );
+                        .into());
                     }
                 }
+                owner.request(std::alloc::Layout::array::<ArrayRef>(chunk.columns().len()).map_err(|_| ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
+                let mut columns = Vec::with_capacity(chunk.columns().len());
+                columns.extend(chunk.columns().iter().cloned());
+                let options =
+                    arrow::array::RecordBatchOptions::new().with_row_count(Some(chunk.len()));
+                let batch = RecordBatch::try_new_with_options(schema.clone(), columns, &options)
+                    .map_err(|error| format!("failed to normalize exchange batch: {error}"))?;
+                observe_stream_writer_batch_construction(
+                    &batch,
+                    &schema_facts,
+                    &mut creation,
+                    control,
+                )
+                .map_err(map_ipc)?;
+                writer
+                    .write(&batch)
+                    .map_err(|error| format!("failed to write batch: {error}"))?;
             }
         }
-
-        if exact_expected_fields {
-            let expected_field = expected_slot.field();
-            if out_column.data_type() != expected_field.data_type() {
-                return Err(format!(
-                    "compiled exchange column {idx} arrives as {:?}, expected {:?}",
-                    out_column.data_type(),
-                    expected_field.data_type()
-                ));
-            }
-            if !expected_field.is_nullable() && out_column.null_count() > 0 {
-                return Err(format!(
-                    "compiled exchange column {idx} carries NULL into a non-null receiver field"
-                ));
-            }
-            if out_field != *expected_field {
-                out_field = expected_field.clone();
-                any_materialized = true;
-            }
-            slots.push(
-                expected_slot.with_field_and_slot_id(expected_slot.slot_id(), out_field.clone())?,
-            );
-            columns.push(out_column);
-            continue;
-        }
-
-        // Reconcile nullability against the expected slot the same way the
-        // type above is reconciled. The sender's field flag is its own
-        // bookkeeping, not a statement about this batch: an expression the
-        // planner proved non-null still arrives marked nullable, and letting
-        // that flag through hands the receiver a column its own contract
-        // refuses. Only nulls the column actually carries widen it -- and
-        // when they do, the contract really was violated and the refusal is
-        // the right answer.
-        let out_nullable = expected_slot.nullable() || out_column.null_count() > 0;
-        if out_field.is_nullable() != out_nullable {
-            out_field = arrow::datatypes::Field::new(
-                out_field.name(),
-                out_field.data_type().clone(),
-                out_nullable,
-            )
-            .with_metadata(out_field.metadata().clone());
-            any_materialized = true;
-        }
-
-        // Use the expected schema's slot ID (not the wire ID) so the decoded
-        // chunk has the receiver's own slot namespace.
-        let output_slot_id = if wire_ids_match {
-            *slot_id
-        } else {
-            expected_slot.slot_id()
-        };
-        if expected_slot.metadata_origins().is_some() {
-            // Native descriptors own the receiver's metadata. Validate the
-            // received logical domains before replacing wire-only fields,
-            // then derive only from those exact immutable descriptor owners.
-            // No receipt is issued for a decoded IPC HashMap or equal Field.
-            validate_root_result_wire_domains(field, expected_slot.field())?;
-            let slot = expected_slot
-                .reconcile_to_carrier(out_column.data_type(), out_nullable)?
-                .with_slot_id(output_slot_id)?;
-            out_column =
-                crate::exec::chunk::type_compatibility::retag_column(&out_column, slot.data_type())
-                    .map_err(|error| {
-                        format!("exchange descriptor metadata publication failed: {error:?}")
-                    })?;
-            slots.push(slot);
-            any_materialized = true;
-        } else {
-            slots.push(expected_slot.with_field_and_slot_id(output_slot_id, out_field.clone())?);
-        }
-        columns.push(out_column);
+        writer
+            .finish()
+            .map_err(|error| format!("failed to finish Arrow IPC writer: {error}"))?;
     }
-    let chunk_schema = Arc::new(crate::exec::chunk::ChunkSchema::try_new(slots)?);
-    let new_batch = if any_materialized {
-        RecordBatch::try_new(chunk_schema.arrow_schema_ref(), columns)
-            .map_err(|e| format!("exchange materialize batch to descriptor failed: {e}"))?
+    Ok(())
+}
+
+pub(crate) fn encode_chunks_with_creation(
+    chunks: &[Chunk],
+    include_slot_ids: bool,
+    factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+    control: &dyn novarocks_functions::KernelEvaluationControl,
+) -> crate::runtime::fragment::ExecutionResult<Vec<u8>> {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    if chunks.is_empty() {
+        return Ok(Vec::new());
+    }
+    let first = &chunks[0];
+    if !first.chunk_schema().is_typed() {
+        return Err(ConstructionFailure::InvalidSource(
+            "exchange sender requires complete value bindings".into(),
+        )
+        .into());
+    }
+    let owner = factory.begin_input_construction(first)?;
+    let mut buffer = Vec::new();
+    encode_typed_arrow_ipc_chunks_to(chunks, &mut buffer, owner.as_ref(), control)
+        .map_err(ExchangeEncodeFailure::into_execution)?;
+    // Envelope words are transient schema descriptors. Request the real header
+    // before copying its immutable slot IDs, not the already-accounted payload.
+    let wire_meta = if include_slot_ids {
+        owner.request(std::alloc::Layout::array::<SlotId>(first.columns().len()).map_err(|_| ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
+        ExchangeWireMeta::from_chunks(chunks)?
     } else {
-        batch.clone()
+        None
     };
-    Ok((new_batch, chunk_schema))
+    Ok(encode_exchange_payload_envelope(
+        &buffer,
+        wire_meta.as_ref(),
+    ))
+}
+
+/// Encode a typed result directly into the original bounded payload backing.
+/// Result credit covers that unchanged backing; the actual BE creator covers
+/// only the new schema/writer structures, and remains independent of credit.
+pub fn encode_chunks_bounded_with_creation(
+    chunks: &[Chunk],
+    include_slot_ids: bool,
+    packet_cap: usize,
+    factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+    control: &dyn novarocks_functions::KernelEvaluationControl,
+) -> Result<BoundedExchangePayload, ExchangeEncodeFailure> {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    let Some(first) = chunks.first() else {
+        return Ok(BoundedExchangePayload {
+            bytes: Bytes::new(),
+            retained_bytes: 0,
+        });
+    };
+    if !first.chunk_schema().is_typed() {
+        return Err(ConstructionFailure::InvalidSource(
+            "exchange sender requires complete value bindings".into(),
+        )
+        .into());
+    }
+    let owner = factory.begin_input_construction(first)?;
+    let slots = first.chunk_schema().slots();
+    let slot_count = if include_slot_ids { slots.len() } else { 0 };
+    let slot_id_bytes = slot_count.saturating_mul(std::mem::size_of::<u32>());
+    let envelope_bytes = EXCHANGE_PAYLOAD_MAGIC
+        .len()
+        .saturating_add(2)
+        .saturating_add(std::mem::size_of::<u32>())
+        .saturating_add(slot_id_bytes);
+    let logical_bytes = chunks.iter().fold(0usize, |total, chunk| {
+        total.saturating_add(chunk.logical_bytes())
+    });
+    let initial_capacity = envelope_bytes
+        .saturating_add(logical_bytes)
+        .saturating_add(4096)
+        .min(packet_cap);
+    let mut output = BoundedPayloadWriter::try_new(packet_cap, initial_capacity)?;
+    output
+        .write_all(EXCHANGE_PAYLOAD_MAGIC)
+        .map_err(|error| format!("failed to write exchange payload magic: {error}"))?;
+    output
+        .write_all(&[EXCHANGE_PAYLOAD_VERSION])
+        .map_err(|error| format!("failed to write exchange payload version: {error}"))?;
+    output
+        .write_all(&[if include_slot_ids {
+            EXCHANGE_PAYLOAD_FLAG_SLOT_IDS
+        } else {
+            0
+        }])
+        .map_err(|error| format!("failed to write exchange payload flags: {error}"))?;
+    output
+        .write_all(&(slot_count as u32).to_le_bytes())
+        .map_err(|error| format!("failed to write exchange payload slot count: {error}"))?;
+    if include_slot_ids {
+        for slot in slots {
+            output
+                .write_all(&slot.slot_id().as_u32().to_le_bytes())
+                .map_err(|error| format!("failed to write exchange payload slot id: {error}"))?;
+        }
+    }
+    encode_typed_arrow_ipc_chunks_to(chunks, &mut output, owner.as_ref(), control)?;
+    Ok(output.into_payload())
 }
 
 /// Encode chunks to exchange payload format.
@@ -1860,6 +2338,7 @@ pub fn encode_chunks(chunks: &[Chunk], include_slot_ids: bool) -> Result<Vec<u8>
 /// This is used by retained result streams after the owner has reserved the
 /// complete packet cap. It avoids the unbounded encoder's Arrow-payload plus
 /// envelope copy and fails while writing as soon as the cap would be crossed.
+#[cfg(test)]
 pub fn encode_chunks_bounded(
     chunks: &[Chunk],
     include_slot_ids: bool,
@@ -1930,9 +2409,10 @@ pub fn encode_chunks_bounded(
     Ok(output.into_payload())
 }
 
-pub fn decode_root_result_chunks(
+#[cfg(test)]
+fn decode_root_result_chunks(
     bytes: &[u8],
-    expected_chunk_schema: Option<&ChunkSchemaRef>,
+    expected_chunk_schema: &ChunkSchemaRef,
 ) -> Result<Vec<Chunk>, String> {
     let exact_payload_limit = novarocks_execution_contract::ResultByteLimit::new(
         u64::try_from(bytes.len())
@@ -1951,24 +2431,24 @@ pub fn decode_root_result_chunks(
         "typed root result payload missing exchange wire slot metadata".to_string()
     })?;
     let batches = decode_arrow_ipc_batches(arrow_payload)?;
-    let mut chunks = Vec::with_capacity(batches.len());
-    for batch in batches {
-        let batch = restore_zero_column_batch_if_needed(batch, &wire_meta)?;
-        let (batch, chunk_schema) = materialize_chunk_for_wire_meta(
-            expected_chunk_schema,
-            &batch,
-            &wire_meta,
-            false,
-            false,
-            DecodeCarrierContract::RootResult,
-        )?;
-        chunks.push(Chunk::try_new_with_chunk_schema(batch, chunk_schema)?);
-    }
-    Ok(chunks)
+    batches
+        .into_iter()
+        .map(|batch| {
+            materialize_chunk_for_wire_meta(
+                expected_chunk_schema,
+                batch,
+                &wire_meta,
+                false,
+                DecodeCarrierContract::RootResult,
+                &ExchangeHeaderCreation::PureInspection,
+            )
+            .map_err(|error| error.to_string())
+        })
+        .collect()
 }
 
 #[cfg(test)]
-pub fn decode_chunks(bytes: &[u8]) -> Result<Vec<Chunk>, String> {
+pub(crate) fn decode_chunks(bytes: &[u8]) -> Result<Vec<Chunk>, String> {
     let DecodedExchangePayload {
         wire_meta,
         arrow_payload,
@@ -1993,80 +2473,83 @@ impl ExecutionExchangeRegistry {
         key: ExchangeKey,
         sender: ExchangeSenderIdentity,
         bytes: &[u8],
-    ) -> Result<Vec<Chunk>, String> {
-        let DecodedExchangePayload {
-            wire_meta: decoded_wire_meta,
+    ) -> Result<Vec<Chunk>, ExchangeReceiveFailure> {
+        let BorrowedExchangePayload {
+            wire_meta: source_meta,
             arrow_payload,
-        } = decode_exchange_payload_envelope(bytes)?;
-        if arrow_payload.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let receiver = get_or_create(self, key);
+        } = borrow_exchange_payload_envelope(bytes)?;
+        let receiver = self
+            .receivers
+            .lock()
+            .expect("exchange lock")
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| "exchange receiver is not registered".to_string())?;
         let expected;
         let wire_meta;
         {
             let mut st = receiver.mu.lock().expect("exchange receiver lock");
-            if let Some(meta) = decoded_wire_meta {
-                match st.sender_wire_meta.get(&sender) {
-                    Some(existing) if existing != &meta => {
-                        return Err(format!(
-                            "exchange sender wire meta changed unexpectedly: finst={} node_id={} sender={}",
-                            key.finst_uuid(),
-                            key.node_id,
-                            sender
-                        ));
-                    }
-                    Some(_) => {}
-                    None => {
-                        st.sender_wire_meta.insert(sender, meta.clone());
-                    }
-                }
-                wire_meta = meta;
-            } else {
-                wire_meta = st
-                .sender_wire_meta
-                    .get(&sender)
-                .cloned()
-                .ok_or_else(|| {
-                    format!(
-                        "exchange wire meta missing before first data chunk: finst={} node_id={} sender={}",
-                        key.finst_uuid(),
-                        key.node_id,
-                        sender
-                    )
-                })?;
-            }
             if st.canceled {
-                return Err("exchange canceled".to_string());
+                return Err("exchange canceled".to_string().into());
             }
-            expected = st.expected.clone();
+            expected = st.expected.clone().ok_or_else(|| {
+                "exchange receiver has no complete frozen declaration".to_string()
+            })?;
+            if arrow_payload.is_empty() {
+                return Ok(Vec::new());
+            }
+            if let Some(source) = source_meta {
+                if source.len() != expected.chunk_schema.slots().len() {
+                    return Err("exchange frozen declaration differs from wire column count"
+                        .to_string()
+                        .into());
+                }
+                // Cache headers own a separate finite scope. Temporary reader
+                // headers never become coupled to the cache's lifetime.
+                if let Some(existing) = st.sender_wire_meta.get(&sender) {
+                    if !source.matches(&existing.value, expected.creation_factory.as_ref())? {
+                        return Err(format!("exchange sender wire meta changed unexpectedly: finst={} node_id={} sender={}", key.finst_uuid(), key.node_id, sender).into());
+                    }
+                    wire_meta = existing.clone();
+                } else {
+                    let metadata_owner = expected
+                        .creation_factory
+                        .begin_typed_construction(&expected.chunk_schema)?;
+                    let metadata =
+                        GuardedExchangeWireMeta::try_from_source(source, metadata_owner.as_ref())?;
+                    let growth = novarocks_type_contract::owned_resources::hashmap::next_insert_allocation_upper_bound_observed::<ExchangeSenderIdentity, Arc<GuardedExchangeWireMeta>, ExchangeReceiveFailure>(
+                        st.sender_wire_meta.len(), st.sender_wire_meta.capacity(),
+                        || { metadata_owner.observe(0, &[], crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork { units: 1 })?; Ok(()) },
+                    )?;
+                    let table_owner = if growth != 0 {
+                        let owner = expected
+                            .creation_factory
+                            .begin_typed_construction(&expected.chunk_schema)?;
+                        owner.observe_opaque_upper_bound(growth)?;
+                        Some(owner)
+                    } else {
+                        None
+                    };
+                    st.sender_wire_meta.insert(sender, metadata.clone());
+                    // Insertion has completed and std dropped the old table.
+                    // Replacing only its finite holder releases original table
+                    // liability, not any payload or metadata-node custody.
+                    if let Some(owner) = table_owner {
+                        st.sender_wire_table_storage = Some(owner.storage_lifetime());
+                    }
+                    wire_meta = metadata;
+                }
+            } else {
+                wire_meta = st.sender_wire_meta.get(&sender).cloned().ok_or_else(|| format!("exchange wire meta missing before first data chunk: finst={} node_id={} sender={}", key.finst_uuid(), key.node_id, sender))?;
+            }
         }
-
-        // Before registration there is no expected schema and the decoded
-        // chunk keeps its wire slot ids; the binding is then applied by the
-        // late registration's retag.
-        let prefer_wire_slot_ids = expected
-            .as_ref()
-            .is_some_and(|expected| expected.column_binding.prefers_wire_slot_ids());
-        let exact_expected_fields = expected
-            .as_ref()
-            .is_some_and(|expected| expected.column_binding == ExchangeColumnBinding::Positional);
-        let batches = decode_arrow_ipc_batches(arrow_payload)?;
-        let mut chunks = Vec::with_capacity(batches.len());
-        for batch in batches {
-            let batch = restore_zero_column_batch_if_needed(batch, &wire_meta)?;
-            let (batch, chunk_schema) = materialize_chunk_for_wire_meta(
-                expected.as_ref().map(|expected| &expected.chunk_schema),
-                &batch,
-                &wire_meta,
-                prefer_wire_slot_ids,
-                exact_expected_fields,
-                DecodeCarrierContract::Exchange,
-            )?;
-            chunks.push(chunk_from_exchange_batch(batch, chunk_schema)?);
-        }
-        Ok(chunks)
+        reader_structure::decode_owned(
+            arrow_payload,
+            &expected.chunk_schema,
+            &wire_meta.value,
+            expected.column_binding.prefers_wire_slot_ids(),
+            expected.creation_factory.as_ref(),
+        )
     }
 }
 
@@ -2092,7 +2575,12 @@ pub fn register_expected_chunk_schema(
     expected_senders: usize,
     chunk_schema: ChunkSchemaRef,
 ) -> Result<(), String> {
-    test_registry().register_expected_chunk_schema(key, expected_senders, chunk_schema)
+    test_registry().register_expected_chunk_schema(
+        key,
+        expected_senders,
+        tests::plain_declaration(&chunk_schema),
+        crate::runtime::fragment::exchange::test_receiver_creation_factory(),
+    )
 }
 
 #[cfg(test)]
@@ -2131,15 +2619,43 @@ pub fn decode_chunks_for_sender(
     backend_number: i32,
     bytes: &[u8],
 ) -> Result<Vec<Chunk>, String> {
-    test_registry().decode_chunks_for_sender(
-        key,
-        ExchangeSenderIdentity::local(sender_id, backend_number),
-        bytes,
-    )
+    test_registry()
+        .decode_chunks_for_sender(
+            key,
+            ExchangeSenderIdentity::local(sender_id, backend_number),
+            bytes,
+        )
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
+    // These fixtures explicitly declare ordinary physical values. Arrow
+    // annotations are source facts and do not author any nominal domain.
+    pub(super) fn plain_declaration(schema: &ChunkSchema) -> ChunkSchemaRef {
+        use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+        let slots = schema
+            .slots()
+            .iter()
+            .map(|slot| {
+                let value = FunctionValueType::new(slot.data_type().clone(), slot.nullable());
+                ChunkSlotSchema::try_new_typed(
+                    slot.slot_id(),
+                    Arc::new(Field::new(
+                        slot.name(),
+                        value.data_type().clone(),
+                        value.nullable(),
+                    )),
+                    value.typed_binding().clone(),
+                    slot.unique_id(),
+                    ValueTypeStorageLifetime::pure(),
+                )
+                .expect("explicit plain fixture declaration")
+            })
+            .collect();
+        Arc::new(ChunkSchema::try_new_typed(slots, ValueTypeStorageLifetime::pure()).unwrap())
+    }
+
     use arrow::array::{
         Array, ArrayRef, Decimal128Array, DictionaryArray, Int32Array, Int64Array, MapArray,
         StringArray, StructArray, make_array,
@@ -2206,7 +2722,8 @@ mod tests {
             Field::new("k1", DataType::Int32, true),
             Field::new(last_name, DataType::Utf8, true),
         ]));
-        let batch = RecordBatch::try_new(schema, chunk.batch.columns().to_vec()).expect("batch");
+        let batch =
+            RecordBatch::try_new(schema, chunk.record_batch().columns().to_vec()).expect("batch");
         Chunk::try_new_with_chunk_schema(batch, chunk.chunk_schema_ref()).expect("chunk")
     }
 
@@ -2214,9 +2731,7 @@ mod tests {
         let options = RecordBatchOptions::new().with_row_count(Some(row_count));
         let batch = RecordBatch::try_new_with_options(Arc::new(Schema::empty()), vec![], &options)
             .expect("empty batch");
-        let mut chunk = Chunk::default();
-        chunk.batch = batch;
-        chunk
+        Chunk::try_new_with_chunk_schema(batch, Arc::new(ChunkSchema::empty())).unwrap()
     }
 
     fn decimal128_chunk_with_over_precision_value(value: i128) -> Chunk {
@@ -2416,10 +2931,12 @@ mod tests {
         ];
 
         for chunk in cases {
+            let expected = plain_declaration(chunk.chunk_schema());
             let payload = encode_chunks(&[chunk], true).expect("encode typed root result");
             let bounds = preflight_typed_test_payload(&payload)
                 .expect("current encoder output must pass preflight");
-            let decoded = decode_root_result_chunks(&payload, None).expect("decode root result");
+            let decoded =
+                decode_root_result_chunks(&payload, &expected).expect("decode root result");
             let actual_backing = decoded.iter().fold(0usize, |total, chunk| {
                 total.saturating_add(chunk.logical_bytes())
             });
@@ -2474,7 +2991,7 @@ mod tests {
     #[test]
     fn typed_root_result_preflight_rejects_compressed_stream() {
         let chunk = exchange_test_chunk("name");
-        let schema = chunk.batch.schema();
+        let schema = chunk.record_batch().schema();
         let options = arrow::ipc::writer::IpcWriteOptions::default()
             .try_with_compression(Some(arrow::ipc::CompressionType::ZSTD))
             .expect("compression support");
@@ -2485,7 +3002,9 @@ mod tests {
             options,
         )
         .expect("compressed stream writer");
-        writer.write(&chunk.batch).expect("compressed batch");
+        writer
+            .write(&chunk.record_batch())
+            .expect("compressed batch");
         writer.finish().expect("finish compressed stream");
         let wire_meta = ExchangeWireMeta::from_chunks(std::slice::from_ref(&chunk))
             .expect("wire metadata")
@@ -2517,8 +3036,11 @@ mod tests {
         let error = preflight_typed_test_payload(&negative_body)
             .expect_err("negative body length must fail closed");
         assert!(error.contains("body length is negative"), "{error}");
-        let error = decode_root_result_chunks(&negative_body, None)
-            .expect_err("the production decode entry must enforce preflight");
+        let error = decode_root_result_chunks(
+            &negative_body,
+            &plain_declaration(exchange_test_chunk("name").chunk_schema()),
+        )
+        .expect_err("the production decode entry must enforce preflight");
         assert!(error.contains("body length is negative"), "{error}");
 
         let mut oversized_body =
@@ -2691,7 +3213,7 @@ mod tests {
     }
 
     #[test]
-    fn m07_root_ipc_refuses_nested_domain_conflicts_before_retagging() {
+    fn root_ipc_source_annotations_cannot_change_frozen_nested_domains() {
         use arrow::array::new_null_array;
         use novarocks_types::logical::{LogicalType, NR_LOGICAL_TYPE_KEY};
         fn marked(field: Field, marker: Option<&str>) -> Field {
@@ -2756,29 +3278,81 @@ mod tests {
                     Some(LogicalType::Bitmap.metadata_value())
                 },
             );
-            let expected = schema(declared.clone(), 74);
+            use novarocks_type_contract::{
+                TypedValueBinding, ValueField, ValueKind, ValueLayout, ValueLogicalType,
+                ValueTypeRef, ValueTypeStorageLifetime,
+            };
+            let storage = ValueTypeStorageLifetime::pure();
+            let leaf = ValueTypeRef::try_new(
+                if kind == 3 {
+                    ValueKind::Binary
+                } else {
+                    ValueKind::Nominal(ValueLogicalType::Bitmap)
+                },
+                true,
+                storage.clone(),
+            )
+            .unwrap();
+            let root = match kind {
+                0 => ValueKind::Struct(
+                    vec![ValueField::new("value", leaf, storage.clone())].into_boxed_slice(),
+                ),
+                1 | 4 => ValueKind::List(leaf),
+                2 | 3 => ValueKind::Map {
+                    key: ValueTypeRef::try_new(
+                        ValueKind::Scalar(DataType::Int32),
+                        false,
+                        storage.clone(),
+                    )
+                    .unwrap(),
+                    value: leaf,
+                },
+                _ => unreachable!(),
+            };
+            let value = ValueTypeRef::try_new(root, true, storage.clone()).unwrap();
+            let layout = ValueLayout::try_new(declared.data_type(), storage.clone()).unwrap();
+            let field = Arc::new(Field::new("root", layout.data_type().clone(), true));
+            let binding = TypedValueBinding::try_new(value, layout).unwrap();
+            let slot = ChunkSlotSchema::try_new_typed(
+                SlotId::new(74),
+                field,
+                binding,
+                None,
+                storage.clone(),
+            )
+            .unwrap();
+            let expected = Arc::new(ChunkSchema::try_new_typed(vec![slot], storage).unwrap());
             for marker in [Some("hll"), Some("unknown-domain"), None, Some("bitmap")] {
                 let source = nested(kind, marker);
-                let chunk = Chunk::try_new_with_columns(
-                    schema(source.clone(), 73),
+                let batch = RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![source.clone()])),
                     vec![new_null_array(source.data_type(), 1)],
                 )
                 .unwrap();
-                let bytes = encode_chunks(&[chunk], true).unwrap();
-                let decoded = decode_root_result_chunks(&bytes, Some(&expected));
-                if matches!(marker, Some("hll" | "unknown-domain"))
-                    || (kind == 3 && marker.is_some())
-                {
-                    assert!(
-                        decoded.unwrap_err().contains("logical domain"),
-                        "kind={kind} marker={marker:?}"
-                    );
-                } else {
-                    let decoded = decoded.unwrap();
-                    assert_eq!(decoded[0].len(), 1);
-                    assert_eq!(decoded[0].columns()[0].data_type(), declared.data_type());
-                    assert_eq!(decoded[0].chunk_schema().slot_ids(), &[SlotId::new(74)]);
-                }
+                let mut arrow = Vec::new();
+                let mut writer =
+                    arrow::ipc::writer::StreamWriter::try_new(&mut arrow, batch.schema().as_ref())
+                        .unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+                drop(writer);
+                let bytes = encode_exchange_payload_envelope(
+                    &arrow,
+                    Some(&ExchangeWireMeta {
+                        slot_ids_by_index: vec![SlotId::new(73)],
+                    }),
+                );
+                let decoded = decode_root_result_chunks(&bytes, &expected).unwrap();
+                assert_eq!(decoded[0].len(), 1);
+                assert_eq!(
+                    decoded[0].columns()[0].data_type(),
+                    expected.slots()[0].data_type()
+                );
+                assert_eq!(decoded[0].chunk_schema().slot_ids(), &[SlotId::new(74)]);
+                assert_eq!(
+                    decoded[0].chunk_schema().slots()[0].typed_binding(),
+                    expected.slots()[0].typed_binding()
+                );
             }
         }
     }
@@ -2811,8 +3385,16 @@ mod tests {
         )
         .unwrap();
         let bytes = encode_chunks(&[chunk], true).unwrap();
-        let expected = logical_status_schema(SlotId::new(73));
-        let decoded = decode_root_result_chunks(&bytes, Some(&expected)).unwrap();
+        let expected = Arc::new(
+            ChunkSchema::try_new(vec![ChunkSlotSchema::new_with_field(
+                SlotId::new(73),
+                Field::new("status", DataType::LargeUtf8, true),
+                None,
+                None,
+            )])
+            .unwrap(),
+        );
+        let decoded = decode_root_result_chunks(&bytes, &plain_declaration(&expected)).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].len(), 3);
         assert_eq!(decoded[0].chunk_schema().slot_ids(), &[SlotId::new(73)]);
@@ -2821,7 +3403,7 @@ mod tests {
             &DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::LargeUtf8))
         );
         assert_eq!(
-            decoded[0].batch.schema().field(0).data_type(),
+            decoded[0].record_batch().schema().field(0).data_type(),
             decoded[0].columns()[0].data_type()
         );
         let key = ExchangeKey {
@@ -2831,7 +3413,10 @@ mod tests {
         };
         register_expected_chunk_schema(key, 1, logical_status_schema(SlotId::new(72))).unwrap();
         let error = decode_chunks_for_sender(key, 9, 1, &bytes).unwrap_err();
-        assert!(error.contains("schema type mismatch"));
+        assert!(
+            error.contains("differs from its frozen value layout"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2920,7 +3505,7 @@ mod tests {
 
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].len(), 1);
-        assert_eq!(decoded[0].batch.num_columns(), 0);
+        assert_eq!(decoded[0].record_batch().num_columns(), 0);
     }
 
     #[test]
@@ -2940,7 +3525,8 @@ mod tests {
             Field::new("k1", DataType::Int32, true),
             Field::new("_cse_0", DataType::Utf8, true),
         ]));
-        let widened = RecordBatch::try_new(schema, strict.batch.columns().to_vec()).expect("batch");
+        let widened =
+            RecordBatch::try_new(schema, strict.record_batch().columns().to_vec()).expect("batch");
         let widened_chunk_schema = Arc::new(
             crate::exec::chunk::ChunkSchema::try_new(
                 widened
@@ -2982,7 +3568,7 @@ mod tests {
 
         assert_eq!(decoded.len(), 1);
         let array = decoded[0]
-            .batch
+            .record_batch()
             .column(0)
             .as_any()
             .downcast_ref::<Decimal128Array>()
@@ -3009,11 +3595,11 @@ mod tests {
             .expect("expected chunk schema"),
         );
 
-        let err = decode_root_result_chunks(&payload, Some(&expected_schema))
+        let err = decode_root_result_chunks(&payload, &plain_declaration(&expected_schema))
             .expect_err("root result decode must reject decimal precision drift");
 
-        assert!(err.contains("exchange schema type mismatch"), "err={err}");
-        assert!(err.contains("slot 55"), "err={err}");
+        assert!(err.contains("frozen value layout"), "err={err}");
+        assert!(err.contains("column 0"), "err={err}");
         assert!(err.contains("Decimal128(38, 2)"), "err={err}");
         assert!(err.contains("Decimal128(20, 2)"), "err={err}");
     }
@@ -3044,8 +3630,8 @@ mod tests {
         let err = decode_chunks_for_sender(key, 3, 1, &payload)
             .expect_err("exchange decode must reject decimal precision drift");
 
-        assert!(err.contains("exchange schema type mismatch"), "err={err}");
-        assert!(err.contains("slot 55"), "err={err}");
+        assert!(err.contains("frozen value layout"), "err={err}");
+        assert!(err.contains("column 0"), "err={err}");
         assert!(err.contains("Decimal128(38, 2)"), "err={err}");
         assert!(err.contains("Decimal128(20, 2)"), "err={err}");
         cancel_exchange_key(key);
@@ -3080,11 +3666,11 @@ mod tests {
             .expect("expected chunk schema"),
         );
 
-        let err = decode_root_result_chunks(&payload, Some(&expected_schema))
+        let err = decode_root_result_chunks(&payload, &plain_declaration(&expected_schema))
             .expect_err("root result decode must reject Utf8/Binary drift");
 
-        assert!(err.contains("exchange schema type mismatch"), "err={err}");
-        assert!(err.contains("slot 56"), "err={err}");
+        assert!(err.contains("frozen value layout"), "err={err}");
+        assert!(err.contains("column 0"), "err={err}");
         assert!(err.contains("Binary"), "err={err}");
         assert!(err.contains("Utf8"), "err={err}");
     }
@@ -3121,12 +3707,12 @@ mod tests {
             .expect("expected chunk schema"),
         );
 
-        let decoded =
-            decode_root_result_chunks(&payload, Some(&expected_schema)).expect("decode root");
+        let decoded = decode_root_result_chunks(&payload, &plain_declaration(&expected_schema))
+            .expect("decode root");
 
         assert_eq!(decoded.len(), 1);
         assert_eq!(
-            decoded[0].batch.schema().field(0).data_type(),
+            decoded[0].record_batch().schema().field(0).data_type(),
             &DataType::Decimal128(38, 2)
         );
         assert_eq!(
@@ -3181,17 +3767,17 @@ mod tests {
             .expect("expected root schema"),
         );
 
-        let decoded =
-            decode_root_result_chunks(&payload, Some(&expected_schema)).expect("decode root");
+        let decoded = decode_root_result_chunks(&payload, &plain_declaration(&expected_schema))
+            .expect("decode root");
 
         assert_eq!(decoded.len(), 1);
         assert_eq!(
             decoded[0].chunk_schema().slot_ids(),
             &[SlotId::new(1), SlotId::new(2), SlotId::new(3)]
         );
-        assert_eq!(decoded[0].batch.schema().field(0).name(), "file");
-        assert_eq!(decoded[0].batch.schema().field(1).name(), "row_id");
-        assert_eq!(decoded[0].batch.schema().field(2).name(), "value");
+        assert_eq!(decoded[0].record_batch().schema().field(0).name(), "file");
+        assert_eq!(decoded[0].record_batch().schema().field(1).name(), "row_id");
+        assert_eq!(decoded[0].record_batch().schema().field(2).name(), "value");
     }
 
     #[test]
@@ -3249,9 +3835,15 @@ mod tests {
             finst_id_lo: 91_736,
             node_id: 73,
         };
+        let expected = plain_declaration(&expected);
         let registry = ExecutionExchangeRegistry::default();
         registry
-            .register_expected_chunk_schema(key, 1, Arc::clone(&expected))
+            .register_expected_chunk_schema(
+                key,
+                1,
+                Arc::clone(&expected),
+                crate::runtime::fragment::exchange::test_receiver_creation_factory(),
+            )
             .unwrap();
         let decoded = registry
             .decode_chunks_for_sender(key, ExchangeSenderIdentity::local(3, 1), &payload)
@@ -3259,7 +3851,7 @@ mod tests {
         assert_eq!(decoded[0].chunk_schema().slot_ids(), &[SlotId::new(73)]);
         assert_eq!(
             decoded[0]
-                .batch
+                .record_batch()
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
@@ -3278,11 +3870,11 @@ mod tests {
     fn decode_root_result_chunks_accepts_nested_map_field_metadata_drift() {
         let source_entries = StructArray::new(
             Fields::from(vec![
-                Field::new("key", DataType::Int32, true),
+                Field::new("key", DataType::Int32, false),
                 Field::new("value", DataType::Int32, true),
             ]),
             vec![
-                Arc::new(Int32Array::from(vec![Some(1), None])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])) as ArrayRef,
                 Arc::new(Int32Array::from(vec![Some(10), Some(20)])) as ArrayRef,
             ],
             None,
@@ -3338,7 +3930,7 @@ mod tests {
             .expect("expected chunk schema"),
         );
 
-        let decoded = decode_root_result_chunks(&payload, Some(&expected_schema))
+        let decoded = decode_root_result_chunks(&payload, &plain_declaration(&expected_schema))
             .expect("decode map field metadata drift");
 
         assert_eq!(decoded.len(), 1);
@@ -3346,15 +3938,18 @@ mod tests {
             decoded[0].chunk_schema().slots()[0].slot_id(),
             SlotId::new(5)
         );
-        let decoded_schema = decoded[0].batch.schema();
+        let decoded_schema = decoded[0].record_batch().schema();
         let DataType::Map(entries, false) = decoded_schema.field(0).data_type() else {
             panic!("expected map");
         };
         let DataType::Struct(fields) = entries.data_type() else {
             panic!("expected entries struct");
         };
-        assert!(fields[0].is_nullable());
-        assert_eq!(decoded[0].batch.column(0).len(), 1);
+        assert!(
+            !fields[0].is_nullable(),
+            "Map keys retain the frozen non-NULL contract"
+        );
+        assert_eq!(decoded[0].record_batch().column(0).len(), 1);
     }
 
     #[test]
@@ -3363,12 +3958,12 @@ mod tests {
         let payload = encode_chunks(&[chunk], true).expect("encode");
         let expected_schema = Arc::new(ChunkSchema::empty());
 
-        let decoded =
-            decode_root_result_chunks(&payload, Some(&expected_schema)).expect("decode root");
+        let decoded = decode_root_result_chunks(&payload, &plain_declaration(&expected_schema))
+            .expect("decode root");
 
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].len(), 3);
-        assert_eq!(decoded[0].batch.num_columns(), 0);
+        assert_eq!(decoded[0].record_batch().num_columns(), 0);
     }
 
     #[test]
@@ -3437,7 +4032,7 @@ mod tests {
             second_decoded[0].chunk_schema().slots()[3].slot_id(),
             SlotId::new(32)
         );
-        assert_eq!(second_decoded[0].schema().field(3).name(), "_cse_2");
+        assert_eq!(second_decoded[0].schema().field(3).name(), "_cse_0");
 
         cancel_exchange_key(key);
     }
@@ -3468,10 +4063,7 @@ mod tests {
 
         let err = decode_chunks_for_sender(key, 3, 1, &payload)
             .expect_err("partial wire schema must not match registered expected schema");
-        assert!(
-            err.contains("exchange expected schema column count mismatch"),
-            "err={err}"
-        );
+        assert!(err.contains("wire column count"), "err={err}");
 
         cancel_exchange_key(key);
     }
@@ -3494,7 +4086,8 @@ mod tests {
             Field::new("_cse_0", DataType::Utf8, true),
         ]));
         let widened =
-            RecordBatch::try_new(widened_schema, strict.batch.columns().to_vec()).expect("batch");
+            RecordBatch::try_new(widened_schema, strict.record_batch().columns().to_vec())
+                .expect("batch");
         let widened_chunk_schema = Arc::new(
             crate::exec::chunk::ChunkSchema::try_new(
                 widened
@@ -3562,7 +4155,7 @@ mod tests {
         let payload = encode_chunks(&[wire_chunk], true).expect("encode drifted chunk");
         let err = decode_chunks_for_sender(key, 3, 1, &payload)
             .expect_err("numeric payload must not pass as an opaque aggregate state");
-        assert!(err.contains("exchange schema type mismatch"), "err={err}");
+        assert!(err.contains("frozen value layout"), "err={err}");
 
         cancel_exchange_key(key);
     }
@@ -3575,7 +4168,15 @@ mod tests {
             node_id: 19,
         };
         let payload = encode_chunks(&[exchange_test_chunk("_cse_0")], true).expect("encode");
-        let decoded = decode_chunks_for_sender(key, 7, 1, &payload).expect("decode directly");
+        assert!(decode_chunks_for_sender(key, 7, 1, &payload).is_err());
+        register_expected_chunk_schema(
+            key,
+            1,
+            plain_declaration(exchange_test_chunk("_cse_0").chunk_schema()),
+        )
+        .unwrap();
+        let decoded =
+            decode_chunks_for_sender(key, 7, 1, &payload).expect("decode after registration");
         assert_eq!(decoded.len(), 1);
         assert_eq!(
             decoded[0].chunk_schema().slots()[3].slot_id(),
@@ -3587,19 +4188,14 @@ mod tests {
     }
 
     #[test]
-    fn late_expected_schema_registration_retags_queued_wire_chunks() {
+    fn installed_expected_schema_retags_queued_wire_chunks() {
         let key = ExchangeKey {
             finst_id_hi: 203,
             finst_id_lo: 204,
             node_id: 21,
         };
         let payload = encode_chunks(&[exchange_test_chunk("_cse_0")], true).expect("encode");
-        let decoded = decode_chunks_for_sender(key, 7, 1, &payload).expect("decode directly");
-        assert_eq!(
-            decoded[0].chunk_schema().slots()[0].slot_id(),
-            SlotId::new(33)
-        );
-        push_chunks(key, 7, 1, decoded, false);
+        assert!(decode_chunks_for_sender(key, 7, 1, &payload).is_err());
 
         let expected_slots = [
             SlotId::new(133),
@@ -3610,11 +4206,15 @@ mod tests {
         let expected_chunk = exchange_test_chunk("_cse_0");
         let expected_chunk_schema =
             crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                expected_chunk.batch.schema().as_ref(),
+                expected_chunk.record_batch().schema().as_ref(),
                 &expected_slots,
             )
             .expect("expected chunk schema");
         register_expected_chunk_schema(key, 1, expected_chunk_schema).expect("register schema");
+
+        let decoded = decode_chunks_for_sender(key, 7, 1, &payload)
+            .expect("decode after installed declaration");
+        push_chunks(key, 7, 1, decoded, false);
 
         let handle = get_receiver_handle(key, 1).expect("receiver handle");
         let Some(ExchangePopResult::Chunk(chunk)) =
@@ -3634,7 +4234,7 @@ mod tests {
     }
 
     #[test]
-    fn late_expected_schema_registration_preserves_queued_zero_column_row_count() {
+    fn installed_expected_schema_preserves_queued_zero_column_row_count() {
         let key = ExchangeKey {
             finst_id_hi: 205,
             finst_id_lo: 206,
@@ -3643,14 +4243,14 @@ mod tests {
         let row_count = 3;
         let payload = encode_chunks(&[exchange_test_zero_column_chunk(row_count)], true)
             .expect("encode zero-column chunk");
-        let decoded = decode_chunks_for_sender(key, 7, 1, &payload).expect("decode directly");
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].len(), row_count);
-        assert_eq!(decoded[0].batch.num_columns(), 0);
-        push_chunks(key, 7, 1, decoded, false);
+        assert!(decode_chunks_for_sender(key, 7, 1, &payload).is_err());
 
         register_expected_chunk_schema(key, 1, Arc::new(crate::exec::chunk::ChunkSchema::empty()))
             .expect("register empty schema");
+
+        let decoded = decode_chunks_for_sender(key, 7, 1, &payload)
+            .expect("decode after installed declaration");
+        push_chunks(key, 7, 1, decoded, false);
 
         let handle = get_receiver_handle(key, 1).expect("receiver handle");
         let Some(ExchangePopResult::Chunk(chunk)) =
@@ -3659,7 +4259,7 @@ mod tests {
             panic!("expected queued zero-column chunk");
         };
         assert_eq!(chunk.len(), row_count);
-        assert_eq!(chunk.batch.num_columns(), 0);
+        assert_eq!(chunk.record_batch().num_columns(), 0);
 
         cancel_exchange_key(key);
     }
@@ -3700,7 +4300,7 @@ mod tests {
         let registry = ExecutionExchangeRegistry::default();
         let first = exchange_test_chunk("_cse_0");
         let second_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-            first.batch.schema().as_ref(),
+            first.record_batch().schema().as_ref(),
             &[
                 SlotId::new(133),
                 SlotId::new(134),
@@ -3709,7 +4309,15 @@ mod tests {
             ],
         )
         .expect("second sender schema");
-        let second = Chunk::new_with_chunk_schema(first.batch.clone(), second_schema);
+        let second = Chunk::new_with_chunk_schema(first.record_batch().clone(), second_schema);
+        registry
+            .register_expected_chunk_schema(
+                key,
+                2,
+                plain_declaration(first.chunk_schema()),
+                crate::runtime::fragment::exchange::test_receiver_creation_factory(),
+            )
+            .unwrap();
         let first_payload = encode_chunks(&[first], true).expect("first sender payload");
         let second_payload = encode_chunks(&[second], true).expect("second sender payload");
         let first_sender = ExchangeSenderIdentity::native(UniqueId::new(1, 1), 0);
@@ -3725,6 +4333,7 @@ mod tests {
             registry
                 .decode_chunks_for_sender(key, first_sender, &second_payload)
                 .expect_err("one exact sender cannot change its wire metadata")
+                .to_string()
                 .contains("sender wire meta changed unexpectedly")
         );
     }
@@ -3736,6 +4345,9 @@ mod tests {
     #[test]
     fn positional_receiver_binds_a_reversed_slot_sender_by_wire_position() {
         use super::ExchangeColumnBinding;
+        use novarocks_type_contract::{
+            TypedValueBinding, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+        };
 
         let sender_schema = Arc::new(Schema::new(vec![
             Field::new("b", DataType::Int64, false),
@@ -3766,11 +4378,34 @@ mod tests {
             Field::new("b_import", DataType::Int64, false),
             Field::new("a_import", DataType::Int64, false),
         ]);
-        let expected = ChunkSchema::try_ref_from_schema_and_slot_ids(
-            &receiver_schema,
-            &[SlotId::new(0), SlotId::new(1)],
-        )
-        .expect("receiver chunk schema");
+        let storage = ValueTypeStorageLifetime::pure();
+        let slots = receiver_schema
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(ordinal, field)| {
+                let value = ValueTypeRef::try_new(
+                    ValueKind::Scalar(DataType::Int64),
+                    false,
+                    storage.clone(),
+                )
+                .unwrap();
+                let binding = TypedValueBinding::try_new(
+                    value,
+                    ValueLayout::try_new(&DataType::Int64, storage.clone()).unwrap(),
+                )
+                .unwrap();
+                ChunkSlotSchema::try_new_typed(
+                    SlotId::new(ordinal as u32),
+                    Arc::clone(field),
+                    binding,
+                    None,
+                    storage.clone(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let expected = Arc::new(ChunkSchema::try_new_typed(slots, storage).unwrap());
         let sender = ExchangeSenderIdentity::native(UniqueId::new(1, 1), 0);
         let column = |chunk: &Chunk, slot: u32| -> Vec<i64> {
             chunk
@@ -3795,12 +4430,15 @@ mod tests {
                 1,
                 Arc::clone(&expected),
                 ExchangeColumnBinding::Positional,
+                crate::runtime::fragment::exchange::test_receiver_creation_factory(),
             )
             .expect("register positional receiver");
         let decoded = registry
             .decode_chunks_for_sender(positional, sender, &payload)
             .expect("positional decode");
         assert_eq!(decoded.len(), 1);
+        assert!(decoded[0].chunk_schema().is_typed());
+        assert!(Arc::ptr_eq(&decoded[0].chunk_schema_ref(), &expected));
         assert_eq!(
             decoded[0]
                 .chunk_schema()
@@ -3819,18 +4457,24 @@ mod tests {
             node_id: 5,
             ..positional
         };
-        let queued = registry
-            .decode_chunks_for_sender(late, sender, &payload)
-            .expect("decode before registration");
-        registry.push_chunks(late, sender, queued, false);
+        assert!(
+            registry
+                .decode_chunks_for_sender(late, sender, &payload)
+                .is_err()
+        );
         registry
             .try_register_expected_chunk_schema_with_binding(
                 late,
                 1,
                 Arc::clone(&expected),
                 ExchangeColumnBinding::Positional,
+                crate::runtime::fragment::exchange::test_receiver_creation_factory(),
             )
             .expect("late positional registration");
+        let queued = registry
+            .decode_chunks_for_sender(late, sender, &payload)
+            .expect("decode installed positional receiver");
+        registry.push_chunks(late, sender, queued, false);
         let handle = registry
             .get_receiver_handle(late, 1)
             .expect("receiver handle");
@@ -3841,6 +4485,8 @@ mod tests {
         };
         assert_eq!(column(&retagged, 0), vec![10, 20]);
         assert_eq!(column(&retagged, 1), vec![1, 2]);
+        assert!(retagged.chunk_schema().is_typed());
+        assert!(Arc::ptr_eq(&retagged.chunk_schema_ref(), &expected));
 
         // The same payload under the legacy slot-id binding is exactly the
         // hazard the positional registration exists to avoid.
@@ -3849,7 +4495,12 @@ mod tests {
             ..positional
         };
         registry
-            .try_register_expected_chunk_schema(by_slot, 1, Arc::clone(&expected))
+            .try_register_expected_chunk_schema(
+                by_slot,
+                1,
+                expected.clone(),
+                crate::runtime::fragment::exchange::test_receiver_creation_factory(),
+            )
             .expect("register slot-id receiver");
         let swapped = registry
             .decode_chunks_for_sender(by_slot, sender, &payload)
@@ -3860,9 +4511,365 @@ mod tests {
         // One receiver has one binding; a conflicting re-registration fails.
         assert!(
             registry
-                .register_expected_chunk_schema(positional, 1, expected)
+                .register_expected_chunk_schema(
+                    positional,
+                    1,
+                    expected,
+                    crate::runtime::fragment::exchange::test_receiver_creation_factory(),
+                )
                 .expect_err("binding conflict")
                 .contains("exchange column binding mismatch")
         );
+    }
+}
+
+#[cfg(test)]
+mod typed_receiver_header_tests {
+    use super::*;
+    use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionFactory};
+    use arrow::array::{DictionaryArray, Int32Array, StringArray};
+    use arrow::datatypes::{Field, Int32Type};
+    use novarocks_type_contract::{
+        TypedValueBinding, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+        ValueTypeStorageLifetime,
+    };
+
+    fn declaration() -> ChunkSchemaRef {
+        // The fixture is a genuine pure frozen author. Its JSON declaration is
+        // independent of the IPC field and of any arbitrary source attributes.
+        let storage = ValueTypeStorageLifetime::pure();
+        let value = ValueTypeRef::try_new(
+            ValueKind::Nominal(ValueLogicalType::Json),
+            false,
+            storage.clone(),
+        )
+        .unwrap();
+        let binding = TypedValueBinding::try_new(
+            value,
+            ValueLayout::try_new(&DataType::Utf8, storage.clone()).unwrap(),
+        )
+        .unwrap();
+        let slot = crate::exec::chunk::ChunkSlotSchema::try_new_typed(
+            SlotId::new(9),
+            Arc::new(Field::new("payload", DataType::Utf8, false)),
+            binding,
+            None,
+            storage.clone(),
+        )
+        .unwrap();
+        Arc::new(
+            crate::exec::chunk::ChunkSchema::try_new_typed_observed::<String>(
+                vec![slot],
+                storage,
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .unwrap(),
+        )
+    }
+    fn factory(
+        tracker: Arc<crate::runtime::mem_tracker::MemTracker>,
+    ) -> Arc<dyn InputConstructionFactory> {
+        crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            tracker,
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        )
+        .unwrap()
+    }
+    fn dictionary_batch() -> RecordBatch {
+        // Only key 0 is selected; the unused NULL dictionary value is legal for
+        // this required JSON source. The descriptor belongs to the real IPC
+        // occurrence, not to JSON value identity.
+        let array: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![0]),
+                Arc::new(StringArray::from(vec![Some("{}"), None])),
+            )
+            .unwrap(),
+        );
+        #[allow(deprecated)]
+        let field = Field::new_dict("wire_payload", array.data_type().clone(), false, 271, false);
+        RecordBatch::try_new(Arc::new(Schema::new(vec![field])), vec![array]).unwrap()
+    }
+    fn key() -> ExchangeKey {
+        ExchangeKey {
+            finst_id_hi: 19,
+            finst_id_lo: 37,
+            node_id: 7,
+        }
+    }
+
+    #[test]
+    fn typed_receiver_requires_frozen_registration_before_reader_and_cache() {
+        let registry = ExecutionExchangeRegistry::default();
+        // A valid envelope with deliberately invalid Arrow bytes cannot create
+        // a schema or sender cache before an installed receiver exists.
+        let wire = ExchangeWireMeta {
+            slot_ids_by_index: vec![SlotId::new(33)],
+        };
+        let payload = encode_exchange_payload_envelope(b"not an IPC schema", Some(&wire));
+        assert!(
+            matches!(registry.decode_chunks_for_sender(key(), ExchangeSenderIdentity::local(1, 1), &payload), Err(ExchangeReceiveFailure::Wire(error)) if error == "exchange receiver is not registered")
+        );
+        assert!(registry.receivers.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn typed_receiver_first_header_refusal_preserves_actual_tracker_cause() {
+        let expected = declaration();
+        let tracker =
+            crate::runtime::mem_tracker::MemTracker::new_root("typed receiver first header");
+        let factory = factory(tracker.clone());
+        let owner = factory.begin_typed_construction(&expected).unwrap();
+        let baseline = tracker.current();
+        assert!(baseline > 0);
+        tracker.install_limit_once(baseline + 1).unwrap();
+        let batch = dictionary_batch();
+        let original_array = batch.column(0).clone();
+        let wire = ExchangeWireMeta {
+            slot_ids_by_index: vec![SlotId::new(33)],
+        };
+        let refusal = materialize_chunk_for_wire_meta(
+            &expected,
+            batch,
+            &wire,
+            false,
+            DecodeCarrierContract::Exchange,
+            &ExchangeHeaderCreation::Runtime(owner.as_ref()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            refusal,
+            ExchangeReceiveFailure::Construction(ConstructionFailure::Memory(_))
+        ));
+        assert_eq!(tracker.current(), baseline);
+        assert_eq!(original_array.len(), 1);
+        assert_eq!(original_array.null_count(), 0);
+        drop(owner);
+        assert!(tracker.current() > 0, "the actual factory is still live");
+        drop(factory);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn typed_receiver_ipc_dictionary_preserves_json_and_last_schema_hold_only() {
+        let expected = declaration();
+        let batch = dictionary_batch();
+        let mut ipc = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut ipc, batch.schema().as_ref()).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        // StreamWriter owns the actual occurrence namespace. Compare the
+        // receiver to its published descriptor, never to the source Field ID.
+        let published = StreamReader::try_new(Cursor::new(&ipc), None)
+            .unwrap()
+            .schema();
+        #[allow(deprecated)]
+        let ipc_id = published.field(0).dict_id().unwrap();
+        let ipc_order = published.field(0).dict_is_ordered().unwrap();
+        let wire = ExchangeWireMeta {
+            slot_ids_by_index: vec![SlotId::new(33)],
+        };
+        let payload = encode_exchange_payload_envelope(&ipc, Some(&wire));
+        let tracker =
+            crate::runtime::mem_tracker::MemTracker::new_root("typed receiver independent schema");
+        tracker.install_limit_once(64 * 1024 * 1024).unwrap();
+        let factory = factory(tracker.clone());
+        let weak_factory = Arc::downgrade(&factory);
+        let registry = ExecutionExchangeRegistry::default();
+        registry
+            .try_register_expected_chunk_schema_with_binding(
+                key(),
+                1,
+                expected,
+                ExchangeColumnBinding::Positional,
+                factory.clone(),
+            )
+            .unwrap();
+        let mut chunks = registry
+            .decode_chunks_for_sender(key(), ExchangeSenderIdentity::local(1, 1), &payload)
+            .unwrap();
+        assert_eq!(chunks.len(), 1);
+        let chunk = chunks.remove(0);
+        let schema = chunk.chunk_schema_ref();
+        assert_eq!(
+            schema.slots()[0].typed_binding().value_type().domain(),
+            Some(ValueLogicalType::Json)
+        );
+        assert!(!schema.slots()[0].nullable());
+        assert!(
+            matches!(chunk.columns()[0].data_type(), DataType::Dictionary(key, value) if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Utf8)
+        );
+        #[allow(deprecated)]
+        {
+            assert_eq!(schema.slots()[0].field().dict_id(), Some(ipc_id));
+            assert_eq!(schema.slots()[0].field().dict_is_ordered(), Some(ipc_order));
+        }
+        registry.remove_exchange_key(key());
+        drop(registry);
+        drop(factory);
+        assert!(weak_factory.upgrade().is_none());
+        drop(chunk);
+        drop(chunks);
+        assert!(tracker.current() > 0);
+        drop(schema);
+        assert_eq!(tracker.current(), 0);
+    }
+}
+
+#[cfg(test)]
+mod bounded_root_header_tests {
+    use super::*;
+    use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+    use novarocks_type_contract::{
+        TypedValueBinding, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+        ValueTypeStorageLifetime,
+    };
+    struct Control;
+    impl novarocks_functions::KernelEvaluationControl for Control {
+        fn checkpoint(&self, _: u32) -> Result<(), novarocks_functions::KernelFailure> {
+            Ok(())
+        }
+        fn wait(&self, _: std::time::Duration) -> Result<(), novarocks_functions::KernelFailure> {
+            panic!("IPC schema construction never waits");
+        }
+    }
+    fn source(array: ArrayRef, value: ValueTypeRef, rows: usize) -> Chunk {
+        let pure = ValueTypeStorageLifetime::pure();
+        let binding = TypedValueBinding::try_new(
+            value,
+            ValueLayout::try_new(array.data_type(), pure.clone()).unwrap(),
+        )
+        .unwrap();
+        let slot = ChunkSlotSchema::try_new_typed(
+            SlotId::new(84),
+            Arc::new(arrow::datatypes::Field::new(
+                "value",
+                array.data_type().clone(),
+                false,
+            )),
+            binding,
+            None,
+            pure.clone(),
+        )
+        .unwrap();
+        let schema = Arc::new(ChunkSchema::try_new_typed(vec![slot], pure).unwrap());
+        Chunk::try_new_typed_with_columns_observed::<String, _>(schema, vec![array], rows, |_| {
+            Ok(())
+        })
+        .unwrap()
+    }
+    #[test]
+    fn bounded_root_sole_typed_writer_preserves_plain_nested_dictionary_and_count_only() {
+        use arrow::array::{DictionaryArray, Int32Array, ListArray, StringArray};
+        use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+        use arrow::datatypes::Int32Type;
+        let pure = ValueTypeStorageLifetime::pure();
+        let plain = source(
+            Arc::new(Int32Array::from(vec![7, 9])),
+            ValueTypeRef::try_new(ValueKind::Scalar(DataType::Int32), false, pure.clone()).unwrap(),
+            2,
+        );
+        let dict: ArrayRef = Arc::new(
+            DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from(vec![0, 2]),
+                Arc::new(StringArray::from(vec![Some("{}"), None, Some("[]")])),
+            )
+            .unwrap(),
+        );
+        #[allow(deprecated)]
+        let item = Arc::new(arrow::datatypes::Field::new_dict(
+            "item",
+            dict.data_type().clone(),
+            true,
+            401,
+            false,
+        ));
+        let nested = source(
+            Arc::new(
+                ListArray::try_new(
+                    item,
+                    OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2])),
+                    dict,
+                    None,
+                )
+                .unwrap(),
+            ),
+            ValueTypeRef::try_new(
+                ValueKind::List(
+                    ValueTypeRef::try_new(
+                        ValueKind::Nominal(ValueLogicalType::Json),
+                        true,
+                        pure.clone(),
+                    )
+                    .unwrap(),
+                ),
+                false,
+                pure.clone(),
+            )
+            .unwrap(),
+            2,
+        );
+        let count = Chunk::try_new_typed_with_columns_observed::<String, _>(
+            Arc::new(ChunkSchema::try_new_typed(vec![], pure).unwrap()),
+            vec![],
+            3,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let tracker = crate::runtime::mem_tracker::MemTracker::new_root("bounded root structures");
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(), tracker.clone(), Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        ).unwrap();
+        let baseline = tracker.current();
+        for input in [&plain, &nested, &count] {
+            let encoded = encode_chunks_bounded_with_creation(
+                std::slice::from_ref(input),
+                true,
+                1024 * 1024,
+                factory.as_ref(),
+                &Control,
+            )
+            .unwrap();
+            assert!(encoded.len() <= encoded.retained_bytes());
+            assert!(encoded.retained_bytes() <= 1024 * 1024);
+            assert_eq!(
+                tracker.current(),
+                baseline,
+                "writer/header scratch must not escape in serialized backing"
+            );
+            let (bytes, _) = encoded.into_parts();
+            let out = decode_root_result_chunks(&bytes, &input.chunk_schema_ref()).unwrap();
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0].len(), input.len());
+            assert_eq!(out[0].columns().len(), input.columns().len());
+            assert!(out[0].chunk_schema().is_typed());
+            if !input.columns().is_empty() {
+                assert!(
+                    out[0]
+                        .chunk_schema()
+                        .slot(SlotId::new(84))
+                        .unwrap()
+                        .typed_binding()
+                        .borrowed()
+                        .exactly_equals_observed(
+                            input
+                                .chunk_schema()
+                                .slot(SlotId::new(84))
+                                .unwrap()
+                                .typed_binding()
+                                .borrowed(),
+                            || Ok::<_, String>(())
+                        )
+                        .unwrap()
+                );
+                assert_eq!(out[0].columns()[0].to_data(), input.columns()[0].to_data());
+            }
+        }
+        drop(factory);
+        assert_eq!(tracker.current(), 0);
     }
 }

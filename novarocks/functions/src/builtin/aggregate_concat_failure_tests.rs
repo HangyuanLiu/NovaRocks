@@ -255,7 +255,9 @@ fn kernel(
         phase,
         Some(novarocks_type_contract::AggregateStateInterpretation {
             distinct: false,
-            order_keys: Box::new([]),
+            order_keys: novarocks_type_contract::AggregateStateOrderKeys::from_pure_boxed(
+                Box::new([]),
+            ),
         }),
     )
     .unwrap()
@@ -580,7 +582,9 @@ fn concat_distinct_final_consumes_producer_receipt_with_empty_merge_flags() {
         let receipt = || {
             Some(novarocks_type_contract::AggregateStateInterpretation {
                 distinct: true,
-                order_keys: Box::new([]),
+                order_keys: novarocks_type_contract::AggregateStateOrderKeys::from_pure_boxed(
+                    Box::new([]),
+                ),
             })
         };
         let partial = kernel_with_source(
@@ -667,4 +671,214 @@ fn concat_distinct_final_consumes_producer_receipt_with_empty_merge_flags() {
         drop((left, right, joined, result));
         assert_eq!(host.ledger.lock().unwrap().bytes, 0);
     }
+}
+
+#[test]
+fn concat_runtime_borrowed_types_preserve_raw_source_child_nulls_and_primary_control() {
+    let host = Arc::new(Host::default());
+    let alloc = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let mut original = GroupConcatState::new(alloc.clone());
+    let mut raw = ScalarWork::new(None);
+    let ty = core::build_default_intermediate_type(&[DataType::Utf8]);
+    let column = text("original");
+    original
+        .update_row(
+            &[(&column, 0)],
+            GroupConcatLayout::infer(1, 0).unwrap(),
+            &mut raw,
+        )
+        .unwrap();
+    let source = core::build_intermediate_array(&ty, std::iter::once(&original), &mut raw).unwrap();
+    let merge = core::GroupConcatMerge::new(&source, 0, &mut raw).unwrap();
+    let borrowed = core::intermediate_arg_types_borrowed(&ty)
+        .unwrap()
+        .next()
+        .unwrap();
+    let DataType::Struct(fields) = &ty else {
+        unreachable!()
+    };
+    let DataType::List(item) = fields[0].data_type() else {
+        unreachable!()
+    };
+    assert!(std::ptr::eq(borrowed, item.data_type()));
+
+    let mut run = |control: &Control| {
+        let mut state = GroupConcatState::new(alloc.clone());
+        let mut checkpoints = crate::kernel_input::EvaluationCheckpoints::new(control);
+        let outcome = {
+            let mut work = ScalarWork::new(Some(&mut checkpoints));
+            merge
+                .merge_row(&mut state, 0, &ty, &mut work)
+                .map_err(ScalarStateError::into_kernel_failure)
+        };
+        let outcome = checkpoints.finish_result(outcome);
+        if outcome.is_ok() {
+            let output = core::build_final_array(
+                &ty,
+                std::iter::once(&state),
+                false,
+                &[],
+                &[],
+                1024,
+                &mut raw,
+            )
+            .unwrap();
+            assert_eq!(
+                output
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "original"
+            );
+        }
+        outcome
+    };
+    let success = Control::default();
+    run(&success).unwrap();
+    let trace = success.trace.lock().unwrap().clone();
+    assert!(!trace.is_empty());
+    for cause in causes() {
+        for at in 0..trace.len() {
+            let control = Control {
+                refusal: Some((at, cause.clone())),
+                ..Default::default()
+            };
+            assert_eq!(run(&control), Err(cause.clone()));
+            assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+        }
+    }
+    drop(run);
+
+    // The actual array child, not its enclosing declared field, remains the
+    // borrowed merge source. A recursive child NULL disagreement must refuse
+    // before touching row state, while preserving the original diagnostic.
+    let inner = arrow_array::ListArray::from_iter_primitive::<arrow_array::types::Int64Type, _, _>(
+        [Some(vec![Some(7)])],
+    );
+    let inner_type = inner.data_type().clone();
+    let outer_item = Arc::new(arrow_schema::Field::new("item", inner_type.clone(), true));
+    let outer = arrow_array::ListArray::new(
+        outer_item,
+        arrow_buffer::OffsetBuffer::new(vec![0i32, 1].into()),
+        Arc::new(inner),
+        None,
+    );
+    let actual = Arc::new(arrow_array::StructArray::new(
+        arrow_schema::Fields::from(vec![Arc::new(arrow_schema::Field::new(
+            "c0",
+            outer.data_type().clone(),
+            true,
+        ))]),
+        vec![Arc::new(outer)],
+        None,
+    )) as ArrayRef;
+    let actual_merge = core::GroupConcatMerge::new(&actual, 0, &mut raw).unwrap();
+    let required_inner = DataType::List(Arc::new(arrow_schema::Field::new(
+        "item",
+        DataType::Int64,
+        false,
+    )));
+    let declared = core::build_default_intermediate_type(std::slice::from_ref(&required_inner));
+    let mut refused = GroupConcatState::new(alloc.clone());
+    let error = actual_merge
+        .merge_row(&mut refused, 0, &declared, &mut raw)
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "group_concat merge argument types mismatch: expected {:?}, got {:?}",
+            [required_inner],
+            [inner_type],
+        )
+    );
+    assert!(refused.rows.is_empty());
+    drop((original, refused, alloc));
+    assert_released(&host);
+}
+
+#[test]
+fn concat_runtime_keeps_original_dictionary_field_equality_and_real_child_negatives() {
+    let dictionary = arrow_array::DictionaryArray::<arrow_array::types::Int8Type>::try_new(
+        arrow_array::Int8Array::from(Vec::<i8>::new()),
+        Arc::new(StringArray::from(Vec::<&str>::new())),
+    )
+    .unwrap();
+    #[allow(deprecated)]
+    let original_item =
+        arrow_schema::Field::new_dict("item", dictionary.data_type().clone(), true, 7, false)
+            .with_metadata([("original.source".into(), "kept".into())].into());
+    let inner = arrow_array::ListArray::new(
+        Arc::new(original_item.clone()),
+        arrow_buffer::OffsetBuffer::new(vec![0i32].into()),
+        Arc::new(dictionary),
+        None,
+    );
+    let inner_type = inner.data_type().clone();
+    let outer = arrow_array::ListArray::new(
+        Arc::new(arrow_schema::Field::new("item", inner_type.clone(), true)),
+        arrow_buffer::OffsetBuffer::new(vec![0i32, 0].into()),
+        Arc::new(inner),
+        None,
+    );
+    let source = Arc::new(arrow_array::StructArray::new(
+        arrow_schema::Fields::from(vec![Arc::new(arrow_schema::Field::new(
+            "c0",
+            outer.data_type().clone(),
+            true,
+        ))]),
+        vec![Arc::new(outer)],
+        None,
+    )) as ArrayRef;
+    let host = Arc::new(Host::default());
+    let allocator = HostAggregateAllocator::try_new(host.clone()).unwrap();
+    let mut raw = ScalarWork::new(None);
+    let merge = core::GroupConcatMerge::new(&source, 0, &mut raw).unwrap();
+    // These are two distinct original Arrow compatibility facts, not internal
+    // frozen type identity. Both were accepted by the old Vec<DataType>::eq.
+    for (id, ordered) in [(i64::MAX, false), (7, true)] {
+        #[allow(deprecated)]
+        let equivalent = arrow_schema::Field::new_dict(
+            "item",
+            original_item.data_type().clone(),
+            true,
+            id,
+            ordered,
+        )
+        .with_metadata(original_item.metadata().clone());
+        let expected = DataType::List(Arc::new(equivalent));
+        assert_eq!(expected, inner_type);
+        let declared = core::build_default_intermediate_type(std::slice::from_ref(&expected));
+        let mut state = GroupConcatState::new(allocator.clone());
+        merge.merge_row(&mut state, 0, &declared, &mut raw).unwrap();
+        assert!(
+            state.rows.is_empty(),
+            "the genuine original empty payload remains empty"
+        );
+    }
+    for different in [
+        original_item.clone().with_nullable(false),
+        original_item
+            .clone()
+            .with_metadata([("original.source".into(), "different".into())].into()),
+    ] {
+        let expected = DataType::List(Arc::new(different));
+        assert_ne!(expected, inner_type);
+        let declared = core::build_default_intermediate_type(std::slice::from_ref(&expected));
+        let mut state = GroupConcatState::new(allocator.clone());
+        let error = merge
+            .merge_row(&mut state, 0, &declared, &mut raw)
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "group_concat merge argument types mismatch: expected {:?}, got {:?}",
+                [expected],
+                [&inner_type],
+            )
+        );
+        assert!(state.rows.is_empty());
+    }
+    drop(allocator);
+    assert_released(&host);
 }

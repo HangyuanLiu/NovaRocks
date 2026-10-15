@@ -82,28 +82,32 @@ pub(super) fn validate_profile(
     let args = &contract.selected().argument_types;
     match operation {
         Operation::ArrayLiteral => {
-            if target.logical_type != ValueLogicalType::Physical || target.nullable {
+            if target.logical_type() != ValueLogicalType::Physical || target.nullable() {
                 return Err(invalid(
                     "array literal requires its exact non-null List result",
                 ));
             }
-            let DataType::List(field) = &target.data_type else {
+            let DataType::List(field) = target.data_type() else {
                 return Err(invalid(
                     "array literal result must be its frozen List field",
                 ));
             };
-            let item = FunctionValueType::try_from_field(field)
-                .map_err(|_| invalid("array literal has an invalid frozen item identity"))?;
+            let item = target
+                .value_type()
+                .child_type_at(0)
+                .ok_or_else(|| invalid("array literal has no frozen semantic item"))?;
             for argument in args.iter() {
                 observe()?;
                 let source = value(argument)?;
-                if source.logical_type != item.logical_type
-                    || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
-                        &source.data_type,
-                        &item.data_type,
-                        &mut observe,
-                    )?
-                {
+                if !FunctionValueType::borrowed_value_domains_equal_observed(
+                    source.value_type(),
+                    item,
+                    &mut observe,
+                )? || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+                    source.data_type(),
+                    field.data_type(),
+                    &mut observe,
+                )? {
                     return Err(invalid(
                         "array literal requires already-materialized exact item arguments",
                     ));
@@ -111,7 +115,7 @@ pub(super) fn validate_profile(
             }
         }
         Operation::MapLookup => {
-            if target.data_type == DataType::Null {
+            if target.data_type() == &DataType::Null {
                 return Err(invalid(
                     "__map_element_at has no installed Null result profile: original nullable-index overlay panics",
                 ));
@@ -123,12 +127,12 @@ pub(super) fn validate_profile(
             };
             let map = value(map)?;
             let key = value(key)?;
-            if map.logical_type != ValueLogicalType::Physical || !target.nullable {
+            if map.logical_type() != ValueLogicalType::Physical || !target.nullable() {
                 return Err(invalid(
                     "map element_at requires a Physical Map and nullable result",
                 ));
             }
-            let DataType::Map(entries, _) = &map.data_type else {
+            let DataType::Map(entries, _) = map.data_type() else {
                 return Err(invalid("map element_at requires its frozen Map input"));
             };
             let DataType::Struct(fields) = entries.data_type() else {
@@ -137,28 +141,36 @@ pub(super) fn validate_profile(
             if fields.len() != 2 {
                 return Err(invalid("map element_at requires exactly two entry fields"));
             }
-            let key_field = FunctionValueType::try_from_field(&fields[0])
-                .map_err(|_| invalid("map element_at key field identity is invalid"))?;
-            let value_field = FunctionValueType::try_from_field(&fields[1])
-                .map_err(|_| invalid("map element_at value field identity is invalid"))?;
-            if key.logical_type != key_field.logical_type
-                || target.logical_type != value_field.logical_type
-                || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
-                    &key.data_type,
-                    &key_field.data_type,
-                    &mut observe,
-                )?
-                || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
-                    &target.data_type,
-                    &value_field.data_type,
-                    &mut observe,
-                )?
-            {
+            let key_semantic = map
+                .value_type()
+                .child_type_at(0)
+                .ok_or_else(|| invalid("map element_at has no frozen semantic key"))?;
+            let value_semantic = map
+                .value_type()
+                .child_type_at(1)
+                .ok_or_else(|| invalid("map element_at has no frozen semantic value"))?;
+            if !FunctionValueType::borrowed_value_domains_equal_observed(
+                key.value_type(),
+                key_semantic,
+                &mut observe,
+            )? || !FunctionValueType::borrowed_value_domains_equal_observed(
+                target.value_type(),
+                value_semantic,
+                &mut observe,
+            )? || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+                key.data_type(),
+                fields[0].data_type(),
+                &mut observe,
+            )? || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+                target.data_type(),
+                fields[1].data_type(),
+                &mut observe,
+            )? {
                 return Err(invalid(
                     "map element_at selected domains differ from its real key/value fields",
                 ));
             }
-            nullable_take_type(&value_field.data_type, &mut observe)?;
+            nullable_take_type(fields[1].data_type(), &mut observe)?;
         }
     }
     Ok(())
@@ -242,7 +254,7 @@ pub(super) fn evaluate<'a>(
                     .ok_or(KernelFailure::ResourceExhausted)?;
                 i32::try_from(slots).map_err(|_| KernelFailure::ResourceExhausted)?;
                 let mut inputs = ArrayLiteralInputs::from_output(
-                    Some(&target.data_type),
+                    Some(target.data_type()),
                     selection.len(),
                     input.arguments().len(),
                     &mut observer,
@@ -275,7 +287,7 @@ pub(super) fn evaluate<'a>(
                         ConstructionFailure::Control(cause) => cause,
                         ConstructionFailure::Data(error) => internal(&error.legacy_message()),
                     })?;
-                SelectedValues::try_new(selection, &target.data_type, values, Box::default())
+                SelectedValues::try_new(selection, target.data_type(), values, Box::default())
                     .map_err(|_| {
                         internal("array literal compact result violates its checked contract")
                     })
@@ -306,7 +318,7 @@ pub(super) fn evaluate<'a>(
                             check: None,
                         })
                     },
-                    Some(&target.data_type),
+                    Some(target.data_type()),
                     |values, indices| {
                         let mut exact_indices = reserve::<Option<u64>>(indices.len(), &work)?;
                         for index in indices {
@@ -334,7 +346,7 @@ pub(super) fn evaluate<'a>(
                 })?;
                 SelectedValues::try_new(
                     selection,
-                    &target.data_type,
+                    target.data_type(),
                     values,
                     errors.into_boxed_slice(),
                 )

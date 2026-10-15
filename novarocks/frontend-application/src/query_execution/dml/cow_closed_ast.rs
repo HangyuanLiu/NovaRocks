@@ -30,6 +30,12 @@ pub(super) enum BuildError {
     Allocation(TryReserveError),
     Original(novarocks_spi::connector::OriginalResultCheckError),
     Control(novarocks_spi::connector::ConnectorError),
+    Compile(novarocks_type_contract::CompileControlError),
+    Constant(novarocks_functions::ConstantError),
+    Copy(novarocks_functions::selected_copy::CopyError),
+    Kernel(novarocks_functions::KernelFailure),
+    Layout(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+    ValueType(novarocks_type_contract::ExecutionValueTypeError),
     InvalidSource(&'static str),
     OriginalSemantic(String),
 }
@@ -41,6 +47,12 @@ impl fmt::Display for BuildError {
             }
             Self::Original(error) => error.fmt(f),
             Self::Control(error) => error.fmt(f),
+            Self::Compile(error) => error.fmt(f),
+            Self::Constant(error) => error.fmt(f),
+            Self::Copy(error) => error.fmt(f),
+            Self::Kernel(error) => error.fmt(f),
+            Self::Layout(error) => write!(f, "COW construction layout: {error:?}"),
+            Self::ValueType(error) => error.fmt(f),
             Self::InvalidSource(reason) => f.write_str(reason),
             Self::OriginalSemantic(reason) => f.write_str(reason),
         }
@@ -52,6 +64,11 @@ impl std::error::Error for BuildError {
             Self::Allocation(error) => Some(error),
             Self::Original(error) => Some(error),
             Self::Control(error) => Some(error),
+            Self::Compile(error) => Some(error),
+            Self::Constant(error) => Some(error),
+            Self::Copy(error) => Some(error),
+            Self::Kernel(error) => Some(error),
+            Self::ValueType(error) => Some(error),
             _ => None,
         }
     }
@@ -59,6 +76,21 @@ impl std::error::Error for BuildError {
 impl From<String> for BuildError {
     fn from(value: String) -> Self {
         Self::OriginalSemantic(value)
+    }
+}
+impl From<novarocks_functions::KernelFailure> for BuildError {
+    fn from(error: novarocks_functions::KernelFailure) -> Self {
+        Self::Kernel(error)
+    }
+}
+impl From<novarocks_type_contract::CompileControlError> for BuildError {
+    fn from(error: novarocks_type_contract::CompileControlError) -> Self {
+        Self::Compile(error)
+    }
+}
+impl From<novarocks_type_contract::ExecutionValueTypeError> for BuildError {
+    fn from(error: novarocks_type_contract::ExecutionValueTypeError) -> Self {
+        Self::ValueType(error)
     }
 }
 pub(super) type Result<T> = std::result::Result<T, BuildError>;
@@ -436,123 +468,115 @@ fn finite_float(value: f64) -> Result<Expr> {
     number(value)
 }
 
-// Same old Arrow caster/parser intersection: LargeUtf8/Time/Nanos may appear
-// in a NULL CAST, but checked_value rejects their non-NULL original values.
-pub(super) fn type_name(data_type: &DataType) -> Result<TypeName> {
-    let (text, count) = match data_type {
-        DataType::Boolean => ("BOOLEAN", 0),
-        DataType::Int8 => ("TINYINT", 0),
-        DataType::Int16 => ("SMALLINT", 0),
-        DataType::Int32 => ("INT", 0),
-        DataType::Int64 => ("BIGINT", 0),
-        DataType::Float32 => ("FLOAT", 0),
-        DataType::Float64 => ("DOUBLE", 0),
-        DataType::Utf8 | DataType::LargeUtf8 => ("STRING", 0),
-        DataType::Binary | DataType::LargeBinary => ("VARBINARY", 0),
-        DataType::Date32 => ("DATE", 0),
-        DataType::Timestamp(TimeUnit::Microsecond, _) => ("DATETIME", 0),
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => ("DATETIME_NS", 0),
-        DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond) => ("TIME", 0),
-        DataType::FixedSizeBinary(_) => ("VARBINARY", 0),
-        DataType::Decimal128(_, scale) if *scale >= 0 => ("DECIMAL", 2),
-        DataType::Decimal128(_, _) => {
-            return Err(BuildError::OriginalSemantic(
-                "COW DECIMAL type parameter is negative".into(),
-            ));
-        }
-        DataType::List(_) => ("ARRAY", 1),
-        DataType::Map(_, _) => ("MAP", 2),
-        DataType::Struct(fields) if !fields.is_empty() => ("STRUCT", fields.len()),
-        DataType::Struct(_) => {
-            return Err(BuildError::OriginalSemantic(
-                "COW empty STRUCT type is unsupported".into(),
-            ));
-        }
-        other => {
-            return Err(BuildError::OriginalSemantic(formatted(format_args!(
-                "unsupported Arrow type for INSERT default conversion: {other:?}"
-            ))?));
-        }
+fn type_failure(
+    error: super::cow_compile_receipt::borrowed_value_footprint::Failure,
+) -> BuildError {
+    use super::cow_compile_receipt::borrowed_value_footprint::Failure as F;
+    match error {
+        F::ResourceExhausted => BuildError::ResourceExhausted,
+        F::Stopped => BuildError::InvalidSource("COW type construction stopped"),
+        F::InvalidSource(reason) => BuildError::InvalidSource(reason),
+        F::OriginalSemantic(reason) => BuildError::OriginalSemantic(reason.into()),
+    }
+}
+pub(super) fn type_name(
+    value: &novarocks_type_contract::FunctionValueType,
+    check: &impl Fn() -> Result<()>,
+) -> Result<TypeName> {
+    type_name_node(
+        super::cow_compile_receipt::type_footprint::Node::root(value),
+        check,
+    )
+}
+fn type_name_node(
+    node: super::cow_compile_receipt::type_footprint::Node<'_>,
+    check: &impl Fn() -> Result<()>,
+) -> Result<TypeName> {
+    use super::cow_compile_receipt::type_footprint::{Node, Spelling};
+    check()?;
+    let spelling = node.spelling().map_err(type_failure)?;
+    let (word, count) = match &spelling {
+        Spelling::Leaf(word) => (*word, 0),
+        Spelling::Decimal { .. } => ("DECIMAL", 2),
+        Spelling::Array(_) => ("ARRAY", 1),
+        Spelling::Map(_, _) => ("MAP", 2),
+        Spelling::Struct(fields, _) => ("STRUCT", fields.len()),
     };
     let mut arguments = exact_vec(count)?;
-    match data_type {
-        DataType::Decimal128(precision, scale) => {
-            arguments.push(TypeNameArgument::Literal(Literal {
-                kind: LiteralKind::Number(formatted(format_args!("{precision}"))?),
-                span: S,
-            }));
-            arguments.push(TypeNameArgument::Literal(Literal {
-                kind: LiteralKind::Number(formatted(format_args!("{scale}"))?),
-                span: S,
-            }));
-        }
-        DataType::List(field) => arguments.push(TypeNameArgument::Type(field_type_name(field)?)),
-        DataType::Map(field, _) => {
-            let DataType::Struct(fields) = field.data_type() else {
-                return Err(BuildError::OriginalSemantic(
-                    "unsupported Arrow map entries type".into(),
-                ));
-            };
-            if fields.len() != 2 {
-                return Err(BuildError::OriginalSemantic(
-                    "unsupported Arrow map entries field count".into(),
-                ));
-            }
-            for child in fields {
-                arguments.push(TypeNameArgument::Type(field_type_name(child)?));
-            }
-        }
-        DataType::Struct(fields) => {
-            for field in fields {
-                arguments.push(TypeNameArgument::Field(StructField {
-                    name: ident(field.name(), true)?,
-                    data_type: field_type_name(field)?,
+    match spelling {
+        Spelling::Leaf(_) => {}
+        Spelling::Decimal { precision, scale } => {
+            for parameter in [precision, scale] {
+                arguments.push(TypeNameArgument::Literal(Literal {
+                    kind: LiteralKind::Number(formatted(format_args!("{parameter}"))?),
                     span: S,
                 }));
             }
         }
-        _ => {}
+        Spelling::Array(item) => {
+            arguments.push(TypeNameArgument::Type(type_name_node(item, check)?))
+        }
+        Spelling::Map(key, value) => {
+            arguments.push(TypeNameArgument::Type(type_name_node(key, check)?));
+            arguments.push(TypeNameArgument::Type(type_name_node(value, check)?));
+        }
+        Spelling::Struct(fields, layout) => {
+            for (field, layout) in fields.iter().zip(layout) {
+                check()?;
+                arguments.push(TypeNameArgument::Field(StructField {
+                    name: ident(field.name(), true)?,
+                    data_type: type_name_node(
+                        Node {
+                            value: field.value_type(),
+                            layout: layout.data_type(),
+                        },
+                        check,
+                    )?,
+                    span: S,
+                }));
+            }
+        }
     }
     let mut spaces = exact_vec(count.saturating_sub(1))?;
     for _ in 1..count {
         spaces.push(true);
     }
     Ok(TypeName {
-        name: name(text)?,
+        name: name(word)?,
         arguments,
         argument_separator_spaces: spaces,
         span: S,
     })
 }
-pub(super) fn field_type_name(field: &arrow::datatypes::Field) -> Result<TypeName> {
-    use super::cow_compile_receipt::{borrowed_value_footprint::Failure, type_footprint};
-    match type_footprint::logical_type_name(field).map_err(|failure| match failure {
-        Failure::OriginalSemantic(message) => BuildError::OriginalSemantic(message.into()),
-        _ => BuildError::InvalidSource("invalid COW field logical type"),
-    })? {
-        Some(logical) => Ok(TypeName {
-            name: name(logical)?,
-            arguments: exact_vec(0)?,
-            argument_separator_spaces: exact_vec(0)?,
-            span: S,
-        }),
-        None => type_name(field.data_type()),
-    }
-}
-pub(super) fn cast_field(expr: Expr, field: &arrow::datatypes::Field) -> Result<Expr> {
+pub(super) fn cast(
+    expr: Expr,
+    value: &novarocks_type_contract::FunctionValueType,
+    check: &impl Fn() -> Result<()>,
+) -> Result<Expr> {
+    // Build the validated spelling before publishing its owning Cast wrapper.
+    let data_type = type_name(value, check)?;
+    check()?;
     Ok(Expr::Cast(CastExpr {
         expr: Box::new(expr),
-        data_type: field_type_name(field)?,
+        data_type,
         kind: CastKind::Cast,
         format: None,
         span: S,
     }))
 }
-#[cfg(test)]
-pub(super) fn cast(expr: Expr, data_type: &DataType) -> Result<Expr> {
+pub(super) fn cast_effect(expr: Expr, check: &impl Fn() -> Result<()>) -> Result<Expr> {
+    // The sealed EffectField constructor owns this required Int8 protocol fact.
+    check()?;
+    let data_type = TypeName {
+        name: name("TINYINT")?,
+        arguments: Vec::new(),
+        argument_separator_spaces: Vec::new(),
+        span: S,
+    };
+    check()?;
     Ok(Expr::Cast(CastExpr {
         expr: Box::new(expr),
-        data_type: type_name(data_type)?,
+        data_type,
         kind: CastKind::Cast,
         format: None,
         span: S,
@@ -621,6 +645,32 @@ pub(super) fn values(
         lateral: false,
         subquery: Box::new(query(SetExpr::Values(Values {
             rows,
+            explicit_row: false,
+            span: S,
+        }))),
+        hints: Vec::new(),
+        alias: Some(TableAlias {
+            name: ident(alias, true)?,
+            columns,
+            explicit_as: true,
+            span: S,
+        }),
+        span: S,
+    })
+}
+/// An explicitly owned materialized source occupies this structural edge.
+/// No SQL literal or CAST is authored here; the statement input supplies the
+/// checked constant rows. Ordinary SQL VALUES still uses values() above.
+pub(super) fn materialized_values(alias: &str, columns: Vec<Ident>) -> Result<TableFactor> {
+    if columns.is_empty() {
+        return Err(BuildError::InvalidSource(
+            "COW materialized source has no columns",
+        ));
+    }
+    Ok(TableFactor::Derived {
+        lateral: false,
+        subquery: Box::new(query(SetExpr::Values(Values {
+            rows: Vec::new(),
             explicit_row: false,
             span: S,
         }))),

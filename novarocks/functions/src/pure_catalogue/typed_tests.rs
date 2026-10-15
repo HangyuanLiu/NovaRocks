@@ -72,7 +72,7 @@ struct Counts {
 }
 
 fn value_type(data_type: DataType) -> FunctionValueType {
-    FunctionValueType::new(data_type, false)
+    FunctionValueType::from_legacy_declared_projection(data_type, false)
 }
 fn state_format() -> AggregateStateFormatIdentity {
     AggregateStateFormatIdentity::try_new("fixture/catalogue/sum-state-v1").unwrap()
@@ -133,7 +133,7 @@ impl Owner {
             });
             overloads.push(FunctionOverloadDeclaration::from_effects(
                 overload.clone(),
-                format!("{:?}", argument.data_type),
+                format!("{:?}", argument.data_type()),
                 "Int64",
                 (kind == FunctionKind::Aggregate).then(|| AggregateBindingDeclaration {
                     state_argument_contract:
@@ -289,7 +289,7 @@ impl AggregateSignatureResolver for Owner {
             .iter()
             .find(|selected| {
                 matches!(&selected.argument_types[0], FunctionArgumentType::Value(ty)
-                    if arguments == [ty.data_type.clone()])
+                    if arguments == [ty.data_type().clone()])
             })
             .ok_or(FunctionResolutionError::NoMatchingSignature {
                 candidates: self.selections.len(),

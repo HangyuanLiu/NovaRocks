@@ -20,13 +20,17 @@
 //! evaluation. Pipeline expansion and DOP still require separate actual
 //! operator/driver instances; a shared node/site cannot own one global state.
 
+use crate::creation::{ProgramCreation, ProgramCreationFailure};
 use crate::{
     ImmutableExpressions, JoinType, LocalProgramGraph, NestedLoopJoinType, ProgramControlFlow,
     ProgramExprId, ProgramNodeId, ProgramNodeKind, StaticExprKind, UnpivotConstant,
 };
+#[cfg(test)]
+use novarocks_type_contract::ValueSchemaCreation;
 use novarocks_type_contract::{
     CompileCheckpoints, CompileControlError, CompilePhase, ControlShape, EvaluationDemand,
-    ExpressionUseId, MAX_CONTROL_USE_REFERENCES, PureCompileControl,
+    ExpressionUseId, MAX_CONTROL_USE_REFERENCES, PureCompileControl, ValueSchemaCreationScope,
+    ValueTypeStorageLifetime,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -168,31 +172,103 @@ impl std::error::Error for ProgramExpressionRootError {}
 /// share one root-reference budget. Immutable backing may be shared between
 /// scopes, but their entry occurrences remain distinct. This checks source
 /// identity and demand, not control domains, prepared types or runtime order.
+
+#[derive(Debug)]
+struct RootFacts<T> {
+    value: T,
+    _storage: ValueTypeStorageLifetime,
+}
+impl<T> std::ops::Deref for RootFacts<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<H> From<ProgramExpressionRootError> for ProgramCreationFailure<ProgramExpressionRootError, H> {
+    fn from(error: ProgramExpressionRootError) -> Self {
+        match error {
+            ProgramExpressionRootError::Control(error) => Self::Control(error),
+            error => Self::Owner(error),
+        }
+    }
+}
+fn pure_programexpressionrooterror(
+    error: ProgramCreationFailure<ProgramExpressionRootError, std::convert::Infallible>,
+) -> ProgramExpressionRootError {
+    match error {
+        ProgramCreationFailure::Control(error) => ProgramExpressionRootError::Control(error),
+        ProgramCreationFailure::Owner(error) => error,
+        ProgramCreationFailure::Resource(_) | ProgramCreationFailure::Capacity(_) => {
+            ProgramExpressionRootError::Control(CompileControlError::ResourceExhausted)
+        }
+        ProgramCreationFailure::Creator(never) => match never {},
+    }
+}
+
+impl<H> From<ProgramRootBindingError> for ProgramCreationFailure<ProgramRootBindingError, H> {
+    fn from(error: ProgramRootBindingError) -> Self {
+        match error {
+            ProgramRootBindingError::Control(error) => Self::Control(error),
+            error => Self::Owner(error),
+        }
+    }
+}
+fn pure_programrootbindingerror(
+    error: ProgramCreationFailure<ProgramRootBindingError, std::convert::Infallible>,
+) -> ProgramRootBindingError {
+    match error {
+        ProgramCreationFailure::Control(error) => ProgramRootBindingError::Control(error),
+        ProgramCreationFailure::Owner(error) => error,
+        ProgramCreationFailure::Resource(_) | ProgramCreationFailure::Capacity(_) => {
+            ProgramRootBindingError::Control(CompileControlError::ResourceExhausted)
+        }
+        ProgramCreationFailure::Creator(never) => match never {},
+    }
+}
 #[derive(Clone, Debug)]
 pub struct ProgramExpressionRoots {
-    arenas: Arc<BTreeMap<ProgramExpressionArena, Arc<ImmutableExpressions>>>,
-    sites: Arc<BTreeMap<ProgramExpressionRootSite, ProgramExpressionRoot>>,
+    arenas: Arc<RootFacts<BTreeMap<ProgramExpressionArena, Arc<ImmutableExpressions>>>>,
+    sites: Arc<RootFacts<BTreeMap<ProgramExpressionRootSite, ProgramExpressionRoot>>>,
 }
 impl ProgramExpressionRoots {
+    /// Pure collection delegates the same validation and construction body.
     pub fn collect(
         program: &LocalProgramGraph,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ProgramExpressionRootError> {
+        Self::collect_core::<std::convert::Infallible>(program, None, control)
+            .map_err(pure_programexpressionrooterror)
+    }
+    pub fn collect_with_creator_in<H>(
+        program: &LocalProgramGraph,
+        creation: &mut dyn ValueSchemaCreationScope<H>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ProgramCreationFailure<ProgramExpressionRootError, H>> {
+        Self::collect_core(program, Some(creation), control)
+    }
+    fn collect_core<H>(
+        program: &LocalProgramGraph,
+        creator: Option<&mut dyn ValueSchemaCreationScope<H>>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ProgramCreationFailure<ProgramExpressionRootError, H>> {
         let mut builder = RootCollector {
             work: CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)
                 .map_err(ProgramExpressionRootError::Control)?,
-            arenas: BTreeMap::from([(ProgramExpressionArena::Main, program.expressions().clone())]),
+            creation: ProgramCreation { creator },
+            arena_insertions: 0,
+            site_insertions: 0,
+            arenas: BTreeMap::new(),
             sites: BTreeMap::new(),
         };
+        builder.arena(ProgramExpressionArena::Main, program.expressions().clone())?;
         for (index, node) in program.nodes().iter().enumerate() {
             builder.step()?;
             builder.node(ProgramNodeId::new(index), node.kind())?;
         }
         if let Some(sink) = program.sink() {
             if let Some(arena) = sink.arena() {
-                builder
-                    .arenas
-                    .insert(ProgramExpressionArena::Sink, arena.clone());
+                builder.arena(ProgramExpressionArena::Sink, arena.clone())?;
             }
             for (branch, value) in sink.branches().iter().enumerate() {
                 builder.step()?;
@@ -218,14 +294,28 @@ impl ProgramExpressionRoots {
                 )?;
             }
         }
-        builder
-            .work
-            .finish()
-            .map_err(ProgramExpressionRootError::Control)?;
-        Ok(Self {
-            arenas: Arc::new(builder.arenas),
-            sites: Arc::new(builder.sites),
-        })
+        // Preserve the original tail control before publishing either map.
+        builder.work.flush()?;
+        let has_creator = builder.creation.creator.is_some();
+        let storage = builder.creation.storage();
+        let arenas = builder.creation.arc::<ProgramExpressionRootError, _>(
+            RootFacts {
+                value: builder.arenas,
+                _storage: storage.clone(),
+            },
+            &mut builder.work,
+        )?;
+        let sites = builder.creation.arc::<ProgramExpressionRootError, _>(
+            RootFacts {
+                value: builder.sites,
+                _storage: storage,
+            },
+            &mut builder.work,
+        )?;
+        if has_creator {
+            builder.work.finish()?;
+        }
+        Ok(Self { arenas, sites })
     }
     pub fn arenas(&self) -> &BTreeMap<ProgramExpressionArena, Arc<ImmutableExpressions>> {
         &self.arenas
@@ -238,40 +328,53 @@ impl ProgramExpressionRoots {
 fn ordinal(value: usize) -> Result<u32, ProgramExpressionRootError> {
     u32::try_from(value).map_err(|_| ProgramExpressionRootError::TooManyRoots)
 }
-struct RootCollector<'control> {
+struct RootCollector<'control, 'creation, H> {
     work: CompileCheckpoints<'control>,
+    creation: ProgramCreation<'creation, H>,
+    arena_insertions: usize,
+    site_insertions: usize,
     arenas: BTreeMap<ProgramExpressionArena, Arc<ImmutableExpressions>>,
     sites: BTreeMap<ProgramExpressionRootSite, ProgramExpressionRoot>,
 }
-impl RootCollector<'_> {
-    fn step(&mut self) -> Result<(), ProgramExpressionRootError> {
-        self.work
-            .step()
-            .map_err(ProgramExpressionRootError::Control)
+impl<H> RootCollector<'_, '_, H> {
+    fn step(&mut self) -> Result<(), ProgramCreationFailure<ProgramExpressionRootError, H>> {
+        self.work.step().map_err(ProgramCreationFailure::Control)
+    }
+    fn arena(
+        &mut self,
+        scope: ProgramExpressionArena,
+        arena: Arc<ImmutableExpressions>,
+    ) -> Result<(), ProgramCreationFailure<ProgramExpressionRootError, H>> {
+        self.creation.before_tree_insert::<ProgramExpressionRootError, ProgramExpressionArena, Arc<ImmutableExpressions>>(self.arena_insertions, &mut self.work)?;
+        self.arena_insertions += 1;
+        self.arenas.insert(scope, arena);
+        Ok(())
     }
     fn add(
         &mut self,
         site: ProgramExpressionRootSite,
         definition: ProgramExprId,
         demand: EvaluationDemand,
-    ) -> Result<(), ProgramExpressionRootError> {
+    ) -> Result<(), ProgramCreationFailure<ProgramExpressionRootError, H>> {
         self.step()?;
         if self.sites.len() >= MAX_CONTROL_USE_REFERENCES {
-            return Err(ProgramExpressionRootError::TooManyRoots);
+            return Err(ProgramExpressionRootError::TooManyRoots.into());
         }
         let arena = self
             .arenas
             .get(&site.arena())
             .ok_or(ProgramExpressionRootError::InvalidArena)?;
         if arena.node(definition).is_none() {
-            return Err(ProgramExpressionRootError::InvalidDefinition);
+            return Err(ProgramExpressionRootError::InvalidDefinition.into());
         }
+        self.creation.before_tree_insert::<ProgramExpressionRootError, ProgramExpressionRootSite, ProgramExpressionRoot>(self.site_insertions, &mut self.work)?;
+        self.site_insertions += 1;
         if self
             .sites
             .insert(site, ProgramExpressionRoot { definition, demand })
             .is_some()
         {
-            return Err(ProgramExpressionRootError::DuplicateSite);
+            return Err(ProgramExpressionRootError::DuplicateSite.into());
         }
         Ok(())
     }
@@ -281,7 +384,7 @@ impl RootCollector<'_> {
         role: ProgramNodeExpressionRole,
         definition: ProgramExprId,
         demand: EvaluationDemand,
-    ) -> Result<(), ProgramExpressionRootError> {
+    ) -> Result<(), ProgramCreationFailure<ProgramExpressionRootError, H>> {
         self.add(
             ProgramExpressionRootSite::Node { node, role },
             definition,
@@ -292,7 +395,7 @@ impl RootCollector<'_> {
         &mut self,
         node: ProgramNodeId,
         kind: &ProgramNodeKind,
-    ) -> Result<(), ProgramExpressionRootError> {
+    ) -> Result<(), ProgramCreationFailure<ProgramExpressionRootError, H>> {
         use EvaluationDemand::{TruthOnly, Value};
         use ProgramNodeExpressionRole as Role;
         match kind {
@@ -351,7 +454,7 @@ impl RootCollector<'_> {
             }
             ProgramNodeKind::Filter { predicates, .. } => {
                 if predicates.is_empty() {
-                    return Err(ProgramExpressionRootError::InvalidDefinition);
+                    return Err(ProgramExpressionRootError::InvalidDefinition.into());
                 }
                 for (predicate, definition) in predicates.iter().enumerate() {
                     self.step()?;
@@ -564,10 +667,10 @@ impl RootCollector<'_> {
                 }
             }
             ProgramNodeKind::TableWriter { projection, .. } => {
-                self.arenas.insert(
+                self.arena(
                     ProgramExpressionArena::WriterProjection(node),
                     projection.arena.clone(),
-                );
+                )?;
                 for (expression, definition) in projection.expressions.iter().enumerate() {
                     self.add(
                         ProgramExpressionRootSite::WriterProjection {
@@ -696,8 +799,8 @@ impl std::error::Error for ProgramRootBindingError {}
 pub struct ProgramRootControlBindings {
     program: LocalProgramGraph,
     roots: ProgramExpressionRoots,
-    flows: Arc<BTreeMap<ProgramExpressionArena, ProgramControlFlow>>,
-    bindings: Arc<BTreeMap<ProgramExpressionRootSite, ExpressionUseId>>,
+    flows: Arc<RootFacts<BTreeMap<ProgramExpressionArena, ProgramControlFlow>>>,
+    bindings: Arc<RootFacts<BTreeMap<ProgramExpressionRootSite, ExpressionUseId>>>,
 }
 impl ProgramRootControlBindings {
     pub fn try_new(
@@ -706,14 +809,66 @@ impl ProgramRootControlBindings {
         bindings: Vec<ProgramRootUseBinding>,
         control: &dyn PureCompileControl,
     ) -> Result<Self, ProgramRootBindingError> {
+        Self::try_new_core::<std::convert::Infallible>(
+            program, flows, bindings, None, None, control,
+        )
+        .map_err(pure_programrootbindingerror)
+    }
+    pub fn try_new_with_creator_in<H>(
+        program: LocalProgramGraph,
+        flows: BTreeMap<ProgramExpressionArena, ProgramControlFlow>,
+        bindings: Vec<ProgramRootUseBinding>,
+        temporary: &mut dyn ValueSchemaCreationScope<H>,
+        retained: &mut dyn ValueSchemaCreationScope<H>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ProgramCreationFailure<ProgramRootBindingError, H>> {
+        Self::try_new_core(
+            program,
+            flows,
+            bindings,
+            Some(temporary),
+            Some(retained),
+            control,
+        )
+    }
+    fn try_new_core<H>(
+        program: LocalProgramGraph,
+        flows: BTreeMap<ProgramExpressionArena, ProgramControlFlow>,
+        bindings: Vec<ProgramRootUseBinding>,
+        temporary: Option<&mut dyn ValueSchemaCreationScope<H>>,
+        mut creator: Option<&mut dyn ValueSchemaCreationScope<H>>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Self, ProgramCreationFailure<ProgramRootBindingError, H>> {
         let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)
             .map_err(ProgramRootBindingError::Control)?;
-        let roots = ProgramExpressionRoots::collect(&program, control)
-            .map_err(ProgramRootBindingError::Roots)?;
+        let has_creator = creator.is_some();
+        let roots = match creator.as_mut() {
+            Some(creation) => {
+                ProgramExpressionRoots::collect_with_creator_in(&program, &mut **creation, control)
+            }
+            None => ProgramExpressionRoots::collect_core(&program, None, control),
+        }
+        .map_err(|error| match error {
+            ProgramCreationFailure::Owner(error) => {
+                ProgramCreationFailure::Owner(ProgramRootBindingError::Roots(error))
+            }
+            ProgramCreationFailure::Control(error) if !has_creator => {
+                ProgramCreationFailure::Owner(ProgramRootBindingError::Roots(
+                    ProgramExpressionRootError::Control(error),
+                ))
+            }
+            ProgramCreationFailure::Control(error) => ProgramCreationFailure::Control(error),
+            ProgramCreationFailure::Creator(error) => ProgramCreationFailure::Creator(error),
+            ProgramCreationFailure::Resource(error) => ProgramCreationFailure::Resource(error),
+            ProgramCreationFailure::Capacity(error) => ProgramCreationFailure::Capacity(error),
+        })?;
+        let mut creation = ProgramCreation { creator };
+        let mut temporary = ProgramCreation { creator: temporary };
         if flows.len() != roots.arenas.len() || bindings.len() != roots.sites.len() {
-            return Err(ProgramRootBindingError::IncompleteCoverage);
+            return Err(ProgramRootBindingError::IncompleteCoverage.into());
         }
         let mut all_roots = BTreeSet::new();
+        let mut root_insertions = 0usize;
         let mut reference_count = 0usize;
         for (scope, flow) in &flows {
             work.step().map_err(ProgramRootBindingError::Control)?;
@@ -728,16 +883,19 @@ impl ProgramRootControlBindings {
             for value in flow.uses().values() {
                 work.step().map_err(ProgramRootBindingError::Control)?;
                 if arena.node(value.definition).is_none() {
-                    return Err(ProgramRootBindingError::InvalidDefinition);
+                    return Err(ProgramRootBindingError::InvalidDefinition.into());
                 }
             }
             validate_intrinsic_correspondence(arena, flow, &mut work)?;
             for use_id in flow.root_use_ids() {
                 work.step().map_err(ProgramRootBindingError::Control)?;
+                temporary.before_tree_insert::<ProgramRootBindingError, (ProgramExpressionArena, ExpressionUseId), ()>(root_insertions, &mut work)?;
+                root_insertions += 1;
                 all_roots.insert((*scope, *use_id));
             }
         }
         let mut sites = BTreeMap::new();
+        let mut site_insertions = 0usize;
         for binding in bindings {
             work.step().map_err(ProgramRootBindingError::Control)?;
             let expected = roots
@@ -755,24 +913,47 @@ impl ProgramRootControlBindings {
             if invocation.definition != expected.definition
                 || invocation.context.demand != expected.demand
             {
-                return Err(ProgramRootBindingError::InvalidRoot);
+                return Err(ProgramRootBindingError::InvalidRoot.into());
             }
+            creation.before_tree_insert::<ProgramRootBindingError, ProgramExpressionRootSite, ExpressionUseId>(site_insertions, &mut work)?;
+            site_insertions += 1;
             if sites.insert(binding.site, binding.use_id).is_some() {
-                return Err(ProgramRootBindingError::DuplicateSite);
+                return Err(ProgramRootBindingError::DuplicateSite.into());
             }
             if !all_roots.remove(&(scope, binding.use_id)) {
-                return Err(ProgramRootBindingError::SharedRootUse);
+                return Err(ProgramRootBindingError::SharedRootUse.into());
             }
         }
         if sites.len() != roots.sites.len() || !all_roots.is_empty() {
-            return Err(ProgramRootBindingError::IncompleteCoverage);
+            return Err(ProgramRootBindingError::IncompleteCoverage.into());
         }
-        work.finish().map_err(ProgramRootBindingError::Control)?;
+        // Scratch is released independently of the published maps.
+        drop(all_roots);
+        drop(temporary);
+        work.flush()?;
+        let storage = creation.storage();
+        let flows = creation.arc::<ProgramRootBindingError, _>(
+            RootFacts {
+                value: flows,
+                _storage: storage.clone(),
+            },
+            &mut work,
+        )?;
+        let bindings = creation.arc::<ProgramRootBindingError, _>(
+            RootFacts {
+                value: sites,
+                _storage: storage,
+            },
+            &mut work,
+        )?;
+        if has_creator {
+            work.finish()?;
+        }
         Ok(Self {
             program,
             roots,
-            flows: Arc::new(flows),
-            bindings: Arc::new(sites),
+            flows,
+            bindings,
         })
     }
     pub const fn program(&self) -> &LocalProgramGraph {

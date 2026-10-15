@@ -250,6 +250,13 @@ fn update(
     mapping: &[usize],
     control: &dyn KernelEvaluationControl,
 ) -> Result<(), EvaluationFailure> {
+    let values = values
+        .iter()
+        .zip(kernel.contract.logical_argument_types())
+        .map(|(array, binding)| {
+            crate::test_value_ingress::array_for_binding(array, binding).unwrap()
+        })
+        .collect::<Vec<_>>();
     let args = values
         .iter()
         .map(EvaluatedArgument::Column)
@@ -295,7 +302,10 @@ fn ds_hll_host_all_four_identities_original_null_empty_and_full_data() {
         };
         let kernel = kernel(
             name,
-            &[FunctionValueType::new(ty.clone(), true)],
+            &[FunctionValueType::from_legacy_declared_projection(
+                ty.clone(),
+                true,
+            )],
             AggregateKernelPhase::Single,
         );
         let host = Arc::new(Host::default());
@@ -344,13 +354,18 @@ fn ds_hll_host_all_four_identities_original_null_empty_and_full_data() {
 }
 #[test]
 fn ds_hll_host_sparse_full_diagnostic_actual_type_no_tail_and_latch() {
-    let field = Arc::new(Field::new("long", DataType::UInt32, true).with_metadata(
-        std::collections::HashMap::from([("source".into(), "x".repeat(900))]),
+    let field = Arc::new(Field::new(
+        "item",
+        DataType::Struct(vec![Field::new("x".repeat(900), DataType::UInt32, true)].into()),
+        true,
     ));
     let values = Arc::new(arrow_array::ListArray::new_null(field, 4)) as ArrayRef;
     let kernel = kernel(
         "ds_hll_count_distinct",
-        &[FunctionValueType::new(values.data_type().clone(), true)],
+        &[FunctionValueType::from_legacy_declared_projection(
+            values.data_type().clone(),
+            true,
+        )],
         AggregateKernelPhase::Single,
     );
     let host = Arc::new(Host::default());
@@ -840,7 +855,10 @@ fn ds_hll_host_every_actual_owned_frontier_all_seven_causes_and_last_drop() {
     let value = Arc::new(arrow_array::ListArray::new_null(field, 1)) as ArrayRef;
     let kernel = kernel(
         "ds_hll_count_distinct",
-        &[FunctionValueType::new(value.data_type().clone(), true)],
+        &[FunctionValueType::from_legacy_declared_projection(
+            value.data_type().clone(),
+            true,
+        )],
         AggregateKernelPhase::Single,
     );
     for cause in causes() {

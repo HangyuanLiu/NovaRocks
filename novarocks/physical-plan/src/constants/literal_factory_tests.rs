@@ -132,12 +132,9 @@ fn largeint() -> FunctionValueType {
 fn same_source(value: &ConstantValue, ty: &FunctionValueType) {
     assert_eq!(value.value_type(), ty);
     assert_eq!(value.field().name(), "constant");
-    assert_eq!(value.field().data_type(), &ty.data_type);
-    assert_eq!(value.field().is_nullable(), ty.nullable);
-    assert_eq!(
-        FunctionValueType::try_from_field(value.field()).unwrap(),
-        *ty
-    );
+    assert_eq!(value.field().data_type(), ty.data_type());
+    assert_eq!(value.field().is_nullable(), ty.nullable());
+    assert_eq!(value.field().metadata().capacity(), 0);
     assert_eq!(value.ordinal(), 0);
     assert_eq!(value.pool().array().len(), 1);
     assert_eq!(value.pool().resource_facts().rows, 1);
@@ -303,7 +300,7 @@ fn literal_factory_keeps_float_bits_nominal_identity_timezone_presence_and_typed
     )
     .unwrap();
     same_source(&value, &json);
-    assert_eq!(value.value_type().logical_type, ValueLogicalType::Json);
+    assert_eq!(value.value_type().logical_type(), ValueLogicalType::Json);
     assert_eq!(value.try_utf8().unwrap(), Some("{\"x\":1}"));
     for ty in [
         json,
@@ -358,15 +355,15 @@ fn literal_factory_refuses_wrong_carriers_nonnullable_null_and_invalid_field_dom
         ),
         Err(Error::Constant(ConstantError::Invalid(_)))
     ));
-    let invalid = FunctionValueType {
-        data_type: DataType::FixedSizeBinary(16),
-        nullable: false,
-        logical_type: ValueLogicalType::Json,
-    };
-    assert!(matches!(
-        admit(&L::Utf8("{}".into()), &invalid, policy(), &Control::good()),
-        Err(Error::Type(_))
-    ));
+    assert_eq!(
+        FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            false,
+            ValueLogicalType::Json
+        )
+        .unwrap_err(),
+        ValueTypeError::InvalidLogicalCarrier(ValueLogicalType::Json)
+    );
     assert!(matches!(
         admit(
             &L::Decimal128(123),
@@ -457,11 +454,7 @@ fn literal_factory_all_small_actual_callback_prefixes_keep_three_original_contro
         ),
         (
             crate::LiteralValue::Utf8("{}".into()),
-            FunctionValueType {
-                data_type: DataType::FixedSizeBinary(16),
-                nullable: false,
-                logical_type: ValueLogicalType::Json,
-            },
+            plain(DataType::Int64, false),
             false,
         ),
     ] {

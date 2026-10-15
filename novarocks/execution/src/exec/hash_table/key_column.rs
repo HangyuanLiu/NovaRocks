@@ -23,7 +23,9 @@ use arrow::array::{
     Int32Builder, Int64Builder, ListArray, StringArray, StringBuilder, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray,
 };
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, Field, TimeUnit};
+#[cfg(test)]
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow_buffer::{NullBufferBuilder, OffsetBuffer, i256};
 
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
@@ -1423,6 +1425,290 @@ pub(crate) fn key_column_from_type_in(
     }
 }
 
+/// Validate the complete original output before any runtime schema construction.
+/// Array representation normalization remains the existing typed Chunk author.
+pub(crate) fn validate_typed_aggregate_output(
+    schema: &ChunkSchema,
+    arena: &crate::exec::expr::ExprArena,
+    groups: &[crate::exec::expr::ExprId],
+    kernels: &[AggKernelEntry],
+    intermediate: bool,
+    mut work: impl FnMut(usize) -> Result<(), crate::exec::pipeline::operator::ConstructionFailure>,
+) -> Result<(), crate::exec::pipeline::operator::ConstructionFailure> {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+    work(0)?;
+    let count = groups
+        .len()
+        .checked_add(kernels.len())
+        .ok_or(LayoutResourceError::Arithmetic)?;
+    if !schema.is_typed() || schema.slots().len() < count {
+        return Err(ConstructionFailure::InvalidSource(
+            "aggregate output requires its complete declared channels".into(),
+        ));
+    }
+    for (index, expression) in groups.iter().enumerate() {
+        work(1)?;
+        let actual = arena.value_type(*expression).ok_or_else(|| {
+            ConstructionFailure::InvalidSource(
+                "aggregate group output lacks its complete original type author".into(),
+            )
+        })?;
+        let declared = schema.slots()[index].typed_binding();
+        if (actual.nullable() && !declared.nullable())
+            || !actual
+                .typed_binding()
+                .borrowed()
+                .same_physical_binding_ignoring_root_nullability_observed(
+                    declared.borrowed(),
+                    || work(1),
+                )?
+        {
+            return Err(ConstructionFailure::InvalidSource(format!(
+                "aggregate group output binding differs at column {index}",
+            )));
+        }
+    }
+    for (index, kernel) in kernels.iter().enumerate() {
+        work(1)?;
+        let declared = schema.slots()[groups.len() + index].typed_binding();
+        let actual = kernel
+            .frozen_output_value_type(intermediate)
+            .ok_or_else(|| {
+                ConstructionFailure::InvalidSource(
+                    "aggregate kernel lacks its complete frozen output author".into(),
+                )
+            })?;
+        if (actual.nullable() && !declared.nullable())
+            || !actual
+                .typed_binding()
+                .borrowed()
+                .same_physical_binding_ignoring_root_nullability_observed(
+                    declared.borrowed(),
+                    || work(1),
+                )?
+        {
+            return Err(ConstructionFailure::InvalidSource(format!(
+                "aggregate frozen output binding differs at column {}",
+                groups.len() + index,
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The local two-phase rewrite creates a new Partial occurrence. Its state
+/// fields come from the original frozen intermediate declarations, never from
+/// the final result carrier. The genuine final port is validated first.
+pub(crate) fn create_local_partial_aggregate_schema(
+    final_schema: &ChunkSchemaRef,
+    arena: &crate::exec::expr::ExprArena,
+    groups: &[crate::exec::expr::ExprId],
+    kernels: &[AggKernelEntry],
+    factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+) -> Result<ChunkSchemaRef, crate::exec::pipeline::operator::ConstructionFailure> {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
+    use std::alloc::Layout;
+    validate_typed_aggregate_output(final_schema, arena, groups, kernels, false, |units| {
+        factory.observe_input_work(units)
+    })?;
+    let count = groups
+        .len()
+        .checked_add(kernels.len())
+        .ok_or(LayoutResourceError::Arithmetic)?;
+    let owner = factory.begin_typed_construction(final_schema)?;
+    owner.request(
+        Layout::array::<ChunkSlotSchema>(count).map_err(|_| LayoutResourceError::Arithmetic)?,
+    )?;
+    let mut slots = Vec::with_capacity(count);
+    for slot in &final_schema.slots()[..groups.len()] {
+        factory.observe_input_work(1)?;
+        slots.push(slot.clone());
+    }
+    for (index, kernel) in kernels.iter().enumerate() {
+        factory.observe_input_work(1)?;
+        let original = &final_schema.slots()[groups.len() + index];
+        let state = kernel.frozen_output_value_type(true).ok_or_else(|| {
+            ConstructionFailure::InvalidSource(
+                "local partial aggregate lacks its frozen state declaration".into(),
+            )
+        })?;
+        owner.request(
+            Layout::array::<u8>(original.field().name().len())
+                .map_err(|_| LayoutResourceError::Arithmetic)?,
+        )?;
+        owner.request(arc_layout(Layout::new::<Field>())?)?;
+        factory.observe_input_work(1)?;
+        let field = Arc::new(Field::new(
+            original.field().name(),
+            state.data_type().clone(),
+            state.nullable(),
+        ));
+        slots.push(ChunkSlotSchema::try_new_typed_observed(
+            original.slot_id(),
+            field,
+            state
+                .typed_binding()
+                .clone_observed(|| factory.observe_input_work(1))?,
+            original.unique_id(),
+            owner.storage_lifetime(),
+            |step| owner.observe(0, &[], step),
+        )?);
+    }
+    let schema = ChunkSchema::try_new_typed_observed(
+        slots,
+        owner.storage_lifetime(),
+        |layout| owner.request(layout),
+        |units| factory.observe_input_work(units),
+    )?;
+    owner.request(arc_layout(Layout::new::<ChunkSchema>())?)?;
+    Ok(Arc::new(schema))
+}
+
+/// A flat loan set follows only Arrow backing actually reused by output arrays.
+/// It never retains the arena, kernel set, factory, or task control.
+struct AggregateArrayTypeLoans {
+    _loans: Vec<novarocks_type_contract::ValueTypeStorageLifetime>,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl novarocks_type_contract::ValueTypeStorageHold for AggregateArrayTypeLoans {}
+
+pub(crate) struct AggregateOutputCreation {
+    owner: Box<dyn crate::exec::pipeline::operator::InputConstructionOwner>,
+    schema: ChunkSchemaRef,
+    array_storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl AggregateOutputCreation {
+    /// Begin before the original output-column Vec and array constructors.
+    pub(crate) fn begin(
+        source: &ChunkSchemaRef,
+        arena: &crate::exec::expr::ExprArena,
+        groups: &[crate::exec::expr::ExprId],
+        kernels: &[AggKernelEntry],
+        intermediate: bool,
+        factory: &dyn crate::exec::pipeline::operator::InputConstructionFactory,
+    ) -> crate::runtime::fragment::ExecutionResult<Self> {
+        use crate::exec::chunk::ArrayNormalizationStep;
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        use novarocks_type_contract::{
+            ValueTypeStorageLifetime,
+            owned_resources::layout::{LayoutResourceError, arc_layout},
+        };
+        use std::alloc::Layout;
+        validate_typed_aggregate_output(source, arena, groups, kernels, intermediate, |units| {
+            factory.observe_input_work(units)
+        })?;
+        let count = groups
+            .len()
+            .checked_add(kernels.len())
+            .ok_or(LayoutResourceError::Arithmetic)
+            .map_err(ConstructionFailure::from)?;
+        let schema = if count == source.slots().len() {
+            source.clone()
+        } else {
+            let container = factory.begin_typed_construction(source)?;
+            container.request(
+                Layout::array::<ChunkSlotSchema>(count)
+                    .map_err(|_| ConstructionFailure::from(LayoutResourceError::Arithmetic))?,
+            )?;
+            let mut slots = Vec::with_capacity(count);
+            for slot in &source.slots()[..count] {
+                factory.observe_input_work(1)?;
+                slots.push(slot.clone());
+            }
+            let schema = ChunkSchema::try_new_typed_observed::<ConstructionFailure>(
+                slots,
+                container.storage_lifetime(),
+                |layout| container.request(layout),
+                |units| factory.observe_input_work(units),
+            )?;
+            container.request(
+                arc_layout(Layout::new::<ChunkSchema>()).map_err(ConstructionFailure::from)?,
+            )?;
+            Arc::new(schema)
+        };
+        let owner = factory.begin_typed_construction(&schema)?;
+        let mut loans = Vec::new();
+        if count != 0 {
+            owner.request(
+                Layout::array::<ValueTypeStorageLifetime>(count)
+                    .map_err(|_| ConstructionFailure::from(LayoutResourceError::Arithmetic))?,
+            )?;
+            loans = Vec::with_capacity(count);
+        }
+        for expression in groups {
+            factory.observe_input_work(1)?;
+            let value = arena.value_type(*expression).ok_or_else(|| {
+                ConstructionFailure::InvalidSource(
+                    "aggregate group output lacks its complete original type author".into(),
+                )
+            })?;
+            loans.push(
+                value
+                    .typed_binding()
+                    .layout()
+                    .arrow_backing_storage_lifetime(),
+            );
+        }
+        for kernel in kernels {
+            factory.observe_input_work(1)?;
+            let value = kernel
+                .frozen_output_value_type(intermediate)
+                .ok_or_else(|| {
+                    ConstructionFailure::InvalidSource(
+                        "aggregate array output lacks its complete original type author".into(),
+                    )
+                })?;
+            loans.push(
+                value
+                    .typed_binding()
+                    .layout()
+                    .arrow_backing_storage_lifetime(),
+            );
+        }
+        let array_storage = if count == 0 {
+            owner.storage_lifetime()
+        } else {
+            owner.request(
+                arc_layout(Layout::new::<AggregateArrayTypeLoans>())
+                    .map_err(ConstructionFailure::from)?,
+            )?;
+            ValueTypeStorageLifetime::held(Arc::new(AggregateArrayTypeLoans {
+                _loans: loans,
+                _storage: owner.storage_lifetime(),
+            }))
+        };
+        owner.observe(
+            0,
+            &[],
+            ArrayNormalizationStep::CreateChunkColumns { channels: count },
+        )?;
+        Ok(Self {
+            owner,
+            schema,
+            array_storage,
+        })
+    }
+
+    pub(crate) fn finish(
+        self,
+        arrays: Vec<arrow::array::ArrayRef>,
+        rows: usize,
+    ) -> crate::runtime::fragment::ExecutionResult<crate::exec::chunk::Chunk> {
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        Ok(
+            crate::exec::chunk::Chunk::try_new_typed_with_columns_owned_observed::<
+                ConstructionFailure,
+                _,
+            >(self.schema, arrays, rows, self.array_storage, |step| {
+                self.owner.observe(0, &[], step)
+            })?,
+        )
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn build_output_schema_from_kernels(
     key_columns: &[KeyColumn],
     kernels: &[AggKernelEntry],
@@ -1604,5 +1890,221 @@ mod tests {
                 .saturating_mul(std::mem::size_of::<Option<Vec<Option<String>>>>())
                 .saturating_add(nested)
         );
+    }
+}
+
+#[cfg(test)]
+mod typed_output_owner_tests {
+    use super::AggregateOutputCreation;
+    use crate::exec::chunk::{ChunkSchemaRef, typed_fixture};
+    use crate::exec::expr::{ExprArena, ExprNode};
+    use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
+    use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionFactory};
+    use crate::runtime::fragment::{ExecutionFailure, ExecutionFailureCause};
+    use crate::runtime::mem_tracker::MemTracker;
+    use crate::runtime::runtime_state::RuntimeErrorState;
+    use arrow::array::{Array, ArrayRef, ListArray, StringArray};
+    use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use novarocks_type_contract::{
+        FunctionValueType, ValueKind, ValueLayout, ValueLogicalType, ValueTypeRef,
+        ValueTypeStorageLifetime,
+    };
+    use novarocks_types::SlotId;
+    use std::sync::Arc;
+
+    fn declared(kind: ValueKind) -> FunctionValueType {
+        let storage = ValueTypeStorageLifetime::pure();
+        let child = ValueTypeRef::try_new(kind, false, storage.clone()).unwrap();
+        let ty = ValueTypeRef::try_new(ValueKind::List(child), false, storage.clone()).unwrap();
+        let carrier = DataType::List(Arc::new(Field::new("item", DataType::Utf8, false)));
+        FunctionValueType::try_from_value(ty, ValueLayout::try_new(&carrier, storage).unwrap())
+            .unwrap()
+    }
+    fn fixture() -> (
+        Arc<MemTracker>,
+        Arc<RuntimeErrorState>,
+        Arc<dyn InputConstructionFactory>,
+        ChunkSchemaRef,
+        ExprArena,
+        crate::exec::expr::ExprId,
+    ) {
+        let tracker = MemTracker::new_root("aggregate typed output structure");
+        let errors = Arc::new(RuntimeErrorState::default());
+        let factory = try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            tracker.clone(),
+            errors.clone(),
+        )
+        .unwrap();
+        let ty = declared(ValueKind::Nominal(ValueLogicalType::Json));
+        let layout = typed_fixture::layout(
+            Arc::new(Schema::new(vec![Field::new(
+                "documents",
+                ty.data_type().clone(),
+                false,
+            )])),
+            &[SlotId::new(1)],
+            &[ty.clone()],
+        );
+        let schema = factory.create_compiled_chunk_schema(&layout).unwrap();
+        let mut arena = ExprArena::default();
+        let expression = arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), ty);
+        (tracker, errors, factory, schema, arena, expression)
+    }
+    fn values() -> ArrayRef {
+        // This is fixture payload. Its original noncanonical anonymous label
+        // exercises the real output normalizer, never a semantic author.
+        Arc::new(
+            ListArray::try_new(
+                Arc::new(Field::new("source_item", DataType::Utf8, false)),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0i32, 1, 2])),
+                Arc::new(StringArray::from(vec!["{}", "[]"])),
+                None,
+            )
+            .unwrap(),
+        )
+    }
+    #[test]
+    fn aggregate_typed_output_normalizes_representation_and_keeps_complete_owner_until_last_exit() {
+        let (tracker, errors, factory, schema, arena, expression) = fixture();
+        let weak_factory = Arc::downgrade(&factory);
+        let input = values();
+        let original_data = input.to_data();
+        let created = AggregateOutputCreation::begin(
+            &schema,
+            &arena,
+            &[expression],
+            &[],
+            false,
+            factory.as_ref(),
+        )
+        .unwrap();
+        let output = created.finish(vec![input.clone()], 2).unwrap();
+        assert!(output.chunk_schema().is_typed());
+        assert_eq!(
+            output.chunk_schema().slots()[0].typed_binding(),
+            schema.slots()[0].typed_binding()
+        );
+        assert_eq!(
+            output.columns()[0].data_type(),
+            schema.slots()[0].data_type()
+        );
+        assert_eq!(input.to_data(), original_data);
+        assert_eq!(output.columns()[0].null_count(), 0);
+        let list = output.columns()[0]
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let strings = list
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!((strings.value(0), strings.value(1)), ("{}", "[]"));
+        let projection = output.into_batch_projection();
+        drop(schema);
+        drop(arena);
+        drop(factory);
+        drop(errors);
+        assert!(weak_factory.upgrade().is_none());
+        assert!(
+            tracker.current() > 0,
+            "independent batch projection retains only real finite structure"
+        );
+        assert_eq!(
+            projection.record_batch().schema_ref().fields()[0]
+                .metadata()
+                .capacity(),
+            0
+        );
+        drop(projection);
+        assert_eq!(tracker.current(), 0);
+    }
+    #[test]
+    fn aggregate_typed_output_refuses_same_carrier_wrong_domain_before_new_scope() {
+        let (tracker, errors, factory, schema, _, _) = fixture();
+        let mut arena = ExprArena::default();
+        let expression = arena.push_value_typed(
+            ExprNode::SlotId(SlotId::new(1)),
+            declared(ValueKind::String),
+        );
+        let allocated = tracker.allocated();
+        let failure = AggregateOutputCreation::begin(
+            &schema,
+            &arena,
+            &[expression],
+            &[],
+            false,
+            factory.as_ref(),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            matches!(failure.cause(), ExecutionFailureCause::Construction(ConstructionFailure::InvalidSource(detail)) if detail == "aggregate group output binding differs at column 0")
+        );
+        assert_eq!(
+            tracker.allocated(),
+            allocated,
+            "wrong declaration precedes all constructor requests"
+        );
+        drop(schema);
+        drop(arena);
+        drop(factory);
+        drop(errors);
+        assert_eq!(tracker.current(), 0);
+    }
+    #[test]
+    fn aggregate_typed_output_real_memory_and_original_control_stop_before_output_construction() {
+        let (tracker, errors, factory, schema, arena, expression) = fixture();
+        let prior = tracker.current();
+        tracker.install_limit_once(prior + 1).unwrap();
+        let input = values();
+        let original = input.to_data();
+        let failure = AggregateOutputCreation::begin(
+            &schema,
+            &arena,
+            &[expression],
+            &[],
+            false,
+            factory.as_ref(),
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(
+            failure.cause(),
+            ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
+        ));
+        assert_eq!(tracker.current(), prior, "refused scope is refunded");
+        assert_eq!(input.to_data(), original);
+        let stopped = ExecutionFailure::from(ConstructionFailure::from(
+            novarocks_type_contract::CompileControlError::Cancelled,
+        ));
+        errors.set_error(stopped.clone());
+        let allocated = tracker.allocated();
+        let failure = AggregateOutputCreation::begin(
+            &schema,
+            &arena,
+            &[expression],
+            &[],
+            false,
+            factory.as_ref(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            failure, stopped,
+            "the original caller cause is not converted to a schema String"
+        );
+        assert_eq!(
+            tracker.allocated(),
+            allocated,
+            "control refusal has no following request"
+        );
+        drop(schema);
+        drop(arena);
+        drop(factory);
+        drop(errors);
+        assert_eq!(tracker.current(), 0);
     }
 }

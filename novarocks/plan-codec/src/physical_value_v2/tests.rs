@@ -349,23 +349,39 @@ fn value_namespace_exact_type_and_source_binding_refuse_foreign_or_missing_facts
     let control = Control::default();
     let base = nested();
     let mut other_nullable = base.clone();
-    other_nullable.nullable = false;
-    let different_metadata = ty(DataType::Struct(
-        vec![Arc::new(
-            Field::new("child", DataType::Utf8, false)
-                .with_metadata([(String::from("unknown"), String::from("changed"))].into()),
-        )]
-        .into(),
+    other_nullable = other_nullable.with_nullable(false).unwrap();
+    let different_child_nullability = ty(DataType::Struct(
+        vec![Arc::new(Field::new("child", DataType::Utf8, true))].into(),
     ));
     let json =
         FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
             .unwrap();
+    let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+    let json_child = novarocks_type_contract::ValueTypeRef::try_new(
+        novarocks_type_contract::ValueKind::Nominal(ValueLogicalType::Json),
+        false,
+        storage.clone(),
+    )
+    .unwrap();
+    let nested_json = FunctionValueType::try_from_value(
+        novarocks_type_contract::ValueTypeRef::try_new(
+            novarocks_type_contract::ValueKind::Struct(Box::from([
+                novarocks_type_contract::ValueField::new("child", json_child, storage.clone()),
+            ])),
+            true,
+            storage.clone(),
+        )
+        .unwrap(),
+        novarocks_type_contract::ValueLayout::try_new(base.data_type(), storage).unwrap(),
+    )
+    .unwrap();
     let roots = [
         (0, base.clone()),
         (1, other_nullable),
-        (2, different_metadata),
+        (2, different_child_nullability),
         (3, ty(DataType::Utf8)),
         (4, json.clone()),
+        (5, nested_json),
     ];
     let types = encode_type_table_sources(&roots, &[], type_limits(), &control).unwrap();
     let decoded_types = decode_type_table(types.as_wire(), type_limits(), &control).unwrap();
@@ -373,7 +389,7 @@ fn value_namespace_exact_type_and_source_binding_refuse_foreign_or_missing_facts
     let nominal = def(u32::MAX, json, expression());
     let payloads = encode_connector_payloads(&[], 0, payload_limits(), &control).unwrap();
     let decoded_payloads = decode_connector_payloads(&[], 0, payload_limits(), &control).unwrap();
-    for type_id in [1, 2, u32::MAX] {
+    for type_id in [1, 2, 5, u32::MAX] {
         assert!(
             encode_values(
                 &[ValueSource {
@@ -575,13 +591,10 @@ fn value_namespace_all_six_caps_aggregate_dictionary_and_origin_requests_before_
     )
     .unwrap();
     let f = *received.facts();
-    assert_eq!(f.allocation_requests_upper_bound, 5); // index, values, two Dictionary boxes, potential Bytes Shared.
+    assert_eq!(f.allocation_requests_upper_bound, 3); // index, values, potential Bytes Shared; binding clones share both owners.
     assert_eq!(
         f.allocation_request_bytes_upper_bound,
-        size_of::<usize>()
-            + size_of::<p::ValueDef>()
-            + 2 * size_of::<DataType>()
-            + bytes_shared_upper().unwrap()
+        size_of::<usize>() + size_of::<p::ValueDef>() + bytes_shared_upper().unwrap()
     );
     assert_eq!(f.origin_reference_count, 2);
     assert_eq!(encoded.facts().allocation_requests_upper_bound, 2);
@@ -867,8 +880,8 @@ fn value_namespace_empty_and_full_fvt_receiving_do_not_guess_source_metadata() {
     let actual = decoded.value(u32::MAX).unwrap().unwrap();
     assert_eq!(actual.ty, roots[0].1);
     match (
-        &actual.ty.data_type,
-        &decoded_types.value_type(0).unwrap().data_type,
+        &actual.ty.data_type(),
+        &decoded_types.value_type(0).unwrap().data_type(),
     ) {
         (DataType::Struct(actual), DataType::Struct(source)) => {
             assert!(Arc::ptr_eq(&actual[0], &source[0]))

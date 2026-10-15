@@ -165,6 +165,18 @@ class BoundaryTests(unittest.TestCase):
         self.assertIn("source escapes its audited package", " ".join(
             guard.verify_package(package, set())))
 
+    def test_arrow_geometry_keeps_only_its_audited_build_authority(self):
+        for name in ("arrow-row", "arrow-ipc", "rustc_version", "semver"):
+            self.assertEqual(guard.verify_package(self.external(name), set()), [])
+        package = self.external("flatbuffers")
+        package["targets"] = [{"name": "build", "kind": ["custom-build"],
+                               "src_path": "/registry/flatbuffers-1.0.0/build.rs"}]
+        package["dependencies"] = [{"name": "rustc_version", "kind": "build"}]
+        self.assertEqual(guard.verify_package(package, set()), [])
+        package["dependencies"].append({"name": "tokio", "kind": "build"})
+        self.assertIn("unaudited build dependencies: tokio", " ".join(
+            guard.verify_package(package, set())))
+
     def test_audited_registry_build_owner_cannot_acquire_runtime(self):
         package = self.external("ahash", "2.0.0")
         package["dependencies"] = [{"name": "tokio", "kind": "build"}]

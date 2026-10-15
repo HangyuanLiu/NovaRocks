@@ -78,7 +78,7 @@ impl PureCompileControl for CompileControl {
 }
 const NAMES: [&str; 1] = ["date"];
 fn source(data_type: DataType, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(data_type, nullable)
+    FunctionValueType::from_legacy_declared_projection(data_type, nullable)
 }
 fn target() -> FunctionValueType {
     source(DataType::Date32, true)
@@ -645,7 +645,7 @@ fn date_owner_preserves_exact_fresh_frozen_arc_effects_and_rejects_stale_sources
         // rejection below concerns canonical body inputs, not those requests.
         for source in [
             FunctionValueType::new(DataType::Binary, true),
-            FunctionValueType::new(
+            FunctionValueType::from_legacy_declared_projection(
                 DataType::List(Arc::new(arrow_schema::Field::new(
                     "item",
                     DataType::Int64,
@@ -722,7 +722,7 @@ fn date_compile_success_and_ordinary_tail_preserve_all_callback_causes() {
         FunctionValueType::new(DataType::Binary, true),
     ] {
         let good = CompileControl::default();
-        let success = ty.data_type == DataType::Utf8;
+        let success = ty.data_type() == &DataType::Utf8;
         assert_eq!(
             prepared_for_test_with_control("date", &ty, DecimalOverflowPolicy::OutputNull, &good)
                 .is_ok(),

@@ -363,6 +363,56 @@ impl ConnectorRewriteCohortRead {
     }
 }
 
+fn complete_schema_digest(
+    schema: &novarocks_connector_contract::ConnectorReadExecutionSchema,
+    creation: &mut crate::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<[u8; 32], novarocks_connector_contract::PureProviderCompileError<ConnectorError>> {
+    let mut hash = Sha256::new();
+    let mut emit = |bytes: &[u8]| {
+        creation.work(bytes.len())?;
+        hash.update(bytes);
+        Ok::<_, novarocks_connector_contract::PureProviderCompileError<ConnectorError>>(())
+    };
+    emit(b"novarocks-rewrite-execution-schema-v1")?;
+    emit(&(schema.bindings().len() as u64).to_le_bytes())?;
+    for (field, binding) in schema.schema().fields().iter().zip(schema.bindings()) {
+        emit(&(field.name().len() as u64).to_le_bytes())?;
+        for name in field.name().as_bytes().chunks(1024) {
+            emit(name)?;
+        }
+        novarocks_type_contract::write_value_type_identity_observed(
+            binding.value_type(),
+            &mut emit,
+        )?;
+        novarocks_type_contract::write_value_layout_identity_observed(
+            binding.typed_binding().layout(),
+            &mut emit,
+        )?;
+    }
+    Ok(hash.finalize().into())
+}
+
+/// Storage and execution have independent type namespaces. The provider's
+/// explicit declaration author owns conversions between them; these root
+/// occurrence laws prevent signing another table or NULL policy by accident.
+pub(crate) fn validate_scan_source_pair(
+    source: &arrow::datatypes::Schema,
+    execution: &novarocks_connector_contract::ConnectorReadExecutionSchema,
+    creation: &mut crate::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+) -> Result<(), novarocks_connector_contract::PureProviderCompileError<ConnectorError>> {
+    creation.work(1)?;
+    if source.fields().len() != execution.bindings().len() {
+        return Err(invalid("rewrite source/execution occurrence counts differ").into());
+    }
+    for (source, target) in source.fields().iter().zip(execution.schema().fields()) {
+        creation.work(source.name().len() + target.name().len() + 1)?;
+        if source.name() != target.name() || source.is_nullable() != target.is_nullable() {
+            return Err(invalid("rewrite source/execution root names or NULL facts differ").into());
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct ConnectorDistributedRewriteCohortPlan {
     cohort_id: ConnectorWriteCohortId,
@@ -373,25 +423,35 @@ pub struct ConnectorDistributedRewriteCohortPlan {
     /// read-side physical carrier, but it is deliberately not the writer
     /// contract: the Provider-signed preparation below owns input shape.
     scan_schema: SchemaRef,
+    scan_execution_schema: novarocks_connector_contract::ConnectorReadExecutionSchema,
+    execution_schema_digest: [u8; 32],
+    _source_storage: novarocks_type_contract::ValueTypeStorageLifetime,
     scan_schema_digest: [u8; 32],
     preparation: ConnectorWritePreparation,
     group_digest: [u8; 32],
 }
 
 impl ConnectorDistributedRewriteCohortPlan {
-    pub fn try_new(
+    pub fn try_new_typed(
         cohort_id: ConnectorWriteCohortId,
         read: ConnectorRewriteCohortRead,
         scan_schema: SchemaRef,
+        scan_execution_schema: novarocks_connector_contract::ConnectorReadExecutionSchema,
         scan_schema_digest: [u8; 32],
         preparation: ConnectorWritePreparation,
         group_digest: [u8; 32],
-    ) -> Result<Self, ConnectorError> {
+        creation: &mut crate::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<Self, novarocks_connector_contract::PureProviderCompileError<ConnectorError>> {
         preparation.validate()?;
+        validate_scan_source_pair(&scan_schema, &scan_execution_schema, creation)?;
+        let execution_schema_digest = complete_schema_digest(&scan_execution_schema, creation)?;
         Ok(Self {
             cohort_id,
             read,
             scan_schema,
+            scan_execution_schema,
+            execution_schema_digest,
+            _source_storage: creation.storage(),
             scan_schema_digest,
             preparation,
             group_digest,
@@ -405,7 +465,17 @@ impl ConnectorDistributedRewriteCohortPlan {
     pub const fn read(&self) -> &ConnectorRewriteCohortRead {
         &self.read
     }
-    pub fn scan_schema(&self) -> &SchemaRef {
+    /// Metadata-free execution projection. Complete value authority lives in
+    /// scan_execution_schema; the original storage format is a separate fact.
+    pub fn scan_schema(&self) -> &arrow::datatypes::Schema {
+        self.scan_execution_schema.schema()
+    }
+    pub fn scan_execution_schema(
+        &self,
+    ) -> &novarocks_connector_contract::ConnectorReadExecutionSchema {
+        &self.scan_execution_schema
+    }
+    pub fn scan_source_schema(&self) -> &arrow::datatypes::Schema {
         &self.scan_schema
     }
     /// Provider-owned canonical digest of the frozen scan Arrow schema.
@@ -424,6 +494,7 @@ impl ConnectorDistributedRewriteCohortPlan {
         hash.update(self.cohort_id.to_bytes());
         hash.update(self.group_digest);
         hash.update(self.scan_schema_digest);
+        hash.update(self.execution_schema_digest);
         self.read.digest_into(hash);
         hash.update(self.preparation.digest());
     }
@@ -670,7 +741,11 @@ pub trait ConnectorDistributedRewrite: Send + Sync {
     fn plan_rewrite(
         &self,
         request: ConnectorDistributedRewritePlanningRequest,
-    ) -> Result<ConnectorDistributedRewritePlan, ConnectorError>;
+        creation: &mut crate::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorDistributedRewritePlan,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    >;
     fn finalize_rewrite(
         &self,
         plan: &ConnectorDistributedRewritePlan,
@@ -797,18 +872,22 @@ impl ConnectorDistributedRewriteLease {
     pub fn plan_rewrite(
         &self,
         request: ConnectorDistributedRewritePlanningRequest,
-    ) -> Result<ConnectorDistributedRewritePlan, ConnectorError> {
+        creation: &mut crate::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorDistributedRewritePlan,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
         request.validate()?;
         if request.owner != self.provider_binding_key {
-            return Err(invalid("distributed rewrite request does not match lease"));
+            return Err(invalid("distributed rewrite request does not match lease").into());
         }
-        let plan = self.rewrite.plan_rewrite(request.clone())?;
+        let plan = self.rewrite.plan_rewrite(request.clone(), creation)?;
         plan.validate()?;
         if plan.owner != self.provider_binding_key
             || plan.operation_id != request.operation_id
             || plan.request_digest != request.request_digest
         {
-            return Err(invalid("distributed rewrite plan does not match request"));
+            return Err(invalid("distributed rewrite plan does not match request").into());
         }
         Ok(plan)
     }
@@ -819,14 +898,18 @@ impl ConnectorDistributedRewriteLease {
         operation_id: ConnectorWriteOperationId,
         operation: ConnectorDistributedRewriteOperation,
         context: ConnectorRequestContext,
-    ) -> Result<ConnectorDistributedRewritePlan, ConnectorError> {
+        creation: &mut crate::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorDistributedRewritePlan,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
         let request = ConnectorDistributedRewritePlanningRequest::try_new(
             operation_id,
             self.provider_binding_key.clone(),
             operation,
             context,
         )?;
-        self.plan_rewrite(request)
+        self.plan_rewrite(request, creation)
     }
     pub fn finalize_rewrite(
         &self,
@@ -981,6 +1064,34 @@ mod tests {
         ConnectorWriteInputShape,
     };
 
+    fn execution_schema(
+        schema: &Schema,
+    ) -> novarocks_connector_contract::ConnectorReadExecutionSchema {
+        use novarocks_type_contract::{
+            FunctionValueType, ValueLogicalType, ValueTypeStorageLifetime,
+        };
+        // These fixture columns are explicitly declared physical Int64 values.
+        let bindings = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                assert_eq!(field.data_type(), &DataType::Int64);
+                FunctionValueType::try_with_logical_type(
+                    DataType::Int64,
+                    field.is_nullable(),
+                    ValueLogicalType::Physical,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        novarocks_connector_contract::ConnectorReadExecutionSchema::try_new(
+            Arc::new(schema.clone()),
+            bindings.into_boxed_slice(),
+            ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap()
+    }
+
     fn request() -> ConnectorDistributedRewritePlanningRequest {
         let instance = ConnectorInstanceId::parse("rewrite-contract-test").unwrap();
         let owner = ConnectorProviderBindingKey {
@@ -1058,10 +1169,18 @@ mod tests {
         let cohort_id =
             ConnectorWriteCohortId::derive(request.operation_id(), b"test", [7; 32]).unwrap();
         let cohort = |schema_digest| {
-            ConnectorDistributedRewriteCohortPlan::try_new(
+            let mut request_layout = |_| Ok(());
+            let mut work = |_| Ok(());
+            let mut creation = crate::connector::read_stack::ConnectorReadSchemaCreation::new(
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                &mut request_layout,
+                &mut work,
+            );
+            ConnectorDistributedRewriteCohortPlan::try_new_typed(
                 cohort_id,
                 cohort_read(),
                 Arc::clone(&schema),
+                execution_schema(&schema),
                 schema_digest,
                 preparation(
                     &request,
@@ -1070,6 +1189,7 @@ mod tests {
                     &schema,
                 ),
                 [7; 32],
+                &mut creation,
             )
             .unwrap()
         };
@@ -1095,6 +1215,106 @@ mod tests {
         assert_ne!(first.plan_digest(), second.plan_digest());
     }
 
+    fn nested_execution_schema(
+        domain: novarocks_type_contract::ValueLogicalType,
+        large: bool,
+        root_nullable: bool,
+        child_nullable: bool,
+        name: &str,
+    ) -> novarocks_connector_contract::ConnectorReadExecutionSchema {
+        use novarocks_type_contract::{
+            FunctionValueType, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+        };
+        let storage = ValueTypeStorageLifetime::pure();
+        let child =
+            FunctionValueType::try_with_logical_type(DataType::Utf8, child_nullable, domain)
+                .unwrap();
+        let item = Arc::new(Field::new("item", DataType::Utf8, child_nullable));
+        let layout = if large {
+            DataType::LargeList(item)
+        } else {
+            DataType::List(item)
+        };
+        let binding = FunctionValueType::try_from_value(
+            ValueTypeRef::try_new(
+                ValueKind::List(child.value_type().clone()),
+                root_nullable,
+                storage.clone(),
+            )
+            .unwrap(),
+            ValueLayout::try_new(&layout, storage.clone()).unwrap(),
+        )
+        .unwrap();
+        novarocks_connector_contract::ConnectorReadExecutionSchema::try_new(
+            Arc::new(Schema::new(vec![Field::new(name, layout, root_nullable)])),
+            vec![binding].into_boxed_slice(),
+            storage,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cohort_execution_digest_covers_nested_domain_nulls_names_and_exact_offsets() {
+        use novarocks_type_contract::{ValueLogicalType, ValueTypeStorageLifetime};
+        let mut request = |_| Ok(());
+        let mut work = |_| Ok(());
+        let mut creation = crate::connector::read_stack::ConnectorReadSchemaCreation::new(
+            ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut work,
+        );
+        let variants = [
+            (ValueLogicalType::Json, false, true, true, "value"),
+            (ValueLogicalType::Physical, false, true, true, "value"),
+            (ValueLogicalType::Json, true, true, true, "value"),
+            (ValueLogicalType::Json, false, false, true, "value"),
+            (ValueLogicalType::Json, false, true, false, "value"),
+            (ValueLogicalType::Json, false, true, true, "other"),
+        ];
+        let digests = variants.map(|(domain, large, root, child, name)| {
+            complete_schema_digest(
+                &nested_execution_schema(domain, large, root, child, name),
+                &mut creation,
+            )
+            .unwrap()
+        });
+        for (index, digest) in digests.iter().enumerate() {
+            assert!(!digests[..index].contains(digest));
+        }
+    }
+
+    #[test]
+    fn cohort_execution_digest_preserves_first_control_refusal() {
+        use novarocks_type_contract::{
+            CompileControlError, ValueLogicalType, ValueTypeStorageLifetime,
+        };
+        let schema = nested_execution_schema(ValueLogicalType::Json, false, true, true, "value");
+        let mut request = |_| Ok(());
+        let mut count = 0;
+        let mut work = |_| {
+            count += 1;
+            if count == 3 {
+                Err(CompileControlError::DeadlineExceeded)
+            } else {
+                Ok(())
+            }
+        };
+        let mut creation = crate::connector::read_stack::ConnectorReadSchemaCreation::new(
+            ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut work,
+        );
+        assert!(matches!(
+            complete_schema_digest(&schema, &mut creation),
+            Err(
+                novarocks_connector_contract::PureProviderCompileError::Control(
+                    CompileControlError::DeadlineExceeded
+                )
+            )
+        ));
+        assert_eq!(count, 3);
+    }
+
     #[test]
     fn plan_rejects_cohort_preparation_with_wrong_target_or_intent() {
         let request = request();
@@ -1106,13 +1326,22 @@ mod tests {
         let cohort_id =
             ConnectorWriteCohortId::derive(request.operation_id(), b"test", [7; 32]).unwrap();
         let cohort = |preparation| {
-            ConnectorDistributedRewriteCohortPlan::try_new(
+            let mut request_layout = |_| Ok(());
+            let mut work = |_| Ok(());
+            let mut creation = crate::connector::read_stack::ConnectorReadSchemaCreation::new(
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                &mut request_layout,
+                &mut work,
+            );
+            ConnectorDistributedRewriteCohortPlan::try_new_typed(
                 cohort_id,
                 cohort_read(),
                 Arc::clone(&schema),
+                execution_schema(&schema),
                 [3; 32],
                 preparation,
                 [7; 32],
+                &mut creation,
             )
             .unwrap()
         };

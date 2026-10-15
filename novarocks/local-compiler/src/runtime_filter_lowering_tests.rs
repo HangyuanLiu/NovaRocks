@@ -254,16 +254,11 @@ fn frozen_read_columns(
     )
     .unwrap();
     let schema = public_schema();
-    let public = ConnectorReadPublicFacts::try_new(
+    let public = crate::scan_lowering_tests::typed_public_schema(
         source,
         None,
-        arrow_schema::Schema::new_with_metadata(
-            schema.fields()[..width].to_vec(),
-            schema.metadata().clone(),
-        ),
-        vec![ValueLogicalType::Physical; width],
-    )
-    .unwrap();
+        arrow_schema::Schema::new(schema.fields()[..width].to_vec()),
+    );
     FrozenConnectorRead::try_new(scan, public).unwrap()
 }
 
@@ -1767,6 +1762,7 @@ fn freeze_counts(
             )
             .unwrap_or_else(|error| panic!("COUNT(*) prepares: {error}"));
         frozen.push(FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,

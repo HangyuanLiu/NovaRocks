@@ -137,7 +137,7 @@ pub(super) fn validate_profile(
         ));
     };
     step()?;
-    let exact = match (&source.logical_type, &source.data_type) {
+    let exact = match (&source.logical_type(), source.data_type()) {
         (ValueLogicalType::Physical, DataType::Null | DataType::Utf8 | DataType::List(_)) => true,
         (ValueLogicalType::Json, DataType::Utf8) => true,
         _ => false,
@@ -149,7 +149,9 @@ pub(super) fn validate_profile(
     }
     let target = contract.result_type();
     step()?;
-    if target.logical_type != ValueLogicalType::Physical || target.data_type != DataType::Boolean {
+    if target.logical_type() != ValueLogicalType::Physical
+        || target.data_type() != &DataType::Boolean
+    {
         return Err(invalid(
             "null_or_empty differs from its exact Boolean result contract",
         ));
@@ -182,7 +184,7 @@ pub(super) fn evaluate<'a>(
             if row >= arg.array().len() {
                 return Err(internal("null_or_empty selected address is out of bounds"));
             }
-            if !source.nullable && nulls.as_ref().is_some_and(|n| n.is_null(row)) {
+            if !source.nullable() && nulls.as_ref().is_some_and(|n| n.is_null(row)) {
                 return Err(internal(
                     "null_or_empty non-null selected source contains SQL NULL",
                 ));
@@ -203,7 +205,7 @@ pub(super) fn evaluate<'a>(
         })?;
         SelectedValues::try_new_observed(
             selection,
-            &input.contract().result_type().data_type,
+            input.contract().result_type().data_type(),
             out,
             Box::default(),
             || work.step(),

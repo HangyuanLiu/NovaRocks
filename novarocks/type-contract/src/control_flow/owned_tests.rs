@@ -107,7 +107,25 @@ fn original_empty_arc_headers_and_actual_duplicate_insert_completion_are_indepen
             facts.allocation_requests_upper_bound,
             facts.allocation_request_bytes_upper_bound
         ),
-        (3, 96)
+        (3, {
+            use crate::owned_resources::layout::arc_layout;
+            use std::alloc::Layout;
+            // Three original publication operations now construct guarded
+            // immutable payloads; use their actual public Arc requests.
+            arc_layout(Layout::new::<
+                ControlFlowOwned<BTreeMap<EvaluationDomainId, ExpressionEvaluationDomain>>,
+            >())
+            .unwrap()
+            .size()
+                + arc_layout(Layout::new::<
+                    ControlFlowOwned<BTreeMap<ExpressionUseId, ExpressionInvocation<u32>>>,
+                >())
+                .unwrap()
+                .size()
+                + arc_layout(Layout::new::<ControlFlowOwned<Box<[ExpressionUseId]>>>())
+                    .unwrap()
+                    .size()
+        })
     );
     let (out, trace) = run(true, None);
     assert_eq!(

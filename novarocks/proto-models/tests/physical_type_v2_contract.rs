@@ -47,9 +47,16 @@ fn reachable_type_messages_have_no_recursive_definition_embedding() {
         .unwrap();
     // This bounds protobuf representation depth, not semantic type depth or
     // decoded allocation. Semantic nesting remains a graph of sparse IDs.
-    assert_eq!(walk(root, &mut BTreeSet::new()), 4);
+    // The complete semantic namespace adds the fixed Union field envelope:
+    // TypeTable -> LogicalTypeDefinition -> UnionValue -> UnionValueField
+    // -> NamedValueField. Its child types remain sparse IDs, never embedded.
+    let logical = pool
+        .get_message_by_name("novarocks.value_type.LogicalTypeDefinition")
+        .unwrap();
+    assert_eq!(walk(logical, &mut BTreeSet::new()), 4);
+    assert_eq!(walk(root, &mut BTreeSet::new()), 5);
     let original = pool
-        .get_message_by_name("novarocks.plan.ArrowPhysicalType")
+        .get_message_by_name("novarocks.arrow_type.ArrowPhysicalType")
         .unwrap();
     let flat = pool
         .get_message_by_name("novarocks.physical_type_v2.CarrierTypeDefinition")
@@ -71,14 +78,10 @@ fn zero_sparse_references_have_presence_and_are_distinct_from_missing() {
         id: u32::MAX,
         name: "nested".into(),
         carrier_type_id: Some(0),
-        dictionary_id: Some(0),
-        dictionary_is_ordered: Some(false),
         ..Default::default()
     };
     let mut absent = present.clone();
     absent.carrier_type_id = None;
-    absent.dictionary_id = None;
-    absent.dictionary_is_ordered = None;
     assert_ne!(present.encode_to_vec(), absent.encode_to_vec());
     assert_eq!(
         v2::FieldDefinition::decode(present.encode_to_vec().as_slice()).unwrap(),
@@ -87,6 +90,23 @@ fn zero_sparse_references_have_presence_and_are_distinct_from_missing() {
     assert_eq!(
         v2::FieldDefinition::decode(absent.encode_to_vec().as_slice()).unwrap(),
         absent
+    );
+    let source_present = v2::SourceArrowFieldFacts {
+        field_id: Some(0),
+        metadata: vec![],
+        dictionary_id: Some(0),
+        dictionary_is_ordered: Some(false),
+    };
+    let mut source_absent = source_present.clone();
+    source_absent.dictionary_id = None;
+    source_absent.dictionary_is_ordered = None;
+    assert_ne!(
+        source_present.encode_to_vec(),
+        source_absent.encode_to_vec()
+    );
+    assert_eq!(
+        v2::SourceArrowFieldFacts::decode(source_present.encode_to_vec().as_slice()).unwrap(),
+        source_present
     );
     // A oneof scalar also preserves a present zero field reference.
     let list = v2::CarrierTypeDefinition {
@@ -115,6 +135,40 @@ fn zero_sparse_references_have_presence_and_are_distinct_from_missing() {
 fn nested_field_attributes_and_explicit_logical_domains_survive_the_carrier() {
     use v2::carrier_type_definition::Kind;
     let table = v2::TypeTable {
+        logical_types: vec![
+            novarocks_proto_models::value_type::LogicalTypeDefinition {
+                id: Some(0),
+                nullable: false,
+                kind: Some(
+                    novarocks_proto_models::value_type::logical_type_definition::Kind::Scalar(
+                        novarocks_proto_models::value_type::ScalarValue {
+                            kind: novarocks_proto_models::value_type::ScalarKind::FixedSizeBinary
+                                as i32,
+                            fixed_binary_width: Some(16),
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            },
+            novarocks_proto_models::value_type::LogicalTypeDefinition {
+                id: Some(1),
+                nullable: false,
+                kind: Some(
+                    novarocks_proto_models::value_type::logical_type_definition::Kind::Nominal(
+                        novarocks_proto_models::value_type::NominalValue::LargeInt as i32,
+                    ),
+                ),
+            },
+            novarocks_proto_models::value_type::LogicalTypeDefinition {
+                id: Some(2),
+                nullable: false,
+                kind: Some(
+                    novarocks_proto_models::value_type::logical_type_definition::Kind::Nominal(
+                        novarocks_proto_models::value_type::NominalValue::Uuid as i32,
+                    ),
+                ),
+            },
+        ],
         carriers: vec![
             v2::CarrierTypeDefinition {
                 id: 0,
@@ -153,31 +207,21 @@ fn nested_field_attributes_and_explicit_logical_domains_survive_the_carrier() {
             },
         ],
         fields: vec![v2::FieldDefinition {
+            value_binding_id: None,
             id: 0,
             name: "item".into(),
             nullable: true,
             carrier_type_id: Some(0),
-            metadata: vec![plan::ArrowFieldMetadataEntry {
-                key: "nr_logical_type".into(),
-                value: "largeint".into(),
-            }],
-            dictionary_id: Some(-17),
-            dictionary_is_ordered: Some(true),
+
+            logical_type_id: None,
         }],
-        value_types: [
-            v2::LogicalType::Physical,
-            v2::LogicalType::LargeInt,
-            v2::LogicalType::Uuid,
-        ]
-        .into_iter()
-        .enumerate()
-        .map(|(id, logical)| v2::ValueTypeDefinition {
-            id: id as u32,
-            carrier_type_id: Some(0),
-            nullable: false,
-            logical_type: logical as i32,
-        })
-        .collect(),
+        value_types: (0..3)
+            .map(|id| v2::ValueTypeDefinition {
+                id,
+                carrier_type_id: Some(0),
+                logical_type_id: Some(id),
+            })
+            .collect(),
     };
     // This is wire representation coverage, not application semantic admission
     // of this table. No type is inferred from the fixed binary width.
@@ -185,11 +229,85 @@ fn nested_field_attributes_and_explicit_logical_domains_survive_the_carrier() {
         v2::TypeTable::decode(table.encode_to_vec().as_slice()).unwrap(),
         table
     );
-    let logical = table
+    let source = v2::SourceFieldTable {
+        shape: Some(v2::TypeTable {
+            value_types: vec![],
+            logical_types: vec![],
+            ..table.clone()
+        }),
+        field_facts: vec![v2::SourceArrowFieldFacts {
+            field_id: Some(0),
+            metadata: vec![plan::ArrowFieldMetadataEntry {
+                key: "nr.logical_type".into(),
+                value: "largeint".into(),
+            }],
+            dictionary_id: Some(-17),
+            dictionary_is_ordered: Some(true),
+        }],
+    };
+    assert_eq!(
+        v2::SourceFieldTable::decode(source.encode_to_vec().as_slice()).unwrap(),
+        source
+    );
+    use novarocks_proto_models::value_type::{
+        NominalValue, ScalarKind, logical_type_definition::Kind as L,
+    };
+    let logical: Vec<_> = table
         .value_types
         .iter()
-        .map(|item| item.logical_type)
-        .collect::<BTreeSet<_>>();
+        .map(|binding| {
+            let logical = table
+                .logical_types
+                .iter()
+                .find(|logical| logical.id == binding.logical_type_id)
+                .unwrap();
+            assert!(!logical.nullable);
+            logical.kind.as_ref().unwrap()
+        })
+        .collect();
     assert_eq!(logical.len(), 3);
-    assert!(!logical.contains(&(v2::LogicalType::Unspecified as i32)));
+    assert!(
+        matches!(logical[0],L::Scalar(value) if value.kind==ScalarKind::FixedSizeBinary as i32 && value.fixed_binary_width==Some(16))
+    );
+    assert_eq!(logical[1], &L::Nominal(NominalValue::LargeInt as i32));
+    assert_eq!(logical[2], &L::Nominal(NominalValue::Uuid as i32));
+    assert_ne!(logical[1], logical[2]);
+}
+
+#[test]
+fn execution_shape_retires_source_attributes_with_reserved_wire_numbers_and_names() {
+    let pool = DescriptorPool::decode(FILE_DESCRIPTOR_SET).unwrap();
+    for (message, retired) in [
+        (
+            "novarocks.physical_type_v2.FieldDefinition",
+            &[
+                (5, "metadata"),
+                (6, "dictionary_id"),
+                (7, "dictionary_is_ordered"),
+            ][..],
+        ),
+        (
+            "novarocks.physical_type_v2.ValueTypeDefinition",
+            &[(3, "nullable"), (4, "logical_type")][..],
+        ),
+        (
+            "novarocks.physical_package_v2.SchemaDefinition",
+            &[(3, "metadata")][..],
+        ),
+    ] {
+        let descriptor = pool.get_message_by_name(message).unwrap();
+        for (number, name) in retired {
+            assert!(descriptor.get_field(*number).is_none());
+            assert!(
+                descriptor
+                    .reserved_ranges()
+                    .any(|range| range.contains(number))
+            );
+            assert!(
+                descriptor
+                    .reserved_names()
+                    .any(|reserved| reserved == *name)
+            );
+        }
+    }
 }

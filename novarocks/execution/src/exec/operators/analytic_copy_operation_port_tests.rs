@@ -81,7 +81,7 @@ impl AnalyticInputWork for Ports<'_> {
         for (batch, source) in batches.iter().zip(sources) {
             assert!(Arc::ptr_eq(
                 batch.column(ordinal),
-                source.batch.column(ordinal)
+                source.record_batch().column(ordinal)
             ));
         }
         self.occurrences.push(Occurrence::Concat {
@@ -134,10 +134,10 @@ fn analytic_copy_operation_port_default_original_batches_and_original_boundaries
     let result = stages::gather(&inputs, &mut work).unwrap();
     let expected = arrow::compute::concat_batches(
         &inputs[0].schema(),
-        inputs.iter().map(|input| &input.batch),
+        inputs.iter().map(|input| input.record_batch()),
     )
     .unwrap();
-    assert_eq!(result.value.batch, expected);
+    assert_eq!(result.value.record_batch(), &expected);
     assert_eq!(
         work.occurrences,
         vec![Occurrence::Concat {
@@ -171,10 +171,10 @@ fn analytic_copy_operation_port_default_original_batches_and_original_boundaries
     assert_eq!(output.value.len(), 2);
     let joined = arrow::compute::concat_batches(
         &ordered.value.schema(),
-        output.value.iter().map(|chunk| &chunk.batch),
+        output.value.iter().map(|chunk| chunk.record_batch()),
     )
     .unwrap();
-    assert_eq!(joined, ordered.value.batch);
+    assert_eq!(&joined, ordered.value.record_batch());
     assert_eq!(
         result.value.chunk_schema_ref(),
         inputs[0].chunk_schema_ref()
@@ -207,14 +207,14 @@ fn analytic_copy_operation_port_zero_columns_single_source_and_identity_skip_cop
     let single = ints(vec![Some(1), Some(2)]);
     let one = stages::gather(&[single.clone()], &mut work).unwrap();
     assert!(Arc::ptr_eq(
-        one.value.batch.column(0),
-        single.batch.column(0)
+        one.value.record_batch().column(0),
+        single.record_batch().column(0)
     ));
-    let key = Arc::clone(single.batch.column(0));
+    let key = Arc::clone(single.record_batch().column(0));
     let identity = stages::regroup(&single, &[key], &mut work).unwrap();
     assert!(Arc::ptr_eq(
-        identity.value.batch.column(0),
-        single.batch.column(0)
+        identity.value.record_batch().column(0),
+        single.record_batch().column(0)
     ));
     assert!(work.occurrences.is_empty());
 }
@@ -247,7 +247,7 @@ fn analytic_copy_operation_port_same_default_control_trace_and_data_formatter() 
                 let second = chunk(Arc::new(Int64Array::from(vec![1, 2])));
                 let error = arrow::compute::concat_batches(
                     &source.schema(),
-                    [&source.batch, &second.batch],
+                    [source.record_batch(), second.record_batch()],
                 )
                 .err()
                 .expect("original upstream Data");

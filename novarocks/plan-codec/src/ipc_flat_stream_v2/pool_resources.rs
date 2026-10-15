@@ -20,7 +20,7 @@
 //! at most one full typed-buffer alignment copy, then zero-row empty offsets.
 //! This is not total reader/container/error allocation or work admission.
 
-use super::{FlatConstantStream, progress::Admission};
+use super::{FlatConstantStream, ReaderResourceFailure, progress::Admission};
 use crate::ipc_flat_batch_v2::{Layout as FlatLayout, layout};
 use crate::physical_type_v2::TypeCodecError;
 use arrow::datatypes::DataType;
@@ -38,6 +38,8 @@ pub enum FlatPoolResourceError {
     Shape(TypeCodecError),
     Constant(ConstantError),
     Control(CompileControlError),
+    ConstructionResource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+    SourceMetadata(novarocks_type_contract::owned_resources::metadata_materialization::MetadataMaterializationError),
 }
 impl From<TypeCodecError> for FlatPoolResourceError {
     fn from(error: TypeCodecError) -> Self {
@@ -66,11 +68,37 @@ impl fmt::Display for FlatPoolResourceError {
             Self::Shape(e) => e.fmt(f),
             Self::Constant(e) => e.fmt(f),
             Self::Control(e) => e.fmt(f),
+            Self::ConstructionResource(e) => write!(f, "IPC constant construction resource: {e:?}"),
+            Self::SourceMetadata(e) => write!(f, "IPC constant source metadata: {e:?}"),
         }
     }
 }
 impl std::error::Error for FlatPoolResourceError {}
 
+impl From<novarocks_type_contract::ValueTypeError> for FlatPoolResourceError {
+    fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+        Self::from(ConstantError::from(error))
+    }
+}
+impl From<novarocks_type_contract::CarrierParameterError> for FlatPoolResourceError {
+    fn from(error: novarocks_type_contract::CarrierParameterError) -> Self {
+        Self::from(ConstantError::from(error))
+    }
+}
+pub(crate) fn flatten_constant_failure<E: super::ReaderResourceFailure>(
+    error: novarocks_constant_contract::ConstantCreationFailure<E>,
+) -> E {
+    match error {
+        novarocks_constant_contract::ConstantCreationFailure::Creator(error) => error,
+        novarocks_constant_contract::ConstantCreationFailure::Constant(error) => error.into(),
+        novarocks_constant_contract::ConstantCreationFailure::Resource(error) => {
+            FlatPoolResourceError::ConstructionResource(error).into()
+        }
+        novarocks_constant_contract::ConstantCreationFailure::SourceMetadata(error) => {
+            FlatPoolResourceError::SourceMetadata(error).into()
+        }
+    }
+}
 /// Requested payload capacities for this specific safe reader recipe, and the
 /// original constant owner's validation bound. Original input remains live.
 /// Structural owners, transient diagnostics and reader work are not included.
@@ -131,22 +159,32 @@ impl FlatConstantStream<'_, '_> {
     ) -> Result<FlatPoolResourceProjection, FlatPoolResourceError> {
         self.pool_resources_core(value_type, policy, None, work)
     }
-    pub(super) fn pool_resources_in(
+    pub(super) fn pool_resources_in<E: ReaderResourceFailure>(
         &self,
         value_type: &FunctionValueType,
         policy: ConstantPolicy,
-        admission: &mut Admission<'_, '_>,
+        admission: &mut Admission<'_, '_, E>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<FlatPoolResourceProjection, FlatPoolResourceError> {
+    ) -> Result<FlatPoolResourceProjection, E> {
         self.pool_resources_core(value_type, policy, Some(admission), work)
     }
-    fn pool_resources_core(
+    fn pool_resources_core<E: ReaderResourceFailure>(
         &self,
         value_type: &FunctionValueType,
         policy: ConstantPolicy,
-        mut admission: Option<&mut Admission<'_, '_>>,
+        admission: Option<&mut Admission<'_, '_, E>>,
         work: &mut CompileCheckpoints<'_>,
-    ) -> Result<FlatPoolResourceProjection, FlatPoolResourceError> {
+    ) -> Result<FlatPoolResourceProjection, E> {
+        self.pool_resources_profile_core(value_type, Some(policy), admission, work)
+            .map(|(facts, _)| facts)
+    }
+    pub(super) fn pool_resources_profile_core<E: ReaderResourceFailure>(
+        &self,
+        value_type: &FunctionValueType,
+        policy: Option<ConstantPolicy>,
+        mut admission: Option<&mut Admission<'_, '_, E>>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<(FlatPoolResourceProjection, ConstantPolicy), E> {
         let parent = admission.is_some();
         let numeric = |r: Result<usize, FlatPoolResourceError>| {
             if parent {
@@ -240,7 +278,7 @@ impl FlatConstantStream<'_, '_> {
             view_validation_bytes_upper_bound: u64_extent(geometry.view_validation_bytes)?,
         };
         work.flush()?;
-        let constant = if let Some(a) = admission {
+        let (constant, sealed) = if let Some(a) = admission {
             let mut capture = |facts: &novarocks_constant_contract::ConstantOwnerResourceFacts| {
                 a.constant(
                     facts.allocation_request_bytes_upper_bound,
@@ -248,31 +286,53 @@ impl FlatConstantStream<'_, '_> {
                     facts.cumulative_work_upper_bound,
                 )
             };
-            novarocks_constant_contract::preflight_flat_pool_resources_in(
-                self.field(),
-                value_type,
-                input,
-                policy,
-                &mut capture,
-                work,
-            )?
+            if let Some(policy) = policy {
+                novarocks_constant_contract::preflight_flat_pool_resources_observed(
+                    self.field(),
+                    value_type,
+                    input,
+                    policy,
+                    &mut capture,
+                    work,
+                )
+                .map(|bounds| (bounds, policy))
+                .map_err(flatten_constant_failure)?
+            } else {
+                novarocks_constant_contract::preflight_flat_pool_resources_input_derived_observed(
+                    self.field(),
+                    value_type,
+                    input,
+                    &mut capture,
+                    work,
+                )
+                .map_err(flatten_constant_failure)?
+            }
         } else {
-            preflight_flat_pool_resources(
-                self.field(),
-                value_type,
-                input,
+            let policy = policy.ok_or_else(|| {
+                shape("input-derived constant projection requires original observation")
+            })?;
+            (
+                preflight_flat_pool_resources(
+                    self.field(),
+                    value_type,
+                    input,
+                    policy,
+                    CompilePhase::Decode,
+                    work.control(),
+                )?,
                 policy,
-                CompilePhase::Decode,
-                work.control(),
-            )?
+            )
         };
-        Ok(FlatPoolResourceProjection {
-            owned_body_capacity_bytes: body_capacity,
-            alignment_repair_possible: repair_possible,
-            alignment_repair_capacity_bytes_upper_bound: repair_capacity,
-            empty_offset_capacity_bytes: empty_offsets,
-            constant,
-        })
+        Ok((
+            FlatPoolResourceProjection {
+                owned_body_capacity_bytes: body_capacity,
+                alignment_repair_possible: repair_possible,
+                alignment_repair_capacity_bytes_upper_bound: repair_capacity,
+                empty_offset_capacity_bytes: empty_offsets,
+                constant,
+            },
+            sealed,
+        ))
     }
 }
 

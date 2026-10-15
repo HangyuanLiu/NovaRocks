@@ -17,6 +17,7 @@
 
 //! Execution-owned failure payloads. These facts own no terminal latch.
 
+use crate::exec::pipeline::operator::input_construction::ConstructionFailure;
 use novarocks_functions::{KernelDiagnostic, KernelFailure, RowDataError, Selection};
 use novarocks_local_program::ProgramExpressionRootSite;
 use std::{error::Error, fmt};
@@ -80,6 +81,7 @@ pub enum ExecutionFailureCause {
     /// An explicitly identified existing text-only execution source. Never
     /// infer a resource, deadline, transport or invariant category from text.
     Pipeline(String),
+    Construction(ConstructionFailure),
     Kernel(KernelFailure),
     InvocationData(novarocks_functions::InvocationData),
     ScalarInvocationData(novarocks_functions::ScalarInvocationData),
@@ -118,6 +120,7 @@ impl ExecutionFailure {
     pub fn detail(&self) -> &str {
         match &self.cause {
             ExecutionFailureCause::Pipeline(message) => message,
+            ExecutionFailureCause::Construction(error) => error.detail(),
             ExecutionFailureCause::RequiredRow(error) => error.error().message(),
             ExecutionFailureCause::InvocationData(error) => error.message(),
             ExecutionFailureCause::ScalarInvocationData(error) => error.message(),
@@ -165,6 +168,27 @@ impl From<KernelFailure> for ExecutionFailure {
         Self {
             cause: ExecutionFailureCause::Kernel(error),
             context: None,
+        }
+    }
+}
+impl From<ConstructionFailure> for ExecutionFailure {
+    fn from(error: ConstructionFailure) -> Self {
+        match error {
+            // Preserve the originating failure, including its existing driver
+            // context, rather than burying its category under construction.
+            ConstructionFailure::Caller(error) => *error,
+            error => Self {
+                cause: ExecutionFailureCause::Construction(error),
+                context: None,
+            },
+        }
+    }
+}
+impl From<crate::runtime::exchange::ExchangeReceiveFailure> for ExecutionFailure {
+    fn from(error: crate::runtime::exchange::ExchangeReceiveFailure) -> Self {
+        match error {
+            crate::runtime::exchange::ExchangeReceiveFailure::Wire(message) => message.into(),
+            crate::runtime::exchange::ExchangeReceiveFailure::Construction(cause) => cause.into(),
         }
     }
 }
@@ -220,6 +244,7 @@ impl fmt::Display for ExecutionFailure {
         }
         match &self.cause {
             ExecutionFailureCause::Pipeline(message) => f.write_str(message),
+            ExecutionFailureCause::Construction(error) => error.fmt(f),
             ExecutionFailureCause::Kernel(error) => error.fmt(f),
             ExecutionFailureCause::RequiredRow(error) => error.fmt(f),
             ExecutionFailureCause::InvocationData(error) => error.fmt(f),
@@ -232,6 +257,7 @@ impl Error for ExecutionFailure {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match &self.cause {
             ExecutionFailureCause::Pipeline(_) => None,
+            ExecutionFailureCause::Construction(error) => Some(error),
             ExecutionFailureCause::Kernel(error) => Some(error),
             ExecutionFailureCause::RequiredRow(error) => Some(error),
             ExecutionFailureCause::InvocationData(error) => Some(error),

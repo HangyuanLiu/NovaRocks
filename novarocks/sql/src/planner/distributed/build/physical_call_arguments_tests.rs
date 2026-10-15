@@ -192,7 +192,7 @@ fn physical_call_request_preserves_original_float_bits_typed_null_field_backing_
 #[test]
 fn physical_call_request_never_turns_reference_type_or_address_errors_into_nonconstant() {
     let (pools, _, mut ty) = float_source();
-    ty.nullable = false;
+    ty = ty.with_nullable(false).unwrap();
     let ref1 = reference(1);
     assert!(
         matches!(invoke(&source(ty, ExprKind::Constant(ref1)), &pools, policy(), &Control::good()), Err(PhysicalArgumentError::Reference(ConstantReferenceError::SourceTypeMismatch(actual))) if actual == ref1)
@@ -228,7 +228,7 @@ fn physical_call_request_never_turns_reference_type_or_address_errors_into_nonco
     )]);
     let ty = FunctionValueType::new(array.data_type().clone(), false);
     let pool = ConstantPool::try_new(
-        Arc::new(Field::new("struct", ty.data_type.clone(), false)),
+        Arc::new(Field::new("struct", array.data_type().clone(), false)),
         ty.clone(),
         array.to_data(),
         policy(),
@@ -241,7 +241,7 @@ fn physical_call_request_never_turns_reference_type_or_address_errors_into_nonco
     let changed = FunctionValueType::new(
         DataType::Struct(
             vec![Arc::new(
-                Field::new("nested_source", DataType::Int64, true)
+                Field::new("different_source_name", DataType::Int64, true)
                     .with_metadata(HashMap::from([("provider.field-id".into(), "20".into())])),
             )]
             .into(),
@@ -299,20 +299,15 @@ fn physical_call_request_legacy_literal_uses_the_sole_factory_and_preserves_erro
             "NULL factory requires nullable exact type"
         )))
     ));
-    let bad = FunctionValueType {
-        data_type: DataType::FixedSizeBinary(16),
-        nullable: false,
-        logical_type: ValueLogicalType::Json,
-    };
+    // Invalid declarations cannot enter an immutable value port.
     assert!(matches!(
-        invoke(
-            &source(bad, ExprKind::Literal(LiteralValue::Utf8("{}".into()))),
-            &empty,
-            policy(),
-            &Control::good()
+        FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            false,
+            ValueLogicalType::Json
         ),
-        Err(PhysicalArgumentError::Type(
-            ValueTypeError::InvalidLogicalCarrier(ValueLogicalType::Json)
+        Err(ValueTypeError::InvalidLogicalCarrier(
+            ValueLogicalType::Json
         ))
     ));
     let node = source(
@@ -352,6 +347,25 @@ fn physical_call_request_legacy_literal_uses_the_sole_factory_and_preserves_erro
     assert_eq!(control.trace(), direct_control.trace());
 }
 
+fn declared_json_list(nullable: bool, child_nullable: bool) -> FunctionValueType {
+    let child = FunctionValueType::try_with_logical_type(
+        DataType::Utf8,
+        child_nullable,
+        ValueLogicalType::Json,
+    )
+    .unwrap();
+    let layout = FunctionValueType::new(
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, child_nullable))),
+        nullable,
+    );
+    let value = novarocks_type_contract::ValueTypeRef::try_new(
+        novarocks_type_contract::ValueKind::List(child.value_type().clone()),
+        nullable,
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+    )
+    .unwrap();
+    FunctionValueType::try_from_value(value, layout.typed_binding().layout().clone()).unwrap()
+}
 #[test]
 fn physical_call_request_lambda_keeps_nested_field_names_metadata_logical_tags_and_body_result_type()
  {
@@ -361,7 +375,11 @@ fn physical_call_request_lambda_keeps_nested_field_names_metadata_logical_tags_a
             ("provider.id".into(), "53".into()),
         ])),
     );
-    let parameter = FunctionValueType::new(DataType::List(item.clone()), true);
+    let parameter = declared_json_list(true, true);
+    let DataType::List(original_layout) = parameter.data_type() else {
+        unreachable!()
+    };
+    let original_layout = original_layout.clone();
     let large = FunctionValueType::try_with_logical_type(
         DataType::FixedSizeBinary(16),
         false,
@@ -391,13 +409,17 @@ fn physical_call_request_lambda_keeps_nested_field_names_metadata_logical_tags_a
     };
     assert_eq!(parameter_types.as_ref(), &[parameter, large]);
     assert_eq!(result_type, result);
-    let DataType::List(actual) = &parameter_types[0].data_type else {
+    let DataType::List(actual) = &parameter_types[0].data_type() else {
         panic!("list")
     };
-    assert!(Arc::ptr_eq(actual, &item));
-    assert_eq!(actual.name(), "actual_json_item");
-    assert_eq!(actual.metadata()["nr_logical_type"], "json");
-    assert_eq!(actual.metadata()["provider.id"], "53");
+    assert!(Arc::ptr_eq(&actual, &original_layout));
+    assert_eq!(actual.name(), "item");
+    assert!(actual.metadata().is_empty());
+    assert_eq!(
+        parameter_types[0].child_at(0).unwrap().logical_type(),
+        ValueLogicalType::Json
+    );
+    assert_eq!(item.metadata()["provider.id"], "53");
     // This port preserves declared lambda types; it does not validate body or
     // lexical references or infer an installed higher-order owner.
 }

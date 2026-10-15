@@ -109,7 +109,7 @@ fn fixture(unsupported: bool) -> ArrayRef {
     ))
 }
 fn source(a: &ArrayRef) -> FunctionValueType {
-    FunctionValueType::new(a.data_type().clone(), true)
+    FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true)
 }
 fn prepared(
     name: &str,

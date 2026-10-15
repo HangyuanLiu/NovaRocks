@@ -401,7 +401,9 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
             bound.function_id.clone(),
             bound.selected.overload.clone(),
             call.kind,
-            argument_types.into_boxed_slice(),
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                argument_types.into_boxed_slice(),
+            ),
             result_type.clone(),
         );
         function.legacy_metadata = Some(novarocks_physical_plan::LegacyBindingMetadata {
@@ -614,9 +616,11 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
             .collect::<Vec<_>>();
         let selection = Arc::new(novarocks_functions::FunctionBindingSelection {
             overload: function.overload.clone(),
-            argument_types: function.argument_types[..logical]
-                .to_vec()
-                .into_boxed_slice(),
+            argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                function.argument_types[..logical]
+                    .to_vec()
+                    .into_boxed_slice(),
+            ),
             result_type: FunctionResultType::Scalar(function.result_type.clone()),
             aggregate: aggregate_binding.as_deref().map(|binding| {
                 novarocks_functions::AggregateBindingSelection {
@@ -633,6 +637,7 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
         let call_context = context(use_id.get());
         if call.uninstalled {
             frozen.push(FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,
@@ -694,6 +699,7 @@ fn package(shape: &Shape, catalog: &PureEngineFunctionCatalog) -> Arc<FragmentPa
             )
             .unwrap_or_else(|error| panic!("fixture window call prepares: {error}"));
         frozen.push(FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,

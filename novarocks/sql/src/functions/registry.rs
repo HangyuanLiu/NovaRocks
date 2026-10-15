@@ -56,10 +56,12 @@ mod bitmap_base64_type_tests {
             );
             assert_eq!(
                 binding.selected.argument_types,
-                vec![novarocks_functions::FunctionArgumentType::Value(
-                    FunctionValueType::new(DataType::Binary, nullable)
-                )]
-                .into_boxed_slice()
+                novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    vec![novarocks_functions::FunctionArgumentType::Value(
+                        FunctionValueType::new(DataType::Binary, nullable)
+                    )]
+                    .into_boxed_slice()
+                )
             );
             // Exact validation consumes already-coerced expressions, as SQL does.
             let coerced = [FunctionArgument::Value {

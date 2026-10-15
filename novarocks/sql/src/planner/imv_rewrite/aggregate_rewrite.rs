@@ -769,7 +769,7 @@ fn merged_state_expr(
                 value_type: novarocks_type_contract::FunctionValueType::new(
                     DataType::Binary,
                     state_column.state_role == SqlImvAggregateStateRole::Single
-                        && state_column.value_type.nullable,
+                        && state_column.value_type.nullable(),
                 ),
             })
         }
@@ -797,16 +797,14 @@ fn merged_state_expr(
                         decimal_overflow_policy:
                             novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
                     },
-                    value_type: novarocks_type_contract::FunctionValueType {
-                        nullable: false,
-                        ..state_column.value_type.clone()
-                    },
+                    value_type: (state_column.value_type.clone())
+                        .with_nullable(false)
+                        .expect("valid value root nullability transform"),
                 })),
             },
-            value_type: novarocks_type_contract::FunctionValueType {
-                nullable: false,
-                ..state_column.value_type.clone()
-            },
+            value_type: (state_column.value_type.clone())
+                .with_nullable(false)
+                .expect("valid value root nullability transform"),
         }),
     }
 }
@@ -995,12 +993,17 @@ fn aggregate_insert_expr_for_output(
         else {
             return Err(format!("Iceberg IMV {name} must return a scalar value").into());
         };
-        if result.logical_type != visible.value_type.logical_type
-            || !novarocks_type_contract::arrow_data_types_exact(
-                &result.data_type,
-                &visible.value_type.data_type,
-            )
-            || (result.nullable && !visible.value_type.nullable)
+        if !result.same_physical_binding_ignoring_root_nullability_observed(
+            &visible.value_type,
+            || {
+                novarocks_type_contract::PureCompileControl::checkpoint(
+                    &ctx.control_view(),
+                    novarocks_type_contract::CompilePhase::Validate,
+                    1,
+                )
+                .map_err(crate::compiler::SqlCompileError::from)
+            },
+        )? || (result.nullable() && !visible.value_type.nullable())
         {
             return Err(format!(
                 "Iceberg IMV {name} result domain {result:?} does not match admitted visible column {} domain {:?}",
@@ -1047,7 +1050,9 @@ fn aggregate_insert_expr_for_output(
 }
 
 fn typed_null(mut value_type: novarocks_type_contract::FunctionValueType) -> TypedExpr {
-    value_type.nullable = true;
+    value_type = value_type
+        .with_nullable(true)
+        .expect("validated root NULL contract");
     TypedExpr {
         kind: ExprKind::Literal(LiteralValue::Null),
         value_type,
@@ -1089,26 +1094,26 @@ fn branch_case_arm_expr(
     expr: TypedExpr,
     target: &novarocks_type_contract::FunctionValueType,
 ) -> TypedExpr {
-    if !branch_case_requires_runtime_cast(&target.data_type)
-        && expr.value_type.logical_type == target.logical_type
-        && novarocks_type_contract::arrow_data_types_exact(
-            &expr.value_type.data_type,
-            &target.data_type,
-        )
+    if !branch_case_requires_runtime_cast(&target.data_type())
+        && expr
+            .value_type
+            .same_physical_binding_ignoring_root_nullability_observed(target, || {
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .expect("infallible checked CASE arm comparison")
     {
         return expr;
     }
-    let nullable = expr.value_type.nullable;
+    let nullable = expr.value_type.nullable();
     TypedExpr {
         kind: ExprKind::Cast {
             expr: Box::new(expr),
-            target: target.data_type.clone(),
+            target: target.data_type().clone(),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
-        value_type: novarocks_type_contract::FunctionValueType {
-            nullable,
-            ..target.clone()
-        },
+        value_type: (target.clone())
+            .with_nullable(nullable)
+            .expect("valid value root nullability transform"),
     }
 }
 
@@ -1364,10 +1369,9 @@ fn visible_state_args(
             merged_state,
             TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::Null),
-                value_type: novarocks_type_contract::FunctionValueType {
-                    nullable: true,
-                    ..visible_type.clone()
-                },
+                value_type: (visible_type.clone())
+                    .with_nullable(true)
+                    .expect("valid value root nullability transform"),
             },
         ]);
     }
@@ -1395,7 +1399,7 @@ fn visible_avg_state_args(
                 state_column.visible_source_index
             )
         })?;
-    if !matches!(visible.value_type.data_type, DataType::Decimal128(_, _)) {
+    if !matches!(visible.value_type.data_type(), DataType::Decimal128(_, _)) {
         return Ok(vec![sum_state, count_state]);
     }
     let Some(DataType::Decimal128(_, input_scale)) = layout
@@ -1414,10 +1418,9 @@ fn visible_avg_state_args(
         int64_literal(i64::from(*input_scale)),
         TypedExpr {
             kind: ExprKind::Literal(LiteralValue::Null),
-            value_type: novarocks_type_contract::FunctionValueType {
-                nullable: true,
-                ..visible.value_type.clone()
-            },
+            value_type: (visible.value_type.clone())
+                .with_nullable(true)
+                .expect("valid value root nullability transform"),
         },
     ])
 }
@@ -1447,10 +1450,9 @@ fn branch_scope_predicate(
             op: BinOp::Eq,
             right: Box::new(TypedExpr {
                 kind: ExprKind::Literal(LiteralValue::Int(scope.branch_id as i64)),
-                value_type: novarocks_type_contract::FunctionValueType {
-                    nullable: false,
-                    ..branch_column.value_type.clone()
-                },
+                value_type: (branch_column.value_type.clone())
+                    .with_nullable(false)
+                    .expect("valid value root nullability transform"),
             }),
             decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
         },
@@ -2116,7 +2118,7 @@ fn signed_aggregate_output_columns(
     }
     for (state_index, state_column) in layout.state_columns.iter().enumerate() {
         let value_type = state_shaped_state_value_type(state_column);
-        let data_type = value_type.data_type.clone();
+        let data_type = value_type.data_type().clone();
         let call = signed_calls.get_mut(state_index).ok_or_else(|| {
             format!(
                 "Iceberg IMV aggregate rewrite missing signed state call for {}",
@@ -2131,12 +2133,16 @@ fn signed_aggregate_output_columns(
                 state_column.name
             ));
         };
-        if result_type.logical_type != value_type.logical_type
-            || !novarocks_type_contract::arrow_data_types_exact(&result_type.data_type, &data_type)
+        if !result_type
+            .same_physical_binding_ignoring_root_nullability_observed(&value_type, || {
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .expect("infallible checked signed-state comparison")
         {
             return Err(format!(
                 "Iceberg IMV signed state {} produces {:?}, expected {data_type:?}",
-                state_column.name, result_type.data_type
+                state_column.name,
+                result_type.data_type()
             ));
         }
         let output =
@@ -2240,19 +2246,17 @@ fn signed_aggregate_project_items(
                                 qualifier: None,
                                 column: child_output.name.clone(),
                             },
-                            value_type: novarocks_type_contract::FunctionValueType {
-                                nullable: false,
-                                ..state_shaped_state_value_type(state_column)
-                            },
+                            value_type: (state_shaped_state_value_type(state_column))
+                                .with_nullable(false)
+                                .expect("valid value root nullability transform"),
                         },
                         output_name: state_column.name.clone(),
                         output_column_id: allocate_imv_column(
                             ctx,
                             &state_column.name,
-                            novarocks_type_contract::FunctionValueType {
-                                nullable: false,
-                                ..state_shaped_state_value_type(state_column)
-                            },
+                            (state_shaped_state_value_type(state_column))
+                                .with_nullable(false)
+                                .expect("valid value root nullability transform"),
                         )?,
                     });
                 }
@@ -2272,7 +2276,7 @@ fn signed_aggregate_project_items(
         if call.output_column_id != child_output.column_id {
             return Err("Iceberg IMV retraction count call and output identity differ".to_string());
         }
-        if child_output.value_type.data_type != DataType::Int64 {
+        if *child_output.value_type.data_type() != DataType::Int64 {
             return Err(
                 "Iceberg IMV retraction count aggregate did not produce BIGINT".to_string(),
             );
@@ -2283,10 +2287,9 @@ fn signed_aggregate_project_items(
             output_column_id: allocate_imv_column(
                 ctx,
                 &state_column.name,
-                novarocks_type_contract::FunctionValueType {
-                    nullable: false,
-                    ..state_shaped_state_value_type(state_column)
-                },
+                (state_shaped_state_value_type(state_column))
+                    .with_nullable(false)
+                    .expect("valid value root nullability transform"),
             )?,
         });
     }
@@ -2318,18 +2321,16 @@ fn nonnull_retraction_count_expr(child: &OutputColumn, column_id: ColumnId) -> T
                 },
                 TypedExpr {
                     kind: ExprKind::Literal(LiteralValue::Int(0)),
-                    value_type: novarocks_type_contract::FunctionValueType {
-                        nullable: false,
-                        ..child.value_type.clone()
-                    },
+                    value_type: (child.value_type.clone())
+                        .with_nullable(false)
+                        .expect("valid value root nullability transform"),
                 },
             )],
             else_expr: Some(Box::new(value)),
         },
-        value_type: novarocks_type_contract::FunctionValueType {
-            nullable: false,
-            ..child.value_type.clone()
-        },
+        value_type: (child.value_type.clone())
+            .with_nullable(false)
+            .expect("valid value root nullability transform"),
     }
 }
 
@@ -2357,7 +2358,7 @@ fn state_shaped_state_value_type(
         | crate::compiler::mv_rewrite::SqlImvAggregateStateRole::AvgCount => {
             novarocks_type_contract::FunctionValueType::new(
                 DataType::Binary,
-                state_column.value_type.nullable,
+                state_column.value_type.nullable(),
             )
         }
         crate::compiler::mv_rewrite::SqlImvAggregateStateRole::RetractionCount => {
@@ -2404,7 +2405,7 @@ fn retraction_count_aggregate_call(
     Ok(AggregateCall {
         name: "sum".to_string(),
         distinct: false,
-        result_type: DataType::Int64,
+        result_type: crate::functions::aggregate_result_type(&resolved).clone(),
         output_column_id: ColumnId::UNSET,
         source: crate::binding::AggregateArgumentSource::logical_update(
             args,
@@ -2465,7 +2466,7 @@ fn signed_aggregate_call(
     Ok(AggregateCall {
         name: signed_name.to_string(),
         distinct: false,
-        result_type: DataType::Binary,
+        result_type: crate::functions::aggregate_result_type(&resolved).clone(),
         output_column_id: ColumnId::UNSET,
         source: crate::binding::AggregateArgumentSource::logical_update(
             vec![input],
@@ -2732,7 +2733,7 @@ mod tests {
             let meta = factory.borrow().get(column.column_id).clone();
             assert_eq!(meta.name, column.name);
             assert_eq!(meta.value_type, column.value_type);
-            assert_eq!(meta.value_type.nullable, column.value_type.nullable);
+            assert_eq!(meta.value_type.nullable(), column.value_type.nullable());
         }
 
         assert_eq!(ext.annotation.partition, None);
@@ -2767,10 +2768,9 @@ mod tests {
             };
             let delta = OutputColumn {
                 column_id: ColumnId::new_for_test(11),
-                value_type: novarocks_type_contract::FunctionValueType {
-                    nullable: false,
-                    ..old.value_type.clone()
-                },
+                value_type: (old.value_type.clone())
+                    .with_nullable(false)
+                    .expect("valid value root nullability transform"),
                 ..old.clone()
             };
             let merged = merged_state_expr(
@@ -2794,8 +2794,8 @@ mod tests {
             assert_eq!(args.len(), 2);
             assert_eq!(binding.logical_argument_count, 2);
             assert_eq!(binding.selected.argument_types.len(), 2);
-            assert_eq!(merged.value_type.data_type, DataType::Binary);
-            assert!(!merged.value_type.nullable);
+            assert_eq!(merged.value_type.data_type().clone(), DataType::Binary);
+            assert!(!merged.value_type.nullable());
             bindings.push(binding.function_id.clone());
         }
         assert_ne!(bindings[0], bindings[1]);
@@ -2888,14 +2888,17 @@ mod tests {
             &args[2].kind,
             ExprKind::Literal(LiteralValue::Int(4))
         ));
-        assert_eq!(args[2].value_type.data_type, DataType::Int64);
-        assert!(!args[2].value_type.nullable);
+        assert_eq!(args[2].value_type.data_type().clone(), DataType::Int64);
+        assert!(!args[2].value_type.nullable());
         assert!(matches!(
             &args[3].kind,
             ExprKind::Literal(LiteralValue::Null)
         ));
-        assert_eq!(args[3].value_type.data_type, DataType::Decimal128(38, 10));
-        assert!(args[3].value_type.nullable);
+        assert_eq!(
+            args[3].value_type.data_type().clone(),
+            DataType::Decimal128(38, 10)
+        );
+        assert!(args[3].value_type.nullable());
     }
 
     fn col_expr(id: u32, name: &str) -> TypedExpr {
@@ -2975,7 +2978,10 @@ mod tests {
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
                     distinct: false,
-                    result_type: DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                     output_column_id: ColumnId::new_for_test(3),
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![col_expr(2, "v")],
@@ -3019,7 +3025,10 @@ mod tests {
                 aggregates: vec![AggregateCall {
                     name: "sum".to_string(),
                     distinct: false,
-                    result_type: DataType::Int64,
+                    result_type: novarocks_type_contract::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    ),
                     output_column_id: ColumnId::new_for_test(3),
                     source: crate::binding::AggregateArgumentSource::uncertified(
                         vec![col_expr(2, "v")],
@@ -3064,7 +3073,7 @@ mod tests {
         node.aggregates.push(AggregateCall {
             name: "count".to_string(),
             distinct: false,
-            result_type: DataType::Int64,
+            result_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
             output_column_id: ColumnId::new_for_test(4),
             source: crate::binding::AggregateArgumentSource::uncertified(
                 Vec::new(),
@@ -3460,7 +3469,7 @@ mod tests {
         );
         for item in &project.items {
             let child_expr = if item.output_name == "__agg_state___ivm_row_count" {
-                assert!(!item.expr.value_type.nullable);
+                assert!(!item.expr.value_type.nullable());
                 let ExprKind::Case {
                     when_then,
                     else_expr: Some(value),
@@ -3495,10 +3504,13 @@ mod tests {
         }
         assert_eq!(signed_aggregate.output_columns[1].name, "__agg_state_s");
         assert_eq!(
-            signed_aggregate.output_columns[1].value_type.data_type,
+            signed_aggregate.output_columns[1]
+                .value_type
+                .data_type()
+                .clone(),
             DataType::Binary
         );
-        assert!(signed_aggregate.output_columns[2].value_type.nullable);
+        assert!(signed_aggregate.output_columns[2].value_type.nullable());
         let args = signed_aggregate.aggregates[0].source.arguments();
         assert_eq!(args.len(), 1);
         let ExprKind::FunctionCall {
@@ -3611,7 +3623,7 @@ mod tests {
             ]
         );
         for item in &project.items {
-            if branch_case_requires_runtime_cast(&item.expr.value_type.data_type) {
+            if branch_case_requires_runtime_cast(&item.expr.value_type.data_type()) {
                 assert_branch_case_arms_cast_to_output_type(item);
             }
         }
@@ -3673,7 +3685,7 @@ mod tests {
             ),
             "INSERT file locator must be NULL"
         );
-        assert!(file_item.expr.value_type.nullable);
+        assert!(file_item.expr.value_type.nullable());
 
         let (delete_pos, insert_pos) = case_arm_exprs(&pos_item.expr);
         let ExprKind::ColumnRef { column_id, .. } = uncast_expr(delete_pos).kind else {
@@ -3687,7 +3699,7 @@ mod tests {
             ),
             "INSERT row position locator must be NULL"
         );
-        assert!(pos_item.expr.value_type.nullable);
+        assert!(pos_item.expr.value_type.nullable());
     }
 
     #[test]
@@ -3737,8 +3749,11 @@ mod tests {
             ),
             "updated MV target rows must inherit their actual commit sequence"
         );
-        assert!(insert_sequence.value_type.nullable);
-        assert_eq!(insert_sequence.value_type.data_type, DataType::Int64);
+        assert!(insert_sequence.value_type.nullable());
+        assert_eq!(
+            insert_sequence.value_type.data_type().clone(),
+            DataType::Int64
+        );
     }
 
     #[test]
@@ -3871,7 +3886,7 @@ mod tests {
         for (_, then_expr) in when_then {
             assert_cast_target(
                 then_expr,
-                &item.expr.value_type.data_type,
+                &item.expr.value_type.data_type(),
                 &item.output_name,
             );
         }
@@ -3880,7 +3895,7 @@ mod tests {
             .unwrap_or_else(|| panic!("expected CASE ELSE for {}", item.output_name));
         assert_cast_target(
             else_expr,
-            &item.expr.value_type.data_type,
+            &item.expr.value_type.data_type(),
             &item.output_name,
         );
     }
@@ -4338,7 +4353,10 @@ mod tests {
             group_key_names(aggregate, crate::optimizer::test_optimizer_control()).unwrap(),
             vec!["9", "7"]
         );
-        aggregate.output_columns[1].value_type.nullable = true;
+        aggregate.output_columns[1].value_type = aggregate.output_columns[1]
+            .value_type
+            .with_nullable(true)
+            .unwrap();
         assert!(matches!(
             group_key_names(aggregate, crate::optimizer::test_optimizer_control()),
             Err(SqlCompileError::Compilation(_))

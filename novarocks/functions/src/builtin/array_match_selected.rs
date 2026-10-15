@@ -42,7 +42,7 @@ pub(super) fn evaluate<'a>(
             ));
         };
         let selection = input.selection();
-        let target = &input.contract().result_type().data_type;
+        let target = input.contract().result_type().data_type();
         if selection.is_empty() {
             return SelectedValues::try_new(
                 selection,

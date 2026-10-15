@@ -48,15 +48,17 @@ impl ConstantValue {
         let mut work = CompileCheckpoints::try_new(control, phase)?;
         let mut stream = SemanticStream::new();
         // Coarse type buckets are sufficient: equality still checks complete
-        // Field/FVT identity. No opaque DataType Hash or Debug traversal occurs.
+        // semantic binding and normalized value layout. No opaque DataType Hash or Debug traversal occurs.
         work.step()?;
         stream
             .hasher
-            .write_u8(logical_bucket(self.value_type().logical_type));
-        stream.hasher.write_u8(u8::from(self.value_type().nullable));
+            .write_u8(logical_bucket(self.value_type().logical_type()));
         stream
             .hasher
-            .write_u8(carrier_bucket(self.field().data_type()));
+            .write_u8(u8::from(self.value_type().nullable()));
+        stream
+            .hasher
+            .write_u8(carrier_bucket(self.value_type().data_type()));
         hash_value(
             Row {
                 data: &self.pool.0.data,
@@ -526,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_field_identity_still_requires_collision_comparison() {
+    fn source_field_attributes_do_not_change_typed_value_equality() {
         let left = value(Arc::new(StringArray::from(vec!["same"])), false);
         let field = Arc::new(
             Field::new("different", DataType::Utf8, false)
@@ -545,8 +547,7 @@ mod tests {
         .unwrap();
         assert_eq!(key(&left), key(&right));
         assert!(
-            !left
-                .equals_observed(&right, CompilePhase::Validate, &Control::good())
+            left.equals_observed(&right, CompilePhase::Validate, &Control::good())
                 .unwrap()
         );
     }

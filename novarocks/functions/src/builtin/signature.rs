@@ -53,7 +53,11 @@ pub enum TypeSpec {
     Float32,
     Float64,
     Utf8,
+    /// Explicit JSON semantics; Utf8 is its canonical storage, not its identity.
+    Json,
     Binary,
+    /// Explicit bitmap bytes; the Binary carrier does not authorize this domain.
+    Bitmap,
     Date,
     Datetime,
     /// Decimal128 with unspecified precision/scale. Strict match accepts any
@@ -198,7 +202,9 @@ impl TypeSpec {
             Self::Float32 => output.push_str("f32"),
             Self::Float64 => output.push_str("f64"),
             Self::Utf8 => output.push_str("utf8"),
+            Self::Json => output.push_str("json"),
             Self::Binary => output.push_str("binary"),
+            Self::Bitmap => output.push_str("bitmap"),
             Self::Date => output.push_str("date"),
             Self::Datetime => output.push_str("datetime"),
             Self::AnyDecimal128 => output.push_str("decimal128"),
@@ -253,6 +259,8 @@ pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
         (TypeSpec::Float64, DataType::Float64) => true,
         (TypeSpec::Utf8, DataType::Utf8) => true,
         (TypeSpec::Utf8, DataType::LargeUtf8) => true,
+        (TypeSpec::Json, DataType::Utf8) => true,
+        (TypeSpec::Bitmap, DataType::Binary) => true,
         (TypeSpec::Binary, DataType::Binary) => true,
         (TypeSpec::Binary, DataType::LargeBinary) => true,
         (TypeSpec::Date, DataType::Date32) => true,
@@ -291,15 +299,33 @@ pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
 /// so a NULL at this position does not leave the variable unbound while still
 /// letting a later position decide it.
 fn bind_nothing_but_open(spec: &TypeSpec, bindings: &mut Bindings) {
+    bind_nothing_with_construction(
+        spec,
+        bindings,
+        &mut ScalarConstruction::<std::convert::Infallible>::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            None,
+        ),
+    )
+    .expect("pure open binding")
+}
+fn bind_nothing_with_construction<E>(
+    spec: &TypeSpec,
+    bindings: &mut Bindings,
+    creation: &mut ScalarConstruction<'_, E>,
+) -> Result<(), ConstructionFailure<E>> {
     match spec {
-        TypeSpec::Any(name) | TypeSpec::Decimal128Of(name) => bindings.bind_null(name),
-        TypeSpec::List(inner) => bind_nothing_but_open(inner, bindings),
+        TypeSpec::Any(name) | TypeSpec::Decimal128Of(name) => {
+            bindings.bind_null_with_construction(name, creation)?
+        }
+        TypeSpec::List(inner) => bind_nothing_with_construction(inner, bindings, creation)?,
         TypeSpec::Map(key, value) => {
-            bind_nothing_but_open(key, bindings);
-            bind_nothing_but_open(value, bindings);
+            bind_nothing_with_construction(key, bindings, creation)?;
+            bind_nothing_with_construction(value, bindings, creation)?;
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Whether this spec names a concrete type rather than standing for one.
@@ -332,8 +358,8 @@ pub(crate) fn realize(spec: &TypeSpec, bindings: &Bindings) -> Result<DataType, 
         TypeSpec::Int64 => DataType::Int64,
         TypeSpec::Float32 => DataType::Float32,
         TypeSpec::Float64 => DataType::Float64,
-        TypeSpec::Utf8 => DataType::Utf8,
-        TypeSpec::Binary => DataType::Binary,
+        TypeSpec::Utf8 | TypeSpec::Json => DataType::Utf8,
+        TypeSpec::Binary | TypeSpec::Bitmap => DataType::Binary,
         TypeSpec::Date => DataType::Date32,
         TypeSpec::Datetime => DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
         TypeSpec::LargeInt => {
@@ -365,7 +391,7 @@ pub(crate) fn realize(spec: &TypeSpec, bindings: &Bindings) -> Result<DataType, 
                     "entries",
                     DataType::Struct(
                         vec![
-                            Arc::new(Field::new("key", k, true)),
+                            Arc::new(Field::new("key", k, false)),
                             Arc::new(Field::new("value", v, true)),
                         ]
                         .into(),
@@ -380,6 +406,10 @@ pub(crate) fn realize(spec: &TypeSpec, bindings: &Bindings) -> Result<DataType, 
             .ok_or_else(|| format!("unbound type variable `{name}` in signature return type"))?,
     })
 }
+
+use super::scalar_construction::{
+    Failure as ConstructionFailure, ScalarConstruction, semantic_option,
+};
 
 /// How `Any(name)` is bound when the same variable shows up at multiple
 /// positions in one signature.
@@ -404,6 +434,13 @@ pub(crate) struct Bindings {
 }
 
 impl Bindings {
+    pub(crate) fn lookup_value_borrowed(&self, name: &str) -> Option<&FunctionValueType> {
+        self.entries
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, ty)| ty)
+    }
+
     pub(crate) fn lookup_value(&self, name: &str) -> Option<FunctionValueType> {
         self.entries
             .iter()
@@ -417,25 +454,49 @@ impl Bindings {
         ty: &FunctionValueType,
         mode: BindMode,
     ) -> bool {
+        self.bind_value_with_construction(
+            name,
+            ty,
+            mode,
+            &mut ScalarConstruction::<std::convert::Infallible>::new(
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                None,
+            ),
+        )
+        .expect("pure value binding")
+    }
+    fn bind_value_with_construction<E>(
+        &mut self,
+        name: &'static str,
+        ty: &FunctionValueType,
+        mode: BindMode,
+        creation: &mut ScalarConstruction<'_, E>,
+    ) -> Result<bool, ConstructionFailure<E>> {
         if let Some(existing) = self.lookup_value(name) {
-            let Some(merged) = merge_value_types(&existing, ty, matches!(mode, BindMode::Widening))
+            let Some(merged) = merge_value_types_with_construction(
+                &existing,
+                ty,
+                matches!(mode, BindMode::Widening),
+                creation,
+            )?
             else {
-                return false;
+                return Ok(false);
             };
             if let Some(entry) = self.entries.iter_mut().find(|(n, _)| *n == name) {
                 entry.1 = merged;
             }
         } else {
+            creation.push(&self.entries)?;
             self.entries.push((name, ty.clone()));
         }
-        true
+        Ok(true)
     }
 
     pub(crate) fn lookup(&self, name: &str) -> Option<DataType> {
         self.entries
             .iter()
             .find(|(n, _)| *n == name)
-            .map(|(_, ty)| ty.data_type.clone())
+            .map(|(_, ty)| ty.data_type().clone())
     }
 
     /// Try to bind `name` to `dt`. If `name` was already bound, the two
@@ -443,65 +504,128 @@ impl Bindings {
     /// `T` is consistent across all occurrences). Returns `false` on a
     /// conflicting bind.
     pub(crate) fn bind(&mut self, name: &'static str, dt: &DataType) -> bool {
+        self.bind_with_construction(
+            name,
+            dt,
+            &mut ScalarConstruction::<std::convert::Infallible>::new(
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                None,
+            ),
+        )
+        .expect("pure carrier binding")
+    }
+    fn bind_with_construction<E>(
+        &mut self,
+        name: &'static str,
+        dt: &DataType,
+        creation: &mut ScalarConstruction<'_, E>,
+    ) -> Result<bool, ConstructionFailure<E>> {
         if let Some(existing) = self.lookup(name) {
-            let Some(merged) = merge_undecided_types(&existing, dt) else {
-                return false;
+            let Some(merged) = merge_undecided_types_with_construction(&existing, dt, creation)?
+            else {
+                return Ok(false);
             };
             if merged != existing {
-                self.replace(name, &merged);
+                return self.replace_with_construction(name, &merged, creation);
             }
-            return true;
+            return Ok(true);
         }
-        self.entries
-            .push((name, FunctionValueType::new(dt.clone(), true)));
-        true
+        let Some(value) =
+            semantic_option(creation.value(dt.clone(), true, ValueLogicalType::Physical))?
+        else {
+            return Ok(false);
+        };
+        creation.push(&self.entries)?;
+        self.entries.push((name, value));
+        Ok(true)
     }
-
-    /// Bind `name` to NULL only if nothing has said what it is.
-    ///
-    /// A NULL argument is a value of whatever the variable turns out to be, so
-    /// it never contradicts another position and never decides one. It is
-    /// recorded anyway, because a call whose every occurrence is NULL still
-    /// has to realize a return type, and NULL is the honest answer there.
     pub(crate) fn bind_null(&mut self, name: &'static str) {
-        if self.lookup(name).is_none() {
-            self.entries
-                .push((name, FunctionValueType::new(DataType::Null, true)));
-        }
+        self.bind_null_with_construction(
+            name,
+            &mut ScalarConstruction::<std::convert::Infallible>::new(
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                None,
+            ),
+        )
+        .expect("pure NULL binding")
     }
-
-    fn replace(&mut self, name: &str, dt: &DataType) {
+    fn bind_null_with_construction<E>(
+        &mut self,
+        name: &'static str,
+        creation: &mut ScalarConstruction<'_, E>,
+    ) -> Result<(), ConstructionFailure<E>> {
+        if self.lookup(name).is_none() {
+            // Preserve original evaluation order: the NULL value is built before Vec::push.
+            let value = creation.value(DataType::Null, true, ValueLogicalType::Physical)?;
+            creation.push(&self.entries)?;
+            self.entries.push((name, value));
+        }
+        Ok(())
+    }
+    fn replace(&mut self, name: &str, dt: &DataType) -> bool {
+        self.replace_with_construction(
+            name,
+            dt,
+            &mut ScalarConstruction::<std::convert::Infallible>::new(
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                None,
+            ),
+        )
+        .expect("pure replacement binding")
+    }
+    fn replace_with_construction<E>(
+        &mut self,
+        name: &str,
+        dt: &DataType,
+        creation: &mut ScalarConstruction<'_, E>,
+    ) -> Result<bool, ConstructionFailure<E>> {
         for entry in self.entries.iter_mut() {
             if entry.0 == name {
-                entry.1 = FunctionValueType::new(dt.clone(), entry.1.nullable);
+                let Some(value) = semantic_option(creation.value(
+                    dt.clone(),
+                    entry.1.nullable(),
+                    ValueLogicalType::Physical,
+                ))?
+                else {
+                    return Ok(false);
+                };
+                entry.1 = value;
             }
         }
+        Ok(true)
     }
-
-    /// Widening bind: if `name` is unbound, bind it to `dt`. If `name` is
-    /// already bound to some `existing`, replace the binding with
-    /// `wider_type(existing, dt)`. Always returns `true` — failure to widen
-    /// means the two types have no common supertype, but that yields
-    /// `wider_type == Utf8` (a deliberate fall-back in NovaRocks today),
-    /// which we accept; downstream codegen / executor will error if the
-    /// widened type is actually nonsensical.
     pub(crate) fn bind_widening(&mut self, name: &'static str, dt: &DataType) -> bool {
+        self.bind_widening_with_construction(
+            name,
+            dt,
+            &mut ScalarConstruction::<std::convert::Infallible>::new(
+                novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                None,
+            ),
+        )
+        .expect("pure widening binding")
+    }
+    fn bind_widening_with_construction<E>(
+        &mut self,
+        name: &'static str,
+        dt: &DataType,
+        creation: &mut ScalarConstruction<'_, E>,
+    ) -> Result<bool, ConstructionFailure<E>> {
         if let Some(existing) = self.lookup(name) {
             if existing == DataType::Null {
-                self.replace(name, dt);
-                return true;
+                return self.replace_with_construction(name, dt, creation);
             }
-            let widened = novarocks_type_contract::wider_type(&existing, dt);
-            for entry in self.entries.iter_mut() {
-                if entry.0 == name {
-                    entry.1 = FunctionValueType::new(widened.clone(), entry.1.nullable);
-                }
-            }
-            return true;
+            let widened = creation.wider(&existing, dt)?;
+            return self.replace_with_construction(name, &widened, creation);
         }
-        self.entries
-            .push((name, FunctionValueType::new(dt.clone(), true)));
-        true
+        let Some(value) =
+            semantic_option(creation.value(dt.clone(), true, ValueLogicalType::Physical))?
+        else {
+            return Ok(false);
+        };
+        creation.push(&self.entries)?;
+        self.entries.push((name, value));
+        Ok(true)
     }
 }
 
@@ -517,59 +641,102 @@ impl Bindings {
 ///
 /// Returns `None` when the two disagree somewhere both of them have decided.
 fn merge_undecided_types(existing: &DataType, incoming: &DataType) -> Option<DataType> {
+    merge_undecided_types_with_construction(
+        existing,
+        incoming,
+        &mut ScalarConstruction::<std::convert::Infallible>::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            None,
+        ),
+    )
+    .expect("pure undecided merge")
+}
+fn merge_undecided_types_with_construction<E>(
+    existing: &DataType,
+    incoming: &DataType,
+    creation: &mut ScalarConstruction<'_, E>,
+) -> Result<Option<DataType>, ConstructionFailure<E>> {
     if existing == incoming {
-        return Some(existing.clone());
+        return Ok(Some(existing.clone()));
     }
-    match (existing, incoming) {
+    Ok(match (existing, incoming) {
         (DataType::Null, decided) | (decided, DataType::Null) => Some(decided.clone()),
-        (DataType::List(existing), DataType::List(incoming)) => {
-            merge_undecided_fields(existing, incoming).map(DataType::List)
+        (DataType::List(a), DataType::List(b)) => {
+            merge_undecided_fields_with_construction(a, b, creation)?.map(DataType::List)
         }
-        (DataType::LargeList(existing), DataType::LargeList(incoming)) => {
-            merge_undecided_fields(existing, incoming).map(DataType::LargeList)
+        (DataType::LargeList(a), DataType::LargeList(b)) => {
+            merge_undecided_fields_with_construction(a, b, creation)?.map(DataType::LargeList)
         }
-        (DataType::Map(existing, existing_sorted), DataType::Map(incoming, incoming_sorted))
-            if existing_sorted == incoming_sorted =>
-        {
-            merge_undecided_fields(existing, incoming)
-                .map(|entries| DataType::Map(entries, *existing_sorted))
+        (DataType::Map(a, ao), DataType::Map(b, bo)) if ao == bo => {
+            merge_undecided_fields_with_construction(a, b, creation)?
+                .map(|fields| DataType::Map(fields, *ao))
         }
-        (DataType::Struct(existing), DataType::Struct(incoming))
-            if existing.len() == incoming.len() =>
-        {
-            let fields = existing
+        (DataType::Struct(a), DataType::Struct(b)) if a.len() == b.len() => {
+            creation.collected_vec::<Arc<Field>>(a.len())?;
+            let Some(fields) = a
                 .iter()
-                .zip(incoming.iter())
-                .map(|(existing, incoming)| merge_undecided_fields(existing, incoming))
-                .collect::<Option<Vec<_>>>()?;
+                .zip(b.iter())
+                .map(|(a, b)| merge_undecided_fields_with_construction(a, b, creation))
+                .collect::<Result<Option<Vec<_>>, ConstructionFailure<E>>>()?
+            else {
+                return Ok(None);
+            };
+            creation.arc_slice::<Arc<Field>>(fields.len())?;
             Some(DataType::Struct(fields.into()))
         }
         _ => None,
-    }
+    })
 }
-
 fn merge_undecided_fields(
     existing: &arrow_schema::FieldRef,
     incoming: &arrow_schema::FieldRef,
 ) -> Option<arrow_schema::FieldRef> {
+    merge_undecided_fields_with_construction(
+        existing,
+        incoming,
+        &mut ScalarConstruction::<std::convert::Infallible>::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            None,
+        ),
+    )
+    .expect("pure undecided field merge")
+}
+fn merge_undecided_fields_with_construction<E>(
+    existing: &arrow_schema::FieldRef,
+    incoming: &arrow_schema::FieldRef,
+    creation: &mut ScalarConstruction<'_, E>,
+) -> Result<Option<arrow_schema::FieldRef>, ConstructionFailure<E>> {
     if existing.data_type() == &DataType::Null {
-        return Some(incoming.clone());
+        return Ok(Some(incoming.clone()));
     }
     if incoming.data_type() == &DataType::Null {
-        return Some(existing.clone());
+        return Ok(Some(existing.clone()));
     }
     if existing.name() != incoming.name() {
-        return None;
+        return Ok(None);
     }
-    let data_type = merge_undecided_types(existing.data_type(), incoming.data_type())?;
-    Some(Arc::new(
-        Field::new(
-            existing.name(),
-            data_type,
-            existing.is_nullable() || incoming.is_nullable(),
+    let Some(data_type) = merge_undecided_types_with_construction(
+        existing.data_type(),
+        incoming.data_type(),
+        creation,
+    )?
+    else {
+        return Ok(None);
+    };
+    creation.array::<u8>(existing.name().len())?;
+    let field = Field::new(
+        existing.name(),
+        data_type,
+        existing.is_nullable() || incoming.is_nullable(),
+    );
+    creation.cloned_annotations(existing.metadata().capacity())?;
+    let field = field.with_metadata(existing.metadata().clone());
+    creation.exact(|| {
+        novarocks_type_contract::owned_resources::layout::arc_layout(
+            std::alloc::Layout::new::<Field>(),
         )
-        .with_metadata(existing.metadata().clone()),
-    ))
+    })?;
+    Ok(Some(Arc::new(field)))
 }
 
 /// Polymorphic match: try to unify each `spec` against `dt`, recording any
@@ -591,28 +758,49 @@ pub(crate) fn unify(
     bindings: &mut Bindings,
     mode: BindMode,
 ) -> bool {
-    match spec {
+    unify_with_construction(
+        spec,
+        dt,
+        bindings,
+        mode,
+        &mut ScalarConstruction::<std::convert::Infallible>::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            None,
+        ),
+    )
+    .expect("pure carrier unification")
+}
+pub(super) fn unify_with_construction<E>(
+    spec: &TypeSpec,
+    dt: &DataType,
+    bindings: &mut Bindings,
+    mode: BindMode,
+    creation: &mut ScalarConstruction<'_, E>,
+) -> Result<bool, ConstructionFailure<E>> {
+    Ok(match spec {
         // A NULL literal is a value of whatever type the variable turns out to
         // be, so it does not decide one. Binding `T` to NULL would make every
         // other position disagree with it and refuse the call - which is how
         // `f(NULL, x)` came to be a type error while `f(x, NULL)` was not.
         TypeSpec::Any(name) if matches!(dt, DataType::Null) => {
-            bindings.bind_null(name);
+            bindings.bind_null_with_construction(name, creation)?;
             true
         }
         TypeSpec::Any(name) => match mode {
-            BindMode::Strict => bindings.bind(name, dt),
-            BindMode::Widening => bindings.bind_widening(name, dt),
+            BindMode::Strict => bindings.bind_with_construction(name, dt, creation)?,
+            BindMode::Widening => bindings.bind_widening_with_construction(name, dt, creation)?,
         },
         // A named decimal binds like a type variable but only over decimals,
         // so the exact precision and scale travel to the return type.
         TypeSpec::Decimal128Of(name) => match dt {
             DataType::Decimal128(_, _) => match mode {
-                BindMode::Strict => bindings.bind(name, dt),
-                BindMode::Widening => bindings.bind_widening(name, dt),
+                BindMode::Strict => bindings.bind_with_construction(name, dt, creation)?,
+                BindMode::Widening => {
+                    bindings.bind_widening_with_construction(name, dt, creation)?
+                }
             },
             DataType::Null => {
-                bindings.bind_null(name);
+                bindings.bind_null_with_construction(name, creation)?;
                 true
             }
             _ => false,
@@ -623,36 +811,42 @@ pub(crate) fn unify(
         // later position to decide -- `arrays_overlap(a, NULL)` takes its
         // element type from `a`.
         TypeSpec::List(inner_spec) if matches!(dt, DataType::Null) => {
-            bind_nothing_but_open(inner_spec, bindings);
+            bind_nothing_with_construction(inner_spec, bindings, creation)?;
             true
         }
         TypeSpec::Map(key_spec, value_spec) if matches!(dt, DataType::Null) => {
-            bind_nothing_but_open(key_spec, bindings);
-            bind_nothing_but_open(value_spec, bindings);
+            bind_nothing_with_construction(key_spec, bindings, creation)?;
+            bind_nothing_with_construction(value_spec, bindings, creation)?;
             true
         }
         TypeSpec::List(inner_spec) => match dt {
             DataType::List(field) | DataType::LargeList(field) => {
-                unify(inner_spec, field.data_type(), bindings, mode)
+                unify_with_construction(inner_spec, field.data_type(), bindings, mode, creation)?
             }
             _ => false,
         },
         TypeSpec::Map(key_spec, value_spec) => match dt {
             DataType::Map(entries, _) => {
                 let DataType::Struct(fields) = entries.data_type() else {
-                    return false;
+                    return Ok(false);
                 };
                 if fields.len() != 2 {
-                    return false;
+                    return Ok(false);
                 }
-                unify(key_spec, fields[0].data_type(), bindings, mode)
-                    && unify(value_spec, fields[1].data_type(), bindings, mode)
+                unify_with_construction(key_spec, fields[0].data_type(), bindings, mode, creation)?
+                    && unify_with_construction(
+                        value_spec,
+                        fields[1].data_type(),
+                        bindings,
+                        mode,
+                        creation,
+                    )?
             }
             _ => false,
         },
         // For anchor specs, fall back to the no-bindings matcher.
         _ => anchor_matches(spec, dt),
-    }
+    })
 }
 
 /// Merge the actual value identities; NULL remains undecided. Carrier widening
@@ -664,196 +858,254 @@ pub(crate) fn merge_value_types(
     right: &FunctionValueType,
     widening: bool,
 ) -> Option<FunctionValueType> {
-    left.validate().ok()?;
-    right.validate().ok()?;
-    if left.data_type == DataType::Null {
-        let mut result = right.clone();
-        result.nullable |= left.nullable;
-        return Some(result);
+    merge_value_types_with_construction(
+        left,
+        right,
+        widening,
+        &mut ScalarConstruction::<std::convert::Infallible>::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            None,
+        ),
+    )
+    .expect("pure value merge")
+}
+pub(super) fn merge_value_types_with_construction<E>(
+    left: &FunctionValueType,
+    right: &FunctionValueType,
+    widening: bool,
+    creation: &mut ScalarConstruction<'_, E>,
+) -> Result<Option<FunctionValueType>, ConstructionFailure<E>> {
+    if left.validate().is_err() || right.validate().is_err() {
+        return Ok(None);
     }
-    if right.data_type == DataType::Null {
-        let mut result = left.clone();
-        result.nullable |= right.nullable;
-        return Some(result);
+    if left.data_type() == &DataType::Null {
+        return semantic_option(creation.nullable(right, right.nullable() || left.nullable()));
     }
-    let (logical_type, domain_carrier) = if left.logical_type == right.logical_type {
-        (left.logical_type, None)
+    if right.data_type() == &DataType::Null {
+        return semantic_option(creation.nullable(left, left.nullable() || right.nullable()));
+    }
+    let (logical_type, domain_carrier) = if left.logical_type() == right.logical_type() {
+        (left.logical_type(), None)
     } else if widening {
-        match (left.logical_type, right.logical_type) {
+        match (left.logical_type(), right.logical_type()) {
             (ValueLogicalType::Json, ValueLogicalType::Physical)
             | (ValueLogicalType::Physical, ValueLogicalType::Json)
-                if left.data_type == DataType::Utf8 && right.data_type == DataType::Utf8 =>
+                if left.data_type() == &DataType::Utf8 && right.data_type() == &DataType::Utf8 =>
             {
                 (ValueLogicalType::Physical, Some(DataType::Utf8))
             }
             (ValueLogicalType::LargeInt, ValueLogicalType::Physical)
                 if matches!(
-                    right.data_type,
+                    right.data_type(),
                     DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
                 ) =>
             {
-                (ValueLogicalType::LargeInt, Some(left.data_type.clone()))
+                (ValueLogicalType::LargeInt, Some(left.data_type().clone()))
             }
             (ValueLogicalType::Physical, ValueLogicalType::LargeInt)
                 if matches!(
-                    left.data_type,
+                    left.data_type(),
                     DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
                 ) =>
             {
-                (ValueLogicalType::LargeInt, Some(right.data_type.clone()))
+                (ValueLogicalType::LargeInt, Some(right.data_type().clone()))
             }
-            _ => return None,
+            _ => return Ok(None),
         }
     } else {
-        return None;
+        return Ok(None);
     };
+    if !widening && !semantic_domains_agree(left.value_type(), right.value_type()) {
+        return Ok(None);
+    }
     let data_type = if let Some(carrier) = domain_carrier {
         carrier
-    } else if let Some(merged) = merge_undecided_types(&left.data_type, &right.data_type) {
-        restore_domains(merged, &left.data_type, &right.data_type, widening)?
+    } else if let Some(merged) =
+        merge_undecided_types_with_construction(left.data_type(), right.data_type(), creation)?
+    {
+        merged
     } else if widening {
-        restore_domains(
-            novarocks_type_contract::wider_type(&left.data_type, &right.data_type),
-            &left.data_type,
-            &right.data_type,
-            widening,
-        )?
+        creation.wider(left.data_type(), right.data_type())?
     } else {
-        return None;
+        return Ok(None);
     };
-    let result = FunctionValueType::try_with_logical_type(
-        data_type,
-        left.nullable || right.nullable,
-        logical_type,
+    let Some(result) = semantic_option(creation.common(data_type, left, right))? else {
+        return Ok(None);
+    };
+    if result.logical_type() != logical_type {
+        return Ok(None);
+    }
+    Ok(
+        (super::value_conversion::assignment_domains_authorized_with_construction(
+            left, &result, creation,
+        )? && super::value_conversion::assignment_domains_authorized_with_construction(
+            right, &result, creation,
+        )?)
+        .then_some(result),
     )
-    .ok()?;
-    (super::value_conversion::assignment_domains_authorized(left, &result)
-        && super::value_conversion::assignment_domains_authorized(right, &result))
-    .then_some(result)
 }
 
-fn restore_domains(
-    target: DataType,
-    left: &DataType,
-    right: &DataType,
-    widening: bool,
-) -> Option<DataType> {
-    if left == &DataType::Null {
-        return Some(right.clone());
+fn semantic_domains_agree(
+    left: &novarocks_type_contract::ValueTypeRef,
+    right: &novarocks_type_contract::ValueTypeRef,
+) -> bool {
+    use novarocks_type_contract::ValueKind;
+    if matches!(left.kind(), ValueKind::Scalar(DataType::Null))
+        || matches!(right.kind(), ValueKind::Scalar(DataType::Null))
+    {
+        return true;
     }
-    if right == &DataType::Null {
-        return Some(left.clone());
+    if left.domain() != right.domain() || left.child_count() != right.child_count() {
+        return false;
     }
-    fn field(target: &Field, left: &Field, right: &Field, widening: bool) -> Option<Arc<Field>> {
-        let left_domain = novarocks_type_contract::field_logical_type(left).ok()?;
-        let right_domain = novarocks_type_contract::field_logical_type(right).ok()?;
-        let decided = if left.data_type() == &DataType::Null {
-            right
-        } else {
-            left
-        };
-        if left.data_type() != &DataType::Null
-            && right.data_type() != &DataType::Null
-            && left_domain != right_domain
-        {
-            let value = merge_value_types(
-                &field_value_type(left)?,
-                &field_value_type(right)?,
-                widening,
-            )?;
-            let mut metadata = left.metadata().clone();
-            if value.logical_type != left_domain {
-                if left_domain != ValueLogicalType::Json
-                    || value.logical_type != ValueLogicalType::Physical
-                {
-                    return None;
-                }
-                metadata.remove(novarocks_type_contract::NR_LOGICAL_TYPE_KEY);
-            }
-            return Some(Arc::new(
-                left.clone()
-                    .with_data_type(value.data_type)
-                    .with_nullable(target.is_nullable())
-                    .with_metadata(metadata),
-            ));
+    (0..left.child_count()).all(|index| {
+        match (left.child_type_at(index), right.child_type_at(index)) {
+            (Some(a), Some(b)) => semantic_domains_agree(a, b),
+            _ => false,
         }
-        let data_type = restore_domains(
-            target.data_type().clone(),
-            left.data_type(),
-            right.data_type(),
-            widening,
-        )?;
-        let result = decided
-            .clone()
-            .with_name(target.name())
-            .with_data_type(data_type)
-            .with_nullable(target.is_nullable());
-        novarocks_type_contract::field_logical_type(&result).ok()?;
-        Some(Arc::new(result))
-    }
-    match (&target, left, right) {
-        (DataType::List(t), DataType::List(l), DataType::List(r)) => {
-            Some(DataType::List(field(t, l, r, widening)?))
-        }
-        (DataType::LargeList(t), DataType::LargeList(l), DataType::LargeList(r)) => {
-            Some(DataType::LargeList(field(t, l, r, widening)?))
-        }
-        (DataType::Map(t, sorted), DataType::Map(l, _), DataType::Map(r, _)) => {
-            Some(DataType::Map(field(t, l, r, widening)?, *sorted))
-        }
-        (DataType::Struct(t), DataType::Struct(l), DataType::Struct(r))
-            if t.len() == l.len() && l.len() == r.len() =>
-        {
-            let by_name = l
-                .iter()
-                .all(|f| r.iter().any(|other| other.name() == f.name()));
-            let fields = t
-                .iter()
-                .zip(l.iter())
-                .enumerate()
-                .map(|(index, (t, l))| {
-                    let r = if by_name {
-                        r.iter().find(|f| f.name() == l.name())?
-                    } else {
-                        &r[index]
-                    };
-                    field(t, l, r, widening)
-                })
-                .collect::<Option<Vec<_>>>()?;
-            Some(DataType::Struct(fields.into()))
-        }
-        _ => {
-            if !novarocks_type_contract::preserves_nested_logical_identity(left, &target)
-                || !novarocks_type_contract::preserves_nested_logical_identity(right, &target)
-            {
-                return None;
-            }
-            Some(target)
-        }
-    }
+    })
 }
 
-pub(crate) fn field_value_type(field: &Field) -> Option<FunctionValueType> {
-    FunctionValueType::try_with_logical_type(
-        field.data_type().clone(),
-        field.is_nullable(),
-        novarocks_type_contract::field_logical_type(field).ok()?,
-    )
-    .ok()
-}
-
-pub(crate) fn value_field(name: &str, ty: &FunctionValueType, nullable: bool) -> Field {
-    let field = Field::new(name, ty.data_type.clone(), nullable);
-    match ty.logical_type.metadata_value() {
-        Some(logical) => field.with_metadata(
-            [(
-                novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_string(),
-                logical.to_string(),
-            )]
-            .into(),
+fn declared_collection(
+    kind: novarocks_type_contract::ValueKind,
+    layout: DataType,
+    nullable: bool,
+) -> Result<FunctionValueType, novarocks_type_contract::ValueTypeError> {
+    declared_collection_with_construction(
+        kind,
+        layout,
+        nullable,
+        &mut ScalarConstruction::<std::convert::Infallible>::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            None,
         ),
-        None => field,
+    )
+    .map_err(super::scalar_construction::pure_value)
+}
+fn declared_collection_with_construction<E>(
+    kind: novarocks_type_contract::ValueKind,
+    layout: DataType,
+    nullable: bool,
+    creation: &mut ScalarConstruction<'_, E>,
+) -> Result<FunctionValueType, ConstructionFailure<E>> {
+    let storage = creation.storage();
+    let semantic = novarocks_type_contract::ValueTypeRef::try_new_with_construction(
+        kind,
+        nullable,
+        storage.clone(),
+        creation.observer(),
+    )?;
+    let layout = novarocks_type_contract::ValueLayout::try_new_with_construction(
+        &layout,
+        storage,
+        creation.observer(),
+    )?;
+    FunctionValueType::try_from_value(semantic, layout).map_err(Into::into)
+}
+pub(crate) fn declared_list(
+    item: &FunctionValueType,
+    nullable: bool,
+) -> Result<FunctionValueType, novarocks_type_contract::ValueTypeError> {
+    declared_list_with_construction(
+        item,
+        nullable,
+        &mut ScalarConstruction::<std::convert::Infallible>::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            None,
+        ),
+    )
+    .map_err(super::scalar_construction::pure_value)
+}
+pub(super) fn declared_list_with_construction<E>(
+    item: &FunctionValueType,
+    nullable: bool,
+    creation: &mut ScalarConstruction<'_, E>,
+) -> Result<FunctionValueType, ConstructionFailure<E>> {
+    let item = creation.nullable(item, true)?;
+    let kind = novarocks_type_contract::ValueKind::List(item.value_type().clone());
+    let layout = DataType::List(creation.field("item", item.data_type().clone(), true)?);
+    declared_collection_with_construction(kind, layout, nullable, creation)
+}
+pub(crate) fn declared_map(
+    key: &FunctionValueType,
+    value: &FunctionValueType,
+    nullable: bool,
+) -> Result<FunctionValueType, novarocks_type_contract::ValueTypeError> {
+    declared_map_with_construction(
+        key,
+        value,
+        nullable,
+        &mut ScalarConstruction::<std::convert::Infallible>::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            None,
+        ),
+    )
+    .map_err(super::scalar_construction::pure_value)
+}
+pub(super) fn declared_map_with_construction<E>(
+    key: &FunctionValueType,
+    value: &FunctionValueType,
+    nullable: bool,
+    creation: &mut ScalarConstruction<'_, E>,
+) -> Result<FunctionValueType, ConstructionFailure<E>> {
+    let key = creation.nullable(key, false)?;
+    let value = creation.nullable(value, true)?;
+    let kind = novarocks_type_contract::ValueKind::Map {
+        key: key.value_type().clone(),
+        value: value.value_type().clone(),
+    };
+    creation.array::<Field>(2)?;
+    creation.array::<u8>("key".len())?;
+    let key_field = Field::new("key", key.data_type().clone(), false);
+    creation.array::<u8>("value".len())?;
+    let value_field = Field::new("value", value.data_type().clone(), true);
+    let fields = vec![key_field, value_field];
+    creation.fields_from_values(fields.len())?;
+    let fields = DataType::Struct(fields.into());
+    let layout = DataType::Map(creation.field("entries", fields, false)?, false);
+    declared_collection_with_construction(kind, layout, nullable, creation)
+}
+pub(crate) fn declared_struct(
+    fields: Vec<(String, FunctionValueType)>,
+    nullable: bool,
+) -> Result<FunctionValueType, novarocks_type_contract::ValueTypeError> {
+    declared_struct_with_construction(
+        fields,
+        nullable,
+        &mut ScalarConstruction::<std::convert::Infallible>::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            None,
+        ),
+    )
+    .map_err(super::scalar_construction::pure_value)
+}
+pub(super) fn declared_struct_with_construction<E>(
+    fields: Vec<(String, FunctionValueType)>,
+    nullable: bool,
+    creation: &mut ScalarConstruction<'_, E>,
+) -> Result<FunctionValueType, ConstructionFailure<E>> {
+    creation.array::<novarocks_type_contract::ValueField>(fields.len())?;
+    let mut semantics = Vec::with_capacity(fields.len());
+    creation.array::<Field>(fields.len())?;
+    let mut layouts = Vec::with_capacity(fields.len());
+    for (name, field) in fields {
+        let field = creation.nullable(&field, true)?;
+        creation.array::<u8>(name.len())?;
+        layouts.push(Field::new(&name, field.data_type().clone(), true));
+        let storage = creation.storage();
+        semantics.push(
+            novarocks_type_contract::ValueField::from_string_with_construction(
+                name,
+                field.value_type().clone(),
+                storage,
+                creation.observer(),
+            )?,
+        );
     }
+    let kind = novarocks_type_contract::ValueKind::Struct(semantics.into());
+    creation.fields_from_values(layouts.len())?;
+    let layout = DataType::Struct(layouts.into());
+    declared_collection_with_construction(kind, layout, nullable, creation)
 }
 
 /// Bind one actual argument against the existing declaration vocabulary.
@@ -865,122 +1117,147 @@ pub(crate) fn unify_value(
     bindings: &mut Bindings,
     mode: BindMode,
 ) -> bool {
+    unify_value_with_construction(
+        spec,
+        ty,
+        bindings,
+        mode,
+        &mut ScalarConstruction::<std::convert::Infallible>::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            None,
+        ),
+    )
+    .expect("pure value unification")
+}
+pub(super) fn unify_value_with_construction<E>(
+    spec: &TypeSpec,
+    ty: &FunctionValueType,
+    bindings: &mut Bindings,
+    mode: BindMode,
+    creation: &mut ScalarConstruction<'_, E>,
+) -> Result<bool, ConstructionFailure<E>> {
     if ty.validate().is_err() {
-        return false;
+        return Ok(false);
     }
-    match spec {
-        TypeSpec::Any(name) => bindings.bind_value(name, ty, mode),
+    Ok(match spec {
+        TypeSpec::Any(name) => bindings.bind_value_with_construction(name, ty, mode, creation)?,
         TypeSpec::AnyType => true,
         TypeSpec::Decimal128Of(name) => {
-            ty.logical_type == ValueLogicalType::Physical
-                && matches!(ty.data_type, DataType::Decimal128(..))
-                && bindings.bind_value(name, ty, mode)
+            ty.logical_type() == ValueLogicalType::Physical
+                && matches!(ty.data_type(), DataType::Decimal128(..))
+                && bindings.bind_value_with_construction(name, ty, mode, creation)?
         }
-        TypeSpec::List(inner) if ty.data_type == DataType::Null => {
-            bind_nothing_but_open(inner, bindings);
+        TypeSpec::List(inner) if ty.data_type() == &DataType::Null => {
+            bind_nothing_with_construction(inner, bindings, creation)?;
             true
         }
-        TypeSpec::Map(key, value) if ty.data_type == DataType::Null => {
-            bind_nothing_but_open(key, bindings);
-            bind_nothing_but_open(value, bindings);
+        TypeSpec::Map(key, value) if ty.data_type() == &DataType::Null => {
+            bind_nothing_with_construction(key, bindings, creation)?;
+            bind_nothing_with_construction(value, bindings, creation)?;
             true
         }
         TypeSpec::List(inner) => {
-            if ty.logical_type != ValueLogicalType::Physical {
-                return false;
+            if ty.logical_type() != ValueLogicalType::Physical {
+                return Ok(false);
             }
-            match &ty.data_type {
-                DataType::List(item) | DataType::LargeList(item) => field_value_type(item)
-                    .is_some_and(|item| unify_value(inner, &item, bindings, mode)),
+            match ty.data_type() {
+                DataType::List(_) | DataType::LargeList(_) => match creation.child(ty, 0)? {
+                    Some(item) => {
+                        unify_value_with_construction(inner, &item, bindings, mode, creation)?
+                    }
+                    None => false,
+                },
                 _ => false,
             }
         }
         TypeSpec::Map(key, value) => {
-            if ty.logical_type != ValueLogicalType::Physical {
-                return false;
+            if ty.logical_type() != ValueLogicalType::Physical {
+                return Ok(false);
             }
-            let DataType::Map(entries, _) = &ty.data_type else {
-                return false;
+            let DataType::Map(entries, _) = ty.data_type() else {
+                return Ok(false);
             };
             let DataType::Struct(fields) = entries.data_type() else {
-                return false;
+                return Ok(false);
             };
-            fields.len() == 2
-                && field_value_type(&fields[0])
-                    .is_some_and(|key_ty| unify_value(key, &key_ty, bindings, mode))
-                && field_value_type(&fields[1])
-                    .is_some_and(|value_ty| unify_value(value, &value_ty, bindings, mode))
+            if fields.len() != 2 {
+                false
+            } else {
+                let key_matches = match creation.child(ty, 0)? {
+                    Some(key_ty) => {
+                        unify_value_with_construction(key, &key_ty, bindings, mode, creation)?
+                    }
+                    None => false,
+                };
+                key_matches
+                    && match creation.child(ty, 1)? {
+                        Some(value_ty) => unify_value_with_construction(
+                            value, &value_ty, bindings, mode, creation,
+                        )?,
+                        None => false,
+                    }
+            }
         }
         TypeSpec::LargeInt => {
-            ty.data_type == DataType::Null
-                || (ty.logical_type == ValueLogicalType::LargeInt
-                    && anchor_matches(spec, &ty.data_type))
-                || realize_value(spec, bindings, ty.nullable).is_ok_and(|target| {
-                    super::value_conversion::recipe_selection(ty, &target).is_ok()
-                })
+            if ty.data_type() == &DataType::Null
+                || (ty.logical_type() == ValueLogicalType::LargeInt
+                    && anchor_matches(spec, ty.data_type()))
+            {
+                true
+            } else {
+                match semantic_option(realize_value_with_construction(
+                    spec,
+                    bindings,
+                    ty.nullable(),
+                    creation,
+                ))? {
+                    Some(target) => super::value_conversion::recipe_family(ty, &target).is_ok(),
+                    None => false,
+                }
+            }
         }
-        TypeSpec::Utf8 if ty.logical_type == ValueLogicalType::Json => {
-            super::value_conversion::recipe_selection(
-                ty,
-                &FunctionValueType::new(DataType::Utf8, ty.nullable),
-            )
-            .is_ok()
+        TypeSpec::Bitmap => {
+            ty.data_type() == &DataType::Null
+                || (ty.logical_type() == ValueLogicalType::Bitmap
+                    && ty.data_type() == &DataType::Binary)
         }
-        _ => ty.logical_type == ValueLogicalType::Physical,
-    }
+        TypeSpec::Json => {
+            ty.data_type() == &DataType::Null
+                || (ty.logical_type() == ValueLogicalType::Json
+                    && ty.data_type() == &DataType::Utf8)
+        }
+        TypeSpec::Utf8 if ty.logical_type() == ValueLogicalType::Json => {
+            let target =
+                creation.value(DataType::Utf8, ty.nullable(), ValueLogicalType::Physical)?;
+            super::value_conversion::recipe_family(ty, &target).is_ok()
+        }
+        _ => ty.logical_type() == ValueLogicalType::Physical,
+    })
 }
-
 pub(crate) fn realize_value(
     spec: &TypeSpec,
     bindings: &Bindings,
     nullable: bool,
 ) -> Result<FunctionValueType, String> {
-    let mut result = match spec {
-        TypeSpec::Any(name) | TypeSpec::Decimal128Of(name) => bindings
-            .lookup_value(name)
-            .ok_or_else(|| format!("value type variable {name} is unbound"))?,
-        TypeSpec::AnyType | TypeSpec::AnyDecimal128 => {
-            return Err("wildcard has no intrinsic result type".into());
-        }
-        TypeSpec::LargeInt => FunctionValueType::try_with_logical_type(
-            DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH),
-            nullable,
-            ValueLogicalType::LargeInt,
-        )
-        .map_err(|error| error.to_string())?,
-        TypeSpec::List(inner) => {
-            let item = realize_value(inner, bindings, true)?;
-            FunctionValueType::new(
-                DataType::List(Arc::new(value_field("item", &item, true))),
-                nullable,
-            )
-        }
-        TypeSpec::Map(key, value) => {
-            let key = realize_value(key, bindings, true)?;
-            let value = realize_value(value, bindings, true)?;
-            FunctionValueType::new(
-                DataType::Map(
-                    Arc::new(Field::new(
-                        "entries",
-                        DataType::Struct(
-                            vec![
-                                Arc::new(value_field("key", &key, true)),
-                                Arc::new(value_field("value", &value, true)),
-                            ]
-                            .into(),
-                        ),
-                        false,
-                    )),
-                    false,
-                ),
-                nullable,
-            )
-        }
-        _ => FunctionValueType::new(realize(spec, bindings)?, nullable),
-    };
-    result.nullable = nullable;
-    result.validate().map_err(|error| error.to_string())?;
-    Ok(result)
+    realize_value_with_construction(
+        spec,
+        bindings,
+        nullable,
+        &mut ScalarConstruction::<std::convert::Infallible>::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            None,
+        ),
+    )
+    .map_err(super::scalar_construction::pure_string)
+}
+pub(super) fn realize_value_with_construction<E>(
+    spec: &TypeSpec,
+    bindings: &Bindings,
+    nullable: bool,
+    creation: &mut ScalarConstruction<'_, E>,
+) -> Result<FunctionValueType, ConstructionFailure<E>> {
+    super::scalar_type_recipe::ScalarTypeRecipe::new(spec, bindings, nullable)
+        .materialize_with_construction(creation)
 }
 
 #[cfg(test)]
@@ -998,7 +1275,7 @@ mod tests {
                 "entries",
                 DataType::Struct(
                     vec![
-                        Arc::new(Field::new("key", k, true)),
+                        Arc::new(Field::new("key", k, false)),
                         Arc::new(Field::new("value", v, true)),
                     ]
                     .into(),

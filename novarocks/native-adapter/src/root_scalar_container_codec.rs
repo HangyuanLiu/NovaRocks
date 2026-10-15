@@ -26,15 +26,17 @@
 //! the same ceiling. Turns then copy the finished record into root segments.
 
 use arrow::array::{Array, ListArray, MapArray, StructArray};
-use novarocks_execution::exec::chunk::{Chunk, ChunkFieldSchema};
+use novarocks_execution::exec::chunk::Chunk;
 use novarocks_result_contract::{
     BorrowedScalarLeaf, RootProfileV1, SCALAR_RECORD_MAX_BYTES, ScalarField, ScalarLeafCursor,
     ScalarRecordWriter, ScalarSchema, ScalarValueType,
 };
 use novarocks_result_render::{RenderTurn, RenderTurnStatus};
-use novarocks_type_contract::result_scalar_type::scalar_field_matches_storage;
+use novarocks_type_contract::result_scalar_type::{
+    scalar_field_matches_binding, scalar_field_matches_storage,
+};
 
-use crate::root_scalar_leaf_codec::{NativeScalarLeafError, borrow_leaf_at, expected_logical};
+use crate::root_scalar_leaf_codec::{NativeScalarLeafError, borrow_leaf_at};
 
 pub struct NativeScalarContainerEncoder {
     record: Vec<u8>,
@@ -58,7 +60,7 @@ impl NativeScalarContainerEncoder {
         if !is_container(schema.field()) {
             return Err(NativeScalarLeafError::Type);
         }
-        let batch = &chunk.batch;
+        let batch = chunk.record_batch();
         if batch.num_columns() != 1
             || batch.schema_ref().fields().len() != 1
             || chunk.chunk_schema().slots().len() != 1
@@ -101,7 +103,7 @@ impl NativeScalarContainerEncoder {
         if !is_container(schema.field()) {
             return Err(NativeScalarLeafError::Type);
         }
-        let batch = &chunk.batch;
+        let batch = chunk.record_batch();
         if batch.num_columns() != 1
             || batch.schema_ref().fields().len() != 1
             || chunk.chunk_schema().slots().len() != 1
@@ -117,10 +119,7 @@ impl NativeScalarContainerEncoder {
         if schema.source_slot() != Some(slot.slot_id().as_u32()) {
             return Err(NativeScalarLeafError::Slot);
         }
-        if !logical_matches(schema.field(), slot.field_schema()) {
-            return Err(NativeScalarLeafError::LogicalMetadata);
-        }
-        let batch_field = &chunk.batch.schema_ref().fields()[0];
+        let batch_field = &chunk.record_batch().schema_ref().fields()[0];
         for field in [slot.field(), batch_field.as_ref()] {
             if !scalar_field_matches_storage(schema.field(), field.data_type(), field.is_nullable())
             {
@@ -129,10 +128,13 @@ impl NativeScalarContainerEncoder {
         }
         if !scalar_field_matches_storage(
             schema.field(),
-            chunk.batch.column(0).data_type(),
+            chunk.record_batch().column(0).data_type(),
             schema.field().nullable,
         ) {
             return Err(NativeScalarLeafError::Type);
+        }
+        if !scalar_field_matches_binding(schema.field(), slot.typed_binding()) {
+            return Err(NativeScalarLeafError::LogicalMetadata);
         }
         Ok(())
     }
@@ -170,33 +172,6 @@ pub(crate) fn is_container(field: &ScalarField) -> bool {
         field.value_type,
         ScalarValueType::List(_) | ScalarValueType::Map { .. } | ScalarValueType::Struct(_)
     )
-}
-
-/// Nested logical facts must match exactly: container nodes carry none, and
-/// each leaf carries exactly the logical type its frozen scalar type implies.
-fn logical_matches(expected: &ScalarField, schema: &ChunkFieldSchema) -> bool {
-    match &expected.value_type {
-        ScalarValueType::List(child) => {
-            schema.logical_type().is_none()
-                && schema.children().len() == 1
-                && logical_matches(child, &schema.children()[0])
-        }
-        ScalarValueType::Map { key, value } => {
-            schema.logical_type().is_none()
-                && schema.children().len() == 2
-                && logical_matches(key, &schema.children()[0])
-                && logical_matches(value, &schema.children()[1])
-        }
-        ScalarValueType::Struct(fields) => {
-            schema.logical_type().is_none()
-                && schema.children().len() == fields.len()
-                && fields
-                    .iter()
-                    .zip(schema.children())
-                    .all(|(field, child)| logical_matches(&field.field, child))
-        }
-        leaf => schema.children().is_empty() && schema.logical_type() == expected_logical(leaf),
-    }
 }
 
 fn exact<T: Array + 'static>(array: &dyn Array) -> Result<&T, NativeScalarLeafError> {

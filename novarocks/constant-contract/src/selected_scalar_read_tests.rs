@@ -59,15 +59,19 @@ fn policy() -> ConstantPolicy {
 fn pool(array: ArrayRef, logical: ValueLogicalType) -> ConstantPool {
     let ty =
         FunctionValueType::try_with_logical_type(array.data_type().clone(), true, logical).unwrap();
-    let field = ty.try_to_field("actual.source").unwrap().with_metadata(
-        ty.try_to_field("actual.source")
-            .unwrap()
-            .metadata()
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .chain([("provider.fact".to_owned(), "preserved".to_owned())])
-            .collect(),
-    );
+    let field = ty
+        .try_to_field("actual.source")
+        .unwrap()
+        .with_data_type(array.data_type().clone())
+        .with_metadata(
+            ty.try_to_field("actual.source")
+                .unwrap()
+                .metadata()
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .chain([("provider.fact".to_owned(), "preserved".to_owned())])
+                .collect(),
+        );
     ConstantPool::try_new(
         Arc::new(field),
         ty,

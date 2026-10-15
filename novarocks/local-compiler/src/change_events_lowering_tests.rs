@@ -184,7 +184,11 @@ fn try_fixture(
     let nested = FunctionValueType::new(DataType::List(field), true);
     let pool_id = ConstantPoolId::new(u32::MAX);
     let pool = ConstantPool::try_new(
-        Arc::new(nested.try_to_field("original-pool").unwrap()),
+        Arc::new(Field::new(
+            "original-pool",
+            list.data_type().clone(),
+            nested.nullable(),
+        )),
         nested.clone(),
         list.to_data(),
         options().constants,

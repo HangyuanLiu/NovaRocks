@@ -117,9 +117,9 @@ fn column_type_source_domains_and_scope_keep_complete_authored_fields() {
             let source = column(carrier.clone(), declaration.clone(), nullable);
             let control = Control::default();
             let result = helpers::column_value_type(&source, &control).unwrap();
-            assert_eq!(result.data_type, carrier);
-            assert_eq!(result.logical_type, logical);
-            assert_eq!(result.nullable, nullable);
+            assert_eq!(result.data_type().clone(), carrier);
+            assert_eq!(result.logical_type(), logical);
+            assert_eq!(result.nullable(), nullable);
             check_prefixes(&control.trace(), |control| {
                 helpers::column_value_type(&source, control)
             });
@@ -144,21 +144,23 @@ fn column_type_source_domains_and_scope_keep_complete_authored_fields() {
         true,
     );
     let result = helpers::column_value_type(&source, &Control::default()).unwrap();
-    let DataType::LargeList(item) = result.data_type else {
+    let DataType::LargeList(item) = result.data_type() else {
         panic!("preserve LargeList carrier");
     };
-    assert_eq!(item.name(), "provider_item");
+    assert_eq!(item.name(), "item");
     assert!(!item.is_nullable());
+    assert_eq!(item.metadata().capacity(), 0);
     assert_eq!(
-        item.metadata().get("provider").map(String::as_str),
-        Some("kept-exactly")
+        result.child_at(0).unwrap().logical_type(),
+        ValueLogicalType::Json
     );
-    assert_eq!(
-        item.metadata().get(NR_LOGICAL_TYPE_KEY).map(String::as_str),
-        Some("json")
-    );
-    assert_eq!(result.logical_type, ValueLogicalType::Physical);
-    assert!(result.nullable);
+    let DataType::LargeList(source_item) = &source.data_type else {
+        panic!("source List")
+    };
+    assert_eq!(source_item.name(), "provider_item");
+    assert_eq!(source_item.metadata()["provider"], "kept-exactly");
+    assert_eq!(result.logical_type(), ValueLogicalType::Physical);
+    assert!(result.nullable());
 }
 
 #[test]
@@ -194,11 +196,12 @@ fn column_type_invalid_catalog_declaration_observes_ordinary_tail_without_public
 
 #[test]
 fn column_type_full_value_validator_preserves_early_and_completed_ordinary_tails() {
-    let valid = FunctionValueType {
-        data_type: DataType::Utf8,
-        nullable: false,
-        logical_type: ValueLogicalType::Json,
-    };
+    let valid = FunctionValueType::try_from_legacy_declared_projection(
+        DataType::Utf8,
+        false,
+        ValueLogicalType::Json,
+    )
+    .expect("valid temporary legacy value projection");
     let control = Control::default();
     helpers::validate_value_type(&valid, &control).unwrap();
     assert!(control.trace().last().unwrap().1 > 0);
@@ -206,40 +209,24 @@ fn column_type_full_value_validator_preserves_early_and_completed_ordinary_tails
         helpers::validate_value_type(&valid, control)
     });
 
-    let invalid = FunctionValueType {
-        data_type: DataType::FixedSizeBinary(16),
-        ..valid
-    };
-    let control = Control::default();
-    let error = helpers::validate_value_type(&invalid, &control).unwrap_err();
-    assert_eq!(error.kind(), AnalyzeErrorKind::Internal);
+    // An invalid binding can no longer exist behind the checked public
+    // wrapper. Refuse it at its actual author, before helper publication.
     assert!(
-        error
-            .message()
-            .contains("binding has invalid exact logical type")
+        FunctionValueType::try_with_logical_type(
+            DataType::FixedSizeBinary(16),
+            false,
+            ValueLogicalType::Json,
+        )
+        .is_err()
     );
-    assert_eq!(error.control_error(), None);
-    // Root-domain validation fails before any node work. Its mandatory tail
-    // must still run, and legitimately observes zero completed units.
-    assert_eq!(
-        control.trace(),
-        vec![(CompilePhase::Validate, 0), (CompilePhase::Validate, 0)]
+    assert!(
+        FunctionValueType::try_with_logical_type(
+            DataType::Decimal128(0, 0),
+            false,
+            ValueLogicalType::Physical,
+        )
+        .is_err()
     );
-    check_prefixes(&control.trace(), |control| {
-        helpers::validate_value_type(&invalid, control)
-    });
-
-    let invalid = FunctionValueType::new(DataType::Decimal128(0, 0), false);
-    let control = Control::default();
-    let error = helpers::validate_value_type(&invalid, &control).unwrap_err();
-    assert_eq!(error.kind(), AnalyzeErrorKind::Internal);
-    assert_eq!(error.control_error(), None);
-    assert_eq!(error.span(), None);
-    assert_eq!(control.trace().len(), 2);
-    assert!(control.trace().last().unwrap().1 > 0);
-    check_prefixes(&control.trace(), |control| {
-        helpers::validate_value_type(&invalid, control)
-    });
 }
 
 #[test]
@@ -255,9 +242,19 @@ fn column_type_wide_real_fields_observe_quantum_and_original_control_prefixes() 
     let source = column(DataType::Struct(fields.clone()), None, true);
     let control = Control::default();
     let value = helpers::column_value_type(&source, &control).unwrap();
-    assert_eq!(value.data_type, DataType::Struct(fields));
-    assert_eq!(value.logical_type, ValueLogicalType::Physical);
-    assert!(value.nullable);
+    let DataType::Struct(actual) = value.data_type() else {
+        panic!("execution Struct")
+    };
+    assert_eq!(actual.len(), fields.len());
+    for (actual, source) in actual.iter().zip(fields.iter()) {
+        assert_eq!(actual.name(), source.name());
+        assert_eq!(actual.data_type(), source.data_type());
+        assert_eq!(actual.is_nullable(), source.is_nullable());
+        assert_eq!(actual.metadata().capacity(), 0);
+        assert!(source.metadata().contains_key("provider"));
+    }
+    assert_eq!(value.logical_type(), ValueLogicalType::Physical);
+    assert!(value.nullable());
     assert!(control.trace().iter().any(|(_, units)| *units == 256));
     check_prefixes(&control.trace(), |control| {
         helpers::column_value_type(&source, control)

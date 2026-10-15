@@ -72,48 +72,95 @@ fn field(id: u32, carrier: u32) -> wire::FieldDefinition {
 }
 fn binding(id: u32) -> raw::ConnectorWriteFieldBinding {
     raw::ConnectorWriteFieldBinding {
-        field_id: Some(id),
+        source_field_id: Some(id),
         field_token: vec![],
+        value_type_id: None,
     }
+}
+fn prepare_source_graph<'s>(
+    package: &'s raw::FragmentPackage,
+    limits: TypeProjectionLimits,
+    source: usize,
+    admit: &mut impl FnMut(&PackageTypeGraphFacts) -> Result<(), CompileControlError>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<PreparedPackageTypeGraph<'s>, TypeCodecError> {
+    super::package_graph::prepare_package_type_graph_namespace_with_host::<std::convert::Infallible>(
+        package, limits, super::root_sources::TypeNamespace::Source, source,
+        &mut |facts| admit(facts).map_err(Into::into), work,
+    ).map_err(crate::host_projection_v2::ProjectionFailure::without_host)
+}
+fn shape(package: &raw::FragmentPackage) -> &wire::TypeTable {
+    package
+        .source_fields
+        .as_ref()
+        .unwrap()
+        .shape
+        .as_ref()
+        .unwrap()
+}
+fn shape_mut(package: &mut raw::FragmentPackage) -> &mut wire::TypeTable {
+    package
+        .source_fields
+        .as_mut()
+        .unwrap()
+        .shape
+        .as_mut()
+        .unwrap()
 }
 fn fixture() -> raw::FragmentPackage {
     raw::FragmentPackage {
-        types: Some(wire::TypeTable {
-            carriers: vec![
-                carrier(
-                    u32::MAX,
-                    Kind::StructType(wire::StructFields {
-                        field_ids: vec![u32::MAX, 0, u32::MAX],
-                    }),
-                ),
-                carrier(12, Kind::Primitive(5)),
-                carrier(0, Kind::Primitive(5)),
-                carrier(9, Kind::ListFieldId(u32::MAX)),
-            ],
-            fields: vec![
-                field(u32::MAX, 0),
-                field(7, u32::MAX),
-                field(12, 12),
-                field(0, 0),
-                field(9, 12),
-            ],
-            value_types: vec![wire::ValueTypeDefinition {
-                id: u32::MAX,
-                carrier_type_id: Some(0),
-                nullable: false,
-                logical_type: 1,
-            }],
+        source_fields: Some(wire::SourceFieldTable {
+            shape: Some(wire::TypeTable {
+                logical_types: Vec::new(),
+                carriers: vec![
+                    carrier(
+                        u32::MAX,
+                        Kind::StructType(wire::StructFields {
+                            field_ids: vec![u32::MAX, 0, u32::MAX],
+                        }),
+                    ),
+                    carrier(12, Kind::Primitive(5)),
+                    carrier(0, Kind::Primitive(5)),
+                    carrier(9, Kind::ListFieldId(u32::MAX)),
+                ],
+                fields: vec![
+                    field(u32::MAX, 0),
+                    field(7, u32::MAX),
+                    field(12, 12),
+                    field(0, 0),
+                    field(9, 12),
+                ],
+                value_types: vec![],
+            }),
+            field_facts: [u32::MAX, 7, 12, 0, 9]
+                .into_iter()
+                .map(|id| wire::SourceArrowFieldFacts {
+                    field_id: Some(id),
+                    ..Default::default()
+                })
+                .collect(),
         }),
         schemas: vec![raw::SchemaDefinition {
             id: 0,
             field_ids: vec![0, 0],
-            metadata: vec![],
         }],
-        constants: vec![raw::IpcConstantPool {
-            id: u32::MAX,
-            field_id: Some(12),
-            ..Default::default()
-        }],
+        constants: vec![
+            raw::IpcConstantPool {
+                id: 0,
+                source_field_id: Some(0),
+                ..Default::default()
+            },
+            raw::IpcConstantPool {
+                id: 1,
+                source_field_id: Some(0),
+                ..Default::default()
+            },
+            raw::IpcConstantPool {
+                id: u32::MAX,
+                source_field_id: Some(12),
+                ..Default::default()
+            },
+        ],
         writes: vec![raw::FrozenWriterRecipe {
             input: Some(raw::ConnectorWriteInputShape {
                 kind: Some(raw::connector_write_input_shape::Kind::Data(
@@ -151,7 +198,7 @@ fn invoke(
         work.step()?;
     }
     let result = (|| {
-        let token = prepare_package_type_graph(
+        let token = prepare_source_graph(
             package,
             limits(),
             SOURCE,
@@ -188,8 +235,8 @@ fn package_graph_sparse_sources_repetitions_and_unused_strict_intersections_have
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     let token =
-        prepare_package_type_graph(&package, limits(), SOURCE, &mut |_| Ok(()), &mut work).unwrap();
-    let table = package.types.as_ref().unwrap();
+        prepare_source_graph(&package, limits(), SOURCE, &mut |_| Ok(()), &mut work).unwrap();
+    let table = shape(&package);
     assert!(std::ptr::eq(token.table_for(&package).unwrap(), table));
     let mut seen = BTreeMap::new();
     let mut ordered = Vec::new();
@@ -258,9 +305,9 @@ fn package_graph_sparse_sources_repetitions_and_unused_strict_intersections_have
         ])
     );
     let f = token.facts();
-    assert_eq!(f.definition_count, 10); // 4 carriers + 5 fields + one Value.
+    assert_eq!(f.definition_count, 9); // Source: 4 carriers + 5 fields; execution Values are separate.
     assert_eq!(f.graph_edges, 9); // Struct3 + unusedList1 + five Field edges.
-    assert_eq!(f.root_occurrences, 7); // Value1 + Schema2 + IPC1 + Writer3.
+    assert_eq!(f.root_occurrences, 6); // Source IPC3 + Writer3; execution schema/Value roots are separate.
     // Original Index9 + domain flags9 + reusable stack1, not actual allocator
     // request measurements and not max sparse identity sized storage.
     assert_eq!(f.allocation_requests_upper_bound, 19);
@@ -275,11 +322,11 @@ fn package_graph_foreign_equal_owner_is_refused_and_raw_representation_is_not_a_
     let mut package = fixture();
     // Legal graph representation with a carrier parameter the separate Arrow
     // law must reject. The graph token must not claim whole type validation.
-    package.types.as_mut().unwrap().carriers[1].kind = Some(Kind::FixedSizeBinary(-1));
+    shape_mut(&mut package).carriers[1].kind = Some(Kind::FixedSizeBinary(-1));
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     let token =
-        prepare_package_type_graph(&package, limits(), SOURCE, &mut |_| Ok(()), &mut work).unwrap();
+        prepare_source_graph(&package, limits(), SOURCE, &mut |_| Ok(()), &mut work).unwrap();
     let foreign = package.clone();
     assert!(matches!(
         token.table_for(&foreign),
@@ -287,7 +334,7 @@ fn package_graph_foreign_equal_owner_is_refused_and_raw_representation_is_not_a_
     ));
     assert!(std::ptr::eq(
         token.table_for(&package).unwrap(),
-        package.types.as_ref().unwrap()
+        shape(&package)
     ));
     work.finish().unwrap();
 }
@@ -308,7 +355,7 @@ fn package_graph_generic_visitor_error_is_original_without_second_event_or_own_f
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     let token =
-        prepare_package_type_graph(&package, limits(), SOURCE, &mut |_| Ok(()), &mut work).unwrap();
+        prepare_source_graph(&package, limits(), SOURCE, &mut |_| Ok(()), &mut work).unwrap();
     let mut calls = 0;
     let mut callback_trace_len = 0;
     let result = token.visit(
@@ -333,7 +380,7 @@ fn package_graph_generic_visitor_error_is_original_without_second_event_or_own_f
     let control = Control::default();
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     let token =
-        prepare_package_type_graph(&package, limits(), SOURCE, &mut |_| Ok(()), &mut work).unwrap();
+        prepare_source_graph(&package, limits(), SOURCE, &mut |_| Ok(()), &mut work).unwrap();
     let mut calls = 0;
     let mut callback_trace_len = 0;
     let result = token.visit(
@@ -399,7 +446,7 @@ fn package_graph_every_actual_small_callback_success_and_ordinary_prefix_keeps_t
     for case in 0..3 {
         let mut package = fixture();
         match case {
-            1 => package.types = None,
+            1 => package.source_fields = None,
             2 => package.writes[0].input = None,
             _ => {}
         }
@@ -424,10 +471,14 @@ fn package_graph_every_actual_small_callback_success_and_ordinary_prefix_keeps_t
 #[test]
 fn package_graph_single_carrier_known_requests_refuse_before_first_root_header_quantum() {
     let package = raw::FragmentPackage {
-        types: Some(wire::TypeTable {
-            carriers: vec![carrier(u32::MAX, Kind::Primitive(5))],
-            fields: vec![],
-            value_types: vec![],
+        source_fields: Some(wire::SourceFieldTable {
+            shape: Some(wire::TypeTable {
+                logical_types: Vec::new(),
+                carriers: vec![carrier(u32::MAX, Kind::Primitive(5))],
+                fields: vec![],
+                value_types: vec![],
+            }),
+            field_facts: vec![],
         }),
         ..Default::default()
     };

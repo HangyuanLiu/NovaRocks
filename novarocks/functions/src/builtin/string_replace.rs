@@ -114,8 +114,8 @@ pub(super) fn evaluate_string_replace<'a>(
             let FunctionArgumentType::Value(ty) = ty else {
                 return Err(invalid("replace requires value arguments"));
             };
-            let exact =
-                ty.logical_type == ValueLogicalType::Physical && ty.data_type == DataType::Utf8;
+            let exact = ty.logical_type() == ValueLogicalType::Physical
+                && ty.data_type() == &DataType::Utf8;
             work.step()?;
             if !exact {
                 return Err(invalid(
@@ -124,9 +124,9 @@ pub(super) fn evaluate_string_replace<'a>(
             }
         }
         let target = input.contract().result_type();
-        if target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
+        if target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Utf8
+            || !target.nullable()
         {
             return Err(invalid(
                 "replace differs from its exact installed result profile",
@@ -164,7 +164,7 @@ pub(super) fn evaluate_string_replace<'a>(
                     let FunctionArgumentType::Value(ty) = &types[index] else {
                         return Err(invalid("replace requires value arguments"));
                     };
-                    if !ty.nullable {
+                    if !ty.nullable() {
                         return Err(internal(
                             "replace non-null argument contains selected SQL NULL",
                         ));
@@ -245,7 +245,7 @@ pub(super) fn evaluate_string_replace<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

@@ -62,7 +62,7 @@ fn inspect(source: &SqlAuthoredPhysicalPlan) -> usize {
             } = &node.kind
             {
                 n += 1;
-                assert_eq!(node.ty.data_type, DataType::Boolean);
+                assert_eq!(node.ty.data_type().clone(), DataType::Boolean);
                 let input = fragment.expressions().get(*expr).unwrap();
                 println!(
                     "actual original IN source fragment={id:?} input={:?} result={:?} negated={negated} candidates={}",

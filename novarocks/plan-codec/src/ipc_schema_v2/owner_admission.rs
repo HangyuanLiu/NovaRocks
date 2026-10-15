@@ -66,7 +66,7 @@ pub(super) struct Admission<'a, 'b, H> {
     pub parent: Option<&'a mut HostSchemaAdmit<'b, H>>,
     pub source: usize,
     pub reader: bool,
-    pub max_work: usize,
+    pub max_work: Option<usize>,
     pub facts: SchemaWriterRequestFacts,
 }
 impl<H> Admission<'_, '_, H> {
@@ -78,7 +78,10 @@ impl<H> Admission<'_, '_, H> {
         self.facts.request_count = self.facts.request_count.max(facts.request_count);
         self.facts.work_upper_bound = self.facts.work_upper_bound.max(facts.work_upper_bound);
         if let Some(parent) = self.parent.as_mut() {
-            if self.facts.work_upper_bound > self.max_work {
+            if self
+                .max_work
+                .is_some_and(|maximum| self.facts.work_upper_bound > maximum)
+            {
                 return Err(TypeCodecError::from(CompileControlError::ResourceExhausted).into());
             }
             parent(&self.facts)?;

@@ -936,3 +936,78 @@ fn frozen_offset_second_rounding_matches_legacy() {
         assert!(expected.ends_with(&format!("{}\"", dt.format("%:z"))));
     }
 }
+
+// These byte oracles previously exercised the uncalled Arrow-field renderer.
+// They now use the installed typed client renderer without source annotations.
+#[test]
+fn format_timestamp_microsecond_omits_zero_fraction() {
+    let batch = input(vec![Arc::new(TimestampMicrosecondArray::from(vec![0]))]);
+    let fields = vec![field(
+        N::Timestamp {
+            unit: U::Microsecond,
+            timezone: None,
+        },
+        P::TimestampContainerText,
+        true,
+    )];
+    assert_eq!(
+        encode(encoder(batch, fields), 1024).0,
+        row(&cell(b"1970-01-01 00:00:00"))
+    );
+}
+
+#[test]
+fn format_timestamp_microsecond_keeps_non_zero_fraction() {
+    let batch = input(vec![Arc::new(TimestampMicrosecondArray::from(vec![1]))]);
+    let fields = vec![field(
+        N::Timestamp {
+            unit: U::Microsecond,
+            timezone: None,
+        },
+        P::TimestampContainerText,
+        true,
+    )];
+    assert_eq!(
+        encode(encoder(batch, fields), 1024).0,
+        row(&cell(b"1970-01-01 00:00:00.000001"))
+    );
+}
+
+#[test]
+fn mysql_text_row_formats_time64_microsecond() {
+    let batch = input(vec![Arc::new(Time64MicrosecondArray::from(vec![
+        12_345_678,
+    ]))]);
+    let fields = vec![field(
+        N::Time {
+            unit: U::Microsecond,
+        },
+        P::ScalarText,
+        true,
+    )];
+    assert_eq!(
+        encode(encoder(batch, fields), 1024).0,
+        row(&cell(b"00:00:12.345678"))
+    );
+}
+
+#[test]
+fn mysql_text_row_uses_declared_struct_json_children() {
+    let array = StructArray::new(
+        vec![Arc::new(Field::new("payload", DataType::Utf8, true))].into(),
+        vec![Arc::new(StringArray::from(vec![Some(r#"{"a":1}"#)])) as ArrayRef],
+        None,
+    );
+    let declared = field(
+        N::Struct(vec![NamedRenderField {
+            name: "payload".into(),
+            field: field(N::Json, P::JsonText, true),
+        }]),
+        P::MysqlContainer,
+        true,
+    );
+    assert_eq!(
+        encode(encoder(input(vec![Arc::new(array)]), vec![declared]), 1024).0,
+        row(&cell(br#"{"payload":'{"a":1}'}"#)),
+    );
+}

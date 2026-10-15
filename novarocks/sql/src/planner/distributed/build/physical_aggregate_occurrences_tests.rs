@@ -224,7 +224,7 @@ impl Fixture {
                 .add_expression(
                     leaf,
                     t.clone(),
-                    ExprKind::Literal(if t.nullable {
+                    ExprKind::Literal(if t.nullable() {
                         LiteralValue::Null
                     } else {
                         LiteralValue::Int64(11)
@@ -247,7 +247,7 @@ impl Fixture {
         let kind = match source {
             Source::Star => None,
             Source::Value => Some(ExprKind::Value(v.unwrap())),
-            Source::Literal => Some(if t.data_type == DataType::Utf8 {
+            Source::Literal => Some(if *t.data_type() == DataType::Utf8 {
                 ExprKind::Literal(LiteralValue::Utf8("中国".into()))
             } else {
                 ExprKind::Literal(LiteralValue::Int64(7))
@@ -322,7 +322,10 @@ impl Fixture {
             let mut channels = binding.function.argument_types.to_vec();
             let ordered_type = channels[0].clone();
             channels.extend((0..order).map(|_| ordered_type.clone()));
-            binding.function.argument_types = channels.into_boxed_slice();
+            binding.function.argument_types =
+                novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                    channels.into_boxed_slice(),
+                );
         }
         alter(&mut binding);
         let arguments: Box<[ExprId]> = if matches!(source, Source::Star) {
@@ -1104,7 +1107,7 @@ fn aggregate_occurrences_wide_actual_channels_and_contexts_observe_real_quantum(
         panic!("selected value")
     };
     let (DataType::Struct(original), DataType::Struct(actual)) =
-        (&t.data_type, &selected.data_type)
+        (&t.data_type(), &selected.data_type())
     else {
         panic!("complete source")
     };

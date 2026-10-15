@@ -30,7 +30,7 @@ use crate::{
 use arrow_array::{Array, MapArray};
 use arrow_buffer::NullBufferBuilder;
 use arrow_schema::DataType;
-use novarocks_type_contract::ValueLogicalType;
+use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 use std::{alloc::Layout, cell::RefCell};
 pub(super) fn validate_profile(
     part: MapPart,
@@ -43,12 +43,12 @@ pub(super) fn validate_profile(
         ));
     };
     observe()?;
-    if source.logical_type != ValueLogicalType::Physical {
+    if source.logical_type() != ValueLogicalType::Physical {
         return Err(invalid(
             "map projection requires its exact Physical Map source",
         ));
     }
-    let DataType::Map(entries, _) = &source.data_type else {
+    let DataType::Map(entries, _) = source.data_type() else {
         return Err(invalid(
             "map projection requires its frozen Map source fields",
         ));
@@ -67,31 +67,38 @@ pub(super) fn validate_profile(
         MapPart::Values => &fields[1],
     };
     let result = contract.result_type();
-    let DataType::List(item) = &result.data_type else {
+    let DataType::List(item) = result.data_type() else {
         return Err(invalid(
             "map projection requires its real frozen List result field",
         ));
     };
     observe()?;
-    if result.logical_type != ValueLogicalType::Physical || !result.nullable {
+    if result.logical_type() != ValueLogicalType::Physical || !result.nullable() {
         return Err(invalid(
             "map projection requires its real nullable Physical List result",
         ));
     }
-    // Read the already validated field tag through its sole neutral author, then
-    // compare frozen nested data types with the existing observed author.
-    let source_tag = novarocks_type_contract::field_logical_type(selected)
-        .map_err(|_| invalid("map projection source field has invalid logical identity"))?;
-    let result_tag = novarocks_type_contract::field_logical_type(item)
-        .map_err(|_| invalid("map projection result field has invalid logical identity"))?;
-    observe()?;
-    if source_tag != result_tag
-        || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
-            selected.data_type(),
-            item.data_type(),
-            &mut observe,
-        )?
-    {
+    let index = match part {
+        MapPart::Keys => 0,
+        MapPart::Values => 1,
+    };
+    let selected_semantic = source
+        .value_type()
+        .child_type_at(index)
+        .ok_or_else(|| invalid("map projection has no selected semantic child"))?;
+    let item_semantic = result
+        .value_type()
+        .child_type_at(0)
+        .ok_or_else(|| invalid("map projection has no result semantic child"))?;
+    if !FunctionValueType::borrowed_value_domains_equal_observed(
+        selected_semantic,
+        item_semantic,
+        &mut observe,
+    )? || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
+        selected.data_type(),
+        item.data_type(),
+        &mut observe,
+    )? {
         return Err(invalid(
             "map projection result differs from its actual selected key/value domain",
         ));
@@ -119,7 +126,7 @@ pub(super) fn evaluate<'a>(
             .ok_or_else(|| internal("map projection exact Map source has foreign carrier class"))?;
         let selection = input.selection();
         let result = input.contract().result_type();
-        let DataType::List(field) = &result.data_type else {
+        let DataType::List(field) = result.data_type() else {
             unreachable!("validated result")
         };
         Layout::array::<i32>(
@@ -192,7 +199,7 @@ pub(super) fn evaluate<'a>(
         })?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &result.data_type,
+            result.data_type(),
             values,
             errors.into_boxed_slice(),
             || work.borrow_mut().step(),

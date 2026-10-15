@@ -32,9 +32,8 @@ use std::sync::Arc;
 use super::build_requirements::{
     BuildComponentRequirements, NullKeyRequirement, RowPayloadRequirement,
 };
-use super::join_hash_map::build_store::BuildStore;
+use super::join_hash_map::build_store::{BuildStore, BuildStoreChunkProjection};
 use super::join_hash_map::method::JoinHashMap;
-use crate::exec::chunk::Chunk;
 
 #[derive(Clone)]
 /// Materialized build-side artifact consumed by join probe operators.
@@ -137,7 +136,10 @@ impl BuildView {
         self.artifact.build_table.clone()
     }
 
-    pub(crate) fn build_chunk(&self, context: &'static str) -> Result<Arc<Chunk>, String> {
+    pub(crate) fn build_chunk(
+        &self,
+        context: &'static str,
+    ) -> Result<BuildStoreChunkProjection, String> {
         let store = self.artifact.build_store.as_ref().ok_or_else(|| {
             format!(
                 "hash join row payload required for {context} but missing; required={:?} provided={:?}",
@@ -147,7 +149,7 @@ impl BuildView {
         Ok(store.chunk())
     }
 
-    pub(crate) fn optional_build_chunk(&self) -> Option<Arc<Chunk>> {
+    pub(crate) fn optional_build_chunk(&self) -> Option<BuildStoreChunkProjection> {
         self.artifact
             .build_store
             .as_ref()

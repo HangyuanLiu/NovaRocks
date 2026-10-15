@@ -209,6 +209,7 @@ struct TestTaskHost {
     /// and before it publishes that task's terminal.
     rollback_gate: Option<(TaskId, Arc<InstallGate>)>,
     prepared_bodies: Mutex<Vec<Bytes>>,
+    preparation_stops: Mutex<Vec<(TaskIdentity, crate::TaskPreparationStopView)>>,
     prepared_root: Mutex<Option<Arc<crate::root_result_channel::RootResultChannel>>>,
     receivers_installed: AtomicUsize,
     receivers_removed: AtomicUsize,
@@ -243,6 +244,17 @@ impl TestTaskHost {
             .expect("test prepared bodies")
             .clone()
     }
+
+    fn preparation_stop(&self, identity: TaskIdentity) -> crate::TaskPreparationStopView {
+        self.preparation_stops
+            .lock()
+            .expect("test preparation stops")
+            .iter()
+            .find(|(task, _)| *task == identity)
+            .expect("host received the preparation's actual stop view")
+            .1
+            .clone()
+    }
 }
 
 impl TaskExecutionHost for TestTaskHost {
@@ -267,9 +279,14 @@ impl TaskExecutionHost for TestTaskHost {
 
     fn install_receiver(
         &self,
-        _descriptor: &TaskDescriptor,
+        descriptor: &TaskDescriptor,
         input: TaskCreationInput,
+        preparation_stop: crate::TaskPreparationStopView,
     ) -> Result<crate::PreparedTaskInstallation, HostRejection> {
+        self.preparation_stops
+            .lock()
+            .expect("test preparation stops")
+            .push((descriptor.identity(), preparation_stop));
         let (plan, _assignment) = input.into_parts();
         if let Some(gate) = &self.install_gate
             && self
@@ -2274,6 +2291,8 @@ fn accepted_create_replays_before_preparation_and_cancel_stops_before_submit() {
         TaskState::Planned
     );
     gate.wait_until_entered();
+    let host_stop = fixture.task_host.preparation_stop(identity);
+    assert_eq!(host_stop.stop_cause(), None);
     let replay = fixture
         .registry
         .accept_create_task(&request, body(STREAM_PLAN));
@@ -2286,6 +2305,11 @@ fn accepted_create_replays_before_preparation_and_cancel_stops_before_submit() {
         CancelReason::UpstreamNoLongerNeeded,
     ));
     assert_eq!(stopped.outcome(), OperationOutcome::Accepted, "{stopped:?}");
+    assert_eq!(
+        host_stop.stop_cause(),
+        Some(crate::TaskPreparationStopCause::Cancelled)
+    );
+    assert!(fixture.registry.has_preparation_charge(identity));
     gate.release();
     wait_for_accepted_state(&fixture.registry, &request, TaskState::Canceled);
     assert_eq!(fixture.task_host.submitted.load(Ordering::SeqCst), 0);
@@ -3424,8 +3448,11 @@ fn bounded_preparing_stop_interleavings_keep_capacity_until_actual_exit() {
             "{trace:?}"
         );
         gate.wait_until_entered();
+        let host_stop = fixture.task_host.preparation_stop(identity);
+        assert_eq!(host_stop.stop_cause(), None, "{trace:?}");
         let quiesce = QuiesceQueryContext::new(TaskOperationId::new_v7(), context);
         let mut expired = false;
+        let mut cancelled = false;
         let mut fenced = false;
         for event in trace {
             match event {
@@ -3462,6 +3489,7 @@ fn bounded_preparing_stop_interleavings_keep_capacity_until_actual_exit() {
                         ),
                         "{trace:?}: {receipt:?}"
                     );
+                    cancelled = true;
                 }
                 ReplayFirst => {
                     let receipt = fixture
@@ -3505,6 +3533,21 @@ fn bounded_preparing_stop_interleavings_keep_capacity_until_actual_exit() {
                 fixture.registry.termination_cause(context),
                 expired.then_some(AbortCause::LeaseExpired),
                 "{trace:?} after {event:?}"
+            );
+            assert_eq!(
+                host_stop.stop_cause(),
+                if expired {
+                    Some(crate::TaskPreparationStopCause::LeaseExpired)
+                } else if cancelled || fenced {
+                    Some(crate::TaskPreparationStopCause::Cancelled)
+                } else {
+                    None
+                },
+                "{trace:?} after {event:?}: decoding must observe the original stop"
+            );
+            assert!(
+                fixture.registry.has_preparation_charge(identity),
+                "{trace:?}"
             );
             assert_eq!(
                 fixture.task_host.submitted.load(Ordering::SeqCst),

@@ -16,7 +16,8 @@
 // under the License.
 //! Actual SQL emission/public-declaration producer and downstream publication consumers.
 //! Frozen v12/v10 VALUES probes stay unchanged as diagnostic evidence.
-//! Non-NULL public obligations use the sole actual ConnectorReadTableFacts v13 producer.
+//! Required source columns use the sole actual ConnectorReadTableFacts producer.
+//! Public NULL guarantees are the completed expression owner's guarantees.
 use super::numeric_unary_original_nonnull_sql_baseline_tests::sql_source as nonnull_source;
 use arrow::datatypes::DataType;
 use novarocks_functions::ConstantPolicy;
@@ -93,18 +94,22 @@ fn table_free_sql(
     }
 }
 
-fn client_candidate(
-    source: novarocks_sql::compiler::SqlAuthoredPhysicalPlan,
+fn freeze_root_purpose(
+    candidate: CompletedPhysicalPlanCandidate,
 ) -> CompletedPhysicalPlanCandidate {
-    let candidate =
-        CompletedPhysicalPlanCandidate::for_sql_program(source, &SqlCompileControl::unbounded())
-            .unwrap();
-    let render = novarocks_sql::compiler::client_render_schema(candidate.plan(), 0).unwrap();
+    // Borrow the same SQL-owned public declaration before publishing any
+    // candidate aliases. This is the application completion's real purpose
+    // handoff; neither the caller's possibly wrong output nor Arrow authors it.
+    let render = novarocks_sql::compiler::client_render_schema_from_port(
+        candidate.original_public_result_port(),
+        0,
+    )
+    .expect("original public client-row declaration");
     candidate
         .freeze_root_output(novarocks_result_contract::FrozenRootOutput::ClientRows(
             render,
         ))
-        .unwrap()
+        .expect("same completed source freezes its root purpose before aliases")
 }
 
 fn freeze(
@@ -170,17 +175,31 @@ fn numeric_unary_public_transport_same_original_source_and_all_consumers() {
             .enumerate()
         {
             assert_eq!(before, public, "same original ordered declaration at {n}");
-            assert_eq!(public.ty.data_type, dt);
-            assert!(!public.ty.nullable);
+            assert_eq!(public.ty.data_type().clone(), dt);
+            assert_eq!(public.ty.nullable(), n != 1);
+            assert_eq!(public.ty.nullable(), computed.fields[n].ty.nullable());
             assert_eq!(public.value, computed.fields[n].value);
             assert_eq!(public.alias, computed.fields[n].alias);
             assert_eq!(public.name, computed.fields[n].name);
-            assert_eq!(public.ty.logical_type, computed.fields[n].ty.logical_type);
-            assert_eq!(public.ty.data_type, computed.fields[n].ty.data_type);
+            assert_eq!(
+                public.ty.logical_type(),
+                computed.fields[n].ty.logical_type()
+            );
+            assert_eq!(public.ty.data_type(), computed.fields[n].ty.data_type());
         }
-        assert!(computed.fields[0].ty.nullable);
-        assert!(!computed.fields[1].ty.nullable);
-        assert!(computed.fields[2].ty.nullable);
+        assert!(computed.fields[0].ty.nullable());
+        assert!(!computed.fields[1].ty.nullable());
+        assert!(computed.fields[2].ty.nullable());
+        let original_candidate = freeze_root_purpose(
+            CompletedPhysicalPlanCandidate::for_sql_program(
+                original,
+                &SqlCompileControl::unbounded(),
+            )
+            .unwrap(),
+        );
+        let original_output =
+            OutputContract::from_completed_candidate(QueryExecutionKind::Read, &original_candidate)
+                .unwrap();
         // Clone shares the publication-proved original port, never copies its fields.
         let cloned = source.clone();
         assert!(ptr::eq(
@@ -191,7 +210,48 @@ fn numeric_unary_public_transport_same_original_source_and_all_consumers() {
                 .original_port()
         ));
         drop(cloned);
-        let candidate = client_candidate(source);
+        let candidate = CompletedPhysicalPlanCandidate::for_sql_program(
+            source,
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        // Preserve the original false-public-obligation rejection at the
+        // exact root boundary. Only the two computed negations are forged.
+        let wrong_candidate = CompletedPhysicalPlanCandidate::for_sql_program(
+            nonnull_source(
+                sql,
+                dt.clone(),
+                SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration,
+            ),
+            &SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        let render = novarocks_sql::compiler::client_render_schema_from_port(
+            wrong_candidate.original_public_result_port(),
+            0,
+        )
+        .unwrap();
+        let mut wrong_columns = render.columns().to_vec();
+        wrong_columns[0].field.nullable = false;
+        wrong_columns[2].field.nullable = false;
+        let wrong_render =
+            novarocks_result_contract::ClientRenderSchema::try_new(wrong_columns, 3).unwrap();
+        let refusal = wrong_candidate
+            .freeze_root_output(novarocks_result_contract::FrozenRootOutput::ClientRows(
+                wrong_render,
+            ))
+            .unwrap_err()
+            .to_string();
+        assert!(refusal.contains("result_port.render_schema"), "{refusal}");
+        assert!(
+            refusal.contains("render occurrence differs at ordinal 0"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains("render occurrence differs at ordinal 2"),
+            "{refusal}"
+        );
+        let candidate = freeze_root_purpose(candidate);
         assert_eq!(
             candidate.sql_emission_mode(),
             Some(SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration)
@@ -199,18 +259,34 @@ fn numeric_unary_public_transport_same_original_source_and_all_consumers() {
         let output =
             OutputContract::from_completed_candidate(QueryExecutionKind::Read, &candidate).unwrap();
         assert_eq!(output.fields().len(), 3);
-        for (field, label) in
-            output
-                .fields()
-                .iter()
-                .zip(["original_negated", "original_source", "repeated_alias"])
+        assert_eq!(output.fields(), original_output.fields());
+        for (ordinal, (field, label)) in output
+            .fields()
+            .iter()
+            .zip(["original_negated", "original_source", "repeated_alias"])
+            .enumerate()
         {
             assert_eq!(field.name(), label);
             assert_eq!(field.data_type(), &dt);
-            assert!(!field.nullable());
+            assert_eq!(field.nullable(), ordinal != 1);
         }
-        let wrong = OutputContract::from_completed_plan(QueryExecutionKind::Read, candidate.plan())
-            .unwrap();
+        let from_plan =
+            OutputContract::from_completed_plan(QueryExecutionKind::Read, candidate.plan())
+                .unwrap();
+        assert_eq!(from_plan.fields(), output.fields());
+        let wrong = OutputContract::Rows(
+            output
+                .fields()
+                .iter()
+                .map(|field| {
+                    novarocks_query_application::api::ResultField::new(
+                        field.name(),
+                        field.value_type().with_nullable(false).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        );
         assert_eq!(
             freeze(candidate.clone(), wrong).unwrap_err(),
             "completed plan output differs from its frozen execution contract"
@@ -240,7 +316,12 @@ fn numeric_unary_public_transport_original_and_unchanged_nested_types_use_actual
             if mode == SqlPhysicalEmissionMode::OriginalNativeV1 {
                 assert!(ptr::eq(original.original_port(), port));
             }
-            let candidate = client_candidate(source);
+            let candidate = CompletedPhysicalPlanCandidate::for_sql_program(
+                source,
+                &SqlCompileControl::unbounded(),
+            )
+            .unwrap();
+            let candidate = freeze_root_purpose(candidate);
             let out =
                 OutputContract::from_completed_candidate(QueryExecutionKind::Read, &candidate)
                     .unwrap();

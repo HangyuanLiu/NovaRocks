@@ -80,7 +80,7 @@ pub(super) fn definition(
 }
 
 pub(super) struct WindowRankingOwner {
-    resolver: BuiltinScalarResolver,
+    resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
     operation: RankingOperation,
@@ -122,7 +122,7 @@ impl WindowRankingOwner {
             })
             .collect();
         Ok(Self {
-            resolver,
+            resolver: Arc::new(resolver),
             declaration,
             implementations,
             operation,
@@ -175,6 +175,10 @@ impl FunctionBindingResolver for WindowRankingOwner {
 }
 
 impl PureFunctionMetadataOwner for WindowRankingOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::fixed_scalar(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -203,41 +207,21 @@ impl FunctionEffectOwner for WindowRankingOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        let result = (|| {
-            let exact_header = input.function_id == self.declaration.function_id()
-                && input.kind == FunctionKind::Window;
-            work.step().map_err(FunctionEffectOwnerError::Control)?;
-            if !exact_header {
-                return Err(FunctionBindingError::UnknownFunction.into());
-            }
-            let exact_scope = input.environment.is_empty()
-                && (matches!(input.proof_scope, CallProofScope::Unconditional)
-                    || input.proof_scope == CallProofScope::Domain(input.context.domain));
-            work.step().map_err(FunctionEffectOwnerError::Control)?;
-            if !exact_scope {
-                return Err(FunctionBindingError::InvalidBinding(
-                    "window_ranking has no environment dependencies and requires an exact proof scope"
-                        .into(),
-                )
-                .into());
-            }
-            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        self.refine_core(input, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => {
-                        FunctionEffectOwnerError::Control(error)
-                    }
-                    other => FunctionEffectOwnerError::Owner(other),
-                })?;
-            Ok(self.call_effects(input.proof_scope))
-        })();
-        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
-            return result;
-        }
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        result
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_core(input, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -248,50 +232,21 @@ impl PureWindowImplementation for WindowRankingOwner {
         contract: Arc<WindowCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedWindowKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        let result: Result<Arc<dyn PreparedWindowKernel>, KernelFailure> = (|| {
-            let exact_call = input.function_id == self.declaration.function_id()
-                && input.kind == FunctionKind::Window
-                && contract.call().function_id() == input.function_id
-                && std::ptr::eq(contract.call().selected(), input.selected)
-                && contract.call().context() == input.context
-                && contract.call().decimal_overflow_policy() == input.decimal_overflow_policy
-                && contract.call().effects() == &self.call_effects(input.proof_scope)
-                && input.environment.is_empty();
-            work.step().map_err(compile_failure)?;
-            if !exact_call {
-                return Err(invalid(
-                    "window_ranking preparation differs from its exact checked call",
-                ));
-            }
-            work.flush().map_err(compile_failure)?;
+        self.prepare_core(input, contract, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => compile_failure(error),
-                    _ => invalid("window_ranking preparation has a stale selected binding"),
-                })?;
-            canonical_call(input, *contract.options(), self.operation, &mut work)?;
-            work.flush().map_err(compile_failure)?;
-            // The prepared object retains the same canonical contract. Its body is
-            // a static pure implementation and needs no live resolver or authority.
-            let prepared = Arc::new(PreparedRanking {
-                contract,
-                operation: self.operation,
-            }) as Arc<dyn PreparedWindowKernel>;
-            work.flush().map_err(compile_failure)?;
-            Ok(prepared)
-        })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
-            return result;
-        }
-        work.finish().map_err(compile_failure)?;
-        result
+        })
+    }
+    fn prepare_window_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<WindowCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedWindowKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_core(input, contract, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -317,7 +272,7 @@ fn canonical_call(
         RankingOperation::CumeDist | RankingOperation::PercentRank => DataType::Float64,
     };
     let exact = matches!(&input.selected.result_type, FunctionResultType::Scalar(ty)
-        if ty.data_type == carrier && ty.logical_type == ValueLogicalType::Physical && ty.nullable);
+        if *ty.data_type() == carrier && ty.logical_type() == ValueLogicalType::Physical && ty.nullable());
     work.step().map_err(compile_failure)?;
     if !exact {
         return Err(invalid(
@@ -336,4 +291,97 @@ fn canonical_call(
     // Legacy ranking ignores frame membership and NULL treatment. Preserve the
     // exact options; this is not a default frame or an input comparer.
     Ok(())
+}
+
+impl WindowRankingOwner {
+    fn refine_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        let result = (|| {
+            let exact_header = input.function_id == self.declaration.function_id()
+                && input.kind == FunctionKind::Window;
+            work.step().map_err(FunctionEffectOwnerError::Control)?;
+            if !exact_header {
+                return Err(FunctionBindingError::UnknownFunction.into());
+            }
+            let exact_scope = input.environment.is_empty()
+                && (matches!(input.proof_scope, CallProofScope::Unconditional)
+                    || input.proof_scope == CallProofScope::Domain(input.context.domain));
+            work.step().map_err(FunctionEffectOwnerError::Control)?;
+            if !exact_scope {
+                return Err(FunctionBindingError::InvalidBinding(
+                    "window_ranking has no environment dependencies and requires an exact proof scope"
+                        .into(),
+                )
+                .into());
+            }
+            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+                other => FunctionEffectOwnerError::Owner(other),
+            })?;
+            Ok(self.call_effects(input.proof_scope))
+        })();
+        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
+            return result;
+        }
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
+        result
+    }
+    fn prepare_core(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<WindowCallContract>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<Arc<dyn PreparedWindowKernel>, KernelFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(compile_failure)?;
+        let result: Result<Arc<dyn PreparedWindowKernel>, KernelFailure> = (|| {
+            let exact_call = input.function_id == self.declaration.function_id()
+                && input.kind == FunctionKind::Window
+                && contract.call().function_id() == input.function_id
+                && std::ptr::eq(contract.call().selected(), input.selected)
+                && contract.call().context() == input.context
+                && contract.call().decimal_overflow_policy() == input.decimal_overflow_policy
+                && contract.call().effects() == &self.call_effects(input.proof_scope)
+                && input.environment.is_empty();
+            work.step().map_err(compile_failure)?;
+            if !exact_call {
+                return Err(invalid(
+                    "window_ranking preparation differs from its exact checked call",
+                ));
+            }
+            work.flush().map_err(compile_failure)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => compile_failure(error),
+                _ => invalid("window_ranking preparation has a stale selected binding"),
+            })?;
+            canonical_call(input, *contract.options(), self.operation, &mut work)?;
+            work.flush().map_err(compile_failure)?;
+            // The prepared object retains the same canonical contract. Its body is
+            // a static pure implementation and needs no live resolver or authority.
+            let prepared = Arc::new(PreparedRanking {
+                contract,
+                operation: self.operation,
+            }) as Arc<dyn PreparedWindowKernel>;
+            work.flush().map_err(compile_failure)?;
+            Ok(prepared)
+        })();
+        if matches!(
+            &result,
+            Err(KernelFailure::Cancelled
+                | KernelFailure::DeadlineExceeded
+                | KernelFailure::ResourceExhausted)
+        ) {
+            return result;
+        }
+        work.finish().map_err(compile_failure)?;
+        result
+    }
 }

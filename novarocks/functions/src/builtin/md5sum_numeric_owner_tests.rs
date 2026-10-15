@@ -129,21 +129,21 @@ fn md5sum_numeric_owner_exact_flat_profiles_and_called_on_null_contract() {
         DataType::Decimal256(76, 2),
     ];
     for ty in profiles {
-        let source = FunctionValueType::new(ty, true);
+        let source = FunctionValueType::from_legacy_declared_projection(ty, true);
         let prepared = prepared_for_test("md5sum_numeric", &[source.clone()]).unwrap();
         assert_eq!(
             prepared.contract().selected().argument_types.as_ref(),
             &[crate::FunctionArgumentType::Value(source)]
         );
         assert_eq!(
-            prepared.contract().result_type().data_type,
+            prepared.contract().result_type().data_type().clone(),
             DataType::FixedSizeBinary(16)
         );
         assert_eq!(
-            prepared.contract().result_type().logical_type,
+            prepared.contract().result_type().logical_type(),
             ValueLogicalType::LargeInt
         );
-        assert!(prepared.contract().result_type().nullable);
+        assert!(prepared.contract().result_type().nullable());
         assert_eq!(
             prepared.contract().effects().argument_control,
             ArgumentControl::Eager
@@ -208,7 +208,13 @@ fn md5sum_numeric_owner_rejects_unproven_display_shapes_and_preserves_public_ari
         DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None),
         DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())),
     ] {
-        assert!(prepared_for_test("md5sum_numeric", &[FunctionValueType::new(ty, true)]).is_err());
+        assert!(
+            prepared_for_test(
+                "md5sum_numeric",
+                &[FunctionValueType::from_legacy_declared_projection(ty, true)]
+            )
+            .is_err()
+        );
     }
     let largeint = FunctionValueType::try_with_logical_type(
         DataType::FixedSizeBinary(16),

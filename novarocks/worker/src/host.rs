@@ -372,6 +372,7 @@ pub trait TaskExecutionHost: Send + Sync {
         &self,
         descriptor: &TaskDescriptor,
         input: TaskCreationInput,
+        preparation_stop: crate::TaskPreparationStopView,
     ) -> Result<PreparedTaskInstallation, HostRejection>;
 
     fn remove_receiver(&self, descriptor: &TaskDescriptor);

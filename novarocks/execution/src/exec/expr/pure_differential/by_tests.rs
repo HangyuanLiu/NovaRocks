@@ -90,7 +90,7 @@ fn check(
             .float_comparison(FloatComparison::Exact),
     );
     assert_eq!(summary.matched_failures, 0);
-    assert!(summary.result_type.nullable);
+    assert!(summary.result_type.nullable());
     assert!(summary.null_results >= 4);
 }
 #[test]
@@ -234,7 +234,7 @@ fn pure_differential_by_empty_null_keys_null_winning_values_and_constants() {
                         .partitions(13, 1721),
                 );
                 assert_eq!(summary.matched_failures, 0);
-                assert!(summary.result_type.nullable);
+                assert!(summary.result_type.nullable());
                 assert_eq!(summary.null_results, 2);
             }
             for null_key in [false, true] {

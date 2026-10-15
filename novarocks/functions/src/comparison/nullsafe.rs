@@ -37,18 +37,18 @@ impl PreparedNullSafeComparisonRecipe {
         let result = (|| {
             validate_type_observed(left, &mut work).map_err(ComparisonPrepareError::Kernel)?;
             validate_type_observed(right, &mut work).map_err(ComparisonPrepareError::Kernel)?;
-            let same_root = left.logical_type == right.logical_type;
+            let same_root = left.logical_type() == right.logical_type();
             work.step()?;
             if !same_root {
                 return Err(ComparisonPrepareError::TypeMismatch);
             }
-            if left.logical_type != ValueLogicalType::Physical {
+            if left.logical_type() != ValueLogicalType::Physical {
                 return Err(ComparisonPrepareError::Unsupported);
             }
             // This is the legacy null-safe scalar capability, not the ordinary
             // Arrow comparison matrix. No data-dependent NULL-only permission.
             let supported = matches!(
-                &left.data_type,
+                left.data_type(),
                 DataType::Null
                     | DataType::Boolean
                     | DataType::Int8
@@ -67,14 +67,14 @@ impl PreparedNullSafeComparisonRecipe {
                 return Err(ComparisonPrepareError::Unsupported);
             }
             if !arrow_data_types_exact_observed::<ComparisonPrepareError>(
-                &left.data_type,
-                &right.data_type,
+                left.data_type(),
+                right.data_type(),
                 || work.step().map_err(Into::into),
             )? {
                 return Err(ComparisonPrepareError::TypeMismatch);
             }
             let leaf =
-                FlatLeaf::from_type(&left.data_type).ok_or(ComparisonPrepareError::Unsupported)?;
+                FlatLeaf::from_type(left.data_type()).ok_or(ComparisonPrepareError::Unsupported)?;
             work.step()?;
             // These admitted carriers have no retained field graph or timezone.
             let recipe = Self {
@@ -147,7 +147,7 @@ impl PreparedNullSafeComparisonRecipe {
             let rn = self.leaf == FlatLeaf::Null || ra.is_null(r);
             work.step()?;
             if self.leaf != FlatLeaf::Null
-                && ((ln && !self.left.nullable) || (rn && !self.right.nullable))
+                && ((ln && !self.left.nullable()) || (rn && !self.right.nullable()))
             {
                 return Err(invalid(
                     "non-null null-safe comparison argument contains a selected NULL",

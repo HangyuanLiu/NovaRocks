@@ -86,16 +86,36 @@ fn source_token_retains_exact_root_identity_full_facts_and_sparse_namespaces() {
             Arc::new(Field::new("same-name", DataType::Utf8, true)),
         ),
     ];
-    let encoded =
-        encode_type_table_sources(&values, &fields, limits(), &Control::default()).unwrap();
+    let control = Control::default();
+    let values_only = encode_type_table_sources(&values, &[], limits(), &control).unwrap();
+    let source_roots: Vec<_> = fields.iter().map(|(id, field)| (*id, field)).collect();
+    let mut source_work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    let source_wire =
+        encode_source_field_table_pure_in(&source_roots, limits(), &mut source_work).unwrap();
+    source_work.finish().unwrap();
+    // Compose this fixture from the same two pure component authors. The
+    // source roots lend original Fields; neither their attributes nor their
+    // carrier graphs enter the execution field namespace.
+    let encoded = EncodedTypeTable {
+        table: values_only.into_wire(),
+        values: ValueRootSources::Owned(&values),
+        fields: FieldRootSources::Owned(&[]),
+        source_table: Some(source_wire),
+        source_fields: FieldRootSources::Owned(&fields),
+        writers: &[],
+    };
     assert_eq!(encoded.source_counts(), (2, 2));
+    assert_eq!(source_roots.len(), 2);
     let value = finish_lookup(&Control::default(), |work| {
         encoded.value_type_observed(u32::MAX, work)
     })
     .unwrap();
     assert!(std::ptr::eq(value, &values[1].1));
-    assert_eq!(value.logical_type, ValueLogicalType::Json);
-    let field = finish_lookup(&Control::default(), |work| encoded.field_observed(0, work)).unwrap();
+    assert_eq!(value.logical_type(), ValueLogicalType::Json);
+    let field = finish_lookup(&Control::default(), |work| {
+        encoded.source_field_observed(0, work)
+    })
+    .unwrap();
     assert!(std::ptr::eq(field, &fields[0].1));
     assert!(Arc::ptr_eq(field, &root));
     assert_eq!(field.metadata()["root"], "untouched");
@@ -105,7 +125,7 @@ fn source_token_retains_exact_root_identity_full_facts_and_sparse_namespaces() {
     assert_eq!(children[0].metadata()["provider.id"], "original");
     assert!(!children[0].is_nullable());
     let field = finish_lookup(&Control::default(), |work| {
-        encoded.field_observed(u32::MAX, work)
+        encoded.source_field_observed(u32::MAX, work)
     })
     .unwrap();
     assert!(field.metadata().is_empty());
@@ -117,12 +137,31 @@ fn source_token_retains_exact_root_identity_full_facts_and_sparse_namespaces() {
             .collect::<Vec<_>>(),
         vec![0, u32::MAX]
     );
-    assert!(wire.fields.iter().any(|field| {
-        field.id == 0
-            && field
+    // Execution shape has no source-attribute slots. Publish the same original
+    // roots through the existing independent SourceFieldTable author.
+    let source_wire = encoded.as_source_wire().unwrap();
+    assert!(source_wire.field_facts.iter().any(|facts| {
+        facts.field_id == Some(0)
+            && facts
                 .metadata
                 .iter()
                 .any(|entry| entry.key == "root" && entry.value == "untouched")
+    }));
+    let child_id = source_wire
+        .shape
+        .as_ref()
+        .unwrap()
+        .fields
+        .iter()
+        .find(|field| field.name == "child")
+        .unwrap()
+        .id;
+    assert!(source_wire.field_facts.iter().any(|facts| {
+        facts.field_id == Some(child_id)
+            && facts
+                .metadata
+                .iter()
+                .any(|entry| entry.key == "provider.id" && entry.value == "original")
     }));
 }
 #[test]

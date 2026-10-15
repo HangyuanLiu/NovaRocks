@@ -21,9 +21,10 @@
 //! provider owns the physical strategy, the signed match layout, and the
 //! base version; the application only persists what it is handed.
 
+#[cfg(test)]
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Field};
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationEffectField,
@@ -37,8 +38,8 @@ use sha2::{Digest, Sha256};
 
 use crate::commit::validation::row_mutation_strategy_from_metadata;
 use crate::commit::write_shared::{
-    exact_requested_write_fields_at_schema, snapshot_token, write_target_schema,
-    write_target_snapshot_id,
+    exact_requested_write_fields_from_declaration, snapshot_token, write_target_schema,
+    write_target_snapshot_id, writer_value_with_nullable,
 };
 use crate::file_reader::execution_payload::{decode_payload, encode_payload};
 use crate::iceberg::spec::{FormatVersion, TableMetadata};
@@ -119,21 +120,8 @@ pub(crate) fn prepare_row_mutation(
     // Insert rows.  The signed match layout therefore declares precisely those
     // fields nullable; Delete/Replace validation still rejects null keys.
     let insert_eligible = request.intent.accepts(ConnectorRowMutationEffect::Insert);
-    let identity_fields = metadata_arrow_fields(&payload.metadata_columns)?
-        .into_iter()
-        .enumerate()
-        .map(|(ordinal, field)| {
-            ConnectorMutationSourceField::new(
-                row_mutation_identity_token(owner, &request.table, ordinal),
-                field
-                    .as_ref()
-                    .clone()
-                    .with_nullable(field.is_nullable() || insert_eligible),
-                ordinal as u32,
-            )
-        })
-        .collect::<Vec<_>>();
-    if identity_fields.is_empty() {
+    let identity_source_fields = metadata_arrow_fields(&payload.metadata_columns)?;
+    if identity_source_fields.is_empty() {
         return Ok(ConnectorRowMutationPreparationOutcome::Denied(
             ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -170,16 +158,41 @@ pub(crate) fn prepare_row_mutation(
             ))
         })
         .collect::<Vec<_>>();
-    let target_schema = Schema::new(
-        exact_requested_write_fields_at_schema(
-            &metadata,
-            &target_iceberg_schema,
-            &requested_target_fields,
-        )?
-        .into_iter()
-        .map(|field| Arc::new(field.field().clone()))
-        .collect::<Vec<_>>(),
-    );
+    let (target_fields, identity_fields) =
+        crate::metadata::with_pure_schema_creation(&request.context, |creation| {
+            let execution = crate::schema_mapping::catalog_value::table(
+                &metadata,
+                &target_iceberg_schema,
+                &payload.metadata_columns,
+                creation,
+            )
+            .map_err(crate::metadata::metadata_creation_error)?;
+            let targets = exact_requested_write_fields_from_declaration(
+                &metadata,
+                &target_iceberg_schema,
+                &requested_target_fields,
+                &execution,
+                creation,
+            )?;
+            let offset = target_iceberg_schema.as_struct().fields().len();
+            let mut identity = creation
+                .reserve(identity_source_fields.len())
+                .map_err(crate::metadata::metadata_creation_error)?;
+            for (ordinal, field) in identity_source_fields.iter().enumerate() {
+                let value = writer_value_with_nullable(
+                    &execution.bindings()[offset + ordinal],
+                    field.is_nullable() || insert_eligible,
+                    creation,
+                )?;
+                identity.push(ConnectorMutationSourceField::try_new_typed(
+                    row_mutation_identity_token(owner, &request.table, ordinal),
+                    field.as_ref().clone().with_nullable(value.nullable()),
+                    ordinal as u32,
+                    value,
+                )?);
+            }
+            Ok((targets, identity))
+        })?;
     // The match query must scan the exact target ref/base chosen above. The
     // ordinary admitted table handle names the provider's default/current ref,
     // so reusing it would silently scan main for a branch mutation. Freeze a
@@ -217,41 +230,49 @@ pub(crate) fn prepare_row_mutation(
             "Iceberg row-mutation identity layout exceeds u32 ordinals",
         )
     })?;
-    let target_width = u32::try_from(target_schema.fields().len()).map_err(|_| {
+    let target_width = u32::try_from(target_fields.len()).map_err(|_| {
         ConnectorError::new(
             ConnectorErrorKind::ResourceExhausted,
             "Iceberg row-mutation target layout exceeds u32 ordinals",
         )
     })?;
-    let before_fields = target_schema
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(ordinal, field)| {
-            ConnectorMutationTargetField::new(
-                row_mutation_field_token(owner, &request.table, b"before", ordinal),
-                field
-                    .as_ref()
-                    .clone()
-                    .with_nullable(field.is_nullable() || insert_eligible),
-                target_start + u32::try_from(ordinal).expect("target ordinal fits u32"),
-            )
-        })
-        .collect::<Vec<_>>();
-    let after_fields = target_schema
-        .fields()
-        .iter()
-        .enumerate()
-        .map(|(ordinal, field)| {
-            ConnectorMutationTargetField::new(
-                row_mutation_field_token(owner, &request.table, b"after", ordinal),
-                field.as_ref().clone(),
-                target_start
-                    + target_width
-                    + u32::try_from(ordinal).expect("target ordinal fits u32"),
-            )
-        })
-        .collect::<Vec<_>>();
+    let (before_fields, after_fields) =
+        crate::metadata::with_pure_schema_creation(&request.context, |creation| {
+            let mut before = creation
+                .reserve(target_fields.len())
+                .map_err(crate::metadata::metadata_creation_error)?;
+            let mut after = creation
+                .reserve(target_fields.len())
+                .map_err(crate::metadata::metadata_creation_error)?;
+            for (ordinal, field) in target_fields.iter().enumerate() {
+                let value = field.execution_type().ok_or_else(|| {
+                    ConnectorError::new(
+                        ConnectorErrorKind::Internal,
+                        "provider target declaration is absent",
+                    )
+                })?;
+                let before_value = writer_value_with_nullable(
+                    value,
+                    value.nullable() || insert_eligible,
+                    creation,
+                )?;
+                before.push(ConnectorMutationTargetField::try_new_typed(
+                    row_mutation_field_token(owner, &request.table, b"before", ordinal),
+                    field.field().clone().with_nullable(before_value.nullable()),
+                    target_start + u32::try_from(ordinal).expect("target ordinal fits u32"),
+                    before_value,
+                )?);
+                after.push(ConnectorMutationTargetField::try_new_typed(
+                    row_mutation_field_token(owner, &request.table, b"after", ordinal),
+                    field.field().clone(),
+                    target_start
+                        + target_width
+                        + u32::try_from(ordinal).expect("target ordinal fits u32"),
+                    value.clone(),
+                )?);
+            }
+            Ok((before, after))
+        })?;
     let effect_field = ConnectorMutationEffectField::try_new(
         row_mutation_effect_token(owner, &request.table),
         Field::new("__row_mutation_effect", DataType::Int8, false),

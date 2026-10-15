@@ -25,7 +25,7 @@ use crate::physical_provider_binding_v2::{
 };
 use crate::physical_type_v2::{
     PackageTypeProjectionLimits, WriterTypeSource, decode_package_type_table_observed,
-    encode_type_table_writer_sources_observed,
+    encode_borrowed_type_namespaces_sources_in,
 };
 use arrow::datatypes::{DataType, Field, TimeUnit};
 use novarocks_connector_contract as c;
@@ -138,17 +138,26 @@ fn draft(input: c::ConnectorWriteInputShape) -> c::ConnectorWriteRecipeDraft {
     c::ConnectorWriteRecipeDraft::try_new(binding, payload, input).unwrap()
 }
 fn field(token: u8, name: &str) -> c::ConnectorWriteFieldBinding {
-    c::ConnectorWriteFieldBinding::new(
+    c::ConnectorWriteFieldBinding::try_new_typed(
         c::ConnectorWriteFieldToken::from_bytes([token; 32]),
         Field::new(name, DataType::Int64, false),
+        novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
     )
+    .unwrap()
 }
 fn data(field: Field) -> c::ConnectorWriteRecipeDraft {
     draft(c::ConnectorWriteInputShape::Data {
-        fields: vec![c::ConnectorWriteFieldBinding::new(
-            c::ConnectorWriteFieldToken::from_bytes([0; 32]),
-            field,
-        )],
+        fields: vec![
+            c::ConnectorWriteFieldBinding::try_new_typed(
+                c::ConnectorWriteFieldToken::from_bytes([0; 32]),
+                field.clone(),
+                novarocks_type_contract::FunctionValueType::new(
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                ),
+            )
+            .unwrap(),
+        ],
     })
 }
 fn five() -> Vec<c::ConnectorWriteRecipeDraft> {
@@ -189,10 +198,33 @@ fn with_encoded<T>(
         .enumerate()
         .map(|(i, r)| (if i == 0 { u32::MAX } else { i as u32 }, r.payload()))
         .collect::<Vec<_>>();
+    let mut values = Vec::new();
+    let value_ids = recipes
+        .iter()
+        .map(|recipe| {
+            recipe
+                .input()
+                .fields_iter()
+                .map(|binding| {
+                    let id = u32::try_from(values.len()).unwrap();
+                    values.push((
+                        id,
+                        binding
+                            .execution_type()
+                            .expect("complete independent fixture declaration"),
+                    ));
+                    id
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     let writers = recipes
         .iter()
         .zip(ids)
-        .map(|(r, ids)| WriterTypeSource::new(r, ids))
+        .zip(&value_ids)
+        .map(|((recipe, source_ids), value_ids)| {
+            WriterTypeSource::new_with_value_ids(recipe, source_ids, value_ids)
+        })
         .collect::<Vec<_>>();
     let bindings =
         encode_joint_provider_bindings(&providers, NAMESPACE_SOURCE, provider_limits(), control)
@@ -200,7 +232,8 @@ fn with_encoded<T>(
     let payloads =
         encode_connector_payloads(&payloads, NAMESPACE_SOURCE, payload_limits(), control).unwrap();
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode).unwrap();
-    let types = encode_type_table_writer_sources_observed(
+    let types = encode_borrowed_type_namespaces_sources_in(
+        &values,
         &[],
         &[],
         &writers,
@@ -315,6 +348,13 @@ fn raw_with_nodes(
             payloads: context.payloads.as_wire().to_vec(),
             package: wire::FragmentPackage {
                 types: Some(context.types.as_wire().clone()),
+                source_fields: Some(
+                    context
+                        .types
+                        .as_source_wire()
+                        .expect("actual emitted source namespace")
+                        .clone(),
+                ),
                 writes,
                 ..Default::default()
             },
@@ -385,7 +425,8 @@ fn decode_run(
 fn fb(token: u8, id: u32) -> wire::ConnectorWriteFieldBinding {
     wire::ConnectorWriteFieldBinding {
         field_token: vec![token; 32],
-        field_id: Some(id),
+        source_field_id: Some(id),
+        value_type_id: Some(u32::from(token)),
     }
 }
 fn expected_shapes() -> Vec<wire::ConnectorWriteInputShape> {
@@ -485,8 +526,31 @@ fn checked_package_large_metadata_projects_and_reassembles_original_constructor(
     let ids = vec![vec![u32::MAX]];
     let raw = raw_with_nodes(std::slice::from_ref(recipe), &ids, &[*node]);
     assert_eq!(raw.package.writes[0].node_id, Some(node.get()));
+    let shape = raw
+        .package
+        .source_fields
+        .as_ref()
+        .unwrap()
+        .shape
+        .as_ref()
+        .unwrap();
+    assert!(shape.value_types.is_empty() && shape.logical_types.is_empty());
+    assert!(
+        shape
+            .fields
+            .iter()
+            .all(|field| field.logical_type_id.is_none() && field.value_binding_id.is_none())
+    );
     assert_eq!(
-        raw.package.types.as_ref().unwrap().fields[0].metadata[0]
+        raw.package
+            .source_fields
+            .as_ref()
+            .unwrap()
+            .field_facts
+            .iter()
+            .find(|facts| facts.field_id == Some(u32::MAX))
+            .unwrap()
+            .metadata[0]
             .value
             .len(),
         20 * 1024
@@ -564,13 +628,13 @@ fn structural_presence_unknown_references_and_original_token_name_laws_refuse() 
             2 => bad.package.writes[0].handle_payload_id = None,
             3 => bad.package.writes[0].input = None,
             4 => bad.package.writes[0].input.as_mut().unwrap().kind = None,
-            5 => first_field(&mut bad).field_id = None,
+            5 => first_field(&mut bad).source_field_id = None,
             6 => first_field(&mut bad).field_token.pop().map(|_| ()).unwrap(),
             7 => first_field(&mut bad).field_token.push(0),
             8 => bad.package.writes.push(bad.package.writes[0].clone()),
             9 => bad.package.writes[0].provider_binding_id = Some(99),
             10 => bad.package.writes[0].handle_payload_id = Some(99),
-            11 => first_field(&mut bad).field_id = Some(99),
+            11 => first_field(&mut bad).source_field_id = Some(99),
             _ => {
                 let field = first_field(&mut bad).clone();
                 let wire::connector_write_input_shape::Kind::Data(v) = bad.package.writes[0]
@@ -812,88 +876,130 @@ fn every_actual_small_success_and_ordinary_footer_callback_preserves_three_cause
 }
 
 #[test]
-fn standalone_writer_wide_struct_and_timezone_preserve_full_carrier_without_package_claim() {
+fn standalone_writer_source_law_preserves_wide_carrier_but_does_not_author_execution_binding() {
     let children = (0..5000)
         .map(|i| Field::new(format!("n{i}"), DataType::Int64, i % 2 == 0))
         .collect::<Vec<_>>();
-    let recipes = [
-        data(Field::new("wide", DataType::Struct(children.into()), false)),
-        data(Field::new(
+    let fields = [
+        Field::new("wide", DataType::Struct(children.into()), false),
+        Field::new(
             "clock",
             DataType::Timestamp(TimeUnit::Nanosecond, Some("z".repeat(2000).into())),
             true,
-        )),
+        ),
     ];
+    // The original standalone Draft test declared external source facts only.
+    // It never supplied a complete execution binding or a Package admission.
+    let recipes = fields
+        .iter()
+        .map(|field| {
+            draft(c::ConnectorWriteInputShape::Data {
+                fields: vec![c::ConnectorWriteFieldBinding::new(
+                    c::ConnectorWriteFieldToken::from_bytes([0; 32]),
+                    field.clone(),
+                )],
+            })
+        })
+        .collect::<Vec<_>>();
     let ids = [vec![0], vec![u32::MAX]];
-    let (encoded, encode_trace) = encode_run(&recipes, &ids, None, limits());
-    let (encoded, _) = encoded.unwrap();
-    assert_eq!(
-        encoded[0].input,
-        Some(wire::ConnectorWriteInputShape {
-            kind: Some(wire::connector_write_input_shape::Kind::Data(
-                wire::ConnectorWriteDataInput {
-                    fields: vec![fb(0, 0)]
-                }
-            ))
-        })
-    );
-    assert_eq!(
-        encoded[1].input,
-        Some(wire::ConnectorWriteInputShape {
-            kind: Some(wire::connector_write_input_shape::Kind::Data(
-                wire::ConnectorWriteDataInput {
-                    fields: vec![fb(0, u32::MAX)]
-                }
-            ))
-        })
-    );
-    for stop in [0, encode_trace.len() / 2, encode_trace.len() - 1] {
+    let writers = recipes
+        .iter()
+        .zip(&ids)
+        .map(|(recipe, ids)| WriterTypeSource::new(recipe, ids))
+        .collect::<Vec<_>>();
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    let source = encode_borrowed_type_namespaces_sources_in(
+        &[],
+        &[],
+        &[],
+        &writers,
+        SOURCE,
+        type_limits(),
+        &mut |_| Ok(()),
+        &mut work,
+    )
+    .unwrap()
+    .into_namespaces()
+    .1
+    .unwrap();
+    work.finish().unwrap();
+    let shape = source.shape.as_ref().unwrap();
+    assert!(shape.value_types.is_empty() && shape.logical_types.is_empty());
+    assert_eq!(source.field_facts.len(), shape.fields.len());
+    let root = shape.fields.iter().find(|field| field.id == 0).unwrap();
+    let carrier = shape
+        .carriers
+        .iter()
+        .find(|carrier| Some(carrier.id) == root.carrier_type_id)
+        .unwrap();
+    let Some(novarocks_proto_models::physical_type_v2::carrier_type_definition::Kind::StructType(
+        children,
+    )) = &carrier.kind
+    else {
+        panic!("source Struct")
+    };
+    assert_eq!(children.field_ids.len(), 5000);
+    let clock = shape
+        .fields
+        .iter()
+        .find(|field| field.id == u32::MAX)
+        .unwrap();
+    let carrier = shape
+        .carriers
+        .iter()
+        .find(|carrier| Some(carrier.id) == clock.carrier_type_id)
+        .unwrap();
+    let Some(novarocks_proto_models::physical_type_v2::carrier_type_definition::Kind::Timestamp(
+        clock,
+    )) = &carrier.kind
+    else {
+        panic!("source Timestamp")
+    };
+    assert_eq!(clock.timezone.as_ref().unwrap().len(), 2000);
+    for field in &fields {
+        assert!(
+            novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                field.data_type().clone(),
+                field.is_nullable(),
+                novarocks_type_contract::ValueLogicalType::Physical
+            )
+            .is_err(),
+            "source law cannot mint an unfreezable complete value author"
+        );
+    }
+    let baseline = control.trace();
+    for stop in [0, baseline.len() / 2, baseline.len() - 1] {
         for cause in CAUSES {
-            let (result, actual) = encode_run(&recipes, &ids, Some((stop, cause)), limits());
-            assert!(matches!(result,Err(E::Control(c)) if c==cause));
-            assert_eq!(actual, encode_trace[..=stop]);
+            control.reset(Some((stop, cause)));
+            let mut work = match CompileCheckpoints::try_new(&control, CompilePhase::Encode) {
+                Ok(work) => work,
+                Err(actual) => {
+                    assert_eq!(actual, cause);
+                    assert_eq!(control.trace(), baseline[..=stop]);
+                    continue;
+                }
+            };
+            let result = encode_borrowed_type_namespaces_sources_in(
+                &[],
+                &[],
+                &[],
+                &writers,
+                SOURCE,
+                type_limits(),
+                &mut |_| Ok(()),
+                &mut work,
+            );
+            if result.is_ok() {
+                assert_eq!(work.finish().unwrap_err(), cause);
+            } else {
+                assert!(
+                    matches!(result,Err(crate::physical_type_v2::TypeCodecError::Control(actual)) if actual==cause)
+                );
+            }
+            assert_eq!(control.trace(), baseline[..=stop]);
         }
     }
-    let raw = raw(&recipes, &ids);
-    let (result, trace) = decode_run(&raw, None, limits(), false);
-    let (owned, facts) = result.unwrap();
-    assert_eq!(facts.input_field_count, 2);
-    assert_eq!(owned[0].1.input(), recipes[0].input());
-    assert_eq!(owned[1].1.input(), recipes[1].input());
-    let DataType::Struct(fields) = owned[0]
-        .1
-        .input()
-        .fields_iter()
-        .next()
-        .unwrap()
-        .field()
-        .data_type()
-    else {
-        panic!("struct expected")
-    };
-    assert_eq!(fields.len(), 5000);
-    assert_eq!(fields[4999].name(), "n4999");
-    let DataType::Timestamp(TimeUnit::Nanosecond, Some(zone)) = owned[1]
-        .1
-        .input()
-        .fields_iter()
-        .next()
-        .unwrap()
-        .field()
-        .data_type()
-    else {
-        panic!("timestamp expected")
-    };
-    assert_eq!(zone.len(), 2000);
-    for stop in [0, trace.len() / 2, trace.len() - 1] {
-        for cause in CAUSES {
-            let (result, actual) = decode_run(&raw, Some((stop, cause)), limits(), false);
-            assert!(matches!(result,Err(E::Control(c)) if c==cause));
-            assert_eq!(actual, trace[..=stop]);
-        }
-    }
-    // No assertion that frequently flushed opaque work must reach a 256 quantum.
-    // These Draft-only domains remain subject to the checked Package target law.
 }
 
 #[test]

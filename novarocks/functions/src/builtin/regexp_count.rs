@@ -210,13 +210,13 @@ pub(super) fn validate_profile(
     }
     for ty in &contract.selected().argument_types {
         step()?;
-        if !matches!(ty, crate::FunctionArgumentType::Value(ty) if ty.logical_type == novarocks_type_contract::ValueLogicalType::Physical && ty.data_type == DataType::Utf8)
+        if !matches!(ty, crate::FunctionArgumentType::Value(ty) if ty.logical_type() == novarocks_type_contract::ValueLogicalType::Physical && ty.data_type() == &DataType::Utf8)
         {
             return Err(invalid("regexp_count requires exact Physical Utf8"));
         }
     }
     step()?;
-    if !matches!(&contract.selected().result_type, crate::FunctionResultType::Scalar(ty) if ty.logical_type == novarocks_type_contract::ValueLogicalType::Physical && ty.data_type == DataType::Int64 && ty.nullable)
+    if !matches!(&contract.selected().result_type, crate::FunctionResultType::Scalar(ty) if ty.logical_type() == novarocks_type_contract::ValueLogicalType::Physical && ty.data_type() == &DataType::Int64 && ty.nullable())
     {
         return Err(invalid("regexp_count requires nullable Physical Int64"));
     }

@@ -38,7 +38,7 @@ fn ordered(
         slot(1, &right),
         StaticExprNode::new(
             StaticExprKind::from_comparison(operator, ProgramExprId::new(0), ProgramExprId::new(1)),
-            result.data_type.clone(),
+            result.data_type().clone(),
             None,
         ),
     ];

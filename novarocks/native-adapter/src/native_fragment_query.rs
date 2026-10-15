@@ -198,6 +198,38 @@ impl NativeFragmentQueryRuntime {
         exec_mem_limit: Option<i64>,
         runtime_filter: Option<RuntimeFilterSessionRef>,
     ) -> Result<NativeFragmentAdmissionResources, NativeFragmentAdmissionError> {
+        let (query_mem_tracker, query_memory) = self.establish_query_resources(
+            execution_id,
+            delivery_expire,
+            query_expire,
+            exec_mem_limit,
+        )?;
+        let fragment_label = format!(
+            "fragment_{:x}_{:x}",
+            fragment_instance_id.high(),
+            fragment_instance_id.low()
+        );
+        let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
+        let resources = NativeFragmentAdmissionResources {
+            query_memory,
+            query_mem_tracker,
+            fragment_mem_tracker,
+            runtime_filter,
+        };
+        Ok(resources)
+    }
+
+    /// Establish resources for an admitted native query context. Its original
+    /// options own this policy, before RF facts or a first task decode types.
+    /// The task protocol remains the lifecycle authority; this is no lookup
+    /// fallback and adds no preparation quota.
+    pub(crate) fn establish_query_resources(
+        &self,
+        execution_id: QueryExecutionId,
+        delivery_expire: Duration,
+        query_expire: Duration,
+        exec_mem_limit: Option<i64>,
+    ) -> Result<(Arc<MemTracker>, Option<QueryMemoryBinding>), NativeFragmentAdmissionError> {
         let execution = execution_key(execution_id);
         self.manager
             .ensure_native_context_execution(execution, false, delivery_expire, query_expire)
@@ -247,19 +279,31 @@ impl NativeFragmentQueryRuntime {
             )
             .map_err(NativeFragmentAdmissionError::Binding)?,
         );
-        let fragment_label = format!(
-            "fragment_{:x}_{:x}",
-            fragment_instance_id.high(),
-            fragment_instance_id.low()
-        );
-        let fragment_mem_tracker = MemTracker::new_child(fragment_label, &query_mem_tracker);
-        let resources = NativeFragmentAdmissionResources {
-            query_memory,
-            query_mem_tracker,
-            fragment_mem_tracker,
-            runtime_filter,
-        };
-        Ok(resources)
+        Ok((query_mem_tracker, query_memory))
+    }
+
+    /// Type decoding precedes runtime installation, but belongs to the already
+    /// established BE query. Observe that same tracker and its frozen policy;
+    /// never invent a default context or a second preparation byte quota.
+    pub(crate) fn type_construction_tracker(
+        &self,
+        execution_id: QueryExecutionId,
+        exec_mem_limit: Option<i64>,
+    ) -> Result<Arc<MemTracker>, NativeFragmentAdmissionError> {
+        let tracker = self
+            .manager
+            .query_mem_tracker_execution(execution_key(execution_id))
+            .ok_or_else(|| {
+                NativeFragmentAdmissionError::Existing(
+                    "native type construction requires an established query tracker".to_string(),
+                )
+            })?;
+        if let Some(limit) = exec_mem_limit {
+            tracker
+                .install_limit_once(limit)
+                .map_err(NativeFragmentAdmissionError::Existing)?;
+        }
+        Ok(tracker)
     }
 
     pub fn register_fragment_execution(

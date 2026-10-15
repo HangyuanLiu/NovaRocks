@@ -1182,6 +1182,39 @@ pub(crate) fn prepare_query_as_iceberg_write_with_write_session(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 ) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
+    prepare_query_as_iceberg_write_with_write_session_and_constants(
+        state,
+        current_catalog,
+        current_database,
+        query,
+        None,
+        sink,
+        table_bindings,
+        query_opts,
+        root_distribution,
+        execution,
+        connector_context,
+        write_session,
+    )
+}
+
+/// The original constant source author retains complete types separately from
+/// the owned syntax query; ordinary cells use the same compiler body.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_query_as_iceberg_write_with_write_session_and_constants(
+    state: &impl DmlQueryExecutionKernel,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    query: &Query,
+    constants: Option<novarocks_sql::compiler::SqlExpressionConstants>,
+    sink: novarocks_sql::planning::dml::DmlWritePlanInput,
+    table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
+    query_opts: Option<QueryOptions>,
+    root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
+    execution: Option<&novarocks_query_application::admitted_query_context::QueryExecutionContext>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
+) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     prepare_query_as_iceberg_write_with_connector_binding(
         state,
         current_catalog,
@@ -1196,6 +1229,7 @@ pub(crate) fn prepare_query_as_iceberg_write_with_write_session(
         write_session,
         None,
         &[],
+        constants.map(DmlMaterializedWriteSource::Expressions),
     )
 }
 
@@ -1218,6 +1252,8 @@ pub(crate) fn prepare_query_as_iceberg_write_at_write_target(
     current_catalog: Option<&str>,
     current_database: &str,
     query: &Query,
+    materialized_site: novarocks_sql::compiler::SqlMaterializedValuesSite,
+    materialized_rows: std::sync::Arc<[Box<[novarocks_functions::ConstantValue]>]>,
     sink: novarocks_sql::planning::dml::DmlWritePlanInput,
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     root_distribution: novarocks_sql::compiler::RootDistributionRequirement,
@@ -1241,6 +1277,10 @@ pub(crate) fn prepare_query_as_iceberg_write_at_write_target(
         write_session,
         Some(write_target_ordinal),
         overlays,
+        Some(DmlMaterializedWriteSource::Complete(
+            materialized_site,
+            materialized_rows,
+        )),
     )
 }
 
@@ -1342,6 +1382,14 @@ impl PreparedDmlWriteAssembly {
     }
 }
 
+enum DmlMaterializedWriteSource {
+    Complete(
+        novarocks_sql::compiler::SqlMaterializedValuesSite,
+        std::sync::Arc<[Box<[novarocks_functions::ConstantValue]>]>,
+    ),
+    Expressions(novarocks_sql::compiler::SqlExpressionConstants),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_query_as_iceberg_write_with_connector_binding(
     state: &impl DmlQueryExecutionKernel,
@@ -1361,6 +1409,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     // used.
     write_target_ordinal: Option<novarocks_spi::connector::write_stack::WriteTargetOrdinal>,
     query_local_overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
+    materialized: Option<DmlMaterializedWriteSource>,
 ) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     let maintenance_execution;
     let execution = match execution {
@@ -1417,8 +1466,28 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
     let compile_control =
         crate::query_execution::planning::sql_compile_control_from_execution(execution);
+    let statement = match materialized {
+        Some(DmlMaterializedWriteSource::Complete(site, rows)) => {
+            novarocks_sql::compiler::SqlStatementInput::materialized_values_query(
+                Box::new(prepared),
+                site,
+                rows,
+                &compile_control,
+            )
+            .map_err(crate::dml::error::DmlExecutionError::from_compile)?
+        }
+        Some(DmlMaterializedWriteSource::Expressions(constants)) => {
+            novarocks_sql::compiler::SqlStatementInput::query_with_expression_constants(
+                Box::new(prepared),
+                constants,
+                &compile_control,
+            )
+            .map_err(crate::dml::error::DmlExecutionError::from_compile)?
+        }
+        None => novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(prepared)),
+    };
     let analyze_request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
-        novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(prepared)),
+        statement,
         novarocks_sql::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
         novarocks_sql::compiler::SqlSessionContext {
             sql_semantics: execution.sql_semantics().clone(),

@@ -87,7 +87,7 @@ impl AnalyzerScope {
         if let crate::analysis::ExprKind::ColumnRef { column_id, .. } = &expr.kind {
             self.factory.borrow().logical_type(*column_id)
         } else {
-            super::helpers::sql_logical_projection(expr.value_type.logical_type)
+            super::helpers::sql_logical_projection(expr.value_type.logical_type())
         }
     }
 
@@ -188,8 +188,8 @@ impl AnalyzerScope {
         );
         for (col, &id) in columns.iter().zip(column_ids) {
             let ty = super::helpers::column_value_type(col, control)?;
-            self.add_column_with_id(qualifier, &col.name, id, ty);
-            self.retain_table_column_provenance(col, id);
+            self.add_column_with_id(qualifier, &col.name, id, ty.clone());
+            self.retain_table_column_provenance(col, id, &ty);
         }
         Ok(())
     }
@@ -206,16 +206,20 @@ impl AnalyzerScope {
         control: &dyn PureCompileControl,
     ) -> Result<ColumnId, AnalyzeError> {
         let ty = super::helpers::column_value_type(col, control)?;
-        let id = self.add_column(qualifier, &col.name, ty);
-        self.retain_table_column_provenance(col, id);
+        let id = self.add_column(qualifier, &col.name, ty.clone());
+        self.retain_table_column_provenance(col, id, &ty);
         Ok(id)
     }
 
-    fn retain_table_column_provenance(&mut self, col: &ColumnDef, id: ColumnId) {
-        let json_list = matches!(&col.data_type, DataType::List(item)
-            if novarocks_types::logical::logical_type_of_field(item) == Some(novarocks_types::logical::LogicalType::Json))
-            || matches!(&col.logical_type, Some(novarocks_types::schema::SqlType::Array(item))
-                if **item == novarocks_types::schema::SqlType::Json);
+    fn retain_table_column_provenance(
+        &mut self,
+        col: &ColumnDef,
+        id: ColumnId,
+        declared: &FunctionValueType,
+    ) {
+        let json_list = matches!(declared.value_type().kind(),
+            novarocks_type_contract::ValueKind::List(item)
+                if item.domain() == Some(novarocks_type_contract::ValueLogicalType::Json));
         let mut factory = self.factory.borrow_mut();
         factory.set_logical_type(id, col.logical_type.clone());
         factory.set_json_list_provenance(id, json_list);
@@ -284,7 +288,7 @@ impl AnalyzerScope {
         name: &str,
     ) -> Result<(ColumnId, DataType, bool), String> {
         let (id, ty) = self.resolve_value_type(qualifier, name)?;
-        Ok((id, ty.data_type, ty.nullable))
+        Ok((id, ty.data_type().clone(), ty.nullable()))
     }
 
     pub(super) fn resolve_value_type(
@@ -389,13 +393,19 @@ impl AnalyzerScope {
     /// where the source's own nullability is still the truth.
     pub(super) fn mark_all_nullable(&mut self) {
         for (_, ty) in self.qualified.values_mut() {
-            ty.nullable = true;
+            *ty = ty
+                .with_nullable(true)
+                .expect("validated root NULL contract");
         }
         for (_, ty) in self.unqualified.values_mut() {
-            ty.nullable = true;
+            *ty = ty
+                .with_nullable(true)
+                .expect("validated root NULL contract");
         }
         for (_, _, _, ty) in &mut self.ordered {
-            ty.nullable = true;
+            *ty = ty
+                .with_nullable(true)
+                .expect("validated root NULL contract");
         }
     }
 
@@ -782,6 +792,49 @@ mod tests {
             nullable,
             write_default: None,
             logical_type: None,
+        }
+    }
+
+    #[test]
+    fn table_json_list_provenance_uses_complete_declaration_with_empty_metadata() {
+        use novarocks_type_contract::ValueLogicalType;
+        use novarocks_types::schema::SqlType;
+        let factory = test_factory();
+        let mut scope = AnalyzerScope::new(factory.clone());
+        for (name, logical, expected) in [("j", SqlType::Json, true), ("s", SqlType::String, false)]
+        {
+            let column = ColumnDef {
+                name: name.into(),
+                data_type: DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Utf8,
+                    true,
+                ))),
+                nullable: true,
+                write_default: None,
+                logical_type: Some(SqlType::Array(Box::new(logical))),
+            };
+            let id = scope
+                .add_table_column(
+                    Some("t"),
+                    &column,
+                    crate::optimizer::test_optimizer_control(),
+                )
+                .unwrap();
+            assert_eq!(factory.borrow().has_json_list_provenance(id), expected);
+            let (_, declared) = scope.resolve_value_type(Some("t"), name).unwrap();
+            assert_eq!(
+                declared.value_type().child_type_at(0).unwrap().domain(),
+                if expected {
+                    Some(ValueLogicalType::Json)
+                } else {
+                    None
+                }
+            );
+            let DataType::List(field) = declared.data_type() else {
+                panic!("list")
+            };
+            assert_eq!(field.metadata().capacity(), 0);
         }
     }
 

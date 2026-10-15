@@ -244,7 +244,10 @@ fn nested() -> (FunctionValueType, ArrayRef) {
         &mut ScalarWork::new(None),
     )
     .unwrap();
-    (FunctionValueType::new(ty, false), values)
+    (
+        FunctionValueType::from_legacy_declared_projection(ty, false),
+        values,
+    )
 }
 fn text_type() -> FunctionValueType {
     FunctionValueType::new(DataType::Utf8, false)

@@ -53,7 +53,11 @@ pub(crate) fn admit_syntax_constant(
                 error => ConstantError::Arrow(error.to_string()),
             },
         )?;
-        let field = Arc::new(value_type.try_to_field("literal")?);
+        let field = Arc::new(arrow::datatypes::Field::new(
+            "literal",
+            value_type.data_type().clone(),
+            value_type.nullable(),
+        ));
         work.flush()?;
         let payload = match value {
             LiteralValue::String(value) => value.len() as u64,
@@ -101,7 +105,7 @@ pub(crate) fn admit_syntax_constant(
                         Arc::new(<$array>::from(vec![value])) as ArrayRef
                     }};
                 }
-                let array: ArrayRef = match value_type.data_type {
+                let array: ArrayRef = match value_type.data_type() {
                     DataType::Int8 => signed!(arrow::array::Int8Array, i8),
                     DataType::Int16 => signed!(arrow::array::Int16Array, i16),
                     DataType::Int32 => signed!(arrow::array::Int32Array, i32),
@@ -118,7 +122,7 @@ pub(crate) fn admit_syntax_constant(
                     DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond) => {
                         signed!(arrow::array::Time64NanosecondArray, i64)
                     }
-                    DataType::Timestamp(ref unit, ref zone) => {
+                    DataType::Timestamp(unit, zone) => {
                         macro_rules! timestamp {
                             ($array:ty) => {
                                 Arc::new(
@@ -157,7 +161,7 @@ pub(crate) fn admit_syntax_constant(
                     work.control(),
                 )
             }
-            LiteralValue::Float(value) => match value_type.data_type {
+            LiteralValue::Float(value) => match value_type.data_type() {
                 DataType::Float64 => scalar!(from_f64_bits, value.to_bits()),
                 DataType::Float32 => {
                     let narrowed = *value as f32;
@@ -182,7 +186,7 @@ pub(crate) fn admit_syntax_constant(
                 )),
             },
             LiteralValue::Decimal(text) => {
-                let (precision, scale) = match value_type.data_type {
+                let (precision, scale) = match value_type.data_type() {
                     DataType::Decimal32(p, s)
                     | DataType::Decimal64(p, s)
                     | DataType::Decimal128(p, s)
@@ -193,7 +197,8 @@ pub(crate) fn admit_syntax_constant(
                         ));
                     }
                 };
-                let coefficient = decimal_coefficient_observed(text, precision, scale, &mut work)?;
+                let coefficient =
+                    decimal_coefficient_observed(text, *precision, *scale, &mut work)?;
                 work.flush()?;
                 macro_rules! decimal {
                     ($native:ty, $array:ty) => {{
@@ -204,7 +209,7 @@ pub(crate) fn admit_syntax_constant(
                                 "SQL decimal coefficient exceeds its declared width",
                             ))?;
                         let array = <$array>::from(vec![coefficient])
-                            .with_precision_and_scale(precision, scale)
+                            .with_precision_and_scale(*precision, *scale)
                             .map_err(|error| ConstantError::Arrow(error.to_string()))?;
                         work.flush()?;
                         ConstantValue::from_scalar_array(
@@ -217,7 +222,7 @@ pub(crate) fn admit_syntax_constant(
                         )
                     }};
                 }
-                match value_type.data_type {
+                match value_type.data_type() {
                     DataType::Decimal32(_, _) => decimal!(i32, arrow::array::Decimal32Array),
                     DataType::Decimal64(_, _) => decimal!(i64, arrow::array::Decimal64Array),
                     DataType::Decimal128(_, _) => decimal!(i128, arrow::array::Decimal128Array),
@@ -363,9 +368,9 @@ pub(crate) fn format_constant_observed(
         .format_diagnostic_observed(CompilePhase::LowerProgram, control)
         .map_err(SqlCompileError::from)?;
     let ty = value.value_type();
-    if ty.logical_type != novarocks_type_contract::ValueLogicalType::Physical
+    if ty.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
         || !matches!(
-            ty.data_type,
+            ty.data_type(),
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
         )
         || value
@@ -413,9 +418,9 @@ pub(crate) fn write_constant_observed(
     output: &mut dyn std::fmt::Write,
 ) -> Result<std::fmt::Result, crate::compiler::SqlCompileError> {
     let ty = value.value_type();
-    let quoted = ty.logical_type == novarocks_type_contract::ValueLogicalType::Physical
+    let quoted = ty.logical_type() == novarocks_type_contract::ValueLogicalType::Physical
         && matches!(
-            ty.data_type,
+            ty.data_type(),
             DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
         )
         && value

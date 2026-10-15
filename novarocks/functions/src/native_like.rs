@@ -199,13 +199,13 @@ impl PreparedNativeLikeRecipe {
                 work.step()?;
             }
             if [text, pattern].iter().any(|ty| {
-                ty.logical_type != ValueLogicalType::Physical || ty.data_type != DataType::Utf8
+                ty.logical_type() != ValueLogicalType::Physical || ty.data_type() != &DataType::Utf8
             }) {
                 return Err(crate::ComparisonPrepareError::Unsupported);
             }
-            if result.logical_type != ValueLogicalType::Physical
-                || result.data_type != DataType::Boolean
-                || ((text.nullable || pattern.nullable) && !result.nullable)
+            if result.logical_type() != ValueLogicalType::Physical
+                || result.data_type() != &DataType::Boolean
+                || ((text.nullable() || pattern.nullable()) && !result.nullable())
             {
                 return Err(crate::ComparisonPrepareError::TypeMismatch);
             }
@@ -262,15 +262,15 @@ impl PreparedNativeLikeRecipe {
             for (arg, expected) in [(text, &self.text), (pattern, &self.pattern)] {
                 // Header identity belongs to the checked invocation even when
                 // every demanded row carries an inherited error placeholder.
-                if arg.array().data_type() != &expected.data_type
+                if arg.array().data_type() != expected.data_type()
                     || !arg.array().as_any().is::<StringArray>()
                 {
                     return Err(invalid("LIKE exact Utf8 carrier is absent"));
                 }
                 work.step()?;
                 if let EvaluatedArgument::Constant(value) = arg {
-                    if value.value_type().logical_type != expected.logical_type
-                        || (value.value_type().nullable && !expected.nullable)
+                    if value.value_type().logical_type() != expected.logical_type()
+                        || (value.value_type().nullable() && !expected.nullable())
                     {
                         return Err(invalid("LIKE constant differs from its exact logical type"));
                     }
@@ -421,7 +421,7 @@ impl PreparedNativeLikeRecipe {
             };
             crate::SelectedValues::try_new_observed(
                 selection,
-                &self.result.data_type,
+                self.result.data_type(),
                 Arc::new(output),
                 errors.into_boxed_slice(),
                 || work.step(),

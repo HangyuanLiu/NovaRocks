@@ -55,6 +55,7 @@ pub(crate) struct RuntimeKernelControl {
     error: Arc<RuntimeErrorState>,
     query_memory: Option<crate::runtime::query_memory::QueryMemoryBinding>,
     allocator: Option<Arc<dyn novarocks_functions::AggregateStateAllocator>>,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
 }
 impl RuntimeKernelControl {
     pub(crate) fn new(error: Arc<RuntimeErrorState>) -> Self {
@@ -62,12 +63,30 @@ impl RuntimeKernelControl {
             error,
             query_memory: None,
             allocator: None,
+            construction: None,
         }
     }
     /// Borrow the already-validated task capability at original operator binding.
     /// Arc/account clones establish no funding domain or allocation authorization.
     pub(crate) fn bind_runtime_memory(&mut self, state: &RuntimeState) {
         self.query_memory = state.query_memory().cloned();
+    }
+    pub(crate) fn bind_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.construction = Some(factory);
+    }
+    pub(crate) fn construction_owner(
+        &self,
+        schema: &ChunkSchema,
+    ) -> ExecutionResult<Box<dyn crate::exec::pipeline::operator::InputConstructionOwner>> {
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        Ok(factory.begin_typed_construction(schema)?)
     }
     pub(crate) fn query_memory(&self) -> Option<&crate::runtime::query_memory::QueryMemoryBinding> {
         self.query_memory.as_ref()
@@ -221,13 +240,39 @@ pub(crate) fn root_value_type(
     }
 }
 
+fn borrowed_project_root_value_type(
+    program: &LocalProgram,
+    site: ProgramExpressionRootSite,
+) -> Result<
+    &novarocks_type_contract::FunctionValueType,
+    crate::exec::pipeline::operator::ConstructionFailure,
+> {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    let expressions = program.checked().channels().expressions();
+    let root = expressions
+        .resolved_calls()
+        .snapshot()
+        .roots()
+        .sites()
+        .get(&site)
+        .ok_or_else(|| {
+            ConstructionFailure::InvalidSource("compiled project root is absent".into())
+        })?;
+    match expressions.definition_type(site.arena(), root.definition) {
+        Some(novarocks_type_contract::FunctionArgumentType::Value(value)) => Ok(value),
+        _ => Err(ConstructionFailure::InvalidSource(
+            "compiled project root lacks a complete value declaration".into(),
+        )),
+    }
+}
+
 /// Project one compiled node: each output column is one ProjectOutput root.
 pub struct CompiledProjectProcessorFactory {
     name: String,
     program: Arc<LocalProgram>,
     sites: Vec<ProgramExpressionRootSite>,
     final_identity_slots: Option<Vec<(novarocks_types::SlotId, novarocks_types::SlotId)>>,
-    output: ChunkSchemaRef,
+    layout_node: ProgramNodeId,
     error: Arc<RuntimeErrorState>,
 }
 impl CompiledProjectProcessorFactory {
@@ -250,9 +295,12 @@ impl CompiledProjectProcessorFactory {
             .nodes()
             .get(root.index())
             .ok_or("compiled final result root is absent")?;
-        let output = ChunkSchema::from_compiled_layout(node.output_layout())?;
-        let pairs = output
-            .slot_ids()
+        if !node.output_layout().is_typed() {
+            return Err("compiled final result requires a complete output layout".into());
+        }
+        let pairs = node
+            .output_layout()
+            .slots()
             .iter()
             .map(|slot| (*slot, *slot))
             .collect();
@@ -261,7 +309,7 @@ impl CompiledProjectProcessorFactory {
             program,
             sites: Vec::new(),
             final_identity_slots: Some(pairs),
-            output,
+            layout_node: root,
             error,
         })
     }
@@ -325,13 +373,15 @@ impl CompiledProjectProcessorFactory {
         } else {
             None
         };
-        let output = ChunkSchema::from_compiled_layout(graph_node.output_layout())?;
+        if !graph_node.output_layout().is_typed() {
+            return Err("compiled Project requires its complete output layout".into());
+        }
         Ok(Self {
             name: format!("COMPILED_PROJECT (node={})", node.index()),
             program,
             sites,
             final_identity_slots,
-            output,
+            layout_node: node,
             error,
         })
     }
@@ -346,7 +396,9 @@ impl OperatorFactory for CompiledProjectProcessorFactory {
             program: Arc::clone(&self.program),
             sites: self.sites.clone(),
             final_identity_slots: self.final_identity_slots.clone(),
-            output: Arc::clone(&self.output),
+            layout_node: self.layout_node,
+            output: None,
+            construction: None,
             control: RuntimeKernelControl::new(Arc::clone(&self.error)),
             instances: None,
             pending: None,
@@ -360,7 +412,9 @@ struct CompiledProjectProcessor {
     program: Arc<LocalProgram>,
     sites: Vec<ProgramExpressionRootSite>,
     final_identity_slots: Option<Vec<(novarocks_types::SlotId, novarocks_types::SlotId)>>,
-    output: ChunkSchemaRef,
+    layout_node: ProgramNodeId,
+    output: Option<ChunkSchemaRef>,
+    construction: Option<Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>>,
     control: RuntimeKernelControl,
     instances: Option<Vec<CompiledExpressionInstance>>,
     pending: Option<Chunk>,
@@ -368,6 +422,40 @@ struct CompiledProjectProcessor {
     finished: bool,
 }
 impl Operator for CompiledProjectProcessor {
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(
+        &mut self,
+        factory: Arc<dyn crate::exec::pipeline::operator::InputConstructionFactory>,
+    ) {
+        self.control.bind_construction_factory(factory.clone());
+        self.construction = Some(factory);
+    }
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        let layout = self.program.graph().nodes()[self.layout_node.index()].output_layout();
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        let owner = factory.begin_compiled_layout_construction(layout)?;
+        self.output = Some(ChunkSchema::from_compiled_layout_owned_observed::<
+            ConstructionFailure,
+        >(
+            layout,
+            owner.storage_lifetime(),
+            |layout| owner.request(layout),
+            |units| {
+                owner.observe(
+                    0,
+                    &[],
+                    crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork { units },
+                )
+            },
+        )?);
+        Ok(())
+    }
     fn bind_runtime_state(&mut self, state: &RuntimeState) -> ExecutionResult<()> {
         self.control.bind_runtime_memory(state);
         Ok(())
@@ -389,6 +477,18 @@ impl Operator for CompiledProjectProcessor {
     }
 }
 impl ProcessorOperator for CompiledProjectProcessor {
+    fn accepts_encoded_path(
+        &self,
+        occurrence: crate::exec::pipeline::operator::EncodedValueOccurrence<'_>,
+    ) -> bool {
+        let Some(pairs) = &self.final_identity_slots else {
+            return false;
+        };
+        let installed = matches!(occurrence.carrier, arrow::datatypes::DataType::Dictionary(key, value)
+            if key.as_ref() == &arrow::datatypes::DataType::Int32
+                && matches!(value.as_ref(), arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::LargeUtf8));
+        installed && pairs.iter().any(|(source, _)| *source == occurrence.slot)
+    }
     fn need_input(&self) -> bool {
         !self.finishing && !self.finished && self.pending.is_none()
     }
@@ -396,50 +496,58 @@ impl ProcessorOperator for CompiledProjectProcessor {
         self.pending.is_some()
     }
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+        use super::project_processor::{
+            ProjectEncodingSource, materialize_project_output_owned, project_reserve,
+        };
+        use crate::exec::pipeline::operator::ConstructionFailure;
         if self.pending.is_some() {
             return Err("compiled Project received input while output is pending".into());
         }
+        let output = self
+            .output
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?
+            .clone();
+        let owner = self.control.construction_owner(&output)?;
+        let storage = if output.slots().is_empty() {
+            owner.storage_lifetime()
+        } else {
+            chunk.source_storage_lifetime_observed(owner.storage_lifetime(), |layout| {
+                owner.request(layout)
+            })?
+        };
         if let Some(pairs) = &self.final_identity_slots {
             super::project_processor::validate_final_result_identity_input_source(
                 &chunk,
-                &self.output,
+                &output,
                 true,
                 pairs.len(),
                 pairs.iter().copied().map(Ok),
             )?;
-            // No column requires projection. Keep the actual row-count-bearing
-            // source and its genuine schema owners after the same validation.
-            if pairs.is_empty() {
-                self.pending = Some(chunk);
-                return Ok(());
-            }
-            let columns = if chunk.is_empty() {
-                self.output
-                    .slots()
-                    .iter()
-                    .map(|slot| arrow::array::new_empty_array(slot.data_type()))
-                    .collect()
-            } else {
-                pairs
-                    .iter()
-                    .map(|(source, _)| {
-                        let ordinal = chunk
-                            .slot_id_to_index()
-                            .get(source)
-                            .copied()
-                            .ok_or("final result input source slot is missing")?;
-                        chunk
-                            .columns()
-                            .get(ordinal)
-                            .map(Arc::clone)
-                            .ok_or_else(|| "final result input array is missing".to_string())
-                    })
-                    .collect::<Result<Vec<_>, String>>()?
+            let source_at = |ordinal: usize| -> Result<
+                &crate::exec::chunk::ChunkSlotSchema,
+                ConstructionFailure,
+            > {
+                chunk.chunk_schema().slot(pairs[ordinal].0).ok_or_else(|| {
+                    ConstructionFailure::InvalidSource("final result source is missing".into())
+                })
             };
-            self.pending = Some(super::project_processor::materialize_project_output(
+            let mut columns = project_reserve(pairs.len(), owner.as_ref())?;
+            for (source, _) in pairs {
+                columns.push(chunk.column_by_slot_id(*source)?);
+            }
+            self.pending = Some(materialize_project_output_owned(
                 columns,
-                &self.output,
-                true,
+                chunk.record_batch().num_rows(),
+                output,
+                |ordinal| Ok(source_at(ordinal)?.typed_binding()),
+                |ordinal| {
+                    Ok(ProjectEncodingSource::OriginalField(
+                        source_at(ordinal)?.field(),
+                    ))
+                },
+                storage,
+                owner.as_ref(),
             )?);
             return Ok(());
         }
@@ -450,22 +558,28 @@ impl ProcessorOperator for CompiledProjectProcessor {
             &self.control,
         )?;
         let instances = self.instances.as_mut().expect("instances were created");
-        let mut columns = Vec::with_capacity(self.sites.len());
+        let mut columns = project_reserve(self.sites.len(), owner.as_ref())?;
         for (instance, site) in instances.iter_mut().zip(&self.sites) {
-            columns.push(evaluate_all(instance, *site, &chunk.batch, &self.control)?);
+            columns.push(evaluate_all(
+                instance,
+                *site,
+                chunk.record_batch(),
+                &self.control,
+            )?);
         }
-        // A Project may publish no column (e.g. under COUNT(*)); its row count
-        // is still its input's, which a zero-column batch cannot infer.
-        let batch = RecordBatch::try_new_with_options(
-            self.output.arrow_schema_ref(),
+        self.pending = Some(materialize_project_output_owned(
             columns,
-            &arrow::record_batch::RecordBatchOptions::new()
-                .with_row_count(Some(chunk.batch.num_rows())),
-        )
-        .map_err(|error| ExecutionFailure::from(format!("compiled Project output: {error}")))?;
-        self.pending = Some(Chunk::try_new_with_chunk_schema(
-            batch,
-            Arc::clone(&self.output),
+            chunk.record_batch().num_rows(),
+            output,
+            |ordinal| {
+                Ok(
+                    borrowed_project_root_value_type(&self.program, self.sites[ordinal])?
+                        .typed_binding(),
+                )
+            },
+            |_| Ok(ProjectEncodingSource::Plain),
+            storage,
+            owner.as_ref(),
         )?);
         Ok(())
     }
@@ -624,8 +738,8 @@ impl ProcessorOperator for CompiledFilterProcessor {
             .as_mut()
             .expect("instance was created")
             .evaluate_required(
-                &chunk.batch,
-                Selection::all(chunk.batch.num_rows()),
+                chunk.record_batch(),
+                Selection::all(chunk.record_batch().num_rows()),
                 &self.control,
             )?;
         let truth = truth
@@ -642,7 +756,7 @@ impl ProcessorOperator for CompiledFilterProcessor {
         } else {
             BooleanArray::from_iter(truth.iter().map(|v| Some(v == Some(true))))
         };
-        let batch = filter_record_batch(&chunk.batch, &mask)
+        let batch = filter_record_batch(chunk.record_batch(), &mask)
             .map_err(|error| ExecutionFailure::from(format!("compiled Filter: {error}")))?;
         self.pending = Some(Chunk::try_new_with_chunk_schema(
             batch,

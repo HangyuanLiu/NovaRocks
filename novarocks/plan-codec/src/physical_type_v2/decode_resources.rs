@@ -72,6 +72,9 @@ fn arc(payload: Layout) -> Result<Layout, E> {
 
 pub(super) struct TypeDecodeModel {
     source: usize,
+    scoped_entities: bool,
+    entity_bytes: usize,
+    field_count: usize,
     definitions: usize,
     expanded: usize,
     strings: usize,
@@ -85,7 +88,11 @@ pub(super) struct TypeDecodeModel {
     graph: PackageTypeGraphFacts,
 }
 impl TypeDecodeModel {
-    fn request(&mut self, allocation: Layout, count: usize) -> Result<(), E> {
+    pub(super) fn request(
+        &mut self,
+        allocation: Layout,
+        count: usize,
+    ) -> Result<(), CompileControlError> {
         if allocation.size() == 0 || count == 0 {
             return Ok(());
         }
@@ -97,6 +104,85 @@ impl TypeDecodeModel {
         self.work = add(self.work, add(mul(bytes, 4)?, mul(count, 128)?)?)?;
         Ok(())
     }
+    /// Classify already-known final Field requests before the first parent
+    /// gate. Numerical totals remain the one original model; the parent only
+    /// reserves the non-entity remainder while each entity uses its own scope.
+    pub(super) fn enable_entity_scopes(&mut self) -> Result<(), E> {
+        if !self.scoped_entities {
+            self.entity_bytes = add(
+                self.entity_bytes,
+                mul(Self::field_arc()?.size(), self.field_count)?,
+            )?;
+            self.scoped_entities = true;
+        }
+        Ok(())
+    }
+    /// Work actually observed by the canonical cached-layout constructor.
+    /// It inspects execution shape/parameters, never whole source attributes.
+    pub(super) fn layout_cache_work(&mut self, units: usize) -> Result<(), CompileControlError> {
+        self.work = add(self.work, units)?;
+        Ok(())
+    }
+
+    pub(super) fn entity_bytes(&self) -> usize {
+        self.entity_bytes
+    }
+    pub(super) fn entity_request(
+        &mut self,
+        layout: Layout,
+        count: usize,
+    ) -> Result<(), CompileControlError> {
+        self.request(layout, count)?;
+        if self.scoped_entities {
+            self.entity_bytes = add(self.entity_bytes, mul(layout.size(), count)?)?;
+        }
+        Ok(())
+    }
+    fn field_arc() -> Result<Layout, E> {
+        arc(Layout::new::<Field>())
+    }
+    fn dictionary_bytes(boxes: usize) -> Result<usize, E> {
+        Ok(array::<DataType>(boxes)?.size())
+    }
+    /// The same final carrier allocation used by the original numerical
+    /// contributor and the actual scoped constructor. Temporary Vecs remain
+    /// outside this footprint, even when Arrow consumes them into an Arc.
+    fn carrier_backing(kind: &Kind) -> Result<Option<Layout>, E> {
+        Ok(match kind {
+            Kind::StructType(fields) => Some(arc(array::<Arc<Field>>(fields.field_ids.len())?)?),
+            Kind::UnionType(fields) => Some(arc(array::<(i8, Arc<Field>)>(fields.fields.len())?)?),
+            Kind::Timestamp(timestamp) => timestamp
+                .timezone
+                .as_ref()
+                .map(|zone| arc(array::<u8>(zone.len())?))
+                .transpose()?,
+            _ => None,
+        })
+    }
+    pub(super) fn dictionary_entity_upper(boxes: usize) -> Result<usize, E> {
+        Self::dictionary_bytes(boxes)
+    }
+    pub(super) fn carrier_entity_upper(kind: &Kind, boxes: usize) -> Result<usize, E> {
+        add(
+            Self::carrier_backing(kind)?.map_or(0, |layout| layout.size()),
+            Self::dictionary_bytes(boxes)?,
+        )
+        .map_err(Into::into)
+    }
+    pub(super) fn field_entity_upper(
+        field: &wire::FieldDefinition,
+        metadata: &[plan::ArrowFieldMetadataEntry],
+        boxes: usize,
+    ) -> Result<usize, E> {
+        let mut bytes = add(Self::field_arc()?.size(), field.name.len())?;
+        let map =
+            hashmap::fresh_table_layout::<String, String>(metadata.len()).map_err(hash_error)?;
+        bytes = add(bytes, map.layout.map_or(0, |layout| layout.size()))?;
+        for entry in metadata {
+            bytes = add(bytes, add(entry.key.len(), entry.value.len())?)?;
+        }
+        add(bytes, Self::dictionary_bytes(boxes)?).map_err(Into::into)
+    }
     fn tree<K, V>(&mut self, n: usize, searches: usize) -> Result<(), E> {
         let facts = btree::insertion_only::<K, V>(n).map_err(tree_error)?;
         self.requests = add(self.requests, facts.allocation_requests_upper_bound)?;
@@ -107,7 +193,7 @@ impl TypeDecodeModel {
     }
     fn string(&mut self, bytes: usize) -> Result<(), E> {
         self.strings = add(self.strings, bytes)?;
-        self.request(array::<u8>(bytes)?, 1)?;
+        self.entity_request(array::<u8>(bytes)?, 1)?;
         self.work = add(self.work, add(64, mul(bytes, 8)?)?)?;
         Ok(())
     }
@@ -118,31 +204,46 @@ impl TypeDecodeModel {
             return Err(E::ResourceSource("type decoder library source model drift"));
         }
         let vertices = add(table.carriers.len(), table.fields.len())?;
-        let definitions = add(vertices, table.value_types.len())?;
+        let definitions = add(
+            add(vertices, table.value_types.len())?,
+            table.logical_types.len(),
+        )?;
         let mut model = Self {
             source,
+            scoped_entities: false,
+            entity_bytes: 0,
+            field_count: table.fields.len(),
             definitions,
             expanded: 0,
             strings: 0,
             requests: 0,
             bytes: 0,
             work: 256,
-            lookup: btree::lookup_work_typed(vertices).map_err(tree_error)?,
+            lookup: btree::lookup_work_typed(vertices.max(table.value_types.len()))
+                .map_err(tree_error)?,
             metadata_table_bytes: 0,
             metadata_buckets: 0,
             metadata_entries: 0,
             graph: PackageTypeGraphFacts::default(),
         };
-        model.tree::<u32, DataType>(table.carriers.len(), 1)?;
-        model.tree::<u32, Arc<Field>>(table.fields.len(), 1)?;
+        model.tree::<u32, super::Materialized<DataType>>(table.carriers.len(), 1)?;
+        model.tree::<u32, super::Materialized<Arc<Field>>>(table.fields.len(), 1)?;
         model.tree::<u32, FunctionValueType>(table.value_types.len(), 1)?;
+        model.tree::<u32, FunctionValueType>(
+            table
+                .fields
+                .iter()
+                .filter(|field| field.value_binding_id.is_some())
+                .count(),
+            1,
+        )?;
         model.tree::<u32, ()>(table.value_types.len(), 1)?;
         model.tree::<Node, Summary>(vertices, 1)?;
         // Active entries retain false; no removal/rebuild allocation exists.
         model.tree::<Node, bool>(vertices, 2)?;
         model.request(array::<Node>(vertices)?, 1)?;
         model.request(array::<Frame>(vertices)?, 1)?;
-        model.request(arc(Layout::new::<Field>())?, table.fields.len())?;
+        model.request(Self::field_arc()?, table.fields.len())?;
         // Same original package Field namespace's weak origin records. These
         // are pre-admitted before their Vec and final Arc slice publication.
         type Loan =
@@ -158,6 +259,22 @@ impl TypeDecodeModel {
         model.work = add(model.work, add(4 * 512, 128 * 128)?)?;
         model.work = add(model.work, add(mul(definitions, 256)?, mul(source, 16)?)?)?;
         Ok(model)
+    }
+    /// Standalone source graphs own their two actual sparse DTO indexes.
+    /// Package graphs already observe these through their borrowed graph author.
+    pub(super) fn source_indexes(&mut self, table: &wire::TypeTable) -> Result<(), E> {
+        self.tree::<u32, &wire::CarrierTypeDefinition>(table.carriers.len(), 1)?;
+        self.tree::<u32, &wire::FieldDefinition>(table.fields.len(), 1)?;
+        Ok(())
+    }
+    pub(super) fn source_facts_work(&mut self, count: usize) -> Result<(), E> {
+        let levels = if count <= 1 {
+            1
+        } else {
+            usize::BITS as usize - count.leading_zeros() as usize
+        };
+        self.work = add(self.work, mul(count, add(mul(levels, 8)?, 16)?)?)?;
+        Ok(())
     }
     /// Replace the same prepared graph contribution, including its real
     /// retained scratch/inline coexistence. The original source B is not added.
@@ -177,7 +294,11 @@ impl TypeDecodeModel {
             Kind::StructType(fields) => {
                 let n = fields.field_ids.len();
                 self.request(array::<Arc<Field>>(n)?, 1)?;
-                self.request(arc(array::<Arc<Field>>(n)?)?, 1)?;
+                self.entity_request(
+                    Self::carrier_backing(kind)?
+                        .ok_or(E::ResourceSource("Struct backing model drift"))?,
+                    1,
+                )?;
                 self.work = add(self.work, mul(n, add(256, mul(self.lookup, 4)?)?)?)?;
             }
             Kind::UnionType(fields) => {
@@ -193,13 +314,21 @@ impl TypeDecodeModel {
                     self.bytes = add(self.bytes, growth.size())?;
                     self.work = add(self.work, add(mul(growth.size(), 4)?, mul(n, 128)?)?)?;
                 }
-                self.request(arc(array::<(i8, Arc<Field>)>(n)?)?, 1)?;
+                self.entity_request(
+                    Self::carrier_backing(kind)?
+                        .ok_or(E::ResourceSource("Union backing model drift"))?,
+                    1,
+                )?;
                 self.work = add(self.work, mul(n, add(512, mul(self.lookup, 4)?)?)?)?;
             }
             Kind::Timestamp(timestamp) => {
                 if let Some(zone) = &timestamp.timezone {
                     self.strings = add(self.strings, zone.len())?;
-                    self.request(arc(array::<u8>(zone.len())?)?, 1)?;
+                    self.entity_request(
+                        Self::carrier_backing(kind)?
+                            .ok_or(E::ResourceSource("Timestamp backing model drift"))?,
+                        1,
+                    )?;
                     self.work = add(self.work, add(128, mul(zone.len(), 8)?)?)?;
                 }
             }
@@ -208,8 +337,23 @@ impl TypeDecodeModel {
         Ok(())
     }
     pub(super) fn field(&mut self, field: &wire::FieldDefinition) -> Result<(), E> {
-        self.string(field.name.len())?;
-        let entries = field.metadata.len();
+        self.field_header(field)
+    }
+    pub(super) fn field_header(&mut self, field: &wire::FieldDefinition) -> Result<(), E> {
+        self.string(field.name.len())
+    }
+    pub(super) fn field_metadata(
+        &mut self,
+        metadata: &[plan::ArrowFieldMetadataEntry],
+    ) -> Result<(), E> {
+        let entries = metadata.len();
+        let mut key_bytes = 0usize;
+        let mut max_key_bytes = 0usize;
+        for entry in metadata {
+            key_bytes = add(key_bytes, entry.key.len())?;
+            max_key_bytes = max_key_bytes.max(entry.key.len());
+        }
+
         let table = hashmap::fresh_table_layout::<String, String>(entries).map_err(hash_error)?;
         self.metadata_table_bytes = self
             .metadata_table_bytes
@@ -217,18 +361,24 @@ impl TypeDecodeModel {
         self.metadata_buckets = self.metadata_buckets.max(table.buckets);
         self.metadata_entries = self.metadata_entries.max(entries);
         if let Some(layout) = table.layout {
-            self.request(layout, 1)?;
+            self.entity_request(layout, 1)?;
         }
-        // Before reading entries, original raw source union B bounds all key
-        // bytes/longest key; later entry calls charge actual owned Strings.
+        // This is the actual fresh metadata constructor, not an arbitrary
+        // source HashMap with deleted buckets. The original source bounds key
+        // bytes; its fresh bucket layout alone bounds any later map iteration.
+        // Empty metadata has no backing and constant iterator work.
         self.work = add(
             self.work,
-            hashmap::fresh_string_table_work_upper_bound(entries, self.source, self.source)
+            hashmap::fresh_string_table_work_upper_bound(entries, key_bytes, max_key_bytes)
                 .map_err(hash_error)?,
         )?;
         self.work = add(
             self.work,
-            hashmap::source_iterator_work_upper_bound(self.source, entries).map_err(hash_error)?,
+            hashmap::source_iterator_work_upper_bound(
+                table.layout.map_or(0, |layout| layout.size()),
+                entries,
+            )
+            .map_err(hash_error)?,
         )?;
         self.work = add(self.work, add(256, mul(self.lookup, 4)?)?)?;
         Ok(())
@@ -249,14 +399,7 @@ impl TypeDecodeModel {
     ) -> Result<(), CompileControlError> {
         self.expanded = add(self.expanded, nodes)?;
         self.work = add(self.work, mul(nodes, add(256, mul(self.lookup, 8)?)?)?)?;
-        let layout = Layout::array::<DataType>(dictionary_boxes)
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
-        self.requests = add(self.requests, dictionary_boxes)?;
-        self.bytes = add(self.bytes, layout.size())?;
-        self.work = add(
-            self.work,
-            add(mul(layout.size(), 4)?, mul(dictionary_boxes, 128)?)?,
-        )?;
+        self.entity_request(Layout::new::<DataType>(), dictionary_boxes)?;
         Ok(())
     }
     /// Requests of the unchanged strict Value walker, which starts with one
@@ -320,9 +463,51 @@ impl TypeDecodeModel {
         self.metadata_validation(expanded)?;
         Ok(())
     }
+    pub(super) fn source_projection_graph(
+        &mut self,
+        vertices: usize,
+        edges: usize,
+    ) -> Result<(), E> {
+        self.tree::<Node, ()>(vertices, 2)?;
+        self.request(array::<Node>(vertices)?, 1)?;
+        self.work = add(
+            self.work,
+            mul(add(vertices, edges)?, add(256, mul(self.lookup, 8)?)?)?,
+        )?;
+        Ok(())
+    }
+    pub(super) fn source_role_work(&mut self, vertices: usize, edges: usize) -> Result<(), E> {
+        let height = usize::try_from(usize::BITS - vertices.leading_zeros())
+            .map_err(|_| CompileControlError::ResourceExhausted)?;
+        // Actual entry-count sorted scratch: one position lookup per vertex
+        // and edge, plus each original fixed-width key comparison and OR.
+        self.work = add(
+            self.work,
+            mul(add(vertices, edges)?, add(32, mul(height, 4)?)?)?,
+        )?;
+        Ok(())
+    }
+    pub(super) fn semantic_profile(
+        &mut self,
+        profile: &super::semantic::Profile,
+    ) -> Result<(), CompileControlError> {
+        // Definition headers already include the logical namespace.
+        self.expanded = add(self.expanded, profile.expanded)?;
+        self.strings = add(self.strings, profile.strings)?;
+        self.work = add(self.work, profile.work)?;
+        Ok(())
+    }
     pub(super) fn facts(
         &self,
         limits: PackageTypeProjectionLimits,
+    ) -> Result<PackageTypeProjectionFacts, CompileControlError> {
+        self.facts_in(Some(limits))
+    }
+    /// Input-derived construction keeps this sole checked model and real
+    /// caller request ports without inventing a receiving capacity threshold.
+    pub(super) fn facts_in(
+        &self,
+        limits: Option<PackageTypeProjectionLimits>,
     ) -> Result<PackageTypeProjectionFacts, CompileControlError> {
         let request_bytes = add(self.bytes, self.graph.request_bytes_upper_bound)?;
         let facts = PackageTypeProjectionFacts {
@@ -340,14 +525,15 @@ impl TypeDecodeModel {
             )?,
             cumulative_work_upper_bound: add(self.work, self.graph.cumulative_work_upper_bound)?,
         };
-        if facts.definition_count > limits.max_definitions
-            || facts.expanded_node_count > limits.max_expanded_nodes
-            || facts.string_bytes > limits.max_string_bytes
-            || facts.allocation_requests_upper_bound > limits.max_allocation_requests
-            || facts.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
-            || facts.coexisting_source_and_request_bytes_upper_bound
-                > limits.max_coexisting_source_and_request_bytes
-            || facts.cumulative_work_upper_bound > limits.max_work
+        if let Some(limits) = limits
+            && (facts.definition_count > limits.max_definitions
+                || facts.expanded_node_count > limits.max_expanded_nodes
+                || facts.string_bytes > limits.max_string_bytes
+                || facts.allocation_requests_upper_bound > limits.max_allocation_requests
+                || facts.allocation_request_bytes_upper_bound > limits.max_allocation_request_bytes
+                || facts.coexisting_source_and_request_bytes_upper_bound
+                    > limits.max_coexisting_source_and_request_bytes
+                || facts.cumulative_work_upper_bound > limits.max_work)
         {
             return Err(CompileControlError::ResourceExhausted);
         }
@@ -384,13 +570,18 @@ mod tests {
             name: "名\0".into(),
             nullable: true,
             carrier_type_id: Some(0),
-            metadata: vec![plan::ArrowFieldMetadataEntry {
-                key: "é".into(),
-                value: "中国\0".into(),
-            }],
-            dictionary_id: Some(-9),
-            dictionary_is_ordered: Some(true),
+
+            logical_type_id: None,
+            value_binding_id: None,
         }
+    }
+    // This is the actual independently authored SourceArrowFieldFacts payload,
+    // not a retired execution FieldDefinition annotation.
+    fn source_metadata() -> Vec<plan::ArrowFieldMetadataEntry> {
+        vec![plan::ArrowFieldMetadataEntry {
+            key: "é".into(),
+            value: "中国\0".into(),
+        }]
     }
     fn arc_golden(payload: Layout) -> usize {
         Layout::new::<[AtomicUsize; 2]>()
@@ -402,8 +593,87 @@ mod tests {
     }
 
     #[test]
+    fn wide_empty_fresh_metadata_uses_actual_buckets_not_whole_source_per_field() {
+        let field = field();
+        let mut actual =
+            TypeDecodeModel::new::<u64, [usize; 4]>(&wire::TypeTable::default(), 2 * 1024 * 1024)
+                .unwrap();
+        let before = facts(&actual);
+        for _ in 0..400 {
+            actual.field(&field).unwrap();
+        }
+        let observed = facts(&actual);
+        // Original source traversal/coexistence remains. Each empty fresh
+        // HashMap contributes constant work and no hash backing allocation.
+        assert!(observed.cumulative_work_upper_bound < 2_000_000_000);
+        assert_eq!(
+            observed.allocation_requests_upper_bound - before.allocation_requests_upper_bound,
+            400
+        );
+        assert_eq!(
+            observed.allocation_request_bytes_upper_bound
+                - before.allocation_request_bytes_upper_bound,
+            400 * field.name.len()
+        );
+        let mut boundary = unlimited();
+        boundary.max_work = observed.cumulative_work_upper_bound;
+        assert!(actual.facts(boundary).is_ok());
+        boundary.max_work -= 1;
+        assert!(matches!(
+            actual.facts(boundary),
+            Err(CompileControlError::ResourceExhausted)
+        ));
+        assert_eq!(
+            observed.coexisting_source_and_request_bytes_upper_bound
+                - before.coexisting_source_and_request_bytes_upper_bound,
+            400 * field.name.len()
+        );
+    }
+
+    #[test]
+    fn scoped_physical_classification_keeps_the_same_original_total_and_temporary_remainder() {
+        let source = field();
+        let table = wire::TypeTable {
+            fields: vec![source.clone()],
+            ..Default::default()
+        };
+        let kind = Kind::StructType(wire::StructFields {
+            field_ids: vec![source.id],
+        });
+        let metadata = source_metadata();
+        let mut original = TypeDecodeModel::new::<u64, [usize; 4]>(&table, 4096).unwrap();
+        let mut scoped = TypeDecodeModel::new::<u64, [usize; 4]>(&table, 4096).unwrap();
+        scoped.enable_entity_scopes().unwrap();
+        for model in [&mut original, &mut scoped] {
+            model.carrier(&kind).unwrap();
+            model.field_header(&source).unwrap();
+            model.field_metadata(&metadata).unwrap();
+            for entry in &metadata {
+                model.entry(entry).unwrap();
+            }
+            model.expanded(3, 2).unwrap();
+        }
+        assert_eq!(
+            facts(&original),
+            facts(&scoped),
+            "classification does not create a second numerical model or alter any original axis"
+        );
+        assert_eq!(
+            scoped.entity_bytes(),
+            TypeDecodeModel::carrier_entity_upper(&kind, 0).unwrap()
+                + TypeDecodeModel::field_entity_upper(&source, &metadata, 2).unwrap()
+        );
+        assert_eq!(original.entity_bytes(), 0);
+        assert!(
+            scoped.entity_bytes() < facts(&scoped).allocation_request_bytes_upper_bound,
+            "table/index/validation/constructor scratch remains separate from reachable backing"
+        );
+    }
+
+    #[test]
     fn original_map_scratch_and_field_arc_layouts_are_prefunded_once() {
         let table = wire::TypeTable {
+            logical_types: Vec::new(),
             carriers: vec![wire::CarrierTypeDefinition {
                 id: 0,
                 kind: Some(Kind::Primitive(5)),
@@ -412,8 +682,8 @@ mod tests {
             value_types: vec![wire::ValueTypeDefinition {
                 id: u32::MAX,
                 carrier_type_id: Some(0),
-                nullable: true,
-                logical_type: 1,
+
+                logical_type_id: None,
             }],
         };
         let original = TypeDecodeModel::new::<u64, [usize; 4]>(&table, 4096).unwrap();
@@ -426,10 +696,10 @@ mod tests {
         type Loan =
             novarocks_type_contract::owned_resources::metadata_materialization::MetadataFieldLoan;
         assert_eq!(actual.allocation_requests_upper_bound, 8 + 2 + 1 + 3 + 128);
-        let trees = btree::insertion_only::<u32, DataType>(1)
+        let trees = btree::insertion_only::<u32, super::super::Materialized<DataType>>(1)
             .unwrap()
             .request_bytes_upper_bound
-            + btree::insertion_only::<u32, Arc<Field>>(1)
+            + btree::insertion_only::<u32, super::super::Materialized<Arc<Field>>>(1)
                 .unwrap()
                 .request_bytes_upper_bound
             + btree::insertion_only::<u32, FunctionValueType>(1)
@@ -524,7 +794,8 @@ mod tests {
         let initial = facts(&actual);
         let field = field();
         actual.field(&field).unwrap();
-        actual.entry(&field.metadata[0]).unwrap();
+        actual.field_metadata(&source_metadata()).unwrap();
+        actual.entry(&source_metadata()[0]).unwrap();
         let current = facts(&actual);
         let table = hashmap::fresh_table_layout::<String, String>(1).unwrap();
         assert_eq!(current.string_bytes, 4 + 2 + 7);
@@ -671,7 +942,8 @@ mod tests {
         )
         .unwrap();
         actual.field(&field()).unwrap();
-        actual.entry(&field().metadata[0]).unwrap();
+        actual.field_metadata(&source_metadata()).unwrap();
+        actual.entry(&source_metadata()[0]).unwrap();
         actual.expanded(3, 2).unwrap();
         let f = facts(&actual);
         let exact = PackageTypeProjectionLimits {
@@ -763,15 +1035,18 @@ mod materialized_metadata_tests {
     use super::*;
     #[test]
     fn validation_uses_actual_fresh_table_layout_without_borrowing_raw_source_capacity() {
-        let field = wire::FieldDefinition {
+        let field = wire::FieldDefinition::default();
+        let source_facts = wire::SourceArrowFieldFacts {
+            field_id: Some(0),
             metadata: vec![
                 plan::ArrowFieldMetadataEntry {
                     key: "k".into(),
-                    value: "v".into(),
+                    value: "v".into()
                 };
                 65
             ],
-            ..Default::default()
+            dictionary_id: None,
+            dictionary_is_ordered: None,
         };
         let mut model = TypeDecodeModel::new::<u64, [usize; 4]>(
             &wire::TypeTable {
@@ -782,6 +1057,7 @@ mod materialized_metadata_tests {
         )
         .unwrap();
         model.field(&field).unwrap();
+        model.field_metadata(&source_facts.metadata).unwrap();
         let actual = hashmap::fresh_table_layout::<String, String>(65).unwrap();
         assert_eq!(model.metadata_table_bytes, actual.layout.unwrap().size());
         assert_eq!(model.metadata_buckets, actual.buckets);

@@ -21,7 +21,9 @@
 //! not infer identity from carriers or install execution implementations.
 
 use novarocks_parser::Span;
-use novarocks_type_contract::{FunctionValueType, preserves_nested_logical_identity};
+use novarocks_type_contract::{
+    FunctionValueType, PureCompileControl, preserves_value_domains_observed,
+};
 
 use crate::analysis::{ExprKind, LiteralValue, TypedExpr, function_argument};
 use crate::analyze_error::AnalyzeError;
@@ -42,18 +44,32 @@ impl super::AnalyzerContext<'_> {
         if source.value_type == target {
             return Ok(source);
         }
-        // The shared identity walker is bounded by the validated value types;
-        // its internal traversal remains opaque to this request control.
+        // The semantic cast walk observes the actual caller's control; its
+        // checked owner preserves nested nominal domains across carrier casts.
         if constant_is_null(&source, self.constant_policy, self.control)? {
             return typed_null_conversion(source, target, self.constant_policy, self.control);
         }
-        let carrier_cast = source.value_type.logical_type == target.logical_type
-            && preserves_nested_logical_identity(&source.value_type.data_type, &target.data_type);
+        let carrier_cast = preserves_value_domains_observed(
+            source.value_type.value_type(),
+            target.value_type(),
+            |units| {
+                self.control
+                    .checkpoint(
+                        novarocks_type_contract::CompilePhase::Validate,
+                        u32::try_from(units).expect("one checked semantic node"),
+                    )
+                    .map_err(AnalyzeError::control)
+            },
+        )?;
         self.check_control()?;
-        if carrier_cast {
+        if carrier_cast
+            || novarocks_type_contract::is_default_json_structure_cast(&source.value_type, &target)
+        {
+            // This exact existing intrinsic consumes the complete target,
+            // including JSON children; it is not a same-shape domain bridge.
             return Ok(TypedExpr {
                 kind: ExprKind::Cast {
-                    target: target.data_type.clone(),
+                    target: target.data_type().clone(),
                     expr: Box::new(source),
                     decimal_overflow_policy: self
                         .sql_semantics
@@ -134,19 +150,20 @@ pub(super) fn convert_value_domain_with_catalog(
             distinct: false,
         },
     };
-    if converted.value_type.logical_type == target.logical_type
-        && converted.value_type.nullable == target.nullable
-        && novarocks_type_contract::arrow_data_types_exact(
-            &converted.value_type.data_type,
-            &target.data_type,
-        )
+    if converted
+        .value_type
+        .exactly_equals_checked_observed(&target, || {
+            control
+                .checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
+                .map_err(AnalyzeError::control)
+        })?
     {
         Ok(converted)
     } else {
         Ok(TypedExpr {
             kind: ExprKind::Cast {
                 expr: Box::new(converted),
-                target: target.data_type.clone(),
+                target: target.data_type().clone(),
                 decimal_overflow_policy,
             },
             value_type: target,
@@ -182,12 +199,16 @@ fn typed_null_conversion(
     policy: novarocks_functions::ConstantPolicy,
     control: &dyn novarocks_type_contract::PureCompileControl,
 ) -> Result<TypedExpr, AnalyzeError> {
-    target.nullable = true;
+    target = target
+        .with_nullable(true)
+        .expect("validated root NULL contract");
     let kind = match source.kind {
         ExprKind::Constant(_) => {
-            let field = target
-                .try_to_field("literal")
-                .map_err(|error| AnalyzeError::internal(error.to_string()))?;
+            let field = arrow::datatypes::Field::new(
+                "literal",
+                target.data_type().clone(),
+                target.nullable(),
+            );
             let value = novarocks_functions::ConstantValue::null(
                 std::sync::Arc::new(field),
                 target.clone(),
@@ -358,12 +379,14 @@ mod checked_constant_tests {
             &control(None),
         )
         .unwrap();
-        assert!(output.value_type.nullable);
-        assert_eq!(output.value_type.logical_type, ValueLogicalType::Json);
+        assert!(output.value_type.nullable());
+        assert_eq!(output.value_type.logical_type(), ValueLogicalType::Json);
         let ExprKind::Constant(value) = output.kind else {
             panic!("materialized NULL retains the checked owner");
         };
         assert_eq!(value.value_type(), &output.value_type);
         assert_eq!(value.try_utf8().unwrap(), None);
+        assert_eq!(value.pool().field_ref().metadata().capacity(), 0);
+        assert!(value.pool().source_metadata_namespace().is_none());
     }
 }

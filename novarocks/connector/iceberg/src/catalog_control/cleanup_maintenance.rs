@@ -1792,15 +1792,22 @@ mod tests {
             Arc::clone(&runtime),
         );
         let loaded = metadata
-            .load_table(ConnectorTableRequest {
-                table: ConnectorTableIdentity {
-                    instance_id,
-                    namespace: Arc::from("orphan_test"),
-                    table: Arc::from("t"),
+            .load_table(
+                ConnectorTableRequest {
+                    table: ConnectorTableIdentity {
+                        instance_id,
+                        namespace: Arc::from("orphan_test"),
+                        table: Arc::from("t"),
+                    },
+                    resolution: ConnectorTableResolution::StrictBaseTable,
+                    context: context(),
                 },
-                resolution: ConnectorTableResolution::StrictBaseTable,
-                context: context(),
-            })
+                &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                    &mut |_| Ok(()),
+                    &mut |_| Ok(()),
+                ),
+            )
             .expect("load real table handle");
         let adapter =
             IcebergCleanupMaintenanceAdapter::new(key.clone(), runtime).expect("cleanup adapter");

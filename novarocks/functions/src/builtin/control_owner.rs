@@ -81,7 +81,7 @@ pub(super) fn definition(
 struct ControlOwner {
     operation: ControlOperation,
     declaration: FunctionBindingDeclaration,
-    resolver: BuiltinScalarResolver,
+    resolver: Arc<BuiltinScalarResolver>,
     implementations: Box<[PureImplementationDeclaration]>,
 }
 impl ControlOwner {
@@ -122,7 +122,7 @@ impl ControlOwner {
         Ok(Self {
             operation,
             declaration,
-            resolver,
+            resolver: Arc::new(resolver),
             implementations,
         })
     }
@@ -170,6 +170,10 @@ impl FunctionBindingResolver for ControlOwner {
     }
 }
 impl PureFunctionMetadataOwner for ControlOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::fixed_scalar(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -194,6 +198,35 @@ impl FunctionEffectOwner for ControlOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
+        self.refine_selected_core(input, control, || {
+            self.validate_selected(input.selected, input.request, control)
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_selected_core(input, control, || {
+            checked.require_fixed_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
+    }
+}
+
+#[cfg(test)]
+#[path = "control_owner_tests.rs"]
+mod tests;
+
+impl ControlOwner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
         binding_control::scope(control, |work| {
             work.step()?;
             if input.function_id != self.declaration.function_id()
@@ -235,7 +268,7 @@ impl FunctionEffectOwner for ControlOwner {
             }
             binding_control::request_types(input.request, work)?;
             work.flush()?;
-            self.validate_selected(input.selected, input.request, control)?;
+            validate()?;
             work.step()?;
             Ok(self.call_effects(input.proof_scope))
         })
@@ -245,7 +278,3 @@ impl FunctionEffectOwner for ControlOwner {
         })
     }
 }
-
-#[cfg(test)]
-#[path = "control_owner_tests.rs"]
-mod tests;

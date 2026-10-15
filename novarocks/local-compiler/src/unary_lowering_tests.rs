@@ -151,7 +151,7 @@ impl Operation {
     fn result(self, input: &FunctionValueType) -> FunctionValueType {
         FunctionValueType::new(
             DataType::Boolean,
-            matches!(self, Self::Not) && input.nullable,
+            matches!(self, Self::Not) && input.nullable(),
         )
     }
 }
@@ -298,7 +298,7 @@ fn fixture(
         .unwrap();
     let mut result_type = operation.result(&input_type);
     if matches!(claim, Claim::WrongResult) {
-        result_type.nullable = !result_type.nullable;
+        result_type = result_type.with_nullable(!result_type.nullable()).unwrap();
     }
     let wrapper = builder
         .add_expression(root, result_type.clone(), operation.kind(reference))
@@ -569,6 +569,7 @@ fn package(functions: &PureEngineFunctionCatalog, fixture: Fixture) -> Arc<Fragm
             )
             .unwrap();
         frozen.push(FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,
@@ -841,16 +842,18 @@ fn actual_if_arguments_keep_distinct_unary_occurrences_and_guarded_value_childre
 fn null_predicates_preserve_authored_uuid_and_variant_operand_domains_in_exact_channels() {
     let functions = functions();
     for input_type in [
-        FunctionValueType {
-            data_type: DataType::FixedSizeBinary(16),
-            nullable: true,
-            logical_type: ValueLogicalType::Uuid,
-        },
-        FunctionValueType {
-            data_type: DataType::LargeBinary,
-            nullable: true,
-            logical_type: ValueLogicalType::Variant,
-        },
+        FunctionValueType::try_from_legacy_declared_projection(
+            DataType::FixedSizeBinary(16),
+            true,
+            ValueLogicalType::Uuid,
+        )
+        .expect("valid temporary legacy value projection"),
+        FunctionValueType::try_from_legacy_declared_projection(
+            DataType::LargeBinary,
+            true,
+            ValueLogicalType::Variant,
+        )
+        .expect("valid temporary legacy value projection"),
     ] {
         for operation in [Operation::IsNull, Operation::IsNotNull] {
             let source = package(

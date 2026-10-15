@@ -76,7 +76,7 @@ pub(super) fn cell(value: Option<i64>) -> LiteralValue {
 
 /// A Values leaf at `node` whose columns have the given complete types and
 /// whose rows are literal cells of exactly those types.
-pub(super) fn values(
+pub(crate) fn values(
     builder: &mut FragmentBuilder,
     node: NodeId,
     types: &[FunctionValueType],
@@ -143,10 +143,31 @@ pub(super) fn package(
     constants: ConstantPools,
     max_dop: u32,
 ) -> Arc<FragmentPackage> {
+    package_with_sink(builder, root, constants, max_dop, FragmentSink::Result)
+}
+
+pub(crate) fn package_with_sink(
+    builder: FragmentBuilder,
+    root: NodeId,
+    constants: ConstantPools,
+    max_dop: u32,
+    sink: FragmentSink,
+) -> Arc<FragmentPackage> {
+    package_with_sink_and_names(builder, root, constants, max_dop, sink, None)
+}
+
+pub(crate) fn package_with_sink_and_names(
+    builder: FragmentBuilder,
+    root: NodeId,
+    constants: ConstantPools,
+    max_dop: u32,
+    sink: FragmentSink,
+    names: Option<&[&str]>,
+) -> Arc<FragmentPackage> {
     let fragment = builder
         .finish_definition(
             root,
-            FragmentSink::Result,
+            sink,
             PipelineDopDomain {
                 min: 1,
                 max: max_dop,
@@ -187,6 +208,9 @@ pub(super) fn package(
     let uses = PhysicalRootUses::try_new(&fragment, flow, bindings, &FixtureControl).unwrap();
     let calls = FrozenFragmentCalls::try_new(&fragment, &uses, vec![], &FixtureControl).unwrap();
     let output = fragment.nodes()[&root].output.clone();
+    if let Some(names) = names {
+        assert_eq!(names.len(), output.columns.len());
+    }
     let result = ResultPort {
         scalar_schema: None,
         fragment: fragment.id(),
@@ -199,7 +223,10 @@ pub(super) fn package(
                 domain: crate::test_result_domain::result_value_domain(
                     &fragment.values()[value].ty,
                 ),
-                name: format!("c{ordinal}").into_boxed_str(),
+                name: names.map_or_else(
+                    || format!("c{ordinal}").into_boxed_str(),
+                    |names| names[ordinal].into(),
+                ),
                 alias: None,
                 value: *value,
                 ty: fragment.values()[value].ty.clone(),
@@ -275,7 +302,7 @@ pub(super) fn try_compile(
         .map_err(|error| error.to_string())
 }
 
-pub(super) fn compile(package: Arc<FragmentPackage>, dop: usize) -> Arc<LocalProgram> {
+pub(crate) fn compile(package: Arc<FragmentPackage>, dop: usize) -> Arc<LocalProgram> {
     try_compile(package, dop).unwrap_or_else(|error| panic!("fixture fragment compiles: {error}"))
 }
 
@@ -288,7 +315,9 @@ pub(super) fn try_run(program: &Arc<LocalProgram>) -> Result<Vec<Chunk>, String>
         None,
         None,
         None,
-        None,
+        Some(crate::runtime::mem_tracker::MemTracker::new_root(
+            "compiled family fixture",
+        )),
         Some(crate::runtime::execution_runtime::test_execution_runtime()),
     ));
     let output = ResultSinkHandle::new();
@@ -317,7 +346,7 @@ pub(super) fn int64_rows(chunks: &[Chunk]) -> Vec<Vec<Option<i64>>> {
     let mut rows = Vec::new();
     for chunk in chunks {
         let columns = chunk
-            .batch
+            .record_batch()
             .columns()
             .iter()
             .map(|column| {

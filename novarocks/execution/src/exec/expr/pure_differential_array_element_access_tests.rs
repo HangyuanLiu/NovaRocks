@@ -16,6 +16,7 @@
 // under the License.
 
 //! Actual two ARRAY element overloads, with typed child identity preserved.
+use super::array_append_tests::{declared_list, declared_struct, execution_list_field};
 use super::generate::{InputGenerator, InputProfile};
 use super::{
     FloatComparison, LegacyConstantForm, ScalarDiffSpec, assert_scalar_matches_v1, constant,
@@ -110,11 +111,11 @@ fn flat_profiles() -> Vec<FunctionValueType> {
     p
 }
 fn values(t: &FunctionValueType, rows: usize, seed: u64) -> ArrayRef {
-    if t.data_type == DataType::FixedSizeBinary(16) {
+    if *t.data_type() == DataType::FixedSizeBinary(16) {
         return novarocks_types::largeint::array_from_i128(
             &(0..rows)
                 .map(|r| {
-                    if t.nullable && r % 7 == 0 {
+                    if t.nullable() && r % 7 == 0 {
                         None
                     } else {
                         Some([i128::MIN, i128::MAX, -1, 0, 1][r % 5])
@@ -124,8 +125,8 @@ fn values(t: &FunctionValueType, rows: usize, seed: u64) -> ArrayRef {
         )
         .unwrap();
     }
-    if t.logical_type != ValueLogicalType::Physical {
-        let physical = FunctionValueType::new(t.data_type.clone(), t.nullable);
+    if t.logical_type() != ValueLogicalType::Physical {
+        let physical = FunctionValueType::new(t.data_type().clone(), t.nullable());
         return InputGenerator::new(seed).column(&physical, rows, &InputProfile::default());
     }
     InputGenerator::new(seed).column(t, rows, &InputProfile::default())
@@ -139,7 +140,7 @@ fn nested() -> Vec<(FunctionValueType, ArrayRef)> {
             FunctionValueType::try_with_logical_type(DataType::FixedSizeBinary(16), true, logical)
                 .unwrap()
         };
-        let field = Arc::new(item.try_to_field("item").unwrap());
+        let field = execution_list_field(&item);
         let a: ArrayRef = Arc::new(ListArray::new(
             field,
             OffsetBuffer::new(
@@ -153,14 +154,18 @@ fn nested() -> Vec<(FunctionValueType, ArrayRef)> {
                 (0..ROWS).map(|r| r % 11 != 0).collect::<Vec<_>>(),
             )),
         ));
-        result.push((FunctionValueType::new(a.data_type().clone(), true), a));
+        result.push((declared_list(&item, true), a));
     }
-    let fs = vec![
-        Arc::new(Field::new("x", DataType::Int32, true)),
-        Arc::new(Field::new("y", DataType::Utf8, true)),
+    let named = [
+        ("x", FunctionValueType::new(DataType::Int32, true)),
+        ("y", FunctionValueType::new(DataType::Utf8, true)),
     ];
+    let declared = declared_struct(&named, true);
+    let DataType::Struct(fs) = declared.data_type() else {
+        panic!("declared Struct")
+    };
     let a: ArrayRef = Arc::new(StructArray::new(
-        fs.into(),
+        fs.clone(),
         vec![
             values(&FunctionValueType::new(DataType::Int32, true), ROWS, 43),
             values(&FunctionValueType::new(DataType::Utf8, true), ROWS, 44),
@@ -169,13 +174,13 @@ fn nested() -> Vec<(FunctionValueType, ArrayRef)> {
             (0..ROWS).map(|r| r % 13 != 0).collect::<Vec<_>>(),
         )),
     ));
-    result.push((FunctionValueType::new(a.data_type().clone(), true), a));
+    result.push((declared, a));
     result
 }
 
 fn list(item: &FunctionValueType, values: ArrayRef, rows: usize, nullable: bool) -> ArrayRef {
     Arc::new(ListArray::new(
-        Arc::new(item.try_to_field("item").unwrap()),
+        execution_list_field(&item),
         OffsetBuffer::new(
             (0..=rows)
                 .map(|r| (r * 2) as i32)
@@ -223,7 +228,7 @@ fn check(
     index_nullable: bool,
 ) {
     let a = list(item, values, ROWS, map_nullable);
-    let source = FunctionValueType::new(a.data_type().clone(), map_nullable);
+    let source = declared_list(item, map_nullable);
     let idx = index(index_type, ROWS, index_nullable);
     let idx_type = FunctionValueType::new(index_type.clone(), index_nullable);
     let s = assert_scalar_matches_v1(
@@ -235,8 +240,8 @@ fn check(
     );
     assert_eq!(s.attributed_row_errors, 0);
     assert_eq!(s.legacy_batch_errors, 0);
-    assert!(s.result_type.nullable);
-    assert_eq!(s.result_type.logical_type, item.logical_type);
+    assert!(s.result_type.nullable());
+    assert_eq!(s.result_type.logical_type(), item.logical_type());
 }
 #[test]
 fn pure_differential_array_element_at_both_overloads_every_flat_and_logical_element_domain() {
@@ -269,7 +274,7 @@ fn pure_differential_array_element_at_both_overloads_nested_elements_and_sliced_
         let idx = index(&index_type, ROWS, true);
         let s = assert_scalar_matches_v1(
             ScalarDiffSpec::new("__array_element_at")
-                .column(a.slice(1, ROWS - 1))
+                .typed_column(declared_list(&item, true), a.slice(1, ROWS - 1))
                 .typed_column(
                     FunctionValueType::new(index_type, true),
                     idx.slice(1, ROWS - 1),
@@ -313,14 +318,14 @@ fn pure_differential_array_element_at_empty_entries_all_null_parent_and_constant
             );
             for rows in [0, ROWS] {
                 let a: ArrayRef = Arc::new(ListArray::new(
-                    Arc::new(item.try_to_field("item").unwrap()),
+                    execution_list_field(&item),
                     OffsetBuffer::new(vec![0; rows + 1].into()),
-                    new_empty_array(&item.data_type),
+                    new_empty_array(&item.data_type()),
                     None,
                 ));
                 let s = assert_scalar_matches_v1(
                     ScalarDiffSpec::new("__array_element_at")
-                        .column(a)
+                        .typed_column(declared_list(&item, false), a)
                         .constant(idx.clone())
                         .legacy_constants(LegacyConstantForm::Pool)
                         .sparse_selections(7, 905),
@@ -328,11 +333,11 @@ fn pure_differential_array_element_at_empty_entries_all_null_parent_and_constant
                 assert!(s.null_results >= rows);
                 assert_eq!(s.attributed_row_errors, 0);
             }
-            let ty = DataType::List(Arc::new(item.try_to_field("item").unwrap()));
+            let ty = DataType::List(execution_list_field(&item));
             let a = new_null_array(&ty, ROWS);
             let s = assert_scalar_matches_v1(
                 ScalarDiffSpec::new("__array_element_at")
-                    .column(a)
+                    .typed_column(declared_list(&item, true), a)
                     .constant(idx)
                     .legacy_constants(LegacyConstantForm::Pool),
             );

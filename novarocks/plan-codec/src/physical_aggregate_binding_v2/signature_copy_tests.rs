@@ -24,11 +24,10 @@ use novarocks_physical_plan::{
 use novarocks_type_contract::{
     AggregateStateArgumentContract, CompileControlError, CompilePhase, FunctionArgumentEvaluation,
     FunctionArgumentType, FunctionFailureBehavior, FunctionId, FunctionIntrinsicRowError,
-    FunctionOverloadId, FunctionValueType, FunctionVolatility, MAX_VALUE_TYPE_NODES,
-    PureCompileControl, ValueLogicalType,
+    FunctionOverloadId, FunctionValueType, FunctionVolatility, PureCompileControl,
+    ValueLogicalType,
 };
 use std::{
-    alloc::Layout,
     collections::HashMap,
     sync::{Arc, Mutex},
 };
@@ -94,29 +93,32 @@ fn fixture(phase: AggregatePhase) -> AggregateBinding {
         Field::new("original", DataType::Utf8, true)
             .with_metadata(HashMap::from([("unknown".into(), "preserved".into())])),
     );
+    let parameter = FunctionValueType::new(DataType::Struct(vec![field.clone()].into()), true);
+    assert_eq!(field.metadata()["unknown"], "preserved");
     AggregateBinding {
         state_interpretation: None,
         function: BoundFunction::from_exact_signature(
             FunctionId::try_new("test/f").unwrap(),
             FunctionOverloadId::try_new("test/o").unwrap(),
             FunctionKind::Aggregate,
-            vec![
-                FunctionArgumentType::Value(dictionary()),
-                FunctionArgumentType::Lambda {
-                    parameter_types: vec![
-                        FunctionValueType::new(DataType::Int64, false),
-                        FunctionValueType::new(DataType::Struct(vec![field].into()), true),
-                    ]
-                    .into_boxed_slice(),
-                    result_type: FunctionValueType::try_with_logical_type(
-                        DataType::FixedSizeBinary(16),
-                        false,
-                        ValueLogicalType::LargeInt,
-                    )
-                    .unwrap(),
-                },
-            ]
-            .into_boxed_slice(),
+            novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                vec![
+                    FunctionArgumentType::Value(dictionary()),
+                    FunctionArgumentType::Lambda {
+                        parameter_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+                            vec![FunctionValueType::new(DataType::Int64, false), parameter]
+                                .into_boxed_slice(),
+                        ),
+                        result_type: FunctionValueType::try_with_logical_type(
+                            DataType::FixedSizeBinary(16),
+                            false,
+                            ValueLogicalType::LargeInt,
+                        )
+                        .unwrap(),
+                    },
+                ]
+                .into_boxed_slice(),
+            ),
             FunctionValueType::new(DataType::Int64, true),
         ),
         phase,
@@ -144,15 +146,11 @@ fn run(
         copy_aggregate_binding_observed(source, work)
     })
 }
-fn copied_dictionary(original: &FunctionValueType, copied: &FunctionValueType) {
+fn shared_value_binding(original: &FunctionValueType, copied: &FunctionValueType) {
     assert_eq!(copied, original);
-    let (DataType::Dictionary(a, b), DataType::Dictionary(c, d)) =
-        (&original.data_type, &copied.data_type)
-    else {
-        panic!("Dictionary")
-    };
-    assert!(!std::ptr::eq(a.as_ref(), c.as_ref()));
-    assert!(!std::ptr::eq(b.as_ref(), d.as_ref()));
+    assert_eq!(copied.data_type(), &DataType::Utf8);
+    assert!(original.value_type().shares_storage(copied.value_type()));
+    assert!(std::ptr::eq(original.data_type(), copied.data_type()));
 }
 fn prefixes(source: &AggregateBinding, emit: bool, successful: bool) {
     let operation = |control: &Control| {
@@ -214,7 +212,7 @@ fn aggregate_copy_preserves_four_phases_sparse_sequences_and_full_owned_types() 
             assert_eq!(copied.logical_argument_count, 1);
             assert_eq!(copied.state_argument_contract, contract);
             assert_eq!(copied.state_format.as_str(), "state/v1");
-            assert!(!std::ptr::eq(
+            assert!(std::ptr::eq(
                 source.state_format.as_str().as_ptr(),
                 copied.state_format.as_str().as_ptr()
             ));
@@ -226,14 +224,14 @@ fn aggregate_copy_preserves_four_phases_sparse_sequences_and_full_owned_types() 
                 copied.function.result_type,
                 FunctionValueType::new(DataType::Int64, true)
             );
-            copied_dictionary(&source.intermediate_type, &copied.intermediate_type);
+            shared_value_binding(&source.intermediate_type, &copied.intermediate_type);
             let (FunctionArgumentType::Value(a), FunctionArgumentType::Value(b)) = (
                 &source.function.argument_types[0],
                 &copied.function.argument_types[0],
             ) else {
                 panic!("Value")
             };
-            copied_dictionary(a, b);
+            shared_value_binding(a, b);
             let (
                 FunctionArgumentType::Lambda {
                     parameter_types: a,
@@ -252,15 +250,16 @@ fn aggregate_copy_preserves_four_phases_sparse_sequences_and_full_owned_types() 
             };
             assert_eq!(a, b);
             assert_eq!(r, s);
-            assert_eq!(s.logical_type, ValueLogicalType::LargeInt);
-            assert!(!std::ptr::eq(a.as_ptr(), b.as_ptr()));
-            let (DataType::Struct(a), DataType::Struct(b)) = (&a[1].data_type, &b[1].data_type)
+            assert_eq!(s.logical_type(), ValueLogicalType::LargeInt);
+            assert!(std::ptr::eq(a.as_ptr(), b.as_ptr()));
+            let (DataType::Struct(a), DataType::Struct(b)) = (&a[1].data_type(), &b[1].data_type())
             else {
                 panic!("Struct")
             };
             assert!(Arc::ptr_eq(&a[0], &b[0]));
             assert_eq!(b[0].name(), "original");
-            assert_eq!(b[0].metadata()["unknown"], "preserved");
+            assert_eq!(b[0].metadata().capacity(), 0);
+            assert!(b[0].is_nullable());
         }
     }
 }
@@ -285,19 +284,13 @@ fn aggregate_copy_requests_have_independent_layout_and_reference_oracles() {
         Ok(model)
     })
     .unwrap();
-    // Function/overload/state Boxes, args Vec+Box, Lambda parameters Vec+Box,
-    // two independent Dictionaries with two DataType Boxes each; no outer Box.
-    let bytes = 20
-        + 2 * Layout::array::<FunctionArgumentType>(2).unwrap().size()
-        + 2 * Layout::array::<FunctionValueType>(2).unwrap().size()
-        + 4 * Layout::new::<DataType>().size();
-    let retained = 20
-        + Layout::array::<FunctionArgumentType>(2).unwrap().size()
-        + Layout::array::<FunctionValueType>(2).unwrap().size()
-        + 4 * Layout::new::<DataType>().size();
+    // Copying an immutable signature retains the same type, collection and
+    // identity owners. No Vec, text Box or Dictionary carrier is recreated.
+    let bytes = 0;
+    let retained = 0;
     assert_eq!(model.facts.definition_count, 1);
     assert_eq!(model.facts.type_reference_count, 6);
-    assert_eq!(model.facts.allocation_requests_upper_bound, 11);
+    assert_eq!(model.facts.allocation_requests_upper_bound, 0);
     assert_eq!(model.facts.request_bytes_upper_bound, bytes);
     assert_eq!(model.retained, retained);
     assert_eq!(
@@ -306,7 +299,7 @@ fn aggregate_copy_requests_have_independent_layout_and_reference_oracles() {
     );
     assert_eq!(
         model.facts.cumulative_work_upper_bound,
-        128 + 32 * 5 + 6 * (16 + 8 * MAX_VALUE_TYPE_NODES) + 4 * bytes + 11
+        128 + 32 * 5 + 6 * 2
     );
 }
 
@@ -319,13 +312,13 @@ fn repeated_aggregate_copies_accumulate_all_six_axes_and_keep_numeric_primary() 
         let once = (model.facts.request_bytes_upper_bound, model.retained);
         preflight_aggregate_binding_copy(&source, &mut model, limits(), work)?;
         assert_eq!(model.facts.type_reference_count, 12);
-        assert_eq!(model.facts.allocation_requests_upper_bound, 22);
+        assert_eq!(model.facts.allocation_requests_upper_bound, 0);
         assert_eq!(model.facts.request_bytes_upper_bound, 2 * once.0);
         assert_eq!(model.retained, 2 * once.1);
         let first = copy_aggregate_binding_observed(&source, work)?;
         let second = copy_aggregate_binding_observed(&source, work)?;
-        copied_dictionary(&first.intermediate_type, &second.intermediate_type);
-        assert!(!std::ptr::eq(
+        shared_value_binding(&first.intermediate_type, &second.intermediate_type);
+        assert!(std::ptr::eq(
             first.state_format.as_str().as_ptr(),
             second.state_format.as_str().as_ptr()
         ));
@@ -343,7 +336,11 @@ fn repeated_aggregate_copies_accumulate_all_six_axes_and_keep_numeric_primary() 
     };
     let mut model = model;
     model.check(tight).unwrap();
-    for axis in 0..6 {
+    // Zero allocation axes accept their exact zero envelopes; there is no
+    // representable one-under allocation count/byte limit for a shared clone.
+    assert_eq!(tight.max_allocation_requests, 0);
+    assert_eq!(tight.max_request_bytes, 0);
+    for axis in [0, 1, 4, 5] {
         let mut under = tight;
         match axis {
             0 => under.max_definitions -= 1,
@@ -407,9 +404,13 @@ fn wide_aggregate_copy_has_real_prepare_quantum_and_sampled_emit_prefixes() {
     let mut source = fixture(AggregatePhase::Partial {
         sequence: AggregateSequenceId::new(u32::MAX),
     });
-    source.function.argument_types = (0..320)
-        .map(|i| FunctionArgumentType::Value(FunctionValueType::new(DataType::Int64, i % 2 == 1)))
-        .collect();
+    source.function.argument_types = novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+        (0..320)
+            .map(|i| {
+                FunctionArgumentType::Value(FunctionValueType::new(DataType::Int64, i % 2 == 1))
+            })
+            .collect::<Box<[_]>>(),
+    );
     source.logical_argument_count = 320;
     let prepare = |control: &Control| {
         scope(control, |work| {
@@ -486,19 +487,14 @@ fn staged_aggregate_counts_preserve_state_and_scalar_roots_before_type_walk() {
     let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Decode).unwrap();
     let mut model = MaterializationModel::for_composition(1, 0, SOURCE, SOURCE);
     preflight_aggregate_binding_copy_counts(&source, &mut model, limits(), &mut work).unwrap();
-    let prefix_bytes = 20
-        + 2 * Layout::array::<FunctionArgumentType>(2).unwrap().size()
-        + 2 * Layout::array::<FunctionValueType>(2).unwrap().size();
+    let prefix_bytes = 0;
     assert_eq!(model.facts.type_reference_count, 6);
-    assert_eq!(model.facts.allocation_requests_upper_bound, 7);
+    assert_eq!(model.facts.allocation_requests_upper_bound, 0);
     assert_eq!(model.facts.request_bytes_upper_bound, prefix_bytes);
     assert_eq!(model.items, 4);
     preflight_aggregate_binding_copy_types(&source, &mut model, limits(), &mut work).unwrap();
-    assert_eq!(model.facts.allocation_requests_upper_bound, 11);
-    assert_eq!(
-        model.facts.request_bytes_upper_bound,
-        prefix_bytes + 4 * Layout::new::<DataType>().size()
-    );
+    assert_eq!(model.facts.allocation_requests_upper_bound, 0);
+    assert_eq!(model.facts.request_bytes_upper_bound, prefix_bytes);
     work.finish().unwrap();
     let full = Control::default();
     let mut work = CompileCheckpoints::try_new(&full, CompilePhase::Decode).unwrap();

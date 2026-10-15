@@ -66,7 +66,7 @@ fn xx_hash3_128_every_actual_selected_checkpoint_preserves_seven_causes_and_fail
     ];
     let sources = arrays
         .iter()
-        .map(|a| FunctionValueType::new(a.data_type().clone(), true))
+        .map(|a| FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true))
         .collect::<Vec<_>>();
     let prepared = prepared(&sources);
     let rows = [0, 2, 3];

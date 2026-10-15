@@ -27,6 +27,7 @@ use novarocks_type_contract::{
 };
 use std::fmt;
 
+pub(crate) mod creation;
 mod encode;
 mod materialize;
 pub(crate) mod owner_admission;
@@ -37,16 +38,18 @@ mod read;
 mod signature_copy;
 pub use materialize::{
     MaterializedFunctionBinding, MaterializedFunctionBindings,
-    PreparedFunctionBindingsMaterialization, materialize_function_bindings,
-    materialize_function_bindings_in, prepare_function_bindings_materialization,
+    PreparedFunctionBindingsMaterialization, materialize_execution_binding_with_creator_in,
+    materialize_function_bindings, materialize_function_bindings_in,
+    materialize_function_bindings_with_creator_in, prepare_function_bindings_materialization,
     prepare_function_bindings_materialization_in,
 };
 pub use read::{
-    PreparedFunctionBindingHeaders, prepare_function_binding_headers,
-    prepare_function_binding_headers_in,
+    PreparedFunctionBindingHeaders, preflight_execution_binding_header_input_derived_in,
+    prepare_function_binding_headers, prepare_function_binding_headers_in,
 };
 pub(crate) use signature_copy::{
-    copy_scalar_signature_observed, copy_table_signature_observed, preflight_scalar_signature_copy,
+    copy_scalar_signature_observed, copy_scalar_signature_with_creator_observed,
+    copy_table_signature_observed, preflight_scalar_signature_copy,
     preflight_scalar_signature_copy_counts, preflight_scalar_signature_copy_counts_in,
     preflight_scalar_signature_copy_in, preflight_scalar_signature_copy_types,
     preflight_scalar_signature_copy_types_in, preflight_table_signature_copy_counts,
@@ -58,6 +61,7 @@ pub(crate) use signature_copy::{
 pub enum BindingCodecError {
     Control(CompileControlError),
     Type(TypeCodecError),
+    Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
     InvalidShape(&'static str),
 }
 impl From<CompileControlError> for BindingCodecError {
@@ -78,6 +82,7 @@ impl fmt::Display for BindingCodecError {
         match self {
             Self::Control(error) => error.fmt(formatter),
             Self::Type(error) => error.fmt(formatter),
+            Self::Resource(error) => write!(formatter, "binding construction resource: {error:?}"),
             Self::InvalidShape(message) => formatter.write_str(message),
         }
     }
@@ -87,6 +92,7 @@ impl std::error::Error for BindingCodecError {
         match self {
             Self::Control(error) => Some(error),
             Self::Type(error) => Some(error),
+            Self::Resource(_) => None,
             Self::InvalidShape(_) => None,
         }
     }
@@ -119,7 +125,10 @@ impl VerifiedSignature {
         self.work
     }
 }
-pub(crate) use encode::{verify_scalar_signature, verify_scalar_signature_admitted};
+pub(crate) use encode::{
+    BindingEmission, emit_binding_definition, verify_scalar_signature,
+    verify_scalar_signature_admitted,
+};
 
 #[derive(Clone, Copy)]
 pub enum BindingSource<'a> {
@@ -400,3 +409,11 @@ mod tests;
 #[cfg(test)]
 #[path = "physical_binding_v2/owner_tests.rs"]
 mod owner_tests;
+
+impl<H> From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+    for crate::host_projection_v2::ProjectionFailure<BindingCodecError, H>
+{
+    fn from(error: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        Self::Codec(BindingCodecError::Resource(error))
+    }
+}

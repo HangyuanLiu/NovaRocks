@@ -88,8 +88,8 @@ pub(super) fn validate_profile(
 ) -> Result<(), KernelFailure> {
     let arguments = &contract.selected().argument_types;
     if arguments.is_empty()
-        || !contract.result_type().nullable
-        || contract.result_type().logical_type != ValueLogicalType::Physical
+        || !contract.result_type().nullable()
+        || contract.result_type().logical_type() != ValueLogicalType::Physical
     {
         return Err(invalid(
             "extrema requires a nonempty exact nullable Physical result profile",
@@ -102,17 +102,18 @@ pub(super) fn validate_profile(
         let FunctionArgumentType::Value(value) = argument else {
             return Err(invalid("extrema requires value arguments"));
         };
-        if value.logical_type != ValueLogicalType::Physical
-            && !(value.logical_type == ValueLogicalType::Json && value.data_type == DataType::Utf8)
+        if value.logical_type() != ValueLogicalType::Physical
+            && !(value.logical_type() == ValueLogicalType::Json
+                && value.data_type() == &DataType::Utf8)
         {
             return Err(invalid(
                 "extrema has no value-preserving implementation for this logical domain",
             ));
         }
-        is_temporal &= temporal(&value.data_type);
-        is_numeric &= numeric(&value.data_type);
+        is_temporal &= temporal(value.data_type());
+        is_numeric &= numeric(value.data_type());
     }
-    let target = &contract.result_type().data_type;
+    let target = contract.result_type().data_type();
     if *target == DataType::Null {
         return Err(invalid(
             "greatest/least has no v1 value result for an exact Null target",
@@ -140,12 +141,12 @@ pub(super) fn validate_profile(
 /// Check a temporal target's exact static conversion, including timezone support.
 pub(super) fn validate_target(contract: &ScalarCallContract) -> Result<(), KernelFailure> {
     if matches!(
-        contract.result_type().data_type,
+        contract.result_type().data_type(),
         DataType::Timestamp(_, Some(_))
     ) {
         let empty =
             Arc::new(TimestampMicrosecondArray::from(Vec::<Option<i64>>::new())) as ArrayRef;
-        cast_output(empty, Some(&contract.result_type().data_type))
+        cast_output(empty, Some(contract.result_type().data_type()))
             .map_err(|message| invalid(&message))?;
     }
     Ok(())
@@ -163,14 +164,14 @@ pub(super) fn evaluate<'a>(
             operation,
             input.arguments(),
             input.selection(),
-            Some(&input.contract().result_type().data_type),
+            Some(input.contract().result_type().data_type()),
             false,
             &mut work,
             None,
         )?;
         SelectedValues::try_new_observed(
             input.selection(),
-            &input.contract().result_type().data_type,
+            input.contract().result_type().data_type(),
             out,
             Box::default(),
             || work.step(),

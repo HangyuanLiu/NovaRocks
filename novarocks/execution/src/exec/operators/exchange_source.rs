@@ -208,15 +208,18 @@ impl ExchangeIdleDeadline {
 /// Factory for exchange source operators that fetch and decode remote stream pages.
 pub struct ExchangeSourceFactory {
     name: String,
-    node: ExchangeSourceNode,
+    node: ExchangeSourceIdentity,
     binding: ExchangeBinding,
-    runtime_filter_execution: ExchangeSourceRuntimeFilterExecution,
-    arena: Arc<ExprArena>,
+    runtime_filter_consumers: Option<RuntimeFilterConsumerSet>,
     idle_progress: Arc<ExchangeIdleProgress>,
 }
 
-struct ExchangeSourceRuntimeFilterExecution {
-    consumers: RuntimeFilterConsumerSet,
+/// The receiver registry owns the exact schema and decoded chunks. A source
+/// driver needs only routing and timeout facts, never another schema owner.
+#[derive(Clone, Copy)]
+struct ExchangeSourceIdentity {
+    node_id: i32,
+    timeout: std::time::Duration,
 }
 
 impl ExchangeSourceFactory {
@@ -229,39 +232,36 @@ impl ExchangeSourceFactory {
         let consumers = RuntimeFilterConsumerSet::from_plan(
             "ExchangeSource",
             node.native_runtime_filter_specs(),
-            Arc::clone(&arena),
+            arena,
         )?;
         Ok(Self {
             name,
-            node,
+            node: ExchangeSourceIdentity {
+                node_id: node.node_id,
+                timeout: node.timeout,
+            },
             binding,
-            runtime_filter_execution: ExchangeSourceRuntimeFilterExecution { consumers },
-            arena,
+            runtime_filter_consumers: Some(consumers),
             idle_progress: Arc::new(ExchangeIdleProgress::new()),
         })
     }
 
     /// Build the source for a compiled ExchangeSource (local-compiler
-    /// output). It owns no legacy expression arena: nothing is thawed for it,
-    /// and a node carrying legacy runtime-filter consumers or hash-key
-    /// expressions is refused rather than evaluated against an empty arena.
+    /// output). Its builder validates the frozen local node's supported shape.
+    /// The receiver registry supplies exact typed chunks; no expression arena
+    /// or duplicate expected schema is constructed for this driver.
     pub(crate) fn new_compiled(
-        node: ExchangeSourceNode,
+        node_id: i32,
+        timeout: std::time::Duration,
         binding: ExchangeBinding,
-    ) -> Result<Self, String> {
-        if !node.native_runtime_filter_specs().is_empty() {
-            return Err(format!(
-                "compiled exchange source {} cannot carry legacy runtime-filter consumers",
-                node.node_id
-            ));
+    ) -> Self {
+        Self {
+            name: format!("EXCHANGE_SOURCE (id={node_id})"),
+            node: ExchangeSourceIdentity { node_id, timeout },
+            binding,
+            runtime_filter_consumers: None,
+            idle_progress: Arc::new(ExchangeIdleProgress::new()),
         }
-        if !node.hash_partition_exprs().is_empty() {
-            return Err(format!(
-                "compiled exchange source {} cannot carry legacy hash-key expressions",
-                node.node_id
-            ));
-        }
-        Self::new_native(node, binding, Arc::new(ExprArena::default()))
     }
 }
 
@@ -277,10 +277,9 @@ impl OperatorFactory for ExchangeSourceFactory {
             .register(&idle_deadline, &source_observable);
         // A chunk held at the runtime-filter gate waits on the same stable
         // source observable as ordinary input.
-        forward_observable(
-            &self.runtime_filter_execution.consumers.gate_observable(),
-            &source_observable,
-        );
+        if let Some(consumers) = &self.runtime_filter_consumers {
+            forward_observable(&consumers.gate_observable(), &source_observable);
+        }
         Box::new(ExchangeSourceOperator {
             name: self.name.clone(),
             node: self.node.clone(),
@@ -295,8 +294,7 @@ impl OperatorFactory for ExchangeSourceFactory {
             logged_first_none: false,
             #[cfg(feature = "test-controls")]
             last_partial_eos_marker_count: 0,
-            arena: Arc::clone(&self.arena),
-            native_runtime_filter_consumers: Some(self.runtime_filter_execution.consumers.clone()),
+            native_runtime_filter_consumers: self.runtime_filter_consumers.clone(),
             gated_chunk: None,
             event_sink: Arc::new(NoopFragmentEventSink),
             receiver_mem_tracker_ready: false,
@@ -308,13 +306,9 @@ impl OperatorFactory for ExchangeSourceFactory {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "The source retains its expression arena for exchange execution contract compatibility."
-)]
 struct ExchangeSourceOperator {
     name: String,
-    node: ExchangeSourceNode,
+    node: ExchangeSourceIdentity,
     binding: ExchangeBinding,
     driver_id: i32,
     receiver: Option<exchange::ExchangeReceiverHandle>,
@@ -326,7 +320,6 @@ struct ExchangeSourceOperator {
     logged_first_none: bool,
     #[cfg(feature = "test-controls")]
     last_partial_eos_marker_count: usize,
-    arena: Arc<ExprArena>,
     native_runtime_filter_consumers: Option<RuntimeFilterConsumerSet>,
     /// The first chunk received, held while the runtime-filter gate that its
     /// arrival opened is still pending.

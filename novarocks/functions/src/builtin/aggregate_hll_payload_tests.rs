@@ -176,7 +176,12 @@ fn kernel(name: &str, source: FunctionValueType, phase: AggregateKernelPhase) ->
     };
     let parameters = SemanticParameters::try_new([]).unwrap();
     let uses = [Some(ExpressionUseId::new(332))];
-    let state_type = FunctionValueType::new(DataType::Binary, true);
+    let state_type = FunctionValueType::try_with_logical_type(
+        DataType::Binary,
+        true,
+        novarocks_type_contract::ValueLogicalType::Hll,
+    )
+    .unwrap();
     let state_context = ExpressionEffectContext {
         use_id: ExpressionUseId::new(333),
         domain: EvaluationDomainId::new(20),
@@ -296,7 +301,12 @@ fn count(array: &ArrayRef) -> Vec<Option<i64>> {
 fn hll_payload_owner_four_phases_three_projections_and_null_empty_groups() {
     for name in ["hll_union", "hll_raw_agg", "hll_union_agg"] {
         let host = Arc::new(Host::default());
-        let ty = FunctionValueType::new(DataType::Binary, true);
+        let ty = FunctionValueType::try_with_logical_type(
+            DataType::Binary,
+            true,
+            novarocks_type_contract::ValueLogicalType::Hll,
+        )
+        .unwrap();
         let mut single = make(
             name,
             AggregateKernelPhase::Single,
@@ -391,7 +401,7 @@ fn hll_payload_owner_unsupported_any_empty_null_whole_data_same_real_domain() {
                 let mut c = make(
                     name,
                     AggregateKernelPhase::Single,
-                    FunctionValueType::new(ty.clone(), true),
+                    FunctionValueType::from_legacy_declared_projection(ty.clone(), true),
                     host.clone(),
                     1,
                 );
@@ -435,7 +445,12 @@ fn hll_payload_owner_update_merge_original_delayed_recipe_phase_and_mapping() {
         let mut c = make(
             "hll_union_agg",
             phase,
-            FunctionValueType::new(DataType::Binary, true),
+            FunctionValueType::try_with_logical_type(
+                DataType::Binary,
+                true,
+                novarocks_type_contract::ValueLogicalType::Hll,
+            )
+            .unwrap(),
             host.clone(),
             2,
         );
@@ -478,7 +493,12 @@ fn control_run(control: &Control) -> Result<(), EvaluationFailure> {
     let mut c = make(
         "hll_union_agg",
         AggregateKernelPhase::Single,
-        FunctionValueType::new(DataType::Binary, true),
+        FunctionValueType::try_with_logical_type(
+            DataType::Binary,
+            true,
+            novarocks_type_contract::ValueLogicalType::Hll,
+        )
+        .unwrap(),
         host.clone(),
         1,
     );
@@ -536,7 +556,12 @@ fn hll_payload_owner_register_allocation_and_original_serialization_real_host_re
         let mut c = make(
             "hll_union",
             AggregateKernelPhase::Partial,
-            FunctionValueType::new(DataType::Binary, true),
+            FunctionValueType::try_with_logical_type(
+                DataType::Binary,
+                true,
+                novarocks_type_contract::ValueLogicalType::Hll,
+            )
+            .unwrap(),
             host.clone(),
             1,
         );
@@ -565,7 +590,12 @@ fn hll_payload_owner_register_allocation_and_original_serialization_real_host_re
         let mut c = make(
             "hll_union",
             AggregateKernelPhase::Partial,
-            FunctionValueType::new(DataType::Binary, true),
+            FunctionValueType::try_with_logical_type(
+                DataType::Binary,
+                true,
+                novarocks_type_contract::ValueLogicalType::Hll,
+            )
+            .unwrap(),
             host.clone(),
             1,
         );
@@ -599,7 +629,7 @@ fn hll_payload_owner_compile_three_causes_and_exact_declared_n1_profiles() {
             DataType::Null,
         ] {
             let arguments = [FunctionArgument::Value {
-                value_type: FunctionValueType::new(dtype, true),
+                value_type: FunctionValueType::from_legacy_declared_projection(dtype, true),
                 constant: None,
             }];
             let request = FunctionBindingRequest {
@@ -655,7 +685,7 @@ fn hll_payload_owner_four_original_payload_carriers_not_numeric_rehash() {
         let mut c = make(
             "hll_union_agg",
             AggregateKernelPhase::Single,
-            FunctionValueType::new(input.data_type().clone(), true),
+            FunctionValueType::from_legacy_declared_projection(input.data_type().clone(), true),
             host.clone(),
             3,
         );
@@ -757,7 +787,7 @@ fn hll_payload_empty_supported_four_carriers_update_and_binary_merge_preserve_nu
             let mut column = make(
                 name,
                 AggregateKernelPhase::Single,
-                FunctionValueType::new(ty.clone(), true),
+                FunctionValueType::from_legacy_declared_projection(ty.clone(), true),
                 host.clone(),
                 1,
             );
@@ -778,7 +808,12 @@ fn hll_payload_empty_supported_four_carriers_update_and_binary_merge_preserve_nu
         let mut column = make(
             name,
             AggregateKernelPhase::Final,
-            FunctionValueType::new(DataType::Binary, true),
+            FunctionValueType::try_with_logical_type(
+                DataType::Binary,
+                true,
+                novarocks_type_contract::ValueLogicalType::Hll,
+            )
+            .unwrap(),
             host.clone(),
             1,
         );
@@ -804,7 +839,12 @@ fn hll_payload_failed_emission_all_positions_preserves_real_healthy_prefix_only(
             let erased: Arc<dyn AggregateStateAllocator> = host.clone();
             let k = kernel(
                 name,
-                FunctionValueType::new(DataType::Binary, true),
+                FunctionValueType::try_with_logical_type(
+                    DataType::Binary,
+                    true,
+                    novarocks_type_contract::ValueLogicalType::Hll,
+                )
+                .unwrap(),
                 AggregateKernelPhase::Single,
             );
             let setup = Control::default();

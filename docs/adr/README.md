@@ -248,6 +248,8 @@ code-anchors:
 
 - ADR-0161 — 纯本地程序为何分离 Task 接管、安装、覆盖观察与实际收敛（active；继承逻辑执行/Native入口/冻结身份的有效规则）
 
+- ADR-0176 — 递归执行语义为何与准确布局、实际编码、来源字段及独立构造责任分离（active）
+
 #### 历史
 
 - ADR-0158 — Task 创建为何只冻结一次、按准确 identity 与生命周期重放，逻辑执行为何只激活一次计划；准确文件 ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md（superseded → ADR-0161）

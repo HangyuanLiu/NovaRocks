@@ -169,9 +169,9 @@ pub(super) fn validate_profile(
         step()?;
     }
     step()?;
-    if contract.result_type().data_type != DataType::Binary
-        || !contract.result_type().nullable
-        || contract.result_type().logical_type
+    if contract.result_type().data_type() != &DataType::Binary
+        || !contract.result_type().nullable()
+        || contract.result_type().logical_type()
             != novarocks_type_contract::ValueLogicalType::Physical
     {
         return Err(invalid(
@@ -238,7 +238,7 @@ pub(super) fn evaluate<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &input.contract().result_type().data_type,
+            input.contract().result_type().data_type(),
             values,
             errors.into_boxed_slice(),
             || work.step(),

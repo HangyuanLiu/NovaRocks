@@ -273,12 +273,17 @@ pub trait ProviderReadMetadata: ProviderReadRuntime {
         &self,
         _session: &ConnectorSession,
         _table: &Self::Table,
-        _columns: &[Self::Column],
-    ) -> Result<ConnectorReadPublicSchema, ConnectorError> {
+        _columns: &[&Self::Column],
+        _creation: &mut super::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorReadPublicSchema,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
         Err(ConnectorError::new(
             crate::connector::ConnectorErrorKind::Unsupported,
             "provider read generation does not publish a public read schema",
-        ))
+        )
+        .into())
     }
 
     fn apply_filter(
@@ -942,13 +947,36 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
         session: &ConnectorSession,
         table: &ConnectorReadTableHandle,
         columns: &[ConnectorReadColumnHandle],
-    ) -> Result<ConnectorReadPublicSchema, ConnectorError> {
+        creation: &mut super::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorReadPublicSchema,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        creation.work(1)?;
         let table = self.table(table)?;
-        let columns = columns
-            .iter()
-            .map(|column| self.column(column).cloned())
-            .collect::<Result<Vec<_>, _>>()?;
-        let schema = self.provider.read_public_schema(session, table, &columns)?;
+        let layout = std::alloc::Layout::array::<&P::Column>(columns.len()).map_err(|_| {
+            ConnectorError::new(
+                crate::connector::ConnectorErrorKind::ResourceExhausted,
+                "public schema source reference extent exceeds address space",
+            )
+        })?;
+        if layout.size() != 0 {
+            creation.request(layout)?;
+        }
+        let mut borrowed = Vec::new();
+        borrowed.try_reserve_exact(columns.len()).map_err(|_| {
+            ConnectorError::new(
+                crate::connector::ConnectorErrorKind::ResourceExhausted,
+                "public schema source reference allocation was refused",
+            )
+        })?;
+        for column in columns {
+            creation.work(1)?;
+            borrowed.push(self.column(column)?);
+        }
+        let schema = self
+            .provider
+            .read_public_schema(session, table, &borrowed, creation)?;
         // The fields are positional facts of the columns asked about. An answer
         // of any other arity cannot be paired back with them, so it is refused
         // here rather than left for a later ordinal check to misattribute.
@@ -960,7 +988,16 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
                     schema.schema().fields().len(),
                     columns.len()
                 ),
-            ));
+            )
+            .into());
+        }
+        creation.work(1)?;
+        if schema.execution_schema().is_none() || schema.source_schema_facts().is_none() {
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::InvalidRequest,
+                "provider public schema lacks complete execution/source declarations",
+            )
+            .into());
         }
         Ok(schema)
     }
@@ -1610,6 +1647,7 @@ mod tests {
     struct Probe {
         descriptor: ConnectorInstanceDescriptor,
         catalog_handle: CatalogHandle,
+        public_schema_calls: AtomicU64,
     }
 
     impl Probe {
@@ -1623,6 +1661,7 @@ mod tests {
                     ConnectorInstanceId::parse("catalog").expect("instance ID"),
                     crate::connector::CatalogVersion::from_bytes([3; 32]),
                 ),
+                public_schema_calls: AtomicU64::new(0),
             }
         }
     }
@@ -1680,8 +1719,13 @@ mod tests {
             &self,
             _session: &ConnectorSession,
             _table: &Self::Table,
-            columns: &[Self::Column],
-        ) -> Result<ConnectorReadPublicSchema, ConnectorError> {
+            columns: &[&Self::Column],
+            creation: &mut super::super::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            ConnectorReadPublicSchema,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
+            self.public_schema_calls.fetch_add(1, Ordering::SeqCst);
             let mut fields = columns
                 .iter()
                 .map(|column| {
@@ -1702,11 +1746,59 @@ mod tests {
                     true,
                 ));
             }
-            let logical_types =
-                vec![novarocks_type_contract::ValueLogicalType::Physical; fields.len()];
-            ConnectorReadPublicSchema::try_new(
-                Arc::new(arrow::datatypes::Schema::new(fields)),
-                logical_types,
+            let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+            let storage = creation.storage();
+            let bindings = schema
+                .fields()
+                .iter()
+                .map(|_| {
+                    // Explicit fixture declaration; source annotations do not
+                    // author even this test provider's value identity.
+                    let semantic = novarocks_type_contract::ValueTypeRef::try_new(
+                        novarocks_type_contract::ValueKind::Scalar(
+                            arrow::datatypes::DataType::Int64,
+                        ),
+                        true,
+                        storage.clone(),
+                    )
+                    .unwrap();
+                    let layout = novarocks_type_contract::ValueLayout::try_from_normalized_arrow(
+                        arrow::datatypes::DataType::Int64,
+                        storage.clone(),
+                    )
+                    .unwrap();
+                    novarocks_type_contract::FunctionValueType::try_from_value(semantic, layout)
+                        .unwrap()
+                })
+                .collect::<Box<[_]>>();
+            let execution = novarocks_connector_contract::ConnectorReadExecutionSchema::try_new(
+                schema.clone(),
+                bindings,
+                storage.clone(),
+            )?;
+            let shape = novarocks_connector_contract::ConnectorSourceSchemaShape::try_new(
+                schema,
+                storage.clone(),
+            )?;
+            let source = novarocks_connector_contract::ConnectorSourceSchemaFacts::try_new(
+                shape,
+                std::collections::HashMap::new(),
+                Box::new([]),
+                storage.clone(),
+            )?;
+            let (request, work) = creation.observers();
+            ConnectorReadPublicSchema::try_new_typed_observed(
+                &execution,
+                &source,
+                storage,
+                |layout| {
+                    request(layout)
+                        .map_err(novarocks_connector_contract::PureProviderCompileError::Control)
+                },
+                |units| {
+                    work(units)
+                        .map_err(novarocks_connector_contract::PureProviderCompileError::Control)
+                },
             )
         }
 
@@ -1893,14 +1985,36 @@ mod tests {
             .expect("session")
     }
 
+    fn probe_public_schema(
+        adapter: &ReadRuntimeAdapter<Probe>,
+        table: &ConnectorReadTableHandle,
+        columns: &[ConnectorReadColumnHandle],
+    ) -> Result<
+        ConnectorReadPublicSchema,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        let mut request = |_| Ok(());
+        let mut work = |_| Ok(());
+        let mut creation = super::super::ConnectorReadSchemaCreation::new(
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            &mut request,
+            &mut work,
+        );
+        ConnectorReadMetadata::read_public_schema(
+            adapter,
+            &test_session(),
+            table,
+            columns,
+            &mut creation,
+        )
+    }
+
     #[test]
     fn public_read_schema_answers_the_frozen_columns_in_assignment_order() {
         let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
         let table = adapter.wrap_table(Table);
         let columns = [2, 1, 2].map(|id| adapter.wrap_column(Column(id)));
-        let schema =
-            ConnectorReadMetadata::read_public_schema(&adapter, &test_session(), &table, &columns)
-                .expect("public schema");
+        let schema = probe_public_schema(&adapter, &table, &columns).expect("public schema");
         assert_eq!(
             schema
                 .schema()
@@ -1921,10 +2035,12 @@ mod tests {
         let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
         let table = adapter.wrap_table(Table);
         let columns = [adapter.wrap_column(Column(PUBLIC_SCHEMA_EXTRA_FIELD))];
-        let error =
-            ConnectorReadMetadata::read_public_schema(&adapter, &test_session(), &table, &columns)
-                .expect_err("one field too many is refused");
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        let error = probe_public_schema(&adapter, &table, &columns)
+            .expect_err("one field too many is refused");
+        assert!(
+            matches!(error, novarocks_connector_contract::PureProviderCompileError::Provider(error)
+            if error.kind() == ConnectorErrorKind::InvalidRequest)
+        );
     }
 
     #[test]
@@ -1938,10 +2054,65 @@ mod tests {
         let other = ReadRuntimeAdapter::new(Arc::new(other));
         let table = adapter.wrap_table(Table);
         let foreign = [other.wrap_column(Column(1))];
-        let error =
-            ConnectorReadMetadata::read_public_schema(&adapter, &test_session(), &table, &foreign)
-                .expect_err("a column of another admitted generation is refused");
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        let error = probe_public_schema(&adapter, &table, &foreign)
+            .expect_err("a column of another admitted generation is refused");
+        assert!(
+            matches!(error, novarocks_connector_contract::PureProviderCompileError::Provider(error)
+            if error.kind() == ConnectorErrorKind::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn public_read_schema_preserves_original_creation_refusal_before_provider_entry() {
+        use novarocks_connector_contract::PureProviderCompileError;
+        use novarocks_type_contract::{CompileControlError, ValueTypeStorageLifetime};
+        for cause in [
+            CompileControlError::Cancelled,
+            CompileControlError::DeadlineExceeded,
+            CompileControlError::ResourceExhausted,
+        ] {
+            for stop_at_request in [false, true] {
+                let probe = Arc::new(Probe::new());
+                let adapter = ReadRuntimeAdapter::new(probe.clone());
+                let table = adapter.wrap_table(Table);
+                let columns = [adapter.wrap_column(Column(1))];
+                let requests = std::cell::RefCell::new(Vec::new());
+                let steps = std::cell::RefCell::new(Vec::new());
+                let mut request = |layout| {
+                    requests.borrow_mut().push(layout);
+                    Err(cause)
+                };
+                let mut work = |units| {
+                    steps.borrow_mut().push(units);
+                    if stop_at_request { Ok(()) } else { Err(cause) }
+                };
+                let mut creation = super::super::ConnectorReadSchemaCreation::new(
+                    ValueTypeStorageLifetime::pure(),
+                    &mut request,
+                    &mut work,
+                );
+                let result = ConnectorReadMetadata::read_public_schema(
+                    &adapter,
+                    &test_session(),
+                    &table,
+                    &columns,
+                    &mut creation,
+                );
+                assert!(
+                    matches!(result, Err(PureProviderCompileError::Control(actual)) if actual == cause)
+                );
+                assert_eq!(probe.public_schema_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(*steps.borrow(), [1]);
+                if stop_at_request {
+                    assert_eq!(
+                        *requests.borrow(),
+                        [std::alloc::Layout::array::<&Column>(1).unwrap()]
+                    );
+                } else {
+                    assert!(requests.borrow().is_empty());
+                }
+            }
+        }
     }
 
     #[test]
@@ -1995,6 +2166,7 @@ mod tests {
             .expect("same static binding rebinds for a new attempt");
 
         let foreign_adapter = ReadRuntimeAdapter::new(Arc::new(Probe {
+            public_schema_calls: AtomicU64::new(0),
             descriptor: ConnectorInstanceDescriptor {
                 provider_id: ConnectorProviderId::parse("probe").expect("provider ID"),
                 instance_id: ConnectorInstanceId::parse("other").expect("instance ID"),
@@ -2036,6 +2208,7 @@ mod tests {
 
         let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
         let foreign_adapter = ReadRuntimeAdapter::new(Arc::new(Probe {
+            public_schema_calls: AtomicU64::new(0),
             descriptor: ConnectorInstanceDescriptor {
                 provider_id: ConnectorProviderId::parse("probe").expect("provider ID"),
                 instance_id: ConnectorInstanceId::parse("foreign").expect("instance ID"),
@@ -2126,6 +2299,7 @@ mod tests {
     fn attempt_access_rejects_mixed_metadata_and_split_generations() {
         let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
         let foreign_adapter = ReadRuntimeAdapter::new(Arc::new(Probe {
+            public_schema_calls: AtomicU64::new(0),
             descriptor: ConnectorInstanceDescriptor {
                 provider_id: ConnectorProviderId::parse("probe").expect("provider ID"),
                 instance_id: ConnectorInstanceId::parse("foreign").expect("instance ID"),

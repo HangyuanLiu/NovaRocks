@@ -256,7 +256,8 @@ fn filter_chunk_by_keep(chunk: Chunk, keep: Vec<bool>) -> Result<Option<Chunk>, 
         return Ok(None);
     }
     let mask = BooleanArray::from(keep);
-    let filtered_batch = filter_record_batch(&chunk.batch, &mask).map_err(|e| e.to_string())?;
+    let filtered_batch =
+        filter_record_batch(&chunk.record_batch(), &mask).map_err(|e| e.to_string())?;
     Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
 }
 
@@ -554,7 +555,8 @@ pub fn filter_chunk_by_min_max_filters_with_exprs_and_dict_cache(
             continue;
         }
         let mask = BooleanArray::from(keep);
-        let filtered_batch = filter_record_batch(&chunk.batch, &mask).map_err(|e| e.to_string())?;
+        let filtered_batch =
+            filter_record_batch(&chunk.record_batch(), &mask).map_err(|e| e.to_string())?;
         current = Some(Chunk::new_like(filtered_batch, &chunk));
     }
     Ok(current)

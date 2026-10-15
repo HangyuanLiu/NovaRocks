@@ -157,8 +157,8 @@ fn legacy_typed(
     let chunk = Chunk::new_with_chunk_schema(batch, schema);
     let mut arena = ExprArena::default();
     arena.set_allow_throw_exception(allow);
-    let left = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), lt.data_type);
-    let right = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), rt.data_type);
+    let left = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), lt.data_type().clone());
+    let right = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), rt.data_type().clone());
     let expr = match op {
         ArithmeticOperator::Add => ExprNode::Add(left, right, policy),
         ArithmeticOperator::Subtract => ExprNode::Sub(left, right, policy),
@@ -166,7 +166,7 @@ fn legacy_typed(
         ArithmeticOperator::Divide => ExprNode::Div(left, right, policy),
         ArithmeticOperator::Modulo => ExprNode::Mod(left, right, policy),
     };
-    let expr = arena.push_typed(expr, output.data_type);
+    let expr = arena.push_typed(expr, output.data_type().clone());
     arena.eval(expr, &chunk)
 }
 fn shared(

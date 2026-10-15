@@ -30,14 +30,10 @@ use crate::{
     physical_type_v2::TypeCodecError,
     resource_source_model::{LOCKED_FAMILY, LOCKED_TOOLCHAIN},
 };
-use arrow::{
-    datatypes::{DataType, Field},
-    ipc::{Field as IpcField, KeyValue},
-};
-use flatbuffers::WIPOffset;
+use arrow::datatypes::{DataType, Field};
 use novarocks_type_contract::{
-    CompileCheckpoints, MAX_VALUE_TYPE_NODES, NR_LOGICAL_TYPE_KEY, ValueTypeVisit,
-    validate_value_type_structure_with_scratch_observed,
+    CompileCheckpoints, MAX_VALUE_TYPE_NODES, ValueTypeVisit,
+    validate_arrow_layout_structure_with_scratch_observed,
 };
 use std::alloc::Layout;
 
@@ -58,15 +54,21 @@ pub(crate) struct SchemaWriterAllocationFacts {
     pub request_count: usize,
     pub work_upper_bound: usize,
 }
-#[derive(Clone, Copy, Default)]
-struct Requests {
-    bytes: usize,
-    count: usize,
+#[derive(Default)]
+struct Requests(novarocks_functions::arrow_ipc_construction::SchemaRequestAccumulator);
+impl std::ops::Deref for Requests {
+    type Target = novarocks_functions::arrow_ipc_construction::SchemaRequestAccumulator;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for Requests {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
 }
 
 type WalkerEntry<'a> = (&'a DataType, usize);
-type ChildOffset = WIPOffset<IpcField<'static>>;
-type MetadataOffset = WIPOffset<KeyValue<'static>>;
 
 fn invalid() -> TypeCodecError {
     TypeCodecError::InvalidShape("schema writer resource extent is not representable")
@@ -93,39 +95,28 @@ impl Requests {
         &mut self,
         layout: Layout,
         copies: usize,
-        work: Option<&mut CompileCheckpoints<'_>>,
+        mut work: Option<&mut CompileCheckpoints<'_>>,
     ) -> Result<(), TypeCodecError> {
-        let result = (|| {
-            if layout.size() != 0 && copies != 0 {
-                self.bytes = add(self.bytes, mul(layout.size(), copies)?)?;
-                self.count = add(self.count, copies)?;
+        self.0.layout::<TypeCodecError>(layout, copies, &mut || {
+            if let Some(work) = work.as_deref_mut() {
+                work.step()?;
             }
             Ok(())
-        })();
-        if let Some(work) = work {
-            work.step()?;
-        }
-        result
+        })
     }
     fn exact<T>(
         &mut self,
         capacity: usize,
         copies: usize,
-        work: Option<&mut CompileCheckpoints<'_>>,
+        mut work: Option<&mut CompileCheckpoints<'_>>,
     ) -> Result<(), TypeCodecError> {
-        let result = (|| {
-            let layout = Layout::array::<T>(capacity).map_err(|_| invalid())?;
-            if layout.size() == 0 || copies == 0 {
-                return Ok(());
-            }
-            self.bytes = add(self.bytes, mul(layout.size(), copies)?)?;
-            self.count = add(self.count, copies)?;
-            Ok(())
-        })();
-        if let Some(work) = work {
-            work.step()?;
-        }
-        result
+        self.0
+            .exact::<T, TypeCodecError>(capacity, copies, &mut || {
+                if let Some(work) = work.as_deref_mut() {
+                    work.step()?;
+                }
+                Ok(())
+            })
     }
     fn geometric<T>(
         &mut self,
@@ -134,26 +125,16 @@ impl Requests {
         copies: usize,
         mut work: Option<&mut CompileCheckpoints<'_>>,
     ) -> Result<(), TypeCodecError> {
-        if target == 0 {
-            return Ok(());
-        }
-        let mut capacity = initial;
-        self.exact::<T>(capacity, copies, work.as_deref_mut())?;
-        while capacity < target {
-            let next = if capacity < 4 {
-                Ok(4)
-            } else {
-                mul(capacity, 2)
-            };
-            if let Some(work) = work.as_deref_mut() {
-                work.step()?;
-            }
-            capacity = next?;
-            self.exact::<T>(capacity, copies, work.as_deref_mut())?;
-        }
-        Ok(())
+        self.0
+            .geometric::<T, TypeCodecError>(target, initial, copies, &mut || {
+                if let Some(work) = work.as_deref_mut() {
+                    work.step()?;
+                }
+                Ok(())
+            })
     }
 }
+
 fn flat(field: &Field, work: &mut CompileCheckpoints<'_>) -> Result<bool, TypeCodecError> {
     // Reuse the existing flat carrier author, without another primitive table.
     let result = ipc_flat_batch_v2::layout(field.data_type()).is_ok();
@@ -177,26 +158,15 @@ fn walkers(
     }
 }
 fn source_work(source: usize, fields: usize, entries: usize) -> Result<usize, TypeCodecError> {
-    // Original raw maps include spare/deleted buckets in the trusted invoice.
-    // Metadata scans: four preflight visits, one emission visit, then up to K
-    // verification visits. Logical probes: two root, four per nested Field.
-    let logical_probes = mul(4, fields)?.checked_sub(2).ok_or_else(invalid)?;
-    let source_probes = add(mul(5, fields)?, logical_probes)?;
-    add(
-        mul(source, add(entries, source_probes)?)?,
-        mul(logical_probes, NR_LOGICAL_TYPE_KEY.len())?,
-    )
+    // Four preflight metadata scans, one emission scan, and up to K source
+    // association scans during verification. Source attributes do not run a
+    // logical tag probe; their original backing bounds only actual map work.
+    mul(source, add(entries, mul(5, fields)?)?)
 }
-
 fn prefix_source_work(source: usize, fields: usize) -> Result<usize, TypeCodecError> {
-    // Two subsequent metadata scans per Field, two nested logical probes in
-    // those walks, and this scratch walk's additional nested logical probe.
-    // The root is not a Field event in any structural walk: one later probe.
-    let logical = mul(3, fields)?.checked_sub(2).ok_or_else(invalid)?;
-    add(
-        mul(source, add(mul(2, fields)?, logical)?)?,
-        mul(logical, NR_LOGICAL_TYPE_KEY.len())?,
-    )
+    // The two subsequent metadata walks use actual source tables. The fixed
+    // structural scratch walk only reads lengths and never interprets a tag.
+    mul(source, mul(2, fields)?)
 }
 fn admit_prefix_work(actual: usize, admitted: usize) -> Result<(), TypeCodecError> {
     if actual > admitted {
@@ -210,7 +180,7 @@ fn admit_prefix_work(actual: usize, admitted: usize) -> Result<(), TypeCodecErro
 
 /// Uses the sole type grammar with fixed scratch to count actual occurrences
 /// before the first two Vec walks. The explicit caller work ceiling is checked
-/// before initialization and before each original opaque logical-map probe.
+/// before initialization and before each actual source metadata walk.
 /// Caller request/source-coexistence admission and flush remain mandatory.
 pub(crate) fn schema_writer_prefix_resources(
     field: &Field,
@@ -314,7 +284,7 @@ fn schema_writer_prefix_core<H>(
             work.flush()?;
             let mut scratch = [None; MAX_VALUE_TYPE_NODES];
             work.flush()?;
-            validate_value_type_structure_with_scratch_observed(
+            validate_arrow_layout_structure_with_scratch_observed(
                 field.data_type(),
                 &mut scratch,
                 |visit| {
@@ -344,8 +314,8 @@ fn schema_writer_prefix_core<H>(
                     }
                     work.step()?;
                     admit_prefix_work(bound, max_preflight_library_work)?;
-                    // Field is immediately before the sole owner's logical
-                    // map probe; ChildEdge is immediately after its success.
+                    // Keep the original opaque-operation boundaries around
+                    // source Fields and structural edges; no tag is decoded.
                     if matches!(
                         visit,
                         ValueTypeVisit::Field(_) | ValueTypeVisit::ChildEdge(_)
@@ -417,99 +387,56 @@ pub(crate) fn preflight_schema_writer_resources(
     result
 }
 
+impl From<novarocks_functions::arrow_ipc_construction::IpcGeometryError> for TypeCodecError {
+    fn from(_: novarocks_functions::arrow_ipc_construction::IpcGeometryError) -> Self {
+        invalid()
+    }
+}
+
 pub(super) fn allocation_facts(
     schema: SchemaPreflight,
     prefix: SchemaWriterPrefixFacts,
     mut work: Option<&mut CompileCheckpoints<'_>>,
 ) -> Result<SchemaWriterAllocationFacts, TypeCodecError> {
-    let flat = prefix.is_flat;
-    let mut requests = Requests::default();
-    requests.exact::<u8>(schema.backing, 2, work.as_deref_mut())?; // builder + finished copy
-    walkers(&mut requests, flat, 4, work.as_deref_mut())?;
-    requests.exact::<(&str, &str)>(schema.metadata_entries, 1, work.as_deref_mut())?;
-    requests.exact::<MetadataOffset>(schema.metadata_entries, 1, work.as_deref_mut())?;
-    // The byte total is summed arities/K; request counts are per actual
-    // nonempty Vec. Each independently checked request fits that total.
-    let metadata_requests = mul(2, schema.metadata_nonempty_fields)?;
-    let metadata_count = if schema.metadata_entries == 0 { 0 } else { 2 };
-    requests.count = add(
-        requests.count,
-        metadata_requests
-            .checked_sub(metadata_count)
-            .ok_or_else(invalid)?,
-    )?;
-    requests.exact::<ChildOffset>(schema.child_offset_items, 1, work.as_deref_mut())?;
-    let child_count = usize::from(schema.child_offset_items != 0);
-    requests.count = add(
-        requests.count,
-        schema
-            .child_offset_requests
-            .checked_sub(child_count)
-            .ok_or_else(invalid)?,
-    )?;
-    requests.exact::<i32>(schema.union_id_items, 1, work.as_deref_mut())?;
-    let union_count = usize::from(schema.union_id_items != 0);
-    requests.count = add(
-        requests.count,
-        schema
-            .union_id_requests
-            .checked_sub(union_count)
-            .ok_or_else(invalid)?,
-    )?;
-    let field_location = field_location_layout();
-    for capacity in [4, 8] {
-        let layout = Layout::from_size_align(
-            mul(field_location.size(), capacity)?,
-            field_location.align(),
-        )
-        .map_err(|_| invalid())?;
-        requests.layout(layout, 1, work.as_deref_mut())?;
-    }
-    requests.geometric::<u32>(schema.tables, 4, 1, work)?;
-    let associations = mul(
-        mul(4, mul(schema.metadata_entries, schema.metadata_entries)?)?,
-        add(schema.string_bytes, 1)?,
-    )?;
-    let vtables = mul(40, mul(schema.tables, schema.tables)?)?;
-    let storage = add(mul(4, requests.bytes)?, requests.count)?;
-    let mut source = source_work(
-        prefix.source_retained_bytes,
-        schema.field_occurrences,
-        schema.metadata_entries,
-    )?;
-    if !flat {
-        // The prefix scratch pass is additional to the four Vec passes.
-        let probes = schema
-            .field_occurrences
-            .checked_sub(1)
-            .ok_or_else(invalid)?;
-        source = add(
-            source,
-            mul(
-                probes,
-                add(prefix.source_retained_bytes, NR_LOGICAL_TYPE_KEY.len())?,
-            )?,
-        )?;
-    }
-    // Four shared walks each visit type/field/edge, emission and borrowed
-    // verification visit those same facts. The source backing and storage
-    // terms additionally cover byte/header construction and teardown.
-    // Per occurrence: four Vec passes contribute <=3 events each,
-    // emission <=4 fixed operations, verification <=16 field/type/header
-    // checks. Their sum is <=32; metadata/slots/bytes are separate terms.
-    let structural = add(
-        mul(32, add(schema.field_occurrences, schema.type_occurrences)?)?,
-        prefix.scratch_work,
-    )?;
-    let work_upper_bound = add(
-        add(add(source, associations)?, vtables)?,
-        add(storage, structural)?,
+    use novarocks_functions::arrow_ipc_construction::{
+        SchemaGeometry, SchemaResourceSource, schema_writer_allocation_metrics,
+    };
+    let geometry = SchemaGeometry {
+        backing: schema.backing,
+        tables: schema.tables,
+        metadata_entries: schema.metadata_entries,
+        string_bytes: schema.string_bytes,
+        field_occurrences: schema.field_occurrences,
+        type_occurrences: schema.type_occurrences,
+        metadata_nonempty_fields: schema.metadata_nonempty_fields,
+        child_offset_items: schema.child_offset_items,
+        child_offset_requests: schema.child_offset_requests,
+        union_id_items: schema.union_id_items,
+        union_id_requests: schema.union_id_requests,
+    };
+    let source = SchemaResourceSource {
+        is_flat: prefix.is_flat,
+        source_retained_bytes: prefix.source_retained_bytes,
+        scratch_work: prefix.scratch_work,
+    };
+    // Receiving policy, source custody and the concrete locked layout guard
+    // remain at this original codec boundary. Only numerical geometry moved.
+    let metrics = schema_writer_allocation_metrics::<TypeCodecError>(
+        geometry,
+        source,
+        field_location_layout(),
+        &mut || {
+            if let Some(work) = work.as_deref_mut() {
+                work.step()?;
+            }
+            Ok(())
+        },
     )?;
     Ok(SchemaWriterAllocationFacts {
         schema,
-        request_bytes: requests.bytes,
-        request_count: requests.count,
-        work_upper_bound,
+        request_bytes: metrics.request_bytes,
+        request_count: metrics.request_count,
+        work_upper_bound: metrics.work_upper_bound,
     })
 }
 
@@ -633,7 +560,7 @@ pub(crate) fn schema_writer_prefix_resources_with_host_in<H>(
         parent: Some(admit),
         source,
         reader: false,
-        max_work,
+        max_work: Some(max_work),
         facts: SchemaWriterRequestFacts::default(),
     };
     schema_writer_prefix_core(field, source, limits, max_work, Some(&mut admission), work)
@@ -829,8 +756,9 @@ mod tests {
             2 * facts.schema.backing
                 + 4 * 8189 * walk
                 + 8 * (Layout::new::<(&str, &str)>().size()
-                    + Layout::new::<MetadataOffset>().size())
-                + 3 * Layout::new::<ChildOffset>().size()
+                    + Layout::new::<flatbuffers::WIPOffset<arrow::ipc::KeyValue<'static>>>()
+                        .size())
+                + 3 * Layout::new::<flatbuffers::WIPOffset<arrow::ipc::Field<'static>>>().size()
                 + 12 * 8
                 + (4 + 8 + 16 + 32) * 4
         );

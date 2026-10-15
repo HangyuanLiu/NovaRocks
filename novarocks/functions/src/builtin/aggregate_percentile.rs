@@ -21,7 +21,7 @@ use crate::aggregate_invocation_backing::HostDiagnostic;
 use crate::aggregate_scalar::{self as scalar, ScalarStateAllocator, ScalarStateError, ScalarWork};
 use crate::exact_percentile_core::{self as core, ExactPercentileAllocator};
 use crate::exact_percentile_failure::{PercentileDataRecipe, PercentileFailureSink};
-use crate::kernel_control::{compile_failure, internal, invalid};
+use crate::kernel_control::{internal, invalid};
 use crate::kernel_input::EvaluationCheckpoints;
 use crate::*;
 use allocator_api2::{
@@ -272,7 +272,7 @@ impl PercentileKernel {
         else {
             unreachable!("validated scalar result")
         };
-        &output.data_type
+        output.data_type()
     }
     fn check_emit(
         &self,
@@ -711,14 +711,8 @@ pub(super) fn validate_selected_profile(
     let FunctionResultType::Scalar(output) = &selected.result_type else {
         return Err(invalid("percentile requires its original scalar result"));
     };
-    let mut expected = value.clone();
-    expected.nullable = true;
-    if !expected
-        .exactly_equals_observed::<KernelFailure>(output, || work.step().map_err(compile_failure))?
-        || !FunctionValueType::new(DataType::Binary, true)
-            .exactly_equals_observed::<KernelFailure>(intermediate_type, || {
-                work.step().map_err(compile_failure)
-            })?
+    if !super::aggregate_any_value::matches_nullable_source(value, output, work)?
+        || !super::aggregate_any_value::matches_nullable_binary(intermediate_type, work)?
     {
         return Err(invalid(
             "percentile selected output, rate or state differs from its original full signature",

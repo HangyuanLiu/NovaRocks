@@ -245,14 +245,14 @@ mod legacy_string_measure_contract_tests {
                 let FunctionResultType::Scalar(result) = &bound.selected.result_type else {
                     panic!("scalar result required");
                 };
-                assert_eq!(result.data_type, DataType::Int32);
+                assert_eq!(result.data_type().clone(), DataType::Int32);
                 assert_eq!(
-                    result.logical_type,
+                    result.logical_type(),
                     novarocks_type_contract::ValueLogicalType::Physical
                 );
                 // ASCII's existing binding conservatively remains nullable;
                 // the two length bindings use source nullability.
-                assert_eq!(result.nullable, name == "ascii" || nullable);
+                assert_eq!(result.nullable(), name == "ascii" || nullable);
             }
         }
         let arguments = [FunctionArgument::Value {

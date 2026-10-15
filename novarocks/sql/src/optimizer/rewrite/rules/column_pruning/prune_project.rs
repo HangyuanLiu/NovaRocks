@@ -566,7 +566,13 @@ mod tests {
             let Operator::LogicalScan(scan_op) = &mut scan.op else {
                 unreachable!()
             };
-            scan_op.columns[1].value_type.data_type = DataType::Decimal128(38, 0);
+            scan_op.columns[1].value_type =
+                novarocks_type_contract::FunctionValueType::try_with_logical_type(
+                    DataType::Decimal128(38, 0),
+                    scan_op.columns[1].value_type.nullable(),
+                    scan_op.columns[1].value_type.logical_type(),
+                )
+                .unwrap();
             scan_op.table.columns[1].data_type = DataType::Decimal128(38, 0);
             let items = {
                 let mut arena = arena_rc.borrow_mut();

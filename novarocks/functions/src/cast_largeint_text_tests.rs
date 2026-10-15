@@ -131,9 +131,13 @@ fn largeint_text_dense_compact_scalar_null_and_slice_keep_actual_addresses() {
     let rows = [1, 2, 3];
     let selection = Selection::try_sparse(4, &rows).unwrap();
     let ty = r.source_type();
-    let compact =
-        SelectedValues::try_new(selection, &ty.data_type, values.slice(1, 3), Box::default())
-            .unwrap();
+    let compact = SelectedValues::try_new(
+        selection,
+        ty.data_type(),
+        values.slice(1, 3),
+        Box::default(),
+    )
+    .unwrap();
     for (ordinal, row) in selection.iter().enumerate() {
         let expected = match row {
             1 => CastRowResult::Text("42".into()),
@@ -196,7 +200,7 @@ fn largeint_text_dense_compact_scalar_null_and_slice_keep_actual_addresses() {
     let unresolved_rows = [1];
     let unresolved = SelectedValues::try_new(
         Selection::try_sparse(4, &unresolved_rows).unwrap(),
-        &ty.data_type,
+        ty.data_type(),
         values.slice(2, 1),
         vec![RowDataError::new(0, "original child")].into_boxed_slice(),
     )

@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_schema::{DataType, Field};
 
+use super::invalid_binding as invalid;
 use super::*;
 
 fn identity(value: &str) -> FunctionOverloadId {
@@ -26,7 +27,7 @@ fn identity(value: &str) -> FunctionOverloadId {
 }
 
 fn value_type(data_type: DataType, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(data_type, nullable)
+    FunctionValueType::from_legacy_declared_projection(data_type, nullable)
 }
 
 fn argument(data_type: DataType, nullable: bool) -> FunctionArgument {
@@ -144,8 +145,9 @@ impl FunctionBindingResolver for EchoResolver {
         };
         Ok(FunctionBindingSelection {
             overload: identity("test/echo/T/v1"),
-            argument_types: vec![FunctionArgumentType::Value(value_type.clone())]
-                .into_boxed_slice(),
+            argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                vec![FunctionArgumentType::Value(value_type.clone())].into_boxed_slice(),
+            ),
             result_type: FunctionResultType::Scalar(value_type.clone()),
             aggregate: None,
         })
@@ -163,6 +165,8 @@ impl FunctionBindingResolver for EchoResolver {
         };
         if selected.overload != identity("test/echo/T/v1")
             || selected.result_type != FunctionResultType::Scalar(value_type.clone())
+            || selected.argument_types.as_ref()
+                != &[FunctionArgumentType::Value(value_type.clone())]
         {
             return Err(invalid(
                 "selected echo signature does not match its concrete input",
@@ -290,8 +294,11 @@ fn frozen_identity_kind_types_and_semantics_fail_closed() {
     changed.kind = FunctionKind::Window;
     assert_rejected(changed);
     let mut changed = bound.clone();
-    changed.selected.argument_types[0] =
-        FunctionArgumentType::Value(value_type(DataType::Decimal128(12, 3), false));
+    replace_selected_argument_fixture(
+        &mut changed.selected.argument_types,
+        0,
+        FunctionArgumentType::Value(value_type(DataType::Decimal128(12, 3), false)),
+    );
     assert_rejected(changed);
     let mut changed = bound.clone();
     changed.selected.result_type =
@@ -335,14 +342,17 @@ impl NamedStructResolver {
         let Some(name) = value.utf8_observed(CompilePhase::FunctionSpecialization, control)? else {
             return Err(invalid("field name must be a compile-time string"));
         };
-        let field = Field::new(name, field_type.data_type.clone(), field_type.nullable);
+        let field = Field::new(name, field_type.data_type().clone(), field_type.nullable());
         Ok(FunctionBindingSelection {
             overload: identity("test/named-struct/T/v1"),
-            argument_types: request
-                .arguments
-                .iter()
-                .map(FunctionArgument::argument_type)
-                .collect(),
+            argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                request
+                    .arguments
+                    .iter()
+                    .map(FunctionArgument::argument_type)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
             result_type: FunctionResultType::Scalar(value_type(
                 DataType::Struct(vec![Arc::new(field)].into()),
                 false,
@@ -605,11 +615,14 @@ impl FunctionBindingResolver for AggregateResolver {
         }
         Ok(FunctionBindingSelection {
             overload: identity("test/aggregate/T/v1"),
-            argument_types: request
-                .arguments
-                .iter()
-                .map(FunctionArgument::argument_type)
-                .collect(),
+            argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                request
+                    .arguments
+                    .iter()
+                    .map(FunctionArgument::argument_type)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
             result_type: FunctionResultType::Scalar(value_type(DataType::Int64, true)),
             aggregate: Some(AggregateBindingSelection {
                 state_argument_contract:
@@ -683,13 +696,17 @@ fn aggregate_binding_preserves_state_format_intermediate_nullability_and_logical
             .is_err()
     );
     let mut changed = bound.clone();
-    changed
-        .selected
-        .aggregate
-        .as_mut()
-        .unwrap()
-        .intermediate_type
-        .nullable = true;
+    {
+        let intermediate = &mut changed
+            .selected
+            .aggregate
+            .as_mut()
+            .unwrap()
+            .intermediate_type;
+        *intermediate = intermediate
+            .with_nullable(true)
+            .expect("valid function nullability declaration");
+    }
     assert!(
         catalog
             .validate_bound(&changed, request, crate::binding_test_control())
@@ -779,7 +796,9 @@ fn selected_overload_semantics_are_exact_with_conservative_name_metadata() {
         let ty = value_type(data_type.clone(), false);
         let selection = FunctionBindingSelection {
             overload: chosen.identity.clone(),
-            argument_types: Box::from([FunctionArgumentType::Value(ty.clone())]),
+            argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                Box::from([FunctionArgumentType::Value(ty.clone())]),
+            ),
             result_type: FunctionResultType::Scalar(ty),
             aggregate: None,
         };
@@ -847,7 +866,9 @@ fn worker_validation_requires_explicitly_coerced_argument_types() {
     let target = value_type(DataType::Int32, false);
     let selected = FunctionBindingSelection {
         overload: identity("test/echo/T/v1"),
-        argument_types: vec![FunctionArgumentType::Value(target.clone())].into_boxed_slice(),
+        argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+            vec![FunctionArgumentType::Value(target.clone())].into_boxed_slice(),
+        ),
         result_type: FunctionResultType::Scalar(target),
         aggregate: None,
     };
@@ -885,10 +906,13 @@ fn higher_order_catalog(arguments: &[FunctionArgument]) -> EngineFunctionCatalog
     );
     let selected = FunctionBindingSelection {
         overload: identity("test/array-map/T-U/v1"),
-        argument_types: arguments
-            .iter()
-            .map(FunctionArgument::argument_type)
-            .collect(),
+        argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+            arguments
+                .iter()
+                .map(FunctionArgument::argument_type)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ),
         result_type: FunctionResultType::Scalar(result),
         aggregate: None,
     };
@@ -907,7 +931,9 @@ fn higher_order_catalog(arguments: &[FunctionArgument]) -> EngineFunctionCatalog
 fn higher_order_arguments() -> [FunctionArgument; 2] {
     [
         FunctionArgument::Lambda {
-            parameter_types: vec![value_type(DataType::Int64, true)].into_boxed_slice(),
+            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                vec![value_type(DataType::Int64, true)].into_boxed_slice(),
+            ),
             result_type: value_type(DataType::Utf8, false),
         },
         argument(
@@ -1024,7 +1050,9 @@ fn higher_order_binding_freezes_lambda_arity_parameter_types_and_result_type() {
         let mut changed = arguments.clone();
         let changed_arity = parameters.len() != 1;
         changed[0] = FunctionArgument::Lambda {
-            parameter_types: parameters.into_boxed_slice(),
+            parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                parameters.into_boxed_slice(),
+            ),
             result_type: result,
         };
         assert!(
@@ -1077,7 +1105,9 @@ fn undeclared_selected_overload_is_rejected_during_resolution() {
     let target = value_type(DataType::Int64, false);
     let selected = FunctionBindingSelection {
         overload: identity("test/undeclared/v1"),
-        argument_types: vec![FunctionArgumentType::Value(target.clone())].into_boxed_slice(),
+        argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+            vec![FunctionArgumentType::Value(target.clone())].into_boxed_slice(),
+        ),
         result_type: FunctionResultType::Scalar(target),
         aggregate: None,
     };
@@ -1106,13 +1136,17 @@ fn table_and_window_bindings_have_distinct_result_shapes() {
     let relation = vec![scalar.clone(), value_type(DataType::Utf8, true)].into_boxed_slice();
     for kind in [FunctionKind::Table, FunctionKind::Window] {
         let result_type = if kind == FunctionKind::Table {
-            FunctionResultType::Relation(relation.clone())
+            FunctionResultType::Relation(
+                novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(relation.clone()),
+            )
         } else {
             FunctionResultType::Scalar(scalar.clone())
         };
         let selected = FunctionBindingSelection {
             overload: identity("test/result/v1"),
-            argument_types: Box::default(),
+            argument_types: novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(
+                Box::default(),
+            ),
             result_type,
             aggregate: None,
         };
@@ -1130,7 +1164,9 @@ fn table_and_window_bindings_have_distinct_result_shapes() {
         changed.selected.result_type = if kind == FunctionKind::Table {
             FunctionResultType::Scalar(scalar.clone())
         } else {
-            FunctionResultType::Relation(relation.clone())
+            FunctionResultType::Relation(
+                novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(relation.clone()),
+            )
         };
         assert!(
             catalog
@@ -1234,55 +1270,66 @@ fn frozen_bindings_refuse_root_and_nested_logical_identity_drift() {
         )
         .unwrap();
     let mut forged = bound.clone();
-    forged.selected.argument_types = Box::from([FunctionArgumentType::Value(
-        FunctionValueType::new(DataType::Utf8, false),
-    )]);
+    forged.selected.argument_types =
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(Box::from([
+            FunctionArgumentType::Value(FunctionValueType::new(DataType::Utf8, false)),
+        ]));
     assert!(
         catalog
             .validate_bound(&forged, request(&arguments), crate::binding_test_control())
             .is_err()
     );
-    let malformed = [FunctionArgument::Value {
-        value_type: FunctionValueType {
-            data_type: DataType::Int64,
-            nullable: false,
-            logical_type: ValueLogicalType::Json,
-        },
-        constant: None,
-    }];
     assert!(
-        catalog
-            .resolve_bound_user(
-                "echo",
-                FunctionKind::Scalar,
-                request(&malformed),
-                crate::binding_test_control()
-            )
+        FunctionValueType::try_with_logical_type(DataType::Int64, false, ValueLogicalType::Json)
             .is_err()
     );
-    let nested = [argument(
-        DataType::List(Arc::new(
-            Field::new("item", DataType::Utf8, true)
-                .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "unknown".into())].into()),
-        )),
+    let unknown = Field::new("item", DataType::Utf8, true)
+        .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "unknown".into())].into());
+    assert!(FunctionValueType::try_from_legacy_field_projection(&unknown).is_err());
+    let nested_json = crate::builtin::signature::declared_list(
+        &FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
+            .unwrap(),
         false,
-    )];
+    )
+    .unwrap();
+    let nested_arguments = [FunctionArgument::Value {
+        value_type: nested_json.clone(),
+        constant: None,
+    }];
+    let nested_bound = catalog
+        .resolve_bound_user(
+            "echo",
+            FunctionKind::Scalar,
+            request(&nested_arguments),
+            crate::binding_test_control(),
+        )
+        .unwrap();
+    let mut forged_nested = nested_bound.clone();
+    forged_nested.selected.argument_types =
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(Box::from([
+            FunctionArgumentType::Value(FunctionValueType::new(
+                nested_json.data_type().clone(),
+                false,
+            )),
+        ]));
     assert!(
         catalog
-            .resolve_bound_user(
-                "echo",
-                FunctionKind::Scalar,
-                request(&nested),
+            .validate_bound(
+                &forged_nested,
+                request(&nested_arguments),
                 crate::binding_test_control()
             )
             .is_err()
     );
     let mut invalid = bound.clone();
-    invalid.selected.result_type = FunctionResultType::Scalar(FunctionValueType {
-        data_type: DataType::Int64,
-        nullable: false,
-        logical_type: ValueLogicalType::Variant,
-    });
+    invalid.selected.result_type = FunctionResultType::Scalar(
+        FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Variant,
+        )
+        .unwrap(),
+    );
     assert!(
         catalog
             .validate_bound(&invalid, request(&arguments), crate::binding_test_control())
@@ -1545,7 +1592,9 @@ fn argument_observed_comparison_keeps_full_lambda_and_nominal_types() {
     )
     .unwrap();
     let lambda = |ty: FunctionValueType| FunctionArgument::Lambda {
-        parameter_types: vec![ty.clone()].into_boxed_slice(),
+        parameter_types: novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+            vec![ty.clone()].into_boxed_slice(),
+        ),
         result_type: ty,
     };
     let left = lambda(largeint.clone());
@@ -1582,7 +1631,7 @@ fn argument_observed_comparison_keeps_full_lambda_and_nominal_types() {
                 control,
             )
         },
-        false,
+        true,
     );
 }
 
@@ -1624,4 +1673,16 @@ fn catalog_nonconstant_argument_keeps_concrete_neutral_carrier() {
         .validate_bound(&binding, request, crate::binding_test_control())
         .unwrap();
     assert_eq!(resolver.resolutions.load(Ordering::Relaxed), 1);
+}
+
+// Publish a new immutable test declaration after changing one selected fact.
+fn replace_selected_argument_fixture(
+    arguments: &mut novarocks_type_contract::FunctionArgumentTypes,
+    ordinal: usize,
+    argument: FunctionArgumentType,
+) {
+    let mut revised = arguments.as_slice().to_vec();
+    revised[ordinal] = argument;
+    *arguments =
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(revised.into_boxed_slice());
 }

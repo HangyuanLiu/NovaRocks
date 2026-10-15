@@ -160,6 +160,9 @@ struct Input {
 }
 struct ProducerState {
     input: Option<Input>,
+    /// Reuse a proof only for the same immutable typed input owner. The cursor
+    /// also retains the proof; no whole input or query is kept by this cache.
+    client_types: Option<novarocks_result_render::ValidatedMysqlInput>,
     builder: Option<RootSegmentBuilder>,
     used: usize,
     statistics_totals: StatisticsCodecTotals,
@@ -293,6 +296,7 @@ impl NativeRootResultSession {
             authority,
             state: Mutex::new(ProducerState {
                 input: None,
+                client_types: None,
                 builder: None,
                 used: 0,
                 statistics_totals: StatisticsCodecTotals::default(),
@@ -415,6 +419,8 @@ impl NativeRootResultSession {
         // Original owners, cursor and scratch are destroyed before exited().
         let input = state.input.take();
         state.cleanup(|| drop(input));
+        let client_types = state.client_types.take();
+        state.cleanup(|| drop(client_types));
         let builder = state.builder.take();
         state.cleanup(|| drop(builder));
         state.used = 0;
@@ -445,8 +451,8 @@ impl NativeRootResultSession {
                 input.scratch = Some(credit);
                 // This clone only allocates the finite columns Vec. Original
                 // Chunk accounting/source capabilities remain live in input.
-                let cloning =
-                    input.chunk.batch.num_columns() * std::mem::size_of::<arrow::array::ArrayRef>();
+                let cloning = input.chunk.record_batch().num_columns()
+                    * std::mem::size_of::<arrow::array::ArrayRef>();
                 let encoder = match self.begin_encoder(
                     input,
                     capacity,
@@ -455,6 +461,7 @@ impl NativeRootResultSession {
                     state.statistics_totals,
                     state.write_totals,
                     &state.cow_totals,
+                    &mut state.client_types,
                 ) {
                     Ok(encoder) => encoder,
                     Err(message) => return self.fail(state, message),
@@ -573,6 +580,7 @@ impl NativeRootResultSession {
         statistics_totals: StatisticsCodecTotals,
         write_totals: WriteCommitTotals,
         cow_totals: &CowSelectionTotals,
+        client_types: &mut Option<novarocks_result_render::ValidatedMysqlInput>,
     ) -> Result<InputEncoder, &'static str> {
         let fits = |inline: usize| inline.checked_add(cloning).is_some_and(|n| n <= capacity);
         match self.spec().contract.output() {
@@ -581,24 +589,31 @@ impl NativeRootResultSession {
                 if !fits(StatisticsArtifactEncoder::inline_capacity_bytes()) {
                     return Err("statistics cursor scratch exceeds its pregrant");
                 }
-                StatisticsArtifactEncoder::try_new(input.chunk.batch.clone(), statistics_totals)
-                    .map(|encoder| InputEncoder::Statistics(Box::new(encoder)))
-                    .map_err(|_| "statistics input differs from its frozen domain")
+                StatisticsArtifactEncoder::try_new(
+                    input.chunk.record_batch().clone(),
+                    statistics_totals,
+                )
+                .map(|encoder| InputEncoder::Statistics(Box::new(encoder)))
+                .map_err(|_| "statistics input differs from its frozen domain")
             }
             FrozenRootOutput::InternalFacts(InternalResultDomain::PreparedWriteCommitV1) => {
                 if !fits(WriteCommitEncoder::inline_capacity_bytes()) {
                     return Err("write commit cursor scratch exceeds its pregrant");
                 }
-                WriteCommitEncoder::try_new(input.chunk.batch.clone(), write_totals)
+                WriteCommitEncoder::try_new(input.chunk.record_batch().clone(), write_totals)
                     .map(|encoder| InputEncoder::WriteCommit(Box::new(encoder)))
                     .map_err(|_| "write commit input differs from its fixed contract")
             }
             FrozenRootOutput::InternalFacts(InternalResultDomain::CowSelectionArrowV1) => {
                 // Node/buffer tables and the record prefix are sized exactly
                 // from this input before anything is allocated.
-                CowSelectionEncoder::try_new(&input.chunk.batch, cow_totals.clone(), capacity)
-                    .map(|encoder| InputEncoder::CowSelection(Box::new(encoder)))
-                    .map_err(|_| "COW selection input differs from its domain codec")
+                CowSelectionEncoder::try_new(
+                    input.chunk.record_batch(),
+                    cow_totals.clone(),
+                    capacity,
+                )
+                .map(|encoder| InputEncoder::CowSelection(Box::new(encoder)))
+                .map_err(|_| "COW selection input differs from its domain codec")
             }
             FrozenRootOutput::ScalarValue(schema) => {
                 // Cumulative cardinality is decided before any cursor: a
@@ -645,9 +660,32 @@ impl NativeRootResultSession {
                 Ok(encoder)
             }
             FrozenRootOutput::ClientRows(_) => {
-                let encoder = ArrowMysqlTextEncoder::try_new_root(
-                    Arc::clone(&self.spec().contract),
-                    input.chunk.batch.clone(),
+                let types: Arc<dyn novarocks_type_contract::ClientInputTypeBindings> =
+                    input.chunk.chunk_schema_ref();
+                if !client_types
+                    .as_ref()
+                    .is_some_and(|proof| proof.is_for(&self.spec().contract, &types))
+                {
+                    let shared = client_types
+                        .as_ref()
+                        .and_then(|proof| proof.rebind_shared(types.clone()));
+                    *client_types = Some(match shared {
+                        Some(proof) => proof,
+                        None => novarocks_result_render::ValidatedMysqlInput::try_new(
+                            novarocks_type_contract::ValidatedClientInputTypes::try_new(
+                                Arc::clone(&self.spec().contract),
+                                types,
+                            )
+                            .map_err(
+                                |_| "root input types differ from its frozen render purpose",
+                            )?,
+                        )
+                        .map_err(|_| "root input layout has no installed render capability")?,
+                    });
+                }
+                let encoder = ArrowMysqlTextEncoder::try_new_typed_root(
+                    client_types.as_ref().unwrap().clone(),
+                    input.chunk.record_batch().clone(),
                 )
                 .map_err(|_| "root input cannot be rendered under its frozen schema")?;
                 if !encoder
@@ -787,7 +825,7 @@ impl RootResultSession for NativeRootResultSession {
             } else if schema
                 .schema_metadata_origin()
                 .unwrap()
-                .backing_bytes_for(&input.chunk.batch.schema())
+                .backing_bytes_for(&input.chunk.record_batch().schema())
                 .is_none()
             {
                 "root input actual schema differs from its metadata owner"
@@ -934,6 +972,8 @@ impl RootProducerJob for NativeRootResultSession {
                 state.input.is_none() && state.builder.is_none(),
                 "producer's real backing exits before its guard"
             );
+            let client_types = state.client_types.take();
+            state.cleanup(|| drop(client_types));
             (
                 state.producer.take(),
                 state.cleanup_panic.take(),

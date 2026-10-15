@@ -31,7 +31,7 @@ use novarocks_local_program::{
 use novarocks_physical_plan::{ExprId, NodeKind, PhysicalNode, PredicateGuaranteeKind, Relation};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 use novarocks_types::SlotId;
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
 
 pub(crate) struct LoweredScan {
     pub kind: ProgramNodeKind,
@@ -133,7 +133,7 @@ pub(crate) fn admit_scan(
 /// `runtime_filters` are the scan's admitted blocking membership consumers in
 /// binding order; consumer `i` is keyed by its `RuntimeFilter { binding: i }`
 /// root over this scan's own output.
-pub(crate) fn lower_scan(
+pub(crate) fn lower_scan_with_creation<H>(
     node: &PhysicalNode,
     id: ProgramNodeId,
     recipe: ConnectorReadProgramRecipe,
@@ -141,9 +141,10 @@ pub(crate) fn lower_scan(
     slots: &[SlotId],
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     control: &dyn PureCompileControl,
-) -> Result<LoweredScan, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<LoweredScan, crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(
+    let result = lower_core_with_creation(
         node,
         id,
         recipe,
@@ -151,15 +152,12 @@ pub(crate) fn lower_scan(
         slots,
         expressions,
         &mut work,
+        creation,
     );
-    if matches!(&result, Err(FragmentCompileError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    crate::creation::finish_attempt(result, work)
 }
 
-fn lower_core(
+fn lower_core_with_creation<H>(
     node: &PhysicalNode,
     id: ProgramNodeId,
     recipe: ConnectorReadProgramRecipe,
@@ -167,14 +165,15 @@ fn lower_core(
     slots: &[SlotId],
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<LoweredScan, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<LoweredScan, crate::FragmentCreationError<H>> {
     let NodeKind::Scan {
         provider_outputs,
         residuals,
         ..
     } = &node.kind
     else {
-        return Err(FragmentCompileError::Invalid("Scan kind differs"));
+        return Err((FragmentCompileError::Invalid("Scan kind differs")).into());
     };
     let public = recipe.frozen().public_facts();
     let width = public.schema().fields().len();
@@ -184,9 +183,10 @@ fn lower_core(
         || width != node.output.columns.len()
         || width != provider_outputs.len()
     {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "Scan input, public schema, channel or output width differs",
-        ));
+        ))
+        .into());
     }
     // Every original residual keeps its own ordered TruthOnly root.
     let mut lowered_residuals = Vec::with_capacity(residuals.len());
@@ -200,23 +200,25 @@ fn lower_core(
         );
         work.step()?;
     }
-    // The provider authored these fields; the layout keeps names, field and
-    // schema metadata exactly. The schema copy is opaque and only observed.
-    work.flush()?;
-    let materializations = public
-        .metadata_materializations()
-        .map(|origin| origin.clone_original_schema());
-    let schema = if let Some(origin) = &materializations {
-        origin.schema_owner().schema().clone()
-    } else {
-        Arc::new(public.schema().clone())
-    };
-    work.flush()?;
-    let layout = if let Some(origin) = materializations {
-        StaticLayout::try_new_materialized_for_compile(origin, Arc::from(slots), work.control())?
-    } else {
-        StaticLayout::try_new_for_compile(schema, Arc::from(slots), work.control())?
-    };
+    // Source attributes remain on the provider facts. Execution fields and
+    // bindings are borrowed from its independently authored typed projection.
+    let execution = public
+        .execution_schema()
+        .ok_or(FragmentCompileError::Invalid(
+            "scan has no complete execution schema",
+        ))?;
+    let mut typed_layout =
+        crate::typed_layout::TypedLayoutBuilder::new_with_creation(width, work, creation)?;
+    for (field, ty) in execution.schema().fields().iter().zip(execution.bindings()) {
+        work.step()?;
+        typed_layout.push_with_creation(
+            ty,
+            crate::typed_layout::copy_name_with_creation(field.name(), work, creation)?,
+            work,
+            creation,
+        )?;
+    }
+    let layout = typed_layout.finish_with_creation(slots, work, creation)?;
     work.flush()?;
     let source = ProgramScanSource::from(recipe);
     let relation = source.relation_header().clone();

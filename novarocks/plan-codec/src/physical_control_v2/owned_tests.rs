@@ -295,19 +295,39 @@ fn every_actual_control_success_and_ordinary_callback_preserves_caller_scope_fir
 }
 #[test]
 fn original_owned_arc_geometry_and_all_seven_axes_have_independent_refusal_oracles() {
-    // Two BTreeMap payloads are 24 bytes each on this locked 64-bit target;
-    // original Arc counters are 16 bytes, and empty roots still own one Arc.
-    assert_eq!(
-        std::mem::size_of::<std::collections::BTreeMap<u32, u32>>(),
-        24
-    );
+    // The checked flow publishes two guarded map payloads and one guarded
+    // root slice. Independently compute the fields' Arc request geometry;
+    // this does not read the model's answer or change any of the seven caps.
+    use novarocks_type_contract::{
+        ExpressionEvaluationDomain, ExpressionInvocation, ValueTypeStorageLifetime,
+        owned_resources::layout::arc_layout,
+    };
+    use std::collections::BTreeMap;
+    let map_domains = arc_layout(Layout::new::<(
+        BTreeMap<EvaluationDomainId, ExpressionEvaluationDomain>,
+        ValueTypeStorageLifetime,
+    )>())
+    .unwrap()
+    .size();
+    let map_uses = arc_layout(Layout::new::<(
+        BTreeMap<ExpressionUseId, ExpressionInvocation<u32>>,
+        ValueTypeStorageLifetime,
+    )>())
+    .unwrap()
+    .size();
+    let root_slice = arc_layout(Layout::new::<(
+        Box<[ExpressionUseId]>,
+        ValueTypeStorageLifetime,
+    )>())
+    .unwrap()
+    .size();
     let header = expression_control_flow_header_resource_facts::<u32>(0, 0).unwrap();
     assert_eq!(
         (
             header.allocation_requests_upper_bound,
             header.allocation_request_bytes_upper_bound
         ),
-        (3, 96)
+        (3, map_domains + map_uses + root_slice)
     );
     let (f, r) = fixture();
     let (input, golden) = encode(&f, &r, None).0.unwrap();

@@ -64,14 +64,14 @@ fn selected_relation_uses_original_receiving_grammar_sparse_identity_and_type_lo
             // Only root-owned dictionary Boxes are copied. Nested FieldRef
             // storage retains exactly the original type owner's Arc identity.
             if let (DataType::Struct(a), DataType::Struct(b)) = (
-                &d.types().value_type(42).unwrap().data_type,
-                &output.schema()[2].ty.data_type,
+                &d.types().value_type(42).unwrap().data_type(),
+                &output.schema()[2].ty.data_type(),
             ) {
                 assert!(Arc::ptr_eq(&a[0], &b[0]));
             } else {
                 panic!("Struct lost");
             }
-            assert_eq!(output.schema()[0].ty.logical_type, ValueLogicalType::Json);
+            assert_eq!(output.schema()[0].ty.logical_type(), ValueLogicalType::Json);
         }
         Ok(())
     })
@@ -85,8 +85,8 @@ fn selected_relation_exact_nine_caps_request_layouts_and_retained_namespace_floo
         let token = prepare_relation_materialization(d, 0, OWNED_SOURCE, limits())?;
         let facts = *token.facts();
         // Independent locked-layout invoice for the original selected metadata
-        // route: temporary index/outerVec; schema/guarantee Vec+Box; dictionary
-        // two Boxes; three column and two read Bytes promotion Shared blocks;
+        // route: temporary index/outerVec; schema/guarantee Vec+Box;
+        // three column and two read Bytes promotion Shared blocks;
         // ordering Vec+Box; exact kind String; coverage Vec+Box.
         // The original bytes source deliberately admits private-field-order
         // padding, rather than claiming the apparent 24-byte struct is exact.
@@ -107,12 +107,11 @@ fn selected_relation_exact_nine_caps_request_layouts_and_retained_namespace_floo
             + Layout::array::<p::Relation>(1).unwrap().size()
             + 2 * Layout::array::<p::RelationField>(3).unwrap().size()
             + 2 * Layout::array::<p::PredicateGuarantee>(3).unwrap().size()
-            + 2 * size_of::<DataType>()
             + 5 * shared
             + 2 * Layout::array::<p::OrderingKey>(2).unwrap().size()
             + "files / ✓".len()
             + 2 * 3;
-        assert_eq!(facts.allocation_requests_upper_bound, 18);
+        assert_eq!(facts.allocation_requests_upper_bound, 16);
         assert_eq!(facts.allocation_request_bytes_upper_bound, oracle);
         assert_eq!(
             facts.coexisting_source_and_request_bytes_upper_bound,

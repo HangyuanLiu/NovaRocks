@@ -25,6 +25,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(test)]
 use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorError, ConnectorErrorKind,
@@ -32,13 +33,10 @@ use novarocks_spi::connector::{
     ConnectorListTablesRequest, ConnectorMetadata, ConnectorNamespaceRequest,
     ConnectorProviderBinding, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
     ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest,
-    ConnectorSplitPlanningResult, ConnectorTableDefinitionFacts, ConnectorTableHandle,
-    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTablePlanningFacts,
-    ConnectorTableRequest, ProviderBindingEpoch, StatisticsDataVersion,
+    ConnectorSplitPlanningResult, ConnectorTableHandle, ConnectorTableIdentity,
+    ConnectorTableMetadata, ConnectorTableRequest, ProviderBindingEpoch,
 };
-use serde::Serialize;
 
-use crate::codec::{Base64Bytes, CODEC_VERSION, encode_v1};
 use crate::domain::{StarRocksConnectorConfig, StarRocksResolvedTable, invalid};
 use crate::{STARROCKS_PROVIDER_ID, starrocks_read_unsupported};
 
@@ -107,22 +105,6 @@ struct Provider {
     metadata: Arc<dyn StarRocksMetadataSource>,
 }
 
-/// The provider-private payload of a StarRocks table handle.
-///
-/// It carries only the identity of one resolved table and the generation that
-/// minted it. This is a metadata handle, not a read handle: nothing in this
-/// crate decodes it, and no scan is ever planned from it.
-#[derive(Serialize)]
-struct TablePayload {
-    version: u16,
-    owner: String,
-    incarnation: Base64Bytes,
-    namespace: String,
-    table: String,
-    schema_version: Base64Bytes,
-    data_version: Base64Bytes,
-}
-
 impl Provider {
     fn active(&self, context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
         if context.is_cancelled() {
@@ -147,39 +129,6 @@ impl Provider {
             ));
         }
         Ok(())
-    }
-
-    fn encode_table(
-        &self,
-        table: StarRocksResolvedTable,
-        max: usize,
-    ) -> Result<ConnectorTableMetadata, ConnectorError> {
-        let payload = TablePayload {
-            version: CODEC_VERSION,
-            owner: self.descriptor.instance_id.as_str().to_string(),
-            incarnation: Base64Bytes(Bytes::copy_from_slice(&self.incarnation.to_bytes())),
-            namespace: table.namespace.to_string(),
-            table: table.table.to_string(),
-            schema_version: Base64Bytes(table.schema_version.clone()),
-            data_version: Base64Bytes(table.data_version.clone()),
-        };
-        let table_handle = ConnectorTableHandle::try_new(
-            self.descriptor.instance_id.clone(),
-            encode_v1(&payload, "table handle", max)?,
-        )?;
-        Ok(ConnectorTableMetadata {
-            identity: ConnectorTableIdentity {
-                instance_id: self.descriptor.instance_id.clone(),
-                namespace: table.namespace,
-                table: table.table,
-            },
-            schema: table.schema,
-            planning_facts: ConnectorTablePlanningFacts::empty(),
-            definition_facts: ConnectorTableDefinitionFacts::empty(),
-            version: Some(table.schema_version),
-            statistics_data_version: Some(StatisticsDataVersion::try_new(table.data_version)?),
-            table: table_handle,
-        })
     }
 }
 
@@ -222,17 +171,18 @@ impl ConnectorMetadata for Provider {
     }
     fn load_table(
         &self,
-        request: ConnectorTableRequest,
-    ) -> Result<ConnectorTableMetadata, ConnectorError> {
-        self.active(&request.context)?;
-        self.ensure_identity(&request.table.instance_id)?;
-        self.encode_table(
-            self.metadata.load_table(
-                &request.table.namespace,
-                &request.table.table,
-                &request.context,
-            )?,
-            request.context.max_handle_payload_bytes(),
+        _request: ConnectorTableRequest,
+        _creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
+        // This retired provider has no execution type author. Do not publish
+        // carrier-only table facts as an active typed read capability.
+        Err(
+            novarocks_connector_contract::PureProviderCompileError::Provider(
+                starrocks_read_unsupported(),
+            ),
         )
     }
 }

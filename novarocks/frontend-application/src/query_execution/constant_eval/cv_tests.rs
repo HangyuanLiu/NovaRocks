@@ -22,7 +22,10 @@ use arrow::array::{Date32Array, Float32Array, Int32Array, Int64Array, StringArra
 use arrow::datatypes::Field;
 use novarocks_functions::{ConstantError, ConstantPolicy};
 use novarocks_sql::compiler::FoldArg;
-use novarocks_type_contract::{CompileControlError, DecimalOverflowPolicy, NR_LOGICAL_TYPE_KEY};
+use novarocks_type_contract::{
+    CompileControlError, DecimalOverflowPolicy, NR_LOGICAL_TYPE_KEY, ValueLayout,
+    ValueTypeStorageLifetime,
+};
 use std::sync::Mutex;
 
 struct TestControl;
@@ -47,7 +50,11 @@ fn policy() -> ConstantPolicy {
 }
 fn pool(array: ArrayRef, ty: FunctionValueType) -> ConstantPool {
     ConstantPool::try_new(
-        Arc::new(ty.try_to_field("literal").unwrap()),
+        Arc::new(Field::new(
+            "literal",
+            array.data_type().clone(),
+            ty.nullable(),
+        )),
         ty,
         array.to_data(),
         policy(),
@@ -58,11 +65,29 @@ fn pool(array: ArrayRef, ty: FunctionValueType) -> ConstantPool {
 }
 fn arg(array: ArrayRef, nullable: bool) -> FoldArg {
     let ty = FunctionValueType::new(array.data_type().clone(), nullable);
+    typed_arg(array, ty)
+}
+fn typed_arg(array: ArrayRef, ty: FunctionValueType) -> FoldArg {
+    let source_type = array.data_type().clone();
     let value = pool(array, ty.clone()).value(0).unwrap();
+    assert_eq!(value.field().data_type(), &source_type);
+    assert_eq!(value.value_type(), &ty);
     FoldArg {
         value,
         value_type: ty,
     }
+}
+fn json_list_type(source_type: &DataType) -> FunctionValueType {
+    let storage = ValueTypeStorageLifetime::pure();
+    let item = ValueTypeRef::try_new(
+        ValueKind::Nominal(ValueLogicalType::Json),
+        true,
+        storage.clone(),
+    )
+    .unwrap();
+    let value = ValueTypeRef::try_new(ValueKind::List(item), true, storage.clone()).unwrap();
+    FunctionValueType::try_from_value(value, ValueLayout::try_new(source_type, storage).unwrap())
+        .unwrap()
 }
 fn i32(value: i32) -> FoldArg {
     arg(Arc::new(Int32Array::from(vec![value])), false)
@@ -232,7 +257,7 @@ fn division_by_zero_is_successful_typed_null_and_nonnullable_output_declines() {
             .is_null_observed(CompilePhase::FunctionSpecialization, &TestControl)
             .unwrap()
     );
-    request.result_type.nullable = false;
+    request.result_type = request.result_type.with_nullable(false).unwrap();
     assert!(matches!(
         constant_evaluator().eval_scalar(&request, &TestControl),
         Ok(None)
@@ -324,23 +349,38 @@ fn authored_nominal_and_nested_domains_decline_without_carrier_retagging() {
     }
     let child = Field::new("item", DataType::Utf8, true)
         .with_metadata([(NR_LOGICAL_TYPE_KEY.into(), "json".into())].into());
-    let ty = DataType::List(Arc::new(child));
-    let null = arg(arrow::array::new_null_array(&ty, 1), true);
+    let source_type = DataType::List(Arc::new(child));
+    let ty = json_list_type(&source_type);
+    let null = typed_arg(arrow::array::new_null_array(&source_type, 1), ty.clone());
+    assert_eq!(null.value.field().data_type(), &source_type);
+    assert_eq!(
+        null.value_type.child_at(0).unwrap().logical_type(),
+        ValueLogicalType::Json
+    );
+    let mut request = cast(vec![null], ty.data_type().clone());
+    request.result_type = ty;
     assert!(matches!(
-        constant_evaluator().eval_scalar(&cast(vec![null], ty), &TestControl),
+        constant_evaluator().eval_scalar(&request, &TestControl),
         Ok(None)
     ));
 }
 #[test]
-fn malformed_later_type_is_not_hidden_by_an_earlier_domain_decline() {
+fn checked_type_refusal_and_later_source_forgery_are_not_hidden_by_domain_decline() {
     let json =
         FunctionValueType::try_with_logical_type(DataType::Utf8, true, ValueLogicalType::Json)
             .unwrap();
     let value = pool(Arc::new(StringArray::from(vec!["{}"])), json.clone())
         .value(0)
         .unwrap();
+    assert!(
+        FunctionValueType::try_with_logical_type(DataType::Int64, false, ValueLogicalType::Json)
+            .is_err()
+    );
+    // A malformed complete declaration cannot enter the evaluator. A later
+    // legitimate JSON declaration with a forged source still fails before an
+    // earlier argument's domain decline hides it.
     let mut invalid = i64(1);
-    invalid.value_type.logical_type = ValueLogicalType::Json;
+    invalid.value_type = json.clone();
     let request = cast(
         vec![
             FoldArg {
@@ -353,7 +393,7 @@ fn malformed_later_type_is_not_hidden_by_an_earlier_domain_decline() {
     );
     assert!(matches!(
         constant_evaluator().eval_scalar(&request, &TestControl),
-        Err(SqlConstantEvaluationError::InvalidType(_))
+        Err(SqlConstantEvaluationError::Constant(_))
     ));
 }
 #[test]
@@ -380,11 +420,11 @@ fn exact_largeint_constant_and_nonzero_pool_ordinal_keep_nominal_identity() {
             value: source,
             value_type: ty.clone(),
         }],
-        ty.data_type.clone(),
+        ty.data_type().clone(),
     );
     request.result_type = ty;
     assert_eq!(evaluate(&request).try_largeint().unwrap(), Some(value));
-    request.args[0].value_type.logical_type = ValueLogicalType::Physical;
+    request.args[0].value_type = FunctionValueType::new(DataType::FixedSizeBinary(16), false);
     assert!(matches!(
         constant_evaluator().eval_scalar(&request, &TestControl),
         Err(SqlConstantEvaluationError::Constant(_))
@@ -439,12 +479,27 @@ fn newly_materialized_unsigned_negative_scale_and_nested_metadata_outputs_are_cv
         Field::new("source", DataType::Int32, true)
             .with_metadata([("provider.fact".into(), "kept".into())].into()),
     );
-    let ty = DataType::List(field);
-    let output = evaluate(&cast(
-        vec![arg(arrow::array::new_null_array(&ty, 1), true)],
-        ty.clone(),
-    ));
-    assert_eq!(output.value_type().data_type, ty);
+    let source_type = DataType::List(field);
+    let source = arg(arrow::array::new_null_array(&source_type, 1), true);
+    let request = cast(vec![source.clone()], source_type.clone());
+    let output = evaluate(&request);
+    assert_eq!(output.value_type(), &request.result_type);
+    assert_eq!(source.value.field().data_type(), &source_type);
+    let DataType::List(source_field) = source.value.field().data_type() else {
+        panic!("original source is a List");
+    };
+    assert_eq!(source_field.name(), "source");
+    assert_eq!(
+        source_field.metadata().get("provider.fact").unwrap(),
+        "kept"
+    );
+    let DataType::List(output_field) = output.value_type().data_type() else {
+        panic!("frozen execution result is a List");
+    };
+    assert_eq!(output_field.name(), "item");
+    assert_eq!(output_field.metadata().capacity(), 0);
+    assert!(output.value_type().nullable());
+    assert!(output_field.is_nullable());
 }
 #[test]
 fn checked_decimal_error_remains_ordinary_evaluation_while_policy_null_is_success() {
@@ -547,7 +602,23 @@ fn actual_metadata_decline_and_successful_output_pool_keep_all_callback_prefixes
     let ty = DataType::List(Arc::new(
         Field::new("item", DataType::Utf8, true).with_metadata(metadata),
     ));
-    let request = cast(vec![arg(arrow::array::new_null_array(&ty, 1), true)], ty);
+    let complete = json_list_type(&ty);
+    let source = typed_arg(arrow::array::new_null_array(&ty, 1), complete.clone());
+    assert_eq!(source.value.field().data_type(), &ty);
+    let DataType::List(source_field) = source.value.field().data_type() else {
+        panic!("original source is a List");
+    };
+    assert_eq!(source_field.metadata().len(), 256);
+    assert_eq!(
+        source_field.metadata().get(NR_LOGICAL_TYPE_KEY).unwrap(),
+        "json"
+    );
+    assert_eq!(
+        source.value_type.child_at(0).unwrap().logical_type(),
+        ValueLogicalType::Json
+    );
+    let mut request = cast(vec![source], complete.data_type().clone());
+    request.result_type = complete;
     assert_all_callbacks(&request, |result| assert!(matches!(result, Ok(None))));
     assert_all_callbacks(
         &binary(BinOp::Add, vec![i32(1), i32(1)], DataType::Int32),
@@ -571,7 +642,7 @@ fn ordinary_kernel_error_and_nonnullable_decline_observe_exact_original_completi
         ))
     });
     let mut request = binary(BinOp::Div, vec![i32(1), i32(0)], DataType::Float64);
-    request.result_type.nullable = false;
+    request.result_type = request.result_type.with_nullable(false).unwrap();
     assert_all_callbacks(&request, |result| assert!(matches!(result, Ok(None))));
 }
 #[test]
@@ -583,22 +654,32 @@ fn shared_type_resource_refusal_cannot_be_replaced_or_fail_open() {
         )]
         .into(),
     );
+    let annotated = DataType::List(Arc::new(field));
     let request = request(
         FoldNodeKind::Cast(DecimalOverflowPolicy::OutputNull),
         vec![],
-        DataType::List(Arc::new(field)),
+        annotated.clone(),
     );
-    let refusing = Control {
-        fail_at: Some((1, CompileControlError::Cancelled)),
-        ..Default::default()
+    let plain = FunctionValueType::new(
+        DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+        true,
+    );
+    // Source annotations no longer establish execution resources or semantics.
+    assert_eq!(request.result_type, plain);
+    let DataType::List(normalized) = request.result_type.data_type() else {
+        panic!("frozen result is a List");
     };
-    assert!(matches!(
-        constant_evaluator().eval_scalar(&request, &refusing),
-        Err(SqlConstantEvaluationError::Control(
-            CompileControlError::ResourceExhausted
-        ))
-    ));
-    assert_eq!(*refusing.checks.lock().unwrap(), [0]);
+    assert_eq!(normalized.metadata().capacity(), 0);
+    let DataType::List(original) = &annotated else {
+        panic!("original source is a List");
+    };
+    assert_eq!(
+        original.metadata()["provider.fact"].len(),
+        novarocks_type_contract::MAX_ARROW_FIELD_METADATA_VALUE_BYTES + 1
+    );
+    // Preserve every actual callback's first cause, including ResourceExhausted,
+    // rather than inventing an annotation-driven execution validation boundary.
+    assert_all_callbacks(&request, |result| assert!(matches!(result, Ok(None))));
 }
 #[test]
 fn explicit_result_policy_refusal_is_typed_preparation_and_has_no_later_callback() {

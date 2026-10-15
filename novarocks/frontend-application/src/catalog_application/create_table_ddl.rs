@@ -78,7 +78,7 @@ pub(crate) fn build_iceberg_create_table_ddl(
     }
     let mut col_defs = Vec::with_capacity(loaded.definition_facts.columns().len());
     for column in loaded.definition_facts.columns() {
-        let field = loaded.schema.field(column.field_ordinal() as usize);
+        let field = loaded.schema().field(column.field_ordinal() as usize);
         let nullable = if column.nullable() { "" } else { " NOT NULL" };
         let comment = if let Some(doc) = column.comment() {
             let escaped = doc.replace('\'', "\\'");
@@ -161,20 +161,26 @@ mod tests {
             &request_context(),
         )
         .expect("definition facts");
-        ConnectorTableMetadata {
-            identity: ConnectorTableIdentity {
-                instance_id: instance_id.clone(),
-                namespace: Arc::from("ns"),
-                table: Arc::from("tbl"),
+        crate::connector::schema_creation::declared_test_metadata(
+            novarocks_spi::connector::ConnectorTableMetadataHeader {
+                identity: ConnectorTableIdentity {
+                    instance_id: instance_id.clone(),
+                    namespace: Arc::from("ns"),
+                    table: Arc::from("tbl"),
+                },
+                planning_facts,
+                definition_facts,
+                version: None,
+                statistics_data_version: None,
+                table: ConnectorTableHandle::try_new(instance_id, Bytes::from_static(b"table"))
+                    .expect("table handle"),
             },
             schema,
-            planning_facts,
-            definition_facts,
-            version: None,
-            statistics_data_version: None,
-            table: ConnectorTableHandle::try_new(instance_id, Bytes::from_static(b"table"))
-                .expect("table handle"),
-        }
+            vec![novarocks_type_contract::FunctionValueType::new(
+                DataType::Int32,
+                nullable,
+            )],
+        )
     }
 
     #[test]

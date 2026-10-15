@@ -18,6 +18,7 @@
 use super::*;
 use crate::{ConstantPolicy, ConstantPool, SelectedValues, Selection};
 use arrow_array::{ArrayRef, Float64Array};
+use novarocks_type_contract::arithmetic_result_value_type_with_op;
 use novarocks_type_contract::{EvaluationDemand, EvaluationDomainId, ExpressionUseId};
 use std::{
     sync::{Arc, Mutex},
@@ -66,7 +67,7 @@ impl KernelEvaluationControl for Control {
     }
 }
 fn ty(carrier: DataType, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(carrier, nullable)
+    FunctionValueType::from_legacy_declared_projection(carrier, nullable)
 }
 fn prepare(
     op: ArithmeticOperator,
@@ -76,7 +77,9 @@ fn prepare(
     allow: bool,
 ) -> PreparedArithmeticRecipe {
     let mut result = arithmetic_result_value_type_with_op(&left, &right, op).unwrap();
-    result.nullable = true;
+    result = result
+        .with_nullable(true)
+        .expect("valid function nullability declaration");
     PreparedArithmeticRecipe::try_new(
         op,
         &left,

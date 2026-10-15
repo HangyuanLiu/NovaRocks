@@ -69,6 +69,9 @@ pub struct NativePlanDecodeContext {
     test_controls: Option<Arc<crate::test_controls::NativeTestControls>>,
     #[cfg(feature = "test-controls")]
     observation_controls: Option<Arc<crate::test_observation_controls::NativeObservationControls>>,
+    original_requests: Option<Arc<crate::fragment_original_requests::NativeOriginalRequests>>,
+    writer_parameters:
+        Option<Arc<novarocks_plan_codec::physical_semantics_v2::CreatedWriterSemanticParameters>>,
 }
 
 impl Default for NativePlanDecodeContext {
@@ -90,6 +93,8 @@ impl Default for NativePlanDecodeContext {
             test_controls: None,
             #[cfg(feature = "test-controls")]
             observation_controls: None,
+            original_requests: None,
+            writer_parameters: None,
         }
     }
 }
@@ -126,6 +131,8 @@ impl NativePlanDecodeContext {
             test_controls: None,
             #[cfg(feature = "test-controls")]
             observation_controls: None,
+            original_requests: None,
+            writer_parameters: None,
         }
     }
 
@@ -190,6 +197,35 @@ impl NativePlanDecodeContext {
     pub fn with_function_catalog(mut self, catalog: Arc<EngineFunctionCatalog>) -> Self {
         self.function_catalog = Some(catalog);
         self
+    }
+
+    pub(crate) fn with_original_requests(
+        mut self,
+        owner: Arc<crate::fragment_original_requests::NativeOriginalRequests>,
+    ) -> Self {
+        self.original_requests = Some(owner);
+        self
+    }
+
+    pub(crate) fn with_writer_parameters(
+        mut self,
+        owner: Option<
+            Arc<novarocks_plan_codec::physical_semantics_v2::CreatedWriterSemanticParameters>,
+        >,
+    ) -> Self {
+        self.writer_parameters = owner;
+        self
+    }
+    pub(crate) fn writer_parameters(&self) -> Option<&novarocks_type_contract::SemanticParameters> {
+        self.writer_parameters
+            .as_ref()
+            .map(|owner| owner.parameters())
+    }
+
+    pub(crate) fn original_requests(
+        &self,
+    ) -> Option<&crate::fragment_original_requests::NativeOriginalRequests> {
+        self.original_requests.as_deref()
     }
 
     pub fn function_catalog(&self) -> Option<&EngineFunctionCatalog> {

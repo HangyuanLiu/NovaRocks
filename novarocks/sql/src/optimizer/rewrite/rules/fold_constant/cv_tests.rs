@@ -49,7 +49,7 @@ fn fold_identity(value: ConstantValue) -> (ScalarArena, ScalarId, ConstantValue,
         .intern_observed(
             ScalarNode::Cast {
                 child,
-                target: ty.data_type.clone(),
+                target: ty.data_type().clone(),
                 decimal_overflow_policy: novarocks_type_contract::DecimalOverflowPolicy::OutputNull,
             },
             ty,

@@ -65,7 +65,7 @@ pub(super) fn definition(
 }
 
 pub(super) struct RegexpCountOwner {
-    resolver: BuiltinScalarResolver,
+    resolver: Arc<BuiltinScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
 }
@@ -107,7 +107,7 @@ impl RegexpCountOwner {
             })
             .collect();
         Ok(Self {
-            resolver,
+            resolver: Arc::new(resolver),
             declaration,
             implementations,
         })
@@ -167,6 +167,10 @@ impl FunctionBindingResolver for RegexpCountOwner {
 }
 
 impl PureFunctionMetadataOwner for RegexpCountOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::fixed_scalar(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -195,40 +199,21 @@ impl FunctionEffectOwner for RegexpCountOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        let result = (|| {
-            work.step().map_err(FunctionEffectOwnerError::Control)?;
-            if input.function_id != self.declaration.function_id()
-                || input.kind != FunctionKind::Scalar
-            {
-                return Err(FunctionBindingError::UnknownFunction.into());
-            }
-            if !input.environment.is_empty()
-                || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                    && input.proof_scope != CallProofScope::Domain(input.context.domain)
-            {
-                return Err(FunctionBindingError::InvalidBinding(
-                    "regexp_count has no environment dependencies and requires an exact proof scope".into(),
-                )
-                .into());
-            }
-            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        self.refine_selected_core(input, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => {
-                        FunctionEffectOwnerError::Control(error)
-                    }
-                    other => FunctionEffectOwnerError::Owner(other),
-                })?;
-            let source = source(input).map_err(FunctionEffectOwnerError::Owner)?;
-            Ok(self.call_effects(input.proof_scope, source))
-        })();
-        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
-            return result;
-        }
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        result
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_selected_core(input, control, || {
+            checked.require_fixed_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -239,49 +224,21 @@ impl PureScalarImplementation for RegexpCountOwner {
         contract: Arc<ScalarCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        let result: Result<Arc<dyn PreparedScalarKernel>, KernelFailure> = (|| {
-            work.step().map_err(compile_failure)?;
-            let source =
-                source(input).map_err(|_| invalid("regexp_count source proof is absent"))?;
-            if input.function_id != self.declaration.function_id()
-                || input.kind != FunctionKind::Scalar
-                || contract.regexp_count_pattern_source() != Some(source)
-                || contract.function_id() != input.function_id
-                || !std::ptr::eq(contract.selected(), input.selected)
-                || contract.context() != input.context
-                || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-                || contract.effects() != &self.call_effects(input.proof_scope, source)
-                || !input.environment.is_empty()
-            {
-                return Err(invalid(
-                    "regexp_count preparation differs from its exact checked call",
-                ));
-            }
-            work.flush().map_err(compile_failure)?;
+        self.prepare_selected_core(input, contract, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => compile_failure(error),
-                    _ => invalid("regexp_count preparation has a stale selected binding"),
-                })?;
-            // The prepared object retains the same canonical contract. Its body is
-            // a static pure implementation and needs no live resolver or authority.
-            super::regexp_count::validate_profile(&contract, || {
-                work.step().map_err(compile_failure)
-            })?;
-            Ok(Arc::new(PreparedRegexpCount { contract, source }) as Arc<dyn PreparedScalarKernel>)
-        })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
-            return result;
-        }
-        work.finish().map_err(compile_failure)?;
-        result
+        })
+    }
+    fn prepare_scalar_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_selected_core(input, contract, control, || {
+            checked.require_fixed_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -352,3 +309,94 @@ fn source(
 #[cfg(test)]
 #[path = "regexp_count_tests.rs"]
 mod tests;
+
+impl RegexpCountOwner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        let result = (|| {
+            work.step().map_err(FunctionEffectOwnerError::Control)?;
+            if input.function_id != self.declaration.function_id()
+                || input.kind != FunctionKind::Scalar
+            {
+                return Err(FunctionBindingError::UnknownFunction.into());
+            }
+            if !input.environment.is_empty()
+                || !matches!(input.proof_scope, CallProofScope::Unconditional)
+                    && input.proof_scope != CallProofScope::Domain(input.context.domain)
+            {
+                return Err(FunctionBindingError::InvalidBinding(
+                    "regexp_count has no environment dependencies and requires an exact proof scope".into(),
+                )
+                .into());
+            }
+            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+                other => FunctionEffectOwnerError::Owner(other),
+            })?;
+            let source = source(input).map_err(FunctionEffectOwnerError::Owner)?;
+            Ok(self.call_effects(input.proof_scope, source))
+        })();
+        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
+            return result;
+        }
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
+        result
+    }
+    fn prepare_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(compile_failure)?;
+        let result: Result<Arc<dyn PreparedScalarKernel>, KernelFailure> = (|| {
+            work.step().map_err(compile_failure)?;
+            let source =
+                source(input).map_err(|_| invalid("regexp_count source proof is absent"))?;
+            if input.function_id != self.declaration.function_id()
+                || input.kind != FunctionKind::Scalar
+                || contract.regexp_count_pattern_source() != Some(source)
+                || contract.function_id() != input.function_id
+                || !std::ptr::eq(contract.selected(), input.selected)
+                || contract.context() != input.context
+                || contract.decimal_overflow_policy() != input.decimal_overflow_policy
+                || contract.effects() != &self.call_effects(input.proof_scope, source)
+                || !input.environment.is_empty()
+            {
+                return Err(invalid(
+                    "regexp_count preparation differs from its exact checked call",
+                ));
+            }
+            work.flush().map_err(compile_failure)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => compile_failure(error),
+                _ => invalid("regexp_count preparation has a stale selected binding"),
+            })?;
+            // The prepared object retains the same canonical contract. Its body is
+            // a static pure implementation and needs no live resolver or authority.
+            super::regexp_count::validate_profile(&contract, || {
+                work.step().map_err(compile_failure)
+            })?;
+            Ok(Arc::new(PreparedRegexpCount { contract, source }) as Arc<dyn PreparedScalarKernel>)
+        })();
+        if matches!(
+            &result,
+            Err(KernelFailure::Cancelled
+                | KernelFailure::DeadlineExceeded
+                | KernelFailure::ResourceExhausted)
+        ) {
+            return result;
+        }
+        work.finish().map_err(compile_failure)?;
+        result
+    }
+}

@@ -144,8 +144,8 @@ pub(super) fn evaluate_string_locate<'a>(
             let FunctionArgumentType::Value(ty) = ty else {
                 return Err(invalid("locate/instr requires checked values"));
             };
-            if ty.logical_type != ValueLogicalType::Physical
-                || ty.data_type
+            if ty.logical_type() != ValueLogicalType::Physical
+                || *ty.data_type()
                     != if index < 2 {
                         DataType::Utf8
                     } else {
@@ -159,9 +159,9 @@ pub(super) fn evaluate_string_locate<'a>(
             work.step()?;
         }
         let target = input.contract().result_type();
-        if target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Int32
-            || !target.nullable
+        if target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Int32
+            || !target.nullable()
         {
             return Err(invalid(
                 "locate/instr differs from its installed result profile",
@@ -217,7 +217,7 @@ pub(super) fn evaluate_string_locate<'a>(
                     let FunctionArgumentType::Value(ty) = &types[index] else {
                         return Err(invalid("locate/instr requires checked values"));
                     };
-                    if !ty.nullable {
+                    if !ty.nullable() {
                         return Err(internal(
                             "locate/instr non-null source contains selected SQL NULL",
                         ));
@@ -249,7 +249,7 @@ pub(super) fn evaluate_string_locate<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

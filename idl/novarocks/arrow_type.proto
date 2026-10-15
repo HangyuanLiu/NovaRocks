@@ -1,0 +1,182 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package novarocks.arrow_type;
+
+import "value_type.proto";
+
+// Sole physical Arrow vocabulary. Metadata describes source facts only.
+// Lossless Arrow schema for an internal execution relation. The enclosing
+// operator owns the semantic contract; this carrier preserves its exact
+// physical fields and slot identities without routing them through SQL
+// TypeDesc normalization.
+message ArrowPhysicalSchema {
+  repeated ArrowPhysicalColumn columns = 1;
+  reserved 2;
+  reserved "schema_metadata";
+  // This schema owns its local logical namespace, independent of fragment IDs.
+  repeated novarocks.value_type.LogicalTypeDefinition logical_types = 3;
+}
+
+// A slot-bound Arrow field used by internal execution relations. Unlike the
+// SQL TypeDesc carrier, this descriptor preserves the exact Arrow physical
+// representation and every field-level contract bit.
+message ArrowPhysicalColumn {
+  uint32 slot_id = 1;
+  ArrowPhysicalField field = 2;
+  bool is_internal = 3;
+}
+
+message ArrowPhysicalField {
+  string name = 1;
+  bool nullable = 2;
+  ArrowPhysicalType type = 3;
+  reserved 4, 5, 6;
+  reserved "metadata", "dictionary_id", "dictionary_is_ordered";
+  // Explicit reference to the owning Arrow schema's logical table, or to the
+  // ExecutionTypeTable when this field belongs to an ExecutionValueBinding.
+  optional uint32 logical_type_id = 7;
+}
+
+// Metadata is encoded as a sorted repeated entry rather than a protobuf map so
+// duplicate keys and non-canonical ordering can be rejected at ingress.
+message ArrowFieldMetadataEntry {
+  string key = 1;
+  string value = 2;
+}
+
+message ArrowPhysicalType {
+  oneof kind {
+    ArrowPrimitiveType primitive = 1;
+    ArrowTimestampType timestamp = 2;
+    ArrowTimeType time32 = 3;
+    ArrowTimeType time64 = 4;
+    ArrowTimeType duration = 5;
+    ArrowIntervalUnit interval = 6;
+    int32 fixed_size_binary = 7;
+    ArrowDecimalType decimal32 = 8;
+    ArrowDecimalType decimal64 = 9;
+    ArrowDecimalType decimal128 = 10;
+    ArrowDecimalType decimal256 = 11;
+    ArrowPhysicalField list = 12;
+    ArrowPhysicalField list_view = 13;
+    ArrowFixedSizeListType fixed_size_list = 14;
+    ArrowPhysicalField large_list = 15;
+    ArrowPhysicalField large_list_view = 16;
+    ArrowStructType struct_type = 17;
+    ArrowUnionType union_type = 18;
+    ArrowDictionaryType dictionary = 19;
+    ArrowMapType map = 20;
+    ArrowRunEndEncodedType run_end_encoded = 21;
+  }
+}
+
+enum ArrowPrimitiveType {
+  ARROW_PRIMITIVE_TYPE_UNSPECIFIED = 0;
+  ARROW_PRIMITIVE_TYPE_NULL = 1;
+  ARROW_PRIMITIVE_TYPE_BOOLEAN = 2;
+  ARROW_PRIMITIVE_TYPE_INT8 = 3;
+  ARROW_PRIMITIVE_TYPE_INT16 = 4;
+  ARROW_PRIMITIVE_TYPE_INT32 = 5;
+  ARROW_PRIMITIVE_TYPE_INT64 = 6;
+  ARROW_PRIMITIVE_TYPE_UINT8 = 7;
+  ARROW_PRIMITIVE_TYPE_UINT16 = 8;
+  ARROW_PRIMITIVE_TYPE_UINT32 = 9;
+  ARROW_PRIMITIVE_TYPE_UINT64 = 10;
+  ARROW_PRIMITIVE_TYPE_FLOAT16 = 11;
+  ARROW_PRIMITIVE_TYPE_FLOAT32 = 12;
+  ARROW_PRIMITIVE_TYPE_FLOAT64 = 13;
+  ARROW_PRIMITIVE_TYPE_DATE32 = 14;
+  ARROW_PRIMITIVE_TYPE_DATE64 = 15;
+  ARROW_PRIMITIVE_TYPE_BINARY = 16;
+  ARROW_PRIMITIVE_TYPE_BINARY_VIEW = 17;
+  ARROW_PRIMITIVE_TYPE_LARGE_BINARY = 18;
+  ARROW_PRIMITIVE_TYPE_UTF8 = 19;
+  ARROW_PRIMITIVE_TYPE_UTF8_VIEW = 20;
+  ARROW_PRIMITIVE_TYPE_LARGE_UTF8 = 21;
+}
+
+enum ArrowTimeUnit {
+  ARROW_TIME_UNIT_UNSPECIFIED = 0;
+  ARROW_TIME_UNIT_SECOND = 1;
+  ARROW_TIME_UNIT_MILLISECOND = 2;
+  ARROW_TIME_UNIT_MICROSECOND = 3;
+  ARROW_TIME_UNIT_NANOSECOND = 4;
+}
+
+enum ArrowIntervalUnit {
+  ARROW_INTERVAL_UNIT_UNSPECIFIED = 0;
+  ARROW_INTERVAL_UNIT_YEAR_MONTH = 1;
+  ARROW_INTERVAL_UNIT_DAY_TIME = 2;
+  ARROW_INTERVAL_UNIT_MONTH_DAY_NANO = 3;
+}
+
+enum ArrowUnionMode {
+  ARROW_UNION_MODE_UNSPECIFIED = 0;
+  ARROW_UNION_MODE_SPARSE = 1;
+  ARROW_UNION_MODE_DENSE = 2;
+}
+
+message ArrowTimestampType {
+  ArrowTimeUnit unit = 1;
+  optional string timezone = 2;
+}
+
+message ArrowTimeType {
+  ArrowTimeUnit unit = 1;
+}
+
+message ArrowDecimalType {
+  uint32 precision = 1;
+  int32 scale = 2;
+}
+
+message ArrowFixedSizeListType {
+  ArrowPhysicalField item = 1;
+  int32 length = 2;
+}
+
+message ArrowStructType {
+  repeated ArrowPhysicalField fields = 1;
+}
+
+message ArrowUnionField {
+  int32 type_id = 1;
+  ArrowPhysicalField field = 2;
+}
+
+message ArrowUnionType {
+  ArrowUnionMode mode = 1;
+  repeated ArrowUnionField fields = 2;
+}
+
+message ArrowDictionaryType {
+  ArrowPhysicalType key = 1;
+  ArrowPhysicalType value = 2;
+}
+
+message ArrowMapType {
+  ArrowPhysicalField entries = 1;
+  bool ordered = 2;
+}
+
+message ArrowRunEndEncodedType {
+  ArrowPhysicalField run_ends = 1;
+  ArrowPhysicalField values = 2;
+}

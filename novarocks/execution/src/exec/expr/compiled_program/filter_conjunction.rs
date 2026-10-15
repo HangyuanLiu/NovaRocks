@@ -113,8 +113,8 @@ impl CompiledFilterConjunctionInstance {
                 else {
                     return Err(invalid("Filter predicate is not a value"));
                 };
-                if ty.data_type != DataType::Boolean
-                    || ty.logical_type != novarocks_type_contract::ValueLogicalType::Physical
+                if *ty.data_type() != DataType::Boolean
+                    || ty.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
                 {
                     return Err(invalid(
                         "Filter predicate is not its original physical Boolean",

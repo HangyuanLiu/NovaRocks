@@ -142,7 +142,7 @@ fn like_recipe_exact_original_utf8_nullability_and_wider_refusal() {
         DataType::Null,
         DataType::Int32,
     ] {
-        let s = FunctionValueType::new(dtype, true);
+        let s = FunctionValueType::from_legacy_declared_projection(dtype, true);
         assert_eq!(
             PreparedNativeLikeRecipe::try_new(
                 false,

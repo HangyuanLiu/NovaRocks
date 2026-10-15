@@ -41,25 +41,37 @@ fn ds_hll_local_stage_after_real_factory_100k_and_exact_identity() {
             final_stage.calls[0].contract.call(),
             original.call()
         ));
-        assert_eq!(partial.output.slots()[0].data_type(), &DataType::Binary);
-        assert_eq!(final_stage.output, factory(&program, P::Single).output);
+        assert_eq!(
+            prepared_schema(&partial, tracker.clone()).slots()[0].data_type(),
+            &DataType::Binary
+        );
+        assert_eq!(
+            prepared_schema(&final_stage, tracker.clone()),
+            prepared_schema(&factory(&program, P::Single), tracker.clone())
+        );
         assert!(
             final_stage.sites.is_empty(),
             "no fabricated expression root"
         );
         let left = run(
             &partial,
-            &[Chunk::new_like(source.batch.slice(0, 50_000), &source)],
+            &[Chunk::new_like(
+                source.record_batch().slice(0, 50_000),
+                &source,
+            )],
             tracker.clone(),
         );
         let right = run(
             &partial,
-            &[Chunk::new_like(source.batch.slice(50_000, 50_000), &source)],
+            &[Chunk::new_like(
+                source.record_batch().slice(50_000, 50_000),
+                &source,
+            )],
             tracker.clone(),
         );
         for payload in [&left, &right] {
             let bytes = payload
-                .batch
+                .record_batch()
                 .column(0)
                 .as_any()
                 .downcast_ref::<BinaryArray>()
@@ -67,7 +79,10 @@ fn ds_hll_local_stage_after_real_factory_100k_and_exact_identity() {
                 .value(0);
             assert_eq!(bytes[3], 17);
             assert_eq!(bytes[5], 0, "original raw partial HIP flag");
-            assert_eq!(payload.chunk_schema(), partial.output.as_ref());
+            assert_eq!(
+                payload.chunk_schema(),
+                prepared_schema(&partial, tracker.clone()).as_ref()
+            );
         }
         for reverse in [false, true] {
             let inputs = if reverse {
@@ -78,7 +93,7 @@ fn ds_hll_local_stage_after_real_factory_100k_and_exact_identity() {
             let result = run(&final_stage, &inputs, tracker.clone());
             assert_eq!(
                 result
-                    .batch
+                    .record_batch()
                     .column(0)
                     .as_any()
                     .downcast_ref::<Int64Array>()
@@ -86,7 +101,10 @@ fn ds_hll_local_stage_after_real_factory_100k_and_exact_identity() {
                     .value(0),
                 100_091
             );
-            assert_eq!(result.chunk_schema(), final_stage.output.as_ref());
+            assert_eq!(
+                result.chunk_schema(),
+                prepared_schema(&final_stage, tracker.clone()).as_ref()
+            );
         }
     }
     assert_eq!(tracker.current(), 0);
@@ -102,14 +120,19 @@ fn ds_hll_local_stage_after_dop_one_original_raw_and_empty_two_driver_lifecycle(
         let single = factory(&program, P::Single);
         let state = RuntimeState::default();
         let mut operator = single.create(1, 0);
+        operator.set_construction_factory(aggregate_fixture::runtime_construction_factory(
+            tracker.clone(),
+            single.error.clone(),
+        ));
         operator.set_mem_tracker(tracker.clone());
+        operator.prepare().expect("prepare actual aggregate schema");
         let processor = operator.as_processor_mut().unwrap();
         processor.push_chunk(&state, source).unwrap();
         processor.set_finishing(&state).unwrap();
         let result = processor.pull_chunk(&state).unwrap().unwrap();
         assert_eq!(
             result
-                .batch
+                .record_batch()
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
@@ -118,6 +141,11 @@ fn ds_hll_local_stage_after_dop_one_original_raw_and_empty_two_driver_lifecycle(
             100_093
         );
         drop(operator);
+        assert!(
+            tracker.current() > 0,
+            "live output retains its actual creator"
+        );
+        drop(result);
         assert_eq!(tracker.current(), 0);
         let (partial, final_stage) = single.into_local_update_stages().unwrap();
         let left = run(&partial, &[], tracker.clone());
@@ -128,7 +156,7 @@ fn ds_hll_local_stage_after_dop_one_original_raw_and_empty_two_driver_lifecycle(
         assert_eq!(result.len(), 1);
         assert_eq!(
             result
-                .batch
+                .record_batch()
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int64Array>()
@@ -149,7 +177,7 @@ fn ds_hll_local_stage_after_actual_partial_and_final_cancel_first_cause_no_repla
         let (partial, final_stage) = factory(&program, P::Single)
             .into_local_update_stages()
             .unwrap();
-        let source = Chunk::new_like(source.batch.slice(0, 50_000), &source);
+        let source = Chunk::new_like(source.record_batch().slice(0, 50_000), &source);
         let partial_output = run(&partial, &[source.clone()], tracker.clone());
         let phase = if final_phase { &final_stage } else { &partial };
         let first = if final_phase {
@@ -159,7 +187,13 @@ fn ds_hll_local_stage_after_actual_partial_and_final_cancel_first_cause_no_repla
         };
         let state = RuntimeState::default();
         let mut operator = phase.create(if final_phase { 1 } else { 2 }, 0);
+        operator.set_construction_factory(aggregate_fixture::runtime_construction_factory(
+            tracker.clone(),
+            phase.error.clone(),
+        ));
         operator.set_mem_tracker(tracker.clone());
+        operator.prepare().expect("prepare actual aggregate schema");
+        let creator_bytes = tracker.current();
         let processor = operator.as_processor_mut().unwrap();
         processor.push_chunk(&state, first.clone()).unwrap();
         assert!(tracker.current() > 0);
@@ -169,7 +203,7 @@ fn ds_hll_local_stage_after_actual_partial_and_final_cancel_first_cause_no_repla
             primary.cause(),
             &crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
         );
-        assert_eq!(tracker.current(), 0);
+        assert_eq!(tracker.current(), creator_bytes);
         assert!(processor.is_finished());
         assert!(!processor.need_input());
         assert!(!processor.has_output());
@@ -177,6 +211,8 @@ fn ds_hll_local_stage_after_actual_partial_and_final_cancel_first_cause_no_repla
         assert_eq!(processor.set_finishing(&state).unwrap_err(), primary);
         assert_eq!(processor.pull_chunk(&state).unwrap_err(), primary);
         drop(operator);
+        drop(partial_output);
+        drop(source);
         assert_eq!(tracker.current(), 0);
     }
 }

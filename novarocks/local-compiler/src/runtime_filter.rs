@@ -148,7 +148,7 @@ fn membership_contract(
         RuntimeFilterNullSemantics::NeverMatches => FilterNullSemantics::NeverMatches,
         RuntimeFilterNullSemantics::NullSafeEqual => FilterNullSemantics::NullSafeEqual,
     };
-    let contract = StaticFilterContract::membership(&ty.data_type, null_semantics)
+    let contract = StaticFilterContract::membership(&ty.data_type(), null_semantics)
         .map_err(|_| unsupported(node, "runtime-filter membership key type"))?;
     Ok((contract, null_semantics))
 }
@@ -393,12 +393,12 @@ fn plan_producer(
         novarocks_physical_plan::JoinSide::Left => key.left,
         novarocks_physical_plan::JoinSide::Right => key.right,
     };
-    let key_type = &fragment
+    let key_type = fragment
         .expressions()
         .get(build_key)
         .ok_or(FragmentCompileError::Invalid("missing join key definition"))?
         .ty
-        .data_type;
+        .data_type();
     if key_type != contract_type(&contract)? {
         return Err(unsupported(
             node,
@@ -536,7 +536,7 @@ fn plan_consumer(
         ))?
         .ty
         .clone();
-    if &ty.data_type != contract_type(&contract)? {
+    if ty.data_type() != contract_type(&contract)? {
         return Err(unsupported(
             node,
             "runtime-filter scan key type differs from its membership type",
@@ -666,7 +666,7 @@ fn plan_join_consumer(
             "join probe endpoint differs from its equality key",
         ));
     }
-    if &definition.ty.data_type != contract_type(&contract)? {
+    if definition.ty.data_type() != contract_type(&contract)? {
         return Err(unsupported(
             node,
             "runtime-filter probe key type differs from its membership type",

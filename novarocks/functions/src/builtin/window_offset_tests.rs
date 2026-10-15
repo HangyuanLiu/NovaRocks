@@ -243,7 +243,7 @@ fn ints(output: &SelectedValues<'_>) -> Vec<Option<i32>> {
         .collect()
 }
 fn ty(array: &ArrayRef, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(array.data_type().clone(), nullable)
+    FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), nullable)
 }
 fn policy() -> ConstantPolicy {
     // Explicit finite test invoice; not a production profile or a host MEM grant.
@@ -540,7 +540,7 @@ fn sliced_scalar_nonzero_cv_and_dense_compact_sources_keep_original_addresses() 
 }
 
 #[test]
-fn physical_dictionary_null_rule_is_preserved_without_value_null_reinterpretation() {
+fn offset_ignore_nulls_follows_selected_values_after_explicit_plain_ingress() {
     let dictionary: ArrayRef = Arc::new(
         DictionaryArray::<Int8Type>::try_new(
             Int8Array::from(vec![Some(0), Some(1), None, Some(1)]),
@@ -551,7 +551,9 @@ fn physical_dictionary_null_rule_is_preserved_without_value_null_reinterpretatio
     assert!(!dictionary.is_null(0));
     let frames = whole_frames(4);
     let peers = [WindowRowRange { start: 0, end: 4 }];
-    let arguments = [EvaluatedArgument::Column(&dictionary)];
+    let plain = arrow_cast::cast(dictionary.as_ref(), &DataType::Utf8).unwrap();
+    assert!(plain.is_null(0));
+    let arguments = [EvaluatedArgument::Column(&plain)];
     for name in NAMES {
         let fixture = Fixture::new(
             name,
@@ -570,20 +572,15 @@ fn physical_dictionary_null_rule_is_preserved_without_value_null_reinterpretatio
         let out = part
             .evaluate(Selection::all(4), 4, &Control::default())
             .unwrap();
-        let array = out
-            .values()
-            .as_any()
-            .downcast_ref::<DictionaryArray<Int8Type>>()
-            .unwrap();
+        let array = out.values().as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(
-            array.keys().iter().collect::<Vec<_>>(),
+            array.iter().collect::<Vec<_>>(),
             if name == "lead" {
-                vec![Some(1), Some(1), Some(1), None]
+                vec![Some("visible"), Some("visible"), Some("visible"), None]
             } else {
-                vec![None, Some(0), Some(1), Some(1)]
+                vec![None, None, Some("visible"), Some("visible")]
             }
         );
-        assert!(array.values().is_null(0));
     }
 }
 
@@ -598,6 +595,7 @@ fn exact_nested_source_fresh_and_frozen_keep_same_installed_attachment_and_metad
         vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
         Some(NullBuffer::from(vec![true, false, true])),
     ));
+    let values = crate::test_value_ingress::array_for_binding(&values, &ty(&values, true)).unwrap();
     let offset = cv(Some(0), false);
     let arguments = [
         EvaluatedArgument::Column(&values),
@@ -685,14 +683,14 @@ fn exact_nested_source_fresh_and_frozen_keep_same_installed_attachment_and_metad
             output.data_type(),
             values.data_type()
         ));
-        assert_eq!(output.fields()[0].metadata(), field.metadata());
+        assert!(output.fields()[0].metadata().is_empty());
         assert_eq!(
             output.nulls().unwrap().iter().collect::<Vec<_>>(),
             [true, false, true]
         );
         let drift = [
             FunctionArgument::Value {
-                value_type: FunctionValueType::new(
+                value_type: FunctionValueType::from_legacy_declared_projection(
                     DataType::Struct(
                         vec![Arc::new(Field::new("drift", DataType::Int32, false))].into(),
                     ),

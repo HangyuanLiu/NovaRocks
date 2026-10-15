@@ -166,9 +166,9 @@ fn expression(
             out.work.flush()?;
             // Boolean case is display spelling only, never value identity.
             if !array_item
-                && value.value_type().logical_type
+                && value.value_type().logical_type()
                     == novarocks_type_contract::ValueLogicalType::Physical
-                && value.value_type().data_type == arrow::datatypes::DataType::Boolean
+                && *value.value_type().data_type() == arrow::datatypes::DataType::Boolean
             {
                 out.append(match label.as_str() {
                     "true" => "TRUE",
@@ -444,10 +444,10 @@ fn typed_string_literal<'a>(
         ExprKind::Literal(query_ir::LiteralValue::String(value)) => Ok(Some(value)),
         ExprKind::Constant(value) => {
             checked_constant(expr, value, out)?;
-            if value.value_type().logical_type
+            if value.value_type().logical_type()
                 != novarocks_type_contract::ValueLogicalType::Physical
                 || !matches!(
-                    value.value_type().data_type,
+                    value.value_type().data_type(),
                     arrow::datatypes::DataType::Utf8
                         | arrow::datatypes::DataType::LargeUtf8
                         | arrow::datatypes::DataType::Utf8View

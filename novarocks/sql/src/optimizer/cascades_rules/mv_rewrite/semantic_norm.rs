@@ -289,7 +289,7 @@ fn normalize_inner(
         } => {
             if !novarocks_type_contract::arrow_data_types_exact_observed::<ConstantError>(
                 target,
-                &value_type.data_type,
+                &value_type.data_type(),
                 || work.step().map_err(Into::into),
             )? {
                 return Ok(None);
@@ -436,11 +436,11 @@ fn fingerprint(
     work.step()?;
     let mut hash = DefaultHasher::new();
     let ty = expr.value_type();
-    hash.write_u8(ty.logical_type as u8);
-    hash.write_u8(u8::from(ty.nullable));
+    hash.write_u8(ty.logical_type() as u8);
+    hash.write_u8(u8::from(ty.nullable()));
     hash.write_u64(
         novarocks_type_contract::arrow_data_type_fingerprint_observed::<ConstantError>(
-            &ty.data_type,
+            &ty.data_type(),
             &mut || work.step().map_err(Into::into),
         )?,
     );

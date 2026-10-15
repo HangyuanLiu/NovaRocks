@@ -152,7 +152,12 @@ impl LocalTableBuilder {
         Ok(Self {
             fields: columns
                 .iter()
-                .map(|(name, nullable)| ResultField::new(*name, DataType::Utf8, *nullable, None))
+                .map(|(name, nullable)| {
+                    ResultField::new(
+                        *name,
+                        novarocks_type_contract::FunctionValueType::new(DataType::Utf8, *nullable),
+                    )
+                })
                 .collect(),
             builders: columns
                 .iter()

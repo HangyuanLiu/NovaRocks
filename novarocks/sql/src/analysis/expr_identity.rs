@@ -539,7 +539,13 @@ mod tests {
             )),
             false,
         );
-        for changed in [changed_slot, changed_name, changed_type] {
+        assert!(typed_expr_semantically_eq(&left, &expression(changed_type), &control).unwrap());
+        let mut changed_nullability = parameter.clone();
+        changed_nullability.value_type = FunctionValueType::new(
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            false,
+        );
+        for changed in [changed_slot, changed_name, changed_nullability] {
             assert!(!typed_expr_semantically_eq(&left, &expression(changed), &control).unwrap());
         }
     }

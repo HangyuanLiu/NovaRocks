@@ -1538,7 +1538,10 @@ fn compute_count(
             },
             &mut |_| Ok::<_, std::convert::Infallible>(()),
         );
-        result.unwrap_or_else(|never| match never {});
+        result.map_err(|error| match error {
+            core::CountVisitError::Invalid(message) => message.to_owned(),
+            core::CountVisitError::Control(never) => match never {},
+        })?;
     }
     Ok(Arc::new(b.finish()))
 }
@@ -3249,6 +3252,8 @@ mod tests {
     fn aggregate_binding(name: &str, argument_types: &[DataType]) -> WindowAggregateBinding {
         let function_set = empty_function_set();
         WindowAggregateBinding {
+            // Explicit legacy carrier fixture; this is not frozen-binding admission.
+            frozen: None,
             function_name: name.to_string(),
             resolved: function_set
                 .catalog()

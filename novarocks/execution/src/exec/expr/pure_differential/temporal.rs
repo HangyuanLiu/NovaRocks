@@ -170,7 +170,7 @@ fn compile(
                 // COUNT's pooled fixture is an actual non-null Utf8 Value
                 // edge. Its unused producer definition must keep that type;
                 // a NULL literal cannot claim a non-null source contract.
-                let producer = if native_checked_constants && !value_type.nullable {
+                let producer = if native_checked_constants && !value_type.nullable() {
                     let strings = values
                         .as_any()
                         .downcast_ref::<StringArray>()
@@ -623,7 +623,7 @@ fn run_compiled(
             }
             if !novarocks_type_contract::arrow_data_types_exact(
                 pure.values.data_type(),
-                &result_type.data_type,
+                &result_type.data_type(),
             ) {
                 details.push("invocation-error carrier differs from the frozen result".into());
             }

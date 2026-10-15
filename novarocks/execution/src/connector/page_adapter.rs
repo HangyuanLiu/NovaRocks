@@ -26,12 +26,9 @@
 //!
 //! Key exported interfaces:
 //! - Types: `SourcePageConverter`, `PageAdapterError`, `PageAdapterErrorKind`.
-//! - Functions: `source_page_to_chunk`.
-//!
-//! Current limitations:
-//! - Owner-local read intermediates may derive their schema from the arrays.
-//!   Native scan outputs instead bind the immutable output declaration and
-//!   metadata-retag equivalent carriers before handing the chunk downstream.
+//! Every page binds the scan's immutable complete typed output declaration.
+//! Runtime construction uses the installed scan factory; page arrays never
+//! author a competing schema.
 //!
 //! Provider neutrality: nothing here names a provider or inspects a provider
 //! variant, so this file compiles with no provider crate in the dependency
@@ -39,14 +36,49 @@
 
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, RecordBatch, RecordBatchOptions};
-use arrow::datatypes::Field;
-
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::SourcePage;
-use novarocks_types::SlotId;
 
-use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
+use crate::exec::chunk::{ArrayNormalizationStep, Chunk, ChunkSchemaRef};
+use crate::exec::pipeline::operator::{
+    ConstructionFailure, InputConstructionFactory, InputConstructionOwner,
+};
+use crate::runtime::fragment::{ExecutionFailure, ExecutionResult};
+
+/// The source diagnostic and creating owner's original cause stay distinct.
+enum PageConversionFailure {
+    Page(PageAdapterError),
+    Construction(ConstructionFailure),
+}
+impl From<PageAdapterError> for PageConversionFailure {
+    fn from(error: PageAdapterError) -> Self {
+        Self::Page(error)
+    }
+}
+impl From<ConstructionFailure> for PageConversionFailure {
+    fn from(error: ConstructionFailure) -> Self {
+        Self::Construction(error)
+    }
+}
+impl PageConversionFailure {
+    fn into_execution(self) -> ExecutionFailure {
+        match self {
+            Self::Page(error) => error.to_string().into(),
+            Self::Construction(error) => error.into(),
+        }
+    }
+    #[cfg(test)]
+    fn into_page(self) -> PageAdapterError {
+        match self {
+            Self::Page(error) => error,
+            // Only the explicit pure adapter uses this conversion. Its body
+            // has no construction owner and cannot originate this variant.
+            Self::Construction(error) => {
+                PageAdapterError::new(PageAdapterErrorKind::Chunk, error.to_string())
+            }
+        }
+    }
+}
 
 /// Why one page could not become a chunk.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -123,65 +155,58 @@ impl std::fmt::Display for PageAdapterError {
 
 impl std::error::Error for PageAdapterError {}
 
-/// Build one chunk from one page and the scan's ordered output slot ids.
-///
-/// `slot_ids[i]` names channel `i`. Channels beyond the bound prefix are the
-/// provider's own working columns and are dropped.
-pub fn source_page_to_chunk(
-    page: SourcePage,
-    slot_ids: &[SlotId],
-) -> Result<Chunk, PageAdapterError> {
-    let mut schema: Option<ChunkSchemaRef> = None;
-    convert_page(page, slot_ids, &mut schema, None)
-}
-
-/// Converts the pages of one scan stream into chunks, reusing the chunk
-/// schema of the last page while the page shape does not change.
-///
-/// `slot_ids[i]` names channel `i`. Channels beyond the bound prefix are the
-/// provider's own working columns and are dropped. A page's accounted output
-/// memory moves onto its chunk.
+/// Converts pages against the scan's frozen complete typed declaration.
+/// Channels beyond its bound prefix remain provider working columns and are
+/// dropped. A page's accounted output memory moves onto its chunk.
 pub struct SourcePageConverter {
-    slot_ids: Vec<SlotId>,
-    schema: Option<ChunkSchemaRef>,
-    output_schema: Option<ChunkSchemaRef>,
+    output_schema: ChunkSchemaRef,
 }
 
 impl SourcePageConverter {
-    pub fn new(slot_ids: Vec<SlotId>) -> Self {
-        Self {
-            slot_ids,
-            schema: None,
-            output_schema: None,
-        }
-    }
-
-    /// Bind a scan's frozen output slots and types. Equivalent nested Arrow
-    /// metadata is re-tagged; a different logical carrier is rejected.
+    /// Borrow the scan's frozen ordered slots and complete typed declarations.
+    /// This converter creates no competing slot-ID vector or type author.
     pub fn with_output_schema(output_schema: ChunkSchemaRef) -> Self {
-        Self {
-            slot_ids: output_schema.slot_ids().to_vec(),
-            schema: None,
-            output_schema: Some(output_schema),
-        }
+        Self { output_schema }
     }
 
-    pub fn convert(&mut self, page: SourcePage) -> Result<Chunk, PageAdapterError> {
-        convert_page(
-            page,
-            &self.slot_ids,
-            &mut self.schema,
-            self.output_schema.as_ref(),
-        )
+    #[cfg(test)]
+    fn convert(&mut self, page: SourcePage) -> Result<Chunk, PageAdapterError> {
+        convert_page(page, &self.output_schema, None).map_err(PageConversionFailure::into_page)
+    }
+
+    /// The installed scan factory creates only the new batch/type scaffolds.
+    /// The provider's column vector and output-memory token transfer unchanged.
+    pub fn convert_with_factory(
+        &mut self,
+        page: SourcePage,
+        factory: &dyn InputConstructionFactory,
+    ) -> ExecutionResult<Chunk> {
+        let owner = factory.begin_typed_construction(&self.output_schema)?;
+        convert_page(page, &self.output_schema, Some(owner.as_ref()))
+            .map_err(PageConversionFailure::into_execution)
     }
 }
 
 fn convert_page(
     mut page: SourcePage,
-    slot_ids: &[SlotId],
-    schema_cache: &mut Option<ChunkSchemaRef>,
-    output_schema: Option<&ChunkSchemaRef>,
-) -> Result<Chunk, PageAdapterError> {
+    output_schema: &ChunkSchemaRef,
+    owner: Option<&dyn InputConstructionOwner>,
+) -> Result<Chunk, PageConversionFailure> {
+    if let Some(owner) = owner {
+        owner.observe(
+            0,
+            &[],
+            ArrayNormalizationStep::InspectConstructionWork { units: 1 },
+        )?;
+    }
+    if !output_schema.is_typed() {
+        return Err(PageAdapterError::new(
+            PageAdapterErrorKind::Chunk,
+            "connector page output schema lacks complete typed bindings",
+        )
+        .into());
+    }
+    let slot_ids = output_schema.slot_ids();
     let positions = page.position_count();
     let channel_count = page.channel_count();
     if slot_ids.len() > channel_count {
@@ -191,7 +216,8 @@ fn convert_page(
                 "scan output binds {} channels but the page carries {channel_count}",
                 slot_ids.len()
             ),
-        ));
+        )
+        .into());
     }
 
     // Discard provider working channels before extracting the page. The
@@ -206,6 +232,13 @@ fn convert_page(
         })?;
     debug_assert_eq!(positions, extracted_positions);
     for (index, column) in columns.iter().enumerate() {
+        if let Some(owner) = owner {
+            owner.observe(
+                index,
+                &[],
+                ArrayNormalizationStep::InspectConstructionWork { units: 1 },
+            )?;
+        }
         if column.len() != positions {
             return Err(PageAdapterError::new(
                 PageAdapterErrorKind::PositionMismatch,
@@ -213,34 +246,47 @@ fn convert_page(
                     "channel {index} produced {} values for a page of {positions} positions",
                     column.len()
                 ),
-            ));
+            )
+            .into());
         }
     }
 
-    let visible_bytes = columns
-        .iter()
-        .map(|column| column.get_array_memory_size() as u64)
-        .fold(0_u64, u64::saturating_add);
-    let mut chunk = if let Some(output_schema) = output_schema
-        && !columns.is_empty()
-    {
-        // A SourcePage has positional channels, not named Arrow fields. Bind
-        // those columns directly to the owner declaration before constructing
-        // the batch; synthetic slot names cannot become a competing contract.
-        Chunk::try_new_with_columns(Arc::clone(output_schema), columns)
-    } else {
-        let schema = match output_schema {
-            Some(schema) => Arc::clone(schema),
-            None => chunk_schema_for(slot_ids, &columns, schema_cache)?,
-        };
-        // A count-only page still reports rows. Preserve that count explicitly
-        // because the column constructor has no array from which to derive it.
-        let options = RecordBatchOptions::new().with_row_count(Some(positions));
-        RecordBatch::try_new_with_options(schema.arrow_schema_ref(), columns, &options)
-            .map_err(|error| format!("connector page record batch failed: {error}"))
-            .and_then(|batch| Chunk::try_new_with_chunk_schema(batch, schema))
+    let mut visible_bytes = 0_u64;
+    for (index, column) in columns.iter().enumerate() {
+        if let Some(owner) = owner {
+            owner.observe(index, &[], ArrayNormalizationStep::OpaqueOperationFinished)?;
+        }
+        visible_bytes = visible_bytes.saturating_add(column.get_array_memory_size() as u64);
+        if let Some(owner) = owner {
+            owner.observe(index, &[], ArrayNormalizationStep::OpaqueOperationFinished)?;
+        }
     }
-    .map_err(|error| PageAdapterError::new(PageAdapterErrorKind::Chunk, error))?;
+    let mut chunk = if let Some(owner) = owner {
+        // The incoming Vec already belongs to the SourcePage. Only actual
+        // normalized wrappers and the new RecordBatch Arc are constructed.
+        Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+            Arc::clone(output_schema),
+            columns,
+            positions,
+            owner.storage_lifetime(),
+            |step| owner.observe(0, &[], step),
+        )?
+    } else {
+        #[cfg(not(test))]
+        return Err(ConstructionFailure::MissingOwner.into());
+        #[cfg(test)]
+        {
+            // The explicit pure fixture path uses the same complete declaration,
+            // including row count for a zero-channel page; it never derives types.
+            Chunk::try_new_typed_with_columns_observed::<String, _>(
+                Arc::clone(output_schema),
+                columns,
+                positions,
+                |_| Ok(()),
+            )
+            .map_err(|error| PageAdapterError::new(PageAdapterErrorKind::Chunk, error))?
+        }
+    };
 
     let output_memory = if let Some(mut output_memory) = output_memory {
         output_memory.shrink_to(visible_bytes).map_err(|error| {
@@ -262,54 +308,150 @@ fn convert_page(
     Ok(chunk)
 }
 
-fn chunk_schema_for(
-    slot_ids: &[SlotId],
-    columns: &[ArrayRef],
-    cache: &mut Option<ChunkSchemaRef>,
-) -> Result<ChunkSchemaRef, PageAdapterError> {
-    if let Some(cached) = cache.as_ref()
-        && cached.slots().len() == columns.len()
-        && cached
-            .slots()
-            .iter()
-            .zip(columns)
-            .all(|(slot, column)| slot.data_type() == column.data_type())
-    {
-        return Ok(Arc::clone(cached));
-    }
-
-    let slots = slot_ids
-        .iter()
-        .zip(columns)
-        .map(|(slot_id, column)| {
-            // Nullable, because the page carries no nullability declaration:
-            // a nullable Arrow field accepts an array with or without nulls,
-            // while the reverse would reject a legal page outright.
-            let field = Field::new(format!("slot_{slot_id}"), column.data_type().clone(), true);
-            ChunkSlotSchema::try_new_with_field(*slot_id, field, None, None)
-        })
-        .collect::<Result<Vec<_>, String>>()
-        .map_err(|error| PageAdapterError::new(PageAdapterErrorKind::Chunk, error))?;
-    let schema = Arc::new(
-        ChunkSchema::try_new(slots)
-            .map_err(|error| PageAdapterError::new(PageAdapterErrorKind::Chunk, error))?,
-    );
-    *cache = Some(Arc::clone(&schema));
-    Ok(schema)
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use arrow::array::{Array, Int64Array};
+    use crate::exec::chunk::{ChunkSchema, ChunkSlotSchema};
+    use arrow::array::{Array, ArrayRef, Int64Array};
+    use arrow::datatypes::Field;
     use novarocks_spi::connector::{
         ConnectorError, ConnectorExecutionResources, ConnectorResourceCheckpoint,
         ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
     };
+    use novarocks_types::SlotId;
 
     use super::*;
     use crate::runtime::mem_tracker::MemTracker;
+
+    fn declared_schema(with_column: bool) -> ChunkSchemaRef {
+        declared_schema_at(with_column, SlotId::new(17))
+    }
+
+    fn declared_schema_at(with_column: bool, slot: SlotId) -> ChunkSchemaRef {
+        use arrow::datatypes::DataType;
+        use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+        let storage = ValueTypeStorageLifetime::pure();
+        let slots = if with_column {
+            let declaration = FunctionValueType::new(DataType::Int64, false);
+            vec![
+                ChunkSlotSchema::try_new_typed(
+                    slot,
+                    Arc::new(Field::new("v", DataType::Int64, false)),
+                    declaration.typed_binding().clone(),
+                    None,
+                    storage.clone(),
+                )
+                .unwrap(),
+            ]
+        } else {
+            vec![]
+        };
+        Arc::new(ChunkSchema::try_new_typed(slots, storage).unwrap())
+    }
+
+    fn actual_factory(
+        tracker: &Arc<MemTracker>,
+        error: Arc<crate::runtime::runtime_state::RuntimeErrorState>,
+    ) -> Arc<dyn InputConstructionFactory> {
+        crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            tracker.clone(),
+            error,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn typed_page_initial_chunk_keeps_only_its_finite_creator_and_frozen_slots() {
+        let tracker = MemTracker::new_root("initial typed page");
+        let error = Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default());
+        let controller = Arc::downgrade(&error);
+        let factory = actual_factory(&tracker, error);
+        let schema = declared_schema(true);
+        let mut converter = SourcePageConverter::with_output_schema(schema.clone());
+        let chunk = converter
+            .convert_with_factory(int_page(vec![1, 2]), factory.as_ref())
+            .unwrap();
+        assert_eq!(chunk.chunk_schema().slot_ids(), &[SlotId::new(17)]);
+        assert_eq!(chunk.len(), 2);
+        assert!(Arc::ptr_eq(&chunk.chunk_schema_ref(), &schema));
+        drop(converter);
+        drop(factory);
+        assert!(
+            controller.upgrade().is_none(),
+            "late chunk does not retain the control/factory"
+        );
+        assert!(tracker.current() > 0);
+        let late = chunk.clone();
+        drop(chunk);
+        assert!(tracker.current() > 0);
+        drop(late);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn typed_count_only_page_and_final_wrapper_refusal_use_the_actual_owner() {
+        use crate::runtime::fragment::ExecutionFailureCause;
+        let tracker = MemTracker::new_root("count-only page constructor");
+        let factory = actual_factory(
+            &tracker,
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        );
+        let initial = tracker.current();
+        let mut converter = SourcePageConverter::with_output_schema(declared_schema(false));
+        let chunk = converter
+            .convert_with_factory(SourcePage::zero_channel(7), factory.as_ref())
+            .unwrap();
+        assert_eq!(chunk.len(), 7);
+        assert!(chunk.columns().is_empty());
+        assert!(chunk.chunk_schema().is_typed());
+        let request_bytes = tracker.current() - initial;
+        assert!(request_bytes > 1);
+        drop(chunk);
+        assert_eq!(tracker.current(), initial);
+        // This same constructor has only scope metadata and its final batch
+        // Arc requests: one byte below its real successful total refuses that
+        // final wrapper without changing the provider's row-count semantics.
+        tracker
+            .install_limit_once(initial + request_bytes - 1)
+            .unwrap();
+        let error = converter
+            .convert_with_factory(SourcePage::zero_channel(7), factory.as_ref())
+            .unwrap_err();
+        assert!(matches!(
+            error.cause(),
+            ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
+        ));
+        assert_eq!(
+            tracker.current(),
+            initial,
+            "all successful prefix requests roll back"
+        );
+        drop(factory);
+        assert_eq!(tracker.current(), 0);
+    }
+
+    #[test]
+    fn typed_page_original_stop_precedes_source_errors_without_constructing_a_chunk() {
+        let tracker = MemTracker::new_root("page original stop");
+        let error = Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default());
+        let factory = actual_factory(&tracker, error.clone());
+        let initial = tracker.current();
+        let original = ExecutionFailure::from("original scan stop".to_owned());
+        error.set_error(original.clone());
+        let mut converter = SourcePageConverter::with_output_schema(declared_schema(true));
+        let refused = converter
+            .convert_with_factory(SourcePage::zero_channel(1), factory.as_ref())
+            .unwrap_err();
+        assert_eq!(
+            refused, original,
+            "the missing source channel must not replace the original stop"
+        );
+        assert_eq!(tracker.current(), initial);
+        drop(factory);
+        assert_eq!(tracker.current(), 0);
+    }
 
     struct OutputLedger {
         retained: Arc<AtomicU64>,
@@ -371,9 +513,14 @@ mod tests {
         SourcePage::try_new(positions, vec![column]).expect("valid page")
     }
 
+    fn convert_declared(page: SourcePage, with_column: bool) -> Result<Chunk, PageAdapterError> {
+        SourcePageConverter::with_output_schema(declared_schema_at(with_column, SlotId::new(1)))
+            .convert(page)
+    }
+
     #[test]
     fn a_zero_channel_page_converts_to_a_row_counted_chunk() {
-        let chunk = source_page_to_chunk(SourcePage::zero_channel(1024), &[]).expect("chunk");
+        let chunk = convert_declared(SourcePage::zero_channel(1024), false).expect("chunk");
         assert_eq!(chunk.len(), 1024);
         assert_eq!(chunk.columns().len(), 0);
         // It is a real result, never end of stream.
@@ -396,9 +543,10 @@ mod tests {
         let page = SourcePage::try_new_accounted(3, vec![column], output_memory)
             .expect("accounted source page");
         let tracker = MemTracker::new_root("converted connector chunk");
-        let mut chunk = SourcePageConverter::new(vec![SlotId::new(1)])
-            .convert(page)
-            .expect("convert accounted page");
+        let mut chunk =
+            SourcePageConverter::with_output_schema(declared_schema_at(true, SlotId::new(1)))
+                .convert(page)
+                .expect("convert accounted page");
         chunk.transfer_to(&tracker);
         assert_eq!(retained.load(Ordering::Acquire), bytes);
         assert_eq!(tracker.current(), 0, "the page must not be charged twice");
@@ -429,7 +577,7 @@ mod tests {
             .expect("freeze full provider output charge");
         let page = SourcePage::try_new_accounted(3, vec![visible, hidden], output_memory)
             .expect("accounted source page");
-        let chunk = source_page_to_chunk(page, &[SlotId::new(1)]).expect("convert projected page");
+        let chunk = convert_declared(page, true).expect("convert projected page");
         assert_eq!(retained.load(Ordering::Acquire), visible_bytes);
         drop(chunk);
         assert_eq!(retained.load(Ordering::Acquire), 0);
@@ -450,7 +598,7 @@ mod tests {
             .expect("freeze hidden provider output charge");
         let page = SourcePage::try_new_accounted(3, vec![hidden], output_memory)
             .expect("accounted source page");
-        let chunk = source_page_to_chunk(page, &[]).expect("convert count-only page");
+        let chunk = convert_declared(page, false).expect("convert count-only page");
         assert_eq!(chunk.len(), 3);
         assert_eq!(retained.load(Ordering::Acquire), 0);
     }
@@ -461,21 +609,22 @@ mod tests {
         let hidden: ArrayRef = Arc::new(Int64Array::from(vec![5_i64, 6]));
         let page = SourcePage::try_new(2, vec![visible, hidden]).expect("valid page");
 
-        let chunk = source_page_to_chunk(page, &[SlotId::new(1)]).expect("chunk");
+        let chunk = convert_declared(page, true).expect("chunk");
         assert_eq!(chunk.columns().len(), 1);
         assert_eq!(chunk.len(), 2);
     }
 
     #[test]
     fn binding_more_channels_than_the_page_carries_is_rejected() {
-        let error = source_page_to_chunk(SourcePage::zero_channel(4), &[SlotId::new(1)])
-            .expect_err("channel mismatch");
+        let error =
+            convert_declared(SourcePage::zero_channel(4), true).expect_err("channel mismatch");
         assert_eq!(error.kind(), PageAdapterErrorKind::ChannelMismatch);
     }
 
     #[test]
     fn the_derived_schema_is_reused_while_the_arrow_types_hold() {
-        let mut converter = SourcePageConverter::new(vec![SlotId::new(1)]);
+        let mut converter =
+            SourcePageConverter::with_output_schema(declared_schema_at(true, SlotId::new(1)));
         let first = converter
             .convert(int_page(vec![1]))
             .expect("first chunk")
@@ -494,7 +643,7 @@ mod tests {
                 "entries",
                 DataType::Struct(
                     vec![
-                        Arc::new(Field::new("key", DataType::Int32, true)),
+                        Arc::new(Field::new("key", DataType::Int32, false)),
                         Arc::new(Field::new("value", value_type, true)),
                     ]
                     .into(),
@@ -503,17 +652,18 @@ mod tests {
             )),
             false,
         );
-        Arc::new(
-            ChunkSchema::try_new(vec![
-                ChunkSlotSchema::from_field(
-                    SlotId::new(17),
-                    &Field::new("mi", map_type, true),
-                    None,
-                )
-                .expect("frozen map slot"),
-            ])
-            .expect("frozen map schema"),
+        use novarocks_type_contract::{FunctionValueType, ValueTypeStorageLifetime};
+        let storage = ValueTypeStorageLifetime::pure();
+        let declaration = FunctionValueType::new(map_type, true);
+        let slot = ChunkSlotSchema::try_new_typed(
+            SlotId::new(17),
+            Arc::new(Field::new("mi", declaration.data_type().clone(), true)),
+            declaration.typed_binding().clone(),
+            None,
+            storage.clone(),
         )
+        .expect("frozen map slot");
+        Arc::new(ChunkSchema::try_new_typed(vec![slot], storage).expect("frozen map schema"))
     }
 
     fn physical_map() -> ArrayRef {
@@ -617,7 +767,7 @@ mod tests {
 
     #[test]
     fn frozen_zero_channel_scan_preserves_count_and_output_contract() {
-        let schema = Arc::new(ChunkSchema::empty());
+        let schema = declared_schema(false);
         let chunk = SourcePageConverter::with_output_schema(Arc::clone(&schema))
             .convert(SourcePage::zero_channel(19))
             .expect("count-only page");

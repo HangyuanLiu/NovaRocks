@@ -414,8 +414,8 @@ mod tests {
             condition.kind,
             ExprKind::Literal(LiteralValue::Bool(true))
         ));
-        assert_eq!(condition.value_type.data_type, DataType::Boolean);
-        assert!(!condition.value_type.nullable);
+        assert_eq!(condition.value_type.data_type().clone(), DataType::Boolean);
+        assert!(!condition.value_type.nullable());
     }
 
     fn contains_apply(plan: &LogicalPlanNode) -> bool {

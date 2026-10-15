@@ -155,12 +155,18 @@ fn draft() -> ConnectorWriteRecipeDraft {
         ConnectorWriteInputShape::Data {
             fields: target_fields()
                 .into_iter()
+                .zip([ty(DataType::Int64, false), ty(DataType::Utf8, true)])
                 .enumerate()
-                .map(|(ordinal, field)| {
-                    ConnectorWriteFieldBinding::new(
+                .map(|(ordinal, (field, execution))| {
+                    // These are the fixed provider's independent value
+                    // declarations; the original source Field carries no
+                    // semantic authority for the complete typed projection.
+                    ConnectorWriteFieldBinding::try_new_typed(
                         ConnectorWriteFieldToken::from_bytes([ordinal as u8 + 1; 32]),
                         field,
+                        execution,
                     )
+                    .unwrap()
                 })
                 .collect(),
         },
@@ -693,7 +699,7 @@ impl ExchangeFrameTransmitter for LoopbackTransmitter {
                 ExchangeTransmitRejection::Failed(FragmentIoError::new(
                     FragmentIoOperation::ExchangeTransmit,
                     FragmentIoErrorKind::RemoteRejected,
-                    error,
+                    error.to_string(),
                 ))
             })
     }
@@ -706,7 +712,9 @@ fn runtime_state() -> Arc<RuntimeState> {
         None,
         None,
         None,
-        None,
+        Some(crate::runtime::mem_tracker::MemTracker::new_root(
+            "compiled writer tests",
+        )),
         Some(crate::runtime::execution_runtime::test_execution_runtime()),
     ))
 }
@@ -817,6 +825,7 @@ fn run_insert(
             ExchangeInputAssignment::new(NonZeroUsize::new(1).unwrap()),
         )])),
         Arc::clone(&port),
+        Some(&crate::runtime::fragment::exchange::test_receiver_creation_factory()),
     )
     .expect("compiled receivers");
     for registration in registrations {
@@ -878,19 +887,43 @@ fn run_insert(
 fn compiled_insert_values_writes_pages_and_publishes_the_root_relation() {
     let rows = [(Some(1), "a"), (Some(2), "b")];
     let insert = insert(&rows, 1);
-    assert!(matches!(
-        insert.writer.graph().nodes()[root_of(&insert.writer).index()].kind(),
-        ProgramNodeKind::TableWriter { .. }
-    ));
+    let writer = root_of(&insert.writer);
+    let ProgramNodeKind::TableWriter { projection, .. } =
+        insert.writer.graph().nodes()[writer.index()].kind()
+    else {
+        panic!("the compiled root is a TableWriter");
+    };
+    // The provider keeps its independently signed nullable target declaration.
+    let provider_fields = target_fields();
+    let provider_types = [ty(DataType::Int64, false), ty(DataType::Utf8, true)];
+    let recipe = insert.writer.write_recipes().get(&writer).unwrap();
+    assert_eq!(recipe.draft().input().field_count(), provider_fields.len());
+    for (ordinal, binding) in recipe.draft().input().fields_iter().enumerate() {
+        assert_eq!(binding.field(), &provider_fields[ordinal]);
+        assert_eq!(binding.execution_type(), Some(&provider_types[ordinal]));
+    }
+    // These literal source values are required, independently of target NULL law.
+    let source_types = [ty(DataType::Int64, false), ty(DataType::Utf8, false)];
+    let execution_schema = Schema::new(vec![
+        Field::new("c1", DataType::Int64, false),
+        Field::new("c2", DataType::Utf8, false),
+    ]);
+    assert_eq!(projection.layout.schema().as_ref(), &execution_schema);
+    for (ordinal, source) in source_types.iter().enumerate() {
+        assert_eq!(
+            projection.layout.value_binding_at(ordinal),
+            Some(source.typed_binding())
+        );
+    }
     let recorded = Arc::new(Mutex::new(Recorded::default()));
     let chunks = run_insert(&insert, 1, &recorded).expect("the compiled insert runs");
 
-    // The provider writer received the projected rows under its exact schema.
+    // Every page retains that exact complete execution projection.
     let recorded = recorded.lock().unwrap();
     assert_eq!(recorded.opened, 1, "one driver opens one writer");
     let mut written = Vec::new();
     for batch in &recorded.batches {
-        assert_eq!(batch.schema().as_ref(), &Schema::new(target_fields()));
+        assert_eq!(batch.schema().as_ref(), &execution_schema);
         let c1 = batch
             .column(0)
             .as_any()
@@ -919,19 +952,19 @@ fn compiled_insert_values_writes_pages_and_publishes_the_root_relation() {
     for chunk in &chunks {
         assert_eq!(chunk.schema().as_ref(), root_write_result_schema().as_ref());
         let kinds = chunk
-            .batch
+            .record_batch()
             .column(0)
             .as_any()
             .downcast_ref::<Int8Array>()
             .unwrap();
         let counts = chunk
-            .batch
+            .record_batch()
             .column(2)
             .as_any()
             .downcast_ref::<Int64Array>()
             .unwrap();
         let payloads = chunk
-            .batch
+            .record_batch()
             .column(3)
             .as_any()
             .downcast_ref::<BinaryArray>()
@@ -1002,8 +1035,35 @@ fn compiled_writer_bindings_cover_exactly_the_programs_writer_family() {
 /// the plan-tree writer and finish bound from the process function set: the
 /// Iceberg Theta sketch of `c1` (BIGINT NOT NULL) and `c2` (nullable STRING),
 /// frozen and prepared exactly as the frontend does.
+pub(crate) fn compiled_statistics_finish_fixture()
+-> (Arc<LocalProgram>, TableFinishRuntimeBinding, RuntimeState) {
+    statistics::finish_owner_fixture()
+}
+
+pub(crate) fn compiled_statistics_writer_fixture()
+-> (Arc<LocalProgram>, TableWriterRuntimeBinding, RuntimeState) {
+    statistics::writer_owner_fixture()
+}
+
 mod statistics {
     use super::*;
+
+    pub(super) fn writer_owner_fixture()
+    -> (Arc<LocalProgram>, TableWriterRuntimeBinding, RuntimeState) {
+        let program = compiled(0, &[], 1).writer;
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let binding = binding(&recorded);
+        let state = statistics_state(theta_function_set());
+        (program, binding, state)
+    }
+
+    pub(super) fn finish_owner_fixture()
+    -> (Arc<LocalProgram>, TableFinishRuntimeBinding, RuntimeState) {
+        let program = compiled(0, &[], 1).finish;
+        let binding = TableFinishRuntimeBinding::new(Arc::new(AcceptCarriers));
+        let state = statistics_state(theta_function_set());
+        (program, binding, state)
+    }
 
     use std::time::Instant;
 
@@ -1251,7 +1311,7 @@ mod statistics {
                 .clone(),
             false,
         );
-        let DataType::List(item) = &list_type.data_type else {
+        let DataType::List(item) = &list_type.data_type() else {
             unreachable!()
         };
         let raw = ListArray::from_iter_primitive::<arrow::datatypes::Int32Type, _, _>([
@@ -1281,7 +1341,7 @@ mod statistics {
                 .clone(),
             false,
         );
-        let DataType::Map(entries, sorted) = &map_type.data_type else {
+        let DataType::Map(entries, sorted) = &map_type.data_type() else {
             unreachable!()
         };
         let DataType::Struct(fields) = entries.data_type() else {
@@ -1350,10 +1410,10 @@ mod statistics {
         let ordinal = WriteTargetOrdinal::try_new(target).unwrap();
         let mut builder = FragmentBuilder::new(FragmentId::new(1));
         let source = builder.reserve_node_id().unwrap();
-        let types = [
-            ty(DataType::Int64, false),
-            ty(DataType::Utf8, rows.iter().any(|(_, text)| text.is_none())),
-        ];
+        // The source declaration comes from the same explicit provider-column
+        // vocabulary used by the original Theta request, independently of
+        // whether this particular fixture batch happens to contain NULL.
+        let types = inputs();
         let values = types
             .iter()
             .enumerate()
@@ -1857,6 +1917,7 @@ mod statistics {
                     )
                     .unwrap_or_else(|error| panic!("the frontend prepares {site:?}: {error}"));
                 FrozenPhysicalCall {
+                    materialized_writer_input: Some(input),
                     regexp_count_pattern_source: None,
                     to_base64_byte_source: None,
                     temporal_source: None,
@@ -2034,8 +2095,67 @@ mod statistics {
         .unwrap()
     }
 
+    // The comparison fixture authors complete plain writer bindings once;
+    // runtime preparation must consume a pure declaration, not an eager schema.
+    fn v1_layout(
+        schema: &crate::exec::chunk::ChunkSchema,
+    ) -> novarocks_local_program::StaticLayout {
+        novarocks_local_program::StaticLayout::try_new_typed_for_compile(
+            schema.arrow_schema_ref(),
+            Arc::from(schema.slot_ids()),
+            schema
+                .slots()
+                .iter()
+                .map(|slot| (slot.typed_binding().clone(), slot.unique_id()))
+                .collect(),
+            schema.storage_lifetime(),
+            |_| Ok(()),
+            &FixtureControl,
+        )
+        .unwrap()
+    }
+
+    fn v1_writer_template()
+    -> crate::exec::node::table_write_relation::WriterMultiplexRelationTemplate {
+        let relation = v1_multiplex();
+        crate::exec::node::table_write_relation::WriterMultiplexRelationTemplate::try_new_reserved(
+            &v1_layout(relation.chunk_schema()),
+        )
+        .unwrap()
+    }
+
+    fn v1_root_template() -> crate::exec::node::table_write_relation::RootWriteResultRelationTemplate
+    {
+        let relation =
+            RootWriteResultRelationSchema::try_new(RootWriteResultSchema::new()).unwrap();
+        crate::exec::node::table_write_relation::RootWriteResultRelationTemplate::try_new_reserved(
+            &v1_layout(relation.chunk_schema()),
+        )
+        .unwrap()
+    }
+
+    #[derive(Debug)]
+    enum V1PreparationFailure {
+        Creator(crate::exec::pipeline::operator::ConstructionFailure),
+        Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
+        Source(novarocks_local_program::PreparedWriterCallsError),
+    }
+    impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+        for V1PreparationFailure
+    {
+        fn from(
+            value: novarocks_type_contract::owned_resources::layout::LayoutResourceError,
+        ) -> Self {
+            Self::Resource(value)
+        }
+    }
+    impl From<novarocks_local_program::PreparedWriterCallsError> for V1PreparationFailure {
+        fn from(value: novarocks_local_program::PreparedWriterCallsError) -> Self {
+            Self::Source(value)
+        }
+    }
     /// The plan-tree writer over the same input port, bound by name from the
-    /// process function set.
+    /// the original frozen compiler source.
     fn v1_writer(
         compiled: &Compiled,
         function_set: &Arc<SealedExecutionFunctionSet>,
@@ -2043,35 +2163,151 @@ mod statistics {
     ) -> TableWriterOperatorFactory {
         let mut arena = ExprArena::default();
         let slots = input_slots(&compiled.writer);
-        let exprs = vec![
-            arena.push_typed(ExprNode::SlotId(slots[0]), DataType::Int64),
-            arena.push_typed(ExprNode::SlotId(slots[1]), DataType::Utf8),
-        ];
-        let expected = Arc::new(Schema::new(target_fields()));
+        let ProgramNodeKind::TableWriter {
+            projection: original,
+            ..
+        } = compiled.writer.graph().nodes()[compiled.writer.graph().root().index()].kind()
+        else {
+            panic!("actual compiled writer");
+        };
+        let exprs = slots
+            .iter()
+            .enumerate()
+            .map(|(ordinal, slot)| {
+                arena.push_value_typed(
+                    ExprNode::SlotId(*slot),
+                    novarocks_type_contract::FunctionValueType::try_from_typed_binding(
+                        original.layout.value_binding_at(ordinal).unwrap().clone(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect();
+        let ProgramNodeKind::TableWriter {
+            projection: original_projection,
+            partial_aggregates,
+            ..
+        } = compiled.writer.graph().nodes()[compiled.writer.graph().root().index()].kind()
+        else {
+            panic!("actual compiled writer");
+        };
+        // Provider input promises are independent of the source's observed
+        // values and of the partial processor's frozen input occurrence.
+        let expected = Arc::new(Schema::new(
+            draft()
+                .input()
+                .fields_iter()
+                .map(|binding| binding.field().clone())
+                .collect::<Vec<_>>(),
+        ));
         let projection =
             TableWriterInputProjection::try_new(arena, exprs, Arc::clone(&expected)).unwrap();
-        let calls = [DataType::Int64, DataType::Utf8]
-            .into_iter()
-            .enumerate()
-            .map(|(channel, input)| WriterPartialAggregateCall {
-                input_slot_id: SlotId::new(channel as u32 + 1),
-                function_name: Arc::from(ICEBERG_THETA_AGGREGATE_NAME),
-                resolved: function_set
-                    .catalog()
-                    .resolve_aggregate_trusted(ICEBERG_THETA_AGGREGATE_NAME, &[input])
+        // Borrow the compiler's genuine frozen installed partial handles.
+        // Only the fixture's independent carrier slots differ.
+        let state = statistics_state(Arc::clone(function_set));
+        let tracker = crate::runtime::mem_tracker::MemTracker::new_root("v1-writer-preparation");
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            tracker, state.error_state(),
+        ).unwrap();
+        let template = v1_writer_template();
+        let output_layout = v1_layout(v1_multiplex().chunk_schema());
+        let input_layout = novarocks_local_program::StaticLayout::try_new_typed_for_compile(
+            Arc::clone(original_projection.layout.schema()),
+            Arc::from(projection.chunk_schema().slot_ids()),
+            (0..original_projection.layout.slots().len())
+                .map(|ordinal| {
+                    (
+                        original_projection
+                            .layout
+                            .value_binding_at(ordinal)
+                            .unwrap()
+                            .clone(),
+                        original_projection
+                            .layout
+                            .slot_metadata_at(ordinal)
+                            .unwrap()
+                            .1,
+                    )
+                })
+                .collect(),
+            original_projection.layout.storage_lifetime(),
+            |_| Ok(()),
+            &FixtureControl,
+        )
+        .unwrap();
+        let owner = factory
+            .begin_compiled_layout_construction(&output_layout)
+            .unwrap();
+        owner
+            .request(
+                std::alloc::Layout::array::<novarocks_local_program::PreparedWriterAggregateCall>(
+                    partial_aggregates.len(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut prepared = Vec::new();
+        prepared
+            .try_reserve_exact(partial_aggregates.len())
+            .unwrap();
+        for (channel, call) in partial_aggregates.iter().enumerate() {
+            let site = novarocks_local_program::ProgramCallSite::WriterPartial {
+                node: compiled.writer.graph().root(),
+                call: u32::try_from(channel).unwrap(),
+            };
+            let Some(novarocks_local_program::ProgramStateTemplate::Aggregate { kernel, .. }) =
+                compiled.writer.state_template(site)
+            else {
+                panic!("actual frozen partial handle");
+            };
+            let actual = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
+                input_layout.value_binding_at(channel).unwrap().clone(),
+            )
+            .unwrap();
+            let expected_argument = kernel.contract().logical_argument_types().next().unwrap();
+            assert!(
+                actual
+                    .fits_value_type_observed(expected_argument, || Ok::<
+                        (),
+                        novarocks_type_contract::ValueTypeError,
+                    >(()))
                     .unwrap(),
-                intermediate_slot_id: SlotId::new(V1_CHANNELS[channel]),
-            })
-            .collect::<Vec<_>>();
+                "independent V1 occurrence must fit its real selected origin: actual={actual:?}, selected={expected_argument:?}"
+            );
+            let output = SlotId::new(V1_CHANNELS[channel]);
+            let position = output_layout
+                .slots()
+                .iter()
+                .position(|slot| *slot == output)
+                .unwrap();
+            prepared.push(novarocks_local_program::PreparedWriterAggregateCall::new(
+                kernel.clone(),
+                projection.chunk_schema().slot_ids()[channel],
+                output,
+                position,
+                owner.storage_lifetime(),
+            ));
+        }
+        if prepared.capacity() != prepared.len() {
+            owner.request(std::alloc::Layout::array::<novarocks_local_program::PreparedWriterAggregateCall>(prepared.len()).unwrap()).unwrap();
+        }
+        let prepared = novarocks_local_program::PreparedWriterAggregateCalls::try_new_observed::<V1PreparationFailure>(
+            prepared.into_boxed_slice(), novarocks_functions::AggregateKernelPhase::Partial, owner.storage_lifetime(),
+            |layout| owner.request(layout).map_err(V1PreparationFailure::Creator),
+            || owner.observe(0, &[], novarocks_functions::array_projection::ArrayNormalizationStep::InspectConstructionWork { units: 1 }).map_err(V1PreparationFailure::Creator),
+        ).unwrap();
         TableWriterOperatorFactory::try_new_local(
             7,
             compiled.target,
             expected,
             projection,
-            v1_multiplex(),
-            &calls,
+            template,
+            Some(prepared),
+            input_layout,
+            output_layout,
+            state.error_state(),
             &binding(recorded),
-            Arc::clone(function_set),
         )
         .unwrap()
     }
@@ -2079,29 +2315,77 @@ mod statistics {
     /// The plan-tree finish of the same target, with its decoder-owned
     /// blob-type literal.
     fn v1_finish(
-        target: WriteTargetOrdinal,
+        compiled: &Compiled,
         function_set: &Arc<SealedExecutionFunctionSet>,
     ) -> TableFinishOperatorFactory {
         let mut arena = ExprArena::default();
-        let blob = arena.push_typed(
+        let target = compiled.target;
+        let blob = arena.push_value_typed(
             ExprNode::Literal(crate::exec::expr::LiteralValue::Utf8(BLOB_TYPE.to_string())),
-            DataType::Utf8,
+            inputs()[1].with_nullable(false).unwrap(),
         );
-        let calls = [DataType::Int64, DataType::Utf8]
-            .into_iter()
+        let ProgramNodeKind::TableFinish {
+            final_aggregates: original,
+            writer_multiplex_layout,
+            ..
+        } = compiled.finish.graph().nodes()[compiled.finish.graph().root().index()].kind()
+        else {
+            panic!("actual compiled finish");
+        };
+        let state = statistics_state(function_set.clone());
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(), crate::runtime::mem_tracker::MemTracker::new_root("v1-final-preparation"), state.error_state(),
+        ).unwrap();
+        let owner = factory
+            .begin_compiled_layout_construction(writer_multiplex_layout)
+            .unwrap();
+        owner
+            .request(
+                std::alloc::Layout::array::<novarocks_local_program::PreparedWriterAggregateCall>(
+                    original.calls.len(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let mut prepared = Vec::new();
+        prepared.try_reserve_exact(original.calls.len()).unwrap();
+        for (ordinal, _) in original.calls.iter().enumerate() {
+            let site = novarocks_local_program::ProgramCallSite::WriterFinal {
+                node: compiled.finish.graph().root(),
+                call: u32::try_from(ordinal).unwrap(),
+            };
+            let Some(novarocks_local_program::ProgramStateTemplate::Aggregate { kernel, .. }) =
+                compiled.finish.state_template(site)
+            else {
+                panic!("actual frozen final handle");
+            };
+            prepared.push(novarocks_local_program::PreparedWriterAggregateCall::new(
+                kernel.clone(),
+                SlotId::new(V1_CHANNELS[ordinal]),
+                SlotId::new(V1_FINALS[ordinal]),
+                ordinal + 1,
+                owner.storage_lifetime(),
+            ));
+        }
+        if prepared.capacity() != prepared.len() {
+            owner.request(std::alloc::Layout::array::<novarocks_local_program::PreparedWriterAggregateCall>(prepared.len()).unwrap()).unwrap();
+        }
+        let prepared = novarocks_local_program::PreparedWriterAggregateCalls::try_new_observed::<V1PreparationFailure>(prepared.into_boxed_slice(), novarocks_functions::AggregateKernelPhase::Final, owner.storage_lifetime(), |layout| owner.request(layout).map_err(V1PreparationFailure::Creator), || owner.observe(0, &[], novarocks_functions::array_projection::ArrayNormalizationStep::InspectConstructionWork { units: 1 }).map_err(V1PreparationFailure::Creator)).unwrap();
+        let calls = original
+            .calls
+            .iter()
             .enumerate()
-            .map(|(channel, input)| WriterFinalAggregateCall {
-                function_name: Arc::from(ICEBERG_THETA_AGGREGATE_NAME),
-                resolved: function_set
-                    .catalog()
-                    .resolve_aggregate_trusted(ICEBERG_THETA_AGGREGATE_NAME, &[input])
-                    .unwrap(),
+            .map(|(channel, call)| WriterFinalAggregateCall {
+                frozen: call.frozen.clone(),
+                function_name: call.function_name.clone(),
+                resolved: call.resolved.clone(),
                 intermediate_input_slot_id: SlotId::new(V1_CHANNELS[channel]),
                 final_output_slot_id: SlotId::new(V1_FINALS[channel]),
             })
             .collect::<Vec<_>>();
         let root = |index| SlotId::new(root_write_result_column_id(index));
         let plan = WriterFinalAggregatePlan {
+            prepared: Some(prepared),
             calls,
             unpivot: Some(WriterGroupedUnpivotPlan {
                 grouping_input_slot_id: WRITE_RELATION_TARGET_SLOT,
@@ -2136,8 +2420,8 @@ mod statistics {
         TableFinishOperatorFactory::new_local(
             8,
             vec![target],
-            v1_multiplex(),
-            RootWriteResultRelationSchema::try_new(RootWriteResultSchema::new()).unwrap(),
+            v1_writer_template(),
+            v1_root_template(),
             plan,
             &TableFinishRuntimeBinding::new(Arc::new(AcceptCarriers)),
             Arc::new(arena),
@@ -2167,6 +2451,47 @@ mod statistics {
         Ok(output)
     }
 
+    /// Direct-operator fixtures use the same original runtime tracker/control
+    /// factory as pipeline preparation. There is no pure or simulated creator.
+    fn install_statistics_construction(
+        operator: &mut dyn Operator,
+        state: &RuntimeState,
+    ) -> Arc<crate::runtime::mem_tracker::MemTracker> {
+        use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
+        let tracker = crate::runtime::mem_tracker::MemTracker::new_root(
+            "compiled-statistics-direct-operator",
+        );
+        operator.set_mem_tracker(Arc::clone(&tracker));
+        if operator.creates_typed_storage() {
+            let factory = try_runtime_input_construction_factory(
+                crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+                Arc::clone(&tracker),
+                state.error_state(),
+            )
+            .unwrap();
+            operator.set_construction_factory(factory);
+        }
+        tracker
+    }
+
+    fn prepared_final_operator(
+        statistics: &dyn crate::exec::operators::table_finish::FinishStatisticsFactory,
+        state: &RuntimeState,
+    ) -> (
+        Box<dyn Operator>,
+        Arc<crate::runtime::mem_tracker::MemTracker>,
+    ) {
+        let tracker =
+            crate::runtime::mem_tracker::MemTracker::new_root("compiled-final-construction");
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(), tracker.clone(), state.error_state(),
+        ).unwrap();
+        let mut operator = statistics.final_aggregate(state, factory.as_ref()).unwrap();
+        operator.set_mem_tracker(tracker.clone());
+        operator.set_construction_factory(factory);
+        (operator, tracker)
+    }
+
     /// Run one writer per driver over that driver's pages; each driver's
     /// complete writer relation, in emission order.
     fn run_writer(
@@ -2180,6 +2505,7 @@ mod statistics {
             .enumerate()
             .map(|(driver, pages)| {
                 let mut operator = factory.create(dop, driver as i32);
+                install_statistics_construction(operator.as_mut(), state);
                 operator.prepare().unwrap();
                 operator.bind_runtime_state(state).unwrap();
                 operator.activate(state).unwrap();
@@ -2214,15 +2540,18 @@ mod statistics {
         state: &RuntimeState,
     ) -> Result<Vec<Chunk>, String> {
         let mut operator = factory.create(1, 0);
+        install_statistics_construction(operator.as_mut(), state);
         operator.prepare().map_err(|e| e.to_string())?;
         operator
             .bind_runtime_state(state)
             .map_err(|e| e.to_string())?;
         operator.activate(state).map_err(|e| e.to_string())?;
         for chunk in chunks {
-            let delivered =
-                Chunk::try_new_with_chunk_schema(chunk.batch.clone(), Arc::clone(relation))
-                    .unwrap();
+            let delivered = Chunk::try_new_with_chunk_schema(
+                chunk.record_batch().clone(),
+                Arc::clone(relation),
+            )
+            .unwrap();
             operator
                 .as_processor_mut()
                 .unwrap()
@@ -2250,7 +2579,10 @@ mod statistics {
     }
 
     fn batches(chunks: &[Chunk]) -> Vec<RecordBatch> {
-        chunks.iter().map(|chunk| chunk.batch.clone()).collect()
+        chunks
+            .iter()
+            .map(|chunk| chunk.record_batch().clone())
+            .collect()
     }
 
     /// Every column of `actual` equals `expected` and so do field names and
@@ -2313,7 +2645,7 @@ mod statistics {
                 .flatten()
                 .map(|chunk| {
                     let kinds = chunk
-                        .batch
+                        .record_batch()
                         .column(0)
                         .as_any()
                         .downcast_ref::<Int8Array>()
@@ -2323,7 +2655,8 @@ mod statistics {
                             .map(|row| keep(kinds.value(row)))
                             .collect::<Vec<_>>(),
                     );
-                    let batch = arrow::compute::filter_record_batch(&chunk.batch, &mask).unwrap();
+                    let batch =
+                        arrow::compute::filter_record_batch(&chunk.record_batch(), &mask).unwrap();
                     Chunk::try_new_with_chunk_schema(batch, chunk.chunk_schema_ref()).unwrap()
                 })
                 .filter(|chunk| !chunk.is_empty())
@@ -2345,7 +2678,7 @@ mod statistics {
             &state,
         );
         let v1_root = run_finish(
-            &v1_finish(compiled.target, &function_set),
+            &v1_finish(&compiled, &function_set),
             v1_multiplex().chunk_schema(),
             &kept(&v1_writer),
             &state,
@@ -2363,31 +2696,31 @@ mod statistics {
         let mut bodies = Vec::new();
         for chunk in root {
             let kinds = chunk
-                .batch
+                .record_batch()
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int8Array>()
                 .unwrap();
             let targets = chunk
-                .batch
+                .record_batch()
                 .column(1)
                 .as_any()
                 .downcast_ref::<Int32Array>()
                 .unwrap();
             let fields = chunk
-                .batch
+                .record_batch()
                 .column(4)
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .unwrap();
             let blob = chunk
-                .batch
+                .record_batch()
                 .column(5)
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .unwrap();
             let body = chunk
-                .batch
+                .record_batch()
                 .column(6)
                 .as_any()
                 .downcast_ref::<BinaryArray>()
@@ -2431,7 +2764,7 @@ mod statistics {
                 .iter()
                 .map(|chunk| {
                     let kinds = chunk
-                        .batch
+                        .record_batch()
                         .column(0)
                         .as_any()
                         .downcast_ref::<Int8Array>()
@@ -2550,7 +2883,7 @@ mod statistics {
                 .flatten()
                 .filter_map(|chunk| {
                     let kinds = chunk
-                        .batch
+                        .record_batch()
                         .column(0)
                         .as_any()
                         .downcast_ref::<Int8Array>()
@@ -2562,7 +2895,8 @@ mod statistics {
                             })
                             .collect::<Vec<_>>(),
                     );
-                    let batch = arrow::compute::filter_record_batch(&chunk.batch, &mask).unwrap();
+                    let batch =
+                        arrow::compute::filter_record_batch(&chunk.record_batch(), &mask).unwrap();
                     (batch.num_rows() > 0).then_some(batch)
                 })
                 .collect::<Vec<_>>()
@@ -2579,7 +2913,9 @@ mod statistics {
             CompiledFinishStatistics::try_new(&finish, finish.graph().root(), state.error_state())
                 .unwrap()
                 .expect("the finish carries statistics");
-        let mut aggregate = statistics.final_aggregate(&state).unwrap();
+        let (mut aggregate, _tracker) = prepared_final_operator(statistics.as_ref(), &state);
+        aggregate.prepare().unwrap();
+        aggregate.bind_runtime_state(&state).unwrap();
         let relation = compiled_relation(&finish);
         for batch in arriving {
             aggregate
@@ -2601,7 +2937,7 @@ mod statistics {
             panic!("one final batch")
         };
         let targets = output
-            .batch
+            .record_batch()
             .column(0)
             .as_any()
             .downcast_ref::<Int32Array>()
@@ -2610,7 +2946,7 @@ mod statistics {
         for (row, target) in targets.values().iter().enumerate() {
             for (call, body) in expected[target].iter().enumerate() {
                 let finals = output
-                    .batch
+                    .record_batch()
                     .column(1 + call)
                     .as_any()
                     .downcast_ref::<BinaryArray>()
@@ -2664,6 +3000,7 @@ mod statistics {
         )
         .unwrap();
         let mut writer = factory.create(1, 0);
+        install_statistics_construction(writer.as_mut(), &state);
         writer.prepare().unwrap();
         writer.bind_runtime_state(&state).unwrap();
         writer.activate(&state).unwrap();
@@ -2737,7 +3074,7 @@ mod statistics {
         for chunk in &chunks {
             assert_eq!(chunk.schema().as_ref(), root_write_result_schema().as_ref());
             let column = chunk
-                .batch
+                .record_batch()
                 .column(0)
                 .as_any()
                 .downcast_ref::<Int8Array>()
@@ -2750,6 +3087,156 @@ mod statistics {
         assert_eq!(estimate_compact_theta(&bodies[0].2).unwrap(), 2.0);
         assert_eq!(estimate_compact_theta(&bodies[1].2).unwrap(), 2.0);
     }
+    #[test]
+    fn compiled_partial_schema_creator_survives_operator_and_output_until_last_slot() {
+        use crate::exec::operators::compiled_writer_statistics::CompiledWriterPartialFactory;
+        let compiled = compiled(0, &[], 1);
+        let state = statistics_state(theta_function_set());
+        let partial = CompiledWriterPartialFactory::try_new(
+            &compiled.writer,
+            compiled.writer.graph().root(),
+            state.error_state(),
+        )
+        .unwrap()
+        .expect("writer partial declarations");
+        let mut operator = partial.create(1, 0);
+        let tracker = install_statistics_construction(operator.as_mut(), &state);
+        operator.prepare().unwrap();
+        operator.bind_runtime_state(&state).unwrap();
+        operator
+            .as_processor_mut()
+            .unwrap()
+            .set_finishing(&state)
+            .unwrap();
+        let mut chunks = poll(&mut operator, &state).unwrap();
+        assert_eq!(chunks.len(), 1, "empty partial emits actual initial states");
+        let output = chunks.pop().unwrap();
+        let slot = output.chunk_schema().slots()[0].clone();
+        drop(operator);
+        drop(partial);
+        drop(compiled);
+        assert!(
+            tracker.current() > 0,
+            "returned real partial retains its creator"
+        );
+        drop(output);
+        assert!(
+            tracker.current() > 0,
+            "independent typed slot retains schema creator"
+        );
+        drop(slot);
+        assert_eq!(tracker.current(), 0, "last actual creator exits");
+    }
+
+    #[test]
+    fn compiled_final_schema_creator_survives_sources_until_last_slot() {
+        let rows = [(1, Some("a"))];
+        let compiled = compiled(0, &rows, 1);
+        let state = statistics_state(theta_function_set());
+        let recorded = Arc::new(Mutex::new(Recorded::default()));
+        let writer = compiled_table_writer_factory(
+            &compiled.writer,
+            compiled.writer.graph().root(),
+            0,
+            &binding(&recorded),
+            &state.error_state(),
+        )
+        .unwrap();
+        let source = run_writer(&writer, &[vec![page(&compiled.writer, &rows)]], &state);
+        let (_, statistics) = CompiledFinishStatistics::try_new(
+            &compiled.finish,
+            compiled.finish.graph().root(),
+            state.error_state(),
+        )
+        .unwrap()
+        .expect("finish final declarations");
+        let (mut operator, tracker) = prepared_final_operator(statistics.as_ref(), &state);
+        operator.prepare().unwrap();
+        operator.bind_runtime_state(&state).unwrap();
+        let relation = compiled_relation(&compiled.finish);
+        for chunk in source.iter().flatten() {
+            // Explicit fixture delivery uses the finish's complete prepared
+            // occurrence declaration, as the real exchange binds its slots.
+            let input = Chunk::try_new_with_chunk_schema(
+                chunk.record_batch().clone(),
+                Arc::clone(&relation),
+            )
+            .unwrap();
+            operator
+                .as_processor_mut()
+                .unwrap()
+                .push_chunk(&state, input)
+                .unwrap();
+        }
+        operator
+            .as_processor_mut()
+            .unwrap()
+            .set_finishing(&state)
+            .unwrap();
+        let mut outputs = poll(&mut operator, &state).unwrap();
+        assert_eq!(outputs.len(), 1);
+        let output = outputs.pop().unwrap();
+        assert_eq!(output.len(), 1);
+        let slot = output.chunk_schema().slots()[1].clone();
+        drop(operator);
+        drop(statistics);
+        drop(writer);
+        drop(source);
+        drop(relation);
+        drop(compiled);
+        assert!(
+            tracker.current() > 0,
+            "final output retains real creator responsibility"
+        );
+        drop(output);
+        assert!(
+            tracker.current() > 0,
+            "independent final schema slot retains its creator"
+        );
+        drop(slot);
+        assert_eq!(
+            tracker.current(),
+            0,
+            "last final schema and buffer owner exits"
+        );
+    }
+
+    #[test]
+    fn compiled_final_prepare_preserves_first_real_tracker_limit_refusal() {
+        use crate::exec::pipeline::operator::ConstructionFailure;
+        use crate::runtime::fragment::ExecutionFailureCause;
+        let compiled = compiled(0, &[], 1);
+        let state = statistics_state(theta_function_set());
+        let (_, statistics) = CompiledFinishStatistics::try_new(
+            &compiled.finish,
+            compiled.finish.graph().root(),
+            state.error_state(),
+        )
+        .unwrap()
+        .expect("finish final declarations");
+        let (mut operator, tracker) = prepared_final_operator(statistics.as_ref(), &state);
+        let original = tracker.current();
+        assert!(original > 0, "real installed factory backing is observed");
+        tracker.install_limit_once(original).unwrap();
+        let failure = operator
+            .prepare()
+            .expect_err("next real creator allocation is refused");
+        assert!(
+            matches!(
+                failure.cause(),
+                ExecutionFailureCause::Construction(ConstructionFailure::Memory(_))
+            ),
+            "original tracker cause is retained: {failure:?}"
+        );
+        assert_eq!(
+            tracker.current(),
+            original,
+            "failed scope releases its partial requests"
+        );
+        drop(operator);
+        assert_eq!(tracker.current(), 0, "no refused schema escapes");
+    }
+
     // Reuse the actual checked Physical writer/finish fixture, immutable pools,
     // canonical call requests, LocalCompiler and original writer/finish bodies.
     include!("compiled_writer_root_positive_statistics_tests.rs");

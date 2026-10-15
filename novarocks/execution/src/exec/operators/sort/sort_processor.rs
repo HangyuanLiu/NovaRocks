@@ -37,22 +37,24 @@ use crate::exec::node::sort::{SortExpression, SortTopNType};
 use crate::exec::operators::sort::{
     ChunksSorter, ChunksSorterHeapSort, ChunksSorterPartitionTopN, ChunksSorterTopN,
 };
-use crate::exec::operators::sort::{
-    append_stable_row_index_sort_column, concat_sort_chunks, normalize_sort_key_array,
-};
 
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use super::creation::{CreatedSortArray, CreatedSortColumns, SortCreation};
+use crate::exec::pipeline::operator::{
+    ConstructionFailure, InputConstructionFactory, Operator, ProcessorOperator,
+};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
 
 use arrow::array::ArrayRef;
-use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
-use arrow::row::{RowConverter, SortField};
+use arrow::compute::{SortColumn, SortOptions};
 
 /// Factory for sort processors that materialize ORDER BY output chunks.
 ///
 /// Design: docs/adr/ADR-0162-in-memory-query-execution-boundary.md
 pub struct SortProcessorFactory {
+    input_layout: Option<novarocks_local_program::StaticLayout>,
+    #[cfg(test)]
+    fixture_input_schema: Option<crate::exec::chunk::ChunkSchemaRef>,
     name: String,
     arena: Arc<ExprArena>,
     order_by: Vec<SortExpression>,
@@ -67,6 +69,21 @@ pub struct SortProcessorFactory {
 }
 
 impl SortProcessorFactory {
+    #[cfg(test)]
+    pub(crate) fn with_fixture_input_schema(
+        mut self,
+        schema: crate::exec::chunk::ChunkSchemaRef,
+    ) -> Self {
+        self.fixture_input_schema = Some(schema);
+        self
+    }
+    pub(crate) fn with_input_layout(
+        mut self,
+        input: novarocks_local_program::StaticLayout,
+    ) -> Self {
+        self.input_layout = Some(input);
+        self
+    }
     #[expect(
         clippy::too_many_arguments,
         reason = "The sort factory mirrors the frozen physical sort-node contract."
@@ -158,6 +175,9 @@ impl SortProcessorFactory {
             "SORT".to_string()
         };
         Self {
+            input_layout: None,
+            #[cfg(test)]
+            fixture_input_schema: None,
             name,
             arena,
             order_by,
@@ -180,6 +200,10 @@ impl OperatorFactory for SortProcessorFactory {
 
     fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
         Box::new(SortProcessorOperator {
+            input_layout: self.input_layout.clone(),
+            #[cfg(test)]
+            fixture_input_schema: self.fixture_input_schema.clone(),
+            output_schema: None,
             name: self.name.clone(),
             arena: Arc::clone(&self.arena),
             order_by: self.order_by.clone(),
@@ -199,11 +223,19 @@ impl OperatorFactory for SortProcessorFactory {
             finished: false,
             profile_initialized: false,
             profiles: None,
+            construction: None,
+            prepared: false,
         })
     }
 }
 
 struct SortProcessorOperator {
+    input_layout: Option<novarocks_local_program::StaticLayout>,
+    #[cfg(test)]
+    fixture_input_schema: Option<crate::exec::chunk::ChunkSchemaRef>,
+    output_schema: Option<crate::exec::chunk::ChunkSchemaRef>,
+    construction: Option<Arc<dyn InputConstructionFactory>>,
+    prepared: bool,
     name: String,
     arena: Arc<ExprArena>,
     order_by: Vec<SortExpression>,
@@ -228,6 +260,38 @@ struct SortProcessorOperator {
 impl Operator for SortProcessorOperator {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        self.construction = Some(factory);
+    }
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        let factory = self
+            .construction
+            .as_ref()
+            .ok_or(ConstructionFailure::MissingOwner)?;
+        if let Some(layout) = self.input_layout.as_ref() {
+            self.output_schema = Some(factory.create_compiled_chunk_schema(layout)?);
+        } else {
+            #[cfg(test)]
+            if let Some(schema) = self.fixture_input_schema.as_ref() {
+                // The old functional carrier supplies a predeclared schema;
+                // the real installed creator validates it before preparation.
+                let _owner = factory.begin_typed_construction(schema)?;
+                self.output_schema = Some(schema.clone());
+                self.prepared = true;
+                return Ok(());
+            }
+            return Err(ConstructionFailure::InvalidSource(
+                "sort lacks its frozen complete input layout".into(),
+            )
+            .into());
+        }
+        self.prepared = true;
+        Ok(())
     }
 
     fn set_profiles(&mut self, profiles: crate::runtime::profile::OperatorProfiles) {
@@ -257,6 +321,9 @@ impl ProcessorOperator for SortProcessorOperator {
     }
 
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+        if !self.prepared {
+            return Err(ConstructionFailure::MissingOwner.into());
+        }
         if self.finished {
             return Ok(());
         }
@@ -266,6 +333,8 @@ impl ProcessorOperator for SortProcessorOperator {
                 .to_string()
                 .into());
         }
+        self.creation()?
+            .verify_chunks(std::slice::from_ref(&chunk))?;
         if !chunk.is_empty() {
             let chunk_bytes = i64::try_from(chunk.estimated_bytes()).unwrap_or(i64::MAX);
             let chunk_rows = i64::try_from(chunk.len()).unwrap_or(i64::MAX);
@@ -303,6 +372,20 @@ impl ProcessorOperator for SortProcessorOperator {
 }
 
 impl SortProcessorOperator {
+    fn creation(&self) -> ExecutionResult<SortCreation<'_>> {
+        if !self.prepared {
+            return Err(ConstructionFailure::MissingOwner.into());
+        }
+        Ok(SortCreation::new(
+            self.construction
+                .as_deref()
+                .ok_or(ConstructionFailure::MissingOwner)?,
+            self.output_schema
+                .as_ref()
+                .ok_or(ConstructionFailure::MissingOwner)?,
+        ))
+    }
+
     const HEAP_SORTER_LIMIT: usize = 1024;
     const TOPN_PRUNE_FACTOR: usize = 4;
     const TOPN_PRUNE_MIN_ROWS: usize = 4096;
@@ -409,11 +492,14 @@ impl SortProcessorOperator {
         Some(sorter)
     }
 
-    fn sort_chunks_for_topn_mode(&self, chunks: &[Chunk]) -> Result<Option<Chunk>, String> {
+    fn sort_chunks_for_topn_mode(
+        &self,
+        chunks: &[Chunk],
+    ) -> crate::runtime::fragment::ExecutionResult<Option<Chunk>> {
         let Some(sorter) = self.build_topn_sorter() else {
             return Ok(None);
         };
-        sorter.sort_chunks(chunks)
+        sorter.sort_chunks(chunks, &self.creation()?)
     }
 
     fn topn_prune_row_threshold(&self, rows_to_keep: usize) -> usize {
@@ -445,12 +531,12 @@ impl SortProcessorOperator {
         self.recompute_buffered_stats();
     }
 
-    fn truncate_buffered_prefix(&mut self, rows_to_keep: usize) {
+    fn truncate_buffered_prefix(&mut self, rows_to_keep: usize) -> ExecutionResult<()> {
         if rows_to_keep == 0 {
             self.buffered.clear();
             self.buffered_bytes = 0;
             self.buffered_rows = 0;
-            return;
+            return Ok(());
         }
         let mut remain = rows_to_keep;
         let mut kept = Vec::new();
@@ -462,15 +548,16 @@ impl SortProcessorOperator {
                 kept.push(chunk.clone());
                 remain -= chunk.len();
             } else {
-                kept.push(chunk.slice(0, remain));
+                kept.push(self.creation()?.slice(chunk, 0, remain)?);
                 remain = 0;
             }
         }
         self.buffered = kept;
         self.recompute_buffered_stats();
+        Ok(())
     }
 
-    fn maybe_prune_topn_buffered(&mut self) -> Result<(), String> {
+    fn maybe_prune_topn_buffered(&mut self) -> crate::runtime::fragment::ExecutionResult<()> {
         let Some(cutoff_base) = self.topn_cutoff_base() else {
             return Ok(());
         };
@@ -502,7 +589,7 @@ impl SortProcessorOperator {
 
         if self.order_by.is_empty() {
             if self.topn_type == SortTopNType::RowNumber {
-                self.truncate_buffered_prefix(cutoff_base);
+                self.truncate_buffered_prefix(cutoff_base)?;
             }
             return Ok(());
         }
@@ -527,7 +614,10 @@ impl SortProcessorOperator {
         self.partition_limit.is_some() && !self.partition_exprs.is_empty()
     }
 
-    fn build_final_output_from_chunks(&self, chunks: &[Chunk]) -> Result<Option<Chunk>, String> {
+    fn build_final_output_from_chunks(
+        &self,
+        chunks: &[Chunk],
+    ) -> crate::runtime::fragment::ExecutionResult<Option<Chunk>> {
         if chunks.is_empty() {
             return Ok(None);
         }
@@ -560,10 +650,17 @@ impl SortProcessorOperator {
             if take_len == 0 {
                 return Ok(None);
             }
-            return Ok(Some(topn_chunk.slice(self.offset, take_len)));
+            return Ok(Some(self.creation()?.slice(
+                &topn_chunk,
+                self.offset,
+                take_len,
+            )?));
         }
 
-        let batch = self.concat_batches_for_chunks(chunks)?;
+        let creation = self.creation()?;
+        creation.verify_chunks(chunks)?;
+        let owner = creation.begin(&chunks[0])?;
+        let batch = creation.concat(chunks, owner.as_ref())?;
         if self.order_by.is_empty() {
             let len = batch.num_rows();
             if self.offset >= len {
@@ -574,11 +671,11 @@ impl SortProcessorOperator {
             } else {
                 len - self.offset
             };
-            let sliced = batch.slice(self.offset, take_len);
-            return Ok(Some(Chunk::new_like(sliced, &chunks[0])));
+            let merged = creation.publish(batch, &chunks[0], owner.as_ref())?;
+            return Ok(Some(creation.slice(&merged, self.offset, take_len)?));
         }
         let indices = self.sort_indices(&batch, &chunks[0])?;
-        let len = indices.len();
+        let len = indices.array().len();
         if self.offset >= len {
             return Ok(None);
         }
@@ -587,9 +684,21 @@ impl SortProcessorOperator {
         } else {
             len - self.offset
         };
-        let sliced_indices = indices.slice(self.offset, take_len);
-        let sorted_batch = self.take_batch(&batch, sliced_indices.as_ref())?;
-        Ok(Some(Chunk::new_like(sorted_batch, &chunks[0])))
+        let index_slice_owner = creation.begin(&chunks[0])?;
+        index_slice_owner.request(
+            novarocks_type_contract::owned_resources::layout::arc_layout(
+                std::alloc::Layout::new::<arrow::array::UInt32Array>(),
+            )
+            .map_err(ConstructionFailure::from)?,
+        )?;
+        let sliced_indices = indices.array().slice(self.offset, take_len);
+        let sorted_batch =
+            creation.take_batch(&batch, sliced_indices.as_ref(), &chunks[0], owner.as_ref())?;
+        Ok(Some(creation.publish(
+            sorted_batch,
+            &chunks[0],
+            owner.as_ref(),
+        )?))
     }
 
     /// Build final output for `RANK`/`DENSE_RANK` topn semantics.
@@ -602,31 +711,47 @@ impl SortProcessorOperator {
     fn build_rank_like_topn_output_from_chunks(
         &self,
         chunks: &[Chunk],
-    ) -> Result<Option<Chunk>, String> {
+    ) -> crate::runtime::fragment::ExecutionResult<Option<Chunk>> {
         if self.offset != 0 {
             return Err(format!(
                 "topn_type {:?} requires offset=0, got {}",
                 self.topn_type, self.offset
-            ));
+            )
+            .into());
         }
         let rank_limit = self.limit.unwrap_or(0);
         if rank_limit == 0 {
             return Ok(None);
         }
 
-        let batch = self.concat_batches_for_chunks(chunks)?;
+        let creation = self.creation()?;
+        creation.verify_chunks(chunks)?;
+        let owner = creation.begin(&chunks[0])?;
+        let batch = creation.concat(chunks, owner.as_ref())?;
         if batch.num_rows() == 0 {
             return Ok(None);
         }
         if self.order_by.is_empty() {
             // Without order-by keys all rows belong to one peer group (rank = 1).
-            return Ok(Some(Chunk::new_like(batch, &chunks[0])));
+            return Ok(Some(creation.publish(batch, &chunks[0], owner.as_ref())?));
         }
 
         let indices = self.sort_indices(&batch, &chunks[0])?;
-        let sorted_batch = self.take_batch(&batch, indices.as_ref())?;
+        let sorted_batch =
+            creation.take_batch(&batch, indices.array().as_ref(), &chunks[0], owner.as_ref())?;
         let key_columns = self.eval_order_by_columns(&sorted_batch, &chunks[0])?;
-        let key_rows = self.convert_sort_keys_to_rows(&key_columns)?;
+        let converter = creation.row_converter(
+            &key_columns,
+            key_columns.storage_lifetime(),
+            self.order_by.iter().map(|expr| SortOptions {
+                descending: !expr.asc,
+                nulls_first: expr.nulls_first,
+            }),
+        )?;
+        let key_rows = converter
+            .converter()
+            .convert_columns(&key_columns)
+            .map_err(|cause| cause.to_string())?;
         let cutoff = rank_like_cutoff(
             self.topn_type,
             rank_limit,
@@ -636,100 +761,81 @@ impl SortProcessorOperator {
         if cutoff == 0 {
             return Ok(None);
         }
-        Ok(Some(Chunk::new_like(
-            sorted_batch.slice(0, cutoff),
-            &chunks[0],
-        )))
-    }
-
-    fn concat_batches_for_chunks(
-        &self,
-        chunks: &[Chunk],
-    ) -> Result<arrow::record_batch::RecordBatch, String> {
-        concat_sort_chunks(chunks)
+        let sorted = creation.publish(sorted_batch, &chunks[0], owner.as_ref())?;
+        Ok(Some(creation.slice(&sorted, 0, cutoff)?))
     }
 
     fn sort_indices(
         &self,
         batch: &arrow::record_batch::RecordBatch,
         source: &Chunk,
-    ) -> Result<arrow::array::ArrayRef, String> {
+    ) -> ExecutionResult<CreatedSortArray> {
+        let creation = self.creation()?;
+        let owner = creation.begin(source)?;
         let key_columns = self.eval_order_by_columns(batch, source)?;
-        let sort_columns = self.build_sort_columns(&key_columns);
-        let indices = lexsort_to_indices(&sort_columns, None).map_err(|e| e.to_string())?;
-        Ok(std::sync::Arc::new(indices))
+        let sort_columns = self.build_sort_columns(&key_columns, &creation, owner.as_ref())?;
+        creation.lexsort(&sort_columns, None, source)
     }
 
     fn eval_order_by_columns(
         &self,
         batch: &arrow::record_batch::RecordBatch,
         source: &Chunk,
-    ) -> Result<Vec<ArrayRef>, String> {
-        let chunk = Chunk::new_like(batch.clone(), source);
+    ) -> ExecutionResult<CreatedSortColumns> {
+        let creation = self.creation()?;
+        let owner = creation.begin(source)?;
+        let types = creation.begin(source)?;
+        owner.observe(
+            0,
+            &[],
+            crate::exec::chunk::ArrayNormalizationStep::CreateChunkColumns {
+                channels: batch.num_columns(),
+            },
+        )?;
+        let chunk = creation.publish(batch.clone(), source, owner.as_ref())?;
+        owner.request(std::alloc::Layout::array::<ArrayRef>(self.order_by.len()).map_err(|_| ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::Arithmetic))?)?;
         let mut columns = Vec::with_capacity(self.order_by.len());
         for sort_expr in &self.order_by {
-            let values = self
-                .arena
-                .eval(sort_expr.expr, &chunk)
-                .map_err(|e| e.to_string())?;
-            columns.push(normalize_sort_key_array(&values)?);
+            let values = self.arena.eval(sort_expr.expr, &chunk)?;
+            let declared = self.arena.value_type(sort_expr.expr).ok_or_else(|| {
+                ConstructionFailure::InvalidSource(
+                    "sort key lacks its complete declared logical type".into(),
+                )
+            })?;
+            columns.push(creation.normalize_key(
+                &values,
+                declared.value_type(),
+                owner.as_ref(),
+                types.as_ref(),
+            )?);
         }
-        Ok(columns)
+        Ok(CreatedSortColumns::new(
+            columns,
+            creation.source_type_storage(source, types.as_ref())?,
+            owner.storage_lifetime(),
+        ))
     }
 
-    fn build_sort_columns(&self, key_columns: &[ArrayRef]) -> Vec<SortColumn> {
-        let mut sort_columns: Vec<SortColumn> = key_columns
-            .iter()
-            .zip(self.order_by.iter())
-            .map(|(values, sort_expr)| SortColumn {
+    fn build_sort_columns(
+        &self,
+        key_columns: &[ArrayRef],
+        creation: &SortCreation<'_>,
+        owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
+    ) -> ExecutionResult<Vec<SortColumn>> {
+        let mut columns = creation.vector::<SortColumn>(key_columns.len(), owner)?;
+        for (values, sort_expr) in key_columns.iter().zip(&self.order_by) {
+            columns.push(SortColumn {
                 values: values.clone(),
                 options: Some(SortOptions {
                     descending: !sort_expr.asc,
                     nulls_first: sort_expr.nulls_first,
                 }),
-            })
-            .collect();
-        if let Some(first) = key_columns.first() {
-            append_stable_row_index_sort_column(&mut sort_columns, first.len());
+            });
         }
-        sort_columns
-    }
-
-    fn convert_sort_keys_to_rows(
-        &self,
-        key_columns: &[ArrayRef],
-    ) -> Result<arrow::row::Rows, String> {
-        let fields = key_columns
-            .iter()
-            .zip(self.order_by.iter())
-            .map(|(col, expr)| {
-                SortField::new_with_options(
-                    col.data_type().clone(),
-                    SortOptions {
-                        descending: !expr.asc,
-                        nulls_first: expr.nulls_first,
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        let converter = RowConverter::new(fields).map_err(|e| e.to_string())?;
-        converter
-            .convert_columns(key_columns)
-            .map_err(|e| e.to_string())
-    }
-
-    fn take_batch(
-        &self,
-        batch: &arrow::record_batch::RecordBatch,
-        indices: &dyn arrow::array::Array,
-    ) -> Result<arrow::record_batch::RecordBatch, String> {
-        let columns = batch
-            .columns()
-            .iter()
-            .map(|c| take(c.as_ref(), indices, None))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?;
-        arrow::array::RecordBatch::try_new(batch.schema(), columns).map_err(|e| e.to_string())
+        if let Some(first) = key_columns.first() {
+            creation.stable_index(&mut columns, first.len(), owner)?;
+        }
+        Ok(columns)
     }
 }
 
@@ -774,29 +880,110 @@ where
 mod tests {
     use super::*;
 
-    use crate::exec::chunk::ChunkSchema;
+    use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
     use arrow::array::{Array, Decimal128Array, Int32Array, make_array};
     use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
+    use novarocks_local_program::StaticLayout;
+    use novarocks_type_contract::{
+        CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
+        TypedValueBinding, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+    };
     use novarocks_types::SlotId;
+    use std::alloc::Layout;
 
-    fn make_chunk(values: Vec<Option<i32>>, nullable: bool) -> Chunk {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "a",
-            DataType::Int32,
-            nullable,
-        )]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))])
-            .expect("record batch");
-        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-            batch.schema().as_ref(),
-            &[SlotId::new(1)],
-        )
-        .expect("chunk schema");
-        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    struct DeclarationControl;
+    impl PureCompileControl for DeclarationControl {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
     }
-
-    fn make_chunk_with_decimal_payload(ids: Vec<i32>, prices: Vec<i128>) -> Chunk {
+    struct TestSource {
+        layout: StaticLayout,
+        creator: Arc<dyn InputConstructionFactory>,
+    }
+    fn source_for(state: &RuntimeState, fields: &[(&str, DataType, bool)]) -> TestSource {
+        let bindings = fields
+            .iter()
+            .map(|(_, ty, nullable)| {
+                let storage = ValueTypeStorageLifetime::pure();
+                TypedValueBinding::try_new(
+                    ValueTypeRef::try_new(
+                        ValueKind::Scalar(ty.clone()),
+                        *nullable,
+                        storage.clone(),
+                    )
+                    .unwrap(),
+                    ValueLayout::try_new(ty, storage).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(
+            fields
+                .iter()
+                .map(|(name, ty, nullable)| Field::new(*name, ty.clone(), *nullable))
+                .collect::<Vec<_>>(),
+        ));
+        let layout = StaticLayout::try_new_typed_for_compile(
+            schema,
+            Arc::from(
+                (1..=fields.len())
+                    .map(|id| SlotId::new(u32::try_from(id).unwrap()))
+                    .collect::<Vec<_>>(),
+            ),
+            bindings
+                .into_iter()
+                .map(|binding| (binding, None))
+                .collect(),
+            ValueTypeStorageLifetime::pure(),
+            |_| Ok(()),
+            &DeclarationControl,
+        )
+        .unwrap();
+        let creator = try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("original-sort-test-scaffolds"),
+            state.error_state(),
+        )
+        .unwrap();
+        TestSource { layout, creator }
+    }
+    fn source_chunk<const N: usize>(
+        source: &TestSource,
+        arrays: [ArrayRef; N],
+        rows: usize,
+    ) -> Chunk {
+        let schema = source
+            .creator
+            .create_compiled_chunk_schema(&source.layout)
+            .unwrap();
+        let owner = source.creator.begin_typed_construction(&schema).unwrap();
+        owner
+            .request(Layout::array::<ArrayRef>(N).unwrap())
+            .unwrap();
+        Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+            schema,
+            arrays.into_iter().collect(),
+            rows,
+            owner.storage_lifetime(),
+            |step| owner.observe(0, &[], step),
+        )
+        .unwrap()
+    }
+    fn make_chunk(source: &TestSource, values: Vec<Option<i32>>) -> Chunk {
+        let rows = values.len();
+        source_chunk(
+            source,
+            [Arc::new(Int32Array::from(values)) as ArrayRef],
+            rows,
+        )
+    }
+    fn make_chunk_with_decimal_payload(
+        source: &TestSource,
+        ids: Vec<i32>,
+        prices: Vec<i128>,
+    ) -> Chunk {
+        let rows = ids.len();
         let wide_prices = Decimal128Array::from(prices.into_iter().map(Some).collect::<Vec<_>>())
             .with_precision_and_scale(38, 2)
             .expect("wide decimal prices");
@@ -806,38 +993,25 @@ mod tests {
             .data_type(DataType::Decimal128(20, 2))
             .build()
             .expect("decimal20 price data");
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, true),
-            Field::new("price", DataType::Decimal128(20, 2), true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![Arc::new(Int32Array::from(ids)), make_array(price_data)],
+        source_chunk(
+            source,
+            [
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                make_array(price_data),
+            ],
+            rows,
         )
-        .expect("record batch");
-        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-            batch.schema().as_ref(),
-            &[SlotId::new(1), SlotId::new(2)],
-        )
-        .expect("chunk schema");
-        Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
-
     #[test]
     fn full_sort_reconciles_nullable_columns_across_chunks() {
-        let chunks = vec![
-            make_chunk(vec![Some(1), Some(2)], false),
-            make_chunk(vec![None, Some(3)], true),
-        ];
         let state = RuntimeState::default();
-        let mut processor = processor_for(
-            DataType::Int32,
-            false,
-            None,
-            0,
-            SortTopNType::RowNumber,
-            None,
-        );
+        // One declared nullable channel covers both batches, independent of observed NULL rows.
+        let source = source_for(&state, &[("v", DataType::Int32, true)]);
+        let chunks = vec![
+            make_chunk(&source, vec![Some(1), Some(2)]),
+            make_chunk(&source, vec![None, Some(3)]),
+        ];
+        let mut processor = processor_for(&source, false, None, 0, SortTopNType::RowNumber, None);
         for chunk in chunks {
             processor
                 .push_chunk(&state, chunk)
@@ -848,9 +1022,9 @@ mod tests {
             .pull_chunk(&state)
             .expect("pull sorted output")
             .expect("chunk");
-        assert!(out.batch.schema().field(0).is_nullable());
+        assert!(out.record_batch().schema().field(0).is_nullable());
         let col = out
-            .batch
+            .record_batch()
             .column(0)
             .as_any()
             .downcast_ref::<Int32Array>()
@@ -865,19 +1039,20 @@ mod tests {
     #[test]
     fn full_sort_preserves_decimal_payload_exceeding_declared_precision() {
         let overflow = 100_000_000_000_000_000_000_i128;
+        let state = RuntimeState::default();
+        let source = source_for(
+            &state,
+            &[
+                ("id", DataType::Int32, true),
+                ("price", DataType::Decimal128(20, 2), true),
+            ],
+        );
         let chunks = vec![make_chunk_with_decimal_payload(
+            &source,
             vec![2, 1],
             vec![overflow, 12_345_i128],
         )];
-        let state = RuntimeState::default();
-        let mut processor = processor_for(
-            DataType::Int32,
-            false,
-            None,
-            0,
-            SortTopNType::RowNumber,
-            None,
-        );
+        let mut processor = processor_for(&source, false, None, 0, SortTopNType::RowNumber, None);
         for chunk in chunks {
             processor
                 .push_chunk(&state, chunk)
@@ -889,7 +1064,7 @@ mod tests {
             .expect("pull sorted output")
             .expect("chunk");
         let ids = out
-            .batch
+            .record_batch()
             .column(0)
             .as_any()
             .downcast_ref::<Int32Array>()
@@ -897,7 +1072,7 @@ mod tests {
         assert_eq!(ids.value(0), 1);
         assert_eq!(ids.value(1), 2);
         let prices = out
-            .batch
+            .record_batch()
             .column(1)
             .as_any()
             .downcast_ref::<Decimal128Array>()
@@ -913,7 +1088,7 @@ mod tests {
     }
 
     fn processor_for(
-        data_type: arrow::datatypes::DataType,
+        source: &TestSource,
         use_top_n: bool,
         limit: Option<usize>,
         offset: usize,
@@ -921,11 +1096,19 @@ mod tests {
         max_buffered_rows: Option<usize>,
     ) -> SortProcessorOperator {
         let mut arena = ExprArena::default();
-        let key = arena.push_typed(
-            crate::exec::expr::ExprNode::SlotId(novarocks_types::SlotId::new(1)),
-            data_type,
+        let key = arena.push_value_typed(
+            crate::exec::expr::ExprNode::SlotId(SlotId::new(1)),
+            FunctionValueType::try_from_typed_binding(
+                source.layout.value_binding_at(0).unwrap().clone(),
+            )
+            .unwrap(),
         );
-        SortProcessorOperator {
+        let mut processor = SortProcessorOperator {
+            input_layout: Some(source.layout.clone()),
+            fixture_input_schema: None,
+            output_schema: None,
+            construction: Some(source.creator.clone()),
+            prepared: false,
             name: "test sort".to_string(),
             arena: Arc::new(arena),
             order_by: vec![SortExpression {
@@ -949,26 +1132,17 @@ mod tests {
             finished: false,
             profile_initialized: false,
             profiles: None,
-        }
+        };
+        processor.prepare().expect("actual installed sort prepare");
+        processor
     }
-
-    fn chunk_from_array(array: ArrayRef) -> Chunk {
-        let schema = Arc::new(arrow::datatypes::Schema::new(vec![
-            arrow::datatypes::Field::new("v", array.data_type().clone(), true),
-        ]));
-        let batch = arrow::record_batch::RecordBatch::try_new(schema, vec![array]).expect("batch");
-        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-            batch.schema().as_ref(),
-            &[novarocks_types::SlotId::new(1)],
-        )
-        .expect("chunk schema");
-        Chunk::new_with_chunk_schema(batch, chunk_schema)
+    fn chunk_from_array(source: &TestSource, array: ArrayRef) -> Chunk {
+        let rows = array.len();
+        source_chunk(source, [array], rows)
     }
-
-    fn int_chunk(values: Vec<i32>) -> Chunk {
-        chunk_from_array(Arc::new(arrow::array::Int32Array::from(values)))
+    fn int_chunk(source: &TestSource, values: Vec<i32>) -> Chunk {
+        chunk_from_array(source, Arc::new(Int32Array::from(values)))
     }
-
     fn int_values(chunk: &Chunk) -> Vec<i32> {
         chunk.columns()[0]
             .as_any()
@@ -984,8 +1158,9 @@ mod tests {
             let offset = 2;
             let rows_to_keep = limit + offset;
             let state = RuntimeState::default();
+            let source = source_for(&state, &[("v", DataType::Int32, true)]);
             let mut processor = processor_for(
-                arrow::datatypes::DataType::Int32,
+                &source,
                 true,
                 Some(limit),
                 offset,
@@ -994,7 +1169,7 @@ mod tests {
             );
             let tracker = crate::runtime::mem_tracker::MemTracker::new_root("sort input");
             let original = (0..(rows_to_keep * 2) as i32).rev().collect::<Vec<_>>();
-            let mut chunk = int_chunk(original.clone());
+            let mut chunk = int_chunk(&source, original.clone());
             let schema = chunk.chunk_schema_ref();
             let input_array = Arc::downgrade(&chunk.columns()[0]);
             chunk.transfer_to(&tracker);
@@ -1013,7 +1188,7 @@ mod tests {
                 "pruning releases the original input charge"
             );
             processor
-                .push_chunk(&state, int_chunk((-6..0).collect()))
+                .push_chunk(&state, int_chunk(&source, (-6..0).collect()))
                 .expect("push late best rows");
             assert_eq!(processor.buffered_rows, rows_to_keep as i64);
             let candidate_array = Arc::downgrade(&processor.buffered[0].columns()[0]);
@@ -1054,19 +1229,13 @@ mod tests {
             (SortTopNType::DenseRank, vec![1, 1, 2, 2, 2]),
         ] {
             let state = RuntimeState::default();
-            let mut processor = processor_for(
-                arrow::datatypes::DataType::Int32,
-                true,
-                Some(2),
-                0,
-                kind,
-                Some(3),
-            );
+            let source = source_for(&state, &[("v", DataType::Int32, true)]);
+            let mut processor = processor_for(&source, true, Some(2), 0, kind, Some(3));
             processor
-                .push_chunk(&state, int_chunk(vec![4, 2, 2, 1]))
+                .push_chunk(&state, int_chunk(&source, vec![4, 2, 2, 1]))
                 .expect("first peer groups");
             processor
-                .push_chunk(&state, int_chunk(vec![2, 1, 3]))
+                .push_chunk(&state, int_chunk(&source, vec![2, 1, 3]))
                 .expect("late boundary peers");
             processor.set_finishing(&state).expect("finish");
             let output = processor.pull_chunk(&state).expect("pull").expect("output");
@@ -1079,20 +1248,17 @@ mod tests {
     fn full_sort_preserves_null_nan_order_and_releases_input_before_output_is_pulled() {
         use arrow::array::{Array, Float64Array};
         let state = RuntimeState::default();
-        let mut processor = processor_for(
-            arrow::datatypes::DataType::Float64,
-            false,
-            None,
-            0,
-            SortTopNType::RowNumber,
-            None,
+        let source = source_for(&state, &[("v", DataType::Float64, true)]);
+        let mut processor = processor_for(&source, false, None, 0, SortTopNType::RowNumber, None);
+        let mut chunk = chunk_from_array(
+            &source,
+            Arc::new(Float64Array::from(vec![
+                Some(f64::NAN),
+                Some(2.0),
+                None,
+                Some(-1.0),
+            ])),
         );
-        let mut chunk = chunk_from_array(Arc::new(Float64Array::from(vec![
-            Some(f64::NAN),
-            Some(2.0),
-            None,
-            Some(-1.0),
-        ])));
         let input_array = Arc::downgrade(&chunk.columns()[0]);
         let tracker = crate::runtime::mem_tracker::MemTracker::new_root("full sort input");
         chunk.transfer_to(&tracker);
@@ -1119,8 +1285,9 @@ mod tests {
     fn empty_sort_finishes_without_output_for_full_sort_and_topn() {
         for use_top_n in [false, true] {
             let state = RuntimeState::default();
+            let source = source_for(&state, &[("v", DataType::Int32, true)]);
             let mut processor = processor_for(
-                arrow::datatypes::DataType::Int32,
+                &source,
                 use_top_n,
                 Some(3),
                 0,
@@ -1180,22 +1347,21 @@ mod tests {
     /// Expected: partition 1 keeps o=[10,20], partition 2 keeps o=[5,6]  → 4 rows
     #[test]
     fn partition_topn_rank_limit_none_routes_per_partition_not_global() {
-        use crate::exec::chunk::{Chunk, ChunkSchema};
         use crate::exec::expr::{ExprArena, ExprNode};
         use crate::exec::node::sort::{SortExpression, SortTopNType};
         use arrow::array::{Array, Int32Array};
-        use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
+        use arrow::datatypes::DataType;
         use novarocks_types::SlotId;
         use std::sync::Arc;
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("p", DataType::Int32, true),
-            Field::new("o", DataType::Int32, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
+        let state = RuntimeState::default();
+        let source = source_for(
+            &state,
+            &[("p", DataType::Int32, true), ("o", DataType::Int32, true)],
+        );
+        let chunk = source_chunk(
+            &source,
+            [
                 Arc::new(Int32Array::from(vec![
                     Some(1),
                     Some(1),
@@ -1213,18 +1379,24 @@ mod tests {
                     Some(7),
                 ])),
             ],
-        )
-        .expect("record batch");
-        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-            batch.schema().as_ref(),
-            &[SlotId::new(1), SlotId::new(2)],
-        )
-        .expect("chunk schema");
-        let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
+            6,
+        );
 
         let mut arena = ExprArena::default();
-        let p_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let o_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int32);
+        let p_expr = arena.push_value_typed(
+            ExprNode::SlotId(SlotId::new(1)),
+            FunctionValueType::try_from_typed_binding(
+                source.layout.value_binding_at(0).unwrap().clone(),
+            )
+            .unwrap(),
+        );
+        let o_expr = arena.push_value_typed(
+            ExprNode::SlotId(SlotId::new(2)),
+            FunctionValueType::try_from_typed_binding(
+                source.layout.value_binding_at(1).unwrap().clone(),
+            )
+            .unwrap(),
+        );
         let partition_exprs = vec![SortExpression {
             expr: p_expr,
             asc: true,
@@ -1251,9 +1423,12 @@ mod tests {
             Some(2), // per-partition cap = 2
         );
 
+        let factory = factory.with_input_layout(source.layout.clone());
         let mut op = factory.create(1, 0);
+        op.set_construction_factory(source.creator.clone());
+        op.prepare()
+            .expect("actual installed partition-sort prepare");
         let proc = op.as_processor_mut().expect("processor");
-        let state = crate::runtime::runtime_state::RuntimeState::default();
 
         proc.push_chunk(&state, chunk).expect("push chunk");
         proc.set_finishing(&state).expect("set finishing");
@@ -1274,7 +1449,7 @@ mod tests {
         );
 
         let o_col = result
-            .batch
+            .record_batch()
             .column(1)
             .as_any()
             .downcast_ref::<Int32Array>()
@@ -1308,23 +1483,22 @@ mod tests {
     ///   partition 1 keeps o=[10,20]; partition 2 keeps o=[5,6]
     #[test]
     fn build_topn_sorter_uses_partition_path_and_yields_per_partition_result() {
-        use crate::exec::chunk::{Chunk, ChunkSchema};
         use crate::exec::expr::{ExprArena, ExprNode};
         use crate::exec::node::sort::{SortExpression, SortTopNType};
         use arrow::array::{Array, Int32Array};
-        use arrow::datatypes::{DataType, Field, Schema};
-        use arrow::record_batch::RecordBatch;
+        use arrow::datatypes::DataType;
         use novarocks_types::SlotId;
         use std::sync::Arc;
 
         // Build a two-column chunk: col 0 = partition key (SlotId 1), col 1 = order key (SlotId 2).
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("p", DataType::Int32, true),
-            Field::new("o", DataType::Int32, true),
-        ]));
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
+        let state = RuntimeState::default();
+        let source = source_for(
+            &state,
+            &[("p", DataType::Int32, true), ("o", DataType::Int32, true)],
+        );
+        let chunk = source_chunk(
+            &source,
+            [
                 Arc::new(Int32Array::from(vec![
                     Some(1),
                     Some(1),
@@ -1342,19 +1516,24 @@ mod tests {
                     Some(7),
                 ])),
             ],
-        )
-        .expect("record batch");
-        let chunk_schema = ChunkSchema::try_ref_from_schema_and_slot_ids(
-            batch.schema().as_ref(),
-            &[SlotId::new(1), SlotId::new(2)],
-        )
-        .expect("chunk schema");
-        let chunk = Chunk::new_with_chunk_schema(batch, chunk_schema);
+            6,
+        );
 
-        // Build arena with slot-ref expressions for the two columns.
         let mut arena = ExprArena::default();
-        let p_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let o_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int32);
+        let p_expr = arena.push_value_typed(
+            ExprNode::SlotId(SlotId::new(1)),
+            FunctionValueType::try_from_typed_binding(
+                source.layout.value_binding_at(0).unwrap().clone(),
+            )
+            .unwrap(),
+        );
+        let o_expr = arena.push_value_typed(
+            ExprNode::SlotId(SlotId::new(2)),
+            FunctionValueType::try_from_typed_binding(
+                source.layout.value_binding_at(1).unwrap().clone(),
+            )
+            .unwrap(),
+        );
         let partition_exprs = vec![SortExpression {
             expr: p_expr,
             asc: true,
@@ -1382,11 +1561,14 @@ mod tests {
         );
 
         // Instantiate the operator and drive it through the push/set_finishing/pull cycle.
+        let factory = factory.with_input_layout(source.layout.clone());
         let mut op = factory.create(1, 0);
+        op.set_construction_factory(source.creator.clone());
+        op.prepare()
+            .expect("actual installed partition-sort prepare");
         let proc = op.as_processor_mut().expect("processor");
 
         // Drive the ordinary runtime state through the processor lifecycle.
-        let state = crate::runtime::runtime_state::RuntimeState::default();
 
         proc.push_chunk(&state, chunk).expect("push chunk");
         proc.set_finishing(&state).expect("set finishing");
@@ -1406,7 +1588,7 @@ mod tests {
 
         // Extract the order-key column (col 1) from the result.
         let o_col = result
-            .batch
+            .record_batch()
             .column(1)
             .as_any()
             .downcast_ref::<Int32Array>()

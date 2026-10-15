@@ -65,7 +65,7 @@ pub(super) fn decode_key(key: i32) -> Result<SemanticParameterKey, SemanticsCode
     }
 }
 
-pub(crate) fn encode_reference(
+pub fn encode_reference(
     reference: &SemanticParameterRef,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::SemanticParameterRef, SemanticsCodecError> {
@@ -76,7 +76,7 @@ pub(crate) fn encode_reference(
     })
 }
 
-pub(crate) fn decode_reference(
+pub fn decode_reference(
     reference: &wire::SemanticParameterRef,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<SemanticParameterRef, SemanticsCodecError> {
@@ -95,7 +95,7 @@ pub(super) fn encode_parameters(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<wire::SemanticParameters, SemanticsCodecError> {
     if parameters.entries().len() > MAX_SEMANTIC_PARAMETERS {
-        return Err(SemanticParameterError::TooManyParameters.into());
+        return Err(SemanticsCodecError::from(SemanticParameterError::TooManyParameters).into());
     }
     emit_parameter_entries(
         parameters,
@@ -146,7 +146,9 @@ fn emit_parameter_entries(
             }
             SemanticParameterValue::TimeZone(value) => {
                 if value.len() > 255 {
-                    return Err(SemanticParameterError::InvalidTimeZone.into());
+                    return Err(
+                        SemanticsCodecError::from(SemanticParameterError::InvalidTimeZone).into(),
+                    );
                 }
                 if observed {
                     work.flush()?;
@@ -194,7 +196,9 @@ fn decode_value(
             // Check before cloning. The public owner performs the remaining
             // empty/control-character validation on this bounded spelling.
             if value.len() > 255 {
-                return Err(SemanticParameterError::InvalidTimeZone.into());
+                return Err(
+                    SemanticsCodecError::from(SemanticParameterError::InvalidTimeZone).into(),
+                );
             }
             Ok(SemanticParameterValue::TimeZone(value.as_str().into()))
         }
@@ -221,7 +225,7 @@ pub(super) fn decode_parameters(
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<SemanticParameters, SemanticsCodecError> {
     if parameters.entries.len() > MAX_SEMANTIC_PARAMETERS {
-        return Err(SemanticParameterError::TooManyParameters.into());
+        return Err(SemanticsCodecError::from(SemanticParameterError::TooManyParameters).into());
     }
     let mut input = parameters.entries.iter();
     let mut projection_error = None;
@@ -264,7 +268,7 @@ pub(super) fn decode_parameters_observed(
 ) -> Result<SemanticParameters, SemanticsCodecError> {
     use novarocks_type_contract::SemanticParameterProjectionError;
     if parameters.entries.len() > MAX_SEMANTIC_PARAMETERS {
-        return Err(SemanticParameterError::TooManyParameters.into());
+        return Err(SemanticsCodecError::from(SemanticParameterError::TooManyParameters).into());
     }
     let mut input = parameters.entries.iter();
     let mut projection_error = None;
@@ -811,4 +815,83 @@ mod tests {
             ]
         );
     }
+}
+
+/// Source values and their actual construction responsibility. Borrowing does
+/// not publish a naked independently owning parameter table.
+pub struct CreatedWriterSemanticParameters {
+    parameters: SemanticParameters,
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+impl CreatedWriterSemanticParameters {
+    pub fn parameters(&self) -> &SemanticParameters {
+        &self.parameters
+    }
+}
+
+/// Keep the original parameter grammar/constructor. Known timezone boxes and
+/// the locked insertion-only BTree operation are observed separately before
+/// the stock constructor; the bound is not an allocator receipt or grant.
+pub fn decode_writer_semantic_parameters_with_creator_in<H>(
+    source: &wire::SemanticParameters,
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<
+    std::sync::Arc<CreatedWriterSemanticParameters>,
+    crate::host_projection_v2::ProjectionFailure<SemanticsCodecError, H>,
+> {
+    use crate::host_projection_v2::ProjectionFailure;
+    use novarocks_type_contract::{SemanticParameterId, owned_resources::layout::arc_layout};
+    use std::{alloc::Layout, sync::Arc};
+    if source.entries.len() > MAX_SEMANTIC_PARAMETERS {
+        return Err(SemanticsCodecError::from(SemanticParameterError::TooManyParameters).into());
+    }
+    let tree = crate::btree_resources_v2::insertion_only::<
+        SemanticParameterId,
+        SemanticParameterValue,
+    >(source.entries.len())
+    .map_err(|_| {
+        SemanticsCodecError::SourceModel("writer parameter tree bound is unrepresentable")
+    })?;
+    work.flush().map_err(SemanticsCodecError::from)?;
+    if tree.request_bytes_upper_bound != 0 {
+        creation
+            .observe_opaque_upper_bound(tree.request_bytes_upper_bound)
+            .map_err(ProjectionFailure::Host)?;
+    }
+    for entry in &source.entries {
+        work.step().map_err(SemanticsCodecError::from)?;
+        if let Some(wire::semantic_parameter::Value::TimeZone(value)) = &entry.value {
+            if value.len() > 255 {
+                return Err(
+                    SemanticsCodecError::from(SemanticParameterError::InvalidTimeZone).into(),
+                );
+            }
+            work.flush().map_err(SemanticsCodecError::from)?;
+            if !value.is_empty() {
+                creation
+                    .request_layout(Layout::array::<u8>(value.len()).map_err(|_| {
+                        SemanticsCodecError::SourceModel(
+                            "writer timezone layout is unrepresentable",
+                        )
+                    })?)
+                    .map_err(ProjectionFailure::Host)?;
+            }
+        }
+    }
+    let parameters = decode_parameters_observed(source, work)?;
+    work.flush().map_err(SemanticsCodecError::from)?;
+    let layout = arc_layout(Layout::new::<CreatedWriterSemanticParameters>()).map_err(|_| {
+        SemanticsCodecError::SourceModel("writer parameter holder layout is unrepresentable")
+    })?;
+    creation
+        .request_layout(layout)
+        .map_err(ProjectionFailure::Host)?;
+    let holder = Arc::new(CreatedWriterSemanticParameters {
+        parameters,
+        _storage: creation.storage_lifetime(),
+    });
+    work.step().map_err(SemanticsCodecError::from)?;
+    work.flush().map_err(SemanticsCodecError::from)?;
+    Ok(holder)
 }

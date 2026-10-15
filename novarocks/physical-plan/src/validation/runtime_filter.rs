@@ -454,13 +454,13 @@ pub(crate) fn validate_runtime_filter_shape(
         key, comparator, ..
     } = &filter.domain
     {
-        if key.ty.data_type == DataType::Null {
+        if *key.ty.data_type() == DataType::Null {
             errors.push(ValidationError::new(
                 path,
                 "ordered runtime-filter key has Null type",
             ));
         }
-        if !comparator.supports_order_key(&key.ty.data_type) {
+        if !comparator.supports_order_key(&key.ty.data_type()) {
             errors.push(ValidationError::new(
                 path,
                 "ordered runtime-filter key type is unsupported by its comparison algorithm",

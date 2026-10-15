@@ -128,10 +128,10 @@ fn nullif_owner_exact_flat_profiles_and_called_on_null_effects() {
     ];
     for ty in profiles {
         for nullable in [false, true] {
-            let source = FunctionValueType::new(ty.clone(), nullable);
+            let source = FunctionValueType::from_legacy_declared_projection(ty.clone(), nullable);
             let prepared = prepared_for_test("nullif", &[source.clone(), source]).unwrap();
-            assert_eq!(prepared.contract().result_type().data_type, ty);
-            assert!(prepared.contract().result_type().nullable);
+            assert_eq!(prepared.contract().result_type().data_type().clone(), ty);
+            assert!(prepared.contract().result_type().nullable());
             let effects = prepared.contract().effects();
             assert_eq!(effects.argument_control, ArgumentControl::Eager);
             assert_eq!(effects.null_behavior, FunctionNullBehavior::CalledOnNull);
@@ -155,7 +155,7 @@ fn nullif_owner_rejects_unsupported_carriers_timezone_and_logical_identities() {
         DataType::Struct(vec![Arc::new(Field::new("item", DataType::Int64, true))].into()),
     ];
     for ty in types {
-        let source = FunctionValueType::new(ty, true);
+        let source = FunctionValueType::from_legacy_declared_projection(ty, true);
         assert!(prepared_for_test("nullif", &[source.clone(), source]).is_err());
     }
     for identity in [
@@ -168,8 +168,17 @@ fn nullif_owner_rejects_unsupported_carriers_timezone_and_logical_identities() {
         ValueLogicalType::LargeInt,
         ValueLogicalType::Uuid,
     ] {
-        let mut source = FunctionValueType::new(DataType::Utf8, true);
-        source.logical_type = identity;
+        let carrier = match identity {
+            ValueLogicalType::Json => DataType::Utf8,
+            ValueLogicalType::Variant => DataType::LargeBinary,
+            ValueLogicalType::LargeInt | ValueLogicalType::Uuid => DataType::FixedSizeBinary(16),
+            ValueLogicalType::Hll
+            | ValueLogicalType::Bitmap
+            | ValueLogicalType::Object
+            | ValueLogicalType::Percentile => DataType::Binary,
+            ValueLogicalType::Physical => unreachable!(),
+        };
+        let source = FunctionValueType::try_with_logical_type(carrier, true, identity).unwrap();
         assert!(prepared_for_test("nullif", &[source.clone(), source]).is_err());
     }
 }

@@ -45,14 +45,23 @@ impl BitmapResult {
             Self::Encoded => core::BitmapOperation::BitmapProjection,
         }
     }
-    fn output_type(self) -> FunctionValueType {
-        FunctionValueType::new(
-            match self {
-                Self::Cardinality => DataType::Int64,
-                Self::Encoded => DataType::Binary,
-            },
-            true,
-        )
+    fn matches_output(self, output: &FunctionValueType) -> bool {
+        let (carrier, domain) = match self {
+            Self::Cardinality => (
+                DataType::Int64,
+                novarocks_type_contract::ValueLogicalType::Physical,
+            ),
+            Self::Encoded => (
+                DataType::Binary,
+                novarocks_type_contract::ValueLogicalType::Bitmap,
+            ),
+        };
+        // These are closed scalar declarations. The immutable checked binding
+        // supplies every parameter; no type node is built during validation.
+        output.nullable()
+            && output.logical_type() == domain
+            && output.data_type() == &carrier
+            && output.value_type().child_count() == 0
     }
 }
 #[derive(Debug)]
@@ -333,7 +342,7 @@ pub(super) fn original_native_profile(
     // The original reader accepts these carriers regardless of their valid nominal domain.
     count == 1
         && matches!(
-            source.data_type,
+            source.data_type(),
             DataType::Boolean
                 | DataType::Int8
                 | DataType::Int16
@@ -348,7 +357,7 @@ pub(super) fn original_native_profile(
                 | DataType::Binary
                 | DataType::LargeBinary
         )
-        && output == &projection.output_type()
+        && projection.matches_output(output)
 }
 pub(super) fn validate_contract(
     contract: &AggregateCallContract,
@@ -361,10 +370,14 @@ pub(super) fn validate_contract(
         contract.call().logical_argument_count(),
         projection,
     ) || !contract.order_keys().is_empty()
-        || !FunctionValueType::new(DataType::Binary, true)
-            .exactly_equals_observed::<KernelFailure>(contract.intermediate_type(), || {
-                work.step().map_err(compile_failure)
-            })?
+        || !{
+            work.step().map_err(compile_failure)?;
+            let state = contract.intermediate_type();
+            state.nullable()
+                && state.logical_type() == novarocks_type_contract::ValueLogicalType::Bitmap
+                && state.data_type() == &DataType::Binary
+                && state.value_type().child_count() == 0
+        }
     {
         return Err(invalid(
             "bitmap_union_int differs from its original fixed full signature",

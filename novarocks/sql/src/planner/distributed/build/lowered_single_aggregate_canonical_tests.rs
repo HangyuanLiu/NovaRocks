@@ -99,8 +99,8 @@ fn aggregate(
     let mut output = column(
         91,
         "aggregate_result",
-        result.data_type.clone(),
-        result.nullable,
+        result.data_type().clone(),
+        result.nullable(),
     );
     output.value_type = result.clone();
     let binding = SqlFunctionBinding::new(resolved, DecimalOverflowPolicy::ReportError);
@@ -112,7 +112,7 @@ fn aggregate(
                 name: name.into(),
                 source: AggregateArgumentSource::logical_update(arguments, order, binding),
                 distinct: false,
-                result_type: output.value_type.data_type.clone(),
+                result_type: output.value_type.clone(),
                 output_column_id: output.column_id,
             }],
             is_merge: vec![false],
@@ -183,7 +183,7 @@ fn value(argument: &FunctionArgument) -> (&ValueType, Option<&novarocks_function
 fn repeat(child: PhysicalPlanNode, original: &OutputColumn) -> PhysicalPlanNode {
     let grouping = column(72, "grouping", DataType::Int64, false);
     let mut repeated = original.clone();
-    repeated.value_type.nullable = true;
+    repeated.value_type = repeated.value_type.with_nullable(true).unwrap();
     PhysicalPlanNode {
         kind: PhysicalPlanKind::Repeat(PlanRepeatNode {
             repeat_column_ref_list: vec![vec![original.name.clone()], vec![]],
@@ -227,10 +227,10 @@ fn single_count_star_and_repeat_nullable_channels_publish_actual_selected_reques
     let captured = value(&entry.captured().request().arguments[0]);
     let canonical = entry.canonical().unwrap();
     let operational = value(&canonical.request().arguments[0]);
-    assert!(!captured.0.nullable);
-    assert!(operational.0.nullable);
+    assert!(!captured.0.nullable());
+    assert!(operational.0.nullable());
     assert!(captured.1.is_none() && operational.1.is_none());
-    assert!(!input.value_type.nullable);
+    assert!(!input.value_type.nullable());
     assert!(canonical.request().expected_result_type.is_none());
     assert_eq!(
         canonical.selected().argument_types.as_ref(),
@@ -262,7 +262,7 @@ fn single_min_keeps_nested_field_metadata_and_nominal_json_source_facts() {
         )
         .unwrap(),
     ] {
-        let mut input = column(7, "full_source", ty.data_type.clone(), ty.nullable);
+        let mut input = column(7, "full_source", ty.data_type().clone(), ty.nullable());
         input.value_type = ty.clone();
         // Empty Values publishes a real typed channel without fabricating a
         // nested literal or claiming a pure MIN kernel for the Struct profile.
@@ -278,7 +278,7 @@ fn single_min_keeps_nested_field_metadata_and_nominal_json_source_facts() {
         assert_eq!(value(&canonical.request().arguments[0]).0, &ty);
         assert_eq!(value(&entry.captured().request().arguments[0]).0, &ty);
         let mut result = ty.clone();
-        result.nullable = true;
+        result = result.with_nullable(true).unwrap();
         assert_eq!(entry.source().binding.function.result_type, result);
         assert_eq!(entry.source().binding.intermediate_type, result);
         assert_eq!(
@@ -582,7 +582,7 @@ fn single_wide_nested_metadata_emission_observes_bounded_original_control() {
         })
         .collect::<Vec<_>>();
     let ty = ValueType::new(DataType::Struct(fields.into()), false);
-    let mut input = column(7, "wide_source", ty.data_type.clone(), ty.nullable);
+    let mut input = column(7, "wide_source", ty.data_type().clone(), ty.nullable());
     input.value_type = ty.clone();
     let plan = aggregate(
         "min",

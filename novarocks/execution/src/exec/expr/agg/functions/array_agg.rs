@@ -747,6 +747,8 @@ mod tests {
             Arc::new(Field::new("f1", DataType::Int32, true)),
         ]));
         let update_func = AggFunction {
+            // Explicit legacy carrier fixture; this is not frozen-binding admission.
+            frozen: None,
             name: "array_agg_distinct".to_string(),
             inputs: vec![],
             input_is_intermediate: false,
@@ -794,6 +796,8 @@ mod tests {
         ArrayAggAgg.drop_state(&update_spec, update_state.as_mut_ptr() as *mut u8);
 
         let merge_func = AggFunction {
+            // Explicit legacy carrier fixture; this is not frozen-binding admission.
+            frozen: None,
             name: "array_agg_distinct".to_string(),
             inputs: vec![],
             input_is_intermediate: true,

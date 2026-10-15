@@ -186,7 +186,7 @@ impl ConstantValue {
     ) -> Result<Self, ConstantError> {
         let mut work = CompileCheckpoints::try_new(control, phase)?;
         let result = (|| {
-            let valid = matches!(&ty.data_type, DataType::List(child) if child.data_type() == &DataType::Int32);
+            let valid = matches!(ty.data_type(), DataType::List(child) if child.data_type() == &DataType::Int32);
             work.step()?;
             if !valid {
                 return Err(ConstantError::Invalid(
@@ -229,7 +229,7 @@ impl ConstantValue {
             )?;
             let offset_buffer = buffer(offsets, &mut work)?;
             let data = array(
-                ArrayData::builder(ty.data_type.clone())
+                ArrayData::builder(field.data_type().clone())
                     .len(1)
                     .add_buffer(offset_buffer)
                     .add_child_data(child),
@@ -254,7 +254,7 @@ impl ConstantValue {
     ) -> Result<Self, ConstantError> {
         let mut work = CompileCheckpoints::try_new(control, phase)?;
         let result = (|| {
-            let entries_type = match &ty.data_type {
+            let entries_type = match field.data_type() {
                 DataType::Map(entry, _) => match entry.data_type() {
                     DataType::Struct(fields)
                         if fields.len() == 2
@@ -370,7 +370,7 @@ impl ConstantValue {
             work.step()?;
             let offsets = buffer(offsets, &mut work)?;
             let data = array(
-                ArrayData::builder(ty.data_type.clone())
+                ArrayData::builder(field.data_type().clone())
                     .len(1)
                     .add_buffer(offsets)
                     .add_child_data(data),

@@ -251,7 +251,7 @@ fn empty(host: &Host) {
 fn prepared(arrays: &[ArrayRef]) -> Arc<dyn PreparedScalarKernel> {
     let types = arrays
         .iter()
-        .map(|a| FunctionValueType::new(a.data_type().clone(), true))
+        .map(|a| FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true))
         .collect::<Vec<_>>();
     prepared_for_test("percentile_approx_raw", &types).unwrap()
 }
@@ -330,8 +330,11 @@ fn percentile_raw_owner_full_any_null_and_original_value_errors() {
 }
 #[test]
 fn percentile_raw_owner_long_actual_type_diagnostic_no_clipping_and_last_drop() {
-    let field = arrow_schema::Field::new("actual-original-unsupported", DataType::UInt32, true)
-        .with_metadata([("provider.source".into(), "诊断".repeat(512))].into());
+    let field = arrow_schema::Field::new(
+        "actual-original-unsupported".repeat(28),
+        DataType::UInt32,
+        true,
+    );
     let ty = DataType::Struct(vec![field].into());
     let arrays = vec![
         arrow_array::new_null_array(&ty, 2),
@@ -776,7 +779,7 @@ fn percentile_raw_owner_original_v3_long_parser_data_is_not_clipped() {
 #[test]
 fn percentile_raw_owner_lossless_diagnostic_all_control_and_owned_frontiers() {
     let field = arrow_schema::Field::new("actual", DataType::UInt32, true)
-        .with_metadata([("original.provider".into(), "diagnostic".repeat(200))].into());
+        .with_name("original_diagnostic_field".repeat(32));
     let arrays = vec![
         arrow_array::new_null_array(&DataType::Struct(vec![field].into()), 1),
         Arc::new(Float64Array::from(vec![0.5])) as ArrayRef,

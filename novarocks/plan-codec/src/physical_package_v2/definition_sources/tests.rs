@@ -32,7 +32,7 @@ use crate::physical_package_v2::type_views::{TypeViewLimits, collect_package_typ
 use crate::physical_properties_v2::PhysicalPropertyProjectionLimits;
 use crate::physical_type_v2::{
     EncodedTypeTable, PackageTypeProjectionLimits, TypeCodecError,
-    encode_borrowed_type_table_writer_sources_in,
+    encode_borrowed_type_namespaces_sources_in,
 };
 use arrow::{
     array::{Array, Int64Array},
@@ -103,7 +103,7 @@ fn function(kind: FunctionKind, args: Box<[FunctionArgumentType]>) -> p::BoundFu
         FunctionId::try_new("fixture/binding-source").unwrap(),
         FunctionOverloadId::try_new("fixture/selected-v1").unwrap(),
         kind,
-        args,
+        novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(args),
         int(),
     )
 }
@@ -200,7 +200,10 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
                     function: function(
                         FunctionKind::Scalar,
                         Box::from([FunctionArgumentType::Lambda {
-                            parameter_types: Box::from([dictionary(), int()]),
+                            parameter_types:
+                                novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                                    Box::from([dictionary(), int()]),
+                                ),
                             result_type: int(),
                         }]),
                     ),
@@ -328,8 +331,11 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
                 function: p::BoundTableFunction::from_exact_signature(
                     FunctionId::try_new("fixture/table-source").unwrap(),
                     FunctionOverloadId::try_new("fixture/table-v1").unwrap(),
-                    Box::default(),
-                    Box::from([int(), dictionary()]),
+                    novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(Box::default()),
+                    novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(Box::from([
+                        int(),
+                        dictionary(),
+                    ])),
                 ),
                 arguments: Box::default(),
                 outputs: Box::from([
@@ -376,7 +382,10 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
                 (
                     p::PhysicalCallDefinition::Expression(scalar),
                     request(Box::from([p::StaticFunctionArgument::Lambda {
-                        parameter_types: Box::from([dictionary(), int()]),
+                        parameter_types:
+                            novarocks_type_contract::FunctionParameterTypes::from_pure_boxed(
+                                Box::from([dictionary(), int()]),
+                            ),
                         result_type: int(),
                     }])),
                 ),
@@ -477,6 +486,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
         .map(|id| {
             let ctx = context(id, 0);
             p::FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,
@@ -506,6 +516,7 @@ pub(in crate::physical_package_v2) fn rich_package() -> p::FragmentPackage {
     ] {
         let ctx = context(use_id, 0);
         claims.push(p::FrozenPhysicalCall {
+            materialized_writer_input: None,
             regexp_count_pattern_source: None,
             to_base64_byte_source: None,
             temporal_source: None,
@@ -599,7 +610,9 @@ pub(in crate::physical_package_v2) fn cv_package() -> p::FragmentPackage {
             FunctionId::try_new("fixture/original-cv").unwrap(),
             FunctionOverloadId::try_new("fixture/value-v1").unwrap(),
             FunctionKind::Scalar,
-            Box::from([FunctionArgumentType::Value(nullable.clone())]),
+            novarocks_type_contract::FunctionArgumentTypes::from_pure_boxed(Box::from([
+                FunctionArgumentType::Value(nullable.clone()),
+            ])),
             int(),
         )
     };
@@ -776,6 +789,7 @@ pub(in crate::physical_package_v2) fn cv_package() -> p::FragmentPackage {
                 let mut effect = effects(FunctionKind::Scalar, ctx);
                 effect.argument_control = ArgumentControl::Eager;
                 p::FrozenPhysicalCall {
+                    materialized_writer_input: None,
                     regexp_count_pattern_source: None,
                     to_base64_byte_source: None,
                     temporal_source: None,
@@ -1073,10 +1087,14 @@ fn writer_recipe() -> c::ConnectorWriteRecipeDraft {
             vec![7].into(),
         ),
         c::ConnectorWriteInputShape::Data {
-            fields: vec![c::ConnectorWriteFieldBinding::new(
-                c::ConnectorWriteFieldToken::from_bytes([1; 32]),
-                Field::new("v", DataType::Int64, false),
-            )],
+            fields: vec![
+                c::ConnectorWriteFieldBinding::new(
+                    c::ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    Field::new("v", DataType::Int64, false),
+                )
+                .with_execution_type(FunctionValueType::new(DataType::Int64, false))
+                .expect("explicit BIGINT writer declaration"),
+            ],
         },
     )
     .unwrap();
@@ -1378,7 +1396,7 @@ fn verify_roots(
         assert_eq!(record.pool, *id);
         same(types, record.value_type_id, pool.value_type(), work)?;
         let field = types
-            .field_observed(record.field_id, work)?
+            .source_field_observed(record.field_id, work)?
             .expect("constant Field root");
         assert!(std::ptr::eq(field, pool.field_ref()));
     }
@@ -1565,9 +1583,10 @@ fn project(
             }
         }
         let writer_types = views.writer_sources_in(&mut budget, &mut work)?;
-        let types = encode_borrowed_type_table_writer_sources_in(
+        let types = encode_borrowed_type_namespaces_sources_in(
             views.values(),
             views.fields(),
+            views.source_fields(),
             &writer_types,
             SOURCE,
             type_limits(),

@@ -32,7 +32,7 @@ pub struct AggregateStateOrderKey {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct AggregateStateInterpretation {
     pub distinct: bool,
-    pub order_keys: Box<[AggregateStateOrderKey]>,
+    pub order_keys: crate::AggregateStateOrderKeys,
 }
 
 impl AggregateStateInterpretation {
@@ -58,17 +58,10 @@ impl AggregateStateInterpretation {
         work: &mut CompileCheckpoints<'_>,
     ) -> Result<Self, CompileControlError> {
         work.flush()?;
-        let mut keys = Vec::new();
-        keys.try_reserve_exact(self.order_keys.len())
-            .map_err(|_| CompileControlError::ResourceExhausted)?;
-        for key in &self.order_keys {
-            keys.push(*key);
-            work.step()?;
-        }
-        work.flush()?;
+        let order_keys = self.order_keys.clone_observed(|| work.step())?;
         let output = Self {
             distinct: self.distinct,
-            order_keys: keys.into_boxed_slice(),
+            order_keys,
         };
         work.flush()?;
         Ok(output)

@@ -120,10 +120,20 @@ pub(crate) fn authored_with_catalog(
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    let sink = |i: usize| {
+        let mut sink = simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal);
+        sink.contract.input_columns[0].nullable = nullable[i];
+        sink.contract.target.fields[0].column.nullable = nullable[i];
+        sink
+    };
+    // The original writer declaration authors each branch's complete input;
+    // the separate Arrow schema above only describes its physical relation.
+    let declared_inputs = (0..counts.len()).map(sink).collect::<Vec<_>>();
     let targets = (0..counts.len())
         .map(|i| WriterStatisticsTargetInput {
             target: WriteTargetOrdinal::try_new(u32::try_from(i).unwrap()).unwrap(),
             input_schema: &schemas[i],
+            input_columns: &declared_inputs[i].contract.input_columns,
             requirements: &requirements[i],
         })
         .collect::<Vec<_>>();
@@ -136,12 +146,7 @@ pub(crate) fn authored_with_catalog(
         &setup,
     )
     .unwrap();
-    let sink = |i: usize| {
-        let mut sink = simple_sql_write_plan_input(ConnectorWriteInputBinding::RootOutputByOrdinal);
-        sink.contract.input_columns[0].nullable = nullable[i];
-        sink.contract.target.fields[0].column.nullable = nullable[i];
-        sink
-    };
+
     let input = column(1, "order_id", DataType::Int64, false);
     let source = values(vec![input.clone()], vec![vec![literal_int(7)]]);
     let draft = if counts.len() == 1 {
@@ -152,7 +157,7 @@ pub(crate) fn authored_with_catalog(
             dop(),
             FinalWriteLowering {
                 reads: None,
-                write: sink(0),
+                write: declared_inputs[0].clone(),
                 write_target_ordinal: ordinal,
                 auxiliary: &auxiliary,
                 targets: FinalizedWriteTargetSet::try_new([(ordinal, write_handle())]).unwrap(),
@@ -204,7 +209,7 @@ pub(crate) fn authored_with_catalog(
                 )],
                 partition_input_positions: Vec::new(),
                 output_partition_ordinals: Vec::new(),
-                sink: sink(i),
+                sink: declared_inputs[i].clone(),
             })
             .collect();
         let handles = (0..counts.len()).map(|i| {
@@ -302,7 +307,17 @@ fn walk(
     let events = RefCell::new(Vec::new());
     let result = (|| {
         let final_source = final_entry(owner, ordinal, &mut work)?;
-        assert!(final_source.canonical().is_none());
+        let final_canonical = final_source.canonical().unwrap();
+        assert!(final_canonical.belongs_to(final_source.captured()));
+        assert_eq!(
+            final_canonical.selected().argument_types.as_ref(),
+            final_source
+                .source()
+                .binding
+                .function
+                .argument_types
+                .as_ref()
+        );
         let captured = final_source.captured();
         let state = final_source.state_inputs_observed(&mut work)?;
         let root = state.root();
@@ -326,6 +341,7 @@ fn walk(
                 assert_eq!(endpoint.fragment, source.fragment().id());
                 let canonical = source.canonical().unwrap();
                 assert!(canonical.belongs_to(source.captured()));
+                assert!(!Arc::ptr_eq(final_canonical, canonical));
                 assert_eq!(
                     canonical.selected().argument_types.as_ref(),
                     source.source().binding.function.argument_types.as_ref()

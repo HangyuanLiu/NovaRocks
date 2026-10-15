@@ -20,12 +20,11 @@
 //! taken from the exact inbound cut, never from a legacy native node ID.
 
 use crate::{assert_rows::reserve_vec, lowering::FragmentCompileError};
-use arrow_schema::{Field, Schema};
 use novarocks_local_program::{CompiledExchangeInput, ProgramNodeKind, StaticLayout};
 use novarocks_physical_plan::{Distribution, EdgeKind, FragmentPackage, NodeKind, PhysicalNode};
 use novarocks_type_contract::{CompileCheckpoints, CompilePhase, PureCompileControl};
 use novarocks_types::SlotId;
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 pub(crate) struct LoweredExchangeSource {
     pub kind: ProgramNodeKind,
@@ -33,79 +32,83 @@ pub(crate) struct LoweredExchangeSource {
     pub input: CompiledExchangeInput,
 }
 
-pub(crate) fn lower_exchange_source(
+pub(crate) fn lower_exchange_source_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     slots: &[SlotId],
     exchange_wait: Duration,
     control: &dyn PureCompileControl,
-) -> Result<LoweredExchangeSource, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<LoweredExchangeSource, crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(package, node, slots, exchange_wait, &mut work);
-    if matches!(&result, Err(FragmentCompileError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    let result = lower_core_with_creation(package, node, slots, exchange_wait, &mut work, creation);
+    crate::creation::finish_attempt(result, work)
 }
 
-fn lower_core(
+fn lower_core_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     slots: &[SlotId],
     exchange_wait: Duration,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<LoweredExchangeSource, FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<LoweredExchangeSource, crate::FragmentCreationError<H>> {
     let NodeKind::ExchangeSource { edge, imports } = &node.kind else {
-        return Err(FragmentCompileError::Invalid("ExchangeSource kind differs"));
+        return Err((FragmentCompileError::Invalid("ExchangeSource kind differs")).into());
     };
     if !node.inputs.is_empty()
         || slots.len() != node.output.columns.len()
         || imports.len() != node.output.columns.len()
     {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "ExchangeSource input, import or channel width differs",
-        ));
+        ))
+        .into());
     }
     let mut found = None;
     for cut in package.cuts().inbound.iter() {
         let addressed = cut.destination_node == node.id;
         work.step()?;
         if addressed && found.replace(cut).is_some() {
-            return Err(FragmentCompileError::Invalid(
+            return Err((FragmentCompileError::Invalid(
                 "ExchangeSource has more than one inbound cut",
-            ));
+            ))
+            .into());
         }
     }
     let cut = found.ok_or(FragmentCompileError::Invalid(
         "ExchangeSource has no inbound cut",
     ))?;
     if cut.edge != *edge {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "ExchangeSource edge differs from its inbound cut",
-        ));
+        ))
+        .into());
     }
     if cut.kind != EdgeKind::Stream || cut.change_stream_writer.is_some() {
-        return Err(FragmentCompileError::Unsupported {
+        return Err((FragmentCompileError::Unsupported {
             node: Some(node.id),
             feature: "inbound CTE or change-stream edge",
-        });
+        })
+        .into());
     }
     // A writer-result receiver presents the writer relation positionally,
     // named by its frozen relation fields; the finish admission proved that
     // it feeds exactly one finish.
     let relation = cut.writer_result.as_ref().map(|relation| &relation.fields);
     if relation.is_some_and(|fields| fields.len() != node.output.columns.len()) {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "writer-result cut width differs from its receiver",
-        ));
+        ))
+        .into());
     }
     // Receive binding is positional: wire column `i` is the cut's import `i`,
     // and the received occurrence `i` is that import's destination value.
     if cut.imports.len() != imports.len() {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "ExchangeSource imports differ from its inbound cut",
-        ));
+        ))
+        .into());
     }
     for ((import, (source, destination)), output) in cut
         .imports
@@ -118,9 +121,10 @@ fn lower_core(
             && destination == output;
         work.step()?;
         if !exact {
-            return Err(FragmentCompileError::Invalid(
+            return Err((FragmentCompileError::Invalid(
                 "ExchangeSource occurrence differs from its inbound cut import",
-            ));
+            ))
+            .into());
         }
     }
     // The edge names keys in the destination value domain. Project each
@@ -128,9 +132,9 @@ fn lower_core(
     let keys = match &cut.partitioning.destination {
         Distribution::Hash { keys, .. } | Distribution::BucketShuffle { keys, .. } => {
             if keys.is_empty() {
-                return Err(FragmentCompileError::Invalid(
-                    "ExchangeSource hash cut has no keys",
-                ));
+                return Err(
+                    (FragmentCompileError::Invalid("ExchangeSource hash cut has no keys")).into(),
+                );
             }
             keys.as_ref()
         }
@@ -146,9 +150,10 @@ fn lower_core(
         for (ordinal, value) in node.output.columns.iter().enumerate() {
             work.step()?;
             if value == key && found.replace(slots[ordinal]).is_some() {
-                return Err(FragmentCompileError::Invalid(
+                return Err((FragmentCompileError::Invalid(
                     "ExchangeSource hash key has more than one output occurrence",
-                ));
+                ))
+                .into());
             }
         }
         hash_partition_slots.push(found.ok_or(FragmentCompileError::Invalid(
@@ -158,18 +163,8 @@ fn lower_core(
     let result = package
         .result()
         .filter(|result| result.output.columns == node.output.columns);
-    let mut fields: Vec<Field> = Vec::new();
-    if package.original_metadata_namespace().is_none() {
-        reserve_vec(&mut fields, slots.len(), work)?;
-    }
-    let mut original_fields = match package.original_metadata_namespace() {
-        Some(_) => {
-            let mut original_fields = Vec::new();
-            reserve_vec(&mut original_fields, slots.len(), work)?;
-            Some(original_fields)
-        }
-        None => None,
-    };
+    let mut typed_layout =
+        crate::typed_layout::TypedLayoutBuilder::new_with_creation(slots.len(), work, creation)?;
     for (ordinal, value) in node.output.columns.iter().enumerate() {
         let ty = &package
             .fragment()
@@ -188,11 +183,12 @@ fn lower_core(
                 let same = field.destination == *value && field.ty == *ty;
                 work.step()?;
                 if !same {
-                    return Err(FragmentCompileError::Invalid(
+                    return Err((FragmentCompileError::Invalid(
                         "writer-result cut field differs from its received occurrence",
-                    ));
+                    ))
+                    .into());
                 }
-                field.name.to_string()
+                crate::typed_layout::copy_name_with_creation(&field.name, work, creation)?
             }
             (None, Some(result)) => {
                 let field = result
@@ -201,38 +197,26 @@ fn lower_core(
                     .ok_or(FragmentCompileError::Invalid(
                         "missing ExchangeSource result label",
                     ))?;
-                field.alias.as_deref().unwrap_or(&field.name).to_owned()
+                crate::typed_layout::copy_name_with_creation(
+                    field.alias.as_deref().unwrap_or(&field.name),
+                    work,
+                    creation,
+                )?
             }
-            (None, None) => format!("local_exchange_{}_{}", node.id.get(), ordinal),
+            (None, None) => crate::typed_layout::local_name_with_creation(
+                "local_exchange",
+                node.id.get(),
+                ordinal,
+                work,
+                creation,
+            )?,
         };
         work.flush()?;
-        if let Some(original_fields) = original_fields.as_mut() {
-            let field = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(ty, name);
-            work.flush()?;
-            original_fields.push(field?);
-        } else {
-            let field = ty.try_to_field(name);
-            work.flush()?;
-            fields.push(field?);
-        }
+        typed_layout.push_with_creation(ty, name, work, creation)?;
         work.step()?;
     }
     work.flush()?;
-    let layout = match (original_fields, package.original_metadata_namespace()) {
-        (Some(fields), Some(namespace)) => {
-            let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema();
-            StaticLayout::try_new_materialized_for_compile(
-                source,
-                Arc::from(slots),
-                work.control(),
-            )?
-        }
-        _ => StaticLayout::try_new_for_compile(
-            Arc::new(Schema::new(fields)),
-            Arc::from(slots),
-            work.control(),
-        )?,
-    };
+    let layout = typed_layout.finish_with_creation(slots, work, creation)?;
     work.flush()?;
     Ok(LoweredExchangeSource {
         kind: ProgramNodeKind::ExchangeSource {

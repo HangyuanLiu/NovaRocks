@@ -66,8 +66,8 @@ pub(super) fn evaluate_string_to_base64<'a>(
         let FunctionArgumentType::Value(source_type) = &types[0] else {
             return Err(invalid("to_base64 requires a value argument"));
         };
-        if source_type.logical_type != ValueLogicalType::Physical
-            || source_type.data_type != DataType::Utf8
+        if source_type.logical_type() != ValueLogicalType::Physical
+            || source_type.data_type() != &DataType::Utf8
         {
             return Err(invalid(
                 "to_base64 differs from its exact installed argument profile",
@@ -75,9 +75,9 @@ pub(super) fn evaluate_string_to_base64<'a>(
         }
         work.step()?;
         let target = input.contract().result_type();
-        if target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
+        if target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Utf8
+            || !target.nullable()
         {
             return Err(invalid(
                 "to_base64 differs from its exact installed result profile",
@@ -113,7 +113,7 @@ pub(super) fn evaluate_string_to_base64<'a>(
             if row >= reader.len() {
                 return Err(internal("to_base64 selected argument row is out of bounds"));
             }
-            if reader.is_null(row) && !source_type.nullable {
+            if reader.is_null(row) && !source_type.nullable() {
                 return Err(internal(
                     "to_base64 non-null argument contains selected SQL NULL",
                 ));
@@ -176,7 +176,7 @@ pub(super) fn evaluate_string_to_base64<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

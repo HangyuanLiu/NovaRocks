@@ -20,7 +20,7 @@ use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
 
 /// Project the fixture's original nominal identity; no carrier infers a domain.
 pub(crate) fn result_value_domain(ty: &FunctionValueType) -> ResultValueDomain {
-    match ty.logical_type {
+    match ty.logical_type() {
         ValueLogicalType::Physical | ValueLogicalType::LargeInt | ValueLogicalType::Uuid => {
             ResultValueDomain::Plain
         }

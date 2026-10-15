@@ -64,6 +64,45 @@ impl CopyIndices {
         }
     }
 }
+/// Borrowed actual index vocabulary. No Arc or semantic declaration is created
+/// to inspect the original gather plan.
+#[derive(Clone, Copy)]
+pub enum CopyIndexView<'a> {
+    UInt32(&'a UInt32Array),
+    UInt64(&'a UInt64Array),
+}
+impl CopyIndices {
+    pub fn borrowed(&self) -> CopyIndexView<'_> {
+        match self {
+            Self::UInt32(a) => CopyIndexView::UInt32(a),
+            Self::UInt64(a) => CopyIndexView::UInt64(a),
+        }
+    }
+}
+impl CopyIndexView<'_> {
+    pub(super) fn len(&self) -> usize {
+        self.as_array().len()
+    }
+    pub(super) fn as_array(&self) -> &dyn Array {
+        match self {
+            Self::UInt32(a) => *a,
+            Self::UInt64(a) => *a,
+        }
+    }
+    pub(super) fn raw_value(&self, row: usize) -> usize {
+        match self {
+            Self::UInt32(a) => a.value(row).as_usize(),
+            Self::UInt64(a) => a.value(row).as_usize(),
+        }
+    }
+    pub(super) fn index_maximum(&self) -> usize {
+        match self {
+            Self::UInt32(_) => u32::MAX as usize,
+            Self::UInt64(_) => usize::MAX,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum CopyOperationError {
     Preflight(CopyError),
@@ -112,6 +151,13 @@ impl CopyOperationFacts {
             copied_root: None,
         })
     }
+    pub(super) fn admit_original_take_diagnostic(
+        &mut self,
+        diagnostic: &super::copy_diagnostic::OriginalTakeDiagnosticFacts,
+    ) -> Result<(), CopyError> {
+        self.operation_peak = add(self.operation_peak, diagnostic.operation_peak_bytes())?;
+        Ok(())
+    }
     pub(super) fn admit_original_concat_diagnostic(
         &mut self,
         diagnostic: &super::concat_diagnostic::OriginalConcatDiagnosticFacts,
@@ -133,8 +179,87 @@ pub(super) struct CopyInvoiceTotals {
     selected_buffers: usize,
     exact_buffers: usize,
     metadata: usize,
+    // These classifications are populated only for the paired structural port.
+    // The existing full-operation facts and arithmetic remain unchanged.
+    classify_structure: bool,
+    result_metadata: usize,
+    temporary_structure_backing: usize,
 }
 impl CopyInvoiceTotals {
+    pub(super) fn structural() -> Self {
+        Self {
+            classify_structure: true,
+            ..Self::default()
+        }
+    }
+    pub(super) fn temporary_metadata_upper(&self) -> Result<usize, CopyError> {
+        add(self.metadata, self.temporary_structure_backing)
+    }
+    pub(super) fn result_metadata_upper(&self) -> usize {
+        self.result_metadata
+    }
+
+    /// Called by the existing selected-node visitor, once per actually emitted
+    /// node. Borrowed Dictionary/ListView children are not walked a second time.
+    pub(super) fn observe_result_node(&mut self, sources: &[&dyn Array]) -> Result<(), CopyError> {
+        if !self.classify_structure {
+            return Ok(());
+        }
+        let array = *sources
+            .first()
+            .ok_or(CopyError::Invalid("copy has no result carrier"))?;
+        let ty = array.data_type();
+        let (buffers, children) = match ty {
+            DataType::Null => (0, 0),
+            DataType::Utf8 | DataType::Binary | DataType::LargeUtf8 | DataType::LargeBinary => {
+                (2, 0)
+            }
+            DataType::Utf8View | DataType::BinaryView => {
+                let mut buffers = 1;
+                for source in sources {
+                    let count = if matches!(ty, DataType::Utf8View) {
+                        source
+                            .as_any()
+                            .downcast_ref::<arrow_array::StringViewArray>()
+                            .ok_or(CopyError::Invalid("copy view has wrong concrete carrier"))?
+                            .data_buffers()
+                            .len()
+                    } else {
+                        source
+                            .as_any()
+                            .downcast_ref::<arrow_array::BinaryViewArray>()
+                            .ok_or(CopyError::Invalid("copy view has wrong concrete carrier"))?
+                            .data_buffers()
+                            .len()
+                    };
+                    buffers = add(buffers, count)?;
+                }
+                (buffers, 0)
+            }
+            DataType::List(_) | DataType::LargeList(_) | DataType::Map(..) => (1, 1),
+            DataType::ListView(_) | DataType::LargeListView(_) => (2, 1),
+            DataType::FixedSizeList(..) => (0, 1),
+            DataType::Struct(fields) => (0, fields.len()),
+            DataType::Dictionary(..) => (1, 1),
+            DataType::Union(fields, mode) => {
+                (if *mode == UnionMode::Dense { 2 } else { 1 }, fields.len())
+            }
+            DataType::RunEndEncoded(ends, _) => {
+                // The run-end primitive is constructed beside the visited values.
+                self.result_metadata = add(
+                    self.result_metadata,
+                    result_node_metadata_upper(ends.data_type(), 1, false, 0)?,
+                )?;
+                (0, 2)
+            }
+            _ => (1, 0),
+        };
+        self.result_metadata = add(
+            self.result_metadata,
+            result_node_metadata_upper(ty, buffers, true, children)?,
+        )?;
+        Ok(())
+    }
     fn initial(&mut self, bytes: usize) -> Result<(), CopyError> {
         self.initial_buffers = add(self.initial_buffers, zip::rounded_capacity(bytes)?)?;
         Ok(())
@@ -149,6 +274,31 @@ impl CopyInvoiceTotals {
             CopyBufferPeak::exact(bytes)?.retained_upper(),
         )?;
         Ok(())
+    }
+    fn temporary_exact(&mut self, bytes: usize) -> Result<(), CopyError> {
+        // The original author already bounds these concrete index/map Vecs.
+        // Reuse that SAME extent for the temporary structural classification.
+        if self.classify_structure {
+            self.temporary_structure_backing = add(
+                self.temporary_structure_backing,
+                CopyBufferPeak::exact(bytes)?.retained_upper(),
+            )?;
+        }
+        self.exact(bytes)
+    }
+    pub(super) fn interleave_exact_payload(&mut self, bytes: usize) -> Result<(), CopyError> {
+        self.exact(bytes)
+    }
+    pub(super) fn interleave_validity(&mut self, rows: usize) -> Result<(), CopyError> {
+        self.exact(zip::rounded_capacity(add(
+            rows / 8,
+            usize::from(!rows.is_multiple_of(8)),
+        )?)?)
+    }
+    pub(super) fn empty_offsets(&mut self, width: usize) -> Result<(), CopyError> {
+        // new_empty's from_len_zeroed has one initial rounded allocation and
+        // no append/realloc path. This is a locked upper bound, not Layout.
+        self.exact(zip::rounded_capacity(width)?)
     }
     pub(super) fn selected_payload(
         &mut self,
@@ -243,7 +393,7 @@ impl CopyInvoiceTotals {
                 if mode.is_take() {
                     // RunEndBuffer owns ordered_indices AND physical_indices
                     // simultaneously. Unstable index sort allocates no heap.
-                    self.exact(mul(2, mul(rows, size_of::<usize>())?)?)?;
+                    self.temporary_exact(mul(2, mul(rows, size_of::<usize>())?)?)?;
                     // Both original builders start at one and double; final
                     // emitted runs cannot exceed actual selected logical rows.
                     self.initial(width)?;
@@ -337,9 +487,9 @@ impl CopyInvoiceTotals {
         let key_width = key.primitive_width().ok_or(CopyError::Extent)?;
         // Actual masked-values Vec tuples (index, optional borrowed bytes),
         // one native mapping per domain element and interleave source choices.
-        self.exact(mul(domain, size_of::<(usize, Option<&[u8]>)>())?)?;
-        self.exact(mul(domain, key_width)?)?;
-        self.exact(mul(domain, size_of::<(usize, usize)>())?)?;
+        self.temporary_exact(mul(domain, size_of::<(usize, Option<&[u8]>)>())?)?;
+        self.temporary_exact(mul(domain, key_width)?)?;
+        self.temporary_exact(mul(domain, size_of::<(usize, usize)>())?)?;
         self.metadata = add(
             self.metadata,
             mul(source_count, size_of::<Vec<(usize, Option<&[u8]>)>>())?,
@@ -355,7 +505,7 @@ impl CopyInvoiceTotals {
             .leading_zeros();
         let buckets = (u64::MAX >> shift).saturating_add(1);
         let buckets = usize::try_from(buckets).map_err(|_| CopyError::Extent)?;
-        self.exact(mul(buckets, size_of::<Option<(Option<&[u8]>, u64)>>())?)
+        self.temporary_exact(mul(buckets, size_of::<Option<(Option<&[u8]>, u64)>>())?)
     }
 
     pub(super) fn constructor(
@@ -451,6 +601,21 @@ impl CopyInvoiceTotals {
     }
 }
 
+/// The sole result-custody node author. This conservative construction
+/// envelope contains private owners and the concrete Array Arc; callers must
+/// not charge an additional wrapper Arc for the same constructor.
+pub(super) fn result_node_metadata_upper(
+    ty: &DataType,
+    buffers: usize,
+    has_nulls: bool,
+    children: usize,
+) -> Result<usize, CopyError> {
+    crate::arrow_result_custody::custody_typed_node_metadata_upper_bound(
+        ty, buffers, has_nulls, children,
+    )
+    .map_err(CopyError::Control)
+}
+
 struct CopySources<C> {
     source: ArrayRef,
     indices: CopyIndices,
@@ -538,7 +703,7 @@ pub fn take_copy_in<C: Send + Sync + 'static>(
     let mut facts = invoice.finish(source_metadata)?;
     work.flush()?;
     let diagnostic = super::copy_diagnostic::OriginalTakeDiagnosticFacts::try_new()?;
-    facts.operation_peak = add(facts.operation_peak, diagnostic.operation_peak_bytes())?;
+    facts.admit_original_take_diagnostic(&diagnostic)?;
     let mut reservation = charge.reserve_operation(facts.operation_peak_bytes())?;
     work.flush()?;
     let copied =

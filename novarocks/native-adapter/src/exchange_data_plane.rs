@@ -65,6 +65,7 @@ pub enum ExchangeRouteDelivery {
     Delivered,
     NormallyClosed(NormalClosedInbound),
     Refused(String),
+    Receiver(novarocks_execution::runtime::exchange::ExchangeReceiveFailure),
 }
 
 impl ExchangeRouteClaim {
@@ -98,9 +99,7 @@ pub trait ExchangeRouteAuthority: Send + Sync + 'static {
         match self.claim_exchange_route(query) {
             ExchangeRouteClaim::Authorized => match receiver_port.push(key, frame) {
                 Ok(()) => ExchangeRouteDelivery::Delivered,
-                Err(error) => {
-                    ExchangeRouteDelivery::Refused(format!("exchange ingress failed: {error}"))
-                }
+                Err(error) => ExchangeRouteDelivery::Receiver(error),
             },
             ExchangeRouteClaim::NormallyClosed(proof) => {
                 ExchangeRouteDelivery::NormallyClosed(proof)
@@ -154,26 +153,31 @@ impl ExchangeRouteAuthority for TaskInboundCapabilitiesRouteAuthority {
         key: ExchangeReceiverKey,
         frame: ExchangeReceiverFrame,
     ) -> ExchangeRouteDelivery {
-        match self.0.deliver_frame(
+        match self.0.deliver_frame_with_receiver_error(
             query.destination_fragment_instance_id,
             FragmentNodeId::new(query.destination_node_id),
             query.source_fragment_instance_id,
             query.sender_ordinal,
             query.sender_count,
-            || {
-                receiver_port
-                    .push(key, frame)
-                    .map_err(|error| error.to_string())
-            },
+            || receiver_port.push(key, frame),
         ) {
-            InboundFrameClaim::Authorized => ExchangeRouteDelivery::Delivered,
-            InboundFrameClaim::NormallyClosed(proof) => {
-                ExchangeRouteDelivery::NormallyClosed(proof)
+            novarocks_worker::InboundFrameDelivery::Claim(InboundFrameClaim::Authorized) => {
+                ExchangeRouteDelivery::Delivered
             }
-            InboundFrameClaim::Refused(detail) => ExchangeRouteDelivery::Refused(detail),
-            InboundFrameClaim::NotHeld => ExchangeRouteDelivery::Refused(
-                "task destination was withdrawn before delivery".to_owned(),
-            ),
+            novarocks_worker::InboundFrameDelivery::Claim(InboundFrameClaim::NormallyClosed(
+                proof,
+            )) => ExchangeRouteDelivery::NormallyClosed(proof),
+            novarocks_worker::InboundFrameDelivery::Claim(InboundFrameClaim::Refused(detail)) => {
+                ExchangeRouteDelivery::Refused(detail)
+            }
+            novarocks_worker::InboundFrameDelivery::Claim(InboundFrameClaim::NotHeld) => {
+                ExchangeRouteDelivery::Refused(
+                    "task destination was withdrawn before delivery".to_owned(),
+                )
+            }
+            novarocks_worker::InboundFrameDelivery::Receiver(error) => {
+                ExchangeRouteDelivery::Receiver(error)
+            }
         }
     }
 }
@@ -383,6 +387,12 @@ pub fn handle_transmit_chunk(
                 sender_ordinal: proof.source().sender_ordinal(),
                 sender_count: proof.sender_count(),
             });
+        }
+        ExchangeRouteDelivery::Receiver(error) => {
+            // This is the existing final wire projection, not error classification.
+            response.status = Some(error_common_status(format!(
+                "exchange ingress failed: {error}"
+            )));
         }
         ExchangeRouteDelivery::Refused(detail) => {
             response.status = Some(error_common_status(format!(

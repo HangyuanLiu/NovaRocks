@@ -160,10 +160,10 @@ fn inlist_signed_actual_source_definitions_ordered_uses_guards_and_exact_recipe(
             use_id: snapshot.bindings()[&site],
         })
         .unwrap();
-    assert_eq!(recipe.source_type().data_type, DataType::Int64);
+    assert_eq!(recipe.source_type().data_type().clone(), DataType::Int64);
     assert_eq!(recipe.candidate_types().len(), 3);
-    assert_eq!(recipe.result_type().data_type, DataType::Boolean);
-    assert!(recipe.result_type().nullable);
+    assert_eq!(recipe.result_type().data_type().clone(), DataType::Boolean);
+    assert!(recipe.result_type().nullable());
 }
 #[test]
 fn inlist_signed_actual_all_widths_value_truthonly_null_sparse_sliced_empty() {
@@ -242,12 +242,12 @@ fn inlist_signed_actual_all_widths_value_truthonly_null_sparse_sliced_empty() {
                     use_id,
                 })
                 .unwrap();
-            assert_eq!(recipe.source_type().data_type, ty);
+            assert_eq!(recipe.source_type().data_type().clone(), ty);
             assert!(
                 recipe
                     .candidate_types()
                     .iter()
-                    .all(|candidate| candidate.data_type == ty)
+                    .all(|candidate| *candidate.data_type() == ty)
             );
             let data = batch(&program, site, input.clone());
             for rows in [vec![0, 1, 2, 3], vec![1, 3], vec![]] {

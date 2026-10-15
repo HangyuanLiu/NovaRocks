@@ -113,7 +113,7 @@ fn request_fragment(
     builder
         .add_values(NodeId::new(99), Box::from([Box::default()]), Box::default())
         .unwrap();
-    let argument_kind = match &ty.data_type {
+    let argument_kind = match &ty.data_type() {
         DataType::Int64 => ExprKind::Literal(crate::LiteralValue::Int64(42)),
         _ => ExprKind::Literal(crate::LiteralValue::Null),
     };
@@ -125,10 +125,12 @@ fn request_fragment(
         function_id: FunctionId::try_new("test/request-source").unwrap(),
         overload: FunctionOverloadId::try_new("test/request-source/structural/v1").unwrap(),
         kind: FunctionKind::Scalar,
-        argument_types: refs
-            .iter()
-            .map(|_| crate::FunctionArgumentType::Value(ty.clone()))
-            .collect(),
+        argument_types: novarocks_type_contract::TypedFactSlice::from_pure_boxed(
+            refs.iter()
+                .map(|_| crate::FunctionArgumentType::Value(ty.clone()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        ),
         result_type: result.clone(),
         legacy_metadata: Some(crate::LegacyBindingMetadata {
             volatility: FunctionVolatility::Immutable,
@@ -385,10 +387,10 @@ fn request_reference_missing_pool_out_of_bounds_and_full_type_refuse_without_rea
 }
 
 #[test]
-fn request_nested_metadata_source_type_is_checked_against_the_real_admitted_pool() {
+fn request_nested_named_semantics_are_checked_against_the_real_admitted_pool() {
     let field = |metadata: &str| {
         Arc::new(
-            Field::new("nested", DataType::Int64, true).with_metadata(
+            Field::new(metadata, DataType::Int64, true).with_metadata(
                 [("source.metadata".to_owned(), metadata.to_owned())]
                     .into_iter()
                     .collect(),
@@ -399,7 +401,7 @@ fn request_nested_metadata_source_type_is_checked_against_the_real_admitted_pool
     let pool = ConstantPool::try_new(
         Arc::new(ty.try_to_field("request.struct").unwrap()),
         ty.clone(),
-        new_null_array(&ty.data_type, 2).to_data(),
+        new_null_array(&ty.data_type(), 2).to_data(),
         policy(),
         PHASE,
         &Control::default(),

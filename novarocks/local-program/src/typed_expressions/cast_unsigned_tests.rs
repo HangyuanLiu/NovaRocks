@@ -40,7 +40,7 @@ fn fixture(
                     decimal_overflow_policy: policy,
                     allow_throw_exception: allow,
                 },
-                result.data_type.clone(),
+                result.data_type().clone(),
                 None,
             ),
             slot(2, &boolean(false)),
@@ -264,5 +264,25 @@ fn unsigned_cast_type_checks_preserve_original_control_at_success_and_error_tail
                 }
             }
         }
+    }
+}
+
+#[test]
+fn carrier_cast_cannot_erase_nested_nominal_domain_even_in_an_unused_definition() {
+    let source = crate::test_value_types::string_structure(&[("payload", true, true)], true);
+    let target = crate::test_value_types::string_structure(&[("payload", true, false)], true);
+    assert_eq!(source.data_type(), target.data_type());
+    for dead in [false, true] {
+        let (calls, types) = fixture(
+            source.clone(),
+            target.clone(),
+            dead,
+            DecimalOverflowPolicy::OutputNull,
+            false,
+        );
+        assert_eq!(
+            ProgramTypedExpressions::try_new(calls, types, &Control).unwrap_err(),
+            ProgramExpressionTypeError::TypeMismatch
+        );
     }
 }

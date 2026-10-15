@@ -551,6 +551,7 @@ pub struct IcebergChangeWindowHandle {
     from_read_domain: Arc<crate::delete_semantics::ReadDomain>,
     to_read_domain: Arc<crate::delete_semantics::ReadDomain>,
     partition_spec_jsons: BTreeMap<i32, String>,
+    nominal_declarations: crate::schema_mapping::nominal_declaration::NominalSourceDeclarations,
 }
 
 impl IcebergChangeWindowHandle {
@@ -619,12 +620,31 @@ impl IcebergChangeWindowHandle {
             from_read_domain,
             to_read_domain,
             partition_spec_jsons,
+            nominal_declarations: BTreeMap::new(),
         })
     }
 
     /// The partition spec a split names, by spec id.
     pub const fn partition_spec_jsons(&self) -> &BTreeMap<i32, String> {
         &self.partition_spec_jsons
+    }
+
+    pub(crate) fn with_nominal_declarations(
+        mut self,
+        declarations: crate::schema_mapping::nominal_declaration::NominalSourceDeclarations,
+    ) -> Result<Self, ConnectorError> {
+        crate::schema_mapping::nominal_declaration::validate_frozen_schema(
+            &self.parse_table_schema()?,
+            &declarations,
+        )?;
+        self.nominal_declarations = declarations;
+        Ok(self)
+    }
+
+    pub(crate) fn nominal_declarations(
+        &self,
+    ) -> &crate::schema_mapping::nominal_declaration::NominalSourceDeclarations {
+        &self.nominal_declarations
     }
 
     pub const fn schema_table_name(&self) -> &SchemaTableName {
@@ -714,6 +734,11 @@ impl IcebergChangeWindowHandle {
             from_read_domain: Some(super::split::encode_read_domain(&self.from_read_domain)),
             to_read_domain: Some(super::split::encode_read_domain(&self.to_read_domain)),
             partition_spec_jsons: self.partition_spec_jsons.clone(),
+            nominal_declarations: self
+                .nominal_declarations
+                .iter()
+                .map(|(id, domain)| (*id, domain.name().to_string()))
+                .collect(),
         }
     }
 
@@ -743,7 +768,20 @@ impl IcebergChangeWindowHandle {
                 })?,
             )?,
             partition_spec_jsons: raw.partition_spec_jsons.clone(),
-        })
+        })?
+        .with_nominal_declarations(
+            raw.nominal_declarations
+                .iter()
+                .map(|(id, value)| {
+                    Ok((
+                        *id,
+                        crate::schema_mapping::nominal_declaration::NominalSourceDomain::parse(
+                            value,
+                        )?,
+                    ))
+                })
+                .collect::<Result<_, ConnectorError>>()?,
+        )
     }
 }
 

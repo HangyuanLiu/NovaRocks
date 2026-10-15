@@ -45,7 +45,7 @@ pub(super) fn original_native_profile(
     // author independently of nominal Physical/LargeInt/Uuid tags. Exact FVT
     // validity and canonical selection remain the original resolver's work.
     let numeric = matches!(
-        source.data_type,
+        source.data_type(),
         DataType::Int8
             | DataType::Int16
             | DataType::Int32
@@ -59,9 +59,9 @@ pub(super) fn original_native_profile(
         return false;
     };
     numeric
-        && target.logical_type == ValueLogicalType::Physical
-        && target.data_type == DataType::Binary
-        && target.nullable
+        && target.logical_type() == ValueLogicalType::Percentile
+        && target.data_type() == &DataType::Binary
+        && target.nullable()
 }
 pub(super) fn validate_profile(
     contract: &ScalarCallContract,
@@ -112,7 +112,7 @@ pub(super) fn evaluate<'a>(
         else {
             unreachable!("profile checks every value channel")
         };
-        if array.data_type() != &source.data_type {
+        if array.data_type() != source.data_type() {
             return Err(internal(
                 "percentile_hash demanded carrier differs from its original full source type",
             ));
@@ -140,7 +140,7 @@ pub(super) fn evaluate<'a>(
                     "percentile_hash demanded address exceeds its original carrier",
                 ));
             }
-            if !source.nullable && array.is_null(row) {
+            if !source.nullable() && array.is_null(row) {
                 return Err(internal(
                     "percentile_hash nonnull source contains selected SQL NULL",
                 ));
@@ -205,7 +205,7 @@ pub(super) fn evaluate<'a>(
         observed(control.checkpoint(0))?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &input.contract().result_type().data_type,
+            input.contract().result_type().data_type(),
             array,
             Box::default(),
             || observed(rows.step()),

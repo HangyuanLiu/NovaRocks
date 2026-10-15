@@ -21,7 +21,7 @@ mod case;
 mod cast;
 mod comparison;
 pub mod compiled_program;
-mod constant_eval;
+pub(crate) mod constant_eval;
 pub mod decimal;
 mod dict_decode;
 pub mod dict_peel;
@@ -142,6 +142,7 @@ pub struct ExprArena {
     nodes: Vec<ExprNode>,
     types: Vec<DataType>,
     field_schemas: Vec<Option<ChunkFieldSchema>>,
+    complete_types: Vec<Option<novarocks_functions::FunctionValueType>>,
     allow_throw_exception: bool,
     query_global_dicts: HashMap<SlotId, Arc<HashMap<i32, Vec<u8>>>>,
     session_time_zone: Option<String>,
@@ -206,7 +207,75 @@ impl ExprArena {
         self.nodes.push(node);
         self.types.push(data_type);
         self.field_schemas.push(None);
+        self.complete_types.push(None);
         id
+    }
+
+    /// Author a node from the exact decoded binding, retaining its creators.
+    pub fn push_value_typed(
+        &mut self,
+        node: ExprNode,
+        value_type: novarocks_functions::FunctionValueType,
+    ) -> ExprId {
+        let id = self.push_typed(node, value_type.data_type().clone());
+        self.field_schemas[id.0] = Some(ChunkFieldSchema::from_value_type(
+            value_type.value_type().clone(),
+        ));
+        self.complete_types[id.0] = Some(value_type);
+        id
+    }
+
+    /// Attach a saved binding only to the same exact declared carrier.
+    pub fn set_value_type(
+        &mut self,
+        id: ExprId,
+        value_type: novarocks_functions::FunctionValueType,
+    ) -> Result<(), String> {
+        self.set_value_type_observed::<String>(id, value_type, || Ok(()))
+    }
+
+    pub fn set_value_type_observed<E: From<String>>(
+        &mut self,
+        id: ExprId,
+        value_type: novarocks_functions::FunctionValueType,
+        mut observe: impl FnMut() -> Result<(), E>,
+    ) -> Result<(), E> {
+        let Some(data_type) = self.types.get(id.0) else {
+            return Err(format!("expression id {} is out of bounds", id.0).into());
+        };
+        enum MatchError<E> {
+            Observer(E),
+            Type(novarocks_type_contract::ValueTypeError),
+        }
+        impl<E> From<novarocks_type_contract::ValueTypeError> for MatchError<E> {
+            fn from(error: novarocks_type_contract::ValueTypeError) -> Self {
+                Self::Type(error)
+            }
+        }
+        let same = novarocks_type_contract::arrow_data_types_exact_observed(
+            data_type,
+            value_type.data_type(),
+            || observe().map_err(MatchError::Observer),
+        )
+        .map_err(|error| match error {
+            MatchError::Observer(error) => error,
+            MatchError::Type(error) => E::from(error.to_string()),
+        })?;
+        if !same {
+            return Err(
+                String::from("expression carrier differs from its complete binding").into(),
+            );
+        }
+        observe()?;
+        self.field_schemas[id.0] = Some(ChunkFieldSchema::from_value_type(
+            value_type.value_type().clone(),
+        ));
+        self.complete_types[id.0] = Some(value_type);
+        Ok(())
+    }
+
+    pub fn value_type(&self, id: ExprId) -> Option<&novarocks_functions::FunctionValueType> {
+        self.complete_types.get(id.0).and_then(Option::as_ref)
     }
 
     pub fn node(&self, id: ExprId) -> Option<&ExprNode> {
@@ -272,7 +341,7 @@ impl ExprArena {
             .ok_or_else(|| "invalid ExprId".to_string())?;
         match node {
             ExprNode::Constant(value) => {
-                if !self.data_type(id).is_some_and(|ty| novarocks_type_contract::arrow_data_types_exact(ty, &value.value_type().data_type)) {
+                if !self.data_type(id).is_some_and(|ty| novarocks_type_contract::arrow_data_types_exact(ty, &value.value_type().data_type())) {
                     return Err("constant pool carrier differs from expression metadata".into());
                 }
                 constant_eval::broadcast(value, chunk.len())
@@ -413,6 +482,12 @@ impl ExprArena {
                     FunctionKind::MvState(name) => {
                         function::eval_mv_state_function(name, self, id, args, chunk)
                     }
+                    FunctionKind::PercentileToBinary => {
+                        function::eval_percentile_to_binary(self, id, args, chunk)
+                    }
+                    FunctionKind::JsonToText => {
+                        function::eval_json_to_text(self, id, args, chunk)
+                    }
                     FunctionKind::NullIf => {
                         function::eval_nullif(self, id, args[0], args[1], chunk)
                     }
@@ -513,11 +588,13 @@ mod tests {
         ordinal: u32,
     ) -> novarocks_functions::ConstantValue {
         novarocks_functions::ConstantPool::try_new(
-            Arc::new(
-                value_type
-                    .try_to_field("constant")
-                    .expect("exact constant field"),
-            ),
+            // The immutable source Field describes its actual encoding and
+            // source attributes. Its semantic declaration is supplied separately.
+            Arc::new(Field::new(
+                "constant",
+                array.data_type().clone(),
+                value_type.nullable(),
+            )),
             value_type,
             array.to_data(),
             constant_policy(),
@@ -543,8 +620,8 @@ mod tests {
 
     fn evaluate_constant(value: novarocks_functions::ConstantValue, rows: usize) -> ArrayRef {
         let mut arena = ExprArena::default();
-        let ty = value.value_type().data_type.clone();
-        let id = arena.push_typed(ExprNode::Constant(value), ty);
+        let ty = value.value_type().clone();
+        let id = arena.push_value_typed(ExprNode::Constant(value), ty);
         arena
             .eval(id, &constant_chunk(rows))
             .expect("exact constant evaluation")
@@ -633,7 +710,7 @@ mod tests {
         for (array, ty) in cases {
             let value = checked_constant(array, ty.clone(), 1);
             let mut arena = ExprArena::default();
-            let id = arena.push_typed(ExprNode::Constant(value.clone()), ty.data_type.clone());
+            let id = arena.push_value_typed(ExprNode::Constant(value.clone()), ty.clone());
             let frozen = arena.into_immutable().expect("freeze CV leaf");
             let novarocks_local_program::StaticExprKind::Constant(stored) =
                 frozen.nodes()[id.0].kind()
@@ -656,8 +733,8 @@ mod tests {
             let output = thawed
                 .eval(id, &constant_chunk(3))
                 .expect("broadcast thawed CV");
-            assert_eq!(output.data_type(), &ty.data_type);
-            match ty.logical_type {
+            assert_eq!(output.data_type().clone(), ty.data_type().clone());
+            match ty.logical_type() {
                 ValueLogicalType::Json => assert!(
                     output
                         .as_any()
@@ -713,13 +790,64 @@ mod tests {
             )
             .expect("list pool"),
         ) as ArrayRef;
-        let ty = FunctionValueType::new(source.data_type().clone(), false);
-        let output = evaluate_constant(checked_constant(source, ty.clone(), 1), 3);
-        assert_eq!(output.data_type(), &ty.data_type);
+        let ty = FunctionValueType::try_from_typed_binding(
+            novarocks_type_contract::TypedValueBinding::try_new(
+                novarocks_type_contract::ValueTypeRef::try_new(
+                    novarocks_type_contract::ValueKind::List(
+                        FunctionValueType::try_with_logical_type(
+                            DataType::Utf8,
+                            true,
+                            ValueLogicalType::Json,
+                        )
+                        .unwrap()
+                        .value_type()
+                        .clone(),
+                    ),
+                    false,
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                )
+                .unwrap(),
+                novarocks_type_contract::ValueLayout::try_new(
+                    source.data_type(),
+                    novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let actual_carrier = source.data_type().clone();
+        let value = checked_constant(source, ty.clone(), 1);
+        let DataType::List(source_child) = value.field().data_type() else {
+            panic!("source List")
+        };
+        assert_eq!(source_child.metadata()["PARQUET:field_id"], "19");
+        assert_eq!(
+            ty.child_at(0).unwrap().logical_type(),
+            ValueLogicalType::Json
+        );
+        let output = evaluate_constant(value.clone(), 3);
+        // The legacy evaluator preserves the actual source representation.
+        // Actual typed publication uses the production Chunk owner below.
+        assert_eq!(output.data_type(), &actual_carrier);
+        let published = crate::exec::chunk::typed_fixture::columns(
+            &["constant"],
+            &[SlotId::new(5)],
+            &[ty.clone()],
+            vec![output.clone()],
+            3,
+        );
+        assert_eq!(published.columns()[0].data_type(), ty.data_type());
+        let DataType::List(execution_child) = published.columns()[0].data_type() else {
+            panic!("execution List")
+        };
+        assert_eq!(execution_child.metadata().capacity(), 0);
+        assert_eq!(value.field().data_type(), &actual_carrier);
         let list = output
             .as_any()
             .downcast_ref::<ListArray>()
             .expect("list output");
+        assert_eq!(list.value_type(), DataType::Utf8);
         for row in 0..3 {
             let items = list.value(row);
             let strings = items
@@ -730,16 +858,19 @@ mod tests {
             assert_eq!(strings.value(0), "{\"x\":1}");
             assert!(strings.is_null(1));
         }
-        let nullable = FunctionValueType {
-            nullable: true,
-            ..ty
-        };
-        let null = checked_constant(new_null_array(&nullable.data_type, 2), nullable.clone(), 1);
+        let nullable = (ty)
+            .with_nullable(true)
+            .expect("valid value root nullability transform");
+        let null = checked_constant(
+            new_null_array(&nullable.data_type(), 2),
+            nullable.clone(),
+            1,
+        );
         let output = evaluate_constant(null.clone(), 3);
-        assert_eq!(output.data_type(), &nullable.data_type);
+        assert_eq!(output.data_type().clone(), nullable.data_type().clone());
         assert_eq!(output.null_count(), 3);
         let empty = evaluate_constant(null, 0);
-        assert_eq!(empty.data_type(), &nullable.data_type);
+        assert_eq!(empty.data_type().clone(), nullable.data_type().clone());
         assert_eq!(empty.len(), 0);
     }
 
@@ -764,8 +895,9 @@ mod tests {
         for (array, ordinal) in [(dictionary, 1), (run, 3)] {
             let ty =
                 novarocks_type_contract::FunctionValueType::new(array.data_type().clone(), false);
+            let actual_carrier = array.data_type().clone();
             let output = evaluate_constant(checked_constant(array, ty.clone(), ordinal), 4);
-            assert_eq!(output.data_type(), &ty.data_type);
+            assert_eq!(output.data_type(), &actual_carrier);
             let values = arrow::compute::cast(&output, &DataType::Utf8)
                 .expect("decode exact output for oracle");
             assert!(
@@ -1140,16 +1272,29 @@ mod tests {
                 as ArrayRef;
         let forged = DataType::Struct(vec![field(20)].into());
         assert_eq!(source.data_type(), &forged);
-        let value = checked_constant(
-            source.clone(),
-            novarocks_type_contract::FunctionValueType::new(source.data_type().clone(), false),
-            0,
-        );
-        let mut arena = ExprArena::default();
-        let id = arena.push_typed(ExprNode::Constant(value), forged);
+        let declared =
+            novarocks_type_contract::FunctionValueType::new(source.data_type().clone(), false);
+        let independently_declared =
+            novarocks_type_contract::FunctionValueType::new(forged.clone(), false);
         assert_eq!(
-            arena.eval(id, &constant_chunk(1)).unwrap_err(),
-            "constant pool carrier differs from expression metadata"
+            declared, independently_declared,
+            "IPC IDs do not author value semantics"
+        );
+        let value = checked_constant(source.clone(), declared.clone(), 0);
+        assert_eq!(constant_eval::broadcast(&value, 1).unwrap().len(), 1);
+        let rejected = novarocks_functions::ConstantPool::try_new(
+            Arc::new(Field::new("constant", forged, false)),
+            declared,
+            source.to_data(),
+            constant_policy(),
+            novarocks_type_contract::CompilePhase::Validate,
+            &ConstantTestControl,
+        )
+        .expect_err("exact original source dictionary identity must match");
+        assert!(
+            rejected
+                .to_string()
+                .contains("constant ArrayData differs from exact field carrier")
         );
     }
 

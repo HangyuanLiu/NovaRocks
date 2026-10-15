@@ -25,6 +25,13 @@ use super::AggregateFunction;
 
 pub(super) struct CountAgg;
 
+fn count_input_error(error: count_core::CountVisitError<std::convert::Infallible>) -> String {
+    match error {
+        count_core::CountVisitError::Invalid(message) => message.to_owned(),
+        count_core::CountVisitError::Control(never) => match never {},
+    }
+}
+
 fn count_fallback(count_all: bool) -> AggSpec {
     AggSpec {
         kind: AggKind::Count,
@@ -101,20 +108,18 @@ impl AggregateFunction for CountAgg {
     ) -> Result<(), String> {
         match input {
             AggInputView::None => {
-                unsafe { count_core::update_legacy_batch(true, None, offset, state_ptrs) };
-                Ok(())
+                unsafe { count_core::update_legacy_batch(true, None, offset, state_ptrs) }
+                    .map_err(count_input_error)
             }
-            AggInputView::Any(array) => {
-                unsafe {
-                    count_core::update_legacy_batch(
-                        spec.count_all,
-                        Some(array.as_ref()),
-                        offset,
-                        state_ptrs,
-                    )
-                };
-                Ok(())
+            AggInputView::Any(array) => unsafe {
+                count_core::update_legacy_batch(
+                    spec.count_all,
+                    Some(array.as_ref()),
+                    offset,
+                    state_ptrs,
+                )
             }
+            .map_err(count_input_error),
             _ => Err("count batch input type mismatch".to_string()),
         }
     }

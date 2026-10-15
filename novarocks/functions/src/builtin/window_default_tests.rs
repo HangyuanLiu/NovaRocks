@@ -80,7 +80,7 @@ fn failures() -> [KernelFailure; 7] {
     ]
 }
 fn ty(data_type: DataType, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(data_type, nullable)
+    FunctionValueType::from_legacy_declared_projection(data_type, nullable)
 }
 fn recipe(source: &FunctionValueType, target: &FunctionValueType) -> DefaultValueRecipe {
     DefaultValueRecipe::try_new(source, target, &CompileControl::default()).unwrap()
@@ -360,15 +360,18 @@ fn typed_null_identity_logical_domain_and_empty_partition_are_truthful() {
         assert_eq!(actual.null_count(), 3);
         assert!(actual.get_array_memory_size() <= r.retained_upper_bound(3).unwrap());
     }
-    let json = FunctionValueType {
-        data_type: DataType::Utf8,
-        nullable: false,
-        logical_type: ValueLogicalType::Json,
-    };
+    let json = FunctionValueType::try_from_legacy_declared_projection(
+        DataType::Utf8,
+        false,
+        ValueLogicalType::Json,
+    )
+    .expect("valid temporary legacy function value declaration");
     let mut target = json.clone();
-    target.nullable = true;
+    target = target
+        .with_nullable(true)
+        .expect("valid function nullability declaration");
     let r = recipe(&json, &target);
-    assert_eq!(r.source_type().logical_type, ValueLogicalType::Json);
+    assert_eq!(r.source_type().logical_type(), ValueLogicalType::Json);
     let source: ArrayRef = Arc::new(StringArray::from(vec!["{}", "[1]"]));
     assert_eq!(
         strings(
@@ -395,20 +398,22 @@ fn unsupported_nominal_and_nonnullable_targets_refuse_without_rebinding() {
         (ty(DataType::UInt64, true), ty(DataType::Int64, true)),
         (ty(DataType::LargeUtf8, true), ty(DataType::Int64, true)),
         (
-            FunctionValueType {
-                data_type: DataType::Utf8,
-                nullable: true,
-                logical_type: ValueLogicalType::Json,
-            },
+            FunctionValueType::try_from_legacy_declared_projection(
+                DataType::Utf8,
+                true,
+                ValueLogicalType::Json,
+            )
+            .expect("valid temporary legacy function value declaration"),
             ty(DataType::Int64, true),
         ),
         (
             ty(DataType::Utf8, true),
-            FunctionValueType {
-                data_type: DataType::Utf8,
-                nullable: true,
-                logical_type: ValueLogicalType::Json,
-            },
+            FunctionValueType::try_from_legacy_declared_projection(
+                DataType::Utf8,
+                true,
+                ValueLogicalType::Json,
+            )
+            .expect("valid temporary legacy function value declaration"),
         ),
     ] {
         assert!(matches!(

@@ -47,7 +47,9 @@ impl KernelEvaluationControl for Control {
 fn prepared(name: &str, arrays: &[ArrayRef]) -> Arc<dyn crate::PreparedScalarKernel> {
     let types: Vec<_> = arrays
         .iter()
-        .map(|array| FunctionValueType::new(array.data_type().clone(), true))
+        .map(|array| {
+            FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true)
+        })
         .collect();
     prepared_for_test_with_policy(name, &types, DecimalOverflowPolicy::OutputNull).unwrap()
 }

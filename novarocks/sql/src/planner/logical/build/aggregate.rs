@@ -107,9 +107,11 @@ pub(super) fn prepare_repeat_input(
                     .any(|column| column.to_ascii_lowercase() == name)
             })
         });
-        let nullable = source_expr.value_type.nullable || nulled_by_some_level;
+        let nullable = source_expr.value_type.nullable() || nulled_by_some_level;
         let mut result_type = source_expr.value_type.clone();
-        result_type.nullable = nullable;
+        result_type = result_type
+            .with_nullable(nullable)
+            .expect("validated root NULL contract");
         let materialized_column_id = factory.create(None, alias_name.clone(), result_type.clone());
         if let Some((original_name, _)) = grouping_key_aliases.get(idx) {
             repeat_key_ids_by_name
@@ -270,19 +272,12 @@ fn validate_group_output_relation(
     control: &dyn PureCompileControl,
 ) -> Result<(), SqlCompileError> {
     group_target_work(control, |work| {
-        let compatible =
-            (!source.nullable || output.nullable) && source.logical_type == output.logical_type;
+        let compatible = !source.nullable() || output.nullable();
         work.step()?;
-        let same_carrier = if compatible {
-            novarocks_type_contract::arrow_data_types_exact_observed::<
-                novarocks_functions::ConstantError,
-            >(&source.data_type, &output.data_type, || {
-                work.step().map_err(Into::into)
-            })
-            .map_err(SqlCompileError::from)?
-        } else {
-            false
-        };
+        let same_carrier = compatible
+            && source.same_physical_binding_ignoring_root_nullability_observed(output, || {
+                work.step().map_err(SqlCompileError::from)
+            })?;
         if !same_carrier {
             return Err(SqlCompileError::InvalidRequest(
                 "grouping output must preserve its source domain and may only widen root nullability".into(),
@@ -308,29 +303,25 @@ fn authored_group_column_matches(
         return Ok(false);
     }
     group_target_work(control, |work| {
-        let compatible = (output.nullable
-            || (!actual.value_type.nullable && !source.value_type.nullable))
-            && actual.value_type.logical_type == source.value_type.logical_type
-            && source.value_type.logical_type == output.logical_type;
+        let compatible =
+            output.nullable() || (!actual.value_type.nullable() && !source.value_type.nullable());
         work.step()?;
         if !compatible {
             return Ok(false);
         }
-        let same_source = novarocks_type_contract::arrow_data_types_exact_observed::<
-            novarocks_functions::ConstantError,
-        >(
-            &actual.value_type.data_type,
-            &source.value_type.data_type,
-            || work.step().map_err(Into::into),
-        )
-        .map_err(SqlCompileError::from)?;
+        let same_source = actual
+            .value_type
+            .same_physical_binding_ignoring_root_nullability_observed(&source.value_type, || {
+                work.step().map_err(SqlCompileError::from)
+            })?;
         if !same_source {
             return Ok(false);
         }
-        novarocks_type_contract::arrow_data_types_exact_observed::<novarocks_functions::ConstantError>(
-            &source.value_type.data_type, &output.data_type,
-            || work.step().map_err(Into::into),
-        ).map_err(Into::into)
+        source
+            .value_type
+            .same_physical_binding_ignoring_root_nullability_observed(output, || {
+                work.step().map_err(SqlCompileError::from)
+            })
     })
 }
 
@@ -436,10 +427,7 @@ pub(super) fn split_projection_for_aggregate(
             Ok(OutputColumn {
                 column_id: call.output_column_id,
                 name,
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    call.result_type.clone(),
-                    true,
-                ),
+                value_type: call.result_type.clone(),
 
                 is_internal: false,
             })
@@ -554,10 +542,7 @@ pub(super) fn ensure_aggregate_output_columns(
             additional.push(OutputColumn {
                 column_id: call.output_column_id,
                 name,
-                value_type: novarocks_type_contract::FunctionValueType::new(
-                    call.result_type.clone(),
-                    true,
-                ),
+                value_type: call.result_type.clone(),
                 is_internal: true,
             });
             work.step()?;
@@ -1087,6 +1072,21 @@ pub(super) fn collect_aggregates(
             order_by,
             resolved,
         } => {
+            // The bound callable owns the complete result, including children.
+            // Never mint a same-value symbol from a substituted declaration.
+            let expected = crate::functions::aggregate_result_type(resolved);
+            if !expr
+                .value_type
+                .exactly_equals_checked_observed(expected, || {
+                    control
+                        .checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
+                        .map_err(SqlCompileError::from)
+                })?
+            {
+                return Err(SqlCompileError::Compilation(
+                    "aggregate occurrence differs from its complete declared type".into(),
+                ));
+            }
             // Avoid duplicates — compare full aggregate semantics, including
             // ORDER BY metadata for ordered aggregates like
             // `array_agg(distinct x order by y desc)`.
@@ -1105,7 +1105,7 @@ pub(super) fn collect_aggregates(
                 out.push(AggregateCall {
                     name: name.clone(),
                     distinct: *distinct,
-                    result_type: expr.value_type.data_type.clone(),
+                    result_type: expr.value_type.clone(),
                     output_column_id,
                     source: crate::binding::AggregateArgumentSource::logical_update(
                         args.clone(),
@@ -1385,7 +1385,7 @@ mod call_policy_tests {
         assert!(typed_expr_semantically_eq(&first, &equivalent, &control).unwrap());
         assert!(!typed_expr_semantically_eq(&first, &different, &control).unwrap());
         let mut nullable = equivalent.clone();
-        nullable.value_type.nullable = true;
+        nullable.value_type = nullable.value_type.with_nullable(true).unwrap();
         assert!(!typed_expr_semantically_eq(&first, &nullable, &control).unwrap());
         let deduped = dedup_group_by_exprs(
             &[first.clone(), equivalent.clone(), different.clone()],
@@ -1814,8 +1814,14 @@ mod call_policy_tests {
         let LogicalPlanKind::Aggregate(aggregate) = &mut plan.kind else {
             unreachable!()
         };
-        aggregate.group_by[1].value_type.nullable = true;
-        aggregate.output_columns[1].value_type.nullable = true;
+        aggregate.group_by[1].value_type = aggregate.group_by[1]
+            .value_type
+            .with_nullable(true)
+            .unwrap();
+        aggregate.output_columns[1].value_type = aggregate.output_columns[1]
+            .value_type
+            .with_nullable(true)
+            .unwrap();
         let targets = planner_repeat_original_group_by_targets(&plan, &control).unwrap();
         assert!(
             matches!(targets[0].expr.kind, ExprKind::ColumnRef { column_id, .. }
@@ -1826,15 +1832,20 @@ mod call_policy_tests {
             matches!(rewritten.kind, ExprKind::ColumnRef { column_id, .. }
             if column_id == ColumnId::new_for_test(702))
         );
-        assert!(rewritten.value_type.nullable);
+        assert!(rewritten.value_type.nullable());
         let mut wrong_type = source.clone();
-        wrong_type.value_type.data_type = DataType::Int32;
+        wrong_type.value_type = novarocks_type_contract::FunctionValueType::try_with_logical_type(
+            DataType::Int32,
+            wrong_type.value_type.nullable(),
+            wrong_type.value_type.logical_type(),
+        )
+        .unwrap();
         let unchanged = rewrite_group_by_expr_refs(&wrong_type, &targets, &control).unwrap();
         assert!(
             matches!(unchanged.kind, ExprKind::ColumnRef { column_id, .. }
             if column_id == ColumnId::new_for_test(303))
         );
-        assert_eq!(unchanged.value_type.data_type, DataType::Int32);
+        assert_eq!(unchanged.value_type.data_type().clone(), DataType::Int32);
 
         let LogicalPlanKind::Repeat(repeat) = &mut plan.children[0].kind else {
             unreachable!()
@@ -1930,7 +1941,7 @@ mod call_policy_tests {
         invalid.aggregates[1]
             .source
             .rewrite_channels(|arguments, _| {
-                arguments[0].value_type.nullable = true;
+                arguments[0].value_type = arguments[0].value_type.with_nullable(true).unwrap();
             });
         let ordinary = EqualityControl {
             trace: Default::default(),
@@ -2063,7 +2074,7 @@ mod call_policy_tests {
         let control = crate::compiler::SqlCompileControl::unbounded();
         let selected = constant_expr(vec![-99, 42], 1);
         let mut widened = selected.value_type.clone();
-        widened.nullable = true;
+        widened = widened.with_nullable(true).unwrap();
         let valid = GroupByRewriteTarget {
             expr: selected.clone(),
             column_id: ColumnId::new_for_test(702),
@@ -2095,15 +2106,8 @@ mod call_policy_tests {
             },
             value_type: FunctionValueType::new(DataType::Int64, true),
         };
-        let nested = |metadata: &str| {
-            FunctionValueType::new(
-                DataType::List(std::sync::Arc::new(
-                    arrow::datatypes::Field::new("item", DataType::Int64, true)
-                        .with_metadata([("provider".into(), metadata.into())].into()),
-                )),
-                false,
-            )
-        };
+        let nested =
+            |json| crate::test_value_types::string_structure(&[("payload", true, json)], false);
         let uuid = FunctionValueType::try_with_logical_type(
             DataType::FixedSizeBinary(16),
             false,
@@ -2117,7 +2121,7 @@ mod call_policy_tests {
             ),
             (selected, FunctionValueType::new(DataType::Int32, false)),
             (computed, FunctionValueType::new(DataType::Int32, true)),
-            (column(nested("source")), nested("changed")),
+            (column(nested(true)), nested(false)),
             (
                 column(FunctionValueType::new(DataType::FixedSizeBinary(16), false)),
                 uuid,
@@ -2173,5 +2177,23 @@ mod call_policy_tests {
                 }
             }
         }
+    }
+    #[test]
+    fn grouping_domain_ignores_source_attributes_and_allows_only_root_null_widening() {
+        let control = crate::compiler::SqlCompileControl::unbounded();
+        let fields = [("payload", true, true)];
+        let layout = DataType::Struct(
+            vec![
+                arrow::datatypes::Field::new("payload", DataType::Utf8, true)
+                    .with_metadata([("provider-key".into(), "source-only".into())].into()),
+            ]
+            .into(),
+        );
+        let input = crate::test_value_types::string_structure_from_source(&fields, false, &layout);
+        let widened = crate::test_value_types::string_structure(&fields, true);
+        assert!(validate_group_output_relation(&input, &widened, &control).is_ok());
+        assert!(validate_group_output_relation(&widened, &input, &control).is_err());
+        let text = crate::test_value_types::string_structure(&[("payload", true, false)], true);
+        assert!(validate_group_output_relation(&input, &text, &control).is_err());
     }
 }

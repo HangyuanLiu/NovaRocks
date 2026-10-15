@@ -70,7 +70,7 @@ pub(super) fn definition(
 }
 
 struct Md5sumNumericOwner {
-    resolver: BuiltinDynamicScalarResolver,
+    resolver: Arc<BuiltinDynamicScalarResolver>,
     declaration: FunctionBindingDeclaration,
     implementations: Box<[PureImplementationDeclaration]>,
 }
@@ -112,7 +112,7 @@ impl Md5sumNumericOwner {
             })
             .collect();
         Ok(Self {
-            resolver,
+            resolver: Arc::new(resolver),
             declaration,
             implementations,
         })
@@ -164,6 +164,10 @@ impl FunctionBindingResolver for Md5sumNumericOwner {
 }
 
 impl PureFunctionMetadataOwner for Md5sumNumericOwner {
+    fn binding_resolver_owner(self: Arc<Self>) -> crate::FunctionBindingResolverOwner {
+        crate::FunctionBindingResolverOwner::dynamic_scalar(Arc::clone(&self.resolver))
+    }
+
     fn binding_declaration(&self) -> &FunctionBindingDeclaration {
         &self.declaration
     }
@@ -192,41 +196,21 @@ impl FunctionEffectOwner for Md5sumNumericOwner {
         input: CallEffectInput<'_>,
         control: &dyn PureCompileControl,
     ) -> Result<CallEffects, FunctionEffectOwnerError<Self::Error>> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(FunctionEffectOwnerError::Control)?;
-        let result = (|| {
-            work.step().map_err(FunctionEffectOwnerError::Control)?;
-            if input.function_id != self.declaration.function_id()
-                || input.kind != FunctionKind::Scalar
-            {
-                return Err(FunctionBindingError::UnknownFunction.into());
-            }
-            if !input.environment.is_empty()
-                || !matches!(input.proof_scope, CallProofScope::Unconditional)
-                    && input.proof_scope != CallProofScope::Domain(input.context.domain)
-            {
-                return Err(FunctionBindingError::InvalidBinding(
-                    "md5sum_numeric has no environment dependencies and requires an exact proof scope"
-                        .into(),
-                )
-                .into());
-            }
-            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+        self.refine_selected_core(input, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => {
-                        FunctionEffectOwnerError::Control(error)
-                    }
-                    other => FunctionEffectOwnerError::Owner(other),
-                })?;
-            let result = self.call_effects(input.proof_scope);
-            Ok(result)
-        })();
-        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
-            return result;
-        }
-        work.finish().map_err(FunctionEffectOwnerError::Control)?;
-        result
+        })
+    }
+    fn validate_and_refine_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+    ) -> Result<CallEffects, crate::CheckedOwnerFailure<FunctionEffectOwnerError<Self::Error>>>
+    {
+        self.refine_selected_core(input, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -237,49 +221,21 @@ impl PureScalarImplementation for Md5sumNumericOwner {
         contract: Arc<ScalarCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
-        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
-            .map_err(compile_failure)?;
-        let result: Result<Arc<dyn PreparedScalarKernel>, KernelFailure> = (|| {
-            work.step().map_err(compile_failure)?;
-            if input.function_id != self.declaration.function_id()
-                || input.kind != FunctionKind::Scalar
-                || contract.function_id() != input.function_id
-                || !std::ptr::eq(contract.selected(), input.selected)
-                || contract.context() != input.context
-                || contract.decimal_overflow_policy() != input.decimal_overflow_policy
-                || contract.effects() != &self.call_effects(input.proof_scope)
-                || !input.environment.is_empty()
-            {
-                return Err(invalid(
-                    "md5sum_numeric preparation differs from its exact checked call",
-                ));
-            }
-            work.flush().map_err(compile_failure)?;
+        self.prepare_selected_core(input, contract, control, || {
             self.validate_selected(input.selected, input.request, control)
-                .map_err(|error| match error {
-                    FunctionBindingError::Control(error) => compile_failure(error),
-                    _ => invalid("md5sum_numeric preparation has a stale selected binding"),
-                })?;
-            super::md5_selected::validate_profile(
-                super::md5_shared::Operation::Md5sumNumeric,
-                &contract,
-                || work.step().map_err(compile_failure),
-            )?;
-            work.step().map_err(compile_failure)?;
-            // The prepared object retains the same canonical contract. Its body is
-            // a static pure implementation and needs no live resolver or authority.
-            Ok(Arc::new(PreparedMd5sumNumeric { contract }) as Arc<dyn PreparedScalarKernel>)
-        })();
-        if matches!(
-            &result,
-            Err(KernelFailure::Cancelled
-                | KernelFailure::DeadlineExceeded
-                | KernelFailure::ResourceExhausted)
-        ) {
-            return result;
-        }
-        work.finish().map_err(compile_failure)?;
-        result
+        })
+    }
+    fn prepare_scalar_checked(
+        &self,
+        input: CallEffectInput<'_>,
+        checked: &crate::CheckedCallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        self.prepare_selected_core(input, contract, control, || {
+            checked.require_binding_author(self.resolver.as_ref(), input)
+        })
+        .map_err(crate::CheckedOwnerFailure::Original)
     }
 }
 
@@ -319,3 +275,95 @@ impl ScalarKernelInstance for Md5sumNumericInstance {
 #[cfg(test)]
 #[path = "md5sum_numeric_owner_tests.rs"]
 pub(super) mod tests;
+
+impl Md5sumNumericOwner {
+    fn refine_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<CallEffects, FunctionEffectOwnerError<FunctionBindingError>> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(FunctionEffectOwnerError::Control)?;
+        let result = (|| {
+            work.step().map_err(FunctionEffectOwnerError::Control)?;
+            if input.function_id != self.declaration.function_id()
+                || input.kind != FunctionKind::Scalar
+            {
+                return Err(FunctionBindingError::UnknownFunction.into());
+            }
+            if !input.environment.is_empty()
+                || !matches!(input.proof_scope, CallProofScope::Unconditional)
+                    && input.proof_scope != CallProofScope::Domain(input.context.domain)
+            {
+                return Err(FunctionBindingError::InvalidBinding(
+                    "md5sum_numeric has no environment dependencies and requires an exact proof scope"
+                        .into(),
+                )
+                .into());
+            }
+            work.flush().map_err(FunctionEffectOwnerError::Control)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => FunctionEffectOwnerError::Control(error),
+                other => FunctionEffectOwnerError::Owner(other),
+            })?;
+            let result = self.call_effects(input.proof_scope);
+            Ok(result)
+        })();
+        if matches!(&result, Err(FunctionEffectOwnerError::Control(_))) {
+            return result;
+        }
+        work.finish().map_err(FunctionEffectOwnerError::Control)?;
+        result
+    }
+    fn prepare_selected_core(
+        &self,
+        input: CallEffectInput<'_>,
+        contract: Arc<ScalarCallContract>,
+        control: &dyn PureCompileControl,
+        validate: impl FnOnce() -> Result<(), FunctionBindingError>,
+    ) -> Result<Arc<dyn PreparedScalarKernel>, KernelFailure> {
+        let mut work = CompileCheckpoints::try_new(control, CompilePhase::FunctionSpecialization)
+            .map_err(compile_failure)?;
+        let result: Result<Arc<dyn PreparedScalarKernel>, KernelFailure> = (|| {
+            work.step().map_err(compile_failure)?;
+            if input.function_id != self.declaration.function_id()
+                || input.kind != FunctionKind::Scalar
+                || contract.function_id() != input.function_id
+                || !std::ptr::eq(contract.selected(), input.selected)
+                || contract.context() != input.context
+                || contract.decimal_overflow_policy() != input.decimal_overflow_policy
+                || contract.effects() != &self.call_effects(input.proof_scope)
+                || !input.environment.is_empty()
+            {
+                return Err(invalid(
+                    "md5sum_numeric preparation differs from its exact checked call",
+                ));
+            }
+            work.flush().map_err(compile_failure)?;
+            validate().map_err(|error| match error {
+                FunctionBindingError::Control(error) => compile_failure(error),
+                _ => invalid("md5sum_numeric preparation has a stale selected binding"),
+            })?;
+            super::md5_selected::validate_profile(
+                super::md5_shared::Operation::Md5sumNumeric,
+                &contract,
+                || work.step().map_err(compile_failure),
+            )?;
+            work.step().map_err(compile_failure)?;
+            // The prepared object retains the same canonical contract. Its body is
+            // a static pure implementation and needs no live resolver or authority.
+            Ok(Arc::new(PreparedMd5sumNumeric { contract }) as Arc<dyn PreparedScalarKernel>)
+        })();
+        if matches!(
+            &result,
+            Err(KernelFailure::Cancelled
+                | KernelFailure::DeadlineExceeded
+                | KernelFailure::ResourceExhausted)
+        ) {
+            return result;
+        }
+        work.finish().map_err(compile_failure)?;
+        result
+    }
+}

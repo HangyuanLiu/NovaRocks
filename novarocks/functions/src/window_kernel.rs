@@ -250,6 +250,15 @@ pub trait PureWindowImplementation:
         contract: Arc<WindowCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedWindowKernel>, KernelFailure>;
+    fn prepare_window_checked(
+        &self,
+        _input: CallEffectInput<'_>,
+        _checked: &crate::CheckedCallEffectInput<'_>,
+        _contract: Arc<WindowCallContract>,
+        _control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedWindowKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        Err(crate::CheckedOwnerFailure::UnconvertedOwner)
+    }
 }
 
 /// The same exact Aggregate owner provides its dedicated window adapter.
@@ -317,9 +326,85 @@ fn specialize_window_once<O: PureWindowImplementation + ?Sized>(
     options: WindowCallOptions,
     control: &dyn PureCompileControl,
 ) -> Result<WindowSpecialization, FunctionSpecializationFailure> {
-    let (receipt, effects) = crate::specialization::refine_once_for_specialization(
-        owner, input, frozen, arguments, control,
-    )?;
+    specialize_window_once_core(
+        owner,
+        input,
+        selected,
+        frozen,
+        arguments,
+        options,
+        control,
+        |arguments| {
+            crate::specialization::refine_once_for_specialization(
+                owner, input, frozen, arguments, control,
+            )
+        },
+        |contract| {
+            owner
+                .prepare_window(input, contract, control)
+                .map_err(FunctionSpecializationFailure::Kernel)
+        },
+    )
+}
+
+pub(crate) fn specialize_window_once_checked<O: PureWindowImplementation + ?Sized>(
+    owner: &O,
+    checked: &crate::CheckedCallEffectInput<'_>,
+    input: CallEffectInput<'_>,
+    selected: Arc<FunctionBindingSelection>,
+    frozen: Option<&CallEffects>,
+    arguments: ScopedExpressionEffects,
+    options: WindowCallOptions,
+    control: &dyn PureCompileControl,
+) -> Result<WindowSpecialization, crate::CheckedOwnerFailure<FunctionSpecializationFailure>> {
+    specialize_window_once_core(
+        owner,
+        input,
+        selected,
+        frozen,
+        arguments,
+        options,
+        control,
+        |arguments| {
+            crate::specialization::refine_once_checked(
+                owner, checked, input, frozen, arguments, control,
+            )
+        },
+        |contract| {
+            owner
+                .prepare_window_checked(input, checked, contract, control)
+                .map_err(|error| match error {
+                    crate::CheckedOwnerFailure::Original(error) => {
+                        crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::Kernel(
+                            error,
+                        ))
+                    }
+                    crate::CheckedOwnerFailure::UnconvertedOwner => {
+                        crate::CheckedOwnerFailure::UnconvertedOwner
+                    }
+                })
+        },
+    )
+}
+
+fn specialize_window_once_core<
+    'a,
+    O: PureWindowImplementation + ?Sized,
+    E: From<FunctionSpecializationFailure>,
+>(
+    _owner: &O,
+    input: CallEffectInput<'a>,
+    selected: Arc<FunctionBindingSelection>,
+    _frozen: Option<&CallEffects>,
+    arguments: ScopedExpressionEffects,
+    options: WindowCallOptions,
+    control: &dyn PureCompileControl,
+    refine: impl FnOnce(
+        ScopedExpressionEffects,
+    ) -> Result<(crate::RefinedCallEffects<'a>, ScopedExpressionEffects), E>,
+    prepare: impl FnOnce(Arc<WindowCallContract>) -> Result<Arc<dyn PreparedWindowKernel>, E>,
+) -> Result<WindowSpecialization, E> {
+    let (receipt, effects) = refine(arguments)?;
     let call = Arc::new(
         FunctionCallContract::from_refined(input, &receipt, selected, control)
             .map_err(FunctionSpecializationFailure::Kernel)?,
@@ -328,13 +413,12 @@ fn specialize_window_once<O: PureWindowImplementation + ?Sized>(
         WindowCallContract::try_window(call, options, control)
             .map_err(FunctionSpecializationFailure::Kernel)?,
     );
-    let prepared = owner
-        .prepare_window(input, contract.clone(), control)
-        .map_err(FunctionSpecializationFailure::Kernel)?;
+    let prepared = prepare(contract.clone())?;
     if !Arc::ptr_eq(prepared.contract(), &contract) {
         return Err(FunctionSpecializationFailure::Kernel(internal(
             "window preparation replaced its exact immutable contract",
-        )));
+        ))
+        .into());
     }
     control
         .checkpoint(CompilePhase::FunctionSpecialization, 0)
@@ -387,6 +471,45 @@ fn specialize_aggregate_window_once<O: PureAggregateWindowImplementation + ?Size
     options: AggregateWindowPreparationOptions,
     control: &dyn PureCompileControl,
 ) -> Result<WindowSpecialization, FunctionSpecializationFailure> {
+    specialize_aggregate_window_once_core(owner, input, options, control, |options| match frozen {
+        Some(frozen) => {
+            specialize_frozen_aggregate(owner, input, selected, frozen, arguments, options, control)
+        }
+        None => specialize_aggregate(owner, input, selected, arguments, options, control),
+    })
+}
+
+pub(crate) fn specialize_aggregate_window_once_checked<
+    O: PureAggregateWindowImplementation + ?Sized,
+>(
+    owner: &O,
+    checked: &crate::CheckedCallEffectInput<'_>,
+    input: CallEffectInput<'_>,
+    selected: Arc<FunctionBindingSelection>,
+    frozen: Option<&CallEffects>,
+    arguments: ScopedExpressionEffects,
+    options: AggregateWindowPreparationOptions,
+    control: &dyn PureCompileControl,
+) -> Result<WindowSpecialization, crate::CheckedOwnerFailure<FunctionSpecializationFailure>> {
+    specialize_aggregate_window_once_core(owner, input, options, control, |options| {
+        crate::aggregate_kernel::specialize_aggregate_once_checked(
+            owner, checked, input, selected, frozen, arguments, options, control,
+        )
+    })
+}
+
+fn specialize_aggregate_window_once_core<
+    O: PureAggregateWindowImplementation + ?Sized,
+    E: From<FunctionSpecializationFailure>,
+>(
+    owner: &O,
+    input: CallEffectInput<'_>,
+    options: AggregateWindowPreparationOptions,
+    control: &dyn PureCompileControl,
+    prepare_aggregate: impl FnOnce(
+        AggregatePreparationOptions,
+    ) -> Result<crate::AggregateSpecialization<O::Kernel>, E>,
+) -> Result<WindowSpecialization, E> {
     let AggregateWindowPreparationOptions {
         aggregate: aggregate_options,
         window: window_options,
@@ -404,27 +527,10 @@ fn specialize_aggregate_window_once<O: PureAggregateWindowImplementation + ?Size
     {
         return Err(FunctionSpecializationFailure::Kernel(invalid(
             "aggregate window specialization requires Single logical input",
-        )));
+        ))
+        .into());
     }
-    let specialization = match frozen {
-        Some(frozen) => specialize_frozen_aggregate(
-            owner,
-            input,
-            selected,
-            frozen,
-            arguments,
-            aggregate_options,
-            control,
-        ),
-        None => specialize_aggregate(
-            owner,
-            input,
-            selected,
-            arguments,
-            aggregate_options,
-            control,
-        ),
-    }?;
+    let specialization = prepare_aggregate(aggregate_options)?;
     let effects = specialization.effects();
     let aggregate = specialization.into_prepared();
     let contract = Arc::new(
@@ -437,7 +543,8 @@ fn specialize_aggregate_window_once<O: PureAggregateWindowImplementation + ?Size
     if !Arc::ptr_eq(prepared.contract(), &contract) {
         return Err(FunctionSpecializationFailure::Kernel(internal(
             "aggregate window adapter replaced its exact immutable contract",
-        )));
+        ))
+        .into());
     }
     control
         .checkpoint(CompilePhase::FunctionSpecialization, 0)
@@ -627,8 +734,8 @@ impl<'input> WindowEvaluationPartition<'input> {
                 // cannot erase required setup/input failures or finish work.
                 SelectedValues::try_new(
                     selection,
-                    &self.contract.result_type().data_type,
-                    arrow_array::new_empty_array(&self.contract.result_type().data_type),
+                    self.contract.result_type().data_type(),
+                    arrow_array::new_empty_array(self.contract.result_type().data_type()),
                     Box::default(),
                 )
                 .map_err(|_| internal("empty window output violates its exact contract"))?

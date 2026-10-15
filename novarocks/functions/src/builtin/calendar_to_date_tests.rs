@@ -69,7 +69,8 @@ fn to_date_supported_profiles_keep_ranges_nulls_sparse_and_no_environment() {
             Some(-1),
         ])) as ArrayRef,
     ] {
-        let ty = FunctionValueType::new(values.data_type().clone(), true);
+        let ty =
+            FunctionValueType::from_legacy_declared_projection(values.data_type().clone(), true);
         let prepared =
             prepared_for_test_with_policy("to_date", &ty, DecimalOverflowPolicy::OutputNull)
                 .unwrap();

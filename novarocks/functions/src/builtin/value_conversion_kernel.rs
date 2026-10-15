@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Exact selected computation for the six hidden value-domain conversions.
+//! Exact selected computation for the hidden value-domain conversions.
 //! Shared-buffer metadata reconstruction and Arrow copy remain opaque library
 //! work bracketed by the original control. No allocation grant is claimed.
 
 use super::value_conversion::{
-    JSON_TEXT, LARGEINT_FLOAT, LARGEINT_SIGNED, LARGEINT_TEXT, NULL_LIFT, SIGNED_LARGEINT,
+    JSON_TEXT, LARGEINT_FLOAT, LARGEINT_SIGNED, LARGEINT_TEXT, NULL_LIFT, OPAQUE_BINARY,
+    SIGNED_LARGEINT,
 };
 use crate::{
     EvaluatedArgument, FunctionArgumentType, FunctionBindingSelection, KernelEvaluationControl,
@@ -64,7 +65,7 @@ impl Signed {
 }
 #[derive(Clone, Copy, Debug)]
 enum Operation {
-    Json,
+    SameShape,
     SignedLargeInt(Signed),
     LargeIntSigned(Signed),
     LargeIntF32,
@@ -115,10 +116,14 @@ impl ConversionRecipe {
             validate_type_observed(source, &mut work)?;
             validate_type_observed(target, &mut work)?;
             let operation = match contract.selected().overload.as_str() {
-                JSON_TEXT => Operation::Json,
-                SIGNED_LARGEINT => Operation::SignedLargeInt(Signed::from_type(&source.data_type)?),
-                LARGEINT_SIGNED => Operation::LargeIntSigned(Signed::from_type(&target.data_type)?),
-                LARGEINT_FLOAT => match target.data_type {
+                JSON_TEXT | OPAQUE_BINARY => Operation::SameShape,
+                SIGNED_LARGEINT => {
+                    Operation::SignedLargeInt(Signed::from_type(source.data_type())?)
+                }
+                LARGEINT_SIGNED => {
+                    Operation::LargeIntSigned(Signed::from_type(target.data_type())?)
+                }
+                LARGEINT_FLOAT => match target.data_type() {
                     DataType::Float32 => Operation::LargeIntF32,
                     DataType::Float64 => Operation::LargeIntF64,
                     _ => return Err(invalid("conversion has a foreign frozen float target")),
@@ -137,8 +142,8 @@ impl ConversionRecipe {
                 edges: Vec::new(),
                 retained: 0,
             };
-            if matches!(operation, Operation::Json) {
-                recipe.prepare_json(&source.data_type, &target.data_type, &mut work)?;
+            if matches!(operation, Operation::SameShape) {
+                recipe.prepare_json(source.data_type(), target.data_type(), &mut work)?;
             }
             recipe.retained = std::mem::size_of::<Self>()
                 .checked_add(
@@ -288,16 +293,16 @@ impl ConversionRecipe {
             }
             let output = if selection.is_empty() {
                 work.flush()?;
-                let output = new_empty_array(&target.data_type);
+                let output = new_empty_array(target.data_type());
                 work.flush()?;
                 output
             } else {
                 match self.operation {
-                    Operation::Json => {
+                    Operation::SameShape => {
                         // Canonical classes are checked before opaque Arrow take,
                         // including unchanged encoded siblings and NULL parents.
                         let compact = compact(*argument, selection, &mut work)?;
-                        self.rebind(0, &compact, &target.data_type, &mut work)?
+                        self.rebind(0, &compact, target.data_type(), &mut work)?
                     }
                     Operation::SignedLargeInt(width) => {
                         signed_largeint(width, *argument, selection, &mut work)?
@@ -323,7 +328,7 @@ impl ConversionRecipe {
             };
             SelectedValues::try_new_observed::<KernelFailure>(
                 selection,
-                &target.data_type,
+                target.data_type(),
                 output,
                 Box::default(),
                 || work.step(),
@@ -349,7 +354,7 @@ impl ConversionRecipe {
                 .ok_or_else(|| internal("JSON recipe child is missing"))
         };
         let output: ArrayRef = match (node.kind, target) {
-            (JsonKind::Keep, _) => Arc::clone(array),
+            (JsonKind::Keep, _) => super::value_conversion::share_same_structure_keep(array),
             (JsonKind::List, DataType::List(field)) => {
                 let source: &ListArray = downcast(array)?;
                 let values = self.rebind(child(0)?, source.values(), field.data_type(), work)?;

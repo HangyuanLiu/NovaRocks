@@ -18,7 +18,8 @@
 //! Mixed independent source: root promotion must never retag an OWN CV.
 use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
-    NodeKind, PhysicalCallDefinition, PhysicalCallSite, StaticFunctionArgument,
+    FunctionArgumentType, NodeKind, PhysicalCallDefinition, PhysicalCallSite,
+    StaticFunctionArgument,
 };
 use novarocks_sql::compiler::{
     SqlCompileControl, SqlPhysicalEmissionMode, ordinary_extrema_constant_state_source_for_test,
@@ -63,15 +64,27 @@ fn check(maximum: bool, mode: SqlPhysicalEmissionMode) {
                 else {
                     panic!("actual MIN/MAX Value source")
                 };
-                assert_eq!(value_type.data_type, DataType::Int64);
+                assert_eq!(value_type.data_type().clone(), DataType::Int64);
                 if constant.is_some() {
-                    assert!(!value_type.nullable, "OWN CV retains exact original FVT");
+                    assert!(!value_type.nullable(), "OWN CV retains exact original FVT");
                 } else {
                     assert!(call.binding.phase.consumes_logical_arguments());
-                    assert_eq!(
-                        value_type.nullable,
-                        mode == SqlPhysicalEmissionMode::ExactComputedWithOriginalDeclaration
+                    assert!(
+                        value_type.nullable(),
+                        "both modes retain successful Int8 NEGATE NULL through the Int64 cast"
                     );
+                    assert_eq!(call.arguments.len(), 1);
+                    assert_eq!(
+                        &fragment.expressions().get(call.arguments[0]).unwrap().ty,
+                        value_type,
+                        "the request retains the completed producer's full FVT"
+                    );
+                    let FunctionArgumentType::Value(bound) =
+                        &call.binding.function.argument_types[0]
+                    else {
+                        panic!("actual MIN/MAX selected Value")
+                    };
+                    assert_eq!(bound, value_type, "selected producer uses its own request");
                     nullable_producers += 1;
                 }
             }

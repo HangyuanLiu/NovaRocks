@@ -69,6 +69,41 @@ pub fn continuation_prefix(bytes: &[u8], offset: usize) -> Result<ContinuationPr
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StandardPrefixError {
+    Prefix(PrefixError),
+    NegativeLength,
+}
+
+/// The pinned StreamReader's original standard prefixes: legacy four-byte
+/// length or continuation marker plus length. This is the same borrowed
+/// framing owner, without a schema import or decoding fallback.
+pub fn standard_prefix(
+    bytes: &[u8],
+    offset: usize,
+) -> Result<ContinuationPrefix, StandardPrefixError> {
+    let range = checked_range(bytes.len(), offset, 4)
+        .map_err(|cause| StandardPrefixError::Prefix(PrefixError::Range(cause)))?;
+    if bytes[range.clone()] == CONTINUATION_MARKER {
+        return continuation_prefix(bytes, offset).map_err(StandardPrefixError::Prefix);
+    }
+    let prefix = &bytes[range.clone()];
+    let len = i32::from_le_bytes([prefix[0], prefix[1], prefix[2], prefix[3]]);
+    if len < 0 {
+        return Err(StandardPrefixError::NegativeLength);
+    }
+    if len == 0 {
+        Ok(ContinuationPrefix::End {
+            next_offset: range.end,
+        })
+    } else {
+        Ok(ContinuationPrefix::Metadata {
+            start: range.end,
+            len: len as usize,
+        })
+    }
+}
+
 /// Checks an extent without reading or allocating its contents.
 pub fn checked_range(
     total_len: usize,

@@ -41,6 +41,9 @@ pub(crate) mod explain;
 pub(crate) mod planner;
 
 #[cfg(test)]
+pub(crate) mod test_value_types;
+
+#[cfg(test)]
 mod common_tests {
     use arrow::datatypes::DataType;
 

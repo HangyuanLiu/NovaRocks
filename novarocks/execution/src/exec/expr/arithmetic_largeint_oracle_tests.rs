@@ -68,7 +68,7 @@ fn integer_array(ty: &FunctionValueType, values: &[Option<i128>]) -> ArrayRef {
             )) as ArrayRef
         };
     }
-    match ty.data_type {
+    match ty.data_type() {
         DataType::Int8 => signed!(Int8Array, i8),
         DataType::Int16 => signed!(Int16Array, i16),
         DataType::Int32 => signed!(Int32Array, i32),
@@ -121,11 +121,11 @@ fn legacy(
     // new nominal FVT receipt; its input types above are separately authored.
     let a = arena.push_typed(
         ExprNode::SlotId(SlotId::new(1)),
-        left_type.data_type.clone(),
+        left_type.data_type().clone(),
     );
     let b = arena.push_typed(
         ExprNode::SlotId(SlotId::new(2)),
-        right_type.data_type.clone(),
+        right_type.data_type().clone(),
     );
     let expression = match op {
         ArithmeticOperator::Add => ExprNode::Add(a, b, policy),
@@ -134,7 +134,7 @@ fn legacy(
         ArithmeticOperator::Divide => ExprNode::Div(a, b, policy),
         ArithmeticOperator::Modulo => ExprNode::Mod(a, b, policy),
     };
-    let id = arena.push_typed(expression, result.data_type);
+    let id = arena.push_typed(expression, result.data_type().clone());
     let frozen = arena.into_immutable().unwrap();
     ExprArena::from_immutable(&frozen).unwrap().eval(id, &chunk)
 }
@@ -146,7 +146,9 @@ fn prepared(
     allow: bool,
 ) -> PreparedArithmeticRecipe {
     let mut result = arithmetic_result_value_type_with_op(left, right, op).unwrap();
-    result.nullable = true;
+    result = result
+        .with_nullable(true)
+        .expect("valid test root nullability");
     PreparedArithmeticRecipe::try_new(op, left, right, &result, policy, allow, &Control).unwrap()
 }
 fn read_large(array: &ArrayRef, row: usize) -> Option<i128> {
@@ -291,7 +293,8 @@ fn legacy_legal_largeint_division_and_float64_mixed_profiles_expose_the_arrow_ca
         assert_eq!(
             arithmetic_result_value_type_with_op(left_type, right_type, ArithmeticOperator::Divide)
                 .unwrap()
-                .data_type,
+                .data_type()
+                .clone(),
             DataType::Float64
         );
         let error = legacy(

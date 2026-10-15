@@ -30,6 +30,7 @@ use super::unpivot::UnpivotConstant;
 
 #[derive(Clone, Debug)]
 pub struct WriterPartialAggregateCall {
+    pub frozen: Option<Arc<novarocks_local_program::FrozenAggregateSelection>>,
     pub input_slot_id: SlotId,
     pub function_name: Arc<str>,
     pub resolved: ResolvedAggregateSignature,
@@ -38,11 +39,13 @@ pub struct WriterPartialAggregateCall {
 
 #[derive(Clone, Debug, Default)]
 pub struct WriterPartialAggregatePlan {
+    pub prepared: Option<novarocks_local_program::PreparedWriterAggregateCalls>,
     pub calls: Vec<WriterPartialAggregateCall>,
 }
 
 #[derive(Clone, Debug)]
 pub struct WriterFinalAggregateCall {
+    pub frozen: Option<Arc<novarocks_local_program::FrozenAggregateSelection>>,
     pub function_name: Arc<str>,
     pub resolved: ResolvedAggregateSignature,
     pub intermediate_input_slot_id: SlotId,
@@ -70,6 +73,7 @@ pub struct WriterGroupedUnpivotPlan {
 
 #[derive(Clone, Debug, Default)]
 pub struct WriterFinalAggregatePlan {
+    pub prepared: Option<novarocks_local_program::PreparedWriterAggregateCalls>,
     pub calls: Vec<WriterFinalAggregateCall>,
     pub unpivot: Option<WriterGroupedUnpivotPlan>,
 }

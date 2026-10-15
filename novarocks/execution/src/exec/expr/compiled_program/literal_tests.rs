@@ -290,7 +290,7 @@ fn check_literal_roots(cases: Vec<(FunctionValueType, LiteralValue)>) {
                 .unwrap();
             assert_eq!(result.selection(), selection);
             assert!(result.errors().is_empty());
-            assert_literal_payload(result.values(), &ty.data_type, literal, 2);
+            assert_literal_payload(result.values(), &ty.data_type(), literal, 2);
         }
         let result = evaluator
             .evaluate(
@@ -301,7 +301,7 @@ fn check_literal_roots(cases: Vec<(FunctionValueType, LiteralValue)>) {
             .unwrap();
         assert!(result.selection().is_empty());
         assert!(result.errors().is_empty());
-        assert_literal_payload(result.values(), &ty.data_type, literal, 0);
+        assert_literal_payload(result.values(), &ty.data_type(), literal, 0);
         assert!(evaluator.instances.is_empty());
     }
 }
@@ -313,7 +313,9 @@ fn with_typed_nulls(
         .into_iter()
         .flat_map(|(ty, literal)| {
             let mut null_type = ty.clone();
-            null_type.nullable = true;
+            null_type = null_type
+                .with_nullable(true)
+                .expect("valid test root nullability");
             [(ty, literal), (null_type, LiteralValue::Null)]
         })
         .collect()

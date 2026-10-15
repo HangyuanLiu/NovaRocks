@@ -605,7 +605,9 @@ fn reserve<T>(n: usize, w: &mut CompileCheckpoints<'_>) -> Result<Vec<T>, Error>
     w.flush()?;
     Ok(output)
 }
-fn policy(value: novarocks_physical_plan::ConstantPolicy) -> wire::SourceConstantPolicy {
+pub(crate) fn encode_source_policy(
+    value: novarocks_physical_plan::ConstantPolicy,
+) -> wire::SourceConstantPolicy {
     wire::SourceConstantPolicy {
         max_rows: Some(value.max_rows),
         max_array_nodes: Some(value.max_array_nodes),
@@ -675,6 +677,7 @@ fn emit_core(
                 w.step()?;
             }
             entries.push(wire::OriginalCallRequest {
+                request_id: None, // The package definition key is its explicit owner identity.
                 definition: Some(wire::CallRequestDefinition { kind: Some(kind) }),
                 arguments,
                 logical_argument_count: Some(
@@ -682,7 +685,7 @@ fn emit_core(
                         .map_err(|_| shape("request prepared logical count changed"))?,
                 ),
                 expected_result_value_type_id: ids.expected_result_type,
-                constant_policy: Some(policy(request.constant_policy)),
+                constant_policy: Some(encode_source_policy(request.constant_policy)),
             });
             w.step()?;
         }

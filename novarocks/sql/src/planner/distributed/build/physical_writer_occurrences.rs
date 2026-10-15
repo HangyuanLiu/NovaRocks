@@ -32,9 +32,13 @@ use novarocks_type_contract::{
 };
 
 use super::{
-    expression_occurrences::{AuthoredPhysicalOccurrences, ExpressionOccurrenceError},
+    expression_occurrences::{
+        AuthoredPhysicalOccurrences, ExpressionOccurrenceError, NativeWriterOccurrences,
+        WriterOccurrenceContexts,
+    },
     physical_relational_effects::{
-        PhysicalRelationalEffectsError, relational_context_observed, writer_value_effects_observed,
+        PhysicalRelationalEffectsError, relational_writer_context_observed,
+        writer_value_context_effects_observed,
     },
     physical_writer_requests::AuthoredPhysicalWriterRequest,
 };
@@ -87,6 +91,17 @@ pub(crate) struct PhysicalWriterOccurrenceInput<'a, 'source> {
     pub proof_scope: CallProofScope,
 }
 
+pub(crate) struct WriterOccurrenceCallInput<'a, 'source> {
+    pub fragment: &'source Fragment,
+    pub node: &'source PhysicalNode,
+    pub source: &'source WriterAggregateCall,
+    pub request: &'a AuthoredPhysicalWriterRequest<'a, 'source>,
+    pub parameters: &'a SemanticParameters,
+    pub environment: &'a [SemanticParameterRef],
+    pub decimal_overflow_policy: DecimalOverflowPolicy,
+    pub proof_scope: CallProofScope,
+}
+
 #[derive(Debug)]
 pub(crate) struct FreshPhysicalWriterOccurrence {
     pub frozen: FrozenPhysicalCall,
@@ -110,13 +125,46 @@ pub(crate) fn prepare_physical_writer_occurrence_observed(
     functions: &dyn SqlFunctionCatalog,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<FreshPhysicalWriterOccurrence, PhysicalWriterOccurrenceError> {
+    let contexts = input.occurrences.writer_contexts();
+    prepare_writer_occurrence_in(
+        WriterOccurrenceCallInput {
+            fragment: input.fragment,
+            node: input.node,
+            source: input.source,
+            request: input.request,
+            parameters: input.parameters,
+            environment: input.environment,
+            decimal_overflow_policy: input.decimal_overflow_policy,
+            proof_scope: input.proof_scope,
+        },
+        &contexts,
+        functions,
+        work,
+    )
+}
+
+pub(crate) fn prepare_native_writer_occurrence_observed(
+    input: WriterOccurrenceCallInput<'_, '_>,
+    occurrences: &NativeWriterOccurrences<'_>,
+    functions: &dyn SqlFunctionCatalog,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FreshPhysicalWriterOccurrence, PhysicalWriterOccurrenceError> {
+    prepare_writer_occurrence_in(input, &occurrences.contexts(), functions, work)
+}
+
+fn prepare_writer_occurrence_in(
+    input: WriterOccurrenceCallInput<'_, '_>,
+    occurrences: &WriterOccurrenceContexts<'_, '_>,
+    functions: &dyn SqlFunctionCatalog,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<FreshPhysicalWriterOccurrence, PhysicalWriterOccurrenceError> {
     let actual = input.fragment.nodes().get(&input.node.id);
     work.step()?;
     let same = actual.is_some_and(|node| std::ptr::eq(node, input.node))
         && std::ptr::eq(input.fragment, input.request.fragment())
         && std::ptr::eq(input.node, input.request.node())
         && std::ptr::eq(input.source, input.request.source())
-        && input.occurrences.root_uses.roots().fragment() == input.fragment.id();
+        && occurrences.root_fragment() == input.fragment.id();
     work.step()?;
     if !same {
         return Err(PhysicalWriterOccurrenceError::InvalidSource(
@@ -174,9 +222,9 @@ pub(crate) fn prepare_physical_writer_occurrence_observed(
             "writer occurrence differs from its original single logical channel",
         ));
     }
-    let context = relational_context_observed(input.occurrences, site, work)?;
-    let (value_context, children) = writer_value_effects_observed(
-        input.occurrences,
+    let context = relational_writer_context_observed(occurrences, site, work)?;
+    let (value_context, children) = writer_value_context_effects_observed(
+        occurrences,
         input.fragment,
         site,
         input.request.input(),
@@ -249,6 +297,7 @@ pub(crate) fn prepare_physical_writer_occurrence_observed(
         temporal_source: None,
         site,
         context,
+        materialized_writer_input: Some(value_context),
         effects: preparation.call_contract().effects().clone(),
         decimal_overflow_policy: input.decimal_overflow_policy,
     };

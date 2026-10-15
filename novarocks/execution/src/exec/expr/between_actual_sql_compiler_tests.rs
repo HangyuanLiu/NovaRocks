@@ -80,19 +80,19 @@ fn between_sql_source_original_required_native_case_retains_actual_bound_decimal
             } = &node.kind
             {
                 assert!(!negated);
-                assert_eq!(node.ty.data_type, DataType::Boolean);
+                assert_eq!(node.ty.data_type().clone(), DataType::Boolean);
                 let operand = &fragment.expressions().get(*expr).unwrap().ty;
-                assert!(matches!(operand.data_type, DataType::Decimal128(..)));
+                assert!(matches!(operand.data_type(), DataType::Decimal128(..)));
                 for child in [low, high] {
                     assert!(
                         operand.same_value_domain(&fragment.expressions().get(*child).unwrap().ty)
                     );
                 }
                 assert_eq!(
-                    node.ty.nullable,
-                    operand.nullable
-                        || fragment.expressions().get(*low).unwrap().ty.nullable
-                        || fragment.expressions().get(*high).unwrap().ty.nullable
+                    node.ty.nullable(),
+                    operand.nullable()
+                        || fragment.expressions().get(*low).unwrap().ty.nullable()
+                        || fragment.expressions().get(*high).unwrap().ty.nullable()
                 );
             }
         }

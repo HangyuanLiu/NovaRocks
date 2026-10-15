@@ -47,7 +47,10 @@ fn legacy(
     let chunk = Chunk::new_with_chunk_schema(batch, layout);
     let mut arena = ExprArena::default();
     arena.set_allow_throw_exception(allow);
-    let child = arena.push_typed(ExprNode::SlotId(SlotId::new(17)), source_type.data_type);
+    let child = arena.push_typed(
+        ExprNode::SlotId(SlotId::new(17)),
+        source_type.data_type().clone(),
+    );
     let cast = arena.push_typed(ExprNode::Cast(child, policy), target.clone());
     let frozen = arena.into_immutable().unwrap();
     let output = ExprArena::from_immutable(&frozen)

@@ -930,13 +930,7 @@ fn prepare_frontend_first_refresh_write(
         definition_has_join(&query),
     )?;
     let target_arrow_schema = target_binding.physical_write_schema()?.as_ref().clone();
-    let target_write_fields = Arc::<[arrow::datatypes::Field]>::from(
-        target_arrow_schema
-            .fields()
-            .iter()
-            .map(|field| field.as_ref().clone())
-            .collect::<Vec<_>>(),
-    );
+    let target_write_fields = target_binding.write_input_fields()?;
     let target_field_ids = target_binding.observation().field_ids().to_vec();
     // `validate_projection_target` already proved this observation carries L's
     // exact partition-spec version; the numeric spec ID below is the provider's
@@ -1385,14 +1379,7 @@ fn prepare_metadata_only_publication(
         &target,
         connector_context,
     )?;
-    let write_input_fields = Arc::<[arrow::datatypes::Field]>::from(
-        target_binding
-            .physical_write_schema()?
-            .fields()
-            .iter()
-            .map(|field| field.as_ref().clone())
-            .collect::<Vec<_>>(),
-    );
+    let write_input_fields = target_binding.write_input_fields()?;
     let write = PreparedMvMetadataOnlyWrite::try_new(
         intent,
         target_binding.handle().clone(),

@@ -646,12 +646,13 @@ pub fn build_final_frozen_connector_write_plan(
         .finalize_provider_read_occurrence(scan_occurrence)
         .map_err(|error| format!("finalize frozen connector scan occurrence: {error}"))?;
     let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0)?;
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0,control)?;
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
         &[
             crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
                 target: write_target_ordinal,
                 input_schema: target_schema.as_ref(),
+                input_columns: &sink.0.contract.input_columns,
                 requirements: statistics,
             },
         ],
@@ -714,12 +715,13 @@ pub fn begin_final_connector_write_plan(
         .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
     let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0)?;
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0,&control)?;
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
         &[
             crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
                 target: write_target_ordinal,
                 input_schema: target_schema.as_ref(),
+                input_columns: &sink.0.contract.input_columns,
                 requirements: statistics,
             },
         ],
@@ -809,12 +811,13 @@ pub fn compile_final_connector_write_plan(
         .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
     let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
     let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0)?;
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0,&control)?;
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
         &[
             crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
                 target: write_target_ordinal,
                 input_schema: target_schema.as_ref(),
+                input_columns: &sink.0.contract.input_columns,
                 requirements: statistics,
             },
         ],
@@ -981,8 +984,14 @@ pub struct DmlCtasSourcePlan {
 pub struct DmlSourceColumn {
     pub domain: novarocks_physical_plan::ResultValueDomain,
     pub name: String,
-    pub data_type: arrow::datatypes::DataType,
-    pub nullable: bool,
+    pub value_type: novarocks_type_contract::FunctionValueType,
+}
+
+impl DmlSourceColumn {
+    /// Persistence uses the complete SQL declaration, including every child domain.
+    pub fn has_private_persistence_domain(&self) -> bool {
+        crate::planning::mv::has_private_persistence_domain(self.value_type.value_type())
+    }
 }
 
 impl DmlCtasSourcePlan {
@@ -999,8 +1008,7 @@ impl DmlCtasSourcePlan {
             .map(|(column, domain)| DmlSourceColumn {
                 domain,
                 name: column.name.clone(),
-                data_type: column.value_type.data_type.clone(),
-                nullable: column.value_type.nullable,
+                value_type: column.value_type.clone(),
             })
             .collect()
     }
@@ -1072,12 +1080,13 @@ pub fn begin_final_ctas_connector_write_plan(
 > {
     let mut physical = crate::planner::optimizer_bridge::to_physical_plan(&source.optimized)?;
     let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0)?;
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0,control)?;
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
         &[
             crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
                 target: write_target_ordinal,
                 input_schema: target_schema.as_ref(),
+                input_columns: &sink.0.contract.input_columns,
                 requirements: statistics,
             },
         ],
@@ -1736,6 +1745,7 @@ fn plan_change_stream_writer_statistics(
         .map(|route| {
             crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(
                 &route.sink.0,
+                control,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1755,6 +1765,7 @@ fn plan_change_stream_writer_statistics(
                 crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
                     target: route.write_target_ordinal,
                     input_schema: schema.as_ref(),
+                    input_columns: &route.sink.0.contract.input_columns,
                     requirements,
                 },
             )
@@ -1810,7 +1821,7 @@ fn build_update_change_event_expand(
     let row_id = output_column_by_name(&child_outputs, "__nr_row_id", "UPDATE row id")?;
     let distributed = distribute_producer(optimized_tree, row_id.column_id);
     let (file, pos, targets, row_id, last_sequence, effect) =
-        allocate_change_outputs(&distributed, target_columns);
+        allocate_change_outputs(&distributed, target_columns, control)?;
     let mut assignments = vec![
         output_expr(
             &mut arena,
@@ -1885,7 +1896,7 @@ fn build_merge_change_event_expand(
         output_column_by_name(&child_outputs, "__nr_merge_assert_key", "MERGE assert key")?;
     let distributed = distribute_producer(optimized_tree, assert_key.column_id);
     let (file, pos, targets, row_id, last_sequence, effect) =
-        allocate_change_outputs(&distributed, target_columns);
+        allocate_change_outputs(&distributed, target_columns, control)?;
     let mut delete_assignments = vec![
         output_expr(
             &mut arena,
@@ -2060,14 +2071,15 @@ type ChangeOutputs = (
 fn allocate_change_outputs(
     node: &crate::optimizer::OptimizedOperatorNode,
     target_columns: &[novarocks_types::schema::ColumnDef],
-) -> ChangeOutputs {
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<ChangeOutputs, crate::compiler::SqlCompileError> {
     let mut next = max_physical_column_id(node) + 1;
     let mut allocate =
-        |name: &str, data_type: arrow::datatypes::DataType, nullable: bool, is_internal: bool| {
+        |name: &str, value_type: novarocks_type_contract::FunctionValueType, is_internal: bool| {
             let output = crate::analysis::OutputColumn {
                 column_id: crate::column_id::ColumnId(next),
                 name: name.to_string(),
-                value_type: novarocks_type_contract::FunctionValueType::new(data_type, nullable),
+                value_type,
 
                 is_internal,
             };
@@ -2076,53 +2088,51 @@ fn allocate_change_outputs(
         };
     let file = allocate(
         ICEBERG_FILE_PATH_COLUMN,
-        arrow::datatypes::DataType::Utf8,
-        true,
+        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Utf8, true),
         true,
     );
     let pos = allocate(
         ICEBERG_ROW_POSITION_COLUMN,
-        arrow::datatypes::DataType::Int64,
-        true,
+        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int64, true),
         true,
     );
     let targets = target_columns
         .iter()
         .map(|column| {
-            (
+            // The catalog declaration, rather than its Arrow carrier, owns
+            // every root/nested domain. Event rows may leave this occurrence
+            // unassigned; provider NOT NULL remains the writer's row obligation.
+            let declared = column.declared_value_type_observed::<
+                crate::planner::distributed::build::ContractLoweringError,
+            >(|| {
+                control.checkpoint(novarocks_type_contract::CompilePhase::Validate, 1)
+                    .map_err(Into::into)
+            }).map_err(final_lowering_error)?;
+            let value_type = declared
+                .with_nullable(true)
+                .map_err(|error| final_lowering_error(error.into()))?;
+            Ok((
                 column.name.clone(),
-                allocate(
-                    &column.name,
-                    column.data_type.clone(),
-                    // An event may leave this field unassigned, and a MERGE
-                    // source may supply a nullable value even when the sink
-                    // rejects null rows. This relation describes the event
-                    // stream, not the sink's acceptance constraint.
-                    true,
-                    false,
-                ),
-            )
+                allocate(&column.name, value_type, false),
+            ))
         })
-        .collect();
+        .collect::<Result<Vec<_>, crate::compiler::SqlCompileError>>()?;
     let row_id = allocate(
         ICEBERG_ROW_ID_COLUMN,
-        arrow::datatypes::DataType::Int64,
-        true,
+        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int64, true),
         true,
     );
     let last_sequence = allocate(
         ICEBERG_LAST_UPDATED_SEQUENCE_COLUMN,
-        arrow::datatypes::DataType::Int64,
-        true,
+        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int64, true),
         true,
     );
     let effect = allocate(
         crate::common::change_stream::ROW_MUTATION_EFFECT_COLUMN,
-        arrow::datatypes::DataType::Int8,
-        false,
+        novarocks_type_contract::FunctionValueType::new(arrow::datatypes::DataType::Int8, false),
         true,
     );
-    (file, pos, targets, row_id, last_sequence, effect)
+    Ok((file, pos, targets, row_id, last_sequence, effect))
 }
 
 fn change_output_columns(
@@ -2568,8 +2578,8 @@ fn build_statistics_connector_physical(
         })?;
         let resolved = crate::binding::SqlFunctionBinding::new(resolved, decimal_overflow_policy);
         let result_type = crate::functions::aggregate_result_type(&resolved);
-        if result_type.logical_type != novarocks_type_contract::ValueLogicalType::Physical
-            || result_type.data_type != arrow::datatypes::DataType::Binary
+        if result_type.logical_type() != novarocks_type_contract::ValueLogicalType::Physical
+            || *result_type.data_type() != arrow::datatypes::DataType::Binary
         {
             return Err(
                 "ANALYZE aggregate must produce an exact Physical Binary artifact body".into(),
@@ -2582,7 +2592,7 @@ fn build_statistics_connector_physical(
                 .intermediate_type
                 .clone(),
         );
-        let result_nullable = crate::functions::aggregate_result_type(&resolved).nullable;
+        let result_nullable = crate::functions::aggregate_result_type(&resolved).nullable();
         let final_output_id = factory.create(
             None,
             format!("analyze_body_{index}"),
@@ -2606,9 +2616,7 @@ fn build_statistics_connector_physical(
 
             is_internal: true,
         });
-        let result_type = crate::functions::aggregate_result_type(&resolved)
-            .data_type
-            .clone();
+        let result_type = crate::functions::aggregate_result_type(&resolved).clone();
         // Both phases retain the original logical update source. The merge
         // lowerer selects the materialized state channel independently.
         let source =
@@ -2876,7 +2884,7 @@ mod tests {
             .iter()
             .find(|output| output.name == super::ICEBERG_LAST_UPDATED_SEQUENCE_COLUMN)
             .expect("sequence output");
-        assert!(sequence.value_type.nullable);
+        assert!(sequence.value_type.nullable());
         let row_id = producer
             .output_columns
             .iter()
@@ -2948,6 +2956,95 @@ mod tests {
             unreachable!()
         };
         assert_eq!(expand.events.len(), 3);
+    }
+
+    #[test]
+    fn mor_merge_id_update_keeps_unchanged_variant_declaration_and_writer_null_obligation() {
+        use arrow::datatypes::DataType;
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType};
+        use novarocks_types::schema::{ColumnDef, SqlType};
+        let required = FunctionValueType::try_with_logical_type(
+            DataType::LargeBinary,
+            false,
+            ValueLogicalType::Variant,
+        )
+        .unwrap();
+        let padded = required.with_nullable(true).unwrap();
+        let columns = [
+            ColumnDef {
+                name: "id".into(),
+                data_type: DataType::Int64,
+                nullable: true,
+                write_default: None,
+                logical_type: Some(SqlType::BigInt),
+            },
+            ColumnDef::from_value_type("v".into(), required.clone(), None).unwrap(),
+        ];
+        let mut producer = mor_match_producer();
+        // The original query updates id=s.new_id, with no __nr_new_v. The
+        // admitted match relation therefore supplies the existing Variant v.
+        let original = crate::analysis::OutputColumn {
+            column_id: crate::column_id::ColumnId(9),
+            name: "v".into(),
+            value_type: padded.clone(),
+            is_internal: false,
+        };
+        producer.output_columns.push(original.clone());
+        let crate::optimizer::operator::Operator::PhysicalValues(values) = &mut producer.op else {
+            unreachable!()
+        };
+        values.columns.push(original.clone());
+        let expanded = super::build_merge_change_event_expand(
+            producer,
+            &columns,
+            true,
+            false,
+            false,
+            &crate::compiler::SqlCompileControl::unbounded(),
+        )
+        .unwrap();
+        assert_replace_inherits_sequence_and_preserves_row_id(&expanded);
+        let output = expanded
+            .output_columns
+            .iter()
+            .find(|column| column.name == "v")
+            .unwrap();
+        assert_eq!(output.value_type, padded);
+        assert!(
+            !columns[1].nullable,
+            "provider obligation is not widened by event padding"
+        );
+        assert_eq!(columns[1].declared_value_type().unwrap(), required);
+        let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &expanded.op
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            expand.events.len(),
+            1,
+            "original matched-update-only MERGE keeps its Replace event"
+        );
+        let arena = expanded.execution_props.scalar_arena.as_ref().unwrap();
+        for event in &expand.events {
+            let value = event
+                .assignments
+                .iter()
+                .find(|assignment| assignment.output_column_id == output.column_id)
+                .and_then(|assignment| assignment.expr)
+                .expect("old/new v remains assigned");
+            assert_eq!(arena.value_type(value), &padded);
+            assert!(
+                matches!(arena.node(value), crate::optimizer::scalar::ScalarNode::ColumnRef(id) if *id == original.column_id)
+            );
+        }
+        assert!(
+            novarocks_functions::builtin::value_conversion::conversion_intermediate_type(
+                &FunctionValueType::new(DataType::LargeBinary, true),
+                &padded,
+            )
+            .is_err(),
+            "ordinary bytes still cannot acquire Variant identity"
+        );
     }
 
     #[test]
@@ -3093,11 +3190,7 @@ mod tests {
             Box::from([crate::compiler::ProviderReadColumnNeed::for_test(
                 0,
                 "id",
-                ValueType {
-                    logical_type: novarocks_type_contract::ValueLogicalType::Physical,
-                    data_type: arrow::datatypes::DataType::Int64,
-                    nullable: true,
-                },
+                ValueType::new(arrow::datatypes::DataType::Int64, true),
                 ConnectorValueType::BigInt,
             )]),
         );
@@ -3314,10 +3407,13 @@ mod tests {
             assert_ne!(*column_id, local_call.output_column_id);
         }
         assert_eq!(
-            local_node.output_columns[0].value_type.data_type,
+            local_node.output_columns[0].value_type.data_type().clone(),
             arrow::datatypes::DataType::Binary
         );
-        assert_eq!(global_call.result_type, arrow::datatypes::DataType::Binary);
+        assert_eq!(
+            global_call.result_type.data_type().clone(),
+            arrow::datatypes::DataType::Binary
+        );
 
         let authored = super::build_final_statistics_connector_plan(
             scan_source,
@@ -3470,8 +3566,8 @@ mod tests {
                 .map(|field| {
                     (
                         field.name.as_ref(),
-                        field.ty.data_type.clone(),
-                        field.ty.nullable,
+                        field.ty.data_type().clone(),
+                        field.ty.nullable(),
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -4334,6 +4430,14 @@ mod tests {
             assert_eq!(columns.len(), 1, "{sql}");
             assert_eq!(columns[0].domain, expected, "{sql}");
             assert_eq!(
+                columns[0].value_type, source.optimized.output_columns[0].value_type,
+                "the application projection must retain the actual complete SQL author: {sql}"
+            );
+            assert_eq!(
+                columns[0].has_private_persistence_domain(),
+                expected == Domain::Percentile
+            );
+            assert_eq!(
                 source.has_private_output_domain(),
                 expected == Domain::Percentile
             );
@@ -4412,6 +4516,20 @@ mod tests {
                 novarocks_physical_plan::ResultValueDomain::Plain
             );
             assert!(source.has_private_output_domain());
+            let columns = source.output_columns();
+            assert_eq!(
+                columns[0].value_type,
+                source.optimized.output_columns[0].value_type
+            );
+            assert!(columns[0].has_private_persistence_domain());
+            assert!(!columns[1].has_private_persistence_domain());
+            assert!(matches!(
+                columns[0].value_type.value_type().kind(),
+                novarocks_type_contract::ValueKind::List(item)
+                    if matches!(item.kind(), novarocks_type_contract::ValueKind::Nominal(
+                        novarocks_type_contract::ValueLogicalType::Object
+                        | novarocks_type_contract::ValueLogicalType::Percentile))
+            ));
             let mut erased = source.clone();
             erased.private_output_domain = false;
             assert_ne!(source.capture_fingerprint(), erased.capture_fingerprint());

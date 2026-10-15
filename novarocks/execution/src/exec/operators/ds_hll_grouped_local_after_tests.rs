@@ -34,7 +34,12 @@ fn run_optional_dop(
 ) -> Option<Chunk> {
     let state = RuntimeState::default();
     let mut operator = factory.create(dop, 0);
+    operator.set_construction_factory(aggregate_fixture::runtime_construction_factory(
+        tracker.clone(),
+        factory.error.clone(),
+    ));
     operator.set_mem_tracker(tracker);
+    operator.prepare().expect("prepare actual aggregate schema");
     let processor = operator.as_processor_mut().unwrap();
     for input in inputs {
         processor.push_chunk(&state, input.clone()).unwrap();
@@ -55,9 +60,12 @@ fn ds_hll_grouped_local_after_hash_slots_real_identity_native_and_nulls() {
             let refpartial = factory(&reference, P::Partial);
             let split = length / 2;
             let source_parts = [
-                Chunk::new_like(reference_input.batch.slice(0, split), &reference_input),
                 Chunk::new_like(
-                    reference_input.batch.slice(split, length - split),
+                    reference_input.record_batch().slice(0, split),
+                    &reference_input,
+                ),
+                Chunk::new_like(
+                    reference_input.record_batch().slice(split, length - split),
                     &reference_input,
                 ),
             ];
@@ -74,18 +82,23 @@ fn ds_hll_grouped_local_after_hash_slots_real_identity_native_and_nulls() {
             let single = factory(&program, P::Single);
             assert!(single.requires_local_update_stages());
             let source_contract = single.calls[0].contract.clone();
-            let output = single.output.clone();
+            let output = prepared_schema(&single, tracker.clone());
             let partition_slots = single.local_group_partition_slots();
             assert_eq!(partition_slots, output.slot_ids()[..1]);
             let (partial, final_stage) = single.into_local_update_stages().unwrap();
             assert_eq!(partial.groups, 1);
             assert_eq!(final_stage.groups, 1);
             assert_eq!(
-                partial.output.arrow_schema_ref().field(0),
+                prepared_schema(&partial, tracker.clone())
+                    .arrow_schema_ref()
+                    .field(0),
                 output.arrow_schema_ref().field(0)
             );
-            assert_eq!(partial.output.slots()[1].data_type(), &DataType::Binary);
-            assert_eq!(final_stage.output, output);
+            assert_eq!(
+                prepared_schema(&partial, tracker.clone()).slots()[1].data_type(),
+                &DataType::Binary
+            );
+            assert_eq!(prepared_schema(&final_stage, tracker.clone()), output);
             assert_eq!(final_stage.calls[0].first_root, 1);
             assert_eq!(partial.calls[0].first_root, 1);
             assert_eq!(partial.calls[0].roots, 3);
@@ -115,10 +128,16 @@ fn ds_hll_grouped_local_after_hash_slots_real_identity_native_and_nulls() {
                 let count = if driver == 0 { split } else { length - split };
                 if let Some(part) = run_optional(
                     &partial,
-                    &[Chunk::new_like(source.batch.slice(offset, count), &source)],
+                    &[Chunk::new_like(
+                        source.record_batch().slice(offset, count),
+                        &source,
+                    )],
                     tracker.clone(),
                 ) {
-                    assert_eq!(part.chunk_schema(), partial.output.as_ref());
+                    assert_eq!(
+                        part.chunk_schema(),
+                        prepared_schema(&partial, tracker.clone()).as_ref()
+                    );
                     exchange.accept(&state, part, driver).unwrap();
                 }
                 assert_eq!(exchange.finish_producer(), driver == 1);
@@ -163,7 +182,10 @@ fn ds_hll_grouped_local_after_original_dop_one_raw_unchanged() {
         let left = run_optional_dop(&single, &[source.clone()], tracker.clone(), 1).unwrap();
         let right = run(&single, &[source], tracker.clone());
         assert_eq!(estimates(&left), estimates(&right));
-        assert_eq!(left.chunk_schema(), single.output.as_ref());
+        assert_eq!(
+            left.chunk_schema(),
+            prepared_schema(&single, tracker.clone()).as_ref()
+        );
     }
     assert_eq!(tracker.current(), 0);
 }
@@ -184,7 +206,13 @@ fn ds_hll_grouped_local_after_actual_partial_final_cancel_latch_drop() {
             let first = if final_phase { partial_output } else { source };
             let state = RuntimeState::default();
             let mut operator = phase.create(2, 0);
+            operator.set_construction_factory(aggregate_fixture::runtime_construction_factory(
+                tracker.clone(),
+                phase.error.clone(),
+            ));
             operator.set_mem_tracker(tracker.clone());
+            operator.prepare().expect("prepare actual aggregate schema");
+            let creator_bytes = tracker.current();
             let processor = operator.as_processor_mut().unwrap();
             processor.push_chunk(&state, first.clone()).unwrap();
             assert!(tracker.current() > 0);
@@ -196,7 +224,7 @@ fn ds_hll_grouped_local_after_actual_partial_final_cancel_latch_drop() {
                 primary.cause(),
                 &crate::runtime::fragment::ExecutionFailureCause::Kernel(KernelFailure::Cancelled)
             );
-            assert_eq!(tracker.current(), 0);
+            assert_eq!(tracker.current(), creator_bytes);
             assert!(processor.is_finished());
             assert!(!processor.need_input());
             assert!(!processor.has_output());

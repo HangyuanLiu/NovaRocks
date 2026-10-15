@@ -1481,10 +1481,9 @@ fn add_join_incremental_change_stream_effect(
             )?;
             let delete = arena.intern_observed(
                 ScalarNode::Literal(HashableLiteral(LiteralValue::Int(CHANGE_OP_DELETE as i64))),
-                novarocks_type_contract::FunctionValueType {
-                    nullable: false,
-                    ..action.value_type.clone()
-                },
+                (action.value_type.clone())
+                    .with_nullable(false)
+                    .expect("valid value root nullability transform"),
                 control,
             )?;
             let is_delete = arena.intern_observed(
@@ -1496,7 +1495,7 @@ fn add_join_incremental_change_stream_effect(
                 },
                 novarocks_type_contract::FunctionValueType::new(
                     arrow::datatypes::DataType::Boolean,
-                    action.value_type.nullable,
+                    action.value_type.nullable(),
                 ),
                 control,
             )?;
@@ -1507,7 +1506,7 @@ fn add_join_incremental_change_stream_effect(
                 },
                 novarocks_type_contract::FunctionValueType::new(
                     arrow::datatypes::DataType::Boolean,
-                    action.value_type.nullable,
+                    action.value_type.nullable(),
                 ),
                 control,
             )?;
@@ -1597,7 +1596,10 @@ fn add_join_incremental_change_stream_effect(
     // the writer decide whether a particular row can be published.
     let mut expanded_columns = routed_outputs;
     for column in &mut expanded_columns {
-        column.value_type.nullable = true;
+        column.value_type = column
+            .value_type
+            .with_nullable(true)
+            .expect("validated root NULL contract");
     }
     expanded_columns.push(effect_output.clone());
     crate::planning::dml::build_change_expand(
@@ -1983,8 +1985,8 @@ fn find_row_id_column(
         crate::common::ICEBERG_ROW_ID_COL,
         &format!("{role} row-id"),
     )?;
-    if column.value_type.data_type != arrow::datatypes::DataType::Int64
-        || column.value_type.nullable
+    if *column.value_type.data_type() != arrow::datatypes::DataType::Int64
+        || column.value_type.nullable()
     {
         return Err(format!(
             "join first-refresh {role} row-id has invalid shape"
@@ -3555,8 +3557,8 @@ mod tests {
             let metadata = factory.get(crate::column_id::ColumnId(id));
             assert!(!metadata.name.starts_with("__reserved_col_"));
             assert_eq!(metadata.name, name);
-            assert_eq!(metadata.value_type.data_type, data_type);
-            assert_eq!(metadata.value_type.nullable, nullable);
+            assert_eq!(metadata.value_type.data_type().clone(), data_type);
+            assert_eq!(metadata.value_type.nullable(), nullable);
         }
     }
 

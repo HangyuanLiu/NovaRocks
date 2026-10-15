@@ -211,16 +211,57 @@ pub fn validate_intermediate_type(ty: &DataType) -> Result<&Fields, String> {
     Ok(fields)
 }
 
-pub fn intermediate_arg_types(intermediate_type: &DataType) -> Result<Vec<DataType>, String> {
-    validate_intermediate_type(intermediate_type)?
-        .iter()
-        .map(|field| match field.data_type() {
-            DataType::List(item) => Ok(item.data_type().clone()),
-            other => Err(format!(
-                "group_concat intermediate field must be ARRAY type, got {other:?}"
-            )),
+/// Borrow the same original validated intermediate channels. Their exact
+/// order and child NULL/layout facts come from the existing Struct/List owner.
+#[derive(Clone, Copy)]
+struct IntermediateArgTypes<'a>(&'a Fields);
+impl<'a> IntermediateArgTypes<'a> {
+    fn try_new(ty: &'a DataType) -> Result<Self, String> {
+        validate_intermediate_type(ty).map(Self)
+    }
+    fn len(self) -> usize {
+        self.0.len()
+    }
+    fn get(self, index: usize) -> &'a DataType {
+        let DataType::List(item) = self.0[index].data_type() else {
+            unreachable!("validated group_concat ARRAY channel")
+        };
+        item.data_type()
+    }
+    fn iter(self) -> impl ExactSizeIterator<Item = &'a DataType> {
+        self.0.iter().map(|field| {
+            let DataType::List(item) = field.data_type() else {
+                unreachable!("validated group_concat ARRAY channel")
+            };
+            item.data_type()
         })
-        .collect()
+    }
+}
+impl std::fmt::Debug for IntermediateArgTypes<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+struct MergeArgTypes<'a, 'b>(&'a [&'b ListArray]);
+impl MergeArgTypes<'_, '_> {
+    fn iter(&self) -> impl ExactSizeIterator<Item = &DataType> {
+        self.0.iter().map(|array| {
+            let DataType::List(item) = array.data_type() else {
+                unreachable!("validated actual group_concat ListArray")
+            };
+            item.data_type()
+        })
+    }
+}
+impl std::fmt::Debug for MergeArgTypes<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+pub fn intermediate_arg_types_borrowed(
+    intermediate_type: &DataType,
+) -> Result<impl ExactSizeIterator<Item = &DataType>, String> {
+    Ok(IntermediateArgTypes::try_new(intermediate_type)?.iter())
 }
 
 pub fn extract_input_columns(array: &ArrayRef) -> Result<Vec<ArrayRef>, String> {
@@ -365,7 +406,7 @@ fn mark_duplicated_rows<A: ScalarStateAllocator>(
 
 fn separator_for_row<A: ScalarStateAllocator>(
     row: &[Option<TrackedAggScalarValue<A>>],
-    arg_types: &[DataType],
+    arg_types: IntermediateArgTypes<'_>,
     layout: GroupConcatLayout,
     work: &mut ScalarWork<'_, '_>,
 ) -> Result<String, ScalarStateError> {
@@ -377,7 +418,7 @@ fn separator_for_row<A: ScalarStateAllocator>(
         {
             scalar_to_string(
                 &tracked_scalar_to_output(separator, work)?,
-                &arg_types[sep_idx],
+                arg_types.get(sep_idx),
                 work,
             )
         } else {
@@ -394,7 +435,6 @@ pub struct GroupConcatMerge<'a> {
     list_columns: Vec<&'a ListArray>,
     value_columns: Vec<ArrayRef>,
     offsets: Vec<Vec<i32>>,
-    arg_types: Vec<DataType>,
 }
 impl<'a> GroupConcatMerge<'a> {
     pub fn new(
@@ -412,17 +452,15 @@ impl<'a> GroupConcatMerge<'a> {
         let mut list_columns = Vec::with_capacity(field_num);
         let mut value_columns = Vec::with_capacity(field_num);
         let mut offsets = Vec::with_capacity(field_num);
-        let mut arg_types = Vec::with_capacity(field_num);
         for (idx, col) in struct_arr.columns().iter().enumerate() {
             work.step()?;
             let list_col = col
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .ok_or_else(|| format!("group_concat merge field {} must be ListArray", idx))?;
-            let DataType::List(item_field) = list_col.data_type() else {
+            let DataType::List(_) = list_col.data_type() else {
                 return Err(format!("group_concat merge field {} must be ARRAY type", idx).into());
             };
-            arg_types.push(item_field.data_type().clone());
             value_columns.push(list_col.values().clone());
             offsets.push(list_col.value_offsets().to_vec());
             list_columns.push(list_col);
@@ -435,7 +473,6 @@ impl<'a> GroupConcatMerge<'a> {
             list_columns,
             value_columns,
             offsets,
-            arg_types,
         })
     }
     pub fn is_null(&self, row: usize) -> bool {
@@ -453,11 +490,26 @@ impl<'a> GroupConcatMerge<'a> {
         if self.array.is_null(row) {
             return Ok(());
         }
-        let expected_types = intermediate_arg_types(intermediate_type)?;
-        if self.arg_types != expected_types {
+        let expected_types = IntermediateArgTypes::try_new(intermediate_type)?;
+        let actual_types = MergeArgTypes(&self.list_columns);
+        let mut matches = actual_types.0.len() == expected_types.len();
+        if matches {
+            for (actual, expected) in actual_types.iter().zip(expected_types.iter()) {
+                work.step()?;
+                if !novarocks_type_contract::arrow_data_types_equal_borrowed_observed::<
+                    crate::KernelFailure,
+                >(actual, expected, || {
+                    work.step().map_err(ScalarStateError::into_kernel_failure)
+                })? {
+                    matches = false;
+                    break;
+                }
+            }
+        }
+        if !matches {
             return Err(format!(
                 "group_concat merge argument types mismatch: expected {expected_types:?}, got {:?}",
-                self.arg_types
+                actual_types
             )
             .into());
         }
@@ -646,7 +698,7 @@ pub fn build_final_array<
             continue;
         }
 
-        let arg_types = intermediate_arg_types(intermediate_type)?;
+        let arg_types = IntermediateArgTypes::try_new(intermediate_type)?;
         let layout = GroupConcatLayout::infer(arg_types.len(), is_asc_order.len())?;
 
         let sorted_indices = sort_indices(&state.rows, layout, is_asc_order, nulls_first, work)?;
@@ -683,7 +735,7 @@ pub fn build_final_array<
                     &mut out,
                     &scalar_to_string(
                         &tracked_scalar_to_output(value, work)?,
-                        &arg_types[col],
+                        arg_types.get(col),
                         work,
                     )?,
                     max_len,
@@ -698,7 +750,7 @@ pub fn build_final_array<
             if pos != last_unique_pos
                 && append_with_limit(
                     &mut out,
-                    &separator_for_row(row, &arg_types, layout, work)?,
+                    &separator_for_row(row, arg_types, layout, work)?,
                     max_len,
                 )
             {

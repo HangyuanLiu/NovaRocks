@@ -334,11 +334,13 @@ pub(crate) fn copy_on_write_match_contract() -> ConnectorMutationMatchContract {
     ]
     .into_iter()
     .map(|(name, data_type, nullable, ordinal, tag)| {
-        ConnectorMutationSourceField::new(
+        ConnectorMutationSourceField::try_new_typed(
             ConnectorWriteFieldToken::from_bytes([tag; 32]),
-            Field::new(name, data_type, nullable),
+            Field::new(name, data_type.clone(), nullable),
             ordinal,
+            novarocks_type_contract::FunctionValueType::new(data_type, nullable),
         )
+        .expect("complete source role declaration")
     })
     .collect::<Vec<_>>();
     ConnectorMutationMatchContract::try_new(
@@ -350,16 +352,24 @@ pub(crate) fn copy_on_write_match_contract() -> ConnectorMutationMatchContract {
             .expect("table"),
         ConnectorWriteBaseVersion::try_new(bytes::Bytes::from_static(b"base")).expect("base"),
         identity.clone(),
-        vec![ConnectorMutationTargetField::new(
-            ConnectorWriteFieldToken::from_bytes([25; 32]),
-            Field::new("k1", DataType::Int64, false),
-            4,
-        )],
-        vec![ConnectorMutationTargetField::new(
-            ConnectorWriteFieldToken::from_bytes([26; 32]),
-            Field::new("k1", DataType::Int64, false),
-            5,
-        )],
+        vec![
+            ConnectorMutationTargetField::try_new_typed(
+                ConnectorWriteFieldToken::from_bytes([25; 32]),
+                Field::new("k1", DataType::Int64, false),
+                4,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            )
+            .expect("complete target declaration"),
+        ],
+        vec![
+            ConnectorMutationTargetField::try_new_typed(
+                ConnectorWriteFieldToken::from_bytes([26; 32]),
+                Field::new("k1", DataType::Int64, false),
+                5,
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            )
+            .expect("complete target declaration"),
+        ],
         vec![identity[2].token()],
         ConnectorMutationEffectField::try_new(
             ConnectorWriteFieldToken::from_bytes([27; 32]),

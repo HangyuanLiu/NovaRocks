@@ -180,12 +180,18 @@ fn prepare_iceberg_distributed_write(
     attempt_reservation: crate::query_execution::completion::QueryAttemptReservation,
 ) -> Result<PreparedIcebergWrite, String> {
     let write_lease = write_target.derive_write_lease()?;
-    let (query, write_columns) = build_iceberg_write_plan(
+    let source_control =
+        crate::query_execution::planning::sql_compile_control_from_connector_request(
+            connector_context,
+        );
+    let (query, write_columns, source_constants) = build_iceberg_write_plan(
         target,
         resolved,
         insert_columns,
         source,
         write_target.metadata(),
+        state.constant_policy(),
+        &source_control,
     )?;
     let intent = match overwrite_mode {
         IcebergWriteMode::Append => ConnectorWriteIntent::Append,
@@ -202,7 +208,8 @@ fn prepare_iceberg_distributed_write(
                 let field = value_type
                     .try_to_field(&column.name)
                     .map_err(|error| error.to_string())?;
-                Ok(ConnectorWriteFieldRequest::new(field))
+                ConnectorWriteFieldRequest::try_new_typed(field, value_type)
+                    .map_err(|error| error.to_string())
             })
             .collect::<Result<Vec<_>, String>>()?,
     };
@@ -255,6 +262,7 @@ fn prepare_iceberg_distributed_write(
         state: state.clone(),
         target: target.clone(),
         query: query.clone(),
+        source_constants,
         sql_write_input,
         table_bindings,
         execution,
@@ -383,11 +391,12 @@ impl PreparedIcebergWrite {
         crate::query_execution::compiler::PreparedDmlWriteAssembly,
         crate::dml::error::DmlExecutionError,
     > {
-        crate::query_execution::compiler::prepare_query_as_iceberg_write_with_write_session(
+        crate::query_execution::compiler::prepare_query_as_iceberg_write_with_write_session_and_constants(
             &self.semantic_binding.state,
             Some(&self.semantic_binding.target.catalog),
             &self.semantic_binding.target.namespace,
             &self.semantic_binding.query,
+            self.semantic_binding.source_constants.clone(),
             self.semantic_binding.sql_write_input.clone(),
             Arc::clone(&self.semantic_binding.table_bindings),
             None,
@@ -477,6 +486,7 @@ struct FrozenIcebergWriteSemanticBinding {
     state: DmlExecutionKernel,
     target: TargetBackend,
     query: Query,
+    source_constants: Option<novarocks_sql::compiler::SqlExpressionConstants>,
     sql_write_input: novarocks_sql::planning::dml::DmlWritePlanInput,
     table_bindings: Arc<crate::catalog_application::query_bindings::QueryTableBindingStore>,
     execution: Option<QueryExecutionContext>,
@@ -498,16 +508,42 @@ pub(crate) fn build_iceberg_write_plan(
     insert_columns: &[String],
     source: &Query,
     metadata: &novarocks_spi::connector::ConnectorTableMetadata,
-) -> Result<(Query, Vec<ColumnDef>), String> {
+    policy: novarocks_functions::ConstantPolicy,
+    control: &dyn novarocks_type_contract::PureCompileControl,
+) -> Result<
+    (
+        Query,
+        Vec<ColumnDef>,
+        Option<novarocks_sql::compiler::SqlExpressionConstants>,
+    ),
+    String,
+> {
     let write_columns = insert_columns_from_connector_metadata(
         metadata,
         &write_defaults_by_name(&resolved.columns),
     )?;
     let source_columns = sql_write_source_columns(&resolved.columns, &write_columns);
-    let query =
-        append_source_to_query_for_write(source, insert_columns, &source_columns, &write_columns)?;
+    let (query, constants) = match crate::dml::insert::shape_insert_source_with_constants(
+        source,
+        insert_columns,
+        &source_columns,
+        &write_columns,
+        policy,
+        control,
+    )? {
+        Some(shaped) => shaped,
+        None => (
+            append_source_to_query_for_write(
+                source,
+                insert_columns,
+                &source_columns,
+                &write_columns,
+            )?,
+            None,
+        ),
+    };
     let _ = target;
-    Ok((query, write_columns))
+    Ok((query, write_columns, constants))
 }
 
 /// A connector read schema can carry execution-only fields (for example
@@ -687,7 +723,7 @@ fn insert_columns_from_connector_metadata(
 ) -> Result<Vec<ColumnDef>, String> {
     let column_facts = metadata.planning_facts.column_facts();
     metadata
-        .schema
+        .schema()
         .fields()
         .iter()
         .enumerate()
@@ -703,25 +739,11 @@ fn insert_columns_from_connector_metadata(
             })
         })
         .map(|(ordinal, field)| {
-            let mut value_type = novarocks_type_contract::FunctionValueType::try_from_field(field)
-                .map_err(|error| {
-                    format!("invalid Iceberg write column `{}`: {error}", field.name())
-                })?;
-            if let Some(data_type) = column_facts
-                .get(ordinal)
-                .and_then(|fact| fact.write_target_type())
-            {
-                value_type.data_type = data_type.clone();
-                value_type.validate().map_err(|error| {
-                    format!("invalid Iceberg write column `{}`: {error}", field.name())
-                })?;
-            }
-            ColumnDef::from_value_type(
-                field.name().clone(),
-                value_type,
+            crate::connector::connector_write_column(
+                metadata,
+                ordinal,
                 write_defaults.get(field.name()).cloned(),
             )
-            .map_err(|error| format!("invalid Iceberg write column `{}`: {error}", field.name()))
         })
         .collect()
 }
@@ -770,15 +792,21 @@ fn omitted_column_expr_sql(column: &ColumnDef) -> Result<String, String> {
 pub(crate) fn target_cast_expr_sql(expr_sql: &str, column: &ColumnDef) -> Result<String, String> {
     Ok(format!(
         "CAST({expr_sql} AS {})",
-        sql_type_name(
-            &novarocks_types::sql_type_from_value_type(
-                &column
-                    .declared_value_type()
-                    .map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())?
+        value_type_to_sql_type_name(
+            &column
+                .declared_value_type()
+                .map_err(|error| error.to_string())?,
         )?
     ))
+}
+
+/// Render the original complete write declaration, including nominal children.
+pub(crate) fn value_type_to_sql_type_name(
+    value: &novarocks_type_contract::FunctionValueType,
+) -> Result<String, String> {
+    sql_type_name(
+        &novarocks_types::sql_type_from_value_type(value).map_err(|error| error.to_string())?,
+    )
 }
 
 fn parse_generated_query(sql: &str, context: &str) -> Result<Query, String> {
@@ -1045,27 +1073,36 @@ mod tests {
         }
     }
 
-    fn write_metadata(fields: Vec<Field>) -> novarocks_spi::connector::ConnectorTableMetadata {
+    fn write_metadata(
+        fields: Vec<Field>,
+        bindings: Vec<novarocks_type_contract::FunctionValueType>,
+    ) -> novarocks_spi::connector::ConnectorTableMetadata {
         use novarocks_spi::connector::{
             ConnectorInstanceId, ConnectorTableDefinitionFacts, ConnectorTableIdentity,
             ConnectorTablePlanningFacts,
         };
 
         let instance = ConnectorInstanceId::parse("writer_domain_test").expect("instance");
-        novarocks_spi::connector::ConnectorTableMetadata {
-            identity: ConnectorTableIdentity {
-                instance_id: instance.clone(),
-                namespace: Arc::from("db"),
-                table: Arc::from("target"),
-            },
-            schema: Arc::new(arrow::datatypes::Schema::new(fields)),
-            planning_facts: ConnectorTablePlanningFacts::empty(),
-            definition_facts: ConnectorTableDefinitionFacts::empty(),
-            version: None,
-            statistics_data_version: None,
-            table: ConnectorTableHandle::try_new(instance, bytes::Bytes::from_static(b"target"))
+        crate::connector::schema_creation::declared_test_metadata(
+            novarocks_spi::connector::ConnectorTableMetadataHeader {
+                identity: ConnectorTableIdentity {
+                    instance_id: instance.clone(),
+                    namespace: Arc::from("db"),
+                    table: Arc::from("target"),
+                },
+                planning_facts: ConnectorTablePlanningFacts::empty(),
+                definition_facts: ConnectorTableDefinitionFacts::empty(),
+                version: None,
+                statistics_data_version: None,
+                table: ConnectorTableHandle::try_new(
+                    instance,
+                    bytes::Bytes::from_static(b"target"),
+                )
                 .expect("checked table handle"),
-        }
+            },
+            Arc::new(arrow::datatypes::Schema::new(fields)),
+            bindings,
+        )
     }
 
     #[test]
@@ -1085,7 +1122,10 @@ mod tests {
         for (carrier, domain) in cases {
             let authored = FunctionValueType::try_with_logical_type(carrier, true, domain)
                 .expect("authored provider field type");
-            let metadata = write_metadata(vec![authored.try_to_field("Value").expect("field")]);
+            let metadata = write_metadata(
+                vec![authored.try_to_field("Value").expect("field")],
+                vec![authored.clone()],
+            );
             let defaults = HashMap::from([("Value".to_string(), ColumnDefault::Null)]);
             let columns = insert_columns_from_connector_metadata(&metadata, &defaults)
                 .expect("exact metadata columns");
@@ -1102,30 +1142,40 @@ mod tests {
                     .expect("column type")
                     .try_to_field("Value")
                     .expect("write request field"),
-                *metadata.schema.field(0),
+                *metadata.schema().field(0),
             );
         }
 
-        let child = FunctionValueType::try_with_logical_type(
-            DataType::FixedSizeBinary(16),
-            false,
-            ValueLogicalType::Uuid,
-        )
-        .expect("UUID child")
-        .try_to_field("nested_uuid")
-        .expect("child field")
-        .with_metadata(
-            [
-                (
-                    novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_string(),
-                    "uuid".to_string(),
-                ),
-                ("PARQUET:field_id".to_string(), "19".to_string()),
-            ]
+        use novarocks_type_contract::{
+            ValueField, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime as S,
+        };
+        let child =
+            ValueTypeRef::try_new(ValueKind::Nominal(ValueLogicalType::Uuid), false, S::pure())
+                .unwrap();
+        let layout = DataType::Struct(
+            vec![Arc::new(Field::new(
+                "nested_uuid",
+                DataType::FixedSizeBinary(16),
+                false,
+            ))]
             .into(),
         );
-        let nested = FunctionValueType::new(DataType::Struct(vec![Arc::new(child)].into()), false);
-        let metadata = write_metadata(vec![nested.try_to_field("nested").expect("nested field")]);
+        let nested = FunctionValueType::try_from_value(
+            ValueTypeRef::try_new(
+                ValueKind::Struct(
+                    vec![ValueField::new("nested_uuid", child, S::pure())].into_boxed_slice(),
+                ),
+                false,
+                S::pure(),
+            )
+            .unwrap(),
+            ValueLayout::try_new(&layout, S::pure()).unwrap(),
+        )
+        .unwrap();
+        let metadata = write_metadata(
+            vec![nested.try_to_field("nested").expect("nested field")],
+            vec![nested.clone()],
+        );
         let columns = insert_columns_from_connector_metadata(&metadata, &HashMap::new())
             .expect("complete nested write type");
         assert_eq!(
@@ -1135,25 +1185,24 @@ mod tests {
     }
 
     #[test]
-    fn metadata_write_columns_reject_unknown_and_incompatible_root_tags() {
-        for (carrier, tag) in [
-            (DataType::Binary, "unknown"),
-            (DataType::Binary, "uuid"),
-            (DataType::FixedSizeBinary(16), "variant"),
+    fn metadata_write_columns_refuse_invalid_declarations_and_ignore_generic_tags() {
+        use novarocks_type_contract::{FunctionValueType, ValueLogicalType as L};
+        for (carrier, logical) in [
+            (DataType::Binary, L::Uuid),
+            (DataType::FixedSizeBinary(16), L::Variant),
         ] {
-            let metadata = write_metadata(vec![
-                Field::new("v", carrier, true).with_metadata(
-                    [(
-                        novarocks_type_contract::NR_LOGICAL_TYPE_KEY.to_string(),
-                        tag.to_string(),
-                    )]
-                    .into(),
-                ),
-            ]);
-            let error = insert_columns_from_connector_metadata(&metadata, &HashMap::new())
-                .expect_err("invalid provider identity cannot become a plain write column");
-            assert!(error.contains("invalid Iceberg write column `v`"));
+            assert!(FunctionValueType::try_with_logical_type(carrier, true, logical).is_err());
         }
+        let ty = FunctionValueType::new(DataType::Binary, true);
+        let metadata = write_metadata(
+            vec![
+                Field::new("v", DataType::Binary, true)
+                    .with_metadata([("nr_logical_type".into(), "unknown".into())].into()),
+            ],
+            vec![ty.clone()],
+        );
+        let columns = insert_columns_from_connector_metadata(&metadata, &HashMap::new()).unwrap();
+        assert_eq!(columns[0].declared_value_type().unwrap(), ty);
     }
 
     #[test]
@@ -1171,7 +1220,10 @@ mod tests {
             ValueLogicalType::Uuid,
         )
         .expect("UUID type");
-        let mut metadata = write_metadata(vec![uuid.try_to_field("v").expect("UUID field")]);
+        let mut metadata = write_metadata(
+            vec![uuid.try_to_field("v").expect("UUID field")],
+            vec![uuid.clone()],
+        );
         let context = ConnectorRequestContext::try_new(
             std::time::Instant::now() + std::time::Duration::from_secs(60),
             ConnectorStopOwner::new().view(),
@@ -1179,8 +1231,9 @@ mod tests {
             65536,
         )
         .expect("bounded request");
+        let source_schema = Arc::new(metadata.schema().clone());
         metadata.planning_facts = ConnectorTablePlanningFacts::try_new(
-            &metadata.schema,
+            &source_schema,
             vec![
                 ConnectorTableColumnPlanningFact::new(
                     0,
@@ -1196,11 +1249,21 @@ mod tests {
             &context,
         )
         .expect("provider write carrier override");
+        assert_eq!(metadata.execution_schema().binding(0), Some(&uuid));
+        assert_eq!(
+            metadata.planning_facts.column_facts()[0].write_target_type(),
+            Some(&DataType::Binary)
+        );
         let error = insert_columns_from_connector_metadata(&metadata, &HashMap::new())
             .expect_err("a carrier override retains and validates the authored UUID identity");
         assert_eq!(
             error,
-            "invalid Iceberg write column `v`: invalid Arrow carrier for Uuid"
+            "connector write layout conflicts with its value contract: invalid Arrow carrier for Uuid"
+        );
+        assert_eq!(metadata.execution_schema().binding(0), Some(&uuid));
+        assert_eq!(
+            metadata.planning_facts.column_facts()[0].write_target_type(),
+            Some(&DataType::Binary)
         );
     }
 

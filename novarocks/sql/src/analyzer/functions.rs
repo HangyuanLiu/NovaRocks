@@ -158,7 +158,7 @@ pub(super) fn validate_scalar_function_call_typed(
 ) -> Result<(), String> {
     let arg_types = args
         .iter()
-        .map(|arg| arg.value_type.data_type.clone())
+        .map(|arg| arg.value_type.data_type().clone())
         .collect::<Vec<_>>();
     validate_scalar_function_call_impl(name, &arg_types, Some(args))
 }
@@ -361,35 +361,36 @@ fn validate_arrays_overlap_arguments(arg_types: &[DataType]) -> Result<(), Strin
 fn validate_arrays_overlap_typed_arguments(args: &[TypedExpr]) -> Result<(), String> {
     let arg_types = args
         .iter()
-        .map(|arg| arg.value_type.data_type.clone())
+        .map(|arg| arg.value_type.data_type().clone())
         .collect::<Vec<_>>();
     let Some(second) = args.get(1) else {
         return Ok(());
     };
     if !matches!(
-        second.value_type.data_type,
+        second.value_type.data_type(),
         DataType::List(_) | DataType::Null
     ) {
         return Err(format!(
             "2-th input of arrays_overlap should be an array, rather than {}",
-            arrays_overlap_type_name(&second.value_type.data_type)
+            arrays_overlap_type_name(&second.value_type.data_type())
         ));
     }
     let Some(first) = args.first() else {
         return Ok(());
     };
     if !matches!(
-        first.value_type.data_type,
+        first.value_type.data_type(),
         DataType::List(_) | DataType::Null
     ) {
         return Err(format!(
             "1-th input of arrays_overlap should be an array, rather than {}",
-            arrays_overlap_type_name(&first.value_type.data_type)
+            arrays_overlap_type_name(&first.value_type.data_type())
         ));
     }
-    if let (DataType::List(left), DataType::List(right)) =
-        (&first.value_type.data_type, &second.value_type.data_type)
-        && !arrays_overlap_element_compatible(left.data_type(), right.data_type())
+    if let (DataType::List(left), DataType::List(right)) = (
+        &first.value_type.data_type(),
+        &second.value_type.data_type(),
+    ) && !arrays_overlap_element_compatible(left.data_type(), right.data_type())
     {
         return Err(arrays_overlap_no_matching_signature_typed(args, &arg_types));
     }
@@ -1399,7 +1400,7 @@ mod tests {
             )
             .unwrap_or_else(|error| panic!("aggregate {name} must resolve: {error}"));
         crate::functions::aggregate_result_type(&binding)
-            .data_type
+            .data_type()
             .clone()
     }
 
@@ -1877,7 +1878,7 @@ mod tests {
                 "entries",
                 DataType::Struct(
                     vec![
-                        Arc::new(arrow::datatypes::Field::new("key", DataType::Int32, true)),
+                        Arc::new(arrow::datatypes::Field::new("key", DataType::Int32, false)),
                         Arc::new(arrow::datatypes::Field::new("value", DataType::Int64, true)),
                     ]
                     .into(),
@@ -1925,10 +1926,10 @@ mod tests {
             .unwrap();
         let result = crate::functions::aggregate_result_type(&binding);
         assert_eq!(
-            result.logical_type,
+            result.logical_type(),
             novarocks_type_contract::ValueLogicalType::LargeInt
         );
-        assert_eq!(result.data_type, largeint_type);
+        assert_eq!(result.data_type().clone(), largeint_type);
     }
 
     #[test]

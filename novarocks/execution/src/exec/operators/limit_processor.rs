@@ -31,7 +31,9 @@ use crate::runtime::fragment::ExecutionResult;
 
 use crate::exec::chunk::Chunk;
 
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{
+    ConstructionFailure, InputConstructionFactory, Operator, ProcessorOperator,
+};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::runtime::runtime_state::RuntimeState;
 use std::sync::Arc;
@@ -82,6 +84,8 @@ impl OperatorFactory for LimitProcessorFactory {
             pending_output: None,
             finishing: false,
             finished,
+            construction_factory: None,
+            prepared: false,
         })
     }
 }
@@ -92,11 +96,29 @@ struct LimitProcessorOperator {
     pending_output: Option<Chunk>,
     finishing: bool,
     finished: bool,
+    construction_factory: Option<Arc<dyn InputConstructionFactory>>,
+    prepared: bool,
 }
 
 impl Operator for LimitProcessorOperator {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn creates_typed_storage(&self) -> bool {
+        true
+    }
+
+    fn set_construction_factory(&mut self, factory: Arc<dyn InputConstructionFactory>) {
+        self.construction_factory = Some(factory);
+    }
+
+    fn prepare(&mut self) -> ExecutionResult<()> {
+        if self.construction_factory.is_none() {
+            return Err(ConstructionFailure::MissingOwner.into());
+        }
+        self.prepared = true;
+        Ok(())
     }
 
     fn is_finished(&self) -> bool {
@@ -122,6 +144,9 @@ impl ProcessorOperator for LimitProcessorOperator {
     }
 
     fn push_chunk(&mut self, _state: &RuntimeState, chunk: Chunk) -> ExecutionResult<()> {
+        if !self.prepared {
+            return Err(ConstructionFailure::MissingOwner.into());
+        }
         if self.finished {
             return Ok(());
         }
@@ -158,7 +183,17 @@ impl ProcessorOperator for LimitProcessorOperator {
         };
 
         if take_rows > 0 {
-            self.pending_output = Some(chunk.slice(skip_rows, take_rows));
+            let factory = self
+                .construction_factory
+                .as_deref()
+                .ok_or(ConstructionFailure::MissingOwner)?;
+            let owner = factory.begin_input_construction(&chunk)?;
+            self.pending_output = Some(chunk.slice_typed_observed::<ConstructionFailure, _>(
+                skip_rows,
+                take_rows,
+                owner.storage_lifetime(),
+                |step| owner.observe(0, &[], step),
+            )?);
         }
 
         if exhausted_limit && self.pending_output.is_none() {
@@ -218,15 +253,56 @@ mod tests {
             ],
         )
         .expect("build record batch");
-        {
-            let batch = batch;
-            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                batch.schema().as_ref(),
-                &[SlotId::new(1), SlotId::new(2)],
-            )
-            .expect("chunk schema");
-            Chunk::new_with_chunk_schema(batch, chunk_schema)
-        }
+        let pure = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+        let slots = batch
+            .schema_ref()
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(index, field)| {
+                let binding = novarocks_type_contract::TypedValueBinding::try_new(
+                    novarocks_type_contract::ValueTypeRef::try_new(
+                        match index {
+                            0 => novarocks_type_contract::ValueKind::Scalar(DataType::Int32),
+                            1 => novarocks_type_contract::ValueKind::String,
+                            _ => unreachable!("fixture has two declared columns"),
+                        },
+                        field.is_nullable(),
+                        pure.clone(),
+                    )
+                    .unwrap(),
+                    novarocks_type_contract::ValueLayout::try_new(field.data_type(), pure.clone())
+                        .unwrap(),
+                )
+                .unwrap();
+                crate::exec::chunk::ChunkSlotSchema::try_new_typed(
+                    SlotId::new(index as u32 + 1),
+                    field.clone(),
+                    binding,
+                    None,
+                    pure.clone(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let schema = Arc::new(crate::exec::chunk::ChunkSchema::try_new_typed(slots, pure).unwrap());
+        Chunk::try_new_typed_with_columns_observed::<String, _>(
+            schema,
+            batch.columns().to_vec(),
+            rows,
+            |_| Ok(()),
+        )
+        .unwrap()
+    }
+
+    fn prepare_limit(op: &mut dyn Operator) {
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("limit fixture"),
+            Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        ).unwrap();
+        op.set_construction_factory(factory);
+        op.prepare().unwrap();
     }
 
     fn chunk_values(chunk: &Chunk) -> Vec<i32> {
@@ -266,9 +342,31 @@ mod tests {
     }
 
     #[test]
+    fn limit_refuses_unprepared_input_before_consuming_row_budget() {
+        let factory = LimitProcessorFactory::new(1, Some(2), 1);
+        let mut op = factory.create(1, 0);
+        let error = op
+            .as_processor_mut()
+            .unwrap()
+            .push_chunk(&RuntimeState::default(), make_chunk(0, 4))
+            .unwrap_err();
+        assert!(matches!(
+            error.cause(),
+            crate::runtime::fragment::ExecutionFailureCause::Construction(
+                ConstructionFailure::MissingOwner
+            )
+        ));
+        let state = factory.state.lock().unwrap();
+        assert_eq!(state.remaining_offset, 1);
+        assert_eq!(state.remaining_limit, Some(2));
+        assert!(!op.as_processor_ref().unwrap().has_output());
+    }
+
+    #[test]
     fn limit_processor_applies_offset_then_limit() {
         let state = RuntimeState::default();
         let mut op = LimitProcessorFactory::new(1, Some(4), 3).create(1, 0);
+        prepare_limit(op.as_mut());
         let p = op.as_processor_mut().expect("processor op");
 
         p.push_chunk(&state, make_chunk(0, 5))
@@ -294,6 +392,7 @@ mod tests {
     fn limit_processor_supports_offset_only() {
         let state = RuntimeState::default();
         let mut op = LimitProcessorFactory::new(2, None, 2).create(1, 0);
+        prepare_limit(op.as_mut());
         let p = op.as_processor_mut().expect("processor op");
 
         p.push_chunk(&state, make_chunk(0, 3))

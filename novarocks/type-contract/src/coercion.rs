@@ -49,11 +49,31 @@ fn wider_decimal_type(
 
 /// Determine the wider type for unifying two types (comparisons, CASE, UNION, etc.).
 pub fn wider_type(a: &DataType, b: &DataType) -> DataType {
+    wider_type_with_construction::<std::convert::Infallible>(a, b, None).expect("pure wider type")
+}
+/// The controlled sibling consumes validated metadata-free type carriers.
+/// Annotation imports remain with their original external author.
+pub fn wider_type_with_construction<E>(
+    a: &DataType,
+    b: &DataType,
+    observer: Option<&mut dyn FnMut(crate::ValueConstructionRequest) -> Result<(), E>>,
+) -> Result<DataType, crate::ValueConstructionFailure<E>> {
+    wider_type_core(
+        a,
+        b,
+        &mut crate::value_construction::ValueConstruction::new(observer),
+    )
+}
+fn wider_type_core<E>(
+    a: &DataType,
+    b: &DataType,
+    creation: &mut crate::value_construction::ValueConstruction<'_, E>,
+) -> Result<DataType, crate::ValueConstructionFailure<E>> {
     if a == b {
-        return a.clone();
+        return creation.cloned_data_type(a);
     }
-    match (a, b) {
-        (DataType::Null, other) | (other, DataType::Null) => other.clone(),
+    Ok(match (a, b) {
+        (DataType::Null, other) | (other, DataType::Null) => creation.cloned_data_type(other)?,
         (l, r)
             if (crate::is_largeint_data_type(l) && is_integer(r))
                 || (is_integer(l) && crate::is_largeint_data_type(r)) =>
@@ -61,25 +81,27 @@ pub fn wider_type(a: &DataType, b: &DataType) -> DataType {
             DataType::FixedSizeBinary(crate::LARGEINT_BYTE_WIDTH)
         }
         (DataType::List(left_field), DataType::List(right_field)) => DataType::List(
-            wider_nested_field(left_field.name(), left_field, right_field),
+            wider_nested_field(left_field.name(), left_field, right_field, creation)?,
         ),
         (DataType::Map(left_entries, _), DataType::Map(right_entries, _)) => {
-            wider_map_type(left_entries, right_entries)
+            wider_map_type(left_entries, right_entries, creation)?
         }
         (DataType::Struct(left_fields), DataType::Struct(right_fields))
             if left_fields.len() == right_fields.len() =>
         {
-            if let Some(fields) = wider_struct_fields_by_name(left_fields, right_fields) {
-                return DataType::Struct(fields);
+            if let Some(fields) = wider_struct_fields_by_name(left_fields, right_fields, creation)?
+            {
+                return Ok(DataType::Struct(fields));
             }
+            creation.collected_arc_slice::<Arc<Field>>(left_fields.len())?;
             DataType::Struct(Fields::from(
                 left_fields
                     .iter()
                     .zip(right_fields.iter())
                     .map(|(left_field, right_field)| {
-                        wider_nested_field(left_field.name(), left_field, right_field)
+                        wider_nested_field(left_field.name(), left_field, right_field, creation)
                     })
-                    .collect::<Vec<_>>(),
+                    .collect::<Result<Vec<_>, crate::ValueConstructionFailure<E>>>()?,
             ))
         }
         // VARCHAR wins before DECIMAL, matching StarRocks TypeManager:
@@ -145,8 +167,8 @@ pub fn wider_type(a: &DataType, b: &DataType) -> DataType {
         (DataType::Int64, _) | (_, DataType::Int64) => DataType::Int64,
         (DataType::Int32, _) | (_, DataType::Int32) => DataType::Int64,
         (DataType::Int16, _) | (_, DataType::Int16) => DataType::Int16,
-        _ => a.clone(),
-    }
+        _ => creation.cloned_data_type(a)?,
+    })
 }
 
 fn integer_decimal_precision(data_type: &DataType) -> u8 {
@@ -172,66 +194,92 @@ fn logical_storage_matches(logical: crate::ValueLogicalType, storage: &DataType)
     }
 }
 
-fn compatible_field_logical_type(field: &Field) -> Option<crate::ValueLogicalType> {
-    field
-        .metadata()
-        .get(crate::NR_LOGICAL_TYPE_KEY)
-        .and_then(|value| {
-            crate::ValueLogicalType::from_metadata_value(&value.trim().to_ascii_lowercase()).ok()
-        })
-        .filter(|logical| logical_storage_matches(*logical, field.data_type()))
+fn compatible_field_logical_type<E>(
+    field: &Field,
+    creation: &mut crate::value_construction::ValueConstruction<'_, E>,
+) -> Result<Option<crate::ValueLogicalType>, crate::ValueConstructionFailure<E>> {
+    let Some(value) = field.metadata().get(crate::NR_LOGICAL_TYPE_KEY) else {
+        return Ok(None);
+    };
+    creation.name(value.trim().len())?;
+    Ok(
+        crate::ValueLogicalType::from_metadata_value(&value.trim().to_ascii_lowercase())
+            .ok()
+            .filter(|logical| logical_storage_matches(*logical, field.data_type())),
+    )
 }
-
-/// Rebuilding a nested common type preserves a shared semantic domain, not a
-/// provider's decoration. A physical Null contributes no conflicting domain.
-fn wider_nested_field(name: &str, left: &Field, right: &Field) -> Arc<Field> {
-    let data_type = wider_type(left.data_type(), right.data_type());
+fn wider_nested_field<E>(
+    name: &str,
+    left: &Field,
+    right: &Field,
+    creation: &mut crate::value_construction::ValueConstruction<'_, E>,
+) -> Result<Arc<Field>, crate::ValueConstructionFailure<E>> {
+    let data_type = wider_type_core(left.data_type(), right.data_type(), creation)?;
     let logical = match (left.data_type(), right.data_type()) {
-        (DataType::Null, _) => compatible_field_logical_type(right),
-        (_, DataType::Null) => compatible_field_logical_type(left),
+        (DataType::Null, _) => compatible_field_logical_type(right, creation)?,
+        (_, DataType::Null) => compatible_field_logical_type(left, creation)?,
         _ => {
-            let left = compatible_field_logical_type(left);
-            let right = compatible_field_logical_type(right);
-            left.filter(|logical| right == Some(*logical))
+            let a = compatible_field_logical_type(left, creation)?;
+            let b = compatible_field_logical_type(right, creation)?;
+            a.filter(|logical| b == Some(*logical))
         }
     }
     .filter(|logical| logical_storage_matches(*logical, &data_type));
-    // Keep an invalid source fact visible to the exact type owner. Removing
-    // it would turn an unsupported declaration into an ordinary string, or
-    // turn conflicting LargeBinary opaque bytes into Native Variant.
-    let invalid_source = [left, right].iter().any(|field| {
-        !matches!(field.data_type(), DataType::Null)
+    let mut invalid_source = false;
+    for field in [left, right] {
+        if !matches!(field.data_type(), DataType::Null)
             && field.metadata().contains_key(crate::NR_LOGICAL_TYPE_KEY)
-            && compatible_field_logical_type(field).is_none()
-    });
-    let erased_opaque = matches!(data_type, DataType::LargeBinary)
-        && logical.is_none()
-        && [left, right]
-            .iter()
-            .any(|field| compatible_field_logical_type(field).is_some());
-    let field = Field::new(name, data_type, left.is_nullable() || right.is_nullable());
-    if invalid_source || erased_opaque {
-        // This is a rejection witness, not a new admitted logical type.
-        return Arc::new(field.with_metadata(
-            [(crate::NR_LOGICAL_TYPE_KEY.to_owned(), "invalid".to_owned())].into(),
-        ));
+            && compatible_field_logical_type(field, creation)?.is_none()
+        {
+            invalid_source = true;
+            break;
+        }
     }
-    Arc::new(match logical {
-        Some(logical) => field.with_metadata(
-            [(
-                crate::NR_LOGICAL_TYPE_KEY.to_owned(),
+    let mut erased_opaque = false;
+    if matches!(data_type, DataType::LargeBinary) && logical.is_none() {
+        for field in [left, right] {
+            if compatible_field_logical_type(field, creation)?.is_some() {
+                erased_opaque = true;
+                break;
+            }
+        }
+    }
+    creation.name(name.len())?;
+    let field = Field::new(name, data_type, left.is_nullable() || right.is_nullable());
+    let field = if invalid_source || erased_opaque {
+        field_marker(field, "invalid", creation)?
+    } else {
+        match logical {
+            Some(logical) => field_marker(
+                field,
                 logical
                     .metadata_value()
-                    .expect("compatible logical type is explicit")
-                    .to_owned(),
-            )]
-            .into(),
-        ),
-        None => field,
-    })
+                    .expect("compatible logical type is explicit"),
+                creation,
+            )?,
+            None => field,
+        }
+    };
+    creation
+        .exact(|| crate::owned_resources::layout::arc_layout(std::alloc::Layout::new::<Field>()))?;
+    Ok(Arc::new(field))
 }
-
-fn wider_struct_fields_by_name(left_fields: &Fields, right_fields: &Fields) -> Option<Fields> {
+fn field_marker<E>(
+    field: Field,
+    value: &str,
+    creation: &mut crate::value_construction::ValueConstruction<'_, E>,
+) -> Result<Field, crate::ValueConstructionFailure<E>> {
+    creation.name(crate::NR_LOGICAL_TYPE_KEY.len())?;
+    creation.name(value.len())?;
+    creation.table::<String, String>(1)?;
+    Ok(field.with_metadata([(crate::NR_LOGICAL_TYPE_KEY.to_owned(), value.to_owned())].into()))
+}
+fn wider_struct_fields_by_name<E>(
+    left_fields: &Fields,
+    right_fields: &Fields,
+    creation: &mut crate::value_construction::ValueConstruction<'_, E>,
+) -> Result<Option<Fields>, crate::ValueConstructionFailure<E>> {
+    creation.table::<&str, &Arc<Field>>(right_fields.len())?;
     let right_by_name = right_fields
         .iter()
         .map(|field| (field.name().as_str(), field))
@@ -240,63 +288,64 @@ fn wider_struct_fields_by_name(left_fields: &Fields, right_fields: &Fields) -> O
         .iter()
         .any(|field| !right_by_name.contains_key(field.name().as_str()))
     {
-        return None;
+        return Ok(None);
     }
-    Some(Fields::from(
-        left_fields
-            .iter()
-            .map(|left_field| {
-                let right_field = right_by_name.get(left_field.name().as_str())?;
-                Some(wider_nested_field(
-                    left_field.name(),
-                    left_field,
-                    right_field,
-                ))
-            })
-            .collect::<Option<Vec<_>>>()?,
-    ))
+    creation.collected_arc_slice::<Arc<Field>>(left_fields.len())?;
+    let fields = left_fields
+        .iter()
+        .map(|left_field| {
+            let Some(right_field) = right_by_name.get(left_field.name().as_str()) else {
+                return Ok(None);
+            };
+            wider_nested_field(left_field.name(), left_field, right_field, creation).map(Some)
+        })
+        .collect::<Result<Option<Vec<_>>, crate::ValueConstructionFailure<E>>>()?;
+    Ok(fields.map(Fields::from))
 }
-
-fn wider_map_type(left_entries: &Field, right_entries: &Field) -> DataType {
+fn wider_map_type<E>(
+    left_entries: &Field,
+    right_entries: &Field,
+    creation: &mut crate::value_construction::ValueConstruction<'_, E>,
+) -> Result<DataType, crate::ValueConstructionFailure<E>> {
+    let malformed = |creation: &mut crate::value_construction::ValueConstruction<'_, E>| {
+        creation.name(left_entries.name().len())?;
+        creation.cloned_annotations(left_entries.metadata().capacity())?;
+        // Field::clone copies its owned name/annotation map and DataType Boxes.
+        creation.cloned_type_backing(left_entries.data_type())?;
+        creation.exact(|| {
+            crate::owned_resources::layout::arc_layout(std::alloc::Layout::new::<Field>())
+        })?;
+        Ok(DataType::Map(Arc::new(left_entries.clone()), false))
+    };
     let DataType::Struct(left_fields) = left_entries.data_type() else {
-        return DataType::Map(Arc::new(left_entries.clone()), false);
+        return malformed(creation);
     };
     let DataType::Struct(right_fields) = right_entries.data_type() else {
-        return DataType::Map(Arc::new(left_entries.clone()), false);
+        return malformed(creation);
     };
     if left_fields.len() != 2 || right_fields.len() != 2 {
-        return DataType::Map(Arc::new(left_entries.clone()), false);
-    }
-
-    DataType::Map(
-        Arc::new(with_invalid_container_marker(
-            Field::new(
-                "entries",
-                DataType::Struct(
-                    vec![
-                        wider_nested_field("key", &left_fields[0], &right_fields[0]),
-                        wider_nested_field("value", &left_fields[1], &right_fields[1]),
-                    ]
-                    .into(),
-                ),
-                false,
-            ),
-            [left_entries, right_entries]
-                .iter()
-                .any(|field| field.metadata().contains_key(crate::NR_LOGICAL_TYPE_KEY)),
-        )),
-        false,
-    )
-}
-
-fn with_invalid_container_marker(field: Field, has_marker: bool) -> Field {
-    // The Map entries container cannot own any scalar logical domain. Keep a
-    // bounded rejection witness through normalization instead of erasing it.
-    if has_marker {
-        field.with_metadata([(crate::NR_LOGICAL_TYPE_KEY.to_owned(), "invalid".to_owned())].into())
+        return malformed(creation);
+    };
+    creation.array::<Arc<Field>>(2)?;
+    let fields = vec![
+        wider_nested_field("key", &left_fields[0], &right_fields[0], creation)?,
+        wider_nested_field("value", &left_fields[1], &right_fields[1], creation)?,
+    ];
+    creation.arc_slice::<Arc<Field>>(2)?;
+    let fields = DataType::Struct(fields.into());
+    creation.name("entries".len())?;
+    let field = Field::new("entries", fields, false);
+    let field = if [left_entries, right_entries]
+        .iter()
+        .any(|field| field.metadata().contains_key(crate::NR_LOGICAL_TYPE_KEY))
+    {
+        field_marker(field, "invalid", creation)?
     } else {
         field
-    }
+    };
+    creation
+        .exact(|| crate::owned_resources::layout::arc_layout(std::alloc::Layout::new::<Field>()))?;
+    Ok(DataType::Map(Arc::new(field), false))
 }
 
 #[cfg(test)]

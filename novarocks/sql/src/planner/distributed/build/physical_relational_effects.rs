@@ -17,7 +17,7 @@
 
 //! Checked original relational contexts and independent argument-root effects.
 
-use super::expression_occurrences::AuthoredPhysicalOccurrences;
+use super::expression_occurrences::{AuthoredPhysicalOccurrences, WriterOccurrenceContexts};
 use novarocks_functions::ScopedExpressionEffects;
 use novarocks_physical_plan::{
     ExprId, ExpressionRootSite, Fragment, PhysicalCallSite, PhysicalRootUses, ValueDef,
@@ -116,8 +116,16 @@ pub(crate) fn relational_context_observed(
     site: PhysicalCallSite,
     work: &mut CompileCheckpoints<'_>,
 ) -> Result<ExpressionEffectContext, PhysicalRelationalEffectsError> {
+    relational_writer_context_observed(&occurrences.writer_contexts(), site, work)
+}
+
+pub(crate) fn relational_writer_context_observed(
+    occurrences: &WriterOccurrenceContexts<'_, '_>,
+    site: PhysicalCallSite,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<ExpressionEffectContext, PhysicalRelationalEffectsError> {
     let mut found = None;
-    for &(actual_site, context) in &occurrences.relational_contexts {
+    for &(actual_site, context) in occurrences.relational_contexts {
         let matching = actual_site == site;
         work.step()?;
         if matching {
@@ -133,7 +141,7 @@ pub(crate) fn relational_context_observed(
     let context = found.ok_or(PhysicalRelationalEffectsError::InvalidSource(
         "relational site has no original relational context",
     ))?;
-    for &(other_site, other) in &occurrences.relational_contexts {
+    for &(other_site, other) in occurrences.relational_contexts {
         let colliding = other_site != site
             && (other.use_id == context.use_id || other.domain == context.domain);
         work.step()?;
@@ -152,8 +160,7 @@ pub(crate) fn relational_context_observed(
             ));
         }
     }
-    let flow = occurrences.root_uses.flow();
-    for invocation in flow.uses().values() {
+    for invocation in occurrences.expression_invocations() {
         let shares_domain = invocation.context.domain == context.domain;
         work.step()?;
         if shares_domain {
@@ -162,9 +169,9 @@ pub(crate) fn relational_context_observed(
             ));
         }
     }
-    let expression_collision = flow.uses().contains_key(&context.use_id);
+    let expression_collision = occurrences.contains_expression_use(context.use_id);
     work.step()?;
-    let domain = flow.domains().get(&context.domain);
+    let domain = occurrences.domain(context.domain);
     work.step()?;
     let matching = !expression_collision
         && context.demand == EvaluationDemand::Value
@@ -179,9 +186,10 @@ pub(crate) fn relational_context_observed(
 }
 
 /// Authenticate an actual materialized Writer channel from the same source
-/// loan. It reads that Value; it never re-evaluates an origin expression.
-pub(crate) fn writer_value_effects_observed(
-    occurrences: &AuthoredPhysicalOccurrences<'_>,
+/// loan. Both host roles reuse this Value-only law; neither re-evaluates an
+/// origin expression or transfers an upstream expression's effects.
+pub(crate) fn writer_value_context_effects_observed(
+    occurrences: &WriterOccurrenceContexts<'_, '_>,
     fragment: &Fragment,
     site: PhysicalCallSite,
     actual_value: &ValueDef,
@@ -217,10 +225,9 @@ pub(crate) fn writer_value_effects_observed(
     let context = found.ok_or(PhysicalRelationalEffectsError::InvalidSource(
         "Writer channel has no original materialized Value occurrence",
     ))?;
-    let flow = occurrences.root_uses.flow();
-    let domain = flow.domains().get(&context.domain);
+    let domain = occurrences.domain(context.domain);
     work.step()?;
-    let actual = !flow.uses().contains_key(&context.use_id)
+    let actual = !occurrences.contains_expression_use(context.use_id)
         && context.demand == EvaluationDemand::Value
         && domain.is_some_and(|domain| domain.parent.is_none() && domain.guard.is_none());
     work.step()?;
@@ -229,7 +236,7 @@ pub(crate) fn writer_value_effects_observed(
             "Writer channel differs from its original unguarded materialized Value domain",
         ));
     }
-    for (_, other) in &occurrences.relational_contexts {
+    for (_, other) in occurrences.relational_contexts {
         let colliding = other.use_id == context.use_id || other.domain == context.domain;
         work.step()?;
         if colliding {
@@ -238,7 +245,7 @@ pub(crate) fn writer_value_effects_observed(
             ));
         }
     }
-    for invocation in flow.uses().values() {
+    for invocation in occurrences.expression_invocations() {
         let shares = invocation.context.domain == context.domain;
         work.step()?;
         if shares {

@@ -381,7 +381,7 @@ impl PreparedAggregateKernel for SumKernel {
     where
         I: ExactSizeIterator<Item = &'state SumState>,
     {
-        let ty = self.contract.intermediate_type().data_type.clone();
+        let ty = self.contract.intermediate_type().data_type().clone();
         observed(control, |work| {
             let rows = states.len();
             match (self.domain, &ty) {
@@ -430,7 +430,7 @@ impl PreparedAggregateKernel for SumKernel {
     where
         I: ExactSizeIterator<Item = &'state SumState>,
     {
-        let ty = self.final_value().data_type.clone();
+        let ty = self.final_value().data_type().clone();
         let policy = self.contract.call().decimal_overflow_policy();
         observed(control, |work| {
             let rows = states.len();

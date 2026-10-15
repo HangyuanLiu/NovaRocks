@@ -210,6 +210,14 @@ impl AggregateStateColumn {
         Ok(index)
     }
 
+    /// Ask this installed state column, rather than a pure FE declaration.
+    pub fn argument_encoding(
+        &self,
+        ordinal: usize,
+    ) -> Result<crate::AggregateArgumentEncoding<'_>, KernelFailure> {
+        self.handle.argument_encoding(ordinal)
+    }
+
     /// One update frame over these states; `mapping[i]` is the group of the
     /// input's selected row `i`.
     pub fn prepare_update_batch<'frame>(

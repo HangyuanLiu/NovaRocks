@@ -409,8 +409,8 @@ impl<'evaluator, 'contract, 'input> LambdaBodyInvocation<'evaluator, 'contract, 
         let result = if input.selection().is_empty() {
             SelectedValues::try_new(
                 input.selection(),
-                &input.contract().result_type().data_type,
-                new_empty_array(&input.contract().result_type().data_type),
+                input.contract().result_type().data_type(),
+                new_empty_array(input.contract().result_type().data_type()),
                 Box::default(),
             )
             .map_err(|_| internal("empty lambda output violates its contract"))
@@ -447,7 +447,7 @@ fn validate_body_output(
         .same_rows_observed(input.selection(), || work.step())?
         || !novarocks_type_contract::arrow_data_types_exact_observed::<KernelFailure>(
             output.values().data_type(),
-            &input.contract().result_type().data_type,
+            input.contract().result_type().data_type(),
             || work.step(),
         )?
     {
@@ -469,7 +469,7 @@ fn validate_body_output(
     }
     // SelectedValues already checks compact shape and ordered error NULLs.
     // Errors are child errors: the parent's own_row_error does not gate them.
-    if !input.contract().result_type().nullable {
+    if !input.contract().result_type().nullable() {
         let mut errors = output.errors().iter().peekable();
         for ordinal in 0..output.values().len() {
             if errors

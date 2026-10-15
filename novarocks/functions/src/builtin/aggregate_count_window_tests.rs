@@ -196,7 +196,7 @@ impl Fixture {
     }
 }
 fn ty(array: &ArrayRef, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(array.data_type().clone(), nullable)
+    FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), nullable)
 }
 fn geometry<'a>(
     prepared: &'a Arc<dyn PreparedWindowKernel>,
@@ -340,7 +340,7 @@ fn installed_star_and_value_frames_have_hand_counts_in_all_frame_units_and_both_
                         PreparedPureKernel::Window(value) => value,
                         _ => panic!("COUNT window"),
                     };
-                    assert!(!prepared.contract().result_type().nullable);
+                    assert!(!prepared.contract().result_type().nullable());
                     let args = if star {
                         Vec::new()
                     } else {
@@ -474,8 +474,10 @@ fn original_nested_metadata_and_child_encoded_nulls_preserve_root_contribution_a
     let FunctionArgumentType::Value(selected) = &fixture.selected.argument_types[0] else {
         panic!("selected source")
     };
+    let decoded = arrow_cast::cast(values.as_ref(), selected.data_type()).unwrap();
+    let values = crate::test_value_ingress::array_for_binding(&decoded, selected).unwrap();
     assert!(novarocks_type_contract::arrow_data_types_exact(
-        &selected.data_type,
+        selected.data_type(),
         values.data_type()
     ));
     let mut builder = EngineFunctionCatalogBuilder::new();
@@ -548,7 +550,7 @@ fn original_nested_metadata_and_child_encoded_nulls_preserve_root_contribution_a
 }
 
 #[test]
-fn encoded_and_bare_null_roots_keep_original_physical_counts_and_generic_profiles() {
+fn encoded_plain_ingress_and_bare_null_follow_logical_counts_and_generic_profiles() {
     let dictionary: ArrayRef = Arc::new(
         DictionaryArray::<Int8Type>::try_new(
             arrow_array::Int8Array::from(vec![Some(0), Some(1), None, Some(1), Some(0)]),
@@ -556,7 +558,7 @@ fn encoded_and_bare_null_roots_keep_original_physical_counts_and_generic_profile
         )
         .unwrap(),
     );
-    // Independent old analytic rule: four non-NULL physical keys, not two logical values.
+    // Physical keys and logical selected values carry distinct NULL facts.
     assert_eq!((0..5).filter(|row| !dictionary.is_null(*row)).count(), 4);
     let null: ArrayRef = Arc::new(NullArray::new(5));
     assert_eq!((0..5).filter(|r| !null.is_null(*r)).count(), 5);
@@ -571,13 +573,14 @@ fn encoded_and_bare_null_roots_keep_original_physical_counts_and_generic_profile
     for source in [
         ty(&dictionary, true),
         ty(&null, true),
-        FunctionValueType::new(union, true),
-        FunctionValueType::new(run, true),
+        FunctionValueType::from_legacy_declared_projection(union, true),
+        FunctionValueType::from_legacy_declared_projection(run, true),
     ] {
         let fixture = Fixture::new(Some(source), DecimalOverflowPolicy::OutputNull);
         assert!(fixture.prepare(false, &CompileControl::default()).is_ok());
     }
-    for (values, expected) in [(dictionary, 4), (null, 5)] {
+    let plain = arrow_cast::cast(dictionary.as_ref(), &DataType::Int32).unwrap();
+    for (values, expected) in [(plain, 2), (null, 0)] {
         let fixture = Fixture::new(Some(ty(&values, true)), DecimalOverflowPolicy::OutputNull);
         let prepared = fixture.prepare(false, &CompileControl::default()).unwrap();
         let args = [EvaluatedArgument::Column(&values)];

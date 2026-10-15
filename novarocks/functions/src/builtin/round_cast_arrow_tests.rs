@@ -70,12 +70,14 @@ fn arrow_values(array: &ArrayRef) -> Vec<Option<f64>> {
     output.iter().collect()
 }
 fn recipe(array: &ArrayRef) -> CastRecipe {
-    let source = FunctionValueType::new(array.data_type().clone(), true);
+    let source =
+        FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true);
     binding_control::scope(crate::binding_test_control(), |work| {
         binding_control::value_type(&source, work)?;
-        CastRecipe::prepare_type(
-            &source.data_type,
-            source.logical_type,
+        // Keep actual encoding separate from complete authored semantics.
+        CastRecipe::prepare_typed(
+            array.data_type(),
+            source.value_type(),
             CastTarget::Float64,
             work,
         )
@@ -247,7 +249,8 @@ fn taking_run_values_before_nested_union_cast_changes_child_population() {
 #[test]
 fn borrowed_prepare_type_preserves_exact_recipe_and_checkpoint_trace_without_clone() {
     let array = dictionary(&[Some(0)], fsl(floats(&[Some(3.0)]), &[true]));
-    let source = FunctionValueType::new(array.data_type().clone(), true);
+    let source =
+        FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true);
     struct Trace(Mutex<Vec<u32>>);
     impl novarocks_type_contract::PureCompileControl for Trace {
         fn checkpoint(
@@ -267,8 +270,8 @@ fn borrowed_prepare_type_preserves_exact_recipe_and_checkpoint_trace_without_clo
     .unwrap();
     let b = binding_control::scope(&second, |work| {
         CastRecipe::prepare_type(
-            &source.data_type,
-            source.logical_type,
+            source.data_type(),
+            source.logical_type(),
             CastTarget::Float64,
             work,
         )
@@ -329,7 +332,7 @@ fn borrowed_prepare_preserves_original_control_at_entry_quantum_and_tail() {
         }),
     )
     .unwrap();
-    let source = FunctionValueType::new(
+    let source = FunctionValueType::from_legacy_declared_projection(
         DataType::Union(fields, arrow_schema::UnionMode::Sparse),
         true,
     );
@@ -337,8 +340,8 @@ fn borrowed_prepare_preserves_original_control_at_entry_quantum_and_tail() {
         binding_control::scope(control, |work| {
             binding_control::value_type(&source, work)?;
             CastRecipe::prepare_type(
-                &source.data_type,
-                source.logical_type,
+                source.data_type(),
+                source.logical_type(),
                 CastTarget::Float64,
                 work,
             )

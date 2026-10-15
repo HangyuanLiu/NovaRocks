@@ -153,9 +153,13 @@ fn public_provider_work_scope_preserves_quantum_and_every_originating_refusal() 
 }
 
 fn pool(array: ArrayRef) -> ConstantPool {
-    let ty = FunctionValueType::new(array.data_type().clone(), true);
+    let ty = FunctionValueType::from_legacy_declared_projection(array.data_type().clone(), true);
     ConstantPool::try_new(
-        Arc::new(ty.try_to_field("selected-null-input").unwrap()),
+        Arc::new(
+            ty.try_to_field("selected-null-input")
+                .unwrap()
+                .with_data_type(array.data_type().clone()),
+        ),
         ty,
         array.to_data(),
         ConstantPolicy {

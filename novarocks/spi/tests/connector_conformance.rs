@@ -125,7 +125,11 @@ impl ConnectorMetadata for OwnerMetadata {
     fn load_table(
         &self,
         _request: ConnectorTableRequest,
-    ) -> Result<ConnectorTableMetadata, ConnectorError> {
+        _creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+    ) -> Result<
+        ConnectorTableMetadata,
+        novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+    > {
         unreachable!("instance construction must not resolve metadata")
     }
 }

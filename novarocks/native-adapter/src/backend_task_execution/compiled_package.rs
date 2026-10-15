@@ -32,16 +32,21 @@ use std::time::Duration;
 use novarocks_connector_contract::PureProviderProgramCatalog;
 use novarocks_functions::{ConstantPolicy, PureEngineFunctionCatalog};
 use novarocks_local_compiler::{
-    FragmentCompileError, LocalCompileOptions, ProviderPreparationError, compile_fragment,
-    validate_fragment_providers,
+    FragmentCreationError, LocalCompileOptions, ProviderPreparationError,
+    compile_fragment_with_creation, validate_fragment_providers,
 };
 use novarocks_local_program::{KernelAbiVersion, LocalProgram};
+use novarocks_plan_codec::host_projection_v2::ProjectionFailure;
 use novarocks_plan_codec::physical_package_v2::{
-    PackageDecodeError, PackageDecodeLimits, decode_fragment_package,
+    PackageDecodeError, PackageDecodeLimits, decode_fragment_package_with_factory,
 };
 use novarocks_plan_codec::resource_preflight_v2::FragmentDecodeResourceModel;
 use novarocks_spi::connector::ConnectorStopView;
-use novarocks_type_contract::{CompileControlError, CompilePhase, PureCompileControl};
+use novarocks_type_contract::{
+    CompileControlError, CompilePhase, PureCompileControl, ValueSchemaCreation,
+};
+
+pub use crate::native_type_construction::NativeTypeConstructionError;
 
 use crate::compiled_runtime_filter::CompiledRuntimeFilterEndpoints;
 
@@ -58,6 +63,10 @@ pub struct CompiledTaskOptions {
 pub enum CompiledPackageError {
     /// The task's own control stopped the work; the cause stays primary.
     Control(CompileControlError),
+    /// The original BE construction owner refused an actual request.
+    Construction(NativeTypeConstructionError),
+    /// The original receiver cause, including its source/resource model.
+    Decode(PackageDecodeError),
     /// The package is not receivable, its providers refuse it, or the
     /// compiler refuses one of its shapes.
     Refused(String),
@@ -67,12 +76,23 @@ impl fmt::Display for CompiledPackageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Control(cause) => cause.fmt(f),
+            Self::Construction(cause) => cause.fmt(f),
+            Self::Decode(cause) => cause.fmt(f),
             Self::Refused(detail) => f.write_str(detail),
         }
     }
 }
 
-impl Error for CompiledPackageError {}
+impl Error for CompiledPackageError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Control(cause) => Some(cause),
+            Self::Construction(cause) => Some(cause),
+            Self::Decode(cause) => Some(cause),
+            Self::Refused(_) => None,
+        }
+    }
+}
 
 /// One task's compiled program and the runtime-filter bindings its package
 /// numbers.
@@ -86,12 +106,79 @@ pub struct CompiledTaskProgram {
     pub runtime_filters: CompiledRuntimeFilterEndpoints,
 }
 
+/// A sealed, borrowed factory supplied by the actual admitted BE preparation.
+/// This public port preserves the compiler's object safety; constructing it is
+/// restricted to the Native owner that already has the tracker and controls.
+pub struct CompiledTypeScopes<'borrow, 'control> {
+    inner: crate::native_type_construction::NativeTypeFactory<'borrow, 'control>,
+}
+impl<'borrow, 'control> CompiledTypeScopes<'borrow, 'control> {
+    pub(crate) fn new(
+        creation: &'borrow crate::native_type_construction::NativeTypeConstruction<'control>,
+    ) -> Self {
+        Self {
+            inner: crate::native_type_construction::NativeTypeFactory::new(creation),
+        }
+    }
+}
+pub struct CompiledTypeScope<'borrow> {
+    inner: crate::native_type_construction::NativeFactoryScope<'borrow>,
+}
+impl novarocks_type_contract::ValueSchemaCreationScope<NativeTypeConstructionError>
+    for CompiledTypeScope<'_>
+{
+    fn storage_lifetime(&self) -> novarocks_type_contract::ValueTypeStorageLifetime {
+        novarocks_type_contract::ValueSchemaCreationScope::storage_lifetime(&self.inner)
+    }
+    fn request_layout(
+        &mut self,
+        layout: std::alloc::Layout,
+    ) -> Result<(), NativeTypeConstructionError> {
+        novarocks_type_contract::ValueSchemaCreationScope::request_layout(&mut self.inner, layout)
+    }
+    fn observe_opaque_upper_bound(
+        &mut self,
+        bytes: usize,
+    ) -> Result<(), NativeTypeConstructionError> {
+        novarocks_type_contract::ValueSchemaCreationScope::observe_opaque_upper_bound(
+            &mut self.inner,
+            bytes,
+        )
+    }
+}
+impl novarocks_type_contract::ValueSchemaCreationFactory<NativeTypeConstructionError>
+    for CompiledTypeScopes<'_, '_>
+{
+    type Scope<'a>
+        = CompiledTypeScope<'a>
+    where
+        Self: 'a;
+    fn begin_scope(&self) -> Result<Self::Scope<'_>, NativeTypeConstructionError> {
+        Ok(CompiledTypeScope {
+            inner: self.inner.begin_scope()?,
+        })
+    }
+    fn begin_scope_observed<O>(
+        &self,
+        observe: &mut dyn FnMut(std::alloc::Layout) -> Result<(), O>,
+    ) -> Result<
+        Self::Scope<'_>,
+        novarocks_type_contract::ValueSchemaScopeBeginFailure<O, NativeTypeConstructionError>,
+    > {
+        Ok(CompiledTypeScope {
+            inner: self.inner.begin_scope_observed(observe)?,
+        })
+    }
+}
+
 /// Turns one task's package bytes into its LocalProgram.
 pub trait CompiledPackageCompiler: Send + Sync + 'static {
     fn compile(
         &self,
         package: &[u8],
         options: CompiledTaskOptions,
+        creation: &mut ValueSchemaCreation<'_, NativeTypeConstructionError>,
+        type_scopes: &CompiledTypeScopes<'_, '_>,
         control: &dyn PureCompileControl,
     ) -> Result<CompiledTaskProgram, CompiledPackageError>;
 }
@@ -132,13 +219,19 @@ where
         &self,
         package: &[u8],
         options: CompiledTaskOptions,
+        creation: &mut ValueSchemaCreation<'_, NativeTypeConstructionError>,
+        type_scopes: &CompiledTypeScopes<'_, '_>,
         control: &dyn PureCompileControl,
     ) -> Result<CompiledTaskProgram, CompiledPackageError> {
-        let package = decode_fragment_package(package, &self.model, &self.decode_limits, control)
-            .map_err(|error| match error {
-            PackageDecodeError::Control(cause) => CompiledPackageError::Control(cause),
-            other => CompiledPackageError::Refused(format!("package is not receivable: {other}")),
-        })?;
+        let package = decode_fragment_package_with_factory(
+            package,
+            &self.model,
+            &self.decode_limits,
+            creation,
+            type_scopes,
+            control,
+        )
+        .map_err(package_decode_failure)?;
         let runtime_filters =
             CompiledRuntimeFilterEndpoints::from_package(&package).map_err(|error| {
                 CompiledPackageError::Refused(format!(
@@ -159,7 +252,11 @@ where
                     CompiledPackageError::Refused(format!("package providers refuse it: {other}"))
                 }
             })?;
-        let program = compile_fragment(
+        use novarocks_type_contract::ValueSchemaCreationFactory;
+        let mut temporary = type_scopes
+            .begin_scope()
+            .map_err(CompiledPackageError::Construction)?;
+        let program = compile_fragment_with_creation(
             validated,
             &self.functions,
             LocalCompileOptions {
@@ -169,11 +266,20 @@ where
                 constants: self.constants,
                 exchange_wait: options.exchange_wait,
             },
+            creation,
+            &mut temporary,
+            type_scopes,
             control,
         )
         .map_err(|error| match error {
-            FragmentCompileError::Control(cause) => CompiledPackageError::Control(cause),
-            other => CompiledPackageError::Refused(format!("package does not compile: {other}")),
+            FragmentCreationError::Control(cause) => CompiledPackageError::Control(cause),
+            FragmentCreationError::Creator(cause) => CompiledPackageError::Construction(cause),
+            FragmentCreationError::Resource(cause) => {
+                CompiledPackageError::Construction(NativeTypeConstructionError::Resource(cause))
+            }
+            FragmentCreationError::Compile(other) => {
+                CompiledPackageError::Refused(format!("package does not compile: {other}"))
+            }
         })?;
         Ok(CompiledTaskProgram {
             program,
@@ -182,21 +288,46 @@ where
     }
 }
 
+fn package_decode_failure(
+    error: ProjectionFailure<PackageDecodeError, NativeTypeConstructionError>,
+) -> CompiledPackageError {
+    match error {
+        ProjectionFailure::Host(cause) => CompiledPackageError::Construction(cause),
+        ProjectionFailure::Codec(PackageDecodeError::Control(cause)) => {
+            CompiledPackageError::Control(cause)
+        }
+        ProjectionFailure::Codec(other) => CompiledPackageError::Decode(other),
+    }
+}
+
 /// Compile control for one task's preparation: a stop of the task refuses the
 /// next checkpoint, so decode, provider validation and compile all end with
 /// the task's own cancellation as their primary cause.
 pub(crate) struct TaskPreparationControl {
     stop: ConnectorStopView,
+    original: novarocks_worker::TaskPreparationStopView,
 }
 
 impl TaskPreparationControl {
-    pub(crate) fn new(stop: ConnectorStopView) -> Self {
-        Self { stop }
+    pub(crate) fn new(
+        stop: ConnectorStopView,
+        original: novarocks_worker::TaskPreparationStopView,
+    ) -> Self {
+        Self { stop, original }
     }
 }
 
 impl PureCompileControl for TaskPreparationControl {
     fn checkpoint(&self, _phase: CompilePhase, _units: u32) -> Result<(), CompileControlError> {
+        match self.original.stop_cause() {
+            Some(novarocks_worker::TaskPreparationStopCause::LeaseExpired) => {
+                return Err(CompileControlError::DeadlineExceeded);
+            }
+            Some(novarocks_worker::TaskPreparationStopCause::Cancelled) => {
+                return Err(CompileControlError::Cancelled);
+            }
+            None => {}
+        }
         if self.stop.is_stopped() {
             return Err(CompileControlError::Cancelled);
         }

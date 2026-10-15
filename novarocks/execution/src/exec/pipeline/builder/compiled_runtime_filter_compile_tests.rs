@@ -391,13 +391,44 @@ fn plan() -> (PhysicalPlan, FrozenConnectorRead) {
         vec![],
     )
     .unwrap();
-    let public = ConnectorReadPublicFacts::try_new(
-        source,
-        None,
-        public_schema(),
-        vec![ValueLogicalType::Physical; 2],
+    let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("v0", DataType::Int64, false),
+        Field::new("v1", DataType::Int64, false),
+    ]));
+    let execution = ConnectorReadExecutionSchema::try_new(
+        schema.clone(),
+        vec![int64(), int64()].into_boxed_slice(),
+        storage.clone(),
     )
     .unwrap();
+    let original_source = public_schema();
+    let shape = ConnectorSourceSchemaShape::try_new(schema, storage.clone()).unwrap();
+    let source_fields = [0_u32, 1]
+        .into_iter()
+        .map(|ordinal| {
+            ConnectorSourceFieldFacts::try_new(
+                vec![ordinal].into_boxed_slice(),
+                Some((ordinal + 1) as i32),
+                None,
+                HashMap::from([("provider.field-id".into(), (ordinal + 1).to_string())]),
+                &[],
+                storage.clone(),
+            )
+            .unwrap()
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    let source_schema = ConnectorSourceSchemaFacts::try_new(
+        shape,
+        original_source.metadata().clone(),
+        source_fields,
+        storage.clone(),
+    )
+    .unwrap();
+    let public =
+        ConnectorReadPublicFacts::try_new_typed(source, None, execution, source_schema, storage)
+            .unwrap();
     (plan, FrozenConnectorRead::try_new(scan, public).unwrap())
 }
 
@@ -870,7 +901,9 @@ fn state(session: Arc<LoopbackSession>) -> Arc<RuntimeState> {
             None,
             None,
             None,
-            None,
+            Some(crate::runtime::mem_tracker::MemTracker::new_root(
+                "compiled runtime filter compile tests",
+            )),
             Some(crate::runtime::execution_runtime::test_execution_runtime()),
         )
         .with_runtime_filter_session(Some(session as execution::RuntimeFilterSessionRef)),

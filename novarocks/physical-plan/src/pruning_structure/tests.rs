@@ -333,8 +333,8 @@ fn public_read(
             .map(|(ordinal, field)| {
                 arrow_schema::Field::new(
                     format!("v{ordinal}"),
-                    field.ty.data_type.clone(),
-                    field.ty.nullable,
+                    field.ty.data_type().clone(),
+                    field.ty.nullable(),
                 )
             })
             .collect::<Vec<_>>(),
@@ -346,7 +346,7 @@ fn public_read(
         relation
             .schema()
             .iter()
-            .map(|field| field.ty.logical_type)
+            .map(|field| field.ty.logical_type())
             .collect(),
     )?;
     FrozenConnectorRead::try_new(scan, public)

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Original observed List CAST invocation: Null child lift and exact Field retag.
+//! Observed List CAST: Null child lift and canonical anonymous-role layout.
 use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::{ExprArena, ExprNode, cast_array_to_target};
 use arrow::array::{Array, ArrayRef, ListArray, NullArray, StringArray};
@@ -27,7 +27,7 @@ use novarocks_types::SlotId;
 use std::{collections::HashMap, sync::Arc};
 pub(super) fn source_type(null_child: bool) -> DataType {
     DataType::List(Arc::new(Field::new(
-        "",
+        "item",
         if null_child {
             DataType::Null
         } else {
@@ -46,11 +46,12 @@ pub(super) fn target_type(null_child: bool, field_id: Option<&str>) -> DataType 
         },
         true,
     );
-    DataType::List(Arc::new(if let Some(id) = field_id {
+    let raw = DataType::List(Arc::new(if let Some(id) = field_id {
         field.with_metadata(HashMap::from([("PARQUET:field_id".into(), id.into())]))
     } else {
         field
-    }))
+    }));
+    FunctionValueType::new(raw, true).data_type().clone()
 }
 pub(super) fn input(null_child: bool) -> ArrayRef {
     let DataType::List(field) = source_type(null_child) else {
@@ -88,6 +89,8 @@ pub(super) fn actual(
     policy: DecimalOverflowPolicy,
     allow: bool,
 ) -> Result<ArrayRef, String> {
+    let array = crate::exec::chunk::normalize_execution_array(&array)?;
+    let target = FunctionValueType::new(target, true).data_type().clone();
     let ty = FunctionValueType::new(array.data_type().clone(), true);
     let data = RecordBatch::try_new(
         Arc::new(Schema::new(vec![ty.try_to_field("original-list").unwrap()])),
@@ -99,7 +102,7 @@ pub(super) fn actual(
             .unwrap();
     let mut arena = ExprArena::default();
     arena.set_allow_throw_exception(allow);
-    let child = arena.push_typed(ExprNode::SlotId(SlotId::new(17)), ty.data_type);
+    let child = arena.push_typed(ExprNode::SlotId(SlotId::new(17)), ty.data_type().clone());
     let root = arena.push_typed(ExprNode::Cast(child, policy), target);
     arena.eval(root, &Chunk::new_with_chunk_schema(data, schema))
 }
@@ -165,17 +168,17 @@ fn retag(id: &str) {
         let DataType::List(field) = out.data_type() else {
             unreachable!()
         };
-        assert_eq!(field.name(), "element");
-        assert_eq!(field.metadata().get("PARQUET:field_id").unwrap(), id);
+        assert_eq!(field.name(), "item");
+        assert_eq!(field.metadata().capacity(), 0);
         assert!(field.is_nullable());
     }
 }
 #[test]
-fn observed_list_cast_original_utf8_field_id7_retags_without_value_reinterpretation() {
+fn observed_list_cast_utf8_field_id7_does_not_change_value_layout_or_payload() {
     retag("7");
 }
 #[test]
-fn observed_list_cast_original_utf8_field_id6_retags_without_value_reinterpretation() {
+fn observed_list_cast_utf8_field_id6_does_not_change_value_layout_or_payload() {
     retag("6");
 }
 #[test]
@@ -233,7 +236,7 @@ fn observed_list_cast_original_nonnullable_child_constructor_panic_is_preserved(
             .unwrap();
         assert_eq!(
             text,
-            "called `Result::unwrap()` on an `Err` value: InvalidArgumentError(\"Non-nullable field of ListArray \\\"element\\\" cannot contain nulls\")"
+            "called `Result::unwrap()` on an `Err` value: InvalidArgumentError(\"Non-nullable field of ListArray \\\"item\\\" cannot contain nulls\")"
         );
     }
 }

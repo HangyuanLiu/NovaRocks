@@ -140,7 +140,7 @@ fn frozen_reads(
                         .expressions()
                         .get(*residual)
                         .expect("original scan residual definition exists");
-                    assert_eq!(expression.ty.data_type, DataType::Boolean);
+                    assert_eq!(expression.ty.data_type().clone(), DataType::Boolean);
                 }
                 for derived in derived_values {
                     assert!(
@@ -168,19 +168,19 @@ fn frozen_reads(
                 let read = relation.read();
                 let mut assignments = Vec::new();
                 let mut fields = Vec::new();
-                let mut logical_types = Vec::new();
+                let mut complete_types = Vec::new();
                 for (ordinal, field) in relation.schema().iter().enumerate() {
-                    assert!(field.ty.nullable, "original k/v/s all nullable");
+                    assert!(field.ty.nullable(), "original k/v/s all nullable");
                     let carrier = connector_type_for_value_type(&field.ty)
                         .expect("sole original connector projection");
                     let name = format!("fixture_column_{ordinal}");
                     assignments.push(StaticScanAssignment::new(Arc::from(name.as_str()), carrier));
                     fields.push(Field::new(
                         name,
-                        field.ty.data_type.clone(),
-                        field.ty.nullable,
+                        field.ty.data_type().clone(),
+                        field.ty.nullable(),
                     ));
-                    logical_types.push(field.ty.logical_type);
+                    complete_types.push(field.ty.clone());
                 }
                 // Preserve the exact same-source ScanSource endpoint, rather than
                 // inventing consumers from query text or Join probe endpoints.
@@ -246,11 +246,31 @@ fn frozen_reads(
                     Vec::new(),
                 )
                 .unwrap();
-                let public = ConnectorReadPublicFacts::try_new(
+                // The original relation fields already own complete execution
+                // declarations. Names remain fixture/provider source facts.
+                let storage = novarocks_type_contract::ValueTypeStorageLifetime::pure();
+                let schema = Arc::new(Schema::new(fields));
+                let execution = ConnectorReadExecutionSchema::try_new(
+                    schema.clone(),
+                    complete_types.into_boxed_slice(),
+                    storage.clone(),
+                )
+                .unwrap();
+                let source_shape =
+                    ConnectorSourceSchemaShape::try_new(schema, storage.clone()).unwrap();
+                let source_schema = ConnectorSourceSchemaFacts::try_new(
+                    source_shape,
+                    std::collections::HashMap::new(),
+                    Box::new([]),
+                    storage,
+                )
+                .unwrap();
+                let public = ConnectorReadPublicFacts::try_new_typed_with_control(
                     facts,
                     None,
-                    Schema::new(fields),
-                    logical_types,
+                    &execution,
+                    &source_schema,
+                    &Control,
                 )
                 .unwrap();
                 assert!(

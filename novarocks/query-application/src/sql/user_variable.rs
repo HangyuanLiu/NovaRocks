@@ -652,7 +652,10 @@ mod tests {
     fn local_mv_scalar_source_counts_the_header_before_formatting() {
         for len in [65_512, 65_513] {
             let result = QueryResult {
-                columns: vec![ResultField::new("TABLE_NAME", DataType::Utf8, false, None)],
+                columns: vec![ResultField::new(
+                    "TABLE_NAME",
+                    novarocks_type_contract::FunctionValueType::new(DataType::Utf8, false),
+                )],
                 batches: vec![
                     RecordBatch::try_from_iter(vec![(
                         "TABLE_NAME",
@@ -672,7 +675,10 @@ mod tests {
             }
         }
         let unsupported = QueryResult {
-            columns: vec![ResultField::new("outside", DataType::Int64, false, None)],
+            columns: vec![ResultField::new(
+                "outside",
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            )],
             batches: vec![
                 RecordBatch::try_from_iter(vec![(
                     "outside",
@@ -782,7 +788,10 @@ mod tests {
     #[test]
     fn converts_text_values_to_escaped_sql_literals() {
         let result = QueryResult {
-            columns: vec![ResultField::new("v", DataType::Utf8, true, None)],
+            columns: vec![ResultField::new(
+                "v",
+                novarocks_type_contract::FunctionValueType::new(DataType::Utf8, true),
+            )],
             batches: vec![
                 RecordBatch::try_from_iter(vec![(
                     "v",
@@ -801,7 +810,10 @@ mod tests {
     #[test]
     fn rejects_more_than_one_scalar_row() {
         let result = QueryResult {
-            columns: vec![ResultField::new("v", DataType::Int64, false, None)],
+            columns: vec![ResultField::new(
+                "v",
+                novarocks_type_contract::FunctionValueType::new(DataType::Int64, false),
+            )],
             batches: vec![
                 RecordBatch::try_from_iter(vec![(
                     "v",

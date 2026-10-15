@@ -581,7 +581,7 @@ impl NlJoinProbeProcessorOperator {
 
         let keep = self.eval_probe_keep_flags(&probe_chunk, &join_scope_schema)?;
         let mask = BooleanArray::from(keep);
-        let filtered = filter_record_batch(&probe_chunk.batch, &mask)
+        let filtered = filter_record_batch(&probe_chunk.record_batch(), &mask)
             .map_err(|e| format!("nljoin semi/anti filter failed: {e}"))?;
         if filtered.num_rows() == 0 {
             return Ok(None);
@@ -1224,7 +1224,7 @@ impl NlJoinProbeProcessorOperator {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .ok_or_else(|| "nljoin join conjunct must return boolean array".to_string())?;
-        filter_record_batch(&chunk.batch, mask)
+        filter_record_batch(chunk.record_batch(), mask)
             .map_err(|e| format!("nljoin join conjunct filter failed: {e}"))
     }
 }

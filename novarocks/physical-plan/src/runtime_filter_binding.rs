@@ -97,27 +97,30 @@ pub fn runtime_filter_bindings(
     plan: &PhysicalPlan,
 ) -> Result<Vec<RuntimeFilterBinding>, RuntimeFilterBindingError> {
     let mut bindings = Vec::new();
-    let mut next_binding = 1_u32;
-    let mut mint = |filter: RuntimeFilterId,
-                    fragment: FragmentId,
-                    node: NodeId,
-                    role: RuntimeFilterBindingRole|
-     -> Result<(), RuntimeFilterBindingError> {
-        let binding_id = next_binding;
-        next_binding = next_binding
-            .checked_add(1)
-            .ok_or(RuntimeFilterBindingError::IdentitySpaceExhausted)?;
-        bindings.push(RuntimeFilterBinding {
-            binding_id,
-            filter,
-            fragment,
-            node,
-            role,
-        });
-        Ok(())
-    };
+    visit_runtime_filter_bindings_observed(
+        plan,
+        &mut |binding| {
+            bindings.push(binding);
+            Ok(())
+        },
+        &mut || Ok(()),
+    )?;
+    Ok(bindings)
+}
+
+/// Visit the sole binding-ID derivation without allocating an intermediate
+/// collection. Every actual source traversal belongs to the original control;
+/// the collecting caller admits its own storage before publication.
+pub fn visit_runtime_filter_bindings_observed<E: From<RuntimeFilterBindingError>>(
+    plan: &PhysicalPlan,
+    emit: &mut impl FnMut(RuntimeFilterBinding) -> Result<(), E>,
+    observe: &mut impl FnMut() -> Result<(), E>,
+) -> Result<(), E> {
+    let mut next_binding = 1u32;
     for fragment in plan.fragments().values() {
+        observe()?;
         for filter_id in fragment.runtime_filters() {
+            observe()?;
             let filter = plan.runtime_filters().get(filter_id).ok_or(
                 RuntimeFilterBindingError::AbsentRuntimeFilter {
                     fragment: fragment.id(),
@@ -125,26 +128,38 @@ pub fn runtime_filter_bindings(
                 },
             )?;
             for (index, producer) in filter.producers.iter().enumerate() {
+                observe()?;
                 if producer.endpoint.fragment == fragment.id() {
-                    mint(
-                        filter.id,
-                        fragment.id(),
-                        producer.endpoint.node,
-                        RuntimeFilterBindingRole::Producer(index),
-                    )?;
+                    let binding_id = next_binding;
+                    next_binding = next_binding
+                        .checked_add(1)
+                        .ok_or(RuntimeFilterBindingError::IdentitySpaceExhausted)?;
+                    emit(RuntimeFilterBinding {
+                        binding_id,
+                        filter: filter.id,
+                        fragment: fragment.id(),
+                        node: producer.endpoint.node,
+                        role: RuntimeFilterBindingRole::Producer(index),
+                    })?;
                 }
             }
             for (index, consumer) in filter.consumers.iter().enumerate() {
+                observe()?;
                 if consumer.endpoint.fragment == fragment.id() {
-                    mint(
-                        filter.id,
-                        fragment.id(),
-                        consumer.endpoint.node,
-                        RuntimeFilterBindingRole::Consumer(index),
-                    )?;
+                    let binding_id = next_binding;
+                    next_binding = next_binding
+                        .checked_add(1)
+                        .ok_or(RuntimeFilterBindingError::IdentitySpaceExhausted)?;
+                    emit(RuntimeFilterBinding {
+                        binding_id,
+                        filter: filter.id,
+                        fragment: fragment.id(),
+                        node: consumer.endpoint.node,
+                        role: RuntimeFilterBindingRole::Consumer(index),
+                    })?;
                 }
             }
         }
     }
-    Ok(bindings)
+    Ok(())
 }

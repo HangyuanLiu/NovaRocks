@@ -105,12 +105,12 @@ pub(super) fn evaluate_date_format<'a>(
             ));
         };
         let target = input.target;
-        if format_type.logical_type != ValueLogicalType::Physical
-            || format_type.data_type != DataType::Utf8
+        if format_type.logical_type() != ValueLogicalType::Physical
+            || format_type.data_type() != &DataType::Utf8
             || format_arg.array().data_type() != &DataType::Utf8
-            || target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Utf8
-            || !target.nullable
+            || target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Utf8
+            || !target.nullable()
         {
             return Err(invalid(
                 "date_format differs from its exact installed profile",
@@ -140,7 +140,7 @@ pub(super) fn evaluate_date_format<'a>(
             }
             let date_null = date_arg.array().is_null(date_row);
             let format_null = formats.is_null(format_row);
-            if date_null && !date_type.nullable || format_null && !format_type.nullable {
+            if date_null && !date_type.nullable() || format_null && !format_type.nullable() {
                 return Err(internal(
                     "date_format non-null source contains selected SQL NULL",
                 ));
@@ -209,7 +209,7 @@ pub(super) fn evaluate_date_format<'a>(
         work.flush()?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &target.data_type,
+            target.data_type(),
             array,
             Box::default(),
             || work.step(),

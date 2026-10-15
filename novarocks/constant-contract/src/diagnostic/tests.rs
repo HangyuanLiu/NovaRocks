@@ -90,7 +90,10 @@ fn typed_pool(
     value_type: FunctionValueType,
     metadata: HashMap<String, String>,
 ) -> ConstantPool {
-    let mut field = value_type.try_to_field("source").unwrap();
+    let mut field = value_type
+        .try_to_field("source")
+        .unwrap()
+        .with_data_type(array.data_type().clone());
     field.metadata_mut().extend(metadata);
     ConstantPool::try_new(
         Arc::new(field),

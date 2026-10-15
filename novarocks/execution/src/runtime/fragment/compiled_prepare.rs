@@ -339,22 +339,6 @@ pub fn prepare_compiled_fragment(
             result_spec,
         )?;
         context.fail_if_injected(PrepareFailurePoint::AfterResult)?;
-        let receivers = materialize_compiled_exchange_receivers(
-            program,
-            finst_id,
-            instance.exchange_inputs(),
-            Arc::clone(&context.exchange_receiver_port),
-        )
-        .map_err(|detail| {
-            FragmentLaunchError::new(
-                FragmentLaunchStage::Register,
-                FragmentLaunchErrorKind::Binding,
-                detail,
-            )
-        })?;
-        resources.acquire_compiled_exchange(receivers.registrations)?;
-        context.fail_if_injected(PrepareFailurePoint::AfterExchange)?;
-
         let runtime_state = build_runtime_state(RuntimeStateInputs {
             query_options: apply_query_option_overrides(
                 Some(instance.runtime_options().query_options().clone()),
@@ -378,6 +362,50 @@ pub fn prepare_compiled_fragment(
                 error,
             )
         })?;
+        // Receiver schemas are created by the same BE tracker/control policy
+        // as operator schemas. The registry retains each independent schema,
+        // while this temporary factory exits with preparation.
+        let construction_error = |cause: crate::exec::pipeline::operator::ConstructionFailure| {
+            FragmentLaunchError::from_failure(
+                FragmentLaunchStage::Register,
+                FragmentLaunchErrorKind::ResourceUnavailable,
+                cause.into(),
+            )
+        };
+        let receiver_creation = if program.exchange_inputs().is_empty() {
+            None
+        } else {
+            let tracker = runtime_state.mem_tracker().ok_or_else(|| {
+                construction_error(
+                    crate::exec::pipeline::operator::ConstructionFailure::MissingOwner,
+                )
+            })?;
+            let profile = crate::exec::pipeline::pipeline::representation_construction_profile()
+                .map_err(crate::exec::pipeline::operator::ConstructionFailure::from)
+                .map_err(construction_error)?;
+            Some(crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+                profile, tracker, runtime_state.error_state(),
+            ).map_err(construction_error)?)
+        };
+        let receivers = materialize_compiled_exchange_receivers(
+            program,
+            finst_id,
+            instance.exchange_inputs(),
+            Arc::clone(&context.exchange_receiver_port),
+            receiver_creation.as_ref(),
+        )
+        .map_err(|cause| {
+            let kind = match &cause {
+                crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(_) => {
+                    FragmentLaunchErrorKind::Binding
+                }
+                _ => FragmentLaunchErrorKind::ResourceUnavailable,
+            };
+            FragmentLaunchError::from_failure(FragmentLaunchStage::Register, kind, cause.into())
+        })?;
+        resources.acquire_compiled_exchange(receivers.registrations)?;
+        context.fail_if_injected(PrepareFailurePoint::AfterExchange)?;
+
         let result_sink = match program.graph().sink() {
             Some(StaticSinkProgram::RootResult(_)) => {
                 let session = resources.root_result_session().ok_or_else(|| {

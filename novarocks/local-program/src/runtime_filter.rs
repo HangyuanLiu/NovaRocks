@@ -181,6 +181,7 @@ pub enum FilterMembershipSchemaError {
     InvalidTimezoneMetadata,
     InvalidDecimal,
     UnsupportedTypeTag,
+    Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError),
 }
 
 impl FilterMembershipSchemaError {
@@ -199,6 +200,7 @@ impl FilterMembershipSchemaError {
             Self::InvalidTimezoneMetadata => "invalid timestamp timezone metadata",
             Self::InvalidDecimal => "invalid decimal schema metadata",
             Self::UnsupportedTypeTag => "unsupported membership schema type tag",
+            Self::Resource(_) => "membership schema construction resource failure",
         }
     }
 }
@@ -210,36 +212,122 @@ impl fmt::Display for FilterMembershipSchemaError {
 }
 
 impl std::error::Error for FilterMembershipSchemaError {}
+impl From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>
+    for FilterMembershipSchemaError
+{
+    fn from(error: novarocks_type_contract::owned_resources::layout::LayoutResourceError) -> Self {
+        Self::Resource(error)
+    }
+}
 
 /// The canonical schema of one membership artifact: its key type and NULL
 /// semantics, their canonical bytes, and the SHA-256 digest of those bytes.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct FilterMembershipSchema {
     data_type: DataType,
     null_semantics: FilterNullSemantics,
     canonical_bytes: Arc<[u8]>,
     digest: [u8; 32],
+    _storage: novarocks_type_contract::ValueTypeStorageLifetime,
 }
+impl PartialEq for FilterMembershipSchema {
+    fn eq(&self, other: &Self) -> bool {
+        self.data_type == other.data_type
+            && self.null_semantics == other.null_semantics
+            && self.canonical_bytes == other.canonical_bytes
+            && self.digest == other.digest
+    }
+}
+impl Eq for FilterMembershipSchema {}
 
 impl FilterMembershipSchema {
     pub fn try_new(
         data_type: &DataType,
         null_semantics: FilterNullSemantics,
     ) -> Result<Self, FilterMembershipSchemaError> {
-        let mut canonical = Vec::with_capacity(48);
+        Self::try_new_observed::<FilterMembershipSchemaError>(
+            data_type,
+            null_semantics,
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+    }
+
+    /// Construct the canonical artifact under the original caller's request
+    /// and work observers. Artifact bytes describe only physical key encoding;
+    /// the complete execution value binding is retained by its channel owner.
+    pub fn try_new_observed<E>(
+        data_type: &DataType,
+        null_semantics: FilterNullSemantics,
+        request: impl FnMut(std::alloc::Layout) -> Result<(), E>,
+        work: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<Self, E>
+    where
+        E: From<FilterMembershipSchemaError>
+            + From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+    {
+        Self::try_new_with_storage_observed(
+            data_type,
+            null_semantics,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+            request,
+            work,
+        )
+    }
+
+    /// The canonical bytes and reused carrier backing retain only their
+    /// actual construction/source lifetimes, independently of a channel.
+    pub fn try_new_with_storage_observed<E>(
+        data_type: &DataType,
+        null_semantics: FilterNullSemantics,
+        storage: novarocks_type_contract::ValueTypeStorageLifetime,
+        mut request: impl FnMut(std::alloc::Layout) -> Result<(), E>,
+        mut work: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<Self, E>
+    where
+        E: From<FilterMembershipSchemaError>
+            + From<novarocks_type_contract::owned_resources::layout::LayoutResourceError>,
+    {
+        use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
+        let mut length = MEMBERSHIP_SCHEMA_DOMAIN
+            .len()
+            .checked_add(2)
+            .ok_or(LayoutResourceError::Arithmetic)?;
+        work(MEMBERSHIP_SCHEMA_DOMAIN.len() + 2)?;
+        visit_filter_key_type::<E>(data_type, |bytes| {
+            work(bytes.len())?;
+            length = length
+                .checked_add(bytes.len())
+                .ok_or(LayoutResourceError::Arithmetic)?;
+            Ok(())
+        })?;
+        let backing =
+            std::alloc::Layout::array::<u8>(length).map_err(|_| LayoutResourceError::Arithmetic)?;
+        request(backing)?;
+        let mut canonical = Vec::with_capacity(length);
+        work(MEMBERSHIP_SCHEMA_DOMAIN.len() + 1)?;
         canonical.extend_from_slice(MEMBERSHIP_SCHEMA_DOMAIN);
         canonical.push(MEMBERSHIP_SCHEMA_VERSION);
-        encode_filter_key_type(data_type, &mut canonical)?;
+        visit_filter_key_type::<E>(data_type, |bytes| {
+            work(bytes.len())?;
+            canonical.extend_from_slice(bytes);
+            Ok(())
+        })?;
+        work(1)?;
         canonical.push(match null_semantics {
             FilterNullSemantics::NeverMatches => 1,
             FilterNullSemantics::NullSafeEqual => 2,
         });
+        work(canonical.len())?;
         let digest = Sha256::digest(&canonical).into();
+        request(arc_layout(backing)?)?;
+        work(1)?;
         Ok(Self {
             data_type: data_type.clone(),
             null_semantics,
             canonical_bytes: canonical.into(),
             digest,
+            _storage: storage,
         })
     }
 
@@ -275,6 +363,7 @@ impl FilterMembershipSchema {
             null_semantics,
             canonical_bytes: Arc::from(canonical),
             digest,
+            _storage: novarocks_type_contract::ValueTypeStorageLifetime::pure(),
         })
     }
 
@@ -328,19 +417,31 @@ pub fn encode_filter_key_type(
     data_type: &DataType,
     output: &mut Vec<u8>,
 ) -> Result<(), FilterMembershipSchemaError> {
+    visit_filter_key_type(data_type, |bytes| {
+        output.extend_from_slice(bytes);
+        Ok(())
+    })
+}
+
+/// Visit canonical physical key bytes without allocating a shadow buffer.
+/// Membership and ordered artifact encoders share this exact vocabulary.
+pub fn visit_filter_key_type<E: From<FilterMembershipSchemaError>>(
+    data_type: &DataType,
+    mut write: impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), E> {
     match data_type {
-        DataType::Boolean => output.push(1),
-        DataType::Int8 => output.push(2),
-        DataType::Int16 => output.push(3),
-        DataType::Int32 => output.push(4),
-        DataType::Int64 => output.push(5),
-        DataType::FixedSizeBinary(width) if *width == LARGEINT_BYTE_WIDTH => output.push(6),
-        DataType::Float32 => output.push(7),
-        DataType::Float64 => output.push(8),
-        DataType::Utf8 => output.push(9),
-        DataType::Date32 => output.push(10),
+        DataType::Boolean => write(&[1])?,
+        DataType::Int8 => write(&[2])?,
+        DataType::Int16 => write(&[3])?,
+        DataType::Int32 => write(&[4])?,
+        DataType::Int64 => write(&[5])?,
+        DataType::FixedSizeBinary(width) if *width == LARGEINT_BYTE_WIDTH => write(&[6])?,
+        DataType::Float32 => write(&[7])?,
+        DataType::Float64 => write(&[8])?,
+        DataType::Utf8 => write(&[9])?,
+        DataType::Date32 => write(&[10])?,
         DataType::Timestamp(unit, timezone) => {
-            output.extend_from_slice(&[
+            write(&[
                 11,
                 match unit {
                     TimeUnit::Second => 1,
@@ -348,16 +449,16 @@ pub fn encode_filter_key_type(
                     TimeUnit::Microsecond => 3,
                     TimeUnit::Nanosecond => 4,
                 },
-            ]);
+            ])?;
             match timezone {
                 Some(timezone) => {
-                    output.push(1);
+                    write(&[1])?;
                     let length = u32::try_from(timezone.len())
                         .map_err(|_| FilterMembershipSchemaError::TimezoneLengthOverflow)?;
-                    output.extend_from_slice(&length.to_be_bytes());
-                    output.extend_from_slice(timezone.as_bytes());
+                    write(&length.to_be_bytes())?;
+                    write(timezone.as_bytes())?;
                 }
-                None => output.push(0),
+                None => write(&[0])?,
             }
         }
         DataType::Decimal128(precision, scale)
@@ -366,9 +467,9 @@ pub fn encode_filter_key_type(
                 && *scale <= DECIMAL128_MAX_SCALE
                 && (*scale <= 0 || (*scale as u8) <= *precision) =>
         {
-            output.extend_from_slice(&[12, *precision, *scale as u8]);
+            write(&[12, *precision, *scale as u8])?;
         }
-        _ => return Err(FilterMembershipSchemaError::UnsupportedType),
+        _ => return Err(FilterMembershipSchemaError::UnsupportedType.into()),
     }
     Ok(())
 }
@@ -634,5 +735,92 @@ mod tests {
             FilterMembershipSchema::from_canonical(&trailing, digest),
             Err(FilterMembershipSchemaError::TrailingBytes)
         );
+    }
+}
+
+#[cfg(test)]
+mod typed_creation_tests {
+    use super::*;
+    use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+
+    #[derive(Debug, PartialEq)]
+    enum Refusal {
+        Observer(usize),
+        Schema(FilterMembershipSchemaError),
+        Resource(LayoutResourceError),
+    }
+    impl From<FilterMembershipSchemaError> for Refusal {
+        fn from(error: FilterMembershipSchemaError) -> Self {
+            Self::Schema(error)
+        }
+    }
+    impl From<LayoutResourceError> for Refusal {
+        fn from(error: LayoutResourceError) -> Self {
+            Self::Resource(error)
+        }
+    }
+    #[test]
+    fn canonical_observed_constructor_keeps_artifact_bytes_and_real_requests() {
+        let timezone: Arc<str> = "Z".repeat(600).into();
+        let ty = DataType::Timestamp(TimeUnit::Microsecond, Some(timezone));
+        let pure =
+            FilterMembershipSchema::try_new(&ty, FilterNullSemantics::NullSafeEqual).unwrap();
+        let mut requests = Vec::new();
+        let mut work_units = 0;
+        let observed = FilterMembershipSchema::try_new_observed::<Refusal>(
+            &ty,
+            FilterNullSemantics::NullSafeEqual,
+            |layout| {
+                requests.push(layout);
+                Ok(())
+            },
+            |units| {
+                work_units += units;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(observed, pure);
+        assert_eq!(requests.len(), 2);
+        let bytes = std::alloc::Layout::array::<u8>(pure.canonical_bytes().len()).unwrap();
+        assert_eq!(requests[0], bytes);
+        assert_eq!(
+            requests[1],
+            novarocks_type_contract::owned_resources::layout::arc_layout(bytes).unwrap()
+        );
+        assert!(work_units >= 3 * 600);
+    }
+    #[test]
+    fn canonical_constructor_returns_first_request_or_work_refusal_without_later_callbacks() {
+        for refuse_at in 1..=2 {
+            let mut calls = 0;
+            let result = FilterMembershipSchema::try_new_observed::<Refusal>(
+                &DataType::Int64,
+                FilterNullSemantics::NeverMatches,
+                |_| {
+                    calls += 1;
+                    if calls == refuse_at {
+                        Err(Refusal::Observer(refuse_at))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| Ok(()),
+            );
+            assert_eq!(result.unwrap_err(), Refusal::Observer(refuse_at));
+            assert_eq!(calls, refuse_at);
+        }
+        let mut calls = 0;
+        let result = FilterMembershipSchema::try_new_observed::<Refusal>(
+            &DataType::Utf8,
+            FilterNullSemantics::NeverMatches,
+            |_| {
+                calls += 1;
+                Ok(())
+            },
+            |_| Err(Refusal::Observer(7)),
+        );
+        assert_eq!(result.unwrap_err(), Refusal::Observer(7));
+        assert_eq!(calls, 0);
     }
 }

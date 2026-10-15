@@ -82,13 +82,13 @@ pub(super) fn evaluate_timestampdiff<'a>(
             ));
         };
         let target = input.target;
-        if target.logical_type != ValueLogicalType::Physical
-            || target.data_type != DataType::Int64
-            || !target.nullable
-            || unit_type.logical_type != ValueLogicalType::Physical
-            || unit_type.data_type != DataType::Utf8
+        if target.logical_type() != ValueLogicalType::Physical
+            || target.data_type() != &DataType::Int64
+            || !target.nullable()
+            || unit_type.logical_type() != ValueLogicalType::Physical
+            || unit_type.data_type() != &DataType::Utf8
             || unit_arg.array().data_type() != &DataType::Utf8
-            || (!input.legacy && start_type.data_type != end_type.data_type)
+            || (!input.legacy && start_type.data_type() != end_type.data_type())
         {
             return Err(invalid(
                 "timestampdiff differs from its exact declared profile",
@@ -129,7 +129,7 @@ pub(super) fn evaluate_timestampdiff<'a>(
                     return Err(internal("timestampdiff selected row is out of bounds"));
                 }
                 let is_null = arguments[index].array().is_null(rows[index]);
-                if is_null && !types[index].nullable {
+                if is_null && !types[index].nullable() {
                     return Err(internal("timestampdiff non-null source contains SQL NULL"));
                 }
                 null |= is_null;

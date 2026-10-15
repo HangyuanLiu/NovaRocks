@@ -22,22 +22,19 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use super::creation::{CreatedSortColumns, SortCreation};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::sort::{SortExpression, SortTopNType};
 use crate::exec::operators::analytic_shared::{compute_partitions, row_equal_on_keys};
+use crate::exec::operators::sort::ChunksSorter;
 use crate::exec::operators::sort::chunks_sorter_heap_sort::sort_chunks_topn_heap;
 use crate::exec::operators::sort::sort_processor::rank_like_cutoff;
-use crate::exec::operators::sort::{ChunksSorter, concat_sort_chunks};
-use crate::exec::operators::sort::{
-    append_stable_row_index_sort_column, merged_sort_schema_for_chunks,
-    normalize_sort_batch_for_schema, normalize_sort_key_array,
-};
 
 use arrow::array::{ArrayRef, UInt32Array};
-use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
-use arrow::record_batch::RecordBatch;
-use arrow::row::{OwnedRow, RowConverter, SortField};
+use arrow::compute::{SortColumn, SortOptions};
+
+use arrow::row::{OwnedRow, RowConverter};
 
 /// Build row-number topn output through boundary filtering + global sort.
 ///
@@ -53,7 +50,8 @@ pub(crate) fn sort_chunks_topn(
     order_by: &[SortExpression],
     rows_to_keep: usize,
     chunks: &[Chunk],
-) -> Result<Option<Chunk>, String> {
+    creation: &SortCreation<'_>,
+) -> crate::runtime::fragment::ExecutionResult<Option<Chunk>> {
     if rows_to_keep == 0 || chunks.is_empty() {
         return Ok(None);
     }
@@ -63,24 +61,26 @@ pub(crate) fn sort_chunks_topn(
         return Ok(None);
     }
     if order_by.is_empty() {
-        let batch = concat_sort_chunks(chunks)?;
+        let owner = creation.begin(&chunks[0])?;
+        let batch = creation.concat(chunks, owner.as_ref())?;
         let keep = rows_to_keep.min(batch.num_rows());
         if keep == 0 {
             return Ok(None);
         }
-        return Chunk::try_new_like(batch.slice(0, keep), &chunks[0])
-            .map(Some)
-            .map_err(|e| e.to_string());
+        let chunk = creation.publish(batch, &chunks[0], owner.as_ref())?;
+        return Ok(Some(creation.slice(&chunk, 0, keep)?));
     }
 
-    let Some(boundary_chunk) = sort_chunks_topn_heap(arena, order_by, rows_to_keep, chunks)? else {
+    let Some(boundary_chunk) =
+        sort_chunks_topn_heap(arena, order_by, rows_to_keep, chunks, creation)?
+    else {
         return Ok(None);
     };
     if boundary_chunk.is_empty() {
         return Ok(None);
     }
-    let boundary_keys = eval_order_by_columns(arena, order_by, &boundary_chunk)?;
-    let converter = build_row_converter(order_by, &boundary_keys)?;
+    let boundary_keys = eval_order_by_columns(arena, order_by, &boundary_chunk, creation)?;
+    let converter = build_row_converter(order_by, &boundary_keys, creation)?;
     let boundary_rows = converter
         .convert_columns(&boundary_keys)
         .map_err(|e| e.to_string())?;
@@ -89,9 +89,14 @@ pub(crate) fn sort_chunks_topn(
 
     let mut filtered = Vec::new();
     for chunk in chunks {
-        if let Some(kept) =
-            filter_chunk_by_boundary(arena, order_by, chunk, &converter, &boundary_key)?
-        {
+        if let Some(kept) = filter_chunk_by_boundary(
+            arena,
+            order_by,
+            chunk,
+            converter.converter(),
+            &boundary_key,
+            creation,
+        )? {
             filtered.push(kept);
         }
     }
@@ -99,12 +104,12 @@ pub(crate) fn sort_chunks_topn(
         return Ok(None);
     }
 
-    let sorted = sort_chunks_by_order(arena, order_by, &filtered)?;
+    let sorted = sort_chunks_by_order(arena, order_by, &filtered, creation)?;
     if sorted.is_empty() {
         return Ok(None);
     }
     let keep = rows_to_keep.min(sorted.len());
-    Ok(Some(sorted.slice(0, keep)))
+    Ok(Some(creation.slice(&sorted, 0, keep)?))
 }
 
 /// Build rank-based topn output:
@@ -119,28 +124,29 @@ pub(crate) fn sort_chunks_rank(
     order_by: &[SortExpression],
     rank_limit: usize,
     chunks: &[Chunk],
-) -> Result<Option<Chunk>, String> {
+    creation: &SortCreation<'_>,
+) -> crate::runtime::fragment::ExecutionResult<Option<Chunk>> {
     if rank_limit == 0 || chunks.is_empty() {
         return Ok(None);
     }
     if order_by.is_empty() {
-        let batch = concat_sort_chunks(chunks)?;
+        let owner = creation.begin(&chunks[0])?;
+        let batch = creation.concat(chunks, owner.as_ref())?;
         if batch.num_rows() == 0 {
             return Ok(None);
         }
-        return Chunk::try_new_like(batch, &chunks[0])
-            .map(Some)
-            .map_err(|e| e.to_string());
+        return Ok(Some(creation.publish(batch, &chunks[0], owner.as_ref())?));
     }
 
-    let Some(boundary_chunk) = sort_chunks_topn(arena, order_by, rank_limit, chunks)? else {
+    let Some(boundary_chunk) = sort_chunks_topn(arena, order_by, rank_limit, chunks, creation)?
+    else {
         return Ok(None);
     };
     if boundary_chunk.is_empty() {
         return Ok(None);
     }
-    let boundary_keys = eval_order_by_columns(arena, order_by, &boundary_chunk)?;
-    let converter = build_row_converter(order_by, &boundary_keys)?;
+    let boundary_keys = eval_order_by_columns(arena, order_by, &boundary_chunk, creation)?;
+    let converter = build_row_converter(order_by, &boundary_keys, creation)?;
     let boundary_rows = converter
         .convert_columns(&boundary_keys)
         .map_err(|e| e.to_string())?;
@@ -149,16 +155,21 @@ pub(crate) fn sort_chunks_rank(
 
     let mut filtered = Vec::new();
     for chunk in chunks {
-        if let Some(kept) =
-            filter_chunk_by_boundary(arena, order_by, chunk, &converter, &boundary_key)?
-        {
+        if let Some(kept) = filter_chunk_by_boundary(
+            arena,
+            order_by,
+            chunk,
+            converter.converter(),
+            &boundary_key,
+            creation,
+        )? {
             filtered.push(kept);
         }
     }
     if filtered.is_empty() {
         return Ok(None);
     }
-    let sorted = sort_chunks_by_order(arena, order_by, &filtered)?;
+    let sorted = sort_chunks_by_order(arena, order_by, &filtered, creation)?;
     Ok(Some(sorted))
 }
 
@@ -173,26 +184,26 @@ pub(crate) fn sort_chunks_dense_rank(
     order_by: &[SortExpression],
     rank_limit: usize,
     chunks: &[Chunk],
-) -> Result<Option<Chunk>, String> {
+    creation: &SortCreation<'_>,
+) -> crate::runtime::fragment::ExecutionResult<Option<Chunk>> {
     if rank_limit == 0 || chunks.is_empty() {
         return Ok(None);
     }
     if order_by.is_empty() {
-        let batch = concat_sort_chunks(chunks)?;
+        let owner = creation.begin(&chunks[0])?;
+        let batch = creation.concat(chunks, owner.as_ref())?;
         if batch.num_rows() == 0 {
             return Ok(None);
         }
-        return Chunk::try_new_like(batch, &chunks[0])
-            .map(Some)
-            .map_err(|e| e.to_string());
+        return Ok(Some(creation.publish(batch, &chunks[0], owner.as_ref())?));
     }
 
-    let sorted = sort_chunks_by_order(arena, order_by, chunks)?;
+    let sorted = sort_chunks_by_order(arena, order_by, chunks, creation)?;
     if sorted.is_empty() {
         return Ok(None);
     }
-    let key_columns = eval_order_by_columns(arena, order_by, &sorted)?;
-    let converter = build_row_converter(order_by, &key_columns)?;
+    let key_columns = eval_order_by_columns(arena, order_by, &sorted, creation)?;
+    let converter = build_row_converter(order_by, &key_columns, creation)?;
     let rows = converter
         .convert_columns(&key_columns)
         .map_err(|e| e.to_string())?;
@@ -210,7 +221,7 @@ pub(crate) fn sort_chunks_dense_rank(
     if cutoff == 0 {
         return Ok(None);
     }
-    Ok(Some(sorted.slice(0, cutoff)))
+    Ok(Some(creation.slice(&sorted, 0, cutoff)?))
 }
 
 /// Per-partition rank-TopN sorter.
@@ -244,7 +255,11 @@ impl ChunksSorterPartitionTopN {
 }
 
 impl ChunksSorter for ChunksSorterPartitionTopN {
-    fn sort_chunks(&self, chunks: &[Chunk]) -> Result<Option<Chunk>, String> {
+    fn sort_chunks(
+        &self,
+        chunks: &[Chunk],
+        creation: &SortCreation<'_>,
+    ) -> crate::runtime::fragment::ExecutionResult<Option<Chunk>> {
         sort_chunks_partition_topn(
             self.arena.as_ref(),
             &self.partition_exprs,
@@ -252,6 +267,7 @@ impl ChunksSorter for ChunksSorterPartitionTopN {
             self.topn_type,
             self.partition_limit,
             chunks,
+            creation,
         )
     }
 }
@@ -281,17 +297,33 @@ impl ChunksSorterTopN {
 }
 
 impl ChunksSorter for ChunksSorterTopN {
-    fn sort_chunks(&self, chunks: &[Chunk]) -> Result<Option<Chunk>, String> {
+    fn sort_chunks(
+        &self,
+        chunks: &[Chunk],
+        creation: &SortCreation<'_>,
+    ) -> crate::runtime::fragment::ExecutionResult<Option<Chunk>> {
         match self.topn_type {
-            SortTopNType::RowNumber => {
-                sort_chunks_topn(self.arena.as_ref(), &self.order_by, self.limit, chunks)
-            }
-            SortTopNType::Rank => {
-                sort_chunks_rank(self.arena.as_ref(), &self.order_by, self.limit, chunks)
-            }
-            SortTopNType::DenseRank => {
-                sort_chunks_dense_rank(self.arena.as_ref(), &self.order_by, self.limit, chunks)
-            }
+            SortTopNType::RowNumber => sort_chunks_topn(
+                self.arena.as_ref(),
+                &self.order_by,
+                self.limit,
+                chunks,
+                creation,
+            ),
+            SortTopNType::Rank => sort_chunks_rank(
+                self.arena.as_ref(),
+                &self.order_by,
+                self.limit,
+                chunks,
+                creation,
+            ),
+            SortTopNType::DenseRank => sort_chunks_dense_rank(
+                self.arena.as_ref(),
+                &self.order_by,
+                self.limit,
+                chunks,
+                creation,
+            ),
         }
     }
 }
@@ -300,80 +332,100 @@ fn eval_order_by_columns(
     arena: &ExprArena,
     order_by: &[SortExpression],
     chunk: &Chunk,
-) -> Result<Vec<ArrayRef>, String> {
-    let mut key_columns = Vec::with_capacity(order_by.len());
+    creation: &SortCreation<'_>,
+) -> crate::runtime::fragment::ExecutionResult<super::creation::CreatedSortColumns> {
+    let owner = creation.begin(chunk)?;
+    let types = creation.begin(chunk)?;
+    let mut key_columns = creation.vector::<ArrayRef>(order_by.len(), owner.as_ref())?;
     for sort_expr in order_by {
-        let key = arena
-            .eval(sort_expr.expr, chunk)
-            .map_err(|e| e.to_string())?;
-        key_columns.push(normalize_sort_key_array(&key)?);
+        let key = arena.eval(sort_expr.expr, chunk)?;
+        let declared = arena.value_type(sort_expr.expr).ok_or_else(|| {
+            crate::exec::pipeline::operator::ConstructionFailure::InvalidSource(
+                "sort key lacks its complete declared logical type".into(),
+            )
+        })?;
+        key_columns.push(creation.normalize_key(
+            &key,
+            declared.value_type(),
+            owner.as_ref(),
+            types.as_ref(),
+        )?);
     }
-    Ok(key_columns)
+    Ok(super::creation::CreatedSortColumns::new(
+        key_columns,
+        creation.source_type_storage(chunk, types.as_ref())?,
+        owner.storage_lifetime(),
+    ))
 }
 
 fn build_row_converter(
     order_by: &[SortExpression],
-    key_columns: &[ArrayRef],
-) -> Result<RowConverter, String> {
-    let fields = key_columns
-        .iter()
-        .zip(order_by.iter())
-        .map(|(col, expr)| {
-            SortField::new_with_options(
-                col.data_type().clone(),
-                SortOptions {
-                    descending: !expr.asc,
-                    nulls_first: expr.nulls_first,
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    RowConverter::new(fields).map_err(|e| e.to_string())
+    key_columns: &CreatedSortColumns,
+    creation: &SortCreation<'_>,
+) -> crate::runtime::fragment::ExecutionResult<super::creation::CreatedSortConverter> {
+    creation.row_converter(
+        key_columns,
+        key_columns.storage_lifetime(),
+        order_by.iter().map(|expr| SortOptions {
+            descending: !expr.asc,
+            nulls_first: expr.nulls_first,
+        }),
+    )
 }
 
-fn build_sort_columns(order_by: &[SortExpression], key_columns: &[ArrayRef]) -> Vec<SortColumn> {
-    let mut sort_columns: Vec<SortColumn> = key_columns
-        .iter()
-        .zip(order_by.iter())
-        .map(|(values, expr)| SortColumn {
+fn build_sort_columns(
+    order_by: &[SortExpression],
+    key_columns: &[ArrayRef],
+    creation: &SortCreation<'_>,
+    owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
+) -> crate::runtime::fragment::ExecutionResult<Vec<SortColumn>> {
+    let mut columns = creation.vector::<SortColumn>(key_columns.len(), owner)?;
+    for (values, expr) in key_columns.iter().zip(order_by) {
+        columns.push(SortColumn {
             values: values.clone(),
             options: Some(SortOptions {
                 descending: !expr.asc,
                 nulls_first: expr.nulls_first,
             }),
-        })
-        .collect();
-    if let Some(first) = key_columns.first() {
-        append_stable_row_index_sort_column(&mut sort_columns, first.len());
+        });
     }
-    sort_columns
+    if let Some(first) = key_columns.first() {
+        creation.stable_index(&mut columns, first.len(), owner)?;
+    }
+    Ok(columns)
 }
 
 fn sort_chunks_by_order(
     arena: &ExprArena,
     order_by: &[SortExpression],
     chunks: &[Chunk],
-) -> Result<Chunk, String> {
+    creation: &SortCreation<'_>,
+) -> crate::runtime::fragment::ExecutionResult<Chunk> {
     if chunks.is_empty() {
-        return Err("sort_chunks_by_order requires non-empty chunks".to_string());
+        return Err("sort_chunks_by_order requires non-empty chunks".into());
     }
-    let batch = concat_sort_chunks(chunks)?;
+    creation.verify_chunks(chunks)?;
+    let owner = creation.begin(&chunks[0])?;
+    let batch = creation.concat(chunks, owner.as_ref())?;
     if batch.num_rows() == 0 || order_by.is_empty() {
-        return Chunk::try_new_like(batch, &chunks[0]).map_err(|e| e.to_string());
+        return creation.publish(batch, &chunks[0], owner.as_ref());
     }
 
-    let key_chunk = Chunk::new_like(batch.clone(), &chunks[0]);
-    let key_columns = eval_order_by_columns(arena, order_by, &key_chunk)?;
-    let sort_columns = build_sort_columns(order_by, &key_columns);
-    let indices = lexsort_to_indices(&sort_columns, None).map_err(|e| e.to_string())?;
-    let columns = batch
-        .columns()
-        .iter()
-        .map(|col| take(col.as_ref(), &indices, None))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    let sorted_batch = RecordBatch::try_new(batch.schema(), columns).map_err(|e| e.to_string())?;
-    Chunk::try_new_like(sorted_batch, &chunks[0]).map_err(|e| e.to_string())
+    let key_owner = creation.begin(&chunks[0])?;
+    key_owner.observe(
+        0,
+        &[],
+        crate::exec::chunk::ArrayNormalizationStep::CreateChunkColumns {
+            channels: batch.num_columns(),
+        },
+    )?;
+    let key_chunk = creation.publish(batch.clone(), &chunks[0], key_owner.as_ref())?;
+    let key_columns = eval_order_by_columns(arena, order_by, &key_chunk, creation)?;
+    let sort_columns = build_sort_columns(order_by, &key_columns, creation, key_owner.as_ref())?;
+    let indices = creation.lexsort(&sort_columns, None, &chunks[0])?;
+    let sorted_batch =
+        creation.take_batch(&batch, indices.array().as_ref(), &chunks[0], owner.as_ref())?;
+    creation.publish(sorted_batch, &chunks[0], owner.as_ref())
 }
 
 fn filter_chunk_by_boundary(
@@ -382,11 +434,12 @@ fn filter_chunk_by_boundary(
     chunk: &Chunk,
     converter: &RowConverter,
     boundary_key: &OwnedRow,
-) -> Result<Option<Chunk>, String> {
+    creation: &SortCreation<'_>,
+) -> crate::runtime::fragment::ExecutionResult<Option<Chunk>> {
     if chunk.is_empty() {
         return Ok(None);
     }
-    let key_columns = eval_order_by_columns(arena, order_by, chunk)?;
+    let key_columns = eval_order_by_columns(arena, order_by, chunk, creation)?;
     let rows = converter
         .convert_columns(&key_columns)
         .map_err(|e| e.to_string())?;
@@ -404,33 +457,31 @@ fn filter_chunk_by_boundary(
     if indices.len() == chunk.len() {
         return Ok(Some(chunk.clone()));
     }
-    take_rows(chunk, &indices)
+    take_rows(chunk, &indices, creation)
 }
 
 /// Take selected rows from `chunk` by absolute row indices.
 ///
 /// Returns `None` if `indices` is empty; returns a clone of `chunk` if all
 /// rows are selected; otherwise performs a physical take and rebuilds the chunk.
-fn take_rows(chunk: &Chunk, indices: &[u32]) -> Result<Option<Chunk>, String> {
+fn take_rows(
+    chunk: &Chunk,
+    indices: &[u32],
+    creation: &SortCreation<'_>,
+) -> crate::runtime::fragment::ExecutionResult<Option<Chunk>> {
     if indices.is_empty() {
         return Ok(None);
     }
     if indices.len() == chunk.len() {
         return Ok(Some(chunk.clone()));
     }
+    let owner = creation.begin(chunk)?;
+    let index_owner = creation.begin(chunk)?;
+    creation.buffer_adoption(index_owner.as_ref())?;
     let selection = UInt32Array::from(indices.to_vec());
-    let schema = merged_sort_schema_for_chunks(std::slice::from_ref(chunk))?;
-    let batch = normalize_sort_batch_for_schema(chunk, &schema, 0)?;
-    let columns = batch
-        .columns()
-        .iter()
-        .map(|col| take(col.as_ref(), &selection, None))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| e.to_string())?;
-    let filtered = RecordBatch::try_new(schema, columns).map_err(|e| e.to_string())?;
-    Chunk::try_new_like(filtered, chunk)
-        .map(Some)
-        .map_err(|e| e.to_string())
+    let batch = chunk.record_batch();
+    let filtered = creation.take_batch(batch, &selection, chunk, owner.as_ref())?;
+    Ok(Some(creation.publish(filtered, chunk, owner.as_ref())?))
 }
 
 /// Per-partition rank-TopN.
@@ -448,21 +499,22 @@ pub(crate) fn sort_chunks_partition_topn(
     topn_type: SortTopNType,
     partition_limit: usize,
     chunks: &[Chunk],
-) -> Result<Option<Chunk>, String> {
+    creation: &SortCreation<'_>,
+) -> crate::runtime::fragment::ExecutionResult<Option<Chunk>> {
     if partition_limit == 0 || chunks.is_empty() {
         return Ok(None);
     }
     // Build a combined sort key: partition keys first (preserving their sort direction), then order keys.
     let mut combined: Vec<SortExpression> = partition_exprs.to_vec();
     combined.extend_from_slice(order_by);
-    let sorted = sort_chunks_by_order(arena, &combined, chunks)?;
+    let sorted = sort_chunks_by_order(arena, &combined, chunks, creation)?;
     if sorted.is_empty() {
         return Ok(None);
     }
     // Materialize partition-key columns from the sorted chunk for grouping.
-    let part_keys = eval_order_by_columns(arena, partition_exprs, &sorted)?;
+    let part_keys = eval_order_by_columns(arena, partition_exprs, &sorted, creation)?;
     // Materialize order-key columns for peer-equality comparisons inside each partition.
-    let order_keys = eval_order_by_columns(arena, order_by, &sorted)?;
+    let order_keys = eval_order_by_columns(arena, order_by, &sorted, creation)?;
     let partitions = compute_partitions(&part_keys, sorted.len())?;
     let mut keep_indices = Vec::<u32>::new();
     for (start, end) in partitions {
@@ -485,7 +537,7 @@ pub(crate) fn sort_chunks_partition_topn(
     if keep_indices.len() == sorted.len() {
         return Ok(Some(sorted));
     }
-    take_rows(&sorted, &keep_indices)
+    take_rows(&sorted, &keep_indices, creation)
 }
 
 #[cfg(test)]
@@ -494,40 +546,144 @@ mod tests {
     use crate::exec::expr::{ExprArena, ExprNode};
     use arrow::array::{Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
-    use arrow::record_batch::RecordBatch;
     use novarocks_types::SlotId;
     use std::sync::Arc;
 
-    /// Build a two-column Chunk: col 0 = partition key (SlotId 1), col 1 = order key (SlotId 2).
-    fn make_two_col_chunk(p_values: Vec<Option<i32>>, o_values: Vec<Option<i32>>) -> Chunk {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("p", DataType::Int32, true),
-            Field::new("o", DataType::Int32, true),
-        ]));
-        let batch = RecordBatch::try_new(
+    use crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory;
+    use crate::exec::pipeline::operator::{ConstructionFailure, InputConstructionFactory};
+    use novarocks_local_program::StaticLayout;
+    use novarocks_type_contract::{
+        CompileControlError, CompilePhase, FunctionValueType, PureCompileControl,
+        TypedValueBinding, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+    use std::alloc::Layout;
+
+    struct DeclarationControl;
+    impl PureCompileControl for DeclarationControl {
+        fn checkpoint(&self, _: CompilePhase, _: u32) -> Result<(), CompileControlError> {
+            Ok(())
+        }
+    }
+    struct TestSource {
+        layout: StaticLayout,
+        output: crate::exec::chunk::ChunkSchemaRef,
+        creator: Arc<dyn InputConstructionFactory>,
+    }
+    fn source_for(names: &[&str]) -> TestSource {
+        // All original kernels in this module declare nullable Int32 channels.
+        let bindings = names
+            .iter()
+            .map(|_| {
+                let storage = ValueTypeStorageLifetime::pure();
+                TypedValueBinding::try_new(
+                    ValueTypeRef::try_new(
+                        ValueKind::Scalar(DataType::Int32),
+                        true,
+                        storage.clone(),
+                    )
+                    .unwrap(),
+                    ValueLayout::try_new(&DataType::Int32, storage).unwrap(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(
+            names
+                .iter()
+                .map(|name| Field::new(*name, DataType::Int32, true))
+                .collect::<Vec<_>>(),
+        ));
+        let layout = StaticLayout::try_new_typed_for_compile(
             schema,
-            vec![
+            Arc::from(
+                (1..=names.len())
+                    .map(|id| SlotId::new(u32::try_from(id).unwrap()))
+                    .collect::<Vec<_>>(),
+            ),
+            bindings
+                .into_iter()
+                .map(|binding| (binding, None))
+                .collect(),
+            ValueTypeStorageLifetime::pure(),
+            |_| Ok(()),
+            &DeclarationControl,
+        )
+        .unwrap();
+        let state = crate::runtime::runtime_state::RuntimeState::default();
+        let creator = try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            crate::runtime::mem_tracker::MemTracker::new_root("original-topn-kernel-scaffolds"),
+            state.error_state(),
+        )
+        .unwrap();
+        // The original kernels receive the same actual owner-backed schema
+        // construction used by operator prepare, before any input is built.
+        let output = creator.create_compiled_chunk_schema(&layout).unwrap();
+        TestSource {
+            layout,
+            output,
+            creator,
+        }
+    }
+    impl TestSource {
+        fn creation(&self) -> SortCreation<'_> {
+            SortCreation::new(self.creator.as_ref(), &self.output)
+        }
+        fn value(&self, ordinal: usize) -> FunctionValueType {
+            FunctionValueType::try_from_typed_binding(
+                self.layout.value_binding_at(ordinal).unwrap().clone(),
+            )
+            .unwrap()
+        }
+    }
+    fn source_chunk<const N: usize>(
+        source: &TestSource,
+        arrays: [arrow::array::ArrayRef; N],
+        rows: usize,
+    ) -> Chunk {
+        let owner = source
+            .creator
+            .begin_typed_construction(&source.output)
+            .unwrap();
+        owner
+            .request(Layout::array::<arrow::array::ArrayRef>(N).unwrap())
+            .unwrap();
+        Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+            source.output.clone(),
+            arrays.into_iter().collect(),
+            rows,
+            owner.storage_lifetime(),
+            |step| owner.observe(0, &[], step),
+        )
+        .unwrap()
+    }
+    /// The source declaration is supplied separately from all observed row data.
+    fn make_two_col_chunk(
+        source: &TestSource,
+        p_values: Vec<Option<i32>>,
+        o_values: Vec<Option<i32>>,
+    ) -> Chunk {
+        let rows = p_values.len();
+        assert_eq!(rows, o_values.len());
+        source_chunk(
+            source,
+            [
                 Arc::new(Int32Array::from(p_values)),
                 Arc::new(Int32Array::from(o_values)),
             ],
+            rows,
         )
-        .expect("record batch");
-        let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-            batch.schema().as_ref(),
-            &[SlotId::new(1), SlotId::new(2)],
-        )
-        .expect("chunk schema");
-        Chunk::new_with_chunk_schema(batch, chunk_schema)
     }
 
     /// Build partition + order SortExpressions for the two-column chunk.
     fn two_col_sort_exprs(
+        source: &TestSource,
         asc: bool,
         nulls_first: bool,
     ) -> (ExprArena, Vec<SortExpression>, Vec<SortExpression>) {
         let mut arena = ExprArena::default();
-        let p_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let o_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int32);
+        let p_expr = arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), source.value(0));
+        let o_expr = arena.push_value_typed(ExprNode::SlotId(SlotId::new(2)), source.value(1));
         let partition_exprs = vec![SortExpression {
             expr: p_expr,
             asc,
@@ -543,7 +699,7 @@ mod tests {
 
     fn collect_col_i32(chunk: &Chunk, col_idx: usize) -> Vec<Option<i32>> {
         let col = chunk
-            .batch
+            .record_batch()
             .column(col_idx)
             .as_any()
             .downcast_ref::<Int32Array>()
@@ -561,11 +717,13 @@ mod tests {
 
     #[test]
     fn partition_topn_row_number_keeps_exactly_k_per_partition() {
+        let source = source_for(&["p", "o"]);
         // p=[1,1,2,2,2], o=[10,20,5,6,7]; limit=1 (ROW_NUMBER)
         // Partition 1: row 10 kept (row_number=1 <= 1)
         // Partition 2: row 5 kept (row_number=1 <= 1)
-        let (arena, partition_exprs, order_by) = two_col_sort_exprs(true, true);
+        let (arena, partition_exprs, order_by) = two_col_sort_exprs(&source, true, true);
         let chunks = vec![make_two_col_chunk(
+            &source,
             vec![Some(1), Some(1), Some(2), Some(2), Some(2)],
             vec![Some(10), Some(20), Some(5), Some(6), Some(7)],
         )];
@@ -577,6 +735,7 @@ mod tests {
             SortTopNType::RowNumber,
             1,
             &chunks,
+            &source.creation(),
         )
         .expect("partition_topn")
         .expect("non-empty result");
@@ -588,11 +747,13 @@ mod tests {
 
     #[test]
     fn partition_topn_dense_rank_keeps_distinct_peer_groups_per_partition() {
+        let source = source_for(&["p", "o"]);
         // p=[1,1,1,1,2,2,2], o=[10,10,20,30,5,5,7]
         // Partition 1: dense_ranks = [1,1,2,3] → dense_rank<=2 keeps [10,10,20] (3 rows)
         // Partition 2: dense_ranks = [1,1,2] → dense_rank<=2 keeps [5,5,7] (3 rows)
-        let (arena, partition_exprs, order_by) = two_col_sort_exprs(true, true);
+        let (arena, partition_exprs, order_by) = two_col_sort_exprs(&source, true, true);
         let chunks = vec![make_two_col_chunk(
+            &source,
             vec![
                 Some(1),
                 Some(1),
@@ -620,6 +781,7 @@ mod tests {
             SortTopNType::DenseRank,
             2,
             &chunks,
+            &source.creation(),
         )
         .expect("partition_topn")
         .expect("non-empty result");
@@ -634,11 +796,13 @@ mod tests {
 
     #[test]
     fn partition_topn_null_partition_key_groups_nulls_together() {
+        let source = source_for(&["p", "o"]);
         // p=[None,None,1], o=[5,10,20]
         // NULL partition key rows grouped together: rank<=1 → o=5 kept from null-group
         // Partition p=1: rank<=1 → o=20 kept
-        let (arena, partition_exprs, order_by) = two_col_sort_exprs(true, true);
+        let (arena, partition_exprs, order_by) = two_col_sort_exprs(&source, true, true);
         let chunks = vec![make_two_col_chunk(
+            &source,
             vec![None, None, Some(1)],
             vec![Some(5), Some(10), Some(20)],
         )];
@@ -650,6 +814,7 @@ mod tests {
             SortTopNType::RowNumber,
             1,
             &chunks,
+            &source.creation(),
         )
         .expect("partition_topn")
         .expect("non-empty result");
@@ -671,29 +836,26 @@ mod tests {
 
     #[test]
     fn partition_topn_empty_partition_exprs_matches_global() {
+        let source = source_for(&["v"]);
         // Empty partition_exprs → one global group; same result as sort_chunks_rank global.
         let mut arena = ExprArena::default();
-        let o_expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let o_expr = arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), source.value(0));
         let order_by = vec![SortExpression {
             expr: o_expr,
             asc: true,
             nulls_first: true,
         }];
 
-        let chunks = vec![make_chunk(vec![
-            Some(10),
-            Some(10),
-            Some(9),
-            Some(8),
-            Some(8),
-            Some(7),
-        ])];
+        let chunks = vec![make_chunk(
+            &source,
+            vec![Some(10), Some(10), Some(9), Some(8), Some(8), Some(7)],
+        )];
 
         // Global rank with limit=4 keeps [7,8,8,9,10,10] minus rank>4 → [7,8,8,9] = 4 rows
         // rank sequence asc: [1,2,2,4,4,6] → rank<=4 keeps rows 7,8,8,9 (5 rows incl boundary ties)
         // Actually: sorted asc = [7,8,8,9,10,10], rank = [1,2,2,4,4,6]
         // rank<=4 keeps [7,8,8,9] = 4 rows
-        let global_out = sort_chunks_rank(&arena, &order_by, 4, &chunks)
+        let global_out = sort_chunks_rank(&arena, &order_by, 4, &chunks, &source.creation())
             .expect("global rank")
             .expect("non-empty");
 
@@ -704,6 +866,7 @@ mod tests {
             SortTopNType::Rank,
             4,
             &chunks,
+            &source.creation(),
         )
         .expect("partition_topn")
         .expect("non-empty result");
@@ -714,13 +877,15 @@ mod tests {
 
     #[test]
     fn partition_topn_resets_rank_per_partition() {
+        let source = source_for(&["p", "o"]);
         // p=[1,1,1,2,2,2], o=[10,20,30,5,6,7]
         // After partition sort: p=[1,1,1,2,2,2], o=[10,20,30,5,6,7] (already sorted)
         // Partition 1 ranks: 1,2,3 → keep rank<=2 → rows (1,10),(1,20)
         // Partition 2 ranks: 1,2,3 → keep rank<=2 → rows (2,5),(2,6)
         // Expected o values: [10,20,5,6]
-        let (arena, partition_exprs, order_by) = two_col_sort_exprs(true, true);
+        let (arena, partition_exprs, order_by) = two_col_sort_exprs(&source, true, true);
         let chunks = vec![make_two_col_chunk(
+            &source,
             vec![Some(1), Some(1), Some(1), Some(2), Some(2), Some(2)],
             vec![Some(10), Some(20), Some(30), Some(5), Some(6), Some(7)],
         )];
@@ -732,6 +897,7 @@ mod tests {
             SortTopNType::Rank,
             2,
             &chunks,
+            &source.creation(),
         )
         .expect("partition_topn")
         .expect("non-empty result");
@@ -745,11 +911,13 @@ mod tests {
 
     #[test]
     fn partition_topn_limit_exceeds_partition_size_keeps_entire_partition() {
+        let source = source_for(&["p", "o"]);
         // p=[1,1,2,2,2], o=[10,20,5,6,7], Rank, partition_limit=10
         // Partition 1 has 2 rows (< 10); all 2 rows must be kept.
         // Partition 2 has 3 rows (< 10); all 3 rows must be kept.
-        let (arena, partition_exprs, order_by) = two_col_sort_exprs(true, true);
+        let (arena, partition_exprs, order_by) = two_col_sort_exprs(&source, true, true);
         let chunks = vec![make_two_col_chunk(
+            &source,
             vec![Some(1), Some(1), Some(2), Some(2), Some(2)],
             vec![Some(10), Some(20), Some(5), Some(6), Some(7)],
         )];
@@ -761,6 +929,7 @@ mod tests {
             SortTopNType::Rank,
             10,
             &chunks,
+            &source.creation(),
         )
         .expect("partition_topn")
         .expect("non-empty result");
@@ -775,15 +944,17 @@ mod tests {
 
     #[test]
     fn partition_topn_handles_multiple_input_chunks() {
+        let source = source_for(&["p", "o"]);
         // Two separate Chunks; rows of the same partition are split across them:
         //   chunk1: (p=1,o=10), (p=2,o=5)
         //   chunk2: (p=1,o=20), (p=1,o=30), (p=2,o=6)
         // Rank limit=2:
         //   Partition 1: sorted o=[10,20,30] → rank sequence [1,2,3] → keep [10,20]
         //   Partition 2: sorted o=[5,6]      → rank sequence [1,2]   → keep [5,6]
-        let (arena, partition_exprs, order_by) = two_col_sort_exprs(true, true);
-        let chunk1 = make_two_col_chunk(vec![Some(1), Some(2)], vec![Some(10), Some(5)]);
+        let (arena, partition_exprs, order_by) = two_col_sort_exprs(&source, true, true);
+        let chunk1 = make_two_col_chunk(&source, vec![Some(1), Some(2)], vec![Some(10), Some(5)]);
         let chunk2 = make_two_col_chunk(
+            &source,
             vec![Some(1), Some(1), Some(2)],
             vec![Some(20), Some(30), Some(6)],
         );
@@ -796,6 +967,7 @@ mod tests {
             SortTopNType::Rank,
             2,
             &chunks,
+            &source.creation(),
         )
         .expect("partition_topn")
         .expect("non-empty result");
@@ -807,24 +979,18 @@ mod tests {
         );
     }
 
-    fn make_chunk(values: Vec<Option<i32>>) -> Chunk {
-        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int32, true)]));
-        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))])
-            .expect("record batch");
-        {
-            let batch = batch;
-            let chunk_schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
-                batch.schema().as_ref(),
-                &[SlotId::new(1)],
-            )
-            .expect("chunk schema");
-            Chunk::new_with_chunk_schema(batch, chunk_schema)
-        }
+    fn make_chunk(source: &TestSource, values: Vec<Option<i32>>) -> Chunk {
+        let rows = values.len();
+        source_chunk(source, [Arc::new(Int32Array::from(values))], rows)
     }
 
-    fn single_key_order_by(asc: bool, nulls_first: bool) -> (ExprArena, Vec<SortExpression>) {
+    fn single_key_order_by(
+        source: &TestSource,
+        asc: bool,
+        nulls_first: bool,
+    ) -> (ExprArena, Vec<SortExpression>) {
         let mut arena = ExprArena::default();
-        let expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
+        let expr = arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), source.value(0));
         let order_by = vec![SortExpression {
             expr,
             asc,
@@ -835,7 +1001,7 @@ mod tests {
 
     fn collect_i32(chunk: &Chunk) -> Vec<Option<i32>> {
         let col = chunk
-            .batch
+            .record_batch()
             .column(0)
             .as_any()
             .downcast_ref::<Int32Array>()
@@ -853,13 +1019,14 @@ mod tests {
 
     #[test]
     fn topn_ascending_keeps_smallest_rows() {
-        let (arena, order_by) = single_key_order_by(true, true);
+        let source = source_for(&["v"]);
+        let (arena, order_by) = single_key_order_by(&source, true, true);
         let chunks = vec![
-            make_chunk(vec![Some(7), Some(2), Some(5)]),
-            make_chunk(vec![Some(1), Some(9), Some(3)]),
+            make_chunk(&source, vec![Some(7), Some(2), Some(5)]),
+            make_chunk(&source, vec![Some(1), Some(9), Some(3)]),
         ];
 
-        let out = sort_chunks_topn(&arena, &order_by, 3, &chunks)
+        let out = sort_chunks_topn(&arena, &order_by, 3, &chunks, &source.creation())
             .expect("topn")
             .expect("chunk");
         assert_eq!(collect_i32(&out), vec![Some(1), Some(2), Some(3)]);
@@ -867,13 +1034,14 @@ mod tests {
 
     #[test]
     fn topn_heap_kernel_keeps_smallest_rows() {
-        let (arena, order_by) = single_key_order_by(true, true);
+        let source = source_for(&["v"]);
+        let (arena, order_by) = single_key_order_by(&source, true, true);
         let chunks = vec![
-            make_chunk(vec![Some(7), Some(2), Some(5)]),
-            make_chunk(vec![Some(1), Some(9), Some(3)]),
+            make_chunk(&source, vec![Some(7), Some(2), Some(5)]),
+            make_chunk(&source, vec![Some(1), Some(9), Some(3)]),
         ];
 
-        let out = sort_chunks_topn_heap(&arena, &order_by, 3, &chunks)
+        let out = sort_chunks_topn_heap(&arena, &order_by, 3, &chunks, &source.creation())
             .expect("topn heap")
             .expect("chunk");
         assert_eq!(collect_i32(&out), vec![Some(1), Some(2), Some(3)]);
@@ -881,17 +1049,14 @@ mod tests {
 
     #[test]
     fn topn_descending_respects_nulls_last() {
-        let (arena, order_by) = single_key_order_by(false, false);
-        let chunks = vec![make_chunk(vec![
-            Some(2),
-            None,
-            Some(9),
-            Some(4),
-            None,
-            Some(7),
-        ])];
+        let source = source_for(&["v"]);
+        let (arena, order_by) = single_key_order_by(&source, false, false);
+        let chunks = vec![make_chunk(
+            &source,
+            vec![Some(2), None, Some(9), Some(4), None, Some(7)],
+        )];
 
-        let out = sort_chunks_topn(&arena, &order_by, 4, &chunks)
+        let out = sort_chunks_topn(&arena, &order_by, 4, &chunks, &source.creation())
             .expect("topn")
             .expect("chunk");
         assert_eq!(collect_i32(&out), vec![Some(9), Some(7), Some(4), Some(2)]);
@@ -899,18 +1064,15 @@ mod tests {
 
     #[test]
     fn rank_topn_expands_boundary_ties() {
-        let (arena, order_by) = single_key_order_by(false, false);
-        let chunks = vec![make_chunk(vec![
-            Some(10),
-            Some(10),
-            Some(9),
-            Some(8),
-            Some(8),
-            Some(7),
-        ])];
+        let source = source_for(&["v"]);
+        let (arena, order_by) = single_key_order_by(&source, false, false);
+        let chunks = vec![make_chunk(
+            &source,
+            vec![Some(10), Some(10), Some(9), Some(8), Some(8), Some(7)],
+        )];
 
         // Rank sequence is [1,1,3,4,4,6], so rank<=4 keeps five rows.
-        let out = sort_chunks_rank(&arena, &order_by, 4, &chunks)
+        let out = sort_chunks_rank(&arena, &order_by, 4, &chunks, &source.creation())
             .expect("rank topn")
             .expect("chunk");
         assert_eq!(
@@ -921,12 +1083,13 @@ mod tests {
 
     #[test]
     fn rank_topn_with_empty_order_by_keeps_all_rows() {
+        let source = source_for(&["v"]);
         let mut arena = ExprArena::default();
-        let _expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let chunks = vec![make_chunk(vec![Some(1), Some(2), Some(3)])];
+        let _expr = arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), source.value(0));
+        let chunks = vec![make_chunk(&source, vec![Some(1), Some(2), Some(3)])];
 
         // Without ORDER BY keys, all rows are in one peer group (rank=1).
-        let out = sort_chunks_rank(&arena, &[], 1, &chunks)
+        let out = sort_chunks_rank(&arena, &[], 1, &chunks, &source.creation())
             .expect("rank topn")
             .expect("chunk");
         assert_eq!(collect_i32(&out), vec![Some(1), Some(2), Some(3)]);
@@ -934,18 +1097,15 @@ mod tests {
 
     #[test]
     fn dense_rank_topn_keeps_first_distinct_peer_groups() {
-        let (arena, order_by) = single_key_order_by(false, false);
-        let chunks = vec![make_chunk(vec![
-            Some(10),
-            Some(10),
-            Some(9),
-            Some(8),
-            Some(8),
-            Some(7),
-        ])];
+        let source = source_for(&["v"]);
+        let (arena, order_by) = single_key_order_by(&source, false, false);
+        let chunks = vec![make_chunk(
+            &source,
+            vec![Some(10), Some(10), Some(9), Some(8), Some(8), Some(7)],
+        )];
 
         // DENSE_RANK sequence is [1,1,2,3,3,4], so dense_rank<=2 keeps three rows.
-        let out = sort_chunks_dense_rank(&arena, &order_by, 2, &chunks)
+        let out = sort_chunks_dense_rank(&arena, &order_by, 2, &chunks, &source.creation())
             .expect("dense rank topn")
             .expect("chunk");
         assert_eq!(collect_i32(&out), vec![Some(10), Some(10), Some(9)]);
@@ -953,12 +1113,13 @@ mod tests {
 
     #[test]
     fn dense_rank_topn_with_empty_order_by_keeps_all_rows() {
+        let source = source_for(&["v"]);
         let mut arena = ExprArena::default();
-        let _expr = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let chunks = vec![make_chunk(vec![Some(1), Some(2), Some(3)])];
+        let _expr = arena.push_value_typed(ExprNode::SlotId(SlotId::new(1)), source.value(0));
+        let chunks = vec![make_chunk(&source, vec![Some(1), Some(2), Some(3)])];
 
         // Without ORDER BY keys, all rows are in one peer group (dense_rank=1).
-        let out = sort_chunks_dense_rank(&arena, &[], 1, &chunks)
+        let out = sort_chunks_dense_rank(&arena, &[], 1, &chunks, &source.creation())
             .expect("dense rank topn")
             .expect("chunk");
         assert_eq!(collect_i32(&out), vec![Some(1), Some(2), Some(3)]);
@@ -966,16 +1127,14 @@ mod tests {
 
     #[test]
     fn topn_rows_to_keep_larger_than_input_does_not_overflow() {
-        let (arena, order_by) = single_key_order_by(true, true);
-        let chunks = vec![make_chunk(vec![
-            Some(5),
-            Some(1),
-            Some(3),
-            Some(2),
-            Some(4),
-        ])];
+        let source = source_for(&["v"]);
+        let (arena, order_by) = single_key_order_by(&source, true, true);
+        let chunks = vec![make_chunk(
+            &source,
+            vec![Some(5), Some(1), Some(3), Some(2), Some(4)],
+        )];
 
-        let out = sort_chunks_topn(&arena, &order_by, usize::MAX, &chunks)
+        let out = sort_chunks_topn(&arena, &order_by, usize::MAX, &chunks, &source.creation())
             .expect("topn")
             .expect("chunk");
         assert_eq!(

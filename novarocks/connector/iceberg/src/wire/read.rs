@@ -427,7 +427,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             1 => singular(Message(SchemaName)),
             2 | 4 | 6 | 9 => singular(Varint),
             3 | 11 | 12 => singular(Scalar),
-            5 | 16 => repeated(MapI32String),
+            5 | 16 | 18 => repeated(MapI32String),
             7 | 8 => singular(Message(TupleDomain)),
             10 => repeated(Message(Column)),
             13 => repeated(MapStringString),
@@ -449,7 +449,7 @@ fn field_rule(schema: Schema, field: u32) -> Option<FieldRule> {
             2 | 4 => singular(Scalar),
             3 => repeated(Message(Column)),
             5 | 6 => singular(Varint),
-            7 => repeated(MapI32String),
+            7 | 10 => repeated(MapI32String),
             _ => return None,
         },
         SystemTable => match field {
@@ -691,7 +691,9 @@ fn scan_message(
                 )?;
             }
             WireValue::MapI32String | WireValue::MapStringString => {
-                if matches!(schema, Schema::Table) && field == 16 {
+                if (matches!(schema, Schema::Table) && matches!(field, 16 | 18))
+                    || (matches!(schema, Schema::ChangeWindowHandle) && field == 10)
+                {
                     // A conservative bound covers one field-ID/domain entry,
                     // including a sparsely occupied BTree node, before decode.
                     context.ledger().charge_retained(256)?;
@@ -1585,8 +1587,33 @@ fn decode_transaction(
     finish_decode(result, context)
 }
 
+fn decode_nominal_declarations(
+    raw: &BTreeMap<i32, String>,
+    context: &mut ConnectorDecodeContext<'_>,
+) -> Result<
+    crate::schema_mapping::nominal_declaration::NominalSourceDeclarations,
+    ConnectorCodecError,
+> {
+    let mut declarations = BTreeMap::new();
+    for (id, name) in raw {
+        context.observe_compile_step()?;
+        let domain = observe_opaque(context, || {
+            crate::schema_mapping::nominal_declaration::NominalSourceDomain::parse(name)
+        })?
+        .map_err(|error| domain_error("nominal_declarations", error))?;
+        declarations.insert(*id, domain);
+        context.observe_compile_step()?;
+    }
+    Ok(declarations)
+}
+
 fn encode_table(value: &IcebergTableHandle) -> dto::IcebergTableHandle {
     dto::IcebergTableHandle {
+        nominal_declarations: value
+            .nominal_declarations()
+            .iter()
+            .map(|(id, domain)| (*id, domain.name().to_string()))
+            .collect(),
         scalar_integer_domains: value
             .scalar_integer_domains()
             .iter()
@@ -1768,6 +1795,9 @@ fn decode_table(
             table.with_scalar_integer_domains(scalar_integer_domains)
         })?
         .map_err(|error| domain_error("iceberg_table", error))?;
+        let nominal = decode_nominal_declarations(&raw.nominal_declarations, context)?;
+        let table = observe_opaque(context, || table.with_nominal_declarations(nominal))?
+            .map_err(|error| domain_error("iceberg_table.nominal_declarations", error))?;
         let source = raw
             .frozen_cow_source
             .as_ref()
@@ -1832,6 +1862,11 @@ fn decode_table_function(
 
 fn encode_change_window(value: &IcebergChangeWindowHandle) -> dto::IcebergChangeWindowHandle {
     dto::IcebergChangeWindowHandle {
+        nominal_declarations: value
+            .nominal_declarations()
+            .iter()
+            .map(|(id, domain)| (*id, domain.name().to_string()))
+            .collect(),
         from_read_domain: Some(encode_read_domain(value.from_read_domain())),
         to_read_domain: Some(encode_read_domain(value.to_read_domain())),
         schema_table_name: Some(encode_schema_name(value.schema_table_name())),
@@ -1905,6 +1940,11 @@ fn decode_change_window(
             })?
         }
         .map_err(|error| domain_error("change_window", error))
+        .and_then(|window| {
+            let nominal = decode_nominal_declarations(&raw.nominal_declarations, context)?;
+            observe_opaque(context, || window.with_nominal_declarations(nominal))?
+                .map_err(|error| domain_error("change_window.nominal_declarations", error))
+        })
     })();
     context.observe_compile_step()?;
     finish_decode(result, context)

@@ -548,11 +548,39 @@ fn a_provider_without_a_public_field_author_refuses_explicitly() {
         .column()
         .clone();
 
+    let mut requests = Vec::new();
+    let mut steps = Vec::new();
+    let mut request = |layout: std::alloc::Layout| {
+        requests.push((layout.size(), layout.align()));
+        Ok(())
+    };
+    let mut work = |units| {
+        steps.push(units);
+        Ok(())
+    };
+    let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        &mut request,
+        &mut work,
+    );
     let error = metadata
-        .read_public_schema(&session(), &table, &[column])
+        .read_public_schema(&session(), &table, &[column], &mut creation)
         .expect_err("the owner default refuses");
+    drop(creation);
+    // The adapter validates and borrows the requested column before invoking
+    // the provider's unsupported default. No public Field/schema is authored.
+    let borrowed = std::alloc::Layout::array::<&AlphaColumn>(1).unwrap();
+    assert_eq!(requests, [(borrowed.size(), borrowed.align())]);
+    assert_eq!(steps, [1, 1]);
+    let novarocks_connector_contract::PureProviderCompileError::Provider(error) = error else {
+        panic!("the original unsupported provider cause must remain nominal");
+    };
     assert_eq!(
         error.kind(),
         novarocks_spi::connector::ConnectorErrorKind::Unsupported
+    );
+    assert_eq!(
+        error.message(),
+        "provider read generation does not publish a public read schema"
     );
 }

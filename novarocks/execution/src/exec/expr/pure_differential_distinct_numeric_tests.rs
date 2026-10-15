@@ -67,14 +67,17 @@ fn check(name: &str, values: ArrayRef, nullable: bool, mapping: Vec<usize>, seed
             .float_comparison(FloatComparison::Exact),
     );
     assert_eq!(summary.matched_failures, 0, "{name} {source_type:?}");
-    assert_eq!(summary.pure_state_type.data_type, DataType::Binary);
+    assert_eq!(
+        summary.pure_state_type.data_type().clone(),
+        DataType::Binary
+    );
     assert_eq!(summary.legacy_intermediate_type, DataType::Binary);
     assert!(summary.null_results >= 4, "two empty groups in both shapes");
     println!(
         "numeric DISTINCT {} [{}] source={source_type:?} nullable={nullable} result={:?} rows={} groups={} partitions={} null_results={}",
         summary.function.as_str(),
         summary.overload.as_str(),
-        summary.result_type.data_type,
+        summary.result_type.data_type(),
         summary.rows,
         summary.groups,
         summary.partitions,
@@ -365,7 +368,7 @@ fn assert_binding_drift_refused(name: &str, values: ArrayRef, raw_output: DataTy
         .resolve_bound_user(name, FunctionKind::Aggregate, request, &HarnessControl)
         .unwrap();
     assert!(
-        matches!(&bound.selected.result_type, FunctionResultType::Scalar(result) if result.data_type == DataType::Float64)
+        matches!(&bound.selected.result_type, FunctionResultType::Scalar(result) if *result.data_type() == DataType::Float64)
     );
     let context = super::harness_context();
     let uses = [Some(ExpressionUseId::new(1))];
@@ -411,7 +414,7 @@ fn assert_binding_drift_refused(name: &str, values: ArrayRef, raw_output: DataTy
                 diagnostic.message(),
                 format!(
                     "builtin.aggregate/{name}/v1 has no installed numeric DISTINCT input profile for {:?}",
-                    source.data_type
+                    source.data_type()
                 )
             )
         }

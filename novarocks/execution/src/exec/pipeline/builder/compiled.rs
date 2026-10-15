@@ -45,8 +45,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::local::{runtime_filter_consumer_contract, runtime_filter_producer};
 use super::*;
-use crate::exec::chunk::{Chunk, ChunkSchema};
-use crate::exec::node::exchange_source::ExchangeSourceNode;
+#[cfg(test)]
+use crate::exec::chunk::Chunk;
 use crate::exec::operators::compiled_aggregate::CompiledAggregateProcessorFactory;
 use crate::exec::operators::compiled_change_events::CompiledChangeEventProcessorFactory;
 use crate::exec::operators::compiled_expression::{
@@ -417,21 +417,13 @@ fn build_node(
         .ok_or_else(|| format!("missing compiled program node {}", id.index()))?;
     let node_id = display_id(id)?;
     match node.kind() {
-        ProgramNodeKind::Values { values } => {
-            let source: Box<dyn OperatorFactory> = match values.batch() {
-                Some(batch) => {
-                    let chunk_schema = ChunkSchema::from_compiled_layout(values.layout())?;
-                    let chunk = Chunk::new_with_chunk_schema(batch.clone(), chunk_schema);
-                    Box::new(ValuesSourceFactory::new(chunk, node_id))
-                }
-                // Dynamic cells are evaluated once, at the source's opening
-                // turn, by the one compiled evaluator.
-                None => Box::new(values_source::CompiledValuesSourceFactory::try_new(
+        ProgramNodeKind::Values { .. } => {
+            let source: Box<dyn OperatorFactory> =
+                Box::new(values_source::CompiledValuesSourceFactory::try_new(
                     Arc::clone(program),
                     id,
                     Arc::clone(error),
-                )?),
-            };
+                )?);
             let pipeline = new_source_pipeline_with_dop(ctx, source, 1);
             Ok(PipelineBuildResult {
                 pipeline,
@@ -570,13 +562,9 @@ fn build_node(
             let binding = ctx.exchange_bindings.get(receiver).ok_or_else(|| {
                 format!("missing exchange binding for compiled receiver node {receiver}")
             })?;
-            let exchange = ExchangeSourceNode::new(
-                node_id,
-                *timeout,
-                ChunkSchema::from_compiled_layout(node.output_layout())?,
-            );
-            let source: Box<dyn OperatorFactory> =
-                Box::new(ExchangeSourceFactory::new_compiled(exchange, binding)?);
+            let source: Box<dyn OperatorFactory> = Box::new(ExchangeSourceFactory::new_compiled(
+                node_id, *timeout, binding,
+            ));
             // Every driver pulls from the one instance-wide receiver.
             let pipeline = new_source_pipeline(ctx, source);
             Ok(PipelineBuildResult {
@@ -755,9 +743,7 @@ fn build_node(
                         program.graph().nodes()[input.index()]
                             .output_layout()
                             .slots(),
-                        crate::exec::chunk::ChunkSchema::from_compiled_layout(
-                            node.output_layout(),
-                        )?,
+                        node.output_layout().clone(),
                         passthrough_columns.len(),
                         *max_output_rows,
                         *max_output_bytes,
@@ -949,6 +935,10 @@ mod writer_pipelines;
 #[cfg(test)]
 #[path = "compiled_writer_tests.rs"]
 mod writer_tests;
+#[cfg(test)]
+pub(crate) use writer_tests::{
+    compiled_statistics_finish_fixture, compiled_statistics_writer_fixture,
+};
 
 #[path = "compiled_join.rs"]
 mod join_pipelines;
@@ -967,7 +957,7 @@ mod scan_tests;
 
 #[cfg(test)]
 #[path = "compiled_family_fixture.rs"]
-mod family_fixture;
+pub(super) mod family_fixture;
 
 #[cfg(test)]
 #[path = "compiled_sort_tests.rs"]
@@ -983,7 +973,7 @@ mod assert_tests;
 
 #[cfg(test)]
 #[path = "compiled_expand_tests.rs"]
-mod expand_tests;
+pub(super) mod expand_tests;
 
 #[cfg(test)]
 #[path = "compiled_topn_split_tests.rs"]

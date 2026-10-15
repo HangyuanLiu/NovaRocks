@@ -21,6 +21,7 @@
 //! barrier only. Candidate discovery, immutable artifacts, object identity,
 //! deletion and receipts remain provider responsibilities.
 
+use crate::connector::schema_creation::FrontendSchemaLoad;
 use std::collections::BTreeSet;
 use std::sync::Mutex;
 
@@ -76,11 +77,13 @@ impl CleanupMaintenanceSession {
             ));
         }
         let lease = resolver.acquire_current_cleanup_maintenance(instance_id)?;
-        let metadata = lease.metadata().load_table(ConnectorTableRequest {
-            table: table.clone(),
-            resolution: ConnectorTableResolution::StrictBaseTable,
-            context: context.clone(),
-        })?;
+        let metadata = lease
+            .metadata()
+            .load_frontend_table(ConnectorTableRequest {
+                table: table.clone(),
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: context.clone(),
+            })?;
         if metadata.identity != table || metadata.table.owner() != &lease.descriptor().instance_id {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -113,11 +116,13 @@ impl CleanupMaintenanceSession {
             ));
         }
         let lease = resolver.acquire_current_cleanup_maintenance(instance_id)?;
-        let metadata = lease.metadata().load_table(ConnectorTableRequest {
-            table: table.clone(),
-            resolution: ConnectorTableResolution::StrictBaseTable,
-            context: context.clone(),
-        })?;
+        let metadata = lease
+            .metadata()
+            .load_frontend_table(ConnectorTableRequest {
+                table: table.clone(),
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: context.clone(),
+            })?;
         if metadata.identity != table || metadata.table.owner() != &lease.descriptor().instance_id {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,

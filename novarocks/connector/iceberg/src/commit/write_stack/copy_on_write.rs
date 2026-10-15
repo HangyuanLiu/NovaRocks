@@ -40,6 +40,8 @@
 //! check, so every one of them is read off the selection and validated against
 //! the frozen file it claims to belong to.
 
+mod typed_schema;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use arrow::array::{Array, Int8Array, Int64Array, StringArray};
@@ -832,15 +834,27 @@ fn freeze_branch_source<F: IcebergCowBaseFile>(
     let source = ConnectorTableHandle::try_new(freeze.catalog.clone(), Bytes::from(encoded))?;
     let (scan_bindings, match_tokens, written_version_token) =
         branch_scan_bindings(freeze.input, scan_schema.as_ref())?;
-    Ok(ConnectorWriteRewriteSource::new(
+    let mut request = |_| Ok(());
+    let mut work = |_| Ok(());
+    let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        &mut request,
+        &mut work,
+    );
+    let execution = typed_schema::from_original_metadata(&payload, freeze.metadata, &mut creation)
+        .map_err(typed_schema::pure_error)?;
+    ConnectorWriteRewriteSource::try_new_typed(
         source,
         pinned_source,
         freeze.base_version_digest,
         scan_schema,
+        execution,
         scan_bindings,
         match_tokens,
         written_version_token,
-    ))
+        &mut creation,
+    )
+    .map_err(typed_schema::pure_error)
 }
 
 fn clone_explicit_file_checked(
@@ -1065,15 +1079,48 @@ fn freeze_branch_source_with_original_scope<F: IcebergCowBaseFile>(
     let (scan_bindings, match_tokens, written_version_token) =
         branch_scan_bindings(freeze.input, scan_schema.as_ref())?;
     scope.active()?;
-    Ok(ConnectorWriteRewriteSource::new(
-        source,
-        pinned_source,
-        freeze.base_version_digest,
-        scan_schema,
-        scan_bindings,
-        match_tokens,
-        written_version_token,
-    ))
+    // Typed FE declarations are pure. Existing source/result retention remains
+    // on its original payload/receipt; no new typed Layout charges this scope.
+    let primary = std::cell::RefCell::new(None);
+    let observe = || match scope.active() {
+        Ok(()) => Ok(()),
+        Err(cause) => {
+            let mut first = primary.borrow_mut();
+            if first.is_none() {
+                *first = Some(cause);
+            }
+            Err(novarocks_type_contract::CompileControlError::ResourceExhausted)
+        }
+    };
+    let mut request = |_| observe();
+    let mut work = |_| observe();
+    let mut creation = novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation::new(
+        novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        &mut request,
+        &mut work,
+    );
+    let result = (|| {
+        let execution =
+            typed_schema::from_original_metadata(&payload, freeze.metadata, &mut creation)?;
+        ConnectorWriteRewriteSource::try_new_typed(
+            source,
+            pinned_source,
+            freeze.base_version_digest,
+            scan_schema,
+            execution,
+            scan_bindings,
+            match_tokens,
+            written_version_token,
+            &mut creation,
+        )
+    })();
+    match result {
+        Ok(source) => Ok(source),
+        Err(cause) => match primary.into_inner() {
+            Some(original) => Err(original),
+            None => Err(typed_schema::pure_error(cause).into()),
+        },
+    }
 }
 
 /// Bind every signed writer field to the column of the frozen source that
@@ -1204,11 +1251,13 @@ mod tests {
         ]
         .into_iter()
         .map(|(name, data_type, nullable, ordinal, token)| {
-            ConnectorMutationSourceField::new(
+            ConnectorMutationSourceField::try_new_typed(
                 ConnectorWriteFieldToken::from_bytes([token; 32]),
-                Field::new(name, data_type, nullable),
+                Field::new(name, data_type.clone(), nullable),
                 ordinal,
+                novarocks_type_contract::FunctionValueType::new(data_type, nullable),
             )
+            .expect("complete source role declaration")
         })
         .collect::<Vec<_>>();
         ConnectorMutationMatchContract::try_new(
@@ -1216,16 +1265,24 @@ mod tests {
             table,
             ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).expect("base"),
             identity.clone(),
-            vec![ConnectorMutationTargetField::new(
-                ConnectorWriteFieldToken::from_bytes([20; 32]),
-                Field::new("v", DataType::Int64, true),
-                4,
-            )],
-            vec![ConnectorMutationTargetField::new(
-                ConnectorWriteFieldToken::from_bytes([21; 32]),
-                Field::new("v", DataType::Int64, true),
-                after_ordinal,
-            )],
+            vec![
+                ConnectorMutationTargetField::try_new_typed(
+                    ConnectorWriteFieldToken::from_bytes([20; 32]),
+                    Field::new("v", DataType::Int64, true),
+                    4,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+                )
+                .expect("complete target declaration"),
+            ],
+            vec![
+                ConnectorMutationTargetField::try_new_typed(
+                    ConnectorWriteFieldToken::from_bytes([21; 32]),
+                    Field::new("v", DataType::Int64, true),
+                    after_ordinal,
+                    novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
+                )
+                .expect("complete target declaration"),
+            ],
             vec![identity[2].token()],
             ConnectorMutationEffectField::try_new(
                 ConnectorWriteFieldToken::from_bytes([22; 32]),

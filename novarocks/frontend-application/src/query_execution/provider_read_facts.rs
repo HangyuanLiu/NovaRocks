@@ -433,7 +433,18 @@ pub(crate) fn freeze_one_read(
         .iter()
         .map(|assignment| assignment.column().clone())
         .collect::<Vec<_>>();
-    let public_schema = metadata.read_public_schema(session, &negotiated.handle, &assigned_columns);
+    let public_schema =
+        crate::connector::schema_creation::with_schema_creation(context, |creation| {
+            metadata.read_public_schema(session, &negotiated.handle, &assigned_columns, creation)
+        })
+        .map_err(crate::connector::schema_creation::connector_schema_error);
+    if let Err(error) = &public_schema
+        && error.kind() != novarocks_spi::connector::ConnectorErrorKind::Unsupported
+    {
+        return Err(format!(
+            "provider read of {name} could not publish its schema: {error}"
+        ));
+    }
 
     // 5. Assemble everything the freeze leaves behind, so that taking the
     //    capability and accounting for it are adjacent: nothing may happen

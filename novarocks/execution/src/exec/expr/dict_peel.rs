@@ -37,7 +37,21 @@ pub fn is_supported_i32_string_dictionary(data_type: &DataType) -> bool {
 
 pub fn referenced_slots(arena: &ExprArena, expr_id: ExprId) -> Option<BTreeSet<SlotId>> {
     let mut slots = BTreeSet::new();
-    collect_referenced_slots(arena, expr_id, &mut slots).then_some(slots)
+    visit_referenced_slots(arena, expr_id, &mut |slot| {
+        slots.insert(slot);
+    })
+    .then_some(slots)
+}
+
+/// Observe the same lexical references without constructing a temporary set.
+/// An invalid expression cannot establish an encoding capability.
+pub(crate) fn expression_uses_slot(
+    arena: &ExprArena,
+    expr_id: ExprId,
+    slot_id: SlotId,
+) -> Option<bool> {
+    let mut found = false;
+    visit_referenced_slots(arena, expr_id, &mut |slot| found |= slot == slot_id).then_some(found)
 }
 
 pub fn expr_can_peel_from_slot(arena: &ExprArena, expr_id: ExprId, slot_id: SlotId) -> bool {
@@ -49,6 +63,296 @@ pub fn try_peel_dict_expr(
     expr_id: ExprId,
     chunk: &Chunk,
 ) -> Result<Option<ArrayRef>, String> {
+    try_peel_dict_expr_with(
+        arena,
+        expr_id,
+        chunk,
+        |slot, values| dict_values_chunk_for_source(chunk, slot, values),
+        |_| Ok(()),
+        |_, _| Ok(()),
+    )
+}
+
+pub(crate) struct OwnedDictionaryPeel {
+    pub array: ArrayRef,
+    /// Present only when this producer has created new dictionary values.
+    pub fresh_field: Option<arrow::datatypes::FieldRef>,
+    pub storage: novarocks_type_contract::ValueTypeStorageLifetime,
+}
+
+pub(crate) fn try_peel_dict_expr_owned(
+    arena: &ExprArena,
+    expr_id: ExprId,
+    chunk: &Chunk,
+    output_name: &str,
+    owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
+    control: &dyn novarocks_functions::KernelEvaluationControl,
+) -> crate::runtime::fragment::ExecutionResult<Option<OwnedDictionaryPeel>> {
+    use crate::exec::chunk::{ArrayNormalizationStep, ChunkSlotSchema};
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    use novarocks_type_contract::{ValueSchemaCreation, owned_resources::layout::arc_layout};
+    let Some(source_slot) = peel_source_slot(arena, expr_id) else {
+        return Ok(None);
+    };
+    let Some(source) = chunk.column_by_slot_id(source_slot).ok() else {
+        return Ok(None);
+    };
+    if !is_supported_i32_string_dictionary(source.data_type()) {
+        return Ok(None);
+    }
+    let dict = source
+        .as_any()
+        .downcast_ref::<DictionaryArray<Int32Type>>()
+        .ok_or_else(|| {
+            ConstructionFailure::InvalidSource(
+                "dictionary peel physical wrapper differs from its carrier".into(),
+            )
+        })?;
+    if dict.values().null_count() > 0 {
+        return Ok(None);
+    }
+    let declaration = arena.value_type(expr_id).ok_or_else(|| {
+        ConstructionFailure::InvalidSource(
+            "dictionary peel lacks its complete output declaration".into(),
+        )
+    })?;
+    validate_peel_source_bindings(arena, expr_id, chunk, owner)?;
+    let storage = chunk.source_storage_lifetime_observed(owner.storage_lifetime(), |layout| {
+        owner.request(layout)
+    })?;
+    let array = try_peel_dict_expr_with::<ConstructionFailure>(
+        arena,
+        expr_id,
+        chunk,
+        |slot, values| {
+            let source = chunk.chunk_schema().slot(slot).ok_or_else(|| {
+                ConstructionFailure::InvalidSource("dictionary peel source is absent".into())
+            })?;
+            if !source.is_typed() {
+                return Err(ConstructionFailure::InvalidSource(
+                    "dictionary peel source lacks its complete binding".into(),
+                ));
+            }
+            // The whole-values fast path was refused above if any value is NULL.
+            // Preserve the actual source declaration; unused NULLs never widen it.
+            let field =
+                novarocks_functions::array_projection::rebuild_field::<ConstructionFailure, _>(
+                    source.field(),
+                    source.typed_binding().data_type(),
+                    source.name(),
+                    &mut |step| owner.observe(0, &[], step),
+                )?;
+            let value_slot = ChunkSlotSchema::try_new_typed_observed::<ConstructionFailure, _>(
+                slot,
+                field,
+                source.typed_binding().clone(),
+                source.unique_id(),
+                storage.clone(),
+                |step| owner.observe(0, &[], step),
+            )?;
+            owner.request(std::alloc::Layout::new::<ChunkSlotSchema>())?;
+            let mut slots = Vec::with_capacity(1);
+            slots.push(value_slot);
+            let schema = ChunkSchema::try_new_typed_observed::<ConstructionFailure>(
+                slots,
+                storage.clone(),
+                |layout| owner.request(layout),
+                |units| {
+                    owner.observe(
+                        0,
+                        &[],
+                        ArrayNormalizationStep::InspectConstructionWork { units },
+                    )
+                },
+            )?;
+            owner.request(arc_layout(std::alloc::Layout::new::<ChunkSchema>())?)?;
+            let schema = Arc::new(schema);
+            let rows = values.len();
+            owner.request(std::alloc::Layout::new::<ArrayRef>())?;
+            let mut columns = Vec::with_capacity(1);
+            columns.push(values);
+            Chunk::try_new_typed_with_columns_owned_observed::<ConstructionFailure, _>(
+                schema,
+                columns,
+                rows,
+                storage.clone(),
+                |step| owner.observe(0, &[], step),
+            )
+        },
+        |_| {
+            // Arrow's actual DictionaryArray constructor creates its two boxed
+            // DataType operands and the new shared array wrapper.
+            owner.request(std::alloc::Layout::new::<DataType>())?;
+            owner.request(std::alloc::Layout::new::<DataType>())?;
+            owner.request(arc_layout(std::alloc::Layout::new::<
+                DictionaryArray<Int32Type>,
+            >())?)
+        },
+        |values, dict| {
+            let mut request = |layout| owner.request(layout);
+            let mut opaque = |bytes| owner.observe_opaque_upper_bound(bytes);
+            let mut creation = ValueSchemaCreation::new(storage.clone(), &mut request, &mut opaque);
+            // Only the geometry borrows an unsigned view. Valid Int32 keys
+            // were checked by the immutable typed Chunk; NULL key bits are
+            // ignored by the same selection visitor. The actual take below
+            // still executes with the original signed keys and NULL mask.
+            let unsigned = arrow::array::UInt32Array::new(
+                arrow::buffer::ScalarBuffer::new(
+                    dict.keys().values().inner().clone(),
+                    0,
+                    dict.len(),
+                ),
+                dict.keys().nulls().cloned(),
+            );
+            novarocks_functions::selected_copy::preflight_take_construction(
+                values.as_ref(),
+                novarocks_functions::selected_copy::CopyIndexView::UInt32(&unsigned),
+                &mut creation,
+                control,
+            )
+            .map(|_| ())
+            .map_err(|error| match error {
+                novarocks_functions::selected_copy::CopyConstructionError::Creator(error) => error,
+                novarocks_functions::selected_copy::CopyConstructionError::Resource(error) => {
+                    ConstructionFailure::Resource(error)
+                }
+                novarocks_functions::selected_copy::CopyConstructionError::Copy(error) => {
+                    match error {
+                        novarocks_functions::selected_copy::CopyError::Control(error) => {
+                            ConstructionFailure::from(
+                                crate::runtime::fragment::ExecutionFailure::from(error),
+                            )
+                        }
+                        _ => ConstructionFailure::InvalidSource(format!(
+                            "dictionary peel copy: {error:?}"
+                        )),
+                    }
+                }
+            })
+        },
+    )?;
+    let Some(array) = array else {
+        return Ok(None);
+    };
+    let fresh_field = if is_supported_i32_string_dictionary(array.data_type()) {
+        owner.observe(
+            0,
+            &[],
+            ArrayNormalizationStep::RebuildField {
+                source: chunk
+                    .chunk_schema()
+                    .slot(peel_source_slot(arena, expr_id).ok_or_else(|| {
+                        ConstructionFailure::InvalidSource(
+                            "dictionary peel has no actual source".into(),
+                        )
+                    })?)
+                    .ok_or_else(|| {
+                        ConstructionFailure::InvalidSource(
+                            "dictionary peel source field is absent".into(),
+                        )
+                    })?
+                    .field(),
+                target: array.data_type(),
+                name: output_name,
+            },
+        )?;
+        #[allow(deprecated)]
+        let field = arrow::datatypes::Field::new_dict(
+            output_name,
+            array.data_type().clone(),
+            declaration.nullable(),
+            0,
+            false,
+        );
+        Some(Arc::new(field))
+    } else {
+        None
+    };
+    Ok(Some(OwnedDictionaryPeel {
+        array,
+        fresh_field,
+        storage,
+    }))
+}
+
+/// Validate only this installed PEEL grammar's actual reachable sources.
+/// This has no lambda/binder vocabulary and cannot authorize a general arena.
+fn validate_peel_source_bindings(
+    arena: &ExprArena,
+    expr: ExprId,
+    chunk: &Chunk,
+    owner: &dyn crate::exec::pipeline::operator::InputConstructionOwner,
+) -> Result<(), crate::exec::pipeline::operator::ConstructionFailure> {
+    use crate::exec::pipeline::operator::ConstructionFailure;
+    let work = || {
+        owner.observe(
+            0,
+            &[],
+            crate::exec::chunk::ArrayNormalizationStep::InspectConstructionWork { units: 1 },
+        )
+    };
+    work()?;
+    match arena.node(expr) {
+        Some(ExprNode::SlotId(slot)) => {
+            let source = chunk.chunk_schema().slot(*slot).ok_or_else(|| {
+                ConstructionFailure::InvalidSource("dictionary peel source is absent".into())
+            })?;
+            let expected = arena.value_type(expr).ok_or_else(|| {
+                ConstructionFailure::InvalidSource(
+                    "dictionary peel source expression lacks its complete declaration".into(),
+                )
+            })?;
+            if !source.is_typed() {
+                return Err(ConstructionFailure::InvalidSource(
+                    "dictionary peel source lacks its complete binding".into(),
+                ));
+            }
+            let source_binding = source.typed_binding();
+            if source_binding
+                .value_type()
+                .shares_storage(expected.value_type())
+                && source_binding
+                    .layout()
+                    .shares_storage(expected.typed_binding().layout())
+            {
+                return Ok(());
+            }
+            let actual = novarocks_type_contract::FunctionValueType::try_from_typed_binding(
+                source_binding.clone_observed(work)?,
+            )
+            .map_err(|error| ConstructionFailure::InvalidSource(error.to_string()))?;
+            if !actual.fits_physical_binding_observed(expected, work)? {
+                return Err(ConstructionFailure::InvalidSource(
+                    "dictionary peel source differs from its complete expression declaration"
+                        .into(),
+                ));
+            }
+            Ok(())
+        }
+        Some(ExprNode::Cast(child, _)) | Some(ExprNode::Clone(child)) => {
+            validate_peel_source_bindings(arena, *child, chunk, owner)
+        }
+        Some(ExprNode::FunctionCall { args, .. }) => {
+            for child in args {
+                validate_peel_source_bindings(arena, *child, chunk, owner)?;
+            }
+            Ok(())
+        }
+        Some(ExprNode::Literal(_)) => Ok(()),
+        _ => Err(ConstructionFailure::InvalidSource(
+            "dictionary peel has no installed grammar for this source".into(),
+        )),
+    }
+}
+
+fn try_peel_dict_expr_with<E: From<String>>(
+    arena: &ExprArena,
+    expr_id: ExprId,
+    chunk: &Chunk,
+    mut value_port: impl FnMut(SlotId, ArrayRef) -> Result<Chunk, E>,
+    mut rewrap: impl FnMut(&DictionaryArray<Int32Type>) -> Result<(), E>,
+    mut expand: impl FnMut(&ArrayRef, &DictionaryArray<Int32Type>) -> Result<(), E>,
+) -> Result<Option<ArrayRef>, E> {
     let Some(source_slot) = peel_source_slot(arena, expr_id) else {
         return Ok(None);
     };
@@ -69,22 +373,25 @@ pub fn try_peel_dict_expr(
                 "dictionary peel expected Dictionary(Int32, Utf8), got {:?}",
                 source.data_type()
             )
-        })?;
+        })
+        .map_err(E::from)?;
     if dict.values().null_count() > 0 {
         return Ok(None);
     }
 
-    let value_chunk = dict_values_chunk_for_source(chunk, source_slot, Arc::clone(dict.values()))?;
-    let new_values = arena.eval(expr_id, &value_chunk)?;
+    let value_chunk = value_port(source_slot, Arc::clone(dict.values()))?;
+    let new_values = arena.eval(expr_id, &value_chunk).map_err(E::from)?;
 
     if new_values.data_type() == &DataType::Utf8 && new_values.null_count() == 0 {
+        rewrap(dict)?;
         let peeled = DictionaryArray::<Int32Type>::try_new(dict.keys().clone(), new_values)
-            .map_err(|e| format!("dictionary peel rewrap failed: {e}"))?;
+            .map_err(|e| E::from(format!("dictionary peel rewrap failed: {e}")))?;
         return Ok(Some(Arc::new(peeled) as ArrayRef));
     }
 
+    expand(&new_values, dict)?;
     let expanded = take(new_values.as_ref(), dict.keys(), None)
-        .map_err(|e| format!("dictionary peel take failed: {e}"))?;
+        .map_err(|e| E::from(format!("dictionary peel take failed: {e}")))?;
     Ok(Some(expanded))
 }
 
@@ -111,26 +418,48 @@ fn peel_source_slot(arena: &ExprArena, expr_id: ExprId) -> Option<SlotId> {
     if !is_peel_safe_expr(arena, expr_id) {
         return None;
     }
-    let slots = referenced_slots(arena, expr_id)?;
-    if slots.len() != 1 {
-        return None;
-    }
-    slots.into_iter().next()
+    let mut source = None;
+    let mut multiple = false;
+    let valid = visit_referenced_slots(arena, expr_id, &mut |slot| match source {
+        None => source = Some(slot),
+        Some(previous) => multiple |= previous != slot,
+    });
+    (valid && !multiple).then_some(source).flatten()
 }
 
-fn collect_referenced_slots(
+fn visit_referenced_slots(
     arena: &ExprArena,
     expr_id: ExprId,
-    slots: &mut BTreeSet<SlotId>,
+    visit: &mut impl FnMut(SlotId),
 ) -> bool {
-    collect_referenced_slots_with_bound(arena, expr_id, &BTreeSet::new(), slots)
+    visit_referenced_slots_with_bound(arena, expr_id, None, visit)
 }
 
-fn collect_referenced_slots_with_bound(
+struct LexicalBindings<'a> {
+    parent: Option<&'a LexicalBindings<'a>>,
+    arguments: &'a [SlotId],
+    common: &'a [(SlotId, ExprId)],
+}
+impl LexicalBindings<'_> {
+    fn contains(&self, slot: SlotId) -> bool {
+        let mut frame = Some(self);
+        while let Some(current) = frame {
+            if current.arguments.contains(&slot)
+                || current.common.iter().any(|(bound, _)| *bound == slot)
+            {
+                return true;
+            }
+            frame = current.parent;
+        }
+        false
+    }
+}
+
+fn visit_referenced_slots_with_bound(
     arena: &ExprArena,
     expr_id: ExprId,
-    bound: &BTreeSet<SlotId>,
-    slots: &mut BTreeSet<SlotId>,
+    bound: Option<&LexicalBindings<'_>>,
+    visit: &mut impl FnMut(SlotId),
 ) -> bool {
     let Some(node) = arena.node(expr_id) else {
         return false;
@@ -138,13 +467,13 @@ fn collect_referenced_slots_with_bound(
     match node {
         ExprNode::Constant(_) | ExprNode::Literal(_) => true,
         ExprNode::SlotId(slot_id) => {
-            if !bound.contains(slot_id) {
-                slots.insert(*slot_id);
+            if !bound.is_some_and(|bound| bound.contains(*slot_id)) {
+                visit(*slot_id);
             }
             true
         }
         ExprNode::ArrayExpr { elements } | ExprNode::StructExpr { fields: elements } => {
-            collect_all_referenced_slots_with_bound(arena, elements, bound, slots)
+            visit_all_referenced_slots_with_bound(arena, elements, bound, visit)
         }
         ExprNode::LambdaFunction {
             body,
@@ -152,12 +481,14 @@ fn collect_referenced_slots_with_bound(
             common_sub_exprs,
             ..
         } => {
-            let mut nested_bound = bound.clone();
-            nested_bound.extend(arg_slots.iter().copied());
-            nested_bound.extend(common_sub_exprs.iter().map(|(slot_id, _)| *slot_id));
-            collect_referenced_slots_with_bound(arena, *body, &nested_bound, slots)
+            let nested_bound = LexicalBindings {
+                parent: bound,
+                arguments: arg_slots,
+                common: common_sub_exprs,
+            };
+            visit_referenced_slots_with_bound(arena, *body, Some(&nested_bound), visit)
                 && common_sub_exprs.iter().all(|(_, expr_id)| {
-                    collect_referenced_slots_with_bound(arena, *expr_id, &nested_bound, slots)
+                    visit_referenced_slots_with_bound(arena, *expr_id, Some(&nested_bound), visit)
                 })
         }
         ExprNode::DictDecode { child, .. }
@@ -167,9 +498,7 @@ fn collect_referenced_slots_with_bound(
         | ExprNode::Not(child)
         | ExprNode::IsNull(child)
         | ExprNode::IsNotNull(child)
-        | ExprNode::Clone(child) => {
-            collect_referenced_slots_with_bound(arena, *child, bound, slots)
-        }
+        | ExprNode::Clone(child) => visit_referenced_slots_with_bound(arena, *child, bound, visit),
         ExprNode::Add(left, right, _)
         | ExprNode::Sub(left, right, _)
         | ExprNode::Mul(left, right, _)
@@ -184,32 +513,32 @@ fn collect_referenced_slots_with_bound(
         | ExprNode::Ge(left, right)
         | ExprNode::And(left, right)
         | ExprNode::Or(left, right) => {
-            collect_referenced_slots_with_bound(arena, *left, bound, slots)
-                && collect_referenced_slots_with_bound(arena, *right, bound, slots)
+            visit_referenced_slots_with_bound(arena, *left, bound, visit)
+                && visit_referenced_slots_with_bound(arena, *right, bound, visit)
         }
         ExprNode::In { child, values, .. } => {
-            collect_referenced_slots_with_bound(arena, *child, bound, slots)
-                && collect_all_referenced_slots_with_bound(arena, values, bound, slots)
+            visit_referenced_slots_with_bound(arena, *child, bound, visit)
+                && visit_all_referenced_slots_with_bound(arena, values, bound, visit)
         }
         ExprNode::Case { children, .. } => {
-            collect_all_referenced_slots_with_bound(arena, children, bound, slots)
+            visit_all_referenced_slots_with_bound(arena, children, bound, visit)
         }
         ExprNode::FunctionCall { args, .. } => {
-            collect_all_referenced_slots_with_bound(arena, args, bound, slots)
+            visit_all_referenced_slots_with_bound(arena, args, bound, visit)
         }
     }
 }
 
-fn collect_all_referenced_slots_with_bound(
+fn visit_all_referenced_slots_with_bound(
     arena: &ExprArena,
     expr_ids: &[ExprId],
-    bound: &BTreeSet<SlotId>,
-    slots: &mut BTreeSet<SlotId>,
+    bound: Option<&LexicalBindings<'_>>,
+    visit: &mut impl FnMut(SlotId),
 ) -> bool {
     expr_ids
         .iter()
         .copied()
-        .all(|expr_id| collect_referenced_slots_with_bound(arena, expr_id, bound, slots))
+        .all(|expr_id| visit_referenced_slots_with_bound(arena, expr_id, bound, visit))
 }
 
 fn is_peel_safe_expr(arena: &ExprArena, expr_id: ExprId) -> bool {
@@ -259,8 +588,8 @@ mod tests {
     use novarocks_types::SlotId;
 
     use super::{
-        expr_can_peel_from_slot, is_supported_i32_string_dictionary, referenced_slots,
-        try_peel_dict_expr,
+        expr_can_peel_from_slot, expression_uses_slot, is_supported_i32_string_dictionary,
+        referenced_slots, try_peel_dict_expr,
     };
 
     fn chunk_with_column(slot_id: SlotId, values: ArrayRef) -> Chunk {
@@ -401,6 +730,14 @@ mod tests {
             vec![captured_outer, captured_by_cse]
         );
         assert!(!expr_can_peel_from_slot(&arena, lambda, captured_outer));
+        for (slot, expected) in [
+            (lambda_arg, false),
+            (captured_outer, true),
+            (cse_slot, false),
+            (captured_by_cse, true),
+        ] {
+            assert_eq!(expression_uses_slot(&arena, lambda, slot), Some(expected));
+        }
     }
 
     #[test]

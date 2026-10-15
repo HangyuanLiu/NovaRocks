@@ -48,12 +48,24 @@ pub use parameter_resources::{
     prepare_semantic_parameters_encode, prepare_semantic_parameters_encode_observed_in,
 };
 
-pub use calls::{decode_frozen_calls_observed, encode_frozen_calls_observed};
+pub use calls::{
+    CreatedFrozenCallParts, CreatedFrozenWriterCall,
+    decode_frozen_call_parts_input_derived_with_creator_in, decode_frozen_calls_observed,
+    decode_frozen_writer_call_with_creator_in, encode_frozen_calls_observed,
+    encode_frozen_calls_pure_in, encode_frozen_writer_call_with_creator_in,
+};
 pub use pruning::{decode_frozen_pruning_observed, encode_frozen_pruning_observed};
 
 pub(crate) use calls::{
     decode_policy as decode_decimal_policy, decode_site as decode_call_site,
     encode_policy as encode_decimal_policy, encode_site as encode_call_site,
+};
+pub use parameters::{
+    CreatedWriterSemanticParameters, decode_writer_semantic_parameters_with_creator_in,
+};
+pub use parameters::{
+    decode_reference as decode_semantic_parameter_reference_in,
+    encode_reference as encode_semantic_parameter_reference_in,
 };
 pub(crate) use parameters::{decode_reference, encode_reference};
 
@@ -213,3 +225,20 @@ pub fn decode_fragment_semantics(
 
 #[cfg(test)]
 mod tests;
+
+/// Pure PlanTree writer projection uses the original parameter grammar and work
+/// body; absence of a memory creator here is explicit FE preparation policy.
+pub(crate) fn encode_writer_parameters_pure_in(
+    source: &SemanticParameters,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::SemanticParameters, SemanticsCodecError> {
+    encode_semantic_parameters_pure_in(source, work)
+}
+/// Explicit FE parameter sender using the original parameter projection body.
+/// It borrows its caller's original control/checkpoints and has no creator.
+pub fn encode_semantic_parameters_pure_in(
+    source: &SemanticParameters,
+    work: &mut CompileCheckpoints<'_>,
+) -> Result<wire::SemanticParameters, SemanticsCodecError> {
+    parameters::encode_parameters_observed(source, work)
+}

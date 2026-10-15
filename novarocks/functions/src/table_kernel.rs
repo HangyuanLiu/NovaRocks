@@ -114,6 +114,15 @@ pub trait PureTableImplementation:
         contract: Arc<TableCallContract>,
         control: &dyn PureCompileControl,
     ) -> Result<Arc<dyn PreparedTableKernel>, KernelFailure>;
+    fn prepare_table_checked(
+        &self,
+        _input: CallEffectInput<'_>,
+        _checked: &crate::CheckedCallEffectInput<'_>,
+        _contract: Arc<TableCallContract>,
+        _control: &dyn PureCompileControl,
+    ) -> Result<Arc<dyn PreparedTableKernel>, crate::CheckedOwnerFailure<KernelFailure>> {
+        Err(crate::CheckedOwnerFailure::UnconvertedOwner)
+    }
 }
 #[derive(Debug)]
 pub struct TableSpecialization {
@@ -158,9 +167,81 @@ fn specialize_table_once<O: PureTableImplementation + ?Sized>(
     arguments: ScopedExpressionEffects,
     control: &dyn PureCompileControl,
 ) -> Result<TableSpecialization, FunctionSpecializationFailure> {
-    let (receipt, effects) = crate::specialization::refine_once_for_specialization(
-        owner, input, frozen, arguments, control,
-    )?;
+    specialize_table_once_core(
+        owner,
+        input,
+        selected,
+        frozen,
+        arguments,
+        control,
+        |arguments| {
+            crate::specialization::refine_once_for_specialization(
+                owner, input, frozen, arguments, control,
+            )
+        },
+        |contract| {
+            owner
+                .prepare_table(input, contract, control)
+                .map_err(FunctionSpecializationFailure::Kernel)
+        },
+    )
+}
+
+pub(crate) fn specialize_table_once_checked<O: PureTableImplementation + ?Sized>(
+    owner: &O,
+    checked: &crate::CheckedCallEffectInput<'_>,
+    input: CallEffectInput<'_>,
+    selected: Arc<FunctionBindingSelection>,
+    frozen: Option<&CallEffects>,
+    arguments: ScopedExpressionEffects,
+    control: &dyn PureCompileControl,
+) -> Result<TableSpecialization, crate::CheckedOwnerFailure<FunctionSpecializationFailure>> {
+    specialize_table_once_core(
+        owner,
+        input,
+        selected,
+        frozen,
+        arguments,
+        control,
+        |arguments| {
+            crate::specialization::refine_once_checked(
+                owner, checked, input, frozen, arguments, control,
+            )
+        },
+        |contract| {
+            owner
+                .prepare_table_checked(input, checked, contract, control)
+                .map_err(|error| match error {
+                    crate::CheckedOwnerFailure::Original(error) => {
+                        crate::CheckedOwnerFailure::Original(FunctionSpecializationFailure::Kernel(
+                            error,
+                        ))
+                    }
+                    crate::CheckedOwnerFailure::UnconvertedOwner => {
+                        crate::CheckedOwnerFailure::UnconvertedOwner
+                    }
+                })
+        },
+    )
+}
+
+fn specialize_table_once_core<
+    'a,
+    O: PureTableImplementation + ?Sized,
+    E: From<FunctionSpecializationFailure>,
+>(
+    _owner: &O,
+    input: CallEffectInput<'a>,
+    selected: Arc<FunctionBindingSelection>,
+    _frozen: Option<&CallEffects>,
+    arguments: ScopedExpressionEffects,
+    control: &dyn PureCompileControl,
+    refine: impl FnOnce(
+        ScopedExpressionEffects,
+    ) -> Result<(crate::RefinedCallEffects<'a>, ScopedExpressionEffects), E>,
+    prepare: impl FnOnce(Arc<TableCallContract>) -> Result<Arc<dyn PreparedTableKernel>, E>,
+) -> Result<TableSpecialization, E> {
+    let (receipt, effects) = refine(arguments)?;
     let call = Arc::new(
         FunctionCallContract::from_refined(input, &receipt, selected, control)
             .map_err(FunctionSpecializationFailure::Kernel)?,
@@ -168,13 +249,12 @@ fn specialize_table_once<O: PureTableImplementation + ?Sized>(
     let contract = Arc::new(
         TableCallContract::try_new(call, control).map_err(FunctionSpecializationFailure::Kernel)?,
     );
-    let prepared = owner
-        .prepare_table(input, contract.clone(), control)
-        .map_err(FunctionSpecializationFailure::Kernel)?;
+    let prepared = prepare(contract.clone())?;
     if !Arc::ptr_eq(prepared.contract(), &contract) {
         return Err(FunctionSpecializationFailure::Kernel(internal(
             "table preparation replaced its exact immutable contract",
-        )));
+        ))
+        .into());
     }
     control
         .checkpoint(CompilePhase::FunctionSpecialization, 0)
@@ -357,7 +437,7 @@ impl<'input> TableEvaluationCursor<'input> {
                     let mut columns = Vec::new();
                     let mut work = EvaluationCheckpoints::new(control);
                     for value in self.contract.result_types() {
-                        columns.push(new_empty_array(&value.data_type));
+                        columns.push(new_empty_array(value.data_type()));
                         work.step()?;
                     }
                     work.finish()?;

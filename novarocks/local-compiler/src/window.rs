@@ -39,7 +39,6 @@
 use crate::{
     assert_rows::reserve_vec, expressions::ExpressionLoweringError, lowering::FragmentCompileError,
 };
-use arrow_schema::{Field, Schema};
 use novarocks_functions::{
     AggregateBindingSelection, AggregateKernelPhase, AggregateOverloadIdentity,
     AggregatePreparationOptions, AggregateWindowPreparationOptions, CallEffectInput,
@@ -288,7 +287,7 @@ pub(crate) fn effective_frame(
 /// Lower one admitted Window whose output is its whole input followed by one
 /// value per call, in call order. Pass-through columns keep their input
 /// channels; `slots` is the planned output, input slots first.
-pub(crate) fn lower_window(
+pub(crate) fn lower_window_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     input: ProgramNodeId,
@@ -296,9 +295,10 @@ pub(crate) fn lower_window(
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     slots: &[SlotId],
     control: &dyn PureCompileControl,
-) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<(ProgramNodeKind, StaticLayout), crate::FragmentCreationError<H>> {
     let mut work = CompileCheckpoints::try_new(control, CompilePhase::LowerProgram)?;
-    let result = lower_core(
+    let result = lower_core_with_creation(
         package,
         node,
         input,
@@ -306,15 +306,12 @@ pub(crate) fn lower_window(
         expressions,
         slots,
         &mut work,
+        creation,
     );
-    if matches!(&result, Err(FragmentCompileError::Control(_))) {
-        return result;
-    }
-    work.finish()?;
-    result
+    crate::creation::finish_attempt(result, work)
 }
 
-fn lower_core(
+fn lower_core_with_creation<H>(
     package: &FragmentPackage,
     node: &PhysicalNode,
     input: ProgramNodeId,
@@ -322,18 +319,20 @@ fn lower_core(
     expressions: &BTreeMap<ExprId, ProgramExprId>,
     slots: &[SlotId],
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(ProgramNodeKind, StaticLayout), FragmentCompileError> {
+    creation: &mut novarocks_type_contract::ValueSchemaCreation<'_, H>,
+) -> Result<(ProgramNodeKind, StaticLayout), crate::FragmentCreationError<H>> {
     let NodeKind::Window(spec) = &node.kind else {
-        return Err(FragmentCompileError::Invalid("Window kind differs"));
+        return Err((FragmentCompileError::Invalid("Window kind differs")).into());
     };
     let width = input_layout.slots().len();
     let total = width
         .checked_add(spec.expressions.len())
         .ok_or(CompileControlError::ResourceExhausted)?;
     if node.inputs.len() != 1 || node.output.columns.len() != total || slots.len() != total {
-        return Err(FragmentCompileError::Invalid(
+        return Err((FragmentCompileError::Invalid(
             "window input, output or channel width differs",
-        ));
+        ))
+        .into());
     }
     let lowered = |id: &ExprId, missing: &'static str| {
         expressions
@@ -373,14 +372,15 @@ fn lower_core(
             ..
         } = &definition.kind
         else {
-            return Err(FragmentCompileError::Invalid(
-                "window expression is not a window call",
-            ));
+            return Err(
+                (FragmentCompileError::Invalid("window expression is not a window call")).into(),
+            );
         };
         if node.output.columns.get(width + ordinal) != Some(&item.output) {
-            return Err(FragmentCompileError::Invalid(
+            return Err((FragmentCompileError::Invalid(
                 "window output is not its input followed by its call outputs",
-            ));
+            ))
+            .into());
         }
         let output = values
             .get(&item.output)
@@ -388,13 +388,14 @@ fn lower_core(
         work.flush()?;
         let same = definition
             .ty
-            .exactly_equals_observed::<FragmentCompileError>(&output.ty, || {
+            .exactly_equals_observed::<crate::FragmentCreationError<H>>(&output.ty, || {
                 work.step().map_err(Into::into)
             })?;
         if !same {
-            return Err(FragmentCompileError::Invalid(
+            return Err((FragmentCompileError::Invalid(
                 "window output type differs from its call",
-            ));
+            ))
+            .into());
         }
         let mut inputs = Vec::new();
         reserve_vec(&mut inputs, args.len(), work)?;
@@ -403,15 +404,20 @@ fn lower_core(
             work.step()?;
         }
         let frozen = frozen_frame(package, frame.as_ref(), work)?;
+        let frozen_aggregate = aggregate_binding
+            .as_deref()
+            .map(|binding| crate::aggregate::freeze_binding_with_creation(binding, work, creation))
+            .transpose()?;
         let aggregate_binding = match aggregate_binding.as_deref() {
             Some(binding) => Some(aggregate_signature(binding, work)?),
             None => None,
         };
         work.flush()?;
         functions.push(StaticWindowFunction {
+            frozen_aggregate,
             kind: WindowFunctionKind::Prepared,
             args: inputs,
-            return_type: definition.ty.data_type.clone(),
+            return_type: definition.ty.data_type().clone(),
             aggregate_binding,
             frame: Some(effective_frame(frozen.as_ref(), ordered)?),
             ignore_nulls: *ignore_nulls,
@@ -431,18 +437,8 @@ fn lower_core(
     let result = package
         .result()
         .filter(|result| result.output.columns == node.output.columns);
-    let mut fields: Vec<Field> = Vec::new();
-    if package.original_metadata_namespace().is_none() {
-        reserve_vec(&mut fields, total, work)?;
-    }
-    let mut original_fields = match package.original_metadata_namespace() {
-        Some(_) => {
-            let mut original_fields = Vec::new();
-            reserve_vec(&mut original_fields, total, work)?;
-            Some(original_fields)
-        }
-        None => None,
-    };
+    let mut typed_layout =
+        crate::typed_layout::TypedLayoutBuilder::new_with_creation(total, work, creation)?;
     for (ordinal, value) in node.output.columns.iter().enumerate() {
         let ty = &values
             .get(value)
@@ -456,38 +452,26 @@ fn lower_core(
                     .fields
                     .get(ordinal)
                     .ok_or(FragmentCompileError::Invalid("missing window result label"))?;
-                field.alias.as_deref().unwrap_or(&field.name).to_owned()
+                crate::typed_layout::copy_name_with_creation(
+                    field.alias.as_deref().unwrap_or(&field.name),
+                    work,
+                    creation,
+                )?
             }
-            None => format!("local_window_{}_{}", node.id.get(), ordinal),
+            None => crate::typed_layout::local_name_with_creation(
+                "local_window",
+                node.id.get(),
+                ordinal,
+                work,
+                creation,
+            )?,
         };
         work.flush()?;
-        if let Some(original_fields) = original_fields.as_mut() {
-            let field = novarocks_type_contract::owned_resources::metadata_materialization::materialize_value_field(ty, name);
-            work.flush()?;
-            original_fields.push(field?);
-        } else {
-            let field = ty.try_to_field(name);
-            work.flush()?;
-            fields.push(field?);
-        }
+        typed_layout.push_with_creation(ty, name, work, creation)?;
         work.step()?;
     }
     work.flush()?;
-    let layout = match (original_fields, package.original_metadata_namespace()) {
-        (Some(fields), Some(namespace)) => {
-            let source = novarocks_type_contract::owned_resources::metadata_materialization::TypedSchemaMaterializations::new(fields, namespace.clone()).into_original_schema();
-            StaticLayout::try_new_materialized_for_compile(
-                source,
-                Arc::from(slots),
-                work.control(),
-            )?
-        }
-        _ => StaticLayout::try_new_for_compile(
-            Arc::new(Schema::new(fields)),
-            Arc::from(slots),
-            work.control(),
-        )?,
-    };
+    let layout = typed_layout.finish_with_creation(slots, work, creation)?;
     work.flush()?;
     Ok((
         ProgramNodeKind::Analytic {
@@ -517,7 +501,7 @@ fn aggregate_signature(
             ));
         };
         work.flush()?;
-        argument_types.push(value.data_type.clone());
+        argument_types.push(value.data_type().clone());
         work.step()?;
     }
     let overload =
@@ -535,8 +519,8 @@ fn aggregate_signature(
         ResolvedAggregateSignature {
             overload,
             argument_types,
-            intermediate_type: binding.intermediate_type.data_type.clone(),
-            output_type: function.result_type.data_type.clone(),
+            intermediate_type: binding.intermediate_type.data_type().clone(),
+            output_type: function.result_type.data_type().clone(),
             state_format: binding.state_format.clone(),
         },
     ))
@@ -656,14 +640,15 @@ pub(crate) fn window_roots(
 /// installed owner. `effects` holds the prepared effects of every expression
 /// occurrence, so each argument root contributes its actual effects; `nodes`
 /// names the local node each physical Window lowers to.
-pub(crate) fn prepare_window_calls(
+pub(crate) fn prepare_window_calls<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     functions: &PureEngineFunctionCatalog,
     effects: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     nodes: &BTreeMap<NodeId, ProgramNodeId>,
     tokens: &mut BTreeMap<ProgramCallSite, PureCallSpecialization>,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<(), ExpressionLoweringError> {
+    creation: crate::expressions::CallCreation<'_, F>,
+) -> Result<(), crate::expressions::ExpressionCreationFailure<H>> {
     let roots = package.expression_uses();
     let mut prepared = 0usize;
     for (site, &use_id) in roots.bindings() {
@@ -676,14 +661,14 @@ pub(crate) fn prepare_window_calls(
             .ok_or(ExpressionLoweringError::Invalid(
                 "window node has no local node",
             ))?;
-        let token = prepare_call(package, functions, effects, use_id, work)?;
+        let token = prepare_call(package, functions, effects, use_id, work, creation)?;
         if tokens
             .insert(ProgramCallSite::Window { node: local, call }, token)
             .is_some()
         {
-            return Err(ExpressionLoweringError::Invalid(
-                "window call site is prepared twice",
-            ));
+            return Err(
+                ExpressionLoweringError::Invalid("window call site is prepared twice").into(),
+            );
         }
         prepared += 1;
         work.step()?;
@@ -710,18 +695,20 @@ pub(crate) fn prepare_window_calls(
     if frozen != prepared {
         return Err(ExpressionLoweringError::Invalid(
             "frozen window calls differ from the actual window call roots",
-        ));
+        )
+        .into());
     }
     Ok(())
 }
 
-fn prepare_call(
+fn prepare_call<H, F: novarocks_type_contract::ValueSchemaCreationFactory<H>>(
     package: &FragmentPackage,
     functions: &PureEngineFunctionCatalog,
     effects: &BTreeMap<ExpressionUseId, ScopedExpressionEffects>,
     use_id: ExpressionUseId,
     work: &mut CompileCheckpoints<'_>,
-) -> Result<PureCallSpecialization, ExpressionLoweringError> {
+    creation: crate::expressions::CallCreation<'_, F>,
+) -> Result<PureCallSpecialization, crate::expressions::ExpressionCreationFailure<H>> {
     let flow = package.expression_uses().flow();
     let invocation = flow
         .uses()
@@ -746,13 +733,13 @@ fn prepare_call(
         aggregate_binding,
     } = &definition.kind
     else {
-        return Err(ExpressionLoweringError::Invalid(
-            "window call root is not a window call",
-        ));
+        return Err(
+            ExpressionLoweringError::Invalid("window call root is not a window call").into(),
+        );
     };
     let site = PhysicalCallSite::Expression(use_id);
     if !function_order_by.is_empty() {
-        return Err(ExpressionLoweringError::UnsupportedCall(site));
+        return Err(ExpressionLoweringError::UnsupportedCall(site).into());
     }
     let frozen = package
         .calls()
@@ -764,7 +751,8 @@ fn prepare_call(
     if frozen.context != invocation.context {
         return Err(ExpressionLoweringError::Invalid(
             "frozen window call context differs from its occurrence",
-        ));
+        )
+        .into());
     }
     let source_request = package
         .fragment()
@@ -774,10 +762,11 @@ fn prepare_call(
     let source_request = source_request.ok_or(ExpressionLoweringError::Invalid(
         "missing original window call request",
     ))?;
-    let request = crate::original_requests::materialize_call_request_observed(
+    let request = crate::original_requests::materialize_call_request_created(
         source_request,
         package.constants(),
         work,
+        creation,
     )?;
     work.flush()?;
     // The selection is the frozen binding itself, never a re-resolution.
@@ -794,12 +783,14 @@ fn prepare_call(
             }),
     });
     work.flush()?;
-    functions.metadata().validate_frozen_selection(
+    crate::expressions::validate_call_created(
+        functions.metadata(),
         &function.function_id,
         function.kind,
         selection.as_ref(),
         request.request(),
         work.control(),
+        creation,
     )?;
     work.flush()?;
     // Each argument use is an unguarded Value occurrence of its ordered
@@ -807,7 +798,8 @@ fn prepare_call(
     if invocation.arguments.len() < args.len() {
         return Err(ExpressionLoweringError::Invalid(
             "window call occurrence lacks its argument uses",
-        ));
+        )
+        .into());
     }
     let mut argument_uses = Vec::new();
     reserve_vec(&mut argument_uses, args.len(), work)?;
@@ -827,7 +819,8 @@ fn prepare_call(
         if !exact {
             return Err(ExpressionLoweringError::Invalid(
                 "window argument use differs from its actual call argument",
-            ));
+            )
+            .into());
         }
         let summary = effects.get(&child).ok_or(ExpressionLoweringError::Invalid(
             "window argument effects were not prepared",
@@ -864,7 +857,7 @@ fn prepare_call(
                 },
             }
         }
-        _ => return Err(ExpressionLoweringError::UnsupportedCall(site)),
+        _ => return Err(ExpressionLoweringError::UnsupportedCall(site).into()),
     };
     let input = CallEffectInput {
         context: frozen.context,
@@ -878,12 +871,14 @@ fn prepare_call(
         decimal_overflow_policy: frozen.decimal_overflow_policy,
         proof_scope: frozen.effects.proof_scope,
     };
-    let token = functions.prepare_frozen(
+    let token = crate::expressions::prepare_call_created(
+        functions,
         input,
         Arc::clone(&selection),
         &frozen.effects,
         options,
         work.control(),
+        creation,
     )?;
     work.flush()?;
     Ok(token)

@@ -85,12 +85,12 @@ impl CompiledRuntimeFilterConsumers {
                         contract.binding_id().get()
                     ));
                 };
-                if &key.data_type != schema.data_type() {
+                if key.data_type() != schema.data_type() {
                     return Err(format!(
                         "compiled {owner} runtime-filter binding_id={} key root at local node {} has type {:?}, not its membership type {:?}",
                         contract.binding_id().get(),
                         node.index(),
-                        key.data_type,
+                        key.data_type(),
                         schema.data_type()
                     ));
                 }
@@ -168,6 +168,6 @@ impl RuntimeFilterKeyProvider for CompiledRuntimeFilterKeys {
             .as_mut()
             .and_then(|instances| instances.get_mut(binding))
             .ok_or("compiled runtime-filter key instance is missing")?;
-        evaluate_all(instance, site, &input.batch, &self.control)
+        evaluate_all(instance, site, &input.record_batch(), &self.control)
     }
 }

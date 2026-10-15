@@ -464,8 +464,10 @@ pub(crate) fn validate_fragment_cuts_into(
                 // it is declared by the statement's column layout, not by the
                 // value that fills it. It may not declare the reverse.
                 Some(value)
-                    if value.ty.same_value_domain(&import.source.ty)
-                        && (value.ty.nullable || !import.source.ty.nullable)
+                    if super::value_bindings_match_ignoring_root_nullability(
+                        &value.ty,
+                        &import.source.ty,
+                    ) && (value.ty.nullable() || !import.source.ty.nullable())
                         && import_origin_matches(
                             &value.origin,
                             cut.edge,

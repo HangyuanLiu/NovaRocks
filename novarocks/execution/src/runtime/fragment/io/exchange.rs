@@ -146,6 +146,7 @@ impl super::ExchangeReceiverPort for TestExchangeReceiverPort {
                 registration.expected_senders,
                 registration.expected_chunk_schema,
                 registration.column_binding,
+                registration.creation_factory,
             )
     }
 
@@ -153,7 +154,7 @@ impl super::ExchangeReceiverPort for TestExchangeReceiverPort {
         &self,
         key: super::ExchangeReceiverKey,
         frame: super::ExchangeReceiverFrame,
-    ) -> Result<(), String> {
+    ) -> Result<(), crate::runtime::exchange::ExchangeReceiveFailure> {
         let key = Self::key(key);
         let sender = crate::runtime::exchange::ExchangeSenderIdentity::native(
             frame.source_fragment_instance_id,
@@ -228,6 +229,25 @@ mod tests {
             fragment_instance_id: UniqueId::new(50, 60),
             node_id: 70,
         };
+        let tracker = crate::runtime::mem_tracker::MemTracker::new_root("exact native EOS fixture");
+        let factory = crate::exec::pipeline::operator::input_construction::try_runtime_input_construction_factory(
+            crate::exec::pipeline::pipeline::representation_construction_profile().unwrap(),
+            tracker.clone(), std::sync::Arc::new(crate::runtime::runtime_state::RuntimeErrorState::default()),
+        ).unwrap();
+        let layout = crate::exec::chunk::typed_fixture::layout(
+            std::sync::Arc::new(arrow::datatypes::Schema::empty()),
+            &[],
+            &[],
+        );
+        let expected = factory.create_compiled_chunk_schema(&layout).unwrap();
+        port.register(crate::runtime::fragment::io::ExchangeReceiverRegistration {
+            key,
+            expected_senders: 2,
+            expected_chunk_schema: expected,
+            column_binding: crate::runtime::exchange::ExchangeColumnBinding::Positional,
+            creation_factory: factory.clone(),
+        })
+        .expect("actual native receiver installation");
         let frame = |source_fragment_instance_id, sender_ordinal| ExchangeReceiverFrame {
             source_fragment_instance_id,
             sender_ordinal,
@@ -248,5 +268,13 @@ mod tests {
 
         let snapshot = port.snapshot(key).expect("receiver snapshot");
         assert_eq!(snapshot.finished_senders, 2);
+        port.remove(key);
+        assert!(port.snapshot(key).is_none());
+        drop(factory);
+        assert_eq!(
+            tracker.current(),
+            0,
+            "removed receiver releases its finite creation"
+        );
     }
 }

@@ -41,7 +41,7 @@ pub(super) fn original_native_profile(
         return false;
     };
     let supported = matches!(
-        source.data_type,
+        source.data_type(),
         DataType::Boolean
             | DataType::Int8
             | DataType::Int16
@@ -62,9 +62,9 @@ pub(super) fn original_native_profile(
         return false;
     };
     supported
-        && target.logical_type == ValueLogicalType::Physical
-        && target.data_type == DataType::Binary
-        && target.nullable
+        && target.logical_type() == ValueLogicalType::Hll
+        && target.data_type() == &DataType::Binary
+        && target.nullable()
 }
 pub(super) fn validate_profile(
     contract: &ScalarCallContract,
@@ -105,7 +105,7 @@ pub(super) fn evaluate<'a>(
         else {
             unreachable!("checked value profile")
         };
-        if array.data_type() != &source.data_type {
+        if array.data_type() != source.data_type() {
             return Err(internal(
                 "hll_hash demanded carrier differs from its original full source type",
             ));
@@ -147,7 +147,7 @@ pub(super) fn evaluate<'a>(
                     "hll_hash demanded address exceeds its original carrier",
                 ));
             }
-            if !source.nullable && array.is_null(row) {
+            if !source.nullable() && array.is_null(row) {
                 return Err(internal(
                     "hll_hash nonnull source contains selected SQL NULL",
                 ));
@@ -178,7 +178,7 @@ pub(super) fn evaluate<'a>(
         control.checkpoint(0)?;
         SelectedValues::try_new_observed::<KernelFailure>(
             selection,
-            &input.contract().result_type().data_type,
+            input.contract().result_type().data_type(),
             array,
             Box::default(),
             || rows.step(),

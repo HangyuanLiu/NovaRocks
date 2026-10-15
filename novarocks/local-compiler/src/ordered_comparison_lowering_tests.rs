@@ -165,11 +165,12 @@ fn ordered_float_sources_keep_nan_payload_and_signed_zero_bits() {
 #[test]
 fn physical_author_rejects_wrong_domains_temporal_decimal_and_result_claims() {
     let functions = functions();
-    let uuid = FunctionValueType {
-        data_type: DataType::FixedSizeBinary(16),
-        nullable: true,
-        logical_type: ValueLogicalType::Uuid,
-    };
+    let uuid = FunctionValueType::try_from_legacy_declared_projection(
+        DataType::FixedSizeBinary(16),
+        true,
+        ValueLogicalType::Uuid,
+    )
+    .expect("valid temporary legacy value projection");
     let bad_pairs = [
         (
             uuid,
@@ -213,11 +214,12 @@ fn physical_author_rejects_wrong_domains_temporal_decimal_and_result_claims() {
 fn exact_uuid_and_successful_null_sources_keep_ordered_recipe_identity() {
     let functions = functions();
     for ty in [
-        FunctionValueType {
-            data_type: DataType::FixedSizeBinary(16),
-            nullable: true,
-            logical_type: ValueLogicalType::Uuid,
-        },
+        FunctionValueType::try_from_legacy_declared_projection(
+            DataType::FixedSizeBinary(16),
+            true,
+            ValueLogicalType::Uuid,
+        )
+        .expect("valid temporary legacy value projection"),
         FunctionValueType::new(DataType::Null, true),
     ] {
         for (physical, expected) in OPERATORS {
@@ -514,17 +516,19 @@ fn real_rand_operand_keeps_volatile_state_and_exact_frozen_effects_under_compari
 #[test]
 fn explicitly_authored_largeint_sources_preserve_their_domain_without_retagging_fixed16() {
     let functions = functions();
-    let signed = FunctionValueType {
-        data_type: DataType::FixedSizeBinary(16),
-        nullable: true,
-        logical_type: ValueLogicalType::LargeInt,
-    };
+    let signed = FunctionValueType::try_from_legacy_declared_projection(
+        DataType::FixedSizeBinary(16),
+        true,
+        ValueLogicalType::LargeInt,
+    )
+    .expect("valid temporary legacy value projection");
     let plain = FunctionValueType::new(DataType::FixedSizeBinary(16), true);
-    let uuid = FunctionValueType {
-        data_type: DataType::FixedSizeBinary(16),
-        nullable: true,
-        logical_type: ValueLogicalType::Uuid,
-    };
+    let uuid = FunctionValueType::try_from_legacy_declared_projection(
+        DataType::FixedSizeBinary(16),
+        true,
+        ValueLogicalType::Uuid,
+    )
+    .expect("valid temporary legacy value projection");
     // Source authority is explicit. Compiler tests do not serve as a row-order oracle.
     for (physical, expected) in OPERATORS {
         for ty in [&signed, &plain, &uuid] {

@@ -21,7 +21,9 @@ use crate::{
     CompileCheckpoints, CompileControlError, CompilePhase, EvaluationDomainId,
     ExpressionEffectContext, ExpressionUseId, PureCompileControl,
 };
+mod creation;
 mod resources;
+pub use creation::ExpressionControlCreationFailure;
 pub use resources::*;
 
 use std::{
@@ -129,10 +131,41 @@ pub struct ExpressionInvocation<D> {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExpressionControlFlow<D> {
-    domains: Arc<BTreeMap<EvaluationDomainId, ExpressionEvaluationDomain>>,
-    uses: Arc<BTreeMap<ExpressionUseId, ExpressionInvocation<D>>>,
-    roots: Arc<[ExpressionUseId]>,
+    domains: Arc<ControlFlowOwned<BTreeMap<EvaluationDomainId, ExpressionEvaluationDomain>>>,
+    uses: Arc<ControlFlowOwned<BTreeMap<ExpressionUseId, ExpressionInvocation<D>>>>,
+    roots: Arc<ControlFlowOwned<Box<[ExpressionUseId]>>>,
     use_references: usize,
+}
+/// Private immutable backing; an independently cloned graph retains only its
+/// own maps/root array and their original creation responsibility.
+struct ControlFlowOwned<T> {
+    value: T,
+    _storage: crate::ValueTypeStorageLifetime,
+}
+impl<T> std::ops::Deref for ControlFlowOwned<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+impl<T: fmt::Debug> fmt::Debug for ControlFlowOwned<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.value.fmt(f)
+    }
+}
+impl<T: PartialEq> PartialEq for ControlFlowOwned<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+impl<T: Eq> Eq for ControlFlowOwned<T> {}
+impl<T> ControlFlowOwned<T> {
+    fn pure(value: T) -> Self {
+        Self {
+            value,
+            _storage: crate::ValueTypeStorageLifetime::pure(),
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExpressionControlFlowError {
@@ -189,9 +222,9 @@ impl<D: Copy> ExpressionControlFlow<D> {
         work.finish()?;
         let (domains, uses, roots, references) = parts?;
         Ok(Self {
-            domains: Arc::new(domains),
-            uses: Arc::new(uses),
-            roots: roots.into(),
+            domains: Arc::new(ControlFlowOwned::pure(domains)),
+            uses: Arc::new(ControlFlowOwned::pure(uses)),
+            roots: Arc::new(ControlFlowOwned::pure(roots.into_boxed_slice())),
             use_references: references,
         })
     }
@@ -209,15 +242,77 @@ impl<D: Copy> ExpressionControlFlow<D> {
         let (domains, uses, roots, references) =
             Self::parts_in(domains, uses, definitions, admit, true, work)?;
         work.flush()?;
-        let domains = Arc::new(domains);
+        let domains = Arc::new(ControlFlowOwned::pure(domains));
         work.step()?;
         work.flush()?;
-        let uses = Arc::new(uses);
+        let uses = Arc::new(ControlFlowOwned::pure(uses));
         work.step()?;
         work.flush()?;
-        let roots = roots.into();
+        let roots = Arc::new(ControlFlowOwned::pure(roots.into_boxed_slice()));
         work.step()?;
         work.flush()?;
+        Ok(Self {
+            domains,
+            uses,
+            roots,
+            use_references: references,
+        })
+    }
+    /// Actual creation of the same validated graph, with temporary validation
+    /// structures and immutable output backing in independent caller scopes.
+    pub fn try_new_with_creator_in<H>(
+        domains: Vec<ExpressionEvaluationDomain>,
+        uses: Vec<ExpressionInvocation<D>>,
+        definitions: &impl ExpressionDefinitionMembership<D>,
+        temporary: &mut dyn crate::ValueSchemaCreationScope<H>,
+        retained: &mut dyn crate::ValueSchemaCreationScope<H>,
+        work: &mut CompileCheckpoints<'_>,
+    ) -> Result<Self, ExpressionControlCreationFailure<H>> {
+        use ExpressionControlCreationFailure as Failure;
+        // Preserve the existing first header law before any admission/traversal.
+        if domains.len() > MAX_CONTROL_DEFINITIONS
+            || uses.len() > MAX_CONTROL_DEFINITIONS
+            || definitions.definition_count() > MAX_CONTROL_DEFINITIONS
+        {
+            return Err(Failure::Owner(ExpressionControlFlowError::TooManyItems));
+        }
+        // The sole constructor geometry visitor also supplies the existing
+        // cumulative pure model. It quotes no input payload or source bytes.
+        creation::observe::<D, H>(domains.len(), uses.len(), temporary, retained, work)?;
+        let (domains, uses, roots, references) =
+            Self::parts_in(domains, uses, definitions, &mut |_| Ok(()), true, work)
+                .map_err(Failure::from)?;
+        work.flush().map_err(Failure::Control)?;
+        let storage = retained.storage_lifetime();
+        let domains = Arc::new(ControlFlowOwned {
+            value: domains,
+            _storage: storage.clone(),
+        });
+        work.step().map_err(Failure::Control)?;
+        work.flush().map_err(Failure::Control)?;
+        let uses = Arc::new(ControlFlowOwned {
+            value: uses,
+            _storage: storage.clone(),
+        });
+        work.step().map_err(Failure::Control)?;
+        work.flush().map_err(Failure::Control)?;
+        if roots.capacity() != roots.len() && !roots.is_empty() {
+            retained
+                .request_layout(
+                    std::alloc::Layout::array::<ExpressionUseId>(roots.len()).map_err(|_| {
+                        Failure::Resource(
+                            crate::owned_resources::layout::LayoutResourceError::Arithmetic,
+                        )
+                    })?,
+                )
+                .map_err(Failure::Creator)?;
+        }
+        let roots = Arc::new(ControlFlowOwned {
+            value: roots.into_boxed_slice(),
+            _storage: storage,
+        });
+        work.step().map_err(Failure::Control)?;
+        work.flush().map_err(Failure::Control)?;
         Ok(Self {
             domains,
             uses,
@@ -588,32 +683,7 @@ pub fn expression_control_flow_header_resource_facts<D>(
     n: usize,
     u: usize,
 ) -> Result<ControlOwnedResourceFacts, ControlResourceError> {
-    let mut r = ControlResourceCounter::default();
-    r.tree::<EvaluationDomainId, ExpressionEvaluationDomain>(n)?;
-    r.tree::<ExpressionUseId, ExpressionInvocation<D>>(u)?;
-    r.tree::<EvaluationDomainId, Vec<EvaluationDomainId>>(n)?;
-    r.tree::<EvaluationDomainId, usize>(n)?;
-    r.tree::<ExpressionUseId, usize>(u)?;
-    r.tree::<EvaluationDomainId, ()>(n)?;
-    r.tree::<ExpressionUseId, usize>(u)?;
-    // Original Vec growth: min non-ZST capacity four; each parent consumes
-    // at least one child. Geometric cumulative capacity is <=16*total children.
-    // Requests are at most pushes. try_reserve keeps the original growth body.
-    r.buffer::<EvaluationDomainId>(control_resource_mul(n, 16)?, 1)?;
-    if n > 0 {
-        r.merge(ControlOwnedResourceFacts {
-            allocation_requests_upper_bound: n - 1,
-            ..Default::default()
-        })?;
-    }
-    // Ready queues reserve their known maximum once, before any push.
-    r.buffer::<EvaluationDomainId>(n, 1)?;
-    r.buffer::<ExpressionUseId>(u, 1)?;
-    // Roots Vec plus possible Vec->Box trim; Arc copies into its own backing.
-    r.buffer::<ExpressionUseId>(u, 2)?;
-    r.arc::<BTreeMap<EvaluationDomainId, ExpressionEvaluationDomain>>(1)?;
-    r.arc::<BTreeMap<ExpressionUseId, ExpressionInvocation<D>>>(1)?;
-    r.arc::<ExpressionUseId>(u)?;
+    let mut r = creation::resource_facts::<D>(n, u)?;
     let lookup = ControlResourceCounter::lookup_work(n.max(u))?;
     r.work(control_resource_mul(
         control_resource_mul(control_resource_add(n, u)?, 64)?,

@@ -316,23 +316,7 @@ fn transfer_request(
                 parameter_types,
                 result_type,
             } => {
-                Layout::array::<ValueType>(parameter_types.len())
-                    .map_err(|_| CompileControlError::ResourceExhausted)?;
-                work.step()?;
-                work.flush()?;
-                let mut parameters = Vec::new();
-                parameters
-                    .try_reserve_exact(parameter_types.len())
-                    .map_err(|_| CompileControlError::ResourceExhausted)?;
-                work.step()?;
-                work.flush()?;
-                for parameter in parameter_types {
-                    work.step()?;
-                    parameters.push(clone_type(parameter, work)?);
-                }
-                work.flush()?;
-                let parameters = parameters.into_boxed_slice();
-                work.step()?;
+                let parameters = parameter_types.clone_observed(|| work.step())?;
                 work.flush()?;
                 StaticFunctionArgument::Lambda {
                     parameter_types: parameters,

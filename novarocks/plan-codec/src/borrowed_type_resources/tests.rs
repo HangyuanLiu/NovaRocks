@@ -16,7 +16,7 @@
 // under the License.
 
 use super::*;
-use arrow::datatypes::{Field, TimeUnit};
+use arrow::datatypes::{DataType, Field, TimeUnit};
 use novarocks_type_contract::{
     CompileControlError, CompilePhase, PureCompileControl, ValueLogicalType,
 };
@@ -92,7 +92,7 @@ fn nested(changed: bool) -> FunctionValueType {
 }
 
 #[test]
-fn borrowed_type_binding_preserves_exact_nested_metadata_and_scalar_attributes() {
+fn borrowed_type_binding_ignores_source_attributes_but_preserves_scalar_parameters() {
     let left = nested(false);
     let independently_authored = nested(false);
     assert!(
@@ -107,7 +107,7 @@ fn borrowed_type_binding_preserves_exact_nested_metadata_and_scalar_attributes()
         .matches()
     );
     assert!(
-        !run(&left, &nested(true), SOURCE, WORK, &Control::default())
+        run(&left, &nested(true), SOURCE, WORK, &Control::default())
             .unwrap()
             .matches()
     );
@@ -138,7 +138,7 @@ fn borrowed_type_binding_preserves_exact_nested_metadata_and_scalar_attributes()
         )
     });
     assert!(
-        !run(
+        run(
             &dictionaries[0],
             &dictionaries[1],
             SOURCE,
@@ -151,14 +151,51 @@ fn borrowed_type_binding_preserves_exact_nested_metadata_and_scalar_attributes()
 }
 
 #[test]
-fn borrowed_type_binding_flags_stop_before_scratch_without_skipping_equal_pointer_compare() {
+fn borrowed_type_binding_checks_nested_nominal_semantics_before_publication() {
+    use novarocks_type_contract::{
+        ValueField, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+    let author = |json: bool| {
+        let storage = ValueTypeStorageLifetime::pure();
+        let child = ValueTypeRef::try_new(
+            if json {
+                ValueKind::Nominal(ValueLogicalType::Json)
+            } else {
+                ValueKind::String
+            },
+            true,
+            storage.clone(),
+        )
+        .unwrap();
+        let semantic = ValueTypeRef::try_new(
+            ValueKind::Struct(vec![ValueField::new("payload", child, storage.clone())].into()),
+            true,
+            storage.clone(),
+        )
+        .unwrap();
+        let layout = ValueLayout::try_new(
+            &DataType::Struct(vec![Field::new("payload", DataType::Utf8, true)].into()),
+            storage,
+        )
+        .unwrap();
+        FunctionValueType::try_from_value(semantic, layout).unwrap()
+    };
+    let json = author(true);
+    let text = author(false);
+    assert_eq!(json.data_type(), text.data_type());
+    every_boundary(&json, &text, SOURCE, WORK, Some(false));
+    every_boundary(&json, &author(true), SOURCE, WORK, Some(true));
+}
+
+#[test]
+fn borrowed_type_binding_flags_stop_before_cached_pair_without_skipping_equal_pointer_compare() {
     let left = FunctionValueType::new(DataType::Int64, false);
     let right = FunctionValueType::new(DataType::Int64, true);
-    let early = run(&left, &right, SOURCE, SOURCE + 2, &Control::default()).unwrap();
+    let early = run(&left, &right, SOURCE, 2, &Control::default()).unwrap();
     assert!(!early.matches());
-    assert_eq!(early.work_upper_bound(), SOURCE + 2);
+    assert_eq!(early.work_upper_bound(), 2);
     assert!(matches!(
-        run(&left, &left, SOURCE, SOURCE + 2, &Control::default()),
+        run(&left, &left, SOURCE, 2, &Control::default()),
         Err(TypeCodecError::Control(
             CompileControlError::ResourceExhausted
         ))
@@ -180,7 +217,7 @@ fn borrowed_type_binding_flags_stop_before_scratch_without_skipping_equal_pointe
 }
 
 #[test]
-fn borrowed_type_binding_deleted_map_invoice_and_work_limits_remain_mandatory() {
+fn borrowed_type_binding_source_floor_is_separate_from_actual_comparison_work() {
     let left = nested(false);
     let right = nested(false);
     let facts = run(&left, &right, SOURCE, WORK, &Control::default()).unwrap();
@@ -208,7 +245,7 @@ fn borrowed_type_binding_deleted_map_invoice_and_work_limits_remain_mandatory() 
         ))
     ));
     let larger = run(&left, &right, SOURCE + 4096, WORK, &Control::default()).unwrap();
-    assert!(larger.work_upper_bound() > facts.work_upper_bound());
+    assert_eq!(larger.work_upper_bound(), facts.work_upper_bound());
     assert!(matches!(
         run(&left, &right, 0, WORK, &Control::default()),
         Err(TypeCodecError::InvalidShape(_))
@@ -249,7 +286,12 @@ fn every_boundary(
 fn borrowed_type_binding_success_mismatch_and_ordinary_tails_preserve_every_control_prefix() {
     let left = nested(false);
     every_boundary(&left, &nested(false), SOURCE, WORK, Some(true));
-    every_boundary(&left, &nested(true), SOURCE, WORK, Some(false));
+    every_boundary(&left, &nested(true), SOURCE, WORK, Some(true));
+    let renamed = FunctionValueType::new(
+        DataType::Struct(vec![Field::new("renamed", DataType::Int64, true)].into()),
+        true,
+    );
+    every_boundary(&left, &renamed, SOURCE, WORK, Some(false));
     every_boundary(&left, &nested(false), 0, WORK, None);
 }
 
@@ -281,7 +323,7 @@ fn numeric_work_refusal_preserves_resource_before_later_controller_or_footer() {
     let upper = run(&left, &right, SOURCE, WORK, &Control::default())
         .unwrap()
         .work_upper_bound();
-    for maximum in [0, SOURCE + 2, upper - 1] {
+    for maximum in [0, 2, upper - 1] {
         let baseline = Control::default();
         assert!(matches!(
             run(&left, &right, SOURCE, maximum, &baseline),
@@ -353,14 +395,13 @@ fn borrowed_type_known_prefix_refusal_precedes_pending_255_for_all_root_flags() 
         ValueLogicalType::Uuid,
     )
     .unwrap();
-    let scratch = mem::size_of::<[Option<(&DataType, usize)>; MAX_VALUE_TYPE_NODES]>();
     for (right, matching_flags) in [
         (&physical, true),
         (&same_flags_other_carrier, true),
         (&nullable, false),
         (&uuid, false),
     ] {
-        let expected_prefix = SOURCE + if matching_flags { scratch } else { 0 } + 2;
+        let expected_prefix = 2;
         let bound = type_binding_prefix_work_upper_bound(&physical, right, SOURCE).unwrap();
         assert_eq!(bound.work_upper_bound(), expected_prefix);
         assert_eq!(bound.flags_match(), matching_flags);
@@ -388,97 +429,60 @@ fn borrowed_type_known_prefix_refusal_precedes_pending_255_for_all_root_flags() 
 }
 
 #[test]
-fn borrowed_type_exact_prefix_deep_gate_and_original_success_tails_keep_their_trace() {
+fn borrowed_type_exact_cached_bound_and_original_success_tails_keep_their_trace() {
     let left = FunctionValueType::new(DataType::Int64, false);
     let nullable = FunctionValueType::new(DataType::Int64, true);
-    let scratch = mem::size_of::<[Option<(&DataType, usize)>; MAX_VALUE_TYPE_NODES]>();
-    let prefix = SOURCE + scratch + 2;
-    // The plain root has one TypeNode: its original model contributes B,
-    // four closed header units and one completed numerical visit.
-    let full = prefix + SOURCE + 5;
+    let full = 2 + 8 + 2 * left.comparison_work_upper_bound().unwrap();
     for pending in [0, 255] {
-        for (right, maximum, expected_bound, expected_flags, expected_trace) in [
-            (
-                &left,
-                full,
-                full,
-                true,
-                vec![0, u32::try_from(pending).unwrap(), 3, 0, 1, 0],
-            ),
-            (
-                &nullable,
-                SOURCE + 2,
-                SOURCE + 2,
-                false,
-                vec![0, u32::try_from(pending).unwrap(), 3, 0],
-            ),
-        ] {
+        for (right, maximum, bound, flags) in [(&left, full, full, true), (&nullable, 2, 2, false)]
+        {
             let control = Control::default();
-            let result =
+            let proof =
                 preflight_with_pending(&left, right, SOURCE, maximum, pending, &control).unwrap();
-            assert_eq!(result.work_upper_bound(), expected_bound);
-            assert_eq!(result.flags_match(), expected_flags);
-            assert_eq!(*control.trace.lock().unwrap(), expected_trace);
-            for at in 0..expected_trace.len() {
+            assert_eq!(proof.work_upper_bound(), bound);
+            assert_eq!(proof.flags_match(), flags);
+            let trace = control.trace.lock().unwrap().clone();
+            assert_eq!(trace[0], 0);
+            assert_eq!(trace[1], pending as u32);
+            for at in 0..trace.len() {
                 for cause in CAUSES {
                     let control = Control {
                         refusal: Some((at, cause)),
-                        ..Control::default()
+                        ..Default::default()
                     };
-                    assert!(matches!(
-                        preflight_with_pending(&left, right, SOURCE, maximum, pending, &control),
-                        Err(TypeCodecError::Control(actual)) if actual == cause
-                    ));
-                    assert_eq!(*control.trace.lock().unwrap(), expected_trace[..=at]);
+                    assert!(
+                        matches!(preflight_with_pending(&left, right, SOURCE, maximum, pending, &control), Err(TypeCodecError::Control(actual)) if actual == cause)
+                    );
+                    assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
                 }
             }
         }
-
-        // An admitted exact prefix does not authorize the later datatype walk.
-        // The first real TypeNode increases the bound and refuses before its
-        // completed step; no opaque exit or ordinary footer follows it.
-        let expected_trace = vec![0, u32::try_from(pending).unwrap(), 3, 0];
-        let control = Control::default();
-        assert!(matches!(
-            preflight_with_pending(&left, &left, SOURCE, prefix, pending, &control),
-            Err(TypeCodecError::Control(
-                CompileControlError::ResourceExhausted
-            ))
-        ));
-        assert_eq!(*control.trace.lock().unwrap(), expected_trace);
+        // The complete cached pair is already known before the pending flush.
         for cause in CAUSES {
             let control = Control {
-                refusal: Some((expected_trace.len(), cause)),
-                ..Control::default()
+                refusal: Some((1, cause)),
+                ..Default::default()
             };
             assert!(matches!(
-                preflight_with_pending(&left, &left, SOURCE, prefix, pending, &control),
+                preflight_with_pending(&left, &left, SOURCE, full - 1, pending, &control),
                 Err(TypeCodecError::Control(
                     CompileControlError::ResourceExhausted
                 ))
             ));
-            assert_eq!(*control.trace.lock().unwrap(), expected_trace);
+            assert_eq!(*control.trace.lock().unwrap(), [0]);
         }
     }
 }
 
 #[test]
-fn borrowed_type_pure_prefix_keeps_ordinary_source_and_arithmetic_error_observations() {
+fn borrowed_type_pure_prefix_keeps_original_ordinary_missing_source_observations() {
     let left = FunctionValueType::new(DataType::Int64, false);
-    for (source, maximum, expected_message, expected_trace) in [
-        (
-            0,
-            0,
-            "borrowed type source invoice omits original inline roots",
-            vec![0, 255, 1],
-        ),
-        (
-            usize::MAX,
-            usize::MAX,
-            "borrowed type comparison work sum overflow",
-            vec![0, 255, 2],
-        ),
-    ] {
+    for (source, maximum, expected_message, expected_trace) in [(
+        0,
+        0,
+        "borrowed type source invoice omits original inline roots",
+        vec![0, 255, 1],
+    )] {
         let control = Control::default();
         assert!(matches!(
             preflight_with_pending(&left, &left, source, maximum, 255, &control),
@@ -550,30 +554,20 @@ fn admitted_comparison_preserves_original_bound_trace_and_every_actual_control_e
 }
 
 #[test]
-fn admitted_comparison_known_prefix_and_field_growth_precede_next_observation() {
-    let left = FunctionValueType::new(
-        DataType::Struct(
-            vec![
-                Field::new("x", DataType::Int64, true).with_metadata(HashMap::from([
-                    ("a".to_owned(), "1".to_owned()),
-                    ("b".to_owned(), "2".to_owned()),
-                ])),
-            ]
-            .into(),
-        ),
-        false,
-    );
-    let prefix = SOURCE + mem::size_of::<[Option<(&DataType, usize)>; MAX_VALUE_TYPE_NODES]>() + 2;
-    // The first real TypeNode contributes B+4 headers+one model visit.
-    let first_node = prefix + SOURCE + 5;
-    for stop_at in [prefix - 1, first_node] {
-        let baseline = Control::default();
-        let run = |control: &Control| -> Result<VerifiedTypeBinding, TypeCodecError> {
-            let mut work = CompileCheckpoints::try_new(control, CompilePhase::Encode)?;
+fn admitted_comparison_known_cached_pair_refusal_precedes_pending_observation() {
+    let left = nested(false);
+    let full = 2 + 8 + 2 * left.comparison_work_upper_bound().unwrap();
+    for stop_at in [1, full - 1] {
+        for cause in CAUSES {
+            let control = Control {
+                refusal: Some((1, cause)),
+                ..Default::default()
+            };
+            let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
             for _ in 0..255 {
-                work.step()?;
+                work.step().unwrap();
             }
-            verify_type_binding_admitted(
+            let result = verify_type_binding_admitted(
                 &left,
                 &left,
                 SOURCE,
@@ -588,35 +582,256 @@ fn admitted_comparison_known_prefix_and_field_growth_precede_next_observation() 
                     }
                 },
                 &mut work,
-            )
-        };
-        assert!(matches!(
-            run(&baseline),
-            Err(TypeCodecError::Control(
-                CompileControlError::ResourceExhausted
-            ))
-        ));
-        let trace = baseline.trace.lock().unwrap().clone();
-        assert_eq!(
-            trace,
-            if stop_at < prefix {
-                vec![0]
-            } else {
-                vec![0, 255, 3, 0]
-            }
-        );
-        for cause in CAUSES {
-            let control = Control {
-                refusal: Some((trace.len(), cause)),
-                ..Control::default()
-            };
+            );
             assert!(matches!(
-                run(&control),
+                result,
                 Err(TypeCodecError::Control(
                     CompileControlError::ResourceExhausted
                 ))
             ));
-            assert_eq!(*control.trace.lock().unwrap(), trace);
+            assert_eq!(*control.trace.lock().unwrap(), [0]);
         }
+    }
+}
+
+#[test]
+fn independent_deep_owners_cover_foreign_equal_and_mismatching_comparison_work() {
+    use novarocks_type_contract::{
+        ValueField, ValueKind, ValueLayout, ValueTypeRef, ValueTypeStorageLifetime,
+    };
+    let author = |json: bool, timezone: &str| {
+        let storage = ValueTypeStorageLifetime::pure();
+        let document = ValueTypeRef::try_new(
+            if json {
+                ValueKind::Nominal(ValueLogicalType::Json)
+            } else {
+                ValueKind::String
+            },
+            true,
+            storage.clone(),
+        )
+        .unwrap();
+        let list = ValueTypeRef::try_new(ValueKind::List(document), true, storage.clone()).unwrap();
+        let timestamp = DataType::Timestamp(TimeUnit::Nanosecond, Some(timezone.into()));
+        let stamp =
+            ValueTypeRef::try_new(ValueKind::Scalar(timestamp.clone()), false, storage.clone())
+                .unwrap();
+        let name = "界".repeat(300);
+        let semantic = ValueTypeRef::try_new(
+            ValueKind::Struct(Box::from([
+                ValueField::new(name.clone(), list, storage.clone()),
+                ValueField::new("stamp", stamp, storage.clone()),
+            ])),
+            true,
+            storage.clone(),
+        )
+        .unwrap();
+        let layout = ValueLayout::try_new(
+            &DataType::Struct(
+                vec![
+                    Field::new(
+                        name,
+                        DataType::List(std::sync::Arc::new(Field::new(
+                            "source-role",
+                            DataType::Dictionary(
+                                Box::new(DataType::Int8),
+                                Box::new(DataType::Utf8),
+                            ),
+                            true,
+                        ))),
+                        true,
+                    ),
+                    Field::new("stamp", timestamp, false),
+                ]
+                .into(),
+            ),
+            storage,
+        )
+        .unwrap();
+        FunctionValueType::try_from_value(semantic, layout).unwrap()
+    };
+    let count = |left: &FunctionValueType, right: &FunctionValueType| {
+        let mut callbacks = 0usize;
+        let matches = left
+            .exactly_equals_observed::<TypeCodecError>(right, || {
+                callbacks += 1;
+                Ok(())
+            })
+            .unwrap();
+        (matches, callbacks)
+    };
+    let left = author(true, "UTC");
+    let right = author(true, "UTC");
+    assert!(!std::ptr::eq(left.data_type(), right.data_type()));
+    assert!(!left.value_type().shares_storage(right.value_type()));
+    let (_, self_steps) = count(&left, &left);
+    assert!(self_steps > 900);
+    assert_eq!(count(&left, &right), (true, self_steps));
+    for other in [right, author(false, "UTC"), author(true, "PST")] {
+        let (matches, paired_steps) = count(&left, &other);
+        let (_, other_steps) = count(&other, &other);
+        assert!(paired_steps <= self_steps + other_steps);
+        let facts = run(&left, &other, SOURCE, WORK, &Control::default()).unwrap();
+        assert_eq!(facts.matches(), matches);
+        let mut actual_weighted = 0usize;
+        assert_eq!(
+            left.exactly_equals_weighted_observed::<TypeCodecError>(&other, |step| {
+                actual_weighted += step.work_units_upper();
+                Ok(())
+            })
+            .unwrap(),
+            matches
+        );
+        assert!(facts.work_upper_bound() >= actual_weighted);
+        assert_eq!(
+            run(&left, &other, SOURCE * 8, WORK, &Control::default())
+                .unwrap()
+                .work_upper_bound(),
+            facts.work_upper_bound()
+        );
+        assert_eq!(
+            run(
+                &left,
+                &other,
+                SOURCE,
+                facts.work_upper_bound(),
+                &Control::default()
+            )
+            .unwrap()
+            .matches(),
+            matches
+        );
+        let under = Control::default();
+        assert!(matches!(
+            run(&left, &other, SOURCE, facts.work_upper_bound() - 1, &under),
+            Err(TypeCodecError::Control(
+                CompileControlError::ResourceExhausted
+            ))
+        ));
+        let trace = under.trace.into_inner().unwrap();
+        for cause in CAUSES {
+            let forbidden = Control {
+                refusal: Some((trace.len(), cause)),
+                ..Default::default()
+            };
+            assert!(matches!(
+                run(
+                    &left,
+                    &other,
+                    SOURCE,
+                    facts.work_upper_bound() - 1,
+                    &forbidden
+                ),
+                Err(TypeCodecError::Control(
+                    CompileControlError::ResourceExhausted
+                ))
+            ));
+            assert_eq!(*forbidden.trace.lock().unwrap(), trace);
+        }
+        every_boundary(&left, &other, SOURCE, WORK, Some(matches));
+    }
+}
+
+#[test]
+fn wide_scalar_comparisons_keep_original_two_billion_boundary_without_source_work() {
+    let left = FunctionValueType::new(DataType::Int64, false);
+    let right = FunctionValueType::new(DataType::Int64, false);
+    let mut total = 0usize;
+    let control = Control::default();
+    let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+    for _ in 0..320 {
+        let proof =
+            verify_type_binding(&left, &right, 2 * SOURCE, 2_000_000_000 - total, &mut work)
+                .unwrap();
+        assert!(proof.matches());
+        total = total.checked_add(proof.work_upper_bound()).unwrap();
+    }
+    work.finish().unwrap();
+    let single = run(&left, &right, 2 * SOURCE, WORK, &Control::default()).unwrap();
+    assert_eq!(total, 320 * single.work_upper_bound());
+    assert!(total < 2_000_000_000);
+    // A huge truthful enclosing source does not invent a comparison traversal.
+    assert_eq!(
+        run(&left, &right, usize::MAX, WORK, &Control::default())
+            .unwrap()
+            .work_upper_bound(),
+        single.work_upper_bound()
+    );
+}
+
+#[test]
+fn actual_comparison_model_each_parent_refusal_keeps_original_payload_without_tail() {
+    #[derive(Debug)]
+    enum Refusal {
+        Codec(TypeCodecError),
+        Host(std::sync::Arc<usize>),
+    }
+    impl From<TypeCodecError> for Refusal {
+        fn from(error: TypeCodecError) -> Self {
+            Self::Codec(error)
+        }
+    }
+    let left = nested(false);
+    let right = nested(false);
+    let recording = Control::default();
+    let mut work = CompileCheckpoints::try_new(&recording, CompilePhase::Encode).unwrap();
+    let mut baseline = Vec::new();
+    let mut before_comparison = Vec::new();
+    let proof = verify_type_binding_admitted::<Refusal>(
+        &left,
+        &right,
+        SOURCE,
+        WORK,
+        &mut |facts| {
+            assert!(facts.flags_match());
+            baseline.push(facts.work_upper_bound());
+            before_comparison.push(recording.trace.lock().unwrap().clone());
+            Ok(())
+        },
+        &mut work,
+    )
+    .unwrap();
+    work.finish().unwrap();
+    // The immutable cache exposes exactly the closed-root admission and the
+    // complete pair admission. Both precede the actual comparison; there is
+    // no retained per-node growth walk or replay of predicted callbacks.
+    let root = type_binding_prefix_work_upper_bound(&left, &right, SOURCE).unwrap();
+    let paired = root.work_upper_bound()
+        + 8
+        + left.comparison_work_upper_bound().unwrap()
+        + right.comparison_work_upper_bound().unwrap();
+    assert_eq!(baseline, [root.work_upper_bound(), paired]);
+    assert_eq!(proof.work_upper_bound(), paired);
+    assert!(proof.matches());
+    assert_eq!(before_comparison, [vec![0], vec![0]]);
+    for stop in 0..baseline.len() {
+        let original = std::sync::Arc::new(stop);
+        let control = Control::default();
+        let mut work = CompileCheckpoints::try_new(&control, CompilePhase::Encode).unwrap();
+        let mut seen = Vec::new();
+        let mut at_refusal = Vec::new();
+        let result = verify_type_binding_admitted::<Refusal>(
+            &left,
+            &right,
+            SOURCE,
+            WORK,
+            &mut |facts| {
+                seen.push(facts.work_upper_bound());
+                if seen.len() - 1 == stop {
+                    at_refusal = control.trace.lock().unwrap().clone();
+                    Err(Refusal::Host(std::sync::Arc::clone(&original)))
+                } else {
+                    Ok(())
+                }
+            },
+            &mut work,
+        );
+        match result {
+            Err(Refusal::Host(actual)) => assert!(std::sync::Arc::ptr_eq(&actual, &original)),
+            Err(Refusal::Codec(error)) => panic!("unexpected codec refusal: {error}"),
+            Ok(_) => panic!("expected the original parent refusal"),
+        }
+        assert_eq!(seen, baseline[..=stop]);
+        assert_eq!(*control.trace.lock().unwrap(), at_refusal);
     }
 }

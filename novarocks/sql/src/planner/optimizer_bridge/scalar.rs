@@ -215,7 +215,7 @@ pub(crate) fn materialize_aggregate_call(
         name: call.name.clone(),
         source,
         distinct: call.distinct,
-        result_type: output_column.value_type.data_type.clone(),
+        result_type: output_column.value_type.clone(),
         output_column_id: call.output_column_id,
     }
 }
@@ -317,7 +317,7 @@ pub(crate) fn materialize_window_expr(
         partition_by: materialize_exprs(arena, &expr.partition_by),
         order_by: materialize_sort_keys(arena, &expr.order_by),
         window_frame: expr.window_frame.clone(),
-        result_type: output_column.value_type.data_type.clone(),
+        result_type: output_column.value_type.data_type().clone(),
         output_name: output_column.name.clone(),
         output_column_id: expr.output_column_id,
         ignore_nulls: expr.ignore_nulls,
@@ -405,7 +405,7 @@ mod tests {
         AggregateCall {
             name: name.to_string(),
             distinct: false,
-            result_type: DataType::Int64,
+            result_type: novarocks_type_contract::FunctionValueType::new(DataType::Int64, true),
             output_column_id,
             source: crate::binding::AggregateArgumentSource::uncertified(
                 vec![],
@@ -540,7 +540,7 @@ mod tests {
         );
 
         assert_eq!(calls[0].output_column_id, id_sum);
-        assert_eq!(calls[0].result_type, DataType::Int64);
+        assert_eq!(calls[0].result_type.data_type().clone(), DataType::Int64);
         assert_eq!(calls[1].output_column_id, id_count);
     }
 
@@ -557,7 +557,7 @@ mod tests {
             .intermediate_type
             .clone();
         let final_type = crate::functions::aggregate_result_type(&binding);
-        assert_ne!(intermediate.data_type, final_type.data_type);
+        assert_ne!(intermediate.data_type(), final_type.data_type());
         let FunctionArgumentType::Value(argument_type) = &binding.selected.argument_types[0] else {
             panic!("avg must select a value argument");
         };
@@ -597,7 +597,7 @@ mod tests {
         );
         let materialized = materialize_aggregate_call(&arena, &spec, &layout);
         assert_eq!(materialized.output_column_id, output_id);
-        assert_eq!(materialized.result_type, intermediate.data_type);
+        assert_eq!(materialized.result_type, intermediate.clone());
         assert_eq!(
             materialized.source.arguments()[0].value_type,
             *argument_type
@@ -716,7 +716,7 @@ mod tests {
             order_by: vec![],
             window_frame: None,
             result_type: crate::functions::aggregate_result_type(&aggregate_binding)
-                .data_type
+                .data_type()
                 .clone(),
             output_name: "ordered_values".to_string(),
             output_column_id: output_id,
@@ -739,7 +739,7 @@ mod tests {
                 output_id,
                 "ordered_values",
                 crate::functions::aggregate_result_type(&aggregate_binding)
-                    .data_type
+                    .data_type()
                     .clone(),
             )],
         );

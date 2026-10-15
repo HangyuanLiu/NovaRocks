@@ -62,7 +62,7 @@ fn policy() -> ConstantPolicy {
 }
 fn pool(array: ArrayRef, nullable: bool) -> ConstantPool {
     let ty = FunctionValueType::new(array.data_type().clone(), nullable);
-    let field = Arc::new(Field::new("literal", ty.data_type.clone(), nullable));
+    let field = Arc::new(Field::new("literal", array.data_type().clone(), nullable));
     ConstantPool::try_new(
         field,
         ty,
@@ -181,7 +181,7 @@ fn dictionary_numbering_and_unused_entries_do_not_change_a_value() {
     #[allow(deprecated)]
     let field = Arc::new(Field::new_dict(
         "literal",
-        r.value_type().data_type.clone(),
+        r.array().data_type().clone(),
         false,
         77,
         true,
@@ -195,7 +195,7 @@ fn dictionary_numbering_and_unused_entries_do_not_change_a_value() {
         &Control::good(),
     )
     .unwrap();
-    assert!(!eq(&l.value(0).unwrap(), &different.value(0).unwrap()));
+    assert!(eq(&l.value(0).unwrap(), &different.value(0).unwrap()));
 }
 #[test]
 fn dictionary_value_null_is_sql_null_even_with_valid_key() {
@@ -205,7 +205,7 @@ fn dictionary_value_null_is_sql_null_even_with_valid_key() {
     )
     .unwrap();
     let ty = FunctionValueType::new(a.data_type().clone(), false);
-    let field = Arc::new(Field::new("literal", ty.data_type.clone(), false));
+    let field = Arc::new(Field::new("literal", a.data_type().clone(), false));
     assert!(matches!(
         ConstantPool::try_new(
             field,
@@ -219,7 +219,7 @@ fn dictionary_value_null_is_sql_null_even_with_valid_key() {
     ));
 }
 #[test]
-fn declared_types_metadata_and_nullability_must_agree() {
+fn declared_nullability_must_agree_and_source_attributes_do_not_reauthor_type() {
     let array = Arc::new(Int64Array::from(vec![1])) as ArrayRef;
     let field = Arc::new(Field::new("literal", DataType::Int64, true));
     assert!(matches!(
@@ -237,7 +237,7 @@ fn declared_types_metadata_and_nullability_must_agree() {
         Field::new("literal", DataType::Utf8, false)
             .with_metadata([("nr_logical_type".into(), "json".into())].into()),
     );
-    assert!(matches!(
+    assert!(
         ConstantPool::try_new(
             field,
             FunctionValueType::new(DataType::Utf8, false),
@@ -245,9 +245,9 @@ fn declared_types_metadata_and_nullability_must_agree() {
             policy(),
             CompilePhase::Validate,
             &Control::good()
-        ),
-        Err(ConstantError::Invalid(_))
-    ));
+        )
+        .is_ok()
+    );
 }
 #[test]
 fn policy_near_over_and_compact_null_logical_size() {
@@ -358,7 +358,7 @@ fn controls_are_typed_at_entry_and_every_observed_interval() {
 #[test]
 fn decimal256_temporal_and_nested_constants_have_exact_owner_values() {
     let ty = FunctionValueType::new(DataType::Decimal256(60, 12), false);
-    let field = Arc::new(Field::new("literal", ty.data_type.clone(), false));
+    let field = Arc::new(Field::new("literal", ty.data_type().clone(), false));
     let value = arrow_buffer::i256::from_i128(i128::MAX);
     let a = ConstantValue::from_decimal256(
         field.clone(),
@@ -438,12 +438,12 @@ fn scalar_factories_do_not_guess_json_or_decimal_precision() {
     )
     .unwrap();
     assert_eq!(
-        json.value_type().logical_type,
+        json.value_type().logical_type(),
         novarocks_type_contract::ValueLogicalType::Json
     );
     assert_eq!(json.try_utf8().unwrap(), Some("{}"));
     let ty = FunctionValueType::new(DataType::Decimal128(2, 0), false);
-    let field = Arc::new(Field::new("literal", ty.data_type.clone(), false));
+    let field = Arc::new(Field::new("literal", ty.data_type().clone(), false));
     assert!(matches!(
         ConstantValue::from_decimal128(
             field,
@@ -810,14 +810,8 @@ fn factories_reject_invalid_grammar_and_large_extents_before_arrow_allocation() 
     ];
     for dtype in invalid {
         assert!(
-            ConstantValue::null(
-                Arc::new(Field::new("literal", dtype.clone(), true)),
-                FunctionValueType::new(dtype, true),
-                policy(),
-                CompilePhase::Validate,
-                &Control::good()
-            )
-            .is_err()
+            FunctionValueType::try_with_logical_type(dtype, true, ValueLogicalType::Physical)
+                .is_err()
         );
     }
     let dtype = DataType::FixedSizeList(

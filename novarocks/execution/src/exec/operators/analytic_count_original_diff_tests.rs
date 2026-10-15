@@ -38,15 +38,15 @@ impl f::KernelEvaluationControl for C {
     }
 }
 pub(super) fn prepare(
-    source: Option<&ArrayRef>,
+    declaration: Option<&t::FunctionValueType>,
     running: bool,
     ignore: bool,
 ) -> Arc<dyn f::PreparedWindowKernel> {
     let catalog = f::builtin::catalogue::builtin_engine_function_catalog();
-    let arguments = source
+    let arguments = declaration
         .into_iter()
-        .map(|a| f::FunctionArgument::Value {
-            value_type: t::FunctionValueType::new(a.data_type().clone(), true),
+        .map(|value_type| f::FunctionArgument::Value {
+            value_type: value_type.clone(),
             constant: None,
         })
         .collect::<Vec<_>>();
@@ -119,7 +119,21 @@ pub(super) fn prepare(
         _ => panic!("COUNT actual window ABI"),
     }
 }
-pub(super) fn compare(source: Option<ArrayRef>, n: usize) {
+pub(super) fn compare(
+    source: Option<ArrayRef>,
+    declaration: Option<t::FunctionValueType>,
+    n: usize,
+) {
+    assert_eq!(source.is_some(), declaration.is_some());
+    // Only the exact installed plain consumer receives this representation
+    // preparation. The original encoded array remains the independent oracle.
+    let plain = source
+        .as_ref()
+        .zip(declaration.as_ref())
+        .map(|(source, ty)| {
+            crate::exec::expr::pure_differential::aggregate::plain_value_array(source, ty)
+                .expect("COUNT window fixture prepares its exact plain input")
+        });
     for running in [false, true] {
         for ignore in [false, true] {
             let window = running.then_some(WindowFrame {
@@ -138,10 +152,10 @@ pub(super) fn compare(source: Option<ArrayRef>, n: usize) {
             let old_args = source.iter().cloned().collect::<Vec<_>>();
             let legacy = compute_count(&old_args, &ctx, n).unwrap();
             let legacy = legacy.as_any().downcast_ref::<Int64Array>().unwrap();
-            let prepared = prepare(source.as_ref(), running, ignore);
+            let prepared = prepare(declaration.as_ref(), running, ignore);
             for (part, (start, end)) in partitions.iter().copied().enumerate() {
                 let rows = end - start;
-                let arrays = source
+                let arrays = plain
                     .iter()
                     .map(|v| v.slice(start, rows))
                     .collect::<Vec<_>>();
@@ -195,7 +209,7 @@ pub(super) fn compare(source: Option<ArrayRef>, n: usize) {
 #[test]
 fn pure_differential_count_over_original_star_actual_signature_frames_sparse_empty() {
     for n in [0, 1, 5, 319] {
-        compare(None, n);
+        compare(None, None, n);
     }
 }
 #[test]
@@ -211,12 +225,20 @@ fn pure_differential_count_over_original_expr_actual_signature_frames_sparse_nul
     ]));
     for input in [source.slice(1, 5), source.slice(2, 0), source.slice(0, 1)] {
         let n = input.len();
-        compare(Some(input), n);
+        compare(
+            Some(input),
+            Some(t::FunctionValueType::new(DataType::Int64, true)),
+            n,
+        );
     }
 }
 #[test]
 fn pure_differential_count_over_original_bare_null_profile() {
-    compare(Some(Arc::new(NullArray::new(5))), 5);
+    compare(
+        Some(Arc::new(NullArray::new(5))),
+        Some(t::FunctionValueType::new(DataType::Null, true)),
+        5,
+    );
 }
 #[test]
 fn pure_differential_count_over_original_dictionary_value_null_profile() {
@@ -227,5 +249,12 @@ fn pure_differential_count_over_original_dictionary_value_null_profile() {
         )
         .unwrap(),
     );
-    compare(Some(input), 5);
+    let declaration = t::FunctionValueType::new(DataType::Utf8, true);
+    let prepared = prepare(Some(&declaration), false, false);
+    let raw_arguments = [f::EvaluatedArgument::Column(&input)];
+    assert!(
+        matches!(f::FullPartitionWindowInput::try_new(prepared.contract(), 5, &raw_arguments, &[], &C),
+        Err(f::KernelFailure::InvalidProgram(diagnostic)) if diagnostic.message()=="evaluated argument differs from its exact selected type")
+    );
+    compare(Some(input), Some(declaration), 5);
 }

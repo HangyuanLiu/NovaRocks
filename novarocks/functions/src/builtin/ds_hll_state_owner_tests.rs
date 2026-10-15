@@ -251,7 +251,7 @@ fn empty(host: &Host) {
 fn prepared(arrays: &[ArrayRef]) -> Arc<dyn PreparedScalarKernel> {
     let types = arrays
         .iter()
-        .map(|a| FunctionValueType::new(a.data_type().clone(), true))
+        .map(|a| FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true))
         .collect::<Vec<_>>();
     prepared_for_test("ds_hll_count_distinct_state", &types).unwrap()
 }

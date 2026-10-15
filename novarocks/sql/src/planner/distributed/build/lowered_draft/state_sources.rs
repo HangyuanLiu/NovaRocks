@@ -413,7 +413,7 @@ fn check_writer_no_contribution_observed<'a, G: StateGraph<'a>>(
     ))?;
     let same_field = field.role == WriterRelationFieldRole::Auxiliary
         && field.value == endpoint.value
-        && field.ty.nullable
+        && field.ty.nullable()
         && node.output.columns.get(auxiliary_ordinal as usize) == Some(&endpoint.value);
     work.step()?;
     if !same_field {

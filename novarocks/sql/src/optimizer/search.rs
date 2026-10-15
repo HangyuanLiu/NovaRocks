@@ -2404,7 +2404,7 @@ mod statistics_control_tests {
     }
     impl PureCompileControl for Once {
         fn checkpoint(&self, _: CompilePhase, units: u32) -> Result<(), CompileControlError> {
-            if units == 256 && self.remaining.swap(false, Ordering::Relaxed) {
+            if units > 0 && self.remaining.swap(false, Ordering::Relaxed) {
                 Err(self.error)
             } else {
                 Ok(())
@@ -2440,6 +2440,7 @@ mod statistics_control_tests {
                     },
                 );
             }
+            assert_eq!(memo.groups[root].logical_exprs.len(), 320);
             let control = Once {
                 remaining: AtomicBool::new(true),
                 error,

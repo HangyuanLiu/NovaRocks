@@ -22,15 +22,24 @@ mod tests {
     use arrow::datatypes::DataType;
 
     use super::super::DecodedNode;
-    use super::super::{NativePlanDecodeContext, decode_node};
+    use super::super::NativePlanDecodeContext;
     use novarocks_execution::exec::expr::ExprArena;
     use novarocks_execution::exec::node::ExecNodeKind;
-    use novarocks_plan_codec::encode_native_type as encode_type;
     use novarocks_proto_models::{common, expr, plan};
     use novarocks_types::SlotId;
 
+    fn decode_node(
+        node: &plan::DistributedNode,
+        arena: &mut ExprArena,
+        context: &NativePlanDecodeContext,
+    ) -> Result<DecodedNode, crate::fragment_error::NativeFragmentDecodeError> {
+        crate::fragment_expression::fixture_sources::with_decoder(|decoder| {
+            super::super::decode_node_with_types(node, arena, context, decoder)
+        })
+    }
+
     fn type_desc(data_type: &DataType) -> common::TypeDesc {
-        encode_type(data_type).expect("encode type")
+        crate::fragment_expression::fixture_sources::type_desc(data_type)
     }
 
     fn output_column(column_id: u32, name: &str, data_type: DataType) -> common::OutputColumn {
@@ -44,26 +53,50 @@ mod tests {
     }
 
     fn int_literal(value: i64) -> expr::Expr {
+        let literal = expr::LiteralExpr {
+            value: Some(common::LiteralValue {
+                value: Some(common::literal_value::Value::IntValue(value)),
+            }),
+        };
         expr::Expr {
-            r#type: Some(type_desc(&DataType::Int64)),
+            original_definition_id: None,
+            r#type: Some(
+                crate::fragment_expression::fixture_sources::type_desc_with_nullable(
+                    &DataType::Int64,
+                    false,
+                ),
+            ),
             nullable: false,
-            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
-                value: Some(common::LiteralValue {
-                    value: Some(common::literal_value::Value::IntValue(value)),
-                }),
-            })),
+            kind: Some(expr::expr::Kind::ConstantReference(
+                crate::fragment_expression::fixture_sources::constant_reference(
+                    &DataType::Int64,
+                    &literal,
+                ),
+            )),
         }
     }
 
     fn bool_literal(value: bool) -> expr::Expr {
+        let literal = expr::LiteralExpr {
+            value: Some(common::LiteralValue {
+                value: Some(common::literal_value::Value::BoolValue(value)),
+            }),
+        };
         expr::Expr {
-            r#type: Some(type_desc(&DataType::Boolean)),
+            original_definition_id: None,
+            r#type: Some(
+                crate::fragment_expression::fixture_sources::type_desc_with_nullable(
+                    &DataType::Boolean,
+                    false,
+                ),
+            ),
             nullable: false,
-            kind: Some(expr::expr::Kind::Literal(expr::LiteralExpr {
-                value: Some(common::LiteralValue {
-                    value: Some(common::literal_value::Value::BoolValue(value)),
-                }),
-            })),
+            kind: Some(expr::expr::Kind::ConstantReference(
+                crate::fragment_expression::fixture_sources::constant_reference(
+                    &DataType::Boolean,
+                    &literal,
+                ),
+            )),
         }
     }
 

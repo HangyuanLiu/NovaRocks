@@ -134,9 +134,9 @@ fn xx_hash3_128_owner_exact_byte_carriers_and_original_logical_domains() {
     for source in profiles {
         let prepared = prepared_for_test("xx_hash3_128", &[source.clone()]).unwrap();
         let result = prepared.contract().result_type();
-        assert_eq!(result.logical_type, ValueLogicalType::LargeInt);
-        assert_eq!(result.data_type, DataType::FixedSizeBinary(16));
-        assert!(result.nullable);
+        assert_eq!(result.logical_type(), ValueLogicalType::LargeInt);
+        assert_eq!(result.data_type().clone(), DataType::FixedSizeBinary(16));
+        assert!(result.nullable());
         assert_eq!(
             prepared.contract().selected().argument_types.as_ref(),
             &[crate::FunctionArgumentType::Value(source)]
@@ -164,7 +164,13 @@ fn xx_hash3_128_owner_rejects_only_genuinely_missing_v1_byte_layouts_and_zero_ar
         DataType::FixedSizeBinary(16),
         DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
     ] {
-        assert!(prepared_for_test("xx_hash3_128", &[FunctionValueType::new(ty, true)]).is_err());
+        assert!(
+            prepared_for_test(
+                "xx_hash3_128",
+                &[FunctionValueType::from_legacy_declared_projection(ty, true)]
+            )
+            .is_err()
+        );
     }
     assert!(prepared_for_test("xx_hash3_128", &[]).is_err());
     assert!(

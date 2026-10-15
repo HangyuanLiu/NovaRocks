@@ -81,7 +81,7 @@ fn failures() -> [KernelFailure; 7] {
     ]
 }
 fn physical(ty: DataType, nullable: bool) -> FunctionValueType {
-    FunctionValueType::new(ty, nullable)
+    FunctionValueType::from_legacy_declared_projection(ty, nullable)
 }
 fn large_type(nullable: bool) -> FunctionValueType {
     FunctionValueType::try_with_logical_type(
@@ -104,6 +104,14 @@ fn run<'a>(
     selection: Selection<'a>,
 ) -> ArrayRef {
     let mut instance = ScalarEvaluationInstance::instantiate(prepared(source, target)).unwrap();
+    let normalized;
+    let argument = match argument {
+        EvaluatedArgument::Column(array) => {
+            normalized = crate::test_value_ingress::array_for_binding(array, source).unwrap();
+            EvaluatedArgument::Column(&normalized)
+        }
+        other => other,
+    };
     let args = [argument];
     let output = instance
         .evaluate(selection, &args, &Control::default())
@@ -322,15 +330,16 @@ fn json_changed_metadata_only_preserves_five_container_shapes_bytes_offsets_and_
         .into_iter()
         .zip(targets)
     {
+        let target = physical(target, true);
         let output = run(
             &physical(source.data_type().clone(), true),
-            &physical(target.clone(), true),
+            &target,
             EvaluatedArgument::Column(&source),
             Selection::all(2),
         );
         assert!(novarocks_type_contract::arrow_data_types_exact(
             output.data_type(),
-            &target
+            target.data_type()
         ));
         let original = source.to_data();
         let output = output.to_data();
@@ -353,7 +362,7 @@ fn json_changed_metadata_only_preserves_five_container_shapes_bytes_offsets_and_
 }
 
 #[test]
-fn json_sparse_copy_retains_unchanged_dictionary_and_uuid_siblings_and_exact_target_fields() {
+fn json_sparse_conversion_preserves_typed_uuid_and_explicitly_decoded_plain_sibling() {
     let dictionary_values: ArrayRef = Arc::new(StringArray::from(
         (0..128).map(|i| format!("v{i}")).collect::<Vec<_>>(),
     ));
@@ -398,17 +407,21 @@ fn json_sparse_copy_retains_unchanged_dictionary_and_uuid_siblings_and_exact_tar
         .unwrap(),
     );
     let target = DataType::Struct(vec![target_field, dictionary_field, uuid_field].into());
+    let source = physical(array.data_type().clone(), false);
+    let target = physical(target, false);
+    let decoded = arrow_cast::cast(array.as_ref(), source.data_type()).unwrap();
+    let array = crate::test_value_ingress::array_for_binding(&decoded, &source).unwrap();
     let rows = [1usize];
     let selection = Selection::try_sparse(2, &rows).unwrap();
     let output = run(
-        &physical(array.data_type().clone(), false),
-        &physical(target.clone(), false),
+        &source,
+        &target,
         EvaluatedArgument::Column(&array),
         selection,
     );
     assert!(novarocks_type_contract::arrow_data_types_exact(
         output.data_type(),
-        &target
+        target.data_type()
     ));
     let output = output.as_any().downcast_ref::<StructArray>().unwrap();
     assert_eq!(
@@ -420,13 +433,16 @@ fn json_sparse_copy_retains_unchanged_dictionary_and_uuid_siblings_and_exact_tar
             .value(0),
         "selected"
     );
-    let output_dict = output
+    let output_plain = output
         .column(1)
         .as_any()
-        .downcast_ref::<DictionaryArray<Int8Type>>()
+        .downcast_ref::<StringArray>()
         .unwrap();
-    assert_eq!(output_dict.key(0), Some(127));
-    assert!(Arc::ptr_eq(output_dict.values(), &dictionary_values));
+    assert_eq!(output_plain.value(0), "v127");
+    assert_eq!(
+        target.value_type().child_type_at(2).unwrap().domain(),
+        Some(ValueLogicalType::Uuid)
+    );
     assert_eq!(
         output
             .column(2)
@@ -745,3 +761,57 @@ fn direct_format_extent_failure_is_primary_before_builder_and_finish_control() {
 
 #[path = "largeint_text_tests.rs"]
 mod largeint_text_tests;
+
+#[test]
+fn opaque_domain_erasure_executes_existing_same_shape_bytes_and_preserves_original_control() {
+    let bytes = crate::hll::encode_hll_single(0x0102_0304_0506_0708);
+    let source_type =
+        FunctionValueType::try_with_logical_type(DataType::Binary, true, ValueLogicalType::Hll)
+            .unwrap();
+    let target = physical(DataType::Binary, true);
+    let source: ArrayRef = Arc::new(arrow_array::BinaryArray::from(vec![
+        Some(bytes.as_slice()),
+        None,
+    ]));
+    let output = run(
+        &source_type,
+        &target,
+        EvaluatedArgument::Column(&source),
+        Selection::all(2),
+    );
+    let actual = output
+        .as_any()
+        .downcast_ref::<arrow_array::BinaryArray>()
+        .unwrap();
+    assert_eq!(actual.value(0), bytes.as_slice());
+    assert!(actual.is_null(1));
+    let prepared = prepared(&source_type, &target);
+    assert_eq!(
+        prepared.contract().selected().overload.as_str(),
+        super::super::value_conversion::OPAQUE_BINARY
+    );
+    let arguments = [EvaluatedArgument::Column(&source)];
+    let baseline = Control::default();
+    let mut instance = ScalarEvaluationInstance::instantiate(prepared.clone()).unwrap();
+    instance
+        .evaluate(Selection::all(2), &arguments, &baseline)
+        .unwrap();
+    let trace = baseline.trace.lock().unwrap().clone();
+    assert!(!trace.is_empty());
+    for at in 0..trace.len() {
+        for cause in failures() {
+            let control = Control {
+                refusal: Some((at, cause.clone())),
+                ..Default::default()
+            };
+            let mut instance = ScalarEvaluationInstance::instantiate(prepared.clone()).unwrap();
+            assert_eq!(
+                instance
+                    .evaluate(Selection::all(2), &arguments, &control)
+                    .unwrap_err(),
+                cause
+            );
+            assert_eq!(*control.trace.lock().unwrap(), trace[..=at]);
+        }
+    }
+}

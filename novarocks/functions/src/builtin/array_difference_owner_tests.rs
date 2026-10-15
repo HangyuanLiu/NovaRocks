@@ -103,7 +103,10 @@ fn instance(a: &ArrayRef) -> ScalarEvaluationInstance {
     ScalarEvaluationInstance::instantiate(
         prepared_for_test_with_control(
             "array_difference",
-            &[FunctionValueType::new(a.data_type().clone(), true)],
+            &[FunctionValueType::from_legacy_declared_projection(
+                a.data_type().clone(),
+                true,
+            )],
             DecimalOverflowPolicy::OutputNull,
             crate::binding_test_control(),
         )
@@ -112,7 +115,7 @@ fn instance(a: &ArrayRef) -> ScalarEvaluationInstance {
     .unwrap()
 }
 fn list(values: ArrayRef, offsets: Vec<i32>, valid: Option<Vec<bool>>) -> ArrayRef {
-    Arc::new(ListArray::new(
+    let raw: ArrayRef = Arc::new(ListArray::new(
         Arc::new(
             Field::new("source-child", values.data_type().clone(), true)
                 .with_metadata([("nested-proof".into(), "retained".into())].into()),
@@ -120,7 +123,9 @@ fn list(values: ArrayRef, offsets: Vec<i32>, valid: Option<Vec<bool>>) -> ArrayR
         OffsetBuffer::new(offsets.into()),
         values,
         valid.map(NullBuffer::from),
-    ))
+    ));
+    let binding = FunctionValueType::new(raw.data_type().clone(), true);
+    crate::test_value_ingress::array_for_binding(&raw, &binding).unwrap()
 }
 fn ints(a: &ArrayRef) -> Vec<Option<i64>> {
     a.as_any()
@@ -152,7 +157,7 @@ fn array_difference_selected_origin_null_slice_empty_nonzero_pool_and_full_targe
     let selection = Selection::try_sparse(4, &rows).unwrap();
     let args = [EvaluatedArgument::Column(&a)];
     let mut k = instance(&a);
-    let expected_type = k.contract().result_type().data_type.clone();
+    let expected_type = k.contract().result_type().data_type().clone();
     let result = k.evaluate(selection, &args, &Control::default()).unwrap();
     assert!(result.errors().is_empty());
     assert_eq!(result.values().data_type(), &expected_type);
@@ -170,7 +175,7 @@ fn array_difference_selected_origin_null_slice_empty_nonzero_pool_and_full_targe
             .value_offsets(),
         &[0, 3, 3, 5]
     );
-    let ty = FunctionValueType::new(a.data_type().clone(), true);
+    let ty = FunctionValueType::from_legacy_declared_projection(a.data_type().clone(), true);
     let prepared = prepared_for_test_with_policy(
         "array_difference",
         &[ty.clone()],
@@ -258,7 +263,7 @@ fn array_difference_selected_original_decimal_float_cast_and_no_admission_wideni
         DataType::FixedSizeBinary(16),
         DataType::Null,
     ] {
-        let source = FunctionValueType::new(
+        let source = FunctionValueType::from_legacy_declared_projection(
             DataType::List(Arc::new(Field::new("item", item, true))),
             true,
         );
@@ -282,7 +287,7 @@ fn array_difference_selected_original_extreme_panic_or_wrapping_core_and_prepare
     );
     let args = [EvaluatedArgument::Column(&a)];
     let mut k = instance(&a);
-    let target = k.contract().result_type().data_type.clone();
+    let target = k.contract().result_type().data_type().clone();
     let core = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         array_difference_core::difference(&a, Some(&target), 1)
     }));
@@ -359,7 +364,7 @@ fn array_difference_compile_callbacks_preserve_primary_causes_on_success_and_rej
     for name in ["array_difference"] {
         for (source, succeeds) in [
             (
-                FunctionValueType::new(
+                FunctionValueType::from_legacy_declared_projection(
                     DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
                     true,
                 ),

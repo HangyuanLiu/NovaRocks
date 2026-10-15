@@ -65,3 +65,75 @@ fn mem_a1_v2_actual_none_metadata_refusal_uses_existing_task_resource_category()
     // The real metadata diagnostic fits the existing bounded task vocabulary.
     assert_eq!(projected.detail().as_str(), full);
 }
+
+#[test]
+fn read_schema_construction_failure_keeps_resource_and_local_model_categories() {
+    use super::{CompiledPackageError, compiled_package_rejection};
+    use novarocks_plan_codec::physical_package_v2::PackageDecodeError;
+    use novarocks_plan_codec::physical_public_source_schema_v2::PublicSourceSchemaCodecError;
+    use novarocks_plan_codec::physical_read_scan_v2::ReadScanCodecError;
+    use novarocks_type_contract::owned_resources::layout::LayoutResourceError;
+    let execution =
+        QueryExecutionId::new(QueryId::new(97411, 97412), AttemptId::new(1).unwrap()).unwrap();
+    let identity = TaskIdentity::new(
+        execution,
+        StageId::new(1).unwrap(),
+        TaskId::new(1).unwrap(),
+        BackendProcessId::new_v7(),
+    );
+    // The real checked Layout author refuses this array before allocation.
+    let arithmetic = std::alloc::Layout::array::<u64>(usize::MAX)
+        .map_err(|_| LayoutResourceError::Arithmetic)
+        .unwrap_err();
+    for (scan, category) in [
+        (
+            ReadScanCodecError::ConstructionResource(arithmetic),
+            TaskFailureCategory::ResourceExhausted,
+        ),
+        (
+            ReadScanCodecError::InvalidSourceSchema(PublicSourceSchemaCodecError::Layout(
+                arithmetic,
+            )),
+            TaskFailureCategory::ResourceExhausted,
+        ),
+        (
+            ReadScanCodecError::ConstructionResource(LayoutResourceError::SourceModel),
+            TaskFailureCategory::Internal,
+        ),
+        (
+            ReadScanCodecError::InvalidSourceSchema(PublicSourceSchemaCodecError::SourceModel(
+                "locked source model is unavailable",
+            )),
+            TaskFailureCategory::Internal,
+        ),
+    ] {
+        let cause = CompiledPackageError::Decode(PackageDecodeError::Scan(scan));
+        let detail = format!("task {identity} package could not be compiled: {cause}");
+        let projected = compiled_package_rejection(identity, cause);
+        assert_eq!(projected.category(), category);
+        assert_eq!(projected.detail().as_str(), detail);
+    }
+}
+
+#[test]
+fn actual_schema_tracker_refusal_is_projected_as_resource_without_text_inference() {
+    use novarocks_execution::exec::pipeline::operator::input_construction::{
+        ConstructionFailure, InputConstructionRequestHost, runtime::TrackedInputConstructionHost,
+    };
+    use novarocks_execution::runtime::{fragment::ExecutionFailure, mem_tracker::MemTracker};
+    let tracker = MemTracker::new_root("typed schema limit");
+    tracker.install_limit_once(1).unwrap();
+    let host = TrackedInputConstructionHost::new(tracker.clone());
+    let cause = host
+        .request(std::alloc::Layout::array::<u64>(2).unwrap())
+        .unwrap_err();
+    assert!(matches!(&cause, ConstructionFailure::Memory(_)));
+    assert_eq!(tracker.current(), 0, "unconstructed request is balanced");
+    let original = cause.to_string();
+    let failure = ExecutionFailure::from(cause);
+    assert_eq!(failure.to_string(), original);
+    assert_eq!(
+        super::failure_cause_category(failure.cause(), TaskFailureCategory::Execution),
+        TaskFailureCategory::ResourceExhausted
+    );
+}

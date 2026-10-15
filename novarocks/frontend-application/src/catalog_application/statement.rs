@@ -1742,7 +1742,11 @@ mod force_drop_admission_tests {
         fn load_table(
             &self,
             _: ConnectorTableRequest,
-        ) -> Result<ConnectorTableMetadata, ConnectorError> {
+            creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            ConnectorTableMetadata,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
             panic!("unexpected table lookup")
         }
     }
@@ -2477,7 +2481,11 @@ pub(crate) mod external_listing_tests {
         fn load_table(
             &self,
             _: ConnectorTableRequest,
-        ) -> Result<ConnectorTableMetadata, ConnectorError> {
+            creation: &mut novarocks_spi::connector::read_stack::ConnectorReadSchemaCreation<'_>,
+        ) -> Result<
+            ConnectorTableMetadata,
+            novarocks_connector_contract::PureProviderCompileError<ConnectorError>,
+        > {
             unreachable!("listing must not load a table")
         }
     }

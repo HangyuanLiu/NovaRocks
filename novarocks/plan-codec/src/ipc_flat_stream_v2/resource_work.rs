@@ -21,36 +21,37 @@ use super::FlatPoolResourceError;
 use novarocks_type_contract::{CompileCheckpoints, CompileControlError};
 
 pub(crate) trait ResourceWork {
-    fn step(&mut self) -> Result<(), CompileControlError>;
-    fn flush(&mut self) -> Result<(), CompileControlError>;
-    fn requests(&mut self, bytes: usize, count: usize) -> Result<(), CompileControlError>;
+    type Error: From<CompileControlError>
+        + From<FlatPoolResourceError>
+        + From<crate::physical_type_v2::TypeCodecError>;
+    fn step(&mut self) -> Result<(), Self::Error>;
+    fn flush(&mut self) -> Result<(), Self::Error>;
+    fn requests(&mut self, bytes: usize, count: usize) -> Result<(), Self::Error>;
     fn parent(&self) -> bool;
-    fn library_work(&mut self, upper: usize) -> Result<(), CompileControlError>;
-    fn numeric<T>(
-        &self,
-        result: Result<T, FlatPoolResourceError>,
-    ) -> Result<T, FlatPoolResourceError> {
+    fn library_work(&mut self, upper: usize) -> Result<(), Self::Error>;
+    fn numeric<T>(&self, result: Result<T, FlatPoolResourceError>) -> Result<T, Self::Error> {
         if self.parent() {
             result.map_err(|_| CompileControlError::ResourceExhausted.into())
         } else {
-            result
+            result.map_err(Into::into)
         }
     }
 }
 impl ResourceWork for CompileCheckpoints<'_> {
-    fn step(&mut self) -> Result<(), CompileControlError> {
-        CompileCheckpoints::step(self)
+    type Error = FlatPoolResourceError;
+    fn step(&mut self) -> Result<(), Self::Error> {
+        CompileCheckpoints::step(self).map_err(Into::into)
     }
-    fn flush(&mut self) -> Result<(), CompileControlError> {
-        CompileCheckpoints::flush(self)
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        CompileCheckpoints::flush(self).map_err(Into::into)
     }
-    fn requests(&mut self, _: usize, _: usize) -> Result<(), CompileControlError> {
+    fn requests(&mut self, _: usize, _: usize) -> Result<(), Self::Error> {
         Ok(())
     }
     fn parent(&self) -> bool {
         false
     }
-    fn library_work(&mut self, _: usize) -> Result<(), CompileControlError> {
+    fn library_work(&mut self, _: usize) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -66,27 +67,32 @@ pub(crate) struct CapturedWork<'a, 'c, F> {
     pub capture: F,
     pub facts: ResourceCountFacts,
 }
-impl<F: FnMut(ResourceCountFacts) -> Result<(), CompileControlError>> ResourceWork
-    for CapturedWork<'_, '_, F>
+impl<F, E> ResourceWork for CapturedWork<'_, '_, F>
+where
+    F: FnMut(ResourceCountFacts) -> Result<(), E>,
+    E: From<CompileControlError>
+        + From<FlatPoolResourceError>
+        + From<crate::physical_type_v2::TypeCodecError>,
 {
-    fn step(&mut self) -> Result<(), CompileControlError> {
+    type Error = E;
+    fn step(&mut self) -> Result<(), Self::Error> {
         self.facts.observed_work = self
             .facts
             .observed_work
             .checked_add(1)
             .ok_or(CompileControlError::ResourceExhausted)?;
         (self.capture)(self.facts)?;
-        self.work.step()
+        self.work.step().map_err(Into::into)
     }
-    fn flush(&mut self) -> Result<(), CompileControlError> {
-        self.work.flush()
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.work.flush().map_err(Into::into)
     }
-    fn requests(&mut self, bytes: usize, count: usize) -> Result<(), CompileControlError> {
+    fn requests(&mut self, bytes: usize, count: usize) -> Result<(), Self::Error> {
         self.facts.bytes = self.facts.bytes.max(bytes);
         self.facts.count = self.facts.count.max(count);
         (self.capture)(self.facts)
     }
-    fn library_work(&mut self, upper: usize) -> Result<(), CompileControlError> {
+    fn library_work(&mut self, upper: usize) -> Result<(), Self::Error> {
         self.facts.work = self.facts.work.max(upper);
         (self.capture)(self.facts)
     }
@@ -99,16 +105,17 @@ impl<F: FnMut(ResourceCountFacts) -> Result<(), CompileControlError>> ResourceWo
 /// traverses children nor reports synthetic completed operations.
 pub(crate) struct HeaderWork;
 impl ResourceWork for HeaderWork {
-    fn step(&mut self) -> Result<(), CompileControlError> {
+    type Error = FlatPoolResourceError;
+    fn step(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
-    fn flush(&mut self) -> Result<(), CompileControlError> {
+    fn flush(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
-    fn requests(&mut self, _: usize, _: usize) -> Result<(), CompileControlError> {
+    fn requests(&mut self, _: usize, _: usize) -> Result<(), Self::Error> {
         Ok(())
     }
-    fn library_work(&mut self, _: usize) -> Result<(), CompileControlError> {
+    fn library_work(&mut self, _: usize) -> Result<(), Self::Error> {
         Ok(())
     }
     fn parent(&self) -> bool {

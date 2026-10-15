@@ -500,6 +500,7 @@ fn package(
         &expression_uses,
         vec![
             FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,
@@ -509,6 +510,7 @@ fn package(
                 decimal_overflow_policy: DecimalOverflowPolicy::OutputNull,
             },
             FrozenPhysicalCall {
+                materialized_writer_input: None,
                 regexp_count_pattern_source: None,
                 to_base64_byte_source: None,
                 temporal_source: None,

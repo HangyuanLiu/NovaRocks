@@ -22,13 +22,21 @@
 //! - Keep sorting algorithms isolated from operator state transitions.
 
 use crate::exec::chunk::Chunk;
-use crate::exec::chunk::type_compatibility::{check_exact, retag_column};
+#[cfg(test)]
+use crate::exec::chunk::type_compatibility::check_exact;
+#[cfg(test)]
+use crate::exec::chunk::type_compatibility::retag_column;
 use arrow::array::{
-    Array, ArrayRef, Decimal128Array, FixedSizeBinaryArray, Int8Array, ListArray, MapArray,
-    StructArray, UInt64Array,
+    Array, ArrayRef, Decimal128Array, FixedSizeBinaryArray, FixedSizeListArray, Int8Array,
+    LargeListArray, ListArray, MapArray, StructArray, UInt64Array,
 };
-use arrow::compute::{SortColumn, SortOptions, concat_batches};
-use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
+use arrow::compute::{SortColumn, SortOptions};
+#[cfg(test)]
+use arrow::datatypes::Schema;
+#[cfg(test)]
+use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Field, Fields};
+#[cfg(test)]
 use arrow::record_batch::RecordBatch;
 use arrow_buffer::OffsetBuffer;
 use std::sync::Arc;
@@ -37,26 +45,19 @@ use novarocks_types::largeint;
 
 mod chunks_sorter_heap_sort;
 mod chunks_sorter_topn;
+pub(super) mod creation;
 mod sort_processor;
 
 /// Shared sorter abstraction for sort/topn operator implementations.
 pub(crate) trait ChunksSorter: Send + Sync {
-    fn sort_chunks(&self, chunks: &[Chunk]) -> Result<Option<Chunk>, String>;
+    fn sort_chunks(
+        &self,
+        chunks: &[Chunk],
+        creation: &creation::SortCreation<'_>,
+    ) -> crate::runtime::fragment::ExecutionResult<Option<Chunk>>;
 }
 
-pub(crate) fn concat_sort_chunks(chunks: &[Chunk]) -> Result<RecordBatch, String> {
-    if chunks.is_empty() {
-        return Err("sort concat requires non-empty chunks".to_string());
-    }
-    let schema = merged_sort_schema_for_chunks(chunks)?;
-    let batches = chunks
-        .iter()
-        .enumerate()
-        .map(|(idx, chunk)| normalize_sort_batch_for_schema(chunk, &schema, idx))
-        .collect::<Result<Vec<_>, _>>()?;
-    concat_batches(&schema, &batches).map_err(|e| e.to_string())
-}
-
+#[cfg(test)]
 fn sort_field_from_array(field: &Field, array: &ArrayRef) -> Field {
     Field::new(
         field.name(),
@@ -66,6 +67,7 @@ fn sort_field_from_array(field: &Field, array: &ArrayRef) -> Field {
     .with_metadata(field.metadata().clone())
 }
 
+#[cfg(test)]
 pub(crate) fn merged_sort_schema_for_chunks(chunks: &[Chunk]) -> Result<SchemaRef, String> {
     let first_schema = chunks
         .first()
@@ -75,7 +77,7 @@ pub(crate) fn merged_sort_schema_for_chunks(chunks: &[Chunk]) -> Result<SchemaRe
     let mut fields = first_schema
         .fields()
         .iter()
-        .zip(chunks[0].batch.columns().iter())
+        .zip(chunks[0].record_batch().columns().iter())
         .map(|(field, array)| sort_field_from_array(field.as_ref(), array))
         .collect::<Vec<_>>();
     let mut changed = first_schema
@@ -95,7 +97,7 @@ pub(crate) fn merged_sort_schema_for_chunks(chunks: &[Chunk]) -> Result<SchemaRe
         }
         for (idx, expected) in fields.clone().iter().enumerate().take(field_count) {
             let actual = schema.field(idx);
-            let actual = sort_field_from_array(actual, chunk.batch.column(idx));
+            let actual = sort_field_from_array(actual, chunk.record_batch().column(idx));
             if expected.name() != actual.name()
                 || check_exact(expected.data_type(), actual.data_type()).is_err()
             {
@@ -110,7 +112,7 @@ pub(crate) fn merged_sort_schema_for_chunks(chunks: &[Chunk]) -> Result<SchemaRe
             }
             let nullable = expected.is_nullable()
                 || actual.is_nullable()
-                || chunk.batch.column(idx).null_count() > 0;
+                || chunk.record_batch().column(idx).null_count() > 0;
             if nullable != expected.is_nullable() {
                 fields[idx] = expected.clone().with_nullable(nullable);
                 changed = true;
@@ -127,6 +129,7 @@ pub(crate) fn merged_sort_schema_for_chunks(chunks: &[Chunk]) -> Result<SchemaRe
     )))
 }
 
+#[cfg(test)]
 fn normalize_sort_array_for_field(array: &ArrayRef, field: &Field) -> Result<ArrayRef, String> {
     if let Err(mismatch) = check_exact(field.data_type(), array.data_type()) {
         return Err(format!(
@@ -148,21 +151,22 @@ fn normalize_sort_array_for_field(array: &ArrayRef, field: &Field) -> Result<Arr
     })
 }
 
+#[cfg(test)]
 pub(crate) fn normalize_sort_batch_for_schema(
     chunk: &Chunk,
     schema: &SchemaRef,
     chunk_index: usize,
 ) -> Result<RecordBatch, String> {
-    if chunk.batch.num_columns() != schema.fields().len() {
+    if chunk.record_batch().num_columns() != schema.fields().len() {
         return Err(format!(
             "sort chunk column count mismatch at index {}: batch_columns={} schema_fields={}",
             chunk_index,
-            chunk.batch.num_columns(),
+            chunk.record_batch().num_columns(),
             schema.fields().len()
         ));
     }
     let columns = chunk
-        .batch
+        .record_batch()
         .columns()
         .iter()
         .zip(schema.fields().iter())
@@ -176,9 +180,126 @@ pub(crate) fn normalize_sort_batch_for_schema(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn normalize_sort_key_array(values: &ArrayRef) -> Result<ArrayRef, String> {
+    normalize_sort_key_array_body::<String>(
+        values,
+        SortKeyDeclaration::LegacyExpansion,
+        &mut |_| Ok(()),
+    )
+}
+
+pub(crate) enum SortKeyConstruction<'a> {
+    ArrayHeader(&'a DataType),
+    ArrayTable(usize),
+    FieldTable(usize),
+    SharedFields(usize),
+    BufferAdoption,
+    Field {
+        source: &'a Field,
+        target: &'a DataType,
+    },
+    Type(&'a DataType),
+    Work(usize),
+}
+
+enum SortKeyTypeCheckFailure<E> {
+    Declaration(novarocks_type_contract::ExecutionValueTypeError),
+    Observer(E),
+}
+impl<E> From<novarocks_type_contract::ExecutionValueTypeError> for SortKeyTypeCheckFailure<E> {
+    fn from(error: novarocks_type_contract::ExecutionValueTypeError) -> Self {
+        Self::Declaration(error)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SortKeyDeclaration<'a> {
+    Value(&'a novarocks_type_contract::ValueTypeRef),
+    // Map entries are a physical Struct wrapper, not an independently authored
+    // semantic Struct. Borrow the two real anonymous Map roles directly.
+    MapEntries(
+        &'a novarocks_type_contract::ValueTypeRef,
+        &'a novarocks_type_contract::ValueTypeRef,
+    ),
+    #[cfg(test)]
+    LegacyExpansion,
+}
+impl<'a> SortKeyDeclaration<'a> {
+    fn child(self, index: usize) -> Result<Self, String> {
+        match self {
+            Self::Value(value) => value
+                .child_type_at(index)
+                .map(Self::Value)
+                .ok_or_else(|| "typed sort key is missing a declared semantic child".to_owned()),
+            Self::MapEntries(key, _) if index == 0 => Ok(Self::Value(key)),
+            Self::MapEntries(_, value) if index == 1 => Ok(Self::Value(value)),
+            Self::MapEntries(..) => {
+                Err("typed Map sort key has an undeclared entries child".to_owned())
+            }
+            #[cfg(test)]
+            Self::LegacyExpansion => Ok(Self::LegacyExpansion),
+        }
+    }
+    fn map_entries(self) -> Result<Self, String> {
+        match self {
+            Self::Value(value) => match value.kind() {
+                novarocks_type_contract::ValueKind::Map { key, value } => {
+                    Ok(Self::MapEntries(key, value))
+                }
+                _ => Err("typed Map sort key has no complete Map declaration".to_owned()),
+            },
+            #[cfg(test)]
+            Self::LegacyExpansion => Ok(Self::LegacyExpansion),
+            _ => Err("typed Map sort key has a physical wrapper as its declaration".to_owned()),
+        }
+    }
+    fn is_largeint(self, _carrier: &DataType) -> bool {
+        match self {
+            Self::Value(value) => {
+                value.domain() == Some(novarocks_type_contract::ValueLogicalType::LargeInt)
+            }
+            Self::MapEntries(..) => false,
+            #[cfg(test)]
+            Self::LegacyExpansion => largeint::is_largeint_data_type(_carrier),
+        }
+    }
+}
+
+/// The original key normalization body with observations before its real
+/// public structure constructors. Existing decoded payload algorithms stay
+/// here; their allocator/accounting is not replaced by this header observer.
+pub(crate) fn normalize_sort_key_array_observed<E: From<String>>(
+    values: &ArrayRef,
+    declared: Option<&novarocks_type_contract::ValueTypeRef>,
+    observe: &mut impl FnMut(SortKeyConstruction<'_>) -> Result<(), E>,
+) -> Result<ArrayRef, E> {
+    let declared = declared.ok_or_else(|| {
+        E::from("typed sort key is missing its complete value declaration".to_owned())
+    })?;
+    novarocks_type_contract::validate_value_layout_observed::<SortKeyTypeCheckFailure<E>>(
+        declared,
+        values.data_type(),
+        |units| {
+            observe(SortKeyConstruction::Work(units)).map_err(SortKeyTypeCheckFailure::Observer)
+        },
+    )
+    .map_err(|cause| match cause {
+        SortKeyTypeCheckFailure::Declaration(error) => E::from(error.to_string()),
+        SortKeyTypeCheckFailure::Observer(error) => error,
+    })?;
+    normalize_sort_key_array_body(values, SortKeyDeclaration::Value(declared), observe)
+}
+
+fn normalize_sort_key_array_body<E: From<String>>(
+    values: &ArrayRef,
+    declaration: SortKeyDeclaration<'_>,
+    observe: &mut impl FnMut(SortKeyConstruction<'_>) -> Result<(), E>,
+) -> Result<ArrayRef, E> {
     match values.data_type() {
         DataType::Null => {
+            observe(SortKeyConstruction::BufferAdoption)?;
+            observe(SortKeyConstruction::ArrayHeader(&DataType::Int8))?;
             return Ok(Arc::new(Int8Array::from(vec![None::<i8>; values.len()])) as ArrayRef);
         }
         DataType::List(field) => {
@@ -186,15 +307,22 @@ pub(crate) fn normalize_sort_key_array(values: &ArrayRef) -> Result<ArrayRef, St
                 .as_any()
                 .downcast_ref::<ListArray>()
                 .ok_or_else(|| "LIST sort key is not ListArray".to_string())?;
-            let normalized_values = normalize_sort_key_array(list.values())?;
+            let normalized_values =
+                normalize_sort_key_array_body(list.values(), declaration.child(0)?, observe)?;
             if normalized_values.data_type() == list.values().data_type() {
                 return Ok(values.clone());
             }
+            observe(SortKeyConstruction::Field {
+                source: field,
+                target: normalized_values.data_type(),
+            })?;
             let normalized_field = Arc::new(Field::new(
                 field.name(),
                 normalized_values.data_type().clone(),
                 field.is_nullable(),
             ));
+            observe(SortKeyConstruction::ArrayHeader(values.data_type()))?;
+            observe(SortKeyConstruction::BufferAdoption)?;
             let normalized = ListArray::new(
                 normalized_field,
                 OffsetBuffer::new(list.value_offsets().to_vec().into()),
@@ -203,34 +331,96 @@ pub(crate) fn normalize_sort_key_array(values: &ArrayRef) -> Result<ArrayRef, St
             );
             return Ok(Arc::new(normalized) as ArrayRef);
         }
+        DataType::LargeList(field) => {
+            let list = values
+                .as_any()
+                .downcast_ref::<LargeListArray>()
+                .ok_or_else(|| "LARGE LIST sort key is not LargeListArray".to_owned())?;
+            let normalized_values =
+                normalize_sort_key_array_body(list.values(), declaration.child(0)?, observe)?;
+            if normalized_values.data_type() == list.values().data_type() {
+                return Ok(values.clone());
+            }
+            observe(SortKeyConstruction::Field {
+                source: field,
+                target: normalized_values.data_type(),
+            })?;
+            let normalized_field = Arc::new(Field::new(
+                field.name(),
+                normalized_values.data_type().clone(),
+                field.is_nullable(),
+            ));
+            observe(SortKeyConstruction::ArrayHeader(values.data_type()))?;
+            observe(SortKeyConstruction::BufferAdoption)?;
+            return Ok(Arc::new(LargeListArray::new(
+                normalized_field,
+                OffsetBuffer::new(list.value_offsets().to_vec().into()),
+                normalized_values,
+                list.nulls().cloned(),
+            )) as ArrayRef);
+        }
+        DataType::FixedSizeList(field, width) => {
+            let list = values
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| "FIXED LIST sort key is not FixedSizeListArray".to_owned())?;
+            let normalized_values =
+                normalize_sort_key_array_body(list.values(), declaration.child(0)?, observe)?;
+            if normalized_values.data_type() == list.values().data_type() {
+                return Ok(values.clone());
+            }
+            observe(SortKeyConstruction::Field {
+                source: field,
+                target: normalized_values.data_type(),
+            })?;
+            let normalized_field = Arc::new(Field::new(
+                field.name(),
+                normalized_values.data_type().clone(),
+                field.is_nullable(),
+            ));
+            observe(SortKeyConstruction::ArrayHeader(values.data_type()))?;
+            return Ok(Arc::new(FixedSizeListArray::new(
+                normalized_field,
+                *width,
+                normalized_values,
+                list.nulls().cloned(),
+            )) as ArrayRef);
+        }
         DataType::Struct(fields) => {
             let struct_arr = values
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| "STRUCT sort key is not StructArray".to_string())?;
             let mut changed = false;
+            observe(SortKeyConstruction::ArrayTable(struct_arr.num_columns()))?;
             let mut normalized_columns = Vec::with_capacity(struct_arr.num_columns());
-            for column in struct_arr.columns() {
-                let normalized = normalize_sort_key_array(column)?;
+            for (index, column) in struct_arr.columns().iter().enumerate() {
+                let normalized =
+                    normalize_sort_key_array_body(column, declaration.child(index)?, observe)?;
                 changed |= normalized.data_type() != column.data_type();
                 normalized_columns.push(normalized);
             }
             if !changed {
                 return Ok(values.clone());
             }
-            let normalized_fields = Fields::from(
-                fields
-                    .iter()
-                    .zip(normalized_columns.iter())
-                    .map(|(field, column)| {
-                        Arc::new(Field::new(
-                            field.name(),
-                            column.data_type().clone(),
-                            field.is_nullable(),
-                        ))
-                    })
-                    .collect::<Vec<_>>(),
-            );
+            observe(SortKeyConstruction::FieldTable(normalized_columns.len()))?;
+            let mut normalized_fields = Vec::with_capacity(normalized_columns.len());
+            for (field, column) in fields.iter().zip(&normalized_columns) {
+                observe(SortKeyConstruction::Field {
+                    source: field,
+                    target: column.data_type(),
+                })?;
+                normalized_fields.push(Arc::new(Field::new(
+                    field.name(),
+                    column.data_type().clone(),
+                    field.is_nullable(),
+                )));
+            }
+            // Conversion to the original shared Fields backing is a separate
+            // public constructor from the temporary FieldRef vector.
+            observe(SortKeyConstruction::SharedFields(normalized_columns.len()))?;
+            let normalized_fields = Fields::from(normalized_fields);
+            observe(SortKeyConstruction::ArrayHeader(values.data_type()))?;
             let normalized = StructArray::new(
                 normalized_fields,
                 normalized_columns,
@@ -243,21 +433,31 @@ pub(crate) fn normalize_sort_key_array(values: &ArrayRef) -> Result<ArrayRef, St
                 .as_any()
                 .downcast_ref::<MapArray>()
                 .ok_or_else(|| "MAP sort key is not MapArray".to_string())?;
+            observe(SortKeyConstruction::ArrayTable(map.entries().num_columns()))?;
+            observe(SortKeyConstruction::ArrayHeader(map.entries().data_type()))?;
             let entries = Arc::new(map.entries().clone()) as ArrayRef;
-            let normalized_entries = normalize_sort_key_array(&entries)?;
+            let normalized_entries =
+                normalize_sort_key_array_body(&entries, declaration.map_entries()?, observe)?;
             if normalized_entries.data_type() == entries.data_type() {
                 return Ok(values.clone());
             }
+            observe(SortKeyConstruction::ArrayTable(map.entries().num_columns()))?;
             let normalized_entries = normalized_entries
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| "normalized MAP entries sort key is not StructArray".to_string())?
                 .clone();
+            observe(SortKeyConstruction::Field {
+                source: entries_field,
+                target: normalized_entries.data_type(),
+            })?;
             let normalized_field = Arc::new(Field::new(
                 entries_field.name(),
                 DataType::Struct(normalized_entries.fields().clone()),
                 entries_field.is_nullable(),
             ));
+            observe(SortKeyConstruction::ArrayHeader(values.data_type()))?;
+            observe(SortKeyConstruction::BufferAdoption)?;
             let normalized = MapArray::new(
                 normalized_field,
                 OffsetBuffer::new(map.value_offsets().to_vec().into()),
@@ -270,7 +470,7 @@ pub(crate) fn normalize_sort_key_array(values: &ArrayRef) -> Result<ArrayRef, St
         _ => {}
     }
 
-    if !largeint::is_largeint_data_type(values.data_type()) {
+    if !declaration.is_largeint(values.data_type()) {
         return Ok(values.clone());
     }
     let array = values
@@ -278,15 +478,16 @@ pub(crate) fn normalize_sort_key_array(values: &ArrayRef) -> Result<ArrayRef, St
         .downcast_ref::<FixedSizeBinaryArray>()
         .ok_or_else(|| "LARGEINT sort key is not FixedSizeBinaryArray".to_string())?;
     if array.value_length() != largeint::LARGEINT_BYTE_WIDTH {
-        return Err(format!(
+        return Err(E::from(format!(
             "LARGEINT sort key width mismatch: expected {}, got {}",
             largeint::LARGEINT_BYTE_WIDTH,
             array.value_length()
-        ));
+        )));
     }
 
     let mut decoded = Vec::with_capacity(array.len());
     for row in 0..array.len() {
+        observe(SortKeyConstruction::Work(1))?;
         if array.is_null(row) {
             decoded.push(None);
         } else {
@@ -294,17 +495,50 @@ pub(crate) fn normalize_sort_key_array(values: &ArrayRef) -> Result<ArrayRef, St
         }
     }
 
+    observe(SortKeyConstruction::ArrayHeader(&DataType::Decimal128(
+        38, 0,
+    )))?;
+    observe(SortKeyConstruction::BufferAdoption)?;
     let decimal = Decimal128Array::from(decoded)
         .with_precision_and_scale(38, 0)
         .map_err(|e| format!("normalize LARGEINT sort key failed: {e}"))?;
     Ok(Arc::new(decimal) as ArrayRef)
 }
 
+#[cfg(test)]
 pub(crate) fn append_stable_row_index_sort_column(
     sort_columns: &mut Vec<SortColumn>,
     num_rows: usize,
 ) {
+    append_stable_row_index_sort_column_observed(sort_columns, num_rows, &mut |_| Ok(())).unwrap()
+}
+
+pub(crate) enum StableIndexConstruction {
+    ArrayHeader,
+    ColumnGrowth(std::alloc::Layout),
+    BufferAdoption,
+}
+
+pub(crate) fn append_stable_row_index_sort_column_observed(
+    sort_columns: &mut Vec<SortColumn>,
+    num_rows: usize,
+    observe: &mut impl FnMut(
+        StableIndexConstruction,
+    ) -> Result<(), crate::exec::pipeline::operator::ConstructionFailure>,
+) -> Result<(), crate::exec::pipeline::operator::ConstructionFailure> {
+    // The original UInt64 row-id payload remains its existing owner. Only the
+    // newly adopted Buffer header and public Array Arc belong to this seam.
+    observe(StableIndexConstruction::BufferAdoption)?;
+    observe(StableIndexConstruction::ArrayHeader)?;
     let row_ids = UInt64Array::from_iter_values((0..num_rows).map(|idx| idx as u64));
+    let growth = novarocks_type_contract::owned_resources::vec::push_growth(sort_columns)
+        .map_err(|cause| match cause {
+            novarocks_type_contract::ControlResourceError::Control(cause) => crate::exec::pipeline::operator::ConstructionFailure::Control(cause),
+            novarocks_type_contract::ControlResourceError::SourceModel(_) => crate::exec::pipeline::operator::ConstructionFailure::Resource(novarocks_type_contract::owned_resources::layout::LayoutResourceError::SourceModel),
+        })?;
+    if let Some(layout) = growth.requested_backing {
+        observe(StableIndexConstruction::ColumnGrowth(layout))?;
+    }
     sort_columns.push(SortColumn {
         values: Arc::new(row_ids) as ArrayRef,
         options: Some(SortOptions {
@@ -312,6 +546,7 @@ pub(crate) fn append_stable_row_index_sort_column(
             nulls_first: true,
         }),
     });
+    Ok(())
 }
 
 pub(crate) use chunks_sorter_heap_sort::ChunksSorterHeapSort;
@@ -432,4 +667,226 @@ mod tests {
 
         assert_eq!(actual, vec![0, 1, 2]);
     }
+    fn fixed16_values() -> ArrayRef {
+        Arc::new(
+            FixedSizeBinaryArray::try_from_iter([-1i128, 0, 1].into_iter().map(i128::to_be_bytes))
+                .unwrap(),
+        )
+    }
+    fn semantic(kind: novarocks_type_contract::ValueKind) -> novarocks_type_contract::ValueTypeRef {
+        novarocks_type_contract::ValueTypeRef::try_new(
+            kind,
+            false,
+            novarocks_type_contract::ValueTypeStorageLifetime::pure(),
+        )
+        .unwrap()
+    }
+    fn normalize_declared(
+        values: &ArrayRef,
+        ty: &novarocks_type_contract::ValueTypeRef,
+    ) -> ArrayRef {
+        normalize_sort_key_array_observed::<String>(values, Some(ty), &mut |_| Ok(())).unwrap()
+    }
+    fn actual_sort_order(values: ArrayRef) -> Vec<u32> {
+        let indices = lexsort_to_indices(
+            &[SortColumn {
+                values,
+                options: Some(SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                }),
+            }],
+            None,
+        )
+        .unwrap();
+        indices.values().to_vec()
+    }
+    #[test]
+    fn typed_sort_fixed16_plain_and_uuid_remain_bytes_while_largeint_is_signed() {
+        use novarocks_type_contract::{ValueKind, ValueLogicalType};
+        let array = fixed16_values();
+        for kind in [
+            ValueKind::Scalar(DataType::FixedSizeBinary(16)),
+            ValueKind::Nominal(ValueLogicalType::Uuid),
+        ] {
+            let declared = semantic(kind);
+            let normalized = normalize_declared(&array, &declared);
+            assert!(Arc::ptr_eq(&normalized, &array));
+            assert_eq!(actual_sort_order(normalized), vec![1, 2, 0]);
+        }
+        let largeint = semantic(ValueKind::Nominal(ValueLogicalType::LargeInt));
+        let normalized = normalize_declared(&array, &largeint);
+        assert_eq!(normalized.data_type(), &DataType::Decimal128(38, 0));
+        assert_eq!(actual_sort_order(normalized), vec![0, 1, 2]);
+    }
+    #[test]
+    fn typed_sort_nested_struct_list_and_map_borrow_actual_semantic_children() {
+        use novarocks_type_contract::{
+            ValueField, ValueKind, ValueLogicalType, ValueTypeStorageLifetime,
+        };
+        let storage = ValueTypeStorageLifetime::pure();
+        let largeint = semantic(ValueKind::Nominal(ValueLogicalType::LargeInt));
+        let uuid = semantic(ValueKind::Nominal(ValueLogicalType::Uuid));
+        let plain = semantic(ValueKind::Scalar(DataType::FixedSizeBinary(16)));
+        let array = fixed16_values();
+        let fields = Fields::from(vec![
+            Arc::new(Field::new("signed", DataType::FixedSizeBinary(16), false)),
+            Arc::new(Field::new("uuid", DataType::FixedSizeBinary(16), false)),
+            Arc::new(Field::new("bytes", DataType::FixedSizeBinary(16), false)),
+        ]);
+        let structure = Arc::new(StructArray::new(
+            fields,
+            vec![array.clone(), array.clone(), array.clone()],
+            None,
+        )) as ArrayRef;
+        let declared = semantic(ValueKind::Struct(
+            vec![
+                ValueField::new("signed", largeint.clone(), storage.clone()),
+                ValueField::new("uuid", uuid.clone(), storage.clone()),
+                ValueField::new("bytes", plain, storage),
+            ]
+            .into_boxed_slice(),
+        ));
+        let normalized = normalize_declared(&structure, &declared);
+        let result = normalized.as_any().downcast_ref::<StructArray>().unwrap();
+        assert_eq!(result.column(0).data_type(), &DataType::Decimal128(38, 0));
+        assert!(Arc::ptr_eq(result.column(1), &array));
+        assert!(Arc::ptr_eq(result.column(2), &array));
+        assert!(
+            result
+                .fields()
+                .iter()
+                .all(|field| field.metadata().capacity() == 0)
+        );
+        assert_eq!(actual_sort_order(normalized), vec![0, 1, 2]);
+        for (child, order) in [(largeint.clone(), vec![0, 1, 2]), (uuid, vec![1, 2, 0])] {
+            let values = Arc::new(ListArray::new(
+                Arc::new(Field::new("item", DataType::FixedSizeBinary(16), false)),
+                OffsetBuffer::new(vec![0i32, 1, 2, 3].into()),
+                array.clone(),
+                None,
+            )) as ArrayRef;
+            let declared = semantic(ValueKind::List(child));
+            assert_eq!(
+                actual_sort_order(normalize_declared(&values, &declared)),
+                order
+            );
+        }
+        let entries = StructArray::new(
+            Fields::from(vec![
+                Arc::new(Field::new("key", DataType::Utf8, false)),
+                Arc::new(Field::new("value", DataType::FixedSizeBinary(16), false)),
+            ]),
+            vec![Arc::new(StringArray::from(vec!["a", "a", "a"])), array],
+            None,
+        );
+        let map = Arc::new(MapArray::new(
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+            OffsetBuffer::new(vec![0i32, 1, 2, 3].into()),
+            entries,
+            None,
+            false,
+        )) as ArrayRef;
+        let declared = semantic(ValueKind::Map {
+            key: semantic(ValueKind::String),
+            value: largeint,
+        });
+        let normalized = normalize_declared(&map, &declared);
+        let result = normalized.as_any().downcast_ref::<MapArray>().unwrap();
+        assert_eq!(
+            result.entries().column(1).data_type(),
+            &DataType::Decimal128(38, 0)
+        );
+        assert_eq!(
+            actual_sort_order(result.entries().column(1).clone()),
+            vec![0, 1, 2]
+        );
+        assert_eq!(result.value_offsets(), &[0, 1, 2, 3]);
+    }
+    #[test]
+    fn typed_sort_missing_declaration_and_original_observer_refusal_have_no_tail() {
+        use novarocks_type_contract::{ValueKind, ValueLogicalType};
+        #[derive(Debug)]
+        enum Failure {
+            Declaration(String),
+            Caller(Arc<u32>),
+        }
+        impl From<String> for Failure {
+            fn from(value: String) -> Self {
+                Self::Declaration(value)
+            }
+        }
+        let values = fixed16_values();
+        let mut seen = 0;
+        let missing = normalize_sort_key_array_observed::<Failure>(&values, None, &mut |_| {
+            seen += 1;
+            Ok(())
+        });
+        assert!(
+            matches!(missing,Err(Failure::Declaration(message)) if message.contains("missing its complete value declaration"))
+        );
+        assert_eq!(seen, 0);
+        let declared = semantic(ValueKind::Nominal(ValueLogicalType::LargeInt));
+        let mut total = 0;
+        normalize_sort_key_array_observed::<Failure>(&values, Some(&declared), &mut |_| {
+            total += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert!(total > 0);
+        let cause = Arc::new(17);
+        for refused in 0..total {
+            let mut seen = 0;
+            let result =
+                normalize_sort_key_array_observed::<Failure>(&values, Some(&declared), &mut |_| {
+                    let boundary = seen;
+                    seen += 1;
+                    if boundary == refused {
+                        Err(Failure::Caller(cause.clone()))
+                    } else {
+                        Ok(())
+                    }
+                });
+            match result {
+                Err(Failure::Caller(original)) => assert!(Arc::ptr_eq(&original, &cause)),
+                other => panic!("wrong caller cause: {other:?}"),
+            }
+            assert_eq!(seen, refused + 1);
+        }
+    }
+    #[test]
+    fn typed_sort_large_and_fixed_lists_keep_uuid_bytes_and_normalize_declared_largeint() {
+        use novarocks_type_contract::{ValueKind, ValueLogicalType};
+        for (domain, expected) in [
+            (ValueLogicalType::LargeInt, vec![0, 1, 2]),
+            (ValueLogicalType::Uuid, vec![1, 2, 0]),
+        ] {
+            let child = semantic(ValueKind::Nominal(domain));
+            let array = fixed16_values();
+            let field = Arc::new(Field::new("item", DataType::FixedSizeBinary(16), false));
+            let large = Arc::new(LargeListArray::new(
+                field.clone(),
+                OffsetBuffer::new(vec![0i64, 1, 2, 3].into()),
+                array.clone(),
+                None,
+            )) as ArrayRef;
+            let large_type = semantic(ValueKind::List(child.clone()));
+            assert_eq!(
+                actual_sort_order(normalize_declared(&large, &large_type)),
+                expected
+            );
+            let fixed = Arc::new(FixedSizeListArray::new(field, 1, array, None)) as ArrayRef;
+            let fixed_type = semantic(ValueKind::FixedSizeList {
+                item: child,
+                length: 1,
+            });
+            assert_eq!(
+                actual_sort_order(normalize_declared(&fixed, &fixed_type)),
+                expected
+            );
+        }
+    }
 }
+
+#[cfg(test)]
+mod typed_sort_owner_tests;

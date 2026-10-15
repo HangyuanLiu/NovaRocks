@@ -70,13 +70,15 @@ use crate::fragment_scan_decode::{
 ///
 /// Native scan carrier validation and Worker source assembly share this one
 /// adapter boundary. Backend plan traversal receives only the lowered node.
-pub fn lower_scan_node(
+pub(crate) fn lower_scan_node(
     node: &plan::DistributedNode,
     _physical: &plan::PlanNode,
     scan: &plan::ScanNode,
     path: FieldPath,
     ctx: &NativePlanDecodeContext,
     arena: &mut ExprArena,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<DecodedNode, NativeFragmentDecodeError> {
     if !scan.dict_columns.is_empty() {
         return Err(NativeFragmentDecodeError::unsupported(
@@ -101,11 +103,12 @@ pub fn lower_scan_node(
     })?;
     let source_path = path.clone().field("table").field("source");
     let output_columns =
-        crate::fragment_scan_output::decode_scan_output_columns(scan, path.clone())?;
+        crate::fragment_scan_output::decode_scan_output_columns(scan, path.clone(), type_decoder)?;
     let variant_path_plan = crate::fragment_variant_path::parse_native_scan_variant_path_columns(
         scan,
         table,
         output_columns.columns(),
+        type_decoder,
     )
     .map_err(|error| error.into_native(path.clone()))?;
     match source {
@@ -117,6 +120,7 @@ pub fn lower_scan_node(
             &variant_path_plan,
             ctx,
             arena,
+            type_decoder,
         )
         .map_err(|error| error.into_native(source_path.field("typed_connector_read"))),
     }
@@ -131,6 +135,8 @@ fn lower_typed_connector_scan(
     variant_path_plan: &NativeVariantPathPlan,
     ctx: &NativePlanDecodeContext,
     arena: &mut ExprArena,
+
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<DecodedNode, NativeFragmentLeafDecodeError> {
     // One parse, and the only one: presence, bounds, known enums, uniqueness,
     // and the carrier's cross-field rules are the protocol layer's contract.
@@ -169,8 +175,13 @@ fn lower_typed_connector_scan(
     check_assignments_match_read_columns(&scan_source, &read_slot_ids)?;
     let layout = output_columns.layout();
     let output_schema = output_columns.output_schema();
-    let output_materialization =
-        output_materialization(&read_slot_ids, &output_schema, variant_path_plan)?;
+    let output_materialization = output_materialization(
+        scan,
+        &read_slot_ids,
+        &output_schema,
+        variant_path_plan,
+        type_decoder,
+    )?;
 
     let mut inputs = typed_scan_runtime_inputs(ctx)?;
     let execution_id = inputs.runtime.execution_id();
@@ -233,7 +244,7 @@ fn lower_typed_connector_scan(
             )
         })?;
 
-    let predicate = lower_scan_predicate(scan, arena, &layout)?;
+    let predicate = lower_scan_predicate(scan, arena, &layout, type_decoder)?;
     // `slot_ids[i]` names page channel `i`, and a page channel exists for each
     // assignment, so both lanes are handed the connector's read column list
     // rather than the node's output schema. Whatever separates the two is the
@@ -588,7 +599,7 @@ fn connector_read_slot_ids(
     let variant_source_slot_ids = variant_path_plan
         .specs
         .iter()
-        .map(|spec| spec.source_read_slot_id)
+        .map(|spec| spec.source_read_slot_id())
         .collect::<std::collections::HashSet<_>>();
     // A query can project a regular column beside a derived VARIANT path while
     // omitting the physical VARIANT source from its output. The source still
@@ -636,10 +647,12 @@ fn check_assignments_match_read_columns(
 /// A scan that projects a VARIANT path reads only the physical source column
 /// and derives the synthetic one after the read, which is the same derivation
 /// the opaque carrier attaches to its reader.
-fn output_materialization(
+pub(crate) fn output_materialization(
+    scan: &plan::ScanNode,
     read_slot_ids: &[SlotId],
     output_schema: &ChunkSchemaRef,
     variant_path_plan: &NativeVariantPathPlan,
+    type_decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
 ) -> Result<Option<Arc<dyn ConnectorBatchTransform>>, NativeFragmentLeafDecodeError> {
     if variant_path_plan.specs.is_empty() {
         // No derived column exists, so nothing can rebuild one column list into
@@ -659,11 +672,197 @@ fn output_materialization(
         return Ok(None);
     }
     validate_variant_path_read_slots(&variant_path_plan.specs, read_slot_ids, "assignments")?;
-    Ok(Some(Arc::new(ConnectorVariantPathTransform::new(
-        read_slot_ids.to_vec(),
-        output_schema,
-        variant_path_plan.specs.clone(),
-    ))))
+    let read_schema = frozen_variant_read_schema(scan, read_slot_ids, type_decoder)
+        .map_err(NativeFragmentLeafDecodeError::from)?;
+    use crate::native_type_construction::NativeTypeConstructionError;
+    use novarocks_type_contract::owned_resources::layout::arc_layout;
+    let transform = match type_decoder {
+        crate::fragment_type_decode::NativeTypeDecoder::Strong { resources, .. } => {
+            resources.work.flush().map_err(|cause| {
+                NativeFragmentLeafDecodeError::from(
+                    crate::fragment_error::NativeFragmentDecodeError::from(
+                        NativeTypeConstructionError::Control(cause),
+                    ),
+                )
+            })?;
+            let scope = resources.creation.begin_scope().map_err(|cause| {
+                NativeFragmentLeafDecodeError::from(
+                    crate::fragment_error::NativeFragmentDecodeError::from(cause),
+                )
+            })?;
+            let mut request = |layout| scope.request_layout(layout);
+            let mut work = |units| {
+                for _ in 0..units {
+                    resources
+                        .work
+                        .step()
+                        .map_err(NativeTypeConstructionError::Control)?;
+                }
+                resources
+                    .work
+                    .flush()
+                    .map_err(NativeTypeConstructionError::Control)
+            };
+            work(1).map_err(|cause| {
+                NativeFragmentLeafDecodeError::from(
+                    crate::fragment_error::NativeFragmentDecodeError::from(cause),
+                )
+            })?;
+            let transform = ConnectorVariantPathTransform::try_new_observed(
+                Arc::clone(&read_schema),
+                Arc::clone(output_schema),
+                &variant_path_plan.specs,
+                scope.storage_lifetime(),
+                &mut request,
+                &mut work,
+            )
+            .map_err(|cause| {
+                NativeFragmentLeafDecodeError::from(
+                    crate::fragment_error::NativeFragmentDecodeError::from(cause),
+                )
+            })?;
+            let layout = arc_layout(std::alloc::Layout::new::<ConnectorVariantPathTransform>())
+                .map_err(|cause| {
+                    NativeFragmentLeafDecodeError::from(
+                        crate::fragment_error::NativeFragmentDecodeError::from(
+                            NativeTypeConstructionError::Resource(cause),
+                        ),
+                    )
+                })?;
+            scope.request_layout(layout).map_err(|cause| {
+                NativeFragmentLeafDecodeError::from(
+                    crate::fragment_error::NativeFragmentDecodeError::from(cause),
+                )
+            })?;
+            transform
+        }
+    };
+    Ok(Some(Arc::new(transform)))
+}
+
+/// Freeze the connector's actual page-channel order from the original scan
+/// bindings. Output SlotId sorting and provider Array types cannot author it.
+fn frozen_variant_read_schema(
+    scan: &plan::ScanNode,
+    read_slot_ids: &[SlotId],
+    decoder: &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
+) -> Result<ChunkSchemaRef, crate::fragment_error::NativeFragmentDecodeError> {
+    use crate::fragment_error::NativeFragmentDecodeError as Error;
+    use crate::native_type_construction::NativeTypeConstructionError;
+    use novarocks_type_contract::owned_resources::layout::{LayoutResourceError, arc_layout};
+    let creation = match &*decoder {
+        crate::fragment_type_decode::NativeTypeDecoder::Strong { resources, .. } => {
+            resources.creation
+        }
+    };
+    let scope = creation.begin_scope()?;
+    let slots_layout =
+        std::alloc::Layout::array::<novarocks_execution::exec::chunk::ChunkSlotSchema>(
+            read_slot_ids.len(),
+        )
+        .map_err(|_| NativeTypeConstructionError::Resource(LayoutResourceError::Arithmetic))?;
+    scope.request_layout(slots_layout)?;
+    let mut slots = Vec::with_capacity(read_slot_ids.len());
+    let mut cursor = 0usize;
+    for (ordinal, slot_id) in read_slot_ids.iter().enumerate() {
+        let column = loop {
+            let column = scan.columns.get(cursor).ok_or_else(|| {
+                Error::missing(
+                    FieldPath::root("scan").field("columns").index(ordinal),
+                    "read slot has no original ordered scan declaration",
+                )
+            })?;
+            {
+                let crate::fragment_type_decode::NativeTypeDecoder::Strong { resources, .. } =
+                    decoder;
+                resources
+                    .work
+                    .step()
+                    .map_err(NativeTypeConstructionError::Control)?;
+            }
+            cursor += 1;
+            if SlotId::new(column.column_id) == *slot_id {
+                break column;
+            }
+        };
+        let desc = column.r#type.as_ref().ok_or_else(|| {
+            Error::missing(
+                FieldPath::root("scan")
+                    .field("columns")
+                    .index(ordinal)
+                    .field("type"),
+                "read scan column type is absent",
+            )
+        })?;
+        let binding = decoder
+            .value_type(
+                desc,
+                FieldPath::root("scan")
+                    .field("columns")
+                    .index(ordinal)
+                    .field("type"),
+            )?
+            .ok_or_else(|| {
+                Error::missing(
+                    FieldPath::root("scan")
+                        .field("columns")
+                        .index(ordinal)
+                        .field("type"),
+                    "complete read binding is absent",
+                )
+            })?;
+        if binding.nullable() != column.nullable {
+            return Err(Error::inconsistent(
+                FieldPath::root("scan")
+                    .field("columns")
+                    .index(ordinal)
+                    .field("nullable"),
+                "read column nullability differs from its original complete binding",
+            ));
+        }
+        {
+            let crate::fragment_type_decode::NativeTypeDecoder::Strong { resources, .. } = decoder;
+            let slot = crate::fragment_layout::slot_schema_from_binding_typed_observed(
+                *slot_id,
+                &column.name,
+                binding.typed_binding(),
+                None,
+                &FieldPath::root("scan").field("columns").index(ordinal),
+                scope.storage_lifetime(),
+                &mut |layout| scope.request(layout),
+                &mut resources.work,
+            )
+            .map_err(crate::fragment_type_decode::layout_failure)?;
+            slots.push(slot);
+        }
+    }
+    {
+        let crate::fragment_type_decode::NativeTypeDecoder::Strong { resources, .. } = decoder;
+        let schema = novarocks_execution::exec::chunk::ChunkSchema::try_new_typed_observed::<Error>(
+            slots,
+            scope.storage_lifetime(),
+            |layout| scope.request_layout(layout).map_err(Error::from),
+            |units| {
+                for _ in 0..units {
+                    resources
+                        .work
+                        .step()
+                        .map_err(NativeTypeConstructionError::Control)?;
+                }
+                resources
+                    .work
+                    .flush()
+                    .map_err(|cause| Error::from(NativeTypeConstructionError::Control(cause)))
+            },
+        )?;
+        scope.request_layout(
+            arc_layout(std::alloc::Layout::new::<
+                novarocks_execution::exec::chunk::ChunkSchema,
+            >())
+            .map_err(NativeTypeConstructionError::Resource)?,
+        )?;
+        Ok(Arc::new(schema))
+    }
 }
 
 /// The exact immutable catalog runtime identity this relation belongs to.
@@ -711,6 +910,100 @@ mod tests {
 
     use super::*;
 
+    struct FixtureControl;
+    impl novarocks_type_contract::PureCompileControl for FixtureControl {
+        fn checkpoint(
+            &self,
+            _: novarocks_type_contract::CompilePhase,
+            _: u32,
+        ) -> Result<(), novarocks_type_contract::CompileControlError> {
+            Ok(())
+        }
+    }
+
+    fn fixture_type(data_type: &DataType) -> common::TypeDesc {
+        // These are explicit fixture declarations, independent of Arrow labels.
+        let id = match data_type {
+            DataType::Int64 => 0,
+            DataType::LargeBinary => 1,
+            other => panic!("undeclared scan fixture type: {other:?}"),
+        };
+        common::TypeDesc {
+            value_binding_id: Some(id),
+        }
+    }
+
+    fn with_fixture_types<T>(
+        operation: impl FnOnce(
+            &mut crate::fragment_type_decode::NativeTypeDecoder<'_, '_, '_>,
+        ) -> Result<T, NativeFragmentDecodeError>,
+    ) -> Result<T, NativeFragmentDecodeError> {
+        use crate::fragment_type_decode::{
+            NativeDecodeResources, NativeTypeDecoder, table_failure,
+        };
+        use crate::native_type_construction::{NativeTypeConstruction, NativeTypeFactory};
+        use novarocks_plan_codec::execution_type_table::{
+            ExecutionTypeRoot, ExecutionTypeTableBuilder, ExecutionTypeTableLimits,
+            decode_execution_type_table_with_factory_in,
+        };
+        use novarocks_type_contract::{
+            CompileCheckpoints, CompilePhase, FunctionValueType, ValueLogicalType,
+        };
+        let values = [
+            FunctionValueType::new(DataType::Int64, true),
+            FunctionValueType::try_with_logical_type(
+                DataType::LargeBinary,
+                true,
+                ValueLogicalType::Variant,
+            )
+            .unwrap(),
+        ];
+        let roots = [
+            ExecutionTypeRoot {
+                id: 0,
+                value: &values[0],
+            },
+            ExecutionTypeRoot {
+                id: 1,
+                value: &values[1],
+            },
+        ];
+        let limits = ExecutionTypeTableLimits::for_validated_root_count(roots.len()).unwrap();
+        let creation = NativeTypeConstruction::try_with_control(
+            novarocks_execution::runtime::mem_tracker::MemTracker::new_root("scan fixture types"),
+            &FixtureControl,
+        )?;
+        let mut source_work =
+            CompileCheckpoints::try_new(&FixtureControl, CompilePhase::Encode).unwrap();
+        let table = ExecutionTypeTableBuilder::new(&roots)
+            .encode_observed(
+                limits,
+                &mut |layout| creation.request(layout),
+                &mut source_work,
+            )
+            .map_err(|error| table_failure(error, FieldPath::root("fixture_source_types")))?
+            .into_wire();
+        source_work.finish().unwrap();
+        let mut resources = NativeDecodeResources::try_new(&creation)?;
+        let factory = NativeTypeFactory::new(&creation);
+        let types = decode_execution_type_table_with_factory_in(
+            &table,
+            limits,
+            &factory,
+            &mut resources.work,
+        )
+        .map_err(|error| table_failure(error, FieldPath::root("execution_types")))?;
+        let mut decoder = NativeTypeDecoder::Strong {
+            types: &types,
+            original_requests: None,
+            resources: &mut resources,
+        };
+        let result = operation(&mut decoder)?;
+        drop(decoder);
+        resources.finish()?;
+        Ok(result)
+    }
+
     /// Decodes the fixture's scan leaf through the adapter-owned Native boundary.
     fn decode_node(
         node: &plan::DistributedNode,
@@ -724,18 +1017,21 @@ mod tests {
         let Some(plan::plan_node::Kind::Scan(scan)) = physical.kind.as_ref() else {
             panic!("fixture node carries a scan");
         };
-        lower_scan_node(
-            node,
-            physical,
-            scan,
-            FieldPath::root("plan_fragment")
-                .field("root")
-                .field("payload")
-                .field("physical")
-                .field("scan"),
-            ctx,
-            arena,
-        )
+        with_fixture_types(|decoder| {
+            lower_scan_node(
+                node,
+                physical,
+                scan,
+                FieldPath::root("plan_fragment")
+                    .field("root")
+                    .field("payload")
+                    .field("physical")
+                    .field("scan"),
+                ctx,
+                arena,
+                decoder,
+            )
+        })
     }
 
     /// Borrow the scan out of a fixture node.
@@ -824,7 +1120,7 @@ mod tests {
         common::OutputColumn {
             column_id,
             name: name.to_string(),
-            r#type: Some(novarocks_plan_codec::encode_native_type(data_type).expect("encode type")),
+            r#type: Some(fixture_type(data_type)),
             nullable: true,
             is_internal: false,
         }
@@ -833,12 +1129,9 @@ mod tests {
     fn typed_column_def(name: &str, data_type: &DataType) -> plan::ColumnDef {
         plan::ColumnDef {
             name: name.to_string(),
-            data_type: Some(
-                novarocks_plan_codec::encode_native_type(data_type).expect("encode type"),
-            ),
+            data_type: Some(fixture_type(data_type)),
             nullable: true,
             write_default_json: None,
-            logical_type: None,
         }
     }
 
@@ -897,10 +1190,7 @@ mod tests {
                         synthetic_column_id: 2,
                         synthetic_column: "__nr_var_v_0".to_string(),
                         canonical_path: "$.a.b".to_string(),
-                        requested_type: Some(
-                            novarocks_plan_codec::encode_native_type(&DataType::Int64)
-                                .expect("encode type"),
-                        ),
+                        requested_type: Some(fixture_type(&DataType::Int64)),
                         strict: true,
                     }],
                     mv_rewritten_from: None,
@@ -1161,16 +1451,24 @@ mod tests {
         let node = typed_variant_scan_node(test_support::scan_source_proto(), &[]);
         let scan = scan_of(&node);
         let table = scan.table.as_ref().expect("fixture table");
-        let output_columns =
-            crate::fragment_scan_output::decode_scan_output_columns(scan, FieldPath::root("scan"))
-                .expect("decode scan output columns");
-        let variant_path_plan =
+        let output_columns = with_fixture_types(|decoder| {
+            crate::fragment_scan_output::decode_scan_output_columns(
+                scan,
+                FieldPath::root("scan"),
+                decoder,
+            )
+        })
+        .expect("decode scan output columns");
+        let variant_path_plan = with_fixture_types(|decoder| {
             crate::fragment_variant_path::parse_native_scan_variant_path_columns(
                 scan,
                 table,
                 output_columns.columns(),
+                decoder,
             )
-            .expect("parse variant path columns");
+            .map_err(|error| error.into_native(FieldPath::root("scan")))
+        })
+        .expect("parse variant path columns");
 
         // One assignment, one page channel, one read slot: the synthetic column
         // is not among them.
@@ -1202,16 +1500,24 @@ mod tests {
         let scan = scan_of_mut(&mut node);
         scan.required_columns = vec!["__nr_var_v_0".to_string(), "id".to_string()];
         let table = scan.table.as_ref().expect("fixture table");
-        let output_columns =
-            crate::fragment_scan_output::decode_scan_output_columns(scan, FieldPath::root("scan"))
-                .expect("decode narrowed output columns");
-        let variant_path_plan =
+        let output_columns = with_fixture_types(|decoder| {
+            crate::fragment_scan_output::decode_scan_output_columns(
+                scan,
+                FieldPath::root("scan"),
+                decoder,
+            )
+        })
+        .expect("decode narrowed output columns");
+        let variant_path_plan = with_fixture_types(|decoder| {
             crate::fragment_variant_path::parse_native_scan_variant_path_columns(
                 scan,
                 table,
                 output_columns.columns(),
+                decoder,
             )
-            .expect("parse variant path columns");
+            .map_err(|error| error.into_native(FieldPath::root("scan")))
+        })
+        .expect("parse variant path columns");
 
         assert_eq!(
             connector_read_slot_ids(scan, &output_columns, &variant_path_plan),
