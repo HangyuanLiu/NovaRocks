@@ -1395,13 +1395,24 @@ mod tests {
         use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
         use crate::iceberg::{NamespaceIdent, TableCreation};
 
-        let catalog = adapter.runtime.novarocks_catalog().vendored_client();
         executor.block_on(async {
-            let namespace = NamespaceIdent::new("maintenance_test".to_string());
-            catalog
-                .create_namespace(&namespace, HashMap::new())
-                .await
-                .expect("create namespace");
+            use crate::catalog::CatalogNamespaceName;
+            use crate::catalog::catalog_request::CatalogPublicationRequest;
+            use crate::catalog::error::CatalogOutcome;
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                &adapter.runtime,
+                adapter.key.incarnation,
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: CatalogNamespaceName::new("maintenance_test"),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
             let schema = Schema::builder()
                 .with_fields(vec![Arc::new(NestedField::required(
                     1,
@@ -1409,18 +1420,33 @@ mod tests {
                     Type::Primitive(PrimitiveType::Long),
                 ))])
                 .build()
-                .expect("schema");
-            catalog
-                .create_table(
-                    &namespace,
-                    TableCreation::builder()
-                        .name("t".to_string())
+                .unwrap();
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                &adapter.runtime,
+                adapter.key.incarnation,
+                CatalogPublicationRequest::CreateTable {
+                    namespace: CatalogNamespaceName::new("maintenance_test"),
+                    creation: TableCreation::builder()
+                        .name("t".into())
                         .schema(schema)
                         .format_version(FormatVersion::V2)
                         .build(),
-                )
-                .await
-                .expect("create table")
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
+            crate::catalog::admission_test_support::load_static_fixture_table(
+                &adapter.runtime,
+                &crate::iceberg::TableIdent::new(
+                    NamespaceIdent::new("maintenance_test".into()),
+                    "t".into(),
+                ),
+            )
+            .await
         })
     }
 
@@ -1431,11 +1457,13 @@ mod tests {
         name: &str,
     ) {
         use crate::iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, Struct};
-        use crate::iceberg::transaction::{ApplyTransactionAction, Transaction};
 
-        let catalog = adapter.runtime.novarocks_catalog().vendored_client();
         executor.block_on(async {
-            let table = catalog.load_table(ident).await.expect("load append table");
+            let table = crate::catalog::admission_test_support::load_static_fixture_table(
+                &adapter.runtime,
+                ident,
+            )
+            .await;
             let location = format!("{}/data/{name}.parquet", table.metadata().location());
             table
                 .file_io()
@@ -1453,15 +1481,27 @@ mod tests {
                 .partition(Struct::empty())
                 .build()
                 .expect("synthetic data file");
-            let transaction = Transaction::new(&table);
-            transaction
-                .fast_append()
-                .add_data_files([file])
-                .apply(transaction)
-                .expect("stage append")
-                .commit(catalog.as_ref())
-                .await
-                .expect("commit append");
+            let contents = vec![
+                crate::commit::model::AddedContent::new_logical_data(
+                    file,
+                    table.metadata().default_partition_spec_id(),
+                )
+                .unwrap(),
+            ];
+            let provider = crate::metadata::IcebergMetadata::new(
+                adapter.descriptor.clone(),
+                adapter.key.incarnation,
+                Arc::clone(&adapter.runtime),
+            );
+            crate::commit::run::append_contents_for_test(
+                provider,
+                table,
+                contents,
+                "main".into(),
+                BTreeMap::new(),
+            )
+            .await
+            .expect("publish fixture append through its owner");
         });
     }
 

@@ -1604,30 +1604,49 @@ mod tests {
             )
             .expect("control runtime"),
         );
-        let catalog = runtime.novarocks_catalog().vendored_client();
-        executor.block_on(async move {
-            let namespace = NamespaceIdent::new("db".to_string());
-            catalog
-                .create_namespace(&namespace, HashMap::new())
-                .await
-                .expect("create namespace");
+        executor.block_on(async {
+            use crate::catalog::CatalogNamespaceName;
+            use crate::catalog::catalog_request::CatalogPublicationRequest;
+            use crate::catalog::error::CatalogOutcome;
+            let generation = ProviderBindingEpoch::from_bytes([8; 16]);
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                &runtime,
+                generation,
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: CatalogNamespaceName::new("db"),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
             let schema = Schema::builder()
                 .with_fields(vec![
                     NestedField::optional(1, "value", Type::Primitive(PrimitiveType::Long)).into(),
                 ])
                 .build()
-                .expect("schema");
-            catalog
-                .create_table(
-                    &namespace,
-                    TableCreation::builder()
-                        .name("t".to_string())
+                .unwrap();
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                &runtime,
+                generation,
+                CatalogPublicationRequest::CreateTable {
+                    namespace: CatalogNamespaceName::new("db"),
+                    creation: TableCreation::builder()
+                        .name("t".into())
                         .schema(schema)
                         .format_version(FormatVersion::V2)
                         .build(),
-                )
-                .await
-                .expect("create table");
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
         });
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),

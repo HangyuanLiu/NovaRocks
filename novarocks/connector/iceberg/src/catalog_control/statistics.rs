@@ -1072,15 +1072,26 @@ mod tests {
     }
 
     #[test]
-    fn empty_collection_bypasses_catalog_transaction_admission() {
+    fn empty_collection_requires_no_publication_preparation() {
         let (executor, _warehouse, provider) = provider();
-        let catalog = provider.runtime().novarocks_catalog().vendored_client();
-        executor.block_on(async move {
-            let namespace = crate::iceberg::NamespaceIdent::new("empty_stats".to_string());
-            catalog
-                .create_namespace(&namespace, HashMap::new())
-                .await
-                .expect("create namespace");
+        executor.block_on(async {
+            use crate::catalog::CatalogNamespaceName;
+            use crate::catalog::catalog_request::CatalogPublicationRequest;
+            use crate::catalog::error::CatalogOutcome;
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                provider.runtime(),
+                provider.incarnation(),
+                CatalogPublicationRequest::CreateNamespace {
+                    namespace: CatalogNamespaceName::new("empty_stats"),
+                    properties: HashMap::new(),
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
             let schema = crate::iceberg::spec::Schema::builder()
                 .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
                     1,
@@ -1088,18 +1099,25 @@ mod tests {
                     Type::Primitive(PrimitiveType::Long),
                 ))])
                 .build()
-                .expect("schema");
-            catalog
-                .create_table(
-                    &namespace,
-                    crate::iceberg::TableCreation::builder()
-                        .name("t".to_string())
+                .unwrap();
+            let outcome = crate::catalog::admission_test_support::publish_catalog_fixture(
+                provider.runtime(),
+                provider.incarnation(),
+                CatalogPublicationRequest::CreateTable {
+                    namespace: CatalogNamespaceName::new("empty_stats"),
+                    creation: crate::iceberg::TableCreation::builder()
+                        .name("t".into())
                         .schema(schema)
                         .format_version(crate::iceberg::spec::FormatVersion::V2)
                         .build(),
-                )
-                .await
-                .expect("create table");
+                    no_op_if_exists: false,
+                },
+            )
+            .await;
+            assert!(
+                matches!(outcome, CatalogOutcome::KnownCommitted { .. }),
+                "{outcome:?}"
+            );
         });
         let identity = ConnectorTableIdentity {
             instance_id: provider.descriptor().instance_id.clone(),

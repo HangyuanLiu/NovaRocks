@@ -52,9 +52,31 @@ pub(crate) async fn append_snapshot_for_test(
     target_ref: String,
     summary: std::collections::BTreeMap<String, String>,
 ) -> crate::iceberg::Result<i64> {
+    let contents = files
+        .iter()
+        .map(|file| {
+            super::model::AddedContent::new_logical_data(
+                super::data_file::from_written_file(file)?,
+                file.partition_spec_id,
+            )
+        })
+        .collect::<crate::iceberg::Result<Vec<_>>>()?;
+    append_contents_for_test(provider, table, contents, target_ref, summary).await
+}
+
+/// Seed exact caller-authored logical data through normal staging and the
+/// prepared owner. Each item carries its original explicit partition spec.
+#[cfg(test)]
+pub(crate) async fn append_contents_for_test(
+    provider: crate::metadata::IcebergMetadata,
+    table: crate::iceberg::table::Table,
+    contents: Vec<super::model::AddedContent>,
+    target_ref: String,
+    summary: std::collections::BTreeMap<String, String>,
+) -> crate::iceberg::Result<i64> {
     use super::model::{
-        AddedContent, Dependency, FileChanges, IsolationLevel, OperationIntent,
-        OperationIntentParts, RequestShape, StartSnapshot, TableTarget,
+        Dependency, FileChanges, IsolationLevel, OperationIntent, OperationIntentParts,
+        RequestShape, StartSnapshot, TableTarget,
     };
     use super::staging::{StagingBase, StagingEngine};
     let runtime = provider.runtime();
@@ -74,15 +96,7 @@ pub(crate) async fn append_snapshot_for_test(
                 sequence_number: snapshot.sequence_number(),
             }),
         changes: FileChanges {
-            added: files
-                .iter()
-                .map(|file| {
-                    AddedContent::new_logical_data(
-                        super::data_file::from_written_file(file)?,
-                        file.partition_spec_id,
-                    )
-                })
-                .collect::<crate::iceberg::Result<Vec<_>>>()?,
+            added: contents,
             removed: Vec::new(),
         },
         dependencies: vec![Dependency::NoReadDependency],

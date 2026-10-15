@@ -595,3 +595,74 @@ pub(crate) async fn publish_catalog(
         .unwrap();
     journal.commit_outcome(entry)
 }
+
+/// Ordinary local fixture setup uses the same frozen publication mechanisms
+/// as a catalog request. The explicit epoch belongs to the fixture's provider.
+pub(crate) async fn publish_catalog_fixture(
+    runtime: &crate::metadata_context::IcebergMetadataContext,
+    generation: novarocks_spi::connector::ProviderBindingEpoch,
+    request: super::catalog_request::CatalogPublicationRequest,
+) -> super::error::CatalogOutcome<super::transaction::CommitProof> {
+    use novarocks_spi::connector::{
+        ConnectorMutationOperationId, ConnectorRequestContext, ConnectorStopOwner,
+    };
+    let operation_id = ConnectorMutationOperationId::new();
+    let owner = Arc::clone(runtime.novarocks_catalog());
+    let frozen = match request {
+        super::catalog_request::CatalogPublicationRequest::CreateTable {
+            namespace,
+            creation,
+            no_op_if_exists,
+        } => owner
+            .freeze_create_publication(super::catalog_request::CatalogCreatePublicationRequest {
+                operation_id: operation_id.to_bytes(),
+                namespace,
+                creation,
+                no_op_if_exists,
+            })
+            .expect("freeze fixture create without SDK mutation"),
+        request => request
+            .freeze(operation_id.to_bytes())
+            .expect("freeze fixture catalog request"),
+    };
+    let context = ConnectorRequestContext::try_new(
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+        ConnectorStopOwner::new().view(),
+        2 * 1024 * 1024,
+        4 * 1024 * 1024,
+    )
+    .unwrap();
+    let binding = runtime
+        .resources()
+        .planning_binding()
+        .for_request(context.clone());
+    publish_catalog(owner, frozen, operation_id, generation, context, binding).await
+}
+
+/// A local fixture read carries its own admitted context and explicitly
+/// requires static materialization; a vended result cannot silently enter it.
+pub(crate) async fn load_static_fixture_table(
+    runtime: &crate::metadata_context::IcebergMetadataContext,
+    ident: &crate::iceberg::TableIdent,
+) -> crate::iceberg::table::Table {
+    use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
+    let context = ConnectorRequestContext::try_new(
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+        ConnectorStopOwner::new().view(),
+        2 * 1024 * 1024,
+        4 * 1024 * 1024,
+    )
+    .unwrap();
+    runtime
+        .novarocks_catalog()
+        .load_table_for_read(
+            super::CatalogTableName::from_identifier(ident),
+            runtime.resources().planning_binding().for_request(context),
+        )
+        .await
+        .expect("read fixture through its catalog owner")
+        .into_parts()
+        .0
+        .into_static_table()
+        .expect("fixture explicitly requires static storage")
+}
