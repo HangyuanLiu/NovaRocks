@@ -39,6 +39,8 @@ use arrow::array::ArrayRef;
 use arrow::compute::filter_record_batch;
 
 mod compiled;
+mod compiled_ordered;
+pub(crate) use compiled_ordered::{CompiledOrderedScanDriver, CompiledOrderedScanFactory};
 mod live_cursor;
 #[cfg(test)]
 mod live_cursor_tests;

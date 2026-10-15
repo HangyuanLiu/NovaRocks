@@ -560,3 +560,6 @@ fn compiled_ordered_partial_keeps_the_first_failure_and_releases_actual_groups()
     drop(state);
     assert_eq!(tracker.current(), 0);
 }
+
+#[path = "compiled_ordered_scan_tests.rs"]
+mod scan_consumer_tests;

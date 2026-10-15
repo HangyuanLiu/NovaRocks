@@ -184,6 +184,12 @@ impl OrderedTopNAllocationHost {
         self.allocator.clone()
     }
 
+    /// Borrow the same creating host for synchronous scalar/mask and filtered
+    /// output admission. This clone creates neither a new payer nor a grant.
+    pub(crate) fn scalar_allocator(&self) -> Arc<dyn AggregateStateAllocator> {
+        Arc::clone(&self.host)
+    }
+
     /// Retain a complete cold entity on the same host as its paid children.
     /// The prefix covers construction only; the returned owner retains the
     /// actual block until its final alias is destroyed.
