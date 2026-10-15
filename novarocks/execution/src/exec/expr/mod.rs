@@ -427,6 +427,7 @@ impl ExprArena {
                     FunctionKind::Abs => function::eval_abs(self, id, args[0], chunk),
                     FunctionKind::ArrayMap => function::eval_array_map(self, id, args, chunk),
                     FunctionKind::Year => function::eval_year(self, id, chunk),
+                    FunctionKind::HourFromUnixtime => function::eval_hour_from_unixtime(self, id, args, chunk),
                     FunctionKind::AssertTrue => function::eval_assert_true(self, args, chunk),
                     FunctionKind::Substring => {
                         let length_expr = if args.len() == 3 { Some(args[2]) } else { None };
