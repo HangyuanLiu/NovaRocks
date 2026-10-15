@@ -902,7 +902,7 @@ impl ConnectorDocumentStorageLease {
         request: super::KeyedDocumentObservationRequest,
     ) -> Result<super::FullKeyedDocumentView, super::KeyedDocumentReadError> {
         self.validate_keyed_request(&request)?;
-        let view = self
+        let mut view = self
             .observation()?
             .observe_full_keyed_documents(request.clone())?;
         view.current.validate_for(&request)?;
@@ -915,6 +915,7 @@ impl ConnectorDocumentStorageLease {
                 invalid("full keyed observation token does not match its exact load").into(),
             );
         }
+        view.token.seal();
         Ok(view)
     }
     pub fn resolve_keyed_commit(
@@ -1219,6 +1220,25 @@ mod tests {
     fn metadata_version() -> ConnectorCommittedVersion {
         ConnectorCommittedVersion::try_new(Bytes::from_static(b"metadata-version"), Some(7))
             .unwrap()
+    }
+
+    #[test]
+    fn full_observation_requires_lease_sealing_before_expiry() {
+        let mut token = super::super::FullObservationToken::try_new(
+            ConnectorProviderBindingKey {
+                instance_id: ConnectorInstanceId::parse("catalog").unwrap(),
+                incarnation: ProviderBindingEpoch::from_bytes([2; 16]),
+            },
+            table("catalog", "ns"),
+            object_id(),
+            metadata_version(),
+            Bytes::from_static(b"full metadata"),
+        )
+        .unwrap();
+        assert!(token.validate_sealed().is_err());
+        token.seal();
+        token.validate_sealed().unwrap();
+        token.clone().validate_sealed().unwrap();
     }
 
     fn document_set() -> ConnectorDocumentSet {

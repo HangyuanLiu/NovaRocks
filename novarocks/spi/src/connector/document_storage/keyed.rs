@@ -370,6 +370,7 @@ pub struct FullObservationToken {
     object_id: ConnectorTableObjectId,
     metadata_version: ConnectorCommittedVersion,
     payload: Bytes,
+    sealed: bool,
 }
 impl std::fmt::Debug for FullObservationToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -400,7 +401,19 @@ impl FullObservationToken {
             object_id,
             metadata_version,
             payload,
+            sealed: false,
         })
+    }
+    pub(crate) fn seal(&mut self) {
+        self.sealed = true;
+    }
+    pub fn validate_sealed(&self) -> Result<(), ConnectorError> {
+        if !self.sealed {
+            return Err(invalid(
+                "full observation was not returned by its retained document lease",
+            ));
+        }
+        Ok(())
     }
     pub fn owner(&self) -> &ConnectorProviderBindingKey {
         &self.owner
@@ -553,6 +566,7 @@ impl KeyedMutationIntent {
             KeyedMutation::Markers(write) => write.validate(),
             KeyedMutation::SlotChange(change) => change.validate(),
             KeyedMutation::Expiry(expiry) => {
+                expiry.observation.validate_sealed()?;
                 if expiry.observation.owner() != owner
                     || expiry.observation.table() != self.admission.target()
                     || Some(expiry.observation.object_id()) != self.admission.expected_object_id()
