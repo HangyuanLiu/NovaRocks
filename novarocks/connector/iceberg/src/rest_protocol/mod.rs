@@ -44,3 +44,6 @@ pub(crate) mod wire;
 
 #[cfg(test)]
 mod activity_tests;
+
+#[cfg(test)]
+mod publication_owner_tests;
